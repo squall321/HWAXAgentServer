@@ -1,6 +1,9 @@
-# HWAX Agent Server — dev minimal (vLLM relay).
-# LangGraph + MCP deps are added in the next phase (see README).
+# HWAX Agent Server — LangGraph ReAct + MCP tool fan-out.
 fastapi==0.136.3
 uvicorn==0.49.0
 httpx==0.28.1
 pydantic==2.12.4
+langgraph==1.2.5
+langchain-openai==1.3.2
+langchain-mcp-adapters==0.3.0
+mcp[cli]==1.28.0
