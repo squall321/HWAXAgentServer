@@ -97,7 +97,9 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             elif kind == "on_tool_end":
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"]})
     except Exception as exc:
-        yield _sse("error", {"code": "agent_error", "message": str(exc)})
+        # Don't leak internals (tool inputs, config, LLM details) to the browser; log server-side.
+        print(f"[agent] chat error: {exc!r}")
+        yield _sse("error", {"code": "agent_error", "message": "에이전트 처리 중 오류"})
         yield _sse("done", {})
         return
     yield _sse("result", {"type": "text", "content": "".join(full)})
