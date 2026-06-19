@@ -31,9 +31,15 @@ from pydantic import BaseModel
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen2.5-7b-dev")
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "demo=http://127.0.0.1:8011/mcp")
+# MCP_CONFIG points at a JSON file (gitignored — may hold tokens) with full per-server
+# config incl. headers, e.g. {"reportarchive":{"url":...,"transport":"streamable_http",
+# "headers":{"Authorization":"Bearer ...","X-Workspace-Slug":"dev"}}}. Falls back to the
+# simple name=url MCP_SERVERS string when unset.
+MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
 SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 한국어로 간결·정확하게 답하세요. "
-    "계산·시간 등 도구로 처리할 수 있는 요청은 반드시 제공된 도구를 사용하세요."
+    "보고서 템플릿·작성, VOC(고객의 소리) 데이터 조회·분석 등은 반드시 제공된 도구를 사용하세요. "
+    "도구 결과에 근거해 답하고, 추측하지 마세요."
 )
 
 
@@ -48,12 +54,19 @@ def _parse_servers(spec: str) -> dict:
     return out
 
 
+def _load_mcp_config() -> dict:
+    if MCP_CONFIG and os.path.exists(MCP_CONFIG):
+        with open(MCP_CONFIG) as f:
+            return json.load(f)
+    return _parse_servers(MCP_SERVERS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Build the LLM (vLLM, OpenAI-compatible) + load MCP tools + compile the ReAct agent once.
     llm = ChatOpenAI(base_url=VLLM_BASE_URL, api_key="EMPTY", model=VLLM_MODEL, temperature=0)
     tools = []
-    servers = _parse_servers(MCP_SERVERS)
+    servers = _load_mcp_config()
     if servers:
         try:
             tools = await MultiServerMCPClient(servers).get_tools()
