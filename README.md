@@ -8,15 +8,18 @@ call and tool fan-out live here**, as a separate service the portal reaches by U
 ```
 ChatDock (portal frontend)
   → portal /agent/chat   (auth · CSRF · concurrency cap · audit · SSE relay)
-    → Agent Server /chat  (THIS) — LLM call, later LangGraph ReAct + MCP tools
+    → Agent Server /chat  (THIS) — LangGraph ReAct loop, forwards caller groups
       → vLLM /v1           (OpenAI-compatible; dev = Qwen2.5-7B on a 5070 Ti)
+      → MCP Gateway /mcp    (HWAXMcpGateway; group-filters the tool set per request)
 ```
 
 ## API
 
-- `POST /chat` — body `{message, system_id?, groups?}`. Streams the portal's §5 SSE
-  contract: `status` → `token`×N → `result` → `done` (or `error`).
-- `GET /health` — `{status, model, vllm}`.
+- `POST /chat` — body `{message, system_id?, groups?}`. `groups` (the caller's JWT
+  groups, handed off by the portal) are forwarded to the MCP Gateway, which returns only
+  the tools those groups may use. Streams the portal's §5 SSE contract:
+  `status` → `token`×N → `result` → `done` (or `error`).
+- `GET /health` — `{status, model, vllm, mcp, tool_scoping}`.
 
 ## Run (dev)
 
@@ -35,12 +38,17 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 |---|---|---|
 | `VLLM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible inference base |
 | `VLLM_MODEL` | `qwen2.5-7b-dev` | served model name |
+| `MCP_CONFIG` | _(unset)_ | path to a gitignored JSON file holding the gateway entry + token (takes precedence) |
+| `MCP_SERVERS` | _(empty)_ | fallback `name=url` pairs when `MCP_CONFIG` is unset (no auth headers) |
 
 ## Status
 
-- **Now**: relays a vLLM completion as SSE (straight model answer).
-- **Next**: LangGraph ReAct loop + MCP tool fan-out (the portal already filters by
-  `allowed_groups`; this server runs the tools the user is allowed to use).
+- **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the
+  caller's `groups` are forwarded to the gateway via the `X-HWAX-Groups` header; the
+  gateway returns only the tools those groups may use (it owns `allowed_groups` filtering —
+  it knows each tool's backend, which is flattened away by the time tools reach here). The
+  compiled agent is cached per group-set. MCP/gateway down → degrades to a no-tool answer.
+- **Next**: `system_id`-based per-page tool scoping (portal Phase 2; accepted, not yet used).
 
 ## prod
 

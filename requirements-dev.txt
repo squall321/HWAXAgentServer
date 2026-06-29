@@ -1,0 +1,2 @@
+# 개발용 — 권한 필터링 단위 테스트 실행 (pytest test_app.py)
+pytest==8.3.4
