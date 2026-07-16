@@ -49,7 +49,8 @@ GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the cal
 SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 반드시 한국어로만 답하세요 — "
     "중국어·영어 등 다른 언어로 절대 전환하지 마세요. 간결·정확하게. "
-    "보고서 템플릿·작성, VOC(고객의 소리) 데이터 조회·분석 등은 반드시 제공된 도구를 사용하세요. "
+    "다음 요청은 반드시 제공된 도구를 사용하세요 — 보고서/템플릿(Report Archive), "
+    "VOC·고객의 소리(SignalForge), 백서·기술문서(MX White Paper), 데이터셋·데이터 허브(AI Data Hub). "
     "도구 결과에 근거해 답하고, 추측하지 마세요. "
     "조회 도구는 항상 좁게 호출하세요 — limit(기본 10 이하)·필터·기간을 지정하고, "
     "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요.\n\n"
@@ -115,6 +116,8 @@ class ChatRequest(BaseModel):
     message: str
     system_id: str | None = None  # sub-page context → tool scope (portal Phase 2; accepted, not yet used)
     groups: list[str] = []
+    # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
+    history: list[dict] = []
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -122,6 +125,10 @@ def _sse(event: str, data: dict) -> bytes:
 
 
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "6000"))  # 도구 결과 절단(문자) — 컨텍스트 보호
+TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "240"))  # 도구 description 절단(문자) — 스키마 슬림
+HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "4000"))  # history 항목별 절단(문자)
+HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "16000"))  # history 전체 예산(문자) — 최신 우선
+HIST_MAX_ITEMS = 40  # history 최대 항목 수
 
 
 def _cap(text, limit=None):
@@ -149,6 +156,34 @@ def _cap_tool(tool):
     return tool
 
 
+def _cap_desc(s):
+    if isinstance(s, str) and len(s) > TOOL_DESC_MAX:
+        return s[:TOOL_DESC_MAX] + "…"
+    return s
+
+
+def _slim_tool(tool):
+    """도구 스키마를 슬림하게 — 99개 도구의 긴 description 이 통째로 프롬프트에 들어가면
+    16K 모델에서 첫 호출부터 'maximum context length' 400 이 난다(실측 16385/16384).
+    tool.description 을 TOOL_DESC_MAX 로 절단하고, args_schema 가 JSON 스키마 dict 면
+    각 필드 description 도 같은 캡을 적용한다(pydantic 모델이면 건드리지 않음)."""
+    try:
+        tool.description = _cap_desc(tool.description)
+        schema = getattr(tool, "args_schema", None)
+        if isinstance(schema, dict):  # MCP 어댑터 도구는 JSON 스키마 dict — 필드 description 도 절단
+            for prop in schema.get("properties", {}).values():
+                if isinstance(prop, dict) and isinstance(prop.get("description"), str):
+                    prop["description"] = _cap_desc(prop["description"])
+    except Exception as exc:  # 슬림 실패해도 도구 자체는 살린다
+        print(f"[agent] tool slim skipped for {getattr(tool, 'name', '?')}: {exc!r}")
+    return tool
+
+
+def _prep_tool(tool):
+    """도구 로드 직후 한 번에 적용하는 체인: 스키마 슬림 + 결과 절단."""
+    return _cap_tool(_slim_tool(tool))
+
+
 async def _agent_for(app: FastAPI, groups: list[str]):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too."""
@@ -160,11 +195,37 @@ async def _agent_for(app: FastAPI, groups: list[str]):
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = [_cap_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
+                tools = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
         cache[key] = create_react_agent(app.state.llm, tools)
     return cache[key]
+
+
+def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
+    """멀티턴 history 를 검증·절단해 LangChain 메시지 tuple 로 만든다.
+    방어: role 이 user/assistant 외면 무시, 항목별 HIST_ITEM_MAX 절단, 항목 수 최대
+    HIST_MAX_ITEMS, 전체는 최신 것 우선으로 HIST_BUDGET 안에서 오래된 것부터 버림."""
+    items: list[tuple[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        role, content = entry.get("role"), entry.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content:
+            continue
+        if len(content) > HIST_ITEM_MAX:
+            content = content[:HIST_ITEM_MAX] + "…"
+        items.append((role, content))
+    items = items[-HIST_MAX_ITEMS:]
+    kept: list[tuple[str, str]] = []
+    used = 0
+    for role, content in reversed(items):  # 최신부터 예산을 채우고, 넘치는 오래된 것은 버림
+        if used + len(content) > HIST_BUDGET:
+            break
+        kept.append((role, content))
+        used += len(content)
+    kept.reverse()
+    return kept
 
 
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
@@ -172,7 +233,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
         agent = await _agent_for(app, req.groups)
-        inputs = {"messages": [("system", SYSTEM_PROMPT), ("user", req.message)]}
+        messages = [("system", SYSTEM_PROMPT), *_history_messages(req.history), ("user", req.message)]
+        inputs = {"messages": messages}
         async for event in agent.astream_events(inputs, version="v2"):
             kind = event["event"]
             if kind == "on_chat_model_stream":
@@ -209,4 +271,6 @@ def health() -> dict:
         "vllm": VLLM_BASE_URL,
         "mcp": list(getattr(app.state, "connections", {})),
         "tool_scoping": "gateway (X-HWAX-Groups)",
+        "tool_desc_max": TOOL_DESC_MAX,
+        "hist_budget": HIST_BUDGET,
     }
