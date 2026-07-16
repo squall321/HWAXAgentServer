@@ -41,6 +41,8 @@ from pydantic import BaseModel
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen2.5-7b-dev")
+# 인증 있는 OpenAI 호환 서버(상암 B300 등)용 — 미설정이면 "EMPTY"(로컬 vLLM 무인증과 동일).
+VLLM_API_KEY = os.environ.get("VLLM_API_KEY") or "EMPTY"
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "")
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
@@ -86,7 +88,7 @@ async def lifespan(app: FastAPI):
     # Build the LLM once. Tools are loaded per request (they depend on the caller's groups),
     # so we keep the raw connection config and compile/cache a ReAct agent per group-set.
     app.state.llm = ChatOpenAI(
-        base_url=VLLM_BASE_URL, api_key="EMPTY", model=VLLM_MODEL, temperature=0
+        base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL, temperature=0
     )
     app.state.connections = _load_mcp_config()
     app.state.agent_cache = {}  # frozenset(groups) -> compiled ReAct agent
