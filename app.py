@@ -49,7 +49,9 @@ GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the cal
 SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 한국어로 간결·정확하게 답하세요. "
     "보고서 템플릿·작성, VOC(고객의 소리) 데이터 조회·분석 등은 반드시 제공된 도구를 사용하세요. "
-    "도구 결과에 근거해 답하고, 추측하지 마세요."
+    "도구 결과에 근거해 답하고, 추측하지 마세요. "
+    "조회 도구는 항상 좁게 호출하세요 — limit(기본 10 이하)·필터·기간을 지정하고, "
+    "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요."
 )
 
 
@@ -110,6 +112,34 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
+TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "6000"))  # 도구 결과 절단(문자) — 컨텍스트 보호
+
+
+def _cap(text, limit=None):
+    limit = limit or TOOL_RESULT_MAX
+    s = text if isinstance(text, str) else str(text)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"\n…[도구 출력 {len(s)}자 → {limit}자로 절단. 필요하면 limit/필터로 좁혀 다시 조회하세요]"
+
+
+def _cap_tool(tool):
+    """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
+    프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384)."""
+    orig = tool.coroutine
+    if orig is None:
+        return tool
+
+    async def capped(*a, **kw):
+        out = await orig(*a, **kw)
+        if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
+            return (_cap(out[0]), out[1])
+        return _cap(out)
+
+    tool.coroutine = capped
+    return tool
+
+
 async def _agent_for(app: FastAPI, groups: list[str]):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too."""
@@ -121,7 +151,7 @@ async def _agent_for(app: FastAPI, groups: list[str]):
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = await MultiServerMCPClient(scoped).get_tools()
+                tools = [_cap_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
         cache[key] = create_react_agent(app.state.llm, tools)
