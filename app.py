@@ -53,7 +53,10 @@ SYSTEM_PROMPT = (
     "VOC·고객의 소리(SignalForge), 백서·기술문서(MX White Paper), 데이터셋·데이터 허브(AI Data Hub). "
     "도구 결과에 근거해 답하고, 추측하지 마세요. "
     "조회 도구는 항상 좁게 호출하세요 — limit(기본 10 이하)·필터·기간을 지정하고, "
-    "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요.\n\n"
+    "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요. "
+    "그래프·차트·시각화를 요청받으면 도구로 데이터를 조회한 뒤, 외부 리소스 없이 "
+    "자체 완결된(self-contained, 인라인 SVG/스크립트) HTML을 ```html 코드블록으로 출력하세요 — "
+    "챗이 미리보기로 렌더링합니다.\n\n"
     "포털 사용법·시작 방법을 물으면 다음을 안내하세요(도구 호출 불필요). "
     "권장 사용법은 이 웹 챗이 아니라 개인 Claude(Desktop/Claude Code)에 이 포털을 MCP로 연결해 쓰는 것입니다 — "
     "웹 챗은 가벼운 확인·데모용이며 본격 업무 사용은 권장되지 않습니다. 연결 방법: "
@@ -191,14 +194,22 @@ async def _agent_for(app: FastAPI, groups: list[str]):
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
+        load_failed = False
         connections = app.state.connections
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
                 tools = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
+                load_failed = True
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
-        cache[key] = create_react_agent(app.state.llm, tools)
+        agent = create_react_agent(app.state.llm, tools)
+        if load_failed:
+            # 실패 결과는 캐시하지 않는다 — 캐시하면 게이트웨이가 복구돼도 이 그룹은
+            # 재시작 전까지 영구 no-tool 이 된다(조용한 최악의 실패 모드). 이번 요청만
+            # 도구 없이 응답하고, 다음 요청에서 재시도한다.
+            return agent
+        cache[key] = agent
     return cache[key]
 
 
