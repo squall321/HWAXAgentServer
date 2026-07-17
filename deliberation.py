@@ -55,9 +55,23 @@ async def _call(tools: dict, name: str, args: dict):
         out = await t.ainvoke(args)
         if isinstance(out, tuple):
             out = out[0]
+        # langchain MCP 어댑터는 [{'type':'text','text':'<본문>'}] content-item 리스트로 반환 → text 합치기
+        if isinstance(out, list) and out and all(isinstance(i, dict) and "text" in i for i in out):
+            return "".join(i.get("text", "") for i in out)
         return out
     except Exception as exc:  # noqa: BLE001 — 도구 실패가 심의를 죽이지 않게
         return f"(tool {name} error: {exc})"
+
+
+def _first_dict(x):
+    """AIDataHub 는 list 반환 툴을 원소별 content 로 직렬화한다 — list면 첫 dict, dict면 자신, 아니면 {}."""
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, list):
+        for e in x:
+            if isinstance(e, dict):
+                return e
+    return {}
 
 
 def _parse_json(text: str):
@@ -112,12 +126,13 @@ async def run_deliberation(app, question: str, groups: list):
         items = []
     personas = []
     for it in (items[:N_PERSONAS] if isinstance(items, list) else []):
+        it = _first_dict(it)
         key = it.get("agent_type") or it.get("id")
         if not key:
             continue
-        # 2) 각 페르소나 컨텍스트 — get_agent_session
-        sess = _parse_json(await _call(tools, "get_agent_session", {"agent_type": key})) or {}
-        sd = sess.get("data", sess)
+        # 2) 각 페르소나 컨텍스트 — get_agent_session (list/dict 방어)
+        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
+        sd = _first_dict(sess.get("data", sess))
         role = (sd.get("description") or sd.get("system_prompt") or "")[:400]
         personas.append({"key": key, "role": role})
     if len(personas) < 2:
