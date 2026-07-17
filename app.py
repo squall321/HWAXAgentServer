@@ -36,6 +36,8 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+
+from deliberation import is_deliberation, run_deliberation, strip_trigger
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
@@ -50,7 +52,8 @@ SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 반드시 한국어로만 답하세요 — "
     "중국어·영어 등 다른 언어로 절대 전환하지 마세요. 간결·정확하게. "
     "다음 요청은 반드시 제공된 도구를 사용하세요 — 보고서/템플릿(Report Archive), "
-    "VOC·고객의 소리(SignalForge), 백서·기술문서(MX White Paper), 데이터셋·데이터 허브(AI Data Hub). "
+    "VOC·고객의 소리(SignalForge), 백서·기술문서(MX White Paper), 데이터셋·데이터 허브(AI Data Hub), "
+    "시뮬레이션 클러스터·Slurm 잡/노드/큐 조회(Smart Twin Cluster, slurm_* 도구). "
     "도구 결과에 근거해 답하고, 추측하지 마세요. "
     "조회 도구는 항상 좁게 호출하세요 — limit(기본 10 이하)·필터·기간을 지정하고, "
     "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요. "
@@ -269,9 +272,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
-    return StreamingResponse(
-        _agent_stream(app, req), media_type="text/event-stream", headers=SSE_HEADERS
-    )
+    # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
+    # 정본은 역량 있는 Claude(개인 Claude via MCP); 이건 GLM 연결 시 포털 챗으로도 되게 하는 진입점.
+    if is_deliberation(req.message):
+        stream = run_deliberation(app, strip_trigger(req.message), req.groups)
+    else:
+        stream = _agent_stream(app, req)
+    return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @app.get("/health")
