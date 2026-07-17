@@ -3,12 +3,22 @@
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
 import json
+import re
 import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
 GROUPS_HEADER = "x-hwax-groups"
 N_PERSONAS = 5
+
+# 화두에 불량/품질 얘기가 있으면 SignalForge(VOC)에서 최근 불량 이슈를 먼저 환기한다.
+_DEFECT_RE = re.compile(
+    r"불량|결함|불만|품질|크랙|파손|파단|리콜|클레임|고장|하자|이슈|스웰링|swelling"
+    r"|defect|failure|crack|fault|recall|complaint|quality", re.IGNORECASE)
+
+
+def _has_defect_topic(question: str) -> bool:
+    return bool(_DEFECT_RE.search(question or ""))
 
 
 def is_deliberation(message: str) -> bool:
@@ -105,6 +115,80 @@ async def _persona_round(llm, persona: dict, prompt: str) -> dict:
     return d
 
 
+def _sf_products(alerts: dict) -> list:
+    """alert_check 결과에서 경보 제품 코드를 방어적으로 추출(스키마 변동 대비)."""
+    out = []
+    for key in ("high_negative_ratio", "negative_surge", "alerts"):
+        for it in alerts.get(key) or []:
+            it = _first_dict(it)
+            p = it.get("product_code") or it.get("product")
+            if p and p not in out:
+                out.append(p)
+    return out
+
+
+async def _defect_briefing(tools: dict, llm, question: str):
+    """SignalForge 3-콜 환기: alert_check → get_top_issues/daily_briefing 폴백 → query_voc 증거.
+    반환 (환기 표시문, 심의 주입 블록 또는 "") — 전 과정 best-effort, 연관성은 LLM이 판정."""
+    parts = []
+    alerts = _first_dict(_parse_json(await _call(tools, "alert_check", {})))
+    summary = alerts.get("summary")
+    if summary:
+        parts.append(f"경보 요약: {str(summary)[:300]}")
+    products = _sf_products(alerts)[:2]
+
+    if products:  # 경보 제품별 이슈 카테고리
+        for p in products:
+            top = _first_dict(_parse_json(await _call(
+                tools, "get_top_issues", {"product_code": p, "period_days": 7, "top_n": 5})))
+            issues = top.get("issues") or top.get("top_issues") or top.get("data") or []
+            if not isinstance(issues, list):
+                issues = []
+            names = [str((_first_dict(i)).get("category") or (_first_dict(i)).get("issue") or i)[:40]
+                     for i in issues[:5] if i]
+            if names:
+                parts.append(f"{p} 최근 7일 이슈: {', '.join(names)}")
+    else:  # 경보가 비면(MIN_VOLUME 컷 등) 데일리 브리핑으로 폴백
+        brief = await _call(tools, "daily_briefing", {})
+        if isinstance(brief, str) and brief.strip():
+            parts.append(f"데일리 브리핑: {brief.strip()[:400]}")
+
+    voc_args = {"sentiment": "negative", "limit": 5}
+    if products:
+        voc_args["product_code"] = products[0]
+    voc = _parse_json(await _call(tools, "query_voc", voc_args))
+    voc_items = voc if isinstance(voc, list) else (_first_dict(voc).get("results") or _first_dict(voc).get("data") or [])
+    if not isinstance(voc_items, list):
+        voc_items = []
+    for i, v in enumerate(voc_items[:5], 1):
+        v = _first_dict(v)
+        txt = (v.get("content_translated") or v.get("content") or "")[:200]
+        if txt:
+            parts.append(f"부정 VOC {i}. ({v.get('product') or v.get('product_code') or '-'}"
+                         f"/{v.get('sentiment_score', '-')}) {txt}")
+
+    if not parts:
+        return "", ""
+    briefing = "\n".join(f"- {p}" for p in parts)
+
+    # 연관성 판정 — 연관된 문제가 있으면 심의에 포함, 없으면 환기만 하고 질문 기반으로 진행.
+    verdict = _parse_json(await _llm_text(
+        llm,
+        "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+        f"[화두]\n{question}\n\n[최근 고객 불만 신호(SignalForge VOC)]\n{briefing}\n\n"
+        "위 불만 신호 중 화두와 실질적으로 연관된 것이 있습니까? "
+        'JSON {"relevant": true|false, "reason": "한 문장"} 로만 답하세요.')) or {}
+    relevant = bool(verdict.get("relevant"))
+    reason = str(verdict.get("reason") or "")[:200]
+
+    display = ("📡 SignalForge 최근 불량 이슈 환기\n" + briefing
+               + f"\n→ 연관성: {'심의에 포함' if relevant else '직접 연관 없음 — 질문 기반으로 진행'}"
+               + (f" ({reason})" if reason else ""))
+    inject = (f"[최근 고객 불만 신호 (SignalForge VOC)]\n{briefing}\n(연관 판정: {reason})\n"
+              if relevant else "")
+    return display, inject
+
+
 async def run_deliberation(app, question: str, groups: list):
     """포털 챗 심의 모드의 SSE 제너레이터. 5단계 파이프라인을 코드로 돌리고 진행을 스트리밍한다."""
     llm = app.state.llm
@@ -114,6 +198,19 @@ async def run_deliberation(app, question: str, groups: list):
     if not tools:
         yield _sse("error", {"content": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
         yield _sse("done", {}); return
+
+    # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
+    stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
+    sf_inject = ""
+    if _has_defect_topic(question):
+        yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
+        try:
+            sf_display, sf_inject = await _defect_briefing(tools, llm, question)
+        except Exception:  # noqa: BLE001 — 환기 실패가 심의를 죽이지 않게
+            sf_display, sf_inject = "", ""
+        if sf_display:
+            stream_head = sf_display + "\n\n"
+            yield _sse("token", {"delta": stream_head})
 
     # 1) 발굴 — recommend_agents
     rec = await _call(tools, "recommend_agents", {"q": question})
@@ -140,7 +237,7 @@ async def run_deliberation(app, question: str, groups: list):
         yield _sse("done", {}); return
     yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": None})
 
-    base = f"[심의 주제]\n{question}\n"
+    base = f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
 
     # 3) 다중 라운드 심의
     yield _sse("status", {"step": "1라운드 — 도메인별 초기 입장", "tool": None})
@@ -171,7 +268,8 @@ async def run_deliberation(app, question: str, groups: list):
     report_note = ""
     try:
         blocks = {
-            "background": [f"심의 주제: {question}"],
+            "background": [f"심의 주제: {question}"]
+                          + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else []),
             "results": [r2t[:1500]],
             "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:12],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}", "3라운드 심의(R1 초기→R2 심화→R3 수렴).", r3t[:1500]],
@@ -183,9 +281,11 @@ async def run_deliberation(app, question: str, groups: list):
         rid = ((made or {}).get("report") or {}).get("id")
         if rid:
             report_note = f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨."
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
+        print(f"[deliberation] create_report_draft failed: {exc!r}")
 
-    yield _sse("token", {"content": decision + report_note})
-    yield _sse("text", {"content": decision + report_note})
+    # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
+    # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
+    yield _sse("token", {"delta": decision + report_note})
+    yield _sse("result", {"type": "text", "content": stream_head + decision + report_note})
     yield _sse("done", {})
