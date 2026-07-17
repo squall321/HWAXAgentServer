@@ -115,6 +115,16 @@ async def _persona_round(llm, persona: dict, prompt: str) -> dict:
     return d
 
 
+def _tool_text_ok(s) -> bool:
+    """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
+    if not isinstance(s, str) or not s.strip():
+        return False
+    head = s.lstrip()[:160]
+    bad = ("(tool ", "Error executing tool", "Traceback", "ProgrammingError",
+           "does not exist", "Connection refused", "Internal Server Error")
+    return not any(b in head for b in bad)
+
+
 def _sf_products(alerts: dict) -> list:
     """alert_check 결과에서 경보 제품 코드를 방어적으로 추출(스키마 변동 대비)."""
     out = []
@@ -131,9 +141,14 @@ async def _defect_briefing(tools: dict, llm, question: str):
     """SignalForge 3-콜 환기: alert_check → get_top_issues/daily_briefing 폴백 → query_voc 증거.
     반환 (환기 표시문, 심의 주입 블록 또는 "") — 전 과정 best-effort, 연관성은 LLM이 판정."""
     parts = []
-    alerts = _first_dict(_parse_json(await _call(tools, "alert_check", {})))
+    degraded = False   # 도구가 죽어 내용을 못 받은 흔적 — 전부 죽었으면 '조회 불가' 한 줄로 진행
+    raw_alert = await _call(tools, "alert_check", {})
+    if isinstance(raw_alert, str) and not _tool_text_ok(raw_alert):
+        degraded = True
+        raw_alert = None
+    alerts = _first_dict(_parse_json(raw_alert))
     summary = alerts.get("summary")
-    if summary:
+    if summary and _tool_text_ok(str(summary)):
         parts.append(f"경보 요약: {str(summary)[:300]}")
     products = _sf_products(alerts)[:2]
 
@@ -150,24 +165,34 @@ async def _defect_briefing(tools: dict, llm, question: str):
                 parts.append(f"{p} 최근 7일 이슈: {', '.join(names)}")
     else:  # 경보가 비면(MIN_VOLUME 컷 등) 데일리 브리핑으로 폴백
         brief = await _call(tools, "daily_briefing", {})
-        if isinstance(brief, str) and brief.strip():
+        if isinstance(brief, str) and _tool_text_ok(brief):
             parts.append(f"데일리 브리핑: {brief.strip()[:400]}")
+        elif isinstance(brief, str):
+            degraded = True
 
     voc_args = {"sentiment": "negative", "limit": 5}
     if products:
         voc_args["product_code"] = products[0]
-    voc = _parse_json(await _call(tools, "query_voc", voc_args))
+    raw_voc = await _call(tools, "query_voc", voc_args)
+    if isinstance(raw_voc, str) and not _tool_text_ok(raw_voc):
+        degraded = True
+        raw_voc = None
+    voc = _parse_json(raw_voc)
     voc_items = voc if isinstance(voc, list) else (_first_dict(voc).get("results") or _first_dict(voc).get("data") or [])
     if not isinstance(voc_items, list):
         voc_items = []
     for i, v in enumerate(voc_items[:5], 1):
         v = _first_dict(v)
         txt = (v.get("content_translated") or v.get("content") or "")[:200]
-        if txt:
+        if txt and _tool_text_ok(txt):
             parts.append(f"부정 VOC {i}. ({v.get('product') or v.get('product_code') or '-'}"
                          f"/{v.get('sentiment_score', '-')}) {txt}")
 
     if not parts:
+        # SignalForge 가 미가용(DB 미복원 등)이면 에러 원문 대신 한 줄로 알리고 질문 기반 진행.
+        if degraded:
+            return ("📡 SignalForge 조회가 지금 불가하여(서비스 미가용) 최근 불량 환기를 건너뜁니다"
+                    " — 질문 기반으로 심의를 진행합니다."), ""
         return "", ""
     briefing = "\n".join(f"- {p}" for p in parts)
 
@@ -190,13 +215,26 @@ async def _defect_briefing(tools: dict, llm, question: str):
 
 
 async def run_deliberation(app, question: str, groups: list):
+    """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
+    (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)"""
+    try:
+        async for chunk in _deliberation_stream(app, question, groups):
+            yield chunk
+    except Exception as exc:  # noqa: BLE001
+        print(f"[deliberation] fatal: {exc!r}")
+        yield _sse("error", {"code": "deliberation_error", "message": f"심의 처리 중 오류: {str(exc)[:200]}"})
+        yield _sse("done", {})
+
+
+async def _deliberation_stream(app, question: str, groups: list):
     """포털 챗 심의 모드의 SSE 제너레이터. 5단계 파이프라인을 코드로 돌리고 진행을 스트리밍한다."""
     llm = app.state.llm
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
     tools = await _tools_by_name(app, groups)
     if not tools:
-        yield _sse("error", {"content": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
+        yield _sse("error", {"code": "gateway_unavailable",
+                             "message": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
         yield _sse("done", {}); return
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
@@ -233,7 +271,8 @@ async def run_deliberation(app, question: str, groups: list):
         role = (sd.get("description") or sd.get("system_prompt") or "")[:400]
         personas.append({"key": key, "role": role})
     if len(personas) < 2:
-        yield _sse("error", {"content": "관련 전문 페르소나를 충분히 찾지 못했습니다."})
+        yield _sse("error", {"code": "no_personas",
+                             "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
         yield _sse("done", {}); return
     yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": None})
 
