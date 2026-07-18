@@ -139,8 +139,9 @@ def _sf_products(alerts: dict) -> list:
 
 async def _defect_briefing(tools: dict, llm, question: str):
     """SignalForge 3-콜 환기: alert_check → get_top_issues/daily_briefing 폴백 → query_voc 증거.
-    반환 (환기 표시문, 심의 주입 블록 또는 "") — 전 과정 best-effort, 연관성은 LLM이 판정."""
+    반환 (환기 표시문, 심의 주입 블록 또는 "", 실제 호출한 도구명 리스트) — best-effort, 연관성은 LLM 판정."""
     parts = []
+    used = ["alert_check"]   # 활동 패널용 — 이 환기에서 실제 호출한 SF 도구들
     degraded = False   # 도구가 죽어 내용을 못 받은 흔적 — 전부 죽었으면 '조회 불가' 한 줄로 진행
     raw_alert = await _call(tools, "alert_check", {})
     if isinstance(raw_alert, str) and not _tool_text_ok(raw_alert):
@@ -153,6 +154,7 @@ async def _defect_briefing(tools: dict, llm, question: str):
     products = _sf_products(alerts)[:2]
 
     if products:  # 경보 제품별 이슈 카테고리
+        used.append("get_top_issues")
         for p in products:
             top = _first_dict(_parse_json(await _call(
                 tools, "get_top_issues", {"product_code": p, "period_days": 7, "top_n": 5})))
@@ -164,6 +166,7 @@ async def _defect_briefing(tools: dict, llm, question: str):
             if names:
                 parts.append(f"{p} 최근 7일 이슈: {', '.join(names)}")
     else:  # 경보가 비면(MIN_VOLUME 컷 등) 데일리 브리핑으로 폴백
+        used.append("daily_briefing")
         brief = await _call(tools, "daily_briefing", {})
         if isinstance(brief, str) and _tool_text_ok(brief):
             parts.append(f"데일리 브리핑: {brief.strip()[:400]}")
@@ -173,6 +176,7 @@ async def _defect_briefing(tools: dict, llm, question: str):
     voc_args = {"sentiment": "negative", "limit": 5}
     if products:
         voc_args["product_code"] = products[0]
+    used.append("query_voc")
     raw_voc = await _call(tools, "query_voc", voc_args)
     if isinstance(raw_voc, str) and not _tool_text_ok(raw_voc):
         degraded = True
@@ -192,8 +196,8 @@ async def _defect_briefing(tools: dict, llm, question: str):
         # SignalForge 가 미가용(DB 미복원 등)이면 에러 원문 대신 한 줄로 알리고 질문 기반 진행.
         if degraded:
             return ("📡 SignalForge 조회가 지금 불가하여(서비스 미가용) 최근 불량 환기를 건너뜁니다"
-                    " — 질문 기반으로 심의를 진행합니다."), ""
-        return "", ""
+                    " — 질문 기반으로 심의를 진행합니다."), "", used
+        return "", "", used
     briefing = "\n".join(f"- {p}" for p in parts)
 
     # 연관성 판정 — 연관된 문제가 있으면 심의에 포함, 없으면 환기만 하고 질문 기반으로 진행.
@@ -211,7 +215,7 @@ async def _defect_briefing(tools: dict, llm, question: str):
                + (f" ({reason})" if reason else ""))
     inject = (f"[최근 고객 불만 신호 (SignalForge VOC)]\n{briefing}\n(연관 판정: {reason})\n"
               if relevant else "")
-    return display, inject
+    return display, inject, used
 
 
 async def run_deliberation(app, question: str, groups: list):
@@ -243,9 +247,11 @@ async def _deliberation_stream(app, question: str, groups: list):
     if _has_defect_topic(question):
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
-            sf_display, sf_inject = await _defect_briefing(tools, llm, question)
+            sf_display, sf_inject, sf_used = await _defect_briefing(tools, llm, question)
         except Exception:  # noqa: BLE001 — 환기 실패가 심의를 죽이지 않게
-            sf_display, sf_inject = "", ""
+            sf_display, sf_inject, sf_used = "", "", []
+        if sf_used:  # 활동 패널용 — 환기에서 실제 호출된 SF 도구들
+            yield _sse("status", {"step": "불량 환기 완료", "tool": None, "tools_used": sf_used})
         if sf_display:
             stream_head = sf_display + "\n\n"
             yield _sse("token", {"delta": stream_head})
@@ -274,7 +280,8 @@ async def _deliberation_stream(app, question: str, groups: list):
         yield _sse("error", {"code": "no_personas",
                              "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
         yield _sse("done", {}); return
-    yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": None})
+    yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": "get_agent_session",
+                          "personas": [p["key"] for p in personas]})
 
     base = f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
 
@@ -304,6 +311,7 @@ async def _deliberation_stream(app, question: str, groups: list):
         "(3) 소수의견과 처리, (4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
+    yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft"})
     report_note = ""
     try:
         blocks = {
