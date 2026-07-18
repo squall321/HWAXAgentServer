@@ -311,7 +311,8 @@ async def _deliberation_stream(app, question: str, groups: list):
         "(3) 소수의견과 처리, (4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
-    yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft"})
+    yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
+                          "detail": f"심의 — {question[:50]}"})
     report_note = ""
     try:
         blocks = {

@@ -29,6 +29,7 @@ Env:
 
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -190,6 +191,28 @@ def _prep_tool(tool):
     return _cap_tool(_slim_tool(tool))
 
 
+# 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.
+# TOOL_MAX(0=무제한, prod 기본)로 바인딩 개수를 캡하고, 자주 쓰는 핵심 도구를 우선 남긴다.
+TOOL_MAX = int(os.environ.get("TOOL_MAX", "0"))
+_TOOL_PRIORITY = (
+    "recommend_agents", "get_agent_session", "agent_search", "semantic_search", "list_records",
+    "data_aggregate", "alert_check", "daily_briefing", "query_voc", "search_voc", "get_top_issues",
+    "create_report_draft", "update_report_draft", "search_reports", "list_templates",
+    "analyze_laminate", "evaluate_laminate", "solve_load_response", "list_materials", "plot_ashby",
+    "search_documents", "search_knowledge", "get_material", "compare_products",
+)
+
+
+def _cap_tool_count(tools: list) -> list:
+    if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
+        return tools
+    rank = {n: i for i, n in enumerate(_TOOL_PRIORITY)}
+    ordered = sorted(tools, key=lambda t: (rank.get(getattr(t, "name", ""), len(rank)), getattr(t, "name", "")))
+    kept = ordered[:TOOL_MAX]
+    print(f"[agent] TOOL_MAX={TOOL_MAX} — {len(tools)}개 중 {len(kept)}개 바인딩(소형 컨텍스트 보호)")
+    return kept
+
+
 async def _agent_for(app: FastAPI, groups: list[str]):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too."""
@@ -202,7 +225,7 @@ async def _agent_for(app: FastAPI, groups: list[str]):
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
+                tools = _cap_tool_count([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()])
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
@@ -242,6 +265,21 @@ def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
     return kept
 
 
+def _tool_preview(v, n: int = 220) -> str:
+    """활동 패널 드릴다운용 도구 입출력 요약 — 안전 문자열화 + 공백 압축 + 절단."""
+    try:
+        if v is None:
+            return ""
+        content = getattr(v, "content", None)   # ToolMessage 등 랩퍼 언랩
+        if content is not None:
+            v = content
+        s = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else str(v)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:n]
+    except Exception:  # noqa: BLE001 — 미리보기 실패가 스트림을 죽이면 안 됨
+        return ""
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     yield _sse("status", {"step": "분석 중", "tool": None})
@@ -257,9 +295,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     full.append(token)
                     yield _sse("token", {"delta": token})
             elif kind == "on_tool_start":
-                yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"]})
+                args = _tool_preview(event.get("data", {}).get("input"))
+                yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
+                                      **({"detail": args} if args else {})})
             elif kind == "on_tool_end":
-                yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"]})
+                out = _tool_preview(event.get("data", {}).get("output"))
+                yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
+                                      **({"result_preview": out} if out else {})})
     except Exception as exc:
         # Don't leak internals (tool inputs, config, LLM details) to the browser; log server-side.
         print(f"[agent] chat error: {exc!r}")
