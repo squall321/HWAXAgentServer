@@ -106,9 +106,17 @@ def _with_groups(connections: dict, groups: list[str]) -> dict:
 async def lifespan(app: FastAPI):
     # Build the LLM once. Tools are loaded per request (they depend on the caller's groups),
     # so we keep the raw connection config and compile/cache a ReAct agent per group-set.
+    # LLM_DISABLE_STREAMING=1: 토큰 스트리밍 대신 완결 응답(invoke) — vLLM 0.23.0의 GLM-5.2
+    # 스트리밍 경로가 tool_calls 를 유실(빈 배열 + finish_reason:stop)하는 서빙 결함 우회.
+    # 텍스트가 모델 턴 단위로 도착하는 대신 도구 호출이 정상 동작한다. dev(qwen)는 기본 0(스트리밍).
+    disable_stream = os.environ.get("LLM_DISABLE_STREAMING", "0") == "1"
     app.state.llm = ChatOpenAI(
-        base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL, temperature=0
+        base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL, temperature=0,
+        disable_streaming=disable_stream,
     )
+    app.state.llm_nostream = disable_stream
+    if disable_stream:
+        print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
     app.state.agent_cache = {}  # frozenset(groups) -> compiled ReAct agent
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
@@ -294,6 +302,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 if token:  # empty on tool-call delta chunks — guard
                     full.append(token)
                     yield _sse("token", {"delta": token})
+            elif kind == "on_chat_model_end" and getattr(app.state, "llm_nostream", False):
+                # 비스트리밍 모드 — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
+                # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip).
+                out_msg = event.get("data", {}).get("output")
+                content = getattr(out_msg, "content", "") or ""
+                if isinstance(content, list):  # 멀티파트 content 방어
+                    content = "".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+                if content:
+                    full.append(content)
+                    yield _sse("token", {"delta": content})
             elif kind == "on_tool_start":
                 args = _tool_preview(event.get("data", {}).get("input"))
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
