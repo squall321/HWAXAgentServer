@@ -115,6 +115,89 @@ async def _persona_round(llm, persona: dict, prompt: str) -> dict:
     return d
 
 
+def _clip_sent(text, n: int) -> str:
+    """문장 경계에서만 끊어 최대 n자 근처까지 — 중간 절단으로 문장이 깨지지 않게(회의 버블용)."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(t) <= n:
+        return t
+    sents = [s for s in re.split(r"(?<=[.!?])\s+", t) if s]
+    out = sents[0] if sents else t[:n]
+    for s in sents[1:]:
+        if len(out) + 1 + len(s) > n:
+            break
+        out += " " + s
+    if len(out) > n:  # 문장부호 없는 run-on 출력 방어 — 상한은 반드시 보장
+        out = out[:n].rstrip() + "…"
+    return out
+
+
+def _norm_stance(s) -> str:
+    """스탠스를 canonical 라벨로 — 부정 표현('동의하지 않습니다' 등)이 동의로 집계되지 않게
+    부정 패턴을 먼저 매칭하고, 판별 불가면 조건부로(거짓 만장일치 방지)."""
+    s = str(s or "")
+    if re.search(r"반대|않|부동의|disagre|oppos|반론", s, re.IGNORECASE):
+        return "반대"
+    if re.search(r"조건|condition|partial|단서", s, re.IGNORECASE):
+        return "조건부 동의"
+    if re.search(r"동의|찬성|agree|수용|지지", s, re.IGNORECASE):
+        return "동의"
+    return "조건부 동의"
+
+
+def _say_of(rnd: int, d: dict) -> str:
+    """라운드별 구조화 발언 → 회의 버블 대화체 합성(회의 chat 렌더와 동일한 연결어)."""
+    def first(v):
+        if isinstance(v, list):
+            return str(v[0]) if v else ""
+        return str(v or "")
+    if rnd == 1:
+        say = _clip_sent(d.get("lens"), 260)
+        rec = _clip_sent(d.get("recommendation"), 300)
+        if rec:
+            say = (say + f" 저는 이렇게 봅니다 — {rec}").strip()
+    elif rnd == 2:
+        parts = []
+        con = _clip_sent(first(d.get("concede")), 200)
+        reb = _clip_sent(first(d.get("rebut")), 240)
+        dp = _clip_sent(d.get("deepen"), 320)
+        if con:
+            parts.append(f"그 지적은 받아들입니다. {con}")
+        if reb:
+            parts.append(f"다만 반박하자면, {reb}")
+        if dp:
+            parts.append(f"제 핵심은 이겁니다. {dp}")
+        say = " ".join(parts)
+    else:
+        say = _clip_sent(d.get("final_position"), 340)
+        vote = _clip_sent(d.get("vote"), 160)
+        if vote:
+            say = (say + f" 최종 권장 — {vote}").strip()
+    return say or _clip_sent(d.get("say"), 400) or "(발언 파싱 실패)"
+
+
+def _delib(kind: str, **kw) -> bytes:
+    """심의 전용 구조화 이벤트 — 프론트 DelibView(라이브 회의·스테퍼·수렴)가 소비."""
+    return _sse("delib", {"kind": kind, **kw})
+
+
+async def _round_live(llm, personas: list, prompt_fn, rnd: int):
+    """라운드 발언을 완료되는 순서대로 산출(async generator) — 라이브 회의 스트림의 핵심.
+    gather(전원 대기)와 달리 as_completed 라 먼저 끝난 전문가부터 화면에 등장한다."""
+    tasks = [asyncio.ensure_future(_persona_round(llm, p, prompt_fn(p))) for p in personas]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            try:
+                d = await fut
+            except Exception as exc:  # noqa: BLE001 — 한 명의 실패가 라운드를 죽이지 않게(불참 처리)
+                print(f"[deliberation] persona r{rnd} failed: {exc!r}")
+                continue
+            yield d
+    finally:  # 클라이언트 중단 시 잔여 LLM 호출 정리
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -245,6 +328,7 @@ async def _deliberation_stream(app, question: str, groups: list):
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
     sf_inject = ""
     if _has_defect_topic(question):
+        yield _delib("stage", stage="recall")
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
             sf_display, sf_inject, sf_used = await _defect_briefing(tools, llm, question)
@@ -254,9 +338,12 @@ async def _deliberation_stream(app, question: str, groups: list):
             yield _sse("status", {"step": "불량 환기 완료", "tool": None, "tools_used": sf_used})
         if sf_display:
             stream_head = sf_display + "\n\n"
+            yield _delib("evidence", source="SignalForge VOC", text=sf_display, included=bool(sf_inject))
             yield _sse("token", {"delta": stream_head})
 
     # 1) 발굴 — recommend_agents
+    # 스테퍼 순서(환기→발굴)와 정확히 일치하도록, 발굴 stage 는 실제 발굴 작업 직전에 방출한다.
+    yield _delib("stage", stage="discover")
     rec = await _call(tools, "recommend_agents", {"q": question})
     recd = _parse_json(rec)
     if isinstance(recd, list):
@@ -282,26 +369,47 @@ async def _deliberation_stream(app, question: str, groups: list):
         yield _sse("done", {}); return
     yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": "get_agent_session",
                           "personas": [p["key"] for p in personas]})
+    yield _delib("personas", personas=[{"key": p["key"], "role": (p.get("role") or "")[:80]} for p in personas])
 
     base = f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
 
-    # 3) 다중 라운드 심의
+    # 3) 다중 라운드 심의 — 발언이 완료되는 순서대로 delib turn 으로 라이브 방출
+    yield _delib("stage", stage="r1", n=len(personas))
     yield _sse("status", {"step": "1라운드 — 도메인별 초기 입장", "tool": None})
-    r1 = await asyncio.gather(*[_persona_round(
-        llm, p, base + "\n당신의 관점·권장안·이 주제에서 당신 도메인이 놓칠 리스크를 JSON {lens,recommendation,concerns:[]} 로.") for p in personas])
+    r1 = []
+    async for o in _round_live(llm, personas, lambda p: base +
+            "\n당신의 관점·권장안·이 주제에서 당신 도메인이 놓칠 리스크, 그리고 현재 입장 한 줄 요약을 "
+            "JSON {lens,recommendation,concerns:[],position_short} 로.", 1):
+        r1.append(o)
+        yield _delib("turn", round=1, persona=o["persona"], say=_say_of(1, o),
+                     position=_clip_sent(o.get("position_short"), 90))
     r1t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('lens','recommendation','concerns')}, ensure_ascii=False)}" for o in r1)
 
+    yield _delib("stage", stage="r2", n=len(personas))
     yield _sse("status", {"step": "2라운드 — 상호 반박·수치 심화", "tool": None})
-    r2 = await asyncio.gather(*[_persona_round(
-        llm, p, base + f"\n[1라운드 전원]\n{r1t}\n\n다른 전문가 입장에 수용/반박(근거:수치·표준·실패모드)하고 당신 핵심 주장을 더 깊게. JSON {{concede:[],rebut:[],deepen}} 로.") for p in personas])
+    r2 = []
+    async for o in _round_live(llm, personas, lambda p: base +
+            f"\n[1라운드 전원]\n{r1t}\n\n다른 전문가 입장에 수용/반박(근거:수치·표준·실패모드)하고 당신 핵심 주장을 더 깊게. "
+            "JSON {concede:[],rebut:[],deepen} 로.", 2):
+        r2.append(o)
+        yield _delib("turn", round=2, persona=o["persona"], say=_say_of(2, o))
     r2t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('concede','rebut','deepen')}, ensure_ascii=False)}" for o in r2)
 
+    yield _delib("stage", stage="r3", n=len(personas))
     yield _sse("status", {"step": "3라운드 — 수렴·최종 입장", "tool": None})
-    r3 = await asyncio.gather(*[_persona_round(
-        llm, p, base + f"\n[2라운드 전원]\n{r2t}\n\n2R를 반영해 최종 입장·절대 양보 못 하는 제약·최종 권장으로 수렴. JSON {{final_position,non_negotiable,vote}} 로.") for p in personas])
+    r3 = []
+    async for o in _round_live(llm, personas, lambda p: base +
+            f"\n[2라운드 전원]\n{r2t}\n\n2R를 반영해 최종 입장·절대 양보 못 하는 제약·최종 권장으로 수렴하고, "
+            "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
+            "JSON {final_position,non_negotiable,vote,stance,position_short} 로.", 3):
+        r3.append(o)
+        yield _delib("turn", round=3, persona=o["persona"], say=_say_of(3, o),
+                     position=_clip_sent(o.get("position_short"), 90),
+                     stance=_norm_stance(o.get("stance")))
     r3t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('final_position','vote')}, ensure_ascii=False)}" for o in r3)
 
     # 4) 의사결정문 합성
+    yield _delib("stage", stage="decide")
     yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
     decision = await _llm_text(
         llm,
@@ -311,16 +419,26 @@ async def _deliberation_stream(app, question: str, groups: list):
         "(3) 소수의견과 처리, (4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
+    yield _delib("stage", stage="report")
     yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
                           "detail": f"심의 — {question[:50]}"})
     report_note = ""
+    rid = None
     try:
+        # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
+        transcript = []
+        for rnd, arr, label in ((1, r1, "1라운드 — 도메인별 초기 입장"),
+                                (2, r2, "2라운드 — 상호 반박·심화"),
+                                (3, r3, "3라운드 — 수렴·최종 입장")):
+            transcript.append(f"— {label} —")
+            transcript += [f"[{o['persona']}] {_say_of(rnd, o)[:400]}" for o in arr]
         blocks = {
             "background": [f"심의 주제: {question}"]
                           + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else []),
             "results": [r2t[:1500]],
             "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:12],
-            "minutes": [f"참여: {', '.join(p['key'] for p in personas)}", "3라운드 심의(R1 초기→R2 심화→R3 수렴).", r3t[:1500]],
+            "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
+                        "3라운드 심의(R1 초기→R2 심화→R3 수렴)."] + transcript[:40],
         }
         made = _parse_json(await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
@@ -331,6 +449,15 @@ async def _deliberation_stream(app, question: str, groups: list):
             report_note = f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨."
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
+
+    # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
+    _KEY = {"동의": "agree", "조건부 동의": "conditional", "반대": "oppose"}
+    tally = {"agree": 0, "conditional": 0, "oppose": 0, "total": len(r3)}
+    for o in r3:
+        tally[_KEY[_norm_stance(o.get("stance"))]] += 1
+    yield _delib("decision", text=decision + report_note)
+    yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
+                 tally=tally, unanimous=(tally["agree"] == tally["total"] and tally["total"] > 0))
 
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
