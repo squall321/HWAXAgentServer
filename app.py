@@ -38,7 +38,14 @@ from fastapi.responses import StreamingResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
-from deliberation import is_deliberation, run_deliberation, strip_trigger
+from deliberation import (
+    is_deliberation,
+    is_report_save,
+    run_deliberation,
+    run_report_save,
+    strip_report_trigger,
+    strip_trigger,
+)
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
@@ -337,6 +344,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     # 정본은 역량 있는 Claude(개인 Claude via MCP); 이건 GLM 연결 시 포털 챗으로도 되게 하는 진입점.
     if is_deliberation(req.message):
         stream = run_deliberation(app, strip_trigger(req.message), req.groups)
+    elif is_report_save(req.message):
+        # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
+        stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)
     else:
         stream = _agent_stream(app, req)
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)

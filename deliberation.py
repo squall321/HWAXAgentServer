@@ -8,6 +8,9 @@ import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
+# 대화 → RA 보고서 저장(결정적) — LLM 재량에 맡기지 않고 코드가 blocks 를 만들어 저장한다.
+# "/보고서 <선택: 내 결론>" — 사용자가 직접 끌어낸 결론을 함께 주면 권고안 맨 앞에 실린다.
+REPORT_TRIGGERS = ("/보고서", "/report")
 GROUPS_HEADER = "x-hwax-groups"
 N_PERSONAS = 5
 
@@ -24,6 +27,19 @@ def _has_defect_topic(question: str) -> bool:
 def is_deliberation(message: str) -> bool:
     m = (message or "").strip()
     return any(m.startswith(t) for t in DELIBERATE_TRIGGERS)
+
+
+def is_report_save(message: str) -> bool:
+    m = (message or "").strip()
+    return any(m.startswith(t) for t in REPORT_TRIGGERS)
+
+
+def strip_report_trigger(message: str) -> str:
+    m = (message or "").strip()
+    for t in REPORT_TRIGGERS:
+        if m.startswith(t):
+            return m[len(t):].strip()
+    return m
 
 
 def strip_trigger(message: str) -> str:
@@ -463,4 +479,53 @@ async def _deliberation_stream(app, question: str, groups: list):
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
     yield _sse("token", {"delta": decision + report_note})
     yield _sse("result", {"type": "text", "content": stream_head + decision + report_note})
+    yield _sse("done", {})
+
+
+async def run_report_save(app, note: str, history: list, groups: list):
+    """대화 이력 → Report Archive 보고서(결정적). LLM 을 거치지 않고 코드가 blocks 를 만든다.
+
+    GLM 이 create_report_draft 를 텍스트로 에코해버리는(도구 미호출) 불안정성을 피하려는 설계 —
+    '/심의' 파이프라인이 보고서를 코드로 저장하는 것과 같은 원칙. history 는 포털 계약
+    [{"role":"user"|"assistant","content":str}, …] (오래된 것→최신, 이번 /보고서 턴 미포함).
+    note 는 사용자가 직접 끌어낸 결론(있으면 권고안 맨 앞).
+    """
+    users = [m.get("content", "") for m in history if m.get("role") == "user"]
+    bots = [m.get("content", "") for m in history if m.get("role") == "assistant"]
+    if not users and not note:
+        yield _sse("result", {"type": "text", "content": "저장할 대화가 없습니다 — 심의/대화 후 다시 시도하세요."})
+        yield _sse("done", {})
+        return
+    question = (users[0] if users else note).split("\n")[0][:120]
+    title = f"심의 — {question[:50]}"
+    yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
+                          "detail": title})
+    # 회의록 — 대화 전개(누가 무엇을 말했는지) 순서대로. 발언당 400자 캡(RA 웹 가독성).
+    minutes = []
+    for m in history:
+        who = "사용자" if m.get("role") == "user" else "어시스턴트"
+        c = str(m.get("content", "")).strip()
+        if c:
+            minutes.append(f"[{who}] {c[:400]}")
+    blocks = {
+        "background": [f"심의 주제: {question}"] + ([f"질문 전문:\n{users[0][:1200]}"] if users else []),
+        "results": [b[:1500] for b in bots[:-1]][:6] if len(bots) > 1 else [b[:1500] for b in bots],
+        "recommendation": ([f"사용자 결론: {note}"] if note else [])
+                          + ([p.strip() for p in bots[-1].split("\n\n") if p.strip()][:10] if bots else []),
+        "minutes": minutes[:40],
+    }
+    rid = None
+    try:
+        tools = await _tools_by_name(app, groups)
+        made = _parse_json(await _call(tools, "create_report_draft", {
+            "template_id": "deliberation", "template_version": 1,
+            "title": title, "blocks": blocks,
+            "tags": ["심의", "conversation-report"]}))
+        rid = ((made or {}).get("report") or {}).get("id")
+    except Exception as exc:  # noqa: BLE001 — RA 미가용(cae00 등)은 비치명적 폴백
+        print(f"[report-save] create_report_draft failed: {exc!r}")
+    text = (f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
+            if rid else "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요.")
+    yield _sse("token", {"delta": text})
+    yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
