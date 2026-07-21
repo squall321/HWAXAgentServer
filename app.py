@@ -39,6 +39,8 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
 from deliberation import (
+    _env_float,
+    _env_int,
     is_deliberation,
     is_report_save,
     run_deliberation,
@@ -117,10 +119,49 @@ async def lifespan(app: FastAPI):
     # 스트리밍 경로가 tool_calls 를 유실(빈 배열 + finish_reason:stop)하는 서빙 결함 우회.
     # 텍스트가 모델 턴 단위로 도착하는 대신 도구 호출이 정상 동작한다. dev(qwen)는 기본 0(스트리밍).
     disable_stream = os.environ.get("LLM_DISABLE_STREAMING", "0") == "1"
-    app.state.llm = ChatOpenAI(
-        base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL, temperature=0,
-        disable_streaming=disable_stream,
-    )
+
+    # LLM 튜닝은 전부 env — 환경(dev qwen 16K vs 상암 GLM)마다 다른 값을 배포 없이 적용한다.
+    # 미설정 시 기존 동작과 동일(temperature=0, max_tokens 미전송=무상한, effort·timeout 미전달).
+    # 파싱은 안전 파서(_env_*) — 오타 값이 lifespan 에서 서버 기동을 죽이지 않고 경고 후 기본값.
+    #   LLM_TEMPERATURE      : 기본 0 (ReAct 도구호출 결정성)
+    #   LLM_MAX_TOKENS       : 0/미설정=미전송. 설정 시 8192급 여유값 권장 — 2048~4096은
+    #                          thinking 토큰과 겹치면 미완 JSON 절단을 유발하므로 금지.
+    #   LLM_REASONING_EFFORT : 빈 값=미전달(RA 규약). GLM 계열은 반드시 extra_body 경유
+    #                          chat_template_kwargs 로 전달 — 톱레벨 reasoning_effort 필드는
+    #                          OpenAI 표준 파라미터로 나가므로 쓰지 않는다.
+    #   LLM_TIMEOUT_S        : 챗(ReAct) 경로 포함 전역 타임아웃. 0/미설정=라이브러리 기본(600s).
+    #   DELIB_*              : 심의 라운드 전용 오버라이드(temperature/max_tokens/effort/timeout).
+    #                          챗 경로는 위 LLM_* 만 따르므로 심의 튜닝이 챗에 새지 않는다.
+    def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0) -> ChatOpenAI:
+        kw: dict = dict(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL,
+                        temperature=temperature, disable_streaming=disable_stream)
+        if max_tokens > 0:
+            kw["max_tokens"] = max_tokens
+        if effort:
+            kw["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": effort}}
+        if timeout_s > 0:
+            kw["timeout"] = timeout_s
+        return ChatOpenAI(**kw)
+
+    base_t = _env_float("LLM_TEMPERATURE", 0.0)
+    base_mt = _env_int("LLM_MAX_TOKENS", 0)
+    base_eff = os.environ.get("LLM_REASONING_EFFORT", "")
+    base_to = _env_float("LLM_TIMEOUT_S", 0.0)
+    app.state.llm = _mk_llm(base_t, base_mt, base_eff, base_to)
+
+    # 심의(라운드 토론) 전용 오버라이드 — DELIB_* 가 하나라도 설정되면 별도 인스턴스.
+    if any(os.environ.get(k, "") for k in
+           ("DELIB_TEMPERATURE", "DELIB_MAX_TOKENS", "DELIB_REASONING_EFFORT", "DELIB_TIMEOUT_S")):
+        d_t = _env_float("DELIB_TEMPERATURE", base_t)
+        d_mt = _env_int("DELIB_MAX_TOKENS", base_mt)
+        d_eff = os.environ.get("DELIB_REASONING_EFFORT", "") or base_eff
+        d_to = _env_float("DELIB_TIMEOUT_S", base_to)
+        app.state.delib_llm = _mk_llm(d_t, d_mt, d_eff, d_to)
+        print(f"[agent] 심의 전용 LLM 오버라이드 — temperature={d_t}, "
+              f"max_tokens={d_mt or '미전송'}, effort={d_eff or '미전달'}, "
+              f"timeout={d_to or '기본'}")
+    else:
+        app.state.delib_llm = app.state.llm
     app.state.llm_nostream = disable_stream
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")

@@ -3,6 +3,7 @@
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
 import json
+import os
 import re
 import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -12,7 +13,51 @@ DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
 # "/보고서 <선택: 내 결론>" — 사용자가 직접 끌어낸 결론을 함께 주면 권고안 맨 앞에 실린다.
 REPORT_TRIGGERS = ("/보고서", "/report")
 GROUPS_HEADER = "x-hwax-groups"
-N_PERSONAS = 5
+
+
+def _env_int(name: str, default: int) -> int:
+    """오타 값이 서버 기동을 죽이지 않게 — 파싱 실패는 경고 로그 후 기본값(app.py 도 공용)."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[deliberation] env {name}='{raw}' 정수 파싱 실패 — 기본값 {default} 사용")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[deliberation] env {name}='{raw}' 숫자 파싱 실패 — 기본값 {default} 사용")
+        return default
+
+
+# 심의 튜닝 손잡이 — 전부 env. 절단은 층위로 구분한다.
+#   모델 입력(role·라운드 직렬화·say 폴백) — 무절단 기본. 모델이 읽는 것을 자르면 발언 깊이가
+#     그 상한에 갇힌다(GLM 심의 품질 검증 보고서 1차 원인). 좁은 컨텍스트 환경(dev 16K)만
+#     DELIB_ROLE_CLIP 으로 방어값을 걸 수 있다.
+#   기록(RA 회의록) — 온전한 발언을 남긴다. DELIB_TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한.
+#   화면(회의 버블) — 가독성용 절단 유지, DELIB_CLIP_SCALE 로 배율 조절.
+N_PERSONAS = _env_int("DELIB_PERSONAS", 5)          # 참여 페르소나 수
+_ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
+_TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 2000)  # RA 회의록 발언당 상한(API 보호용)
+_PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
+_CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
+# 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
+# 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
+_SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
+_DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라운드당 상한(자), 0=무제한
+
+
+def _c(n: int) -> int:
+    """회의 버블 절단 상한에 DELIB_CLIP_SCALE 배율 적용 — 환경별로 발언 표시 길이를 조절."""
+    return int(n * _CLIP_SCALE)
 
 # 화두에 불량/품질 얘기가 있으면 SignalForge(VOC)에서 최근 불량 이슈를 먼저 환기한다.
 _DEFECT_RE = re.compile(
@@ -120,15 +165,69 @@ async def _llm_text(llm, system: str, human: str) -> str:
     return r.content if hasattr(r, "content") else str(r)
 
 
-async def _persona_round(llm, persona: dict, prompt: str) -> dict:
-    """페르소나 1명의 한 라운드 발언(JSON). 실패해도 텍스트로 폴백."""
+async def _persona_round(llm, persona: dict, prompt: str, required: tuple = ()) -> dict:
+    """페르소나 1명의 한 라운드 발언(JSON). 파싱 실패 또는 요구 키 결손 시 에러 피드백으로
+    재호출(DELIB_PARSE_RETRIES, 재시도마다 문구를 바꿔 temperature 0 에서도 동일 실패 반복 방지),
+    최종 실패에도 원문을 say 로 보존 — 다음 라운드에 무음 유실이 없다(_ser 참조)."""
     sysmsg = (f"당신은 '{persona['key']}' 전문가입니다. 전문 영역: {persona.get('role','')}. "
               f"오직 당신의 도메인 관점에서만, 구체적 수치·표준·실패모드로 발언하세요. 영역 밖은 아는 척 금지. "
               f"반드시 유효한 JSON 하나만 출력하세요.")
+
+    def ok(x) -> bool:
+        if not isinstance(x, dict):
+            return False
+        return not required or any(x.get(k) not in (None, "", []) for k in required)
+
     txt = await _llm_text(llm, sysmsg, prompt)
-    d = _parse_json(txt) or {"say": txt[:800]}
+    d = _parse_json(txt)
+    for attempt in range(max(0, _PARSE_RETRIES)):
+        if ok(d):
+            break
+        hint = ("직전 출력이 유효한 JSON 객체가 아니었습니다."
+                if not isinstance(d, dict)
+                else f"직전 JSON 에 요구 키({', '.join(required)})의 내용이 비어 있었습니다.")
+        txt = await _llm_text(llm, sysmsg, prompt +
+                              f"\n\n(재시도 {attempt + 1}/{_PARSE_RETRIES} — {hint} "
+                              f"다른 설명 없이, 요구된 키를 실제 내용으로 채운 JSON 객체 하나만 출력하세요.)")
+        d = _parse_json(txt)
+    if not isinstance(d, dict):
+        d = {"say": str(txt)[:800]}
+    elif required and not any(d.get(k) not in (None, "", []) for k in required):
+        # 요구 키 없는 dict({"response":…} 등) — 원문을 say 로 보존해 다음 라운드에 전달
+        d = {**d, "say": str(d.get("say") or txt)[:800]}
     d["persona"] = persona["key"]
     return d
+
+
+def _ser_val(v) -> str:
+    """직렬화 값 정규화 — 배열은 이어 붙이고, DELIB_SER_CLIP 여유 상한만 건다(0=무절단)."""
+    if isinstance(v, list):
+        v = "; ".join(str(x) for x in v if x)
+    s = str(v)
+    if _SER_CLIP > 0 and len(s) > _SER_CLIP:
+        s = s[:_SER_CLIP].rstrip() + "…"
+    return s
+
+
+def _ser(o: dict, keys: tuple, primary: str = "") -> str:
+    """라운드 결과를 다음 라운드 컨텍스트용으로 직렬화. 커버리지 규칙 —
+    (1) 핵심 키(primary: r1=lens, r2=deepen, r3=final_position)가 비고 say 가 있으면 say 병기
+        (짧은 부수 키 하나로 폴백이 막혀 최종입장이 유실되는 구멍 방지),
+    (2) 구조화 키가 전부 비면 say 원문으로 폴백 — 종전 {lens: null,…} 무음 유실 방지."""
+    picked = {k: _ser_val(o.get(k)) for k in keys if o.get(k) not in (None, "", [])}
+    if primary and primary not in picked and o.get("say"):
+        picked["say"] = str(o.get("say"))[:800]
+    if not picked and o.get("say"):
+        picked = {"say": str(o.get("say"))[:800]}
+    return json.dumps(picked, ensure_ascii=False)
+
+
+def _cap_ctx(s: str) -> str:
+    """의장 프롬프트에 싣는 라운드 텍스트의 라운드당 상한(DELIB_DECISION_CTX, 0=무제한) —
+    3개 라운드 합산이 좁은 컨텍스트(dev 16K)에서 의장 호출을 밀어내는 꼬리위험 방지."""
+    if _DECISION_CTX > 0 and len(s) > _DECISION_CTX:
+        return s[:_DECISION_CTX].rstrip() + "\n…(이하 생략)"
+    return s
 
 
 def _clip_sent(text, n: int) -> str:
@@ -160,22 +259,30 @@ def _norm_stance(s) -> str:
     return "조건부 동의"
 
 
-def _say_of(rnd: int, d: dict) -> str:
-    """라운드별 구조화 발언 → 회의 버블 대화체 합성(회의 chat 렌더와 동일한 연결어)."""
-    def first(v):
+def _say_of(rnd: int, d: dict, full: bool = False) -> str:
+    """라운드별 구조화 발언 → 대화체 합성(회의 chat 렌더와 동일한 연결어).
+    배열 필드는 전 항목을 잇는다 — 종전 first() 는 수용/반박의 첫 항목만 남기고 나머지를 버렸다.
+    full=False(회의 버블): DELIB_CLIP_SCALE 배율 절단(_c). full=True(RA 회의록 등 기록):
+    무절단 합성 — 기록은 온전해야 하고, 저장 상한은 호출부(_TRANSCRIPT_CLIP)가 여유값으로 건다."""
+    BIG = 10 ** 9   # _clip_sent 의 공백 정규화는 유지하되 사실상 무절단
+
+    def clip(v, n):
+        return _clip_sent(v, BIG if full else _c(n))
+
+    def joined(v):
         if isinstance(v, list):
-            return str(v[0]) if v else ""
+            return "; ".join(str(x) for x in v if x)
         return str(v or "")
     if rnd == 1:
-        say = _clip_sent(d.get("lens"), 260)
-        rec = _clip_sent(d.get("recommendation"), 300)
+        say = clip(d.get("lens"), 260)
+        rec = clip(d.get("recommendation"), 300)
         if rec:
             say = (say + f" 저는 이렇게 봅니다 — {rec}").strip()
     elif rnd == 2:
         parts = []
-        con = _clip_sent(first(d.get("concede")), 200)
-        reb = _clip_sent(first(d.get("rebut")), 240)
-        dp = _clip_sent(d.get("deepen"), 320)
+        con = clip(joined(d.get("concede")), 200)
+        reb = clip(joined(d.get("rebut")), 240)
+        dp = clip(d.get("deepen"), 320)
         if con:
             parts.append(f"그 지적은 받아들입니다. {con}")
         if reb:
@@ -184,11 +291,11 @@ def _say_of(rnd: int, d: dict) -> str:
             parts.append(f"제 핵심은 이겁니다. {dp}")
         say = " ".join(parts)
     else:
-        say = _clip_sent(d.get("final_position"), 340)
-        vote = _clip_sent(d.get("vote"), 160)
+        say = clip(d.get("final_position"), 340)
+        vote = clip(d.get("vote"), 160)
         if vote:
             say = (say + f" 최종 권장 — {vote}").strip()
-    return say or _clip_sent(d.get("say"), 400) or "(발언 파싱 실패)"
+    return say or clip(d.get("say"), 400) or "(발언 파싱 실패)"
 
 
 def _delib(kind: str, **kw) -> bytes:
@@ -196,10 +303,11 @@ def _delib(kind: str, **kw) -> bytes:
     return _sse("delib", {"kind": kind, **kw})
 
 
-async def _round_live(llm, personas: list, prompt_fn, rnd: int):
+async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = ()):
     """라운드 발언을 완료되는 순서대로 산출(async generator) — 라이브 회의 스트림의 핵심.
-    gather(전원 대기)와 달리 as_completed 라 먼저 끝난 전문가부터 화면에 등장한다."""
-    tasks = [asyncio.ensure_future(_persona_round(llm, p, prompt_fn(p))) for p in personas]
+    gather(전원 대기)와 달리 as_completed 라 먼저 끝난 전문가부터 화면에 등장한다.
+    required 는 라운드별 요구 키 — 파싱 재시도·say 보존 판정(_persona_round)에 쓰인다."""
+    tasks = [asyncio.ensure_future(_persona_round(llm, p, prompt_fn(p), required)) for p in personas]
     try:
         for fut in asyncio.as_completed(tasks):
             try:
@@ -331,7 +439,8 @@ async def run_deliberation(app, question: str, groups: list):
 
 async def _deliberation_stream(app, question: str, groups: list):
     """포털 챗 심의 모드의 SSE 제너레이터. 5단계 파이프라인을 코드로 돌리고 진행을 스트리밍한다."""
-    llm = app.state.llm
+    # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
+    llm = getattr(app.state, "delib_llm", None) or app.state.llm
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
     tools = await _tools_by_name(app, groups)
@@ -377,7 +486,11 @@ async def _deliberation_stream(app, question: str, groups: list):
         # 2) 각 페르소나 컨텍스트 — get_agent_session (list/dict 방어)
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
         sd = _first_dict(sess.get("data", sess))
-        role = (sd.get("description") or sd.get("system_prompt") or "")[:400]
+        # role 은 모델 입력(각 페르소나 자신의 시스템 메시지에만 실림 — 인원수에 곱해지지 않는다)
+        # 이라 무절단이 기본. 좁은 컨텍스트 환경만 DELIB_ROLE_CLIP>0 으로 방어.
+        role = sd.get("description") or sd.get("system_prompt") or ""
+        if _ROLE_CLIP > 0:
+            role = role[:_ROLE_CLIP]
         personas.append({"key": key, "role": role})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
@@ -394,35 +507,42 @@ async def _deliberation_stream(app, question: str, groups: list):
     yield _sse("status", {"step": "1라운드 — 도메인별 초기 입장", "tool": None})
     r1 = []
     async for o in _round_live(llm, personas, lambda p: base +
-            "\n당신의 관점·권장안·이 주제에서 당신 도메인이 놓칠 리스크, 그리고 현재 입장 한 줄 요약을 "
-            "JSON {lens,recommendation,concerns:[],position_short} 로.", 1):
+            "\n당신의 관점(lens — 2~4문장, 구체적으로), 위 주제·근거에 실제로 주어진 정보와 당신 도메인의 "
+            "확립된 표준·경험칙에 대한 해석(reads — 배열, 접근할 수 없는 데이터·수치를 지어내지 말고 "
+            "경험칙에는 (경험칙) 표기), 권장안(recommendation — 2~4문장), "
+            "이 주제에서 당신 도메인이 놓칠 리스크(concerns — 최소 2개), 현재 입장 한 줄 요약(position_short)을 "
+            "JSON {lens,reads:[],recommendation,concerns:[],position_short} 로. 한 줄 요약은 position_short 에만 — "
+            "나머지 필드를 한 줄로 줄이지 마세요.", 1, required=("lens", "recommendation")):
         r1.append(o)
         yield _delib("turn", round=1, persona=o["persona"], say=_say_of(1, o),
                      position=_clip_sent(o.get("position_short"), 90))
-    r1t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('lens','recommendation','concerns')}, ensure_ascii=False)}" for o in r1)
+    r1t = "\n".join(f"• {o['persona']}: {_ser(o, ('lens', 'reads', 'recommendation', 'concerns'), primary='lens')}" for o in r1)
 
     yield _delib("stage", stage="r2", n=len(personas))
     yield _sse("status", {"step": "2라운드 — 상호 반박·수치 심화", "tool": None})
     r2 = []
     async for o in _round_live(llm, personas, lambda p: base +
-            f"\n[1라운드 전원]\n{r1t}\n\n다른 전문가 입장에 수용/반박(근거:수치·표준·실패모드)하고 당신 핵심 주장을 더 깊게. "
-            "JSON {concede:[],rebut:[],deepen} 로.", 2):
+            f"\n[1라운드 전원]\n{r1t}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
+            "근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, 두루뭉술 금지). "
+            "JSON {concede:[],rebut:[],deepen} 로.", 2, required=("deepen", "rebut", "concede")):
         r2.append(o)
         yield _delib("turn", round=2, persona=o["persona"], say=_say_of(2, o))
-    r2t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('concede','rebut','deepen')}, ensure_ascii=False)}" for o in r2)
+    r2t = "\n".join(f"• {o['persona']}: {_ser(o, ('concede', 'rebut', 'deepen'), primary='deepen')}" for o in r2)
 
     yield _delib("stage", stage="r3", n=len(personas))
     yield _sse("status", {"step": "3라운드 — 수렴·최종 입장", "tool": None})
     r3 = []
     async for o in _round_live(llm, personas, lambda p: base +
-            f"\n[2라운드 전원]\n{r2t}\n\n2R를 반영해 최종 입장·절대 양보 못 하는 제약·최종 권장으로 수렴하고, "
+            f"\n[2라운드 전원]\n{r2t}\n\n2R를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
+            "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
             "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
-            "JSON {final_position,non_negotiable,vote,stance,position_short} 로.", 3):
+            "JSON {final_position,non_negotiable,vote,stance,position_short} 로.", 3,
+            required=("final_position", "vote")):
         r3.append(o)
         yield _delib("turn", round=3, persona=o["persona"], say=_say_of(3, o),
                      position=_clip_sent(o.get("position_short"), 90),
                      stance=_norm_stance(o.get("stance")))
-    r3t = "\n".join(f"• {o['persona']}: {json.dumps({k: o.get(k) for k in ('final_position','vote')}, ensure_ascii=False)}" for o in r3)
+    r3t = "\n".join(f"• {o['persona']}: {_ser(o, ('final_position', 'non_negotiable', 'vote', 'stance'), primary='final_position')}" for o in r3)
 
     # 4) 의사결정문 합성
     yield _delib("stage", stage="decide")
@@ -430,9 +550,11 @@ async def _deliberation_stream(app, question: str, groups: list):
     decision = await _llm_text(
         llm,
         "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게.",
-        base + f"\n[2R 심화]\n{r2t}\n\n[3R 최종]\n{r3t}\n\n"
+        base + f"\n[1R 초기입장]\n{_cap_ctx(r1t)}\n\n[2R 심화]\n{_cap_ctx(r2t)}\n\n[3R 최종]\n{_cap_ctx(r3t)}\n\n"
         "## 의사결정문 — (1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
-        "(3) 소수의견과 처리, (4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
+        "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
+        "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
+        "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     yield _delib("stage", stage="report")
@@ -447,7 +569,9 @@ async def _deliberation_stream(app, question: str, groups: list):
                                 (2, r2, "2라운드 — 상호 반박·심화"),
                                 (3, r3, "3라운드 — 수렴·최종 입장")):
             transcript.append(f"— {label} —")
-            transcript += [f"[{o['persona']}] {_say_of(rnd, o)[:400]}" for o in arr]
+            # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다.
+            # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 2000자)일 뿐.
+            transcript += [f"[{o['persona']}] {_say_of(rnd, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
         blocks = {
             "background": [f"심의 주제: {question}"]
                           + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else []),
