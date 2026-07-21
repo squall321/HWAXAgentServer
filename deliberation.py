@@ -231,8 +231,10 @@ def _cap_ctx(s: str) -> str:
 
 
 def _clip_sent(text, n: int) -> str:
-    """문장 경계에서만 끊어 최대 n자 근처까지 — 중간 절단으로 문장이 깨지지 않게(회의 버블용)."""
-    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    """문장 경계에서만 끊어 최대 n자 근처까지 — 중간 절단으로 문장이 깨지지 않게(회의 버블용).
+    가로 공백만 정규화하고 개행은 보존한다 — 발언이 한 덩어리로 뭉개져 보이던 원인 수정."""
+    t = re.sub(r"[ \t]+", " ", str(text or ""))
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
     if len(t) <= n:
         return t
     sents = [s for s in re.split(r"(?<=[.!?])\s+", t) if s]
@@ -273,11 +275,12 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
         if isinstance(v, list):
             return "; ".join(str(x) for x in v if x)
         return str(v or "")
+    # 부분 발언(관점/권장, 수용/반박/심화)은 빈 줄로 구분 — 버블·회의록에서 문단으로 보인다.
     if rnd == 1:
         say = clip(d.get("lens"), 260)
         rec = clip(d.get("recommendation"), 300)
         if rec:
-            say = (say + f" 저는 이렇게 봅니다 — {rec}").strip()
+            say = (say + f"\n\n저는 이렇게 봅니다 — {rec}").strip()
     elif rnd == 2:
         parts = []
         con = clip(joined(d.get("concede")), 200)
@@ -289,12 +292,12 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
             parts.append(f"다만 반박하자면, {reb}")
         if dp:
             parts.append(f"제 핵심은 이겁니다. {dp}")
-        say = " ".join(parts)
+        say = "\n\n".join(parts)
     else:
         say = clip(d.get("final_position"), 340)
         vote = clip(d.get("vote"), 160)
         if vote:
-            say = (say + f" 최종 권장 — {vote}").strip()
+            say = (say + f"\n\n최종 권장 — {vote}").strip()
     return say or clip(d.get("say"), 400) or "(발언 파싱 실패)"
 
 
