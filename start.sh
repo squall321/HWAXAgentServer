@@ -16,6 +16,18 @@ fi
 PORT="${AGENT_PORT:-9009}"                                   # 9000 is taken by MinIO on this box
 export VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8000/v1}"
 export VLLM_MODEL="${VLLM_MODEL:-qwen2.5-7b-dev}"
+# 미치환 마커 가드 — .env 가 apply-envs.sh 치환 없이 킷을 그대로 복사·수동편집돼 @FROM_RA:...@
+# 마커가 남으면, 서버는 그 엉터리 주소로 vLLM 에 붙으려다 매 요청 APIConnectionError 로 죽는다.
+# cryptic 한 연결 에러 대신 기동 시 즉시·명확히 멈춘다(값 교체 방법도 안내).
+case "$VLLM_BASE_URL $VLLM_MODEL ${VLLM_API_KEY:-}" in
+  *@FROM_RA:*|*@GENERATE_*)
+    echo "==> ⚠ vLLM 설정에 미치환 마커가 있습니다 — 서버를 띄우지 않습니다."
+    echo "    VLLM_BASE_URL=$VLLM_BASE_URL"
+    echo "    VLLM_MODEL=$VLLM_MODEL"
+    echo "    조치: .env 의 @FROM_RA:...@ 를 ReportArchive/.env 의 실제 LLM_* 값으로 바꾸거나,"
+    echo "          그 줄들을 지우고 'apply-envs.sh agent-server' 재실행(RA 값으로 치환)."
+    exit 1 ;;
+esac
 # MCP_CONFIG 기본값 — 없으면 서버가 mcp:[] 로 떠 도구(심의 페르소나 발굴 등)가 전부 소실된다.
 # 서비스 매니페스트(services.yaml)는 이 값을 주입하지만 맨손 ./start.sh 는 .env 에만 의존했다 —
 # .env 에 MCP_CONFIG 가 없는 박스에서 맨손 재시작 시 도구가 안 떠 심의가 실패하던 함정 제거.
