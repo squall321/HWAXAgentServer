@@ -378,9 +378,15 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
                                       **({"result_preview": out} if out else {})})
     except Exception as exc:
-        # Don't leak internals (tool inputs, config, LLM details) to the browser; log server-side.
+        # 상세는 서버 로그에만(내부 유출 방지). 단 AGENT_DEBUG_ERRORS=1 이면 예외 타입·메시지를
+        # 브라우저 응답에도 실어 운영자가 바로 원인을 본다(기본 꺼짐 — 켜면 재시작 필요).
         print(f"[agent] chat error: {exc!r}")
-        yield _sse("error", {"code": "agent_error", "message": "에이전트 처리 중 오류"})
+        import traceback as _tb
+        _tb.print_exc()
+        detail = ""
+        if os.environ.get("AGENT_DEBUG_ERRORS") == "1":
+            detail = f" — {type(exc).__name__}: {str(exc)[:400]}"
+        yield _sse("error", {"code": "agent_error", "message": f"에이전트 처리 중 오류{detail}"})
         yield _sse("done", {})
         return
     yield _sse("result", {"type": "text", "content": "".join(full)})
