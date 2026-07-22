@@ -10,6 +10,11 @@ cd "$(dirname "$0")"
 PORT="${AGENT_PORT:-9009}"                                   # 9000 is taken by MinIO on this box
 export VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8000/v1}"
 export VLLM_MODEL="${VLLM_MODEL:-qwen2.5-7b-dev}"
+# MCP_CONFIG 기본값 — 없으면 서버가 mcp:[] 로 떠 도구(심의 페르소나 발굴 등)가 전부 소실된다.
+# 서비스 매니페스트(services.yaml)는 이 값을 주입하지만 맨손 ./start.sh 는 .env 에만 의존했다 —
+# .env 에 MCP_CONFIG 가 없는 박스에서 맨손 재시작 시 도구가 안 떠 심의가 실패하던 함정 제거.
+# cd(위)로 cwd=레포디렉토리라 상대경로 mcp_servers.json 이 곧 이 레포의 파일이다.
+export MCP_CONFIG="${MCP_CONFIG:-$(pwd)/mcp_servers.json}"
 
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/pip install -q -r requirements.txt
