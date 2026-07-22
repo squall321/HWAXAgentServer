@@ -54,6 +54,16 @@ _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절
 _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
 _DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라운드당 상한(자), 0=무제한
 
+# 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
+# 동시 적용 시 지시 추종이 분산돼 효과가 상쇄되므로(§5 실행 순서) 한 번에 하나씩 A/B 할 것.
+_EVIDENCE_PREPASS = _env_int("DELIB_EVIDENCE_PREPASS", 0)  # T1 정량 근거 선주입(도구 조회→발췌)
+_REBUT_QUOTE = _env_int("DELIB_REBUT_QUOTE", 0)      # T2 반박 인용 계약 — quote 실재를 코드 검증
+_PROSE_FIRST = _env_int("DELIB_PROSE_FIRST", 0)      # T3 산문 논증 후 JSON(형식 강제 완화)
+_CROSS_EXAM = _env_int("DELIB_CROSS_EXAM", 0)        # 2R 교차심문 — 지목 표적의 원본 전체에 반박
+_ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주입(동조 붕괴 방어)
+_CHAIR_BESTOF = _env_int("DELIB_CHAIR_BESTOF", 1)    # 의장 후보 n개→심판 선택(1=끔, temp>0 필요)
+_CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라운드·페르소나] 출처 태깅
+
 
 def _c(n: int) -> int:
     """회의 버블 절단 상한에 DELIB_CLIP_SCALE 배율 적용 — 환경별로 발언 표시 길이를 조절."""
@@ -146,7 +156,10 @@ def _first_dict(x):
 
 
 def _parse_json(text: str):
-    """LLM 출력에서 첫 JSON 객체를 관대하게 추출."""
+    """LLM 출력에서 JSON 객체를 관대하게 추출. 최상위 균형 객체들을 앞에서부터 스캔해
+    마지막 것을 취한다 — 산문 선행 출력(DELIB_PROSE_FIRST)의 '마지막에 JSON' 계약과 맞고,
+    산문 속 '{x}' 수식·중간 예시(첫 '{'~마지막 '}' 방식이 오추출하던 엣지)에 안 속는다.
+    JSON-only 출력(객체 하나)에서는 종전과 동일 결과."""
     if isinstance(text, (dict, list)):
         return text
     s = str(text).strip()
@@ -154,10 +167,22 @@ def _parse_json(text: str):
         return json.loads(s)  # 배열/객체 전체가 유효 JSON 이면 그대로
     except Exception:
         pass
-    try:
-        return json.loads(s[s.index("{"): s.rindex("}") + 1])  # 객체 부분만 추출
-    except Exception:
-        return None
+    # 병리 입력(미종결 문자열 반복 등)에서 스캔이 O(n²) — 유효 JSON 전체는 위 快경로가 이미
+    # 처리했으므로 폴백 스캔에만 상한을 건다(96KB→168ms, 300KB→1.6s 실측).
+    if len(s) > 100_000:
+        s = s[:100_000]
+    dec = json.JSONDecoder()
+    found = None
+    i = s.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(s, i)
+            if isinstance(obj, dict):
+                found = obj
+            i = s.find("{", max(end, i + 1))
+        except Exception:
+            i = s.find("{", i + 1)
+    return found
 
 
 async def _llm_text(llm, system: str, human: str) -> str:
@@ -165,27 +190,34 @@ async def _llm_text(llm, system: str, human: str) -> str:
     return r.content if hasattr(r, "content") else str(r)
 
 
-async def _persona_round(llm, persona: dict, prompt: str, required: tuple = ()) -> dict:
-    """페르소나 1명의 한 라운드 발언(JSON). 파싱 실패 또는 요구 키 결손 시 에러 피드백으로
+async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
+                         validator=None) -> dict:
+    """페르소나 1명의 한 라운드 발언(JSON). 파싱 실패·요구 키 결손·검증기 지적 시 에러 피드백으로
     재호출(DELIB_PARSE_RETRIES, 재시도마다 문구를 바꿔 temperature 0 에서도 동일 실패 반복 방지),
-    최종 실패에도 원문을 say 로 보존 — 다음 라운드에 무음 유실이 없다(_ser 참조)."""
+    최종 실패에도 원문을 say 로 보존 — 다음 라운드에 무음 유실이 없다(_ser 참조).
+    validator: dict → 지적 문구(str) 또는 None(통과). 형식 검증을 내용 수준으로 올리는 훅
+    (인용 반박 실재 검증 등) — 재시도가 소진되면 지적이 남아도 발언은 그대로 쓴다(soft)."""
+    fmt = ("당신의 논증을 먼저 산문으로 자유롭게 전개한 뒤(6~12문장), 마지막에 유효한 JSON 객체 "
+           "하나로 마무리하세요. JSON 뒤에는 아무것도 쓰지 마세요. JSON 필드에는 결론의 전문을 "
+           "담으세요 — 산문을 참조('위에서 말했듯')하지 마세요."
+           if _PROSE_FIRST else "반드시 유효한 JSON 하나만 출력하세요.")
     sysmsg = (f"당신은 '{persona['key']}' 전문가입니다. 전문 영역: {persona.get('role','')}. "
               f"오직 당신의 도메인 관점에서만, 구체적 수치·표준·실패모드로 발언하세요. 영역 밖은 아는 척 금지. "
-              f"반드시 유효한 JSON 하나만 출력하세요.")
+              f"{fmt}")
 
-    def ok(x) -> bool:
+    def problem_of(x):
         if not isinstance(x, dict):
-            return False
-        return not required or any(x.get(k) not in (None, "", []) for k in required)
+            return "직전 출력이 유효한 JSON 객체가 아니었습니다."
+        if required and not any(x.get(k) not in (None, "", []) for k in required):
+            return f"직전 JSON 에 요구 키({', '.join(required)})의 내용이 비어 있었습니다."
+        return validator(x) if validator else None
 
     txt = await _llm_text(llm, sysmsg, prompt)
     d = _parse_json(txt)
     for attempt in range(max(0, _PARSE_RETRIES)):
-        if ok(d):
+        hint = problem_of(d)
+        if not hint:
             break
-        hint = ("직전 출력이 유효한 JSON 객체가 아니었습니다."
-                if not isinstance(d, dict)
-                else f"직전 JSON 에 요구 키({', '.join(required)})의 내용이 비어 있었습니다.")
         txt = await _llm_text(llm, sysmsg, prompt +
                               f"\n\n(재시도 {attempt + 1}/{_PARSE_RETRIES} — {hint} "
                               f"다른 설명 없이, 요구된 키를 실제 내용으로 채운 JSON 객체 하나만 출력하세요.)")
@@ -200,9 +232,13 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = ()) 
 
 
 def _ser_val(v) -> str:
-    """직렬화 값 정규화 — 배열은 이어 붙이고, DELIB_SER_CLIP 여유 상한만 건다(0=무절단)."""
+    """직렬화 값 정규화 — 배열은 이어 붙이고, DELIB_SER_CLIP 여유 상한만 건다(0=무절단).
+    dict 항목(인용 반박 계약 등 구조화 출력)은 Python repr 로 새지 않게 JSON 으로 직렬화."""
+    if isinstance(v, dict):
+        v = json.dumps(v, ensure_ascii=False)
     if isinstance(v, list):
-        v = "; ".join(str(x) for x in v if x)
+        v = "; ".join(json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else str(x)
+                      for x in v if x)
     s = str(v)
     if _SER_CLIP > 0 and len(s) > _SER_CLIP:
         s = s[:_SER_CLIP].rstrip() + "…"
@@ -248,6 +284,60 @@ def _clip_sent(text, n: int) -> str:
     return out
 
 
+def _norm_ws(s) -> str:
+    """공백·개행 정규화 — 인용 실재 검증은 표시 개행 차이에 흔들리면 안 된다."""
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
+    """반박 인용 계약(DELIB_REBUT_QUOTE) 검증기 — quote 가 모델이 실제로 본 라운드 직렬화
+    문자열(절단 포함)에 실재해야 반박으로 인정. 항목 하나라도 유효하면 통과(재시도 폭주 방지).
+    허수아비 반박('동의하지만 추가 고려 필요')을 구조적으로 차단하는, 코드로 검증 가능한
+    유일한 깊이 레버(GLM 리뷰 §5). where 는 재시도 힌트의 복사 출처 문구(교차심문은 표적 명시).
+    ctx 는 json.dumps 직렬화라 값 안의 개행이 리터럴 \\n, 따옴표가 \\" 로 실린다 — 모델이
+    화면 그대로 복사한 quote 는 JSON 디코드 후 실제 개행·따옴표가 되므로, 이스케이프를 해제한
+    변형 컨텍스트도 병행 매칭한다(완벽한 verbatim 인용이 다행 값에서 실패하던 비대칭 제거)."""
+    nctx = _norm_ws(ctx)
+    nctx_unesc = _norm_ws(str(ctx).replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\"))
+
+    def check(d: dict):
+        rebs = d.get("rebut")
+        if not isinstance(rebs, list) or not rebs:
+            return ("rebut 이 비어 있습니다 — 최소 1개, "
+                    "{target,quote,counter,basis} 객체 배열로 작성하세요.")
+        any_dict = False
+        for r in rebs:
+            if not isinstance(r, dict):
+                continue
+            any_dict = True
+            q = _norm_ws(r.get("quote"))
+            if len(q) >= 15 and (q in nctx or q in nctx_unesc):
+                return None
+        if not any_dict:
+            return ("rebut 항목이 문자열입니다 — {target,quote,counter,basis} 객체 배열로 다시. "
+                    f"quote 는 {where}에서 20자 이상 그대로 복사하세요.")
+        return (f"rebut 의 quote 가 상대 발언 원문에 실재하지 않습니다 — {where}에서 "
+                "문구를 20자 이상 그대로(변형 없이) 복사해 quote 에 넣으세요.")
+
+    return check
+
+
+def _item_text(x) -> str:
+    """배열 항목 → 대화체 문구. 인용 반박 계약의 dict({target,quote,counter,basis})는
+    '누구의 어떤 발언에 대한 반박인지'가 읽히게 합성하고, 그 외 dict 는 key: value 나열."""
+    if not isinstance(x, dict):
+        return str(x or "")
+    if x.get("counter") or x.get("quote"):
+        tgt = str(x.get("target") or "").strip()
+        q = _norm_ws(x.get("quote"))
+        c = str(x.get("counter") or "").strip()
+        b = str(x.get("basis") or "").strip()
+        head = (f"{tgt}의 " if tgt else "") + (f"'{q[:80]}' 에 대해 —" if q else "")
+        parts = [p for p in (head.strip(), c, f"(근거: {b})" if b else "") if p]
+        return " ".join(parts)
+    return "; ".join(f"{k}: {v}" for k, v in x.items() if v)
+
+
 def _norm_stance(s) -> str:
     """스탠스를 canonical 라벨로 — 부정 표현('동의하지 않습니다' 등)이 동의로 집계되지 않게
     부정 패턴을 먼저 매칭하고, 판별 불가면 조건부로(거짓 만장일치 방지)."""
@@ -273,8 +363,8 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
 
     def joined(v):
         if isinstance(v, list):
-            return "; ".join(str(x) for x in v if x)
-        return str(v or "")
+            return "; ".join(_item_text(x) for x in v if x)
+        return _item_text(v) if v else ""
     # 부분 발언(관점/권장, 수용/반박/심화)은 빈 줄로 구분 — 버블·회의록에서 문단으로 보인다.
     if rnd == 1:
         say = clip(d.get("lens"), 260)
@@ -306,11 +396,15 @@ def _delib(kind: str, **kw) -> bytes:
     return _sse("delib", {"kind": kind, **kw})
 
 
-async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = ()):
+async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = (),
+                      validator_fn=None):
     """라운드 발언을 완료되는 순서대로 산출(async generator) — 라이브 회의 스트림의 핵심.
     gather(전원 대기)와 달리 as_completed 라 먼저 끝난 전문가부터 화면에 등장한다.
-    required 는 라운드별 요구 키 — 파싱 재시도·say 보존 판정(_persona_round)에 쓰인다."""
-    tasks = [asyncio.ensure_future(_persona_round(llm, p, prompt_fn(p), required)) for p in personas]
+    required 는 라운드별 요구 키 — 파싱 재시도·say 보존 판정(_persona_round)에 쓰인다.
+    validator_fn: 페르소나 → 내용 검증기(교차심문은 표적이 달라 검증 컨텍스트가 1인 1개)."""
+    tasks = [asyncio.ensure_future(_persona_round(
+        llm, p, prompt_fn(p), required,
+        validator_fn(p) if validator_fn else None)) for p in personas]
     try:
         for fut in asyncio.as_completed(tasks):
             try:
@@ -428,6 +522,48 @@ async def _defect_briefing(tools: dict, llm, question: str):
     return display, inject, used
 
 
+# T1 근거 선주입 후보 — (도구명, 인자 빌더). 게이트웨이 스키마 확인 완료(2026-07-21, 전부 q/query 필수).
+# LLM 에게 도구 선택을 맡기지 않는다('/보고서'와 같은 LLM 재량 금지 원칙) — 실패는 _tool_text_ok 로 걸러짐.
+_EVIDENCE_TOOLS = (
+    ("hybrid_search", lambda q: {"q": q, "top_k": 3}),
+    ("search_knowledge", lambda q: {"q": q, "limit": 3}),
+    ("search_reports", lambda q: {"q": q, "limit": 3}),
+    ("query_rules", lambda q: {"query": q, "k": 3}),
+)
+
+
+async def _evidence_prepass(tools: dict, llm, question: str):
+    """T1 정량 근거 선주입(DELIB_EVIDENCE_PREPASS) — 수치 인용을 '기억 인출'에서 '컨텍스트
+    발췌'로 바꾸는 최대 깊이 레버(GLM 리뷰 §5). 지식·보고서 검색을 결정적으로 돌리고 LLM 1콜로
+    주제 관련 정량 근거만 증류한다. 반환 (표시문, 주입 블록 또는 "", 호출 도구 리스트) —
+    best-effort: 도구 실패·관련 근거 없음이면 빈 블록, 심의는 질문 기반으로 계속."""
+    chunks, used = [], []
+    for name, argf in _EVIDENCE_TOOLS:
+        if name not in tools:
+            continue
+        out = await _call(tools, name, argf(question))
+        if not isinstance(out, str):
+            out = json.dumps(out, ensure_ascii=False) if out else ""
+        if out and _tool_text_ok(out):
+            used.append(name)
+            chunks.append(f"### {name}\n{out[:2500]}")
+        if len(chunks) >= 3:
+            break
+    if not chunks:
+        return "", "", used
+    distilled = str(await _llm_text(
+        llm,
+        "당신은 심의 준비 보조자입니다. 주어진 검색 결과에서만 발췌하고, 결과에 없는 수치를 만들지 마세요.",
+        f"[심의 주제]\n{question}\n\n[도구 검색 결과]\n" + "\n\n".join(chunks)[:8000] + "\n\n"
+        "주제와 직접 관련된 정량 수치·표준·사례만 불릿으로 추리세요. 각 불릿 끝에 (출처: 도구명) 표기. "
+        "직접 관련된 정보가 없으면 '관련 근거 없음' 한 줄만 출력하세요.")).strip()
+    if not distilled or "관련 근거 없음" in distilled[:40]:
+        return "", "", used
+    inject = (f"[정량 근거 (도구 조회 — 발언에 인용할 것. 여기 없는 수치는 지어내지 말고 "
+              f"(경험칙) 표기)]\n{distilled[:3000]}\n")
+    return distilled, inject, used
+
+
 async def run_deliberation(app, question: str, groups: list):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)"""
@@ -469,6 +605,20 @@ async def _deliberation_stream(app, question: str, groups: list):
             yield _delib("evidence", source="SignalForge VOC", text=sf_display, included=bool(sf_inject))
             yield _sse("token", {"delta": stream_head})
 
+    # 0.5) T1 정량 근거 선주입(DELIB_EVIDENCE_PREPASS) — 발언이 인용할 수치를 심의 전에 조달
+    ev_inject = ""
+    if _EVIDENCE_PREPASS:
+        yield _sse("status", {"step": "정량 근거 수집 — 지식·보고서 검색", "tool": "hybrid_search"})
+        try:
+            ev_display, ev_inject, ev_used = await _evidence_prepass(tools, llm, question)
+        except Exception:  # noqa: BLE001 — 근거 수집 실패가 심의를 죽이지 않게
+            ev_display, ev_inject, ev_used = "", "", []
+        if ev_used:
+            yield _sse("status", {"step": "정량 근거 수집 완료", "tool": None, "tools_used": ev_used})
+        if ev_display:
+            yield _delib("evidence", source="지식·보고서 검색", text=ev_display[:1500],
+                         included=bool(ev_inject))
+
     # 1) 발굴 — recommend_agents
     # 스테퍼 순서(환기→발굴)와 정확히 일치하도록, 발굴 stage 는 실제 발굴 작업 직전에 방출한다.
     yield _delib("stage", stage="discover")
@@ -503,7 +653,8 @@ async def _deliberation_stream(app, question: str, groups: list):
                           "personas": [p["key"] for p in personas]})
     yield _delib("personas", personas=[{"key": p["key"], "role": (p.get("role") or "")[:80]} for p in personas])
 
-    base = f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
+    base = (f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
+            + (f"\n{ev_inject}" if ev_inject else ""))
 
     # 3) 다중 라운드 심의 — 발언이 완료되는 순서대로 delib turn 으로 라이브 방출
     yield _delib("stage", stage="r1", n=len(personas))
@@ -523,24 +674,75 @@ async def _deliberation_stream(app, question: str, groups: list):
 
     yield _delib("stage", stage="r2", n=len(personas))
     yield _sse("status", {"step": "2라운드 — 상호 반박·수치 심화", "tool": None})
+
+    # 교차심문(DELIB_CROSS_EXAM) — R1 완료 순서 기준 라운드로빈으로 반박 표적을 지목하고,
+    # 표적의 원본 전체 + 나머지는 한 줄 입장만 준다. 넓고 얕은 '5인 요약→일반론 반박' 도피로를
+    # 없애 반박을 한 논증에 집중시킨다(GLM 리뷰 §5, 비용 중립). 인용 검증 컨텍스트도 1인 1개.
+    r1_by_key = {o["persona"]: o for o in r1}
+    r1_keys = [o["persona"] for o in r1]
+
+    def _r2_ctx(p) -> tuple:
+        """페르소나별 (2R 컨텍스트, 인용 실재 검증 대상 문자열)."""
+        if not (_CROSS_EXAM and len(r1) >= 2):
+            return f"[1라운드 전원]\n{r1t}", r1t
+        if p["key"] in r1_keys:
+            tkey = r1_keys[(r1_keys.index(p["key"]) + 1) % len(r1_keys)]
+        else:  # R1 불참(실패) 페르소나 — 첫 완료자를 표적으로
+            tkey = r1_keys[0]
+        tser = _ser(r1_by_key[tkey], ("lens", "reads", "recommendation", "concerns"), primary="lens")
+        others = "\n".join(
+            f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('lens'), 160)}"
+            for o in r1 if o["persona"] != tkey)
+        ctx = (f"[당신의 지정 반박 표적: {tkey} — 1라운드 발언 전체]\n{tser}\n\n"
+               f"[다른 전문가 한 줄 입장]\n{others}\n\n"
+               f"표적({tkey})의 논증에서 특정 주장을 골라 반박하세요. 다른 전문가 언급은 자유.")
+        return ctx, tser
+
+    rebut_spec = ("반박(rebut)은 객체 배열 — 각 항목 {target: 상대 키, quote: 상대 발언에서 "
+                  "20자 이상 그대로 복사한 문구, counter: 반박 논지, basis: 수치·표준·실패모드}. "
+                  "인용 없는 반박은 불인정. JSON {concede:[],rebut:[{target,quote,counter,basis}],deepen} 로."
+                  if _REBUT_QUOTE else
+                  "JSON {concede:[],rebut:[],deepen} 로.")
+
+    def _r2_prompt(p) -> str:
+        ctx, _ = _r2_ctx(p)
+        return (base + f"\n{ctx}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
+                f"근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, "
+                f"두루뭉술 금지). {rebut_spec}")
+
+    _quote_where = ("당신의 지정 반박 표적의 1라운드 발언 전체" if _CROSS_EXAM and len(r1) >= 2
+                    else "위 [1라운드 전원] 텍스트")
+    r2_validator_fn = (lambda p: _quote_validator(_r2_ctx(p)[1], _quote_where)) if _REBUT_QUOTE else None
     r2 = []
-    async for o in _round_live(llm, personas, lambda p: base +
-            f"\n[1라운드 전원]\n{r1t}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
-            "근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, 두루뭉술 금지). "
-            "JSON {concede:[],rebut:[],deepen} 로.", 2, required=("deepen", "rebut", "concede")):
+    async for o in _round_live(llm, personas, _r2_prompt, 2,
+                               required=("deepen", "rebut", "concede"),
+                               validator_fn=r2_validator_fn):
         r2.append(o)
         yield _delib("turn", round=2, persona=o["persona"], say=_say_of(2, o))
     r2t = "\n".join(f"• {o['persona']}: {_ser(o, ('concede', 'rebut', 'deepen'), primary='deepen')}" for o in r2)
 
     yield _delib("stage", stage="r3", n=len(personas))
     yield _sse("status", {"step": "3라운드 — 수렴·최종 입장", "tool": None})
+    def _r3_prompt(p) -> str:
+        # 입장 앵커 재주입(DELIB_ANCHOR) — 약한 모델의 수렴 라운드 동조 붕괴(전원이 평균 입장으로
+        # 뭉개짐) 방어. 자기 1R 핵심을 되돌려주고, 입장 변경엔 새 근거 명시를 요구한다(GLM 리뷰 §5).
+        anchor = ""
+        if _ANCHOR:
+            mine = r1_by_key.get(p["key"])
+            if mine:
+                aser = _ser(mine, ("lens", "recommendation"), primary="lens")
+                anchor = (f"\n[당신의 1라운드 입장(앵커)]\n{aser}\n다수 의견에 동조해 당신 도메인의 "
+                          "제약을 희석하지 마세요 — 입장을 바꾼다면 어떤 새 근거 때문인지 "
+                          "final_position 에 명시하세요.\n")
+        return (base + f"\n[2라운드 전원]\n{r2t}\n" + anchor +
+                "\n2R를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
+                "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
+                "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
+                "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
+
     r3 = []
-    async for o in _round_live(llm, personas, lambda p: base +
-            f"\n[2라운드 전원]\n{r2t}\n\n2R를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
-            "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
-            "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
-            "JSON {final_position,non_negotiable,vote,stance,position_short} 로.", 3,
-            required=("final_position", "vote")):
+    async for o in _round_live(llm, personas, _r3_prompt, 3,
+                               required=("final_position", "vote")):
         r3.append(o)
         yield _delib("turn", round=3, persona=o["persona"], say=_say_of(3, o),
                      position=_clip_sent(o.get("position_short"), 90),
@@ -550,14 +752,45 @@ async def _deliberation_stream(app, question: str, groups: list):
     # 4) 의사결정문 합성
     yield _delib("stage", stage="decide")
     yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
-    decision = await _llm_text(
-        llm,
-        "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게.",
+    # 출처 태깅(DELIB_CHAIR_CITE) — 절충형 뭉개기(전 의견 나열 병합)를 가시화·감사 가능하게.
+    cite_note = ("각 결정사항 항목 끝에 근거가 된 라운드 발언 출처를 [R2·페르소나키] 형식으로 표기하고, "
+                 "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
+                 if _CHAIR_CITE else "")
+    chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
+    chair_human = (
         base + f"\n[1R 초기입장]\n{_cap_ctx(r1t)}\n\n[2R 심화]\n{_cap_ctx(r2t)}\n\n[3R 최종]\n{_cap_ctx(r3t)}\n\n"
         "## 의사결정문 — (1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
         "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
         "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
-        "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. 라운드별 심화·수렴을 드러내라.")
+        "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. " + cite_note +
+        "라운드별 심화·수렴을 드러내라.")
+    # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
+    # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
+    n_cand = max(1, _CHAIR_BESTOF)
+    if n_cand == 1:
+        decision = await _llm_text(llm, chair_sys, chair_human)
+    else:
+        raw_cands = await asyncio.gather(
+            *[_llm_text(llm, chair_sys, chair_human) for _ in range(n_cand)],
+            return_exceptions=True)
+        cands = [c for c in raw_cands if isinstance(c, str) and c.strip()]
+        if not cands:
+            raise RuntimeError("의장 의사결정문 합성 실패(후보 전멸)")
+        if len(cands) == 1:
+            decision = cands[0]
+        else:
+            pick = _parse_json(await _llm_text(
+                llm, "당신은 심의 기록 심사자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+                "\n\n".join(f"[후보 {i + 1}]\n{c[:4000]}" for i, c in enumerate(cands)) +
+                "\n\n위 의사결정문 후보 중 (a) 판정 수치가 구체적이고 (b) 라운드 발언에 접지되며 "
+                "(c) 소수의견이 보존되고 (d) 실행 가능한 것 하나를 고르세요. "
+                'JSON {"best": 후보번호} 로만.')) or {}
+            try:
+                b = int(pick.get("best", 1))
+                # 범위 밖(0·음수 — 음수 인덱싱으로 폴백을 조용히 우회 — ·후보수 초과)은 첫 후보로
+                decision = cands[b - 1] if 1 <= b <= len(cands) else cands[0]
+            except (ValueError, TypeError):
+                decision = cands[0]
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     yield _delib("stage", stage="report")
@@ -577,7 +810,8 @@ async def _deliberation_stream(app, question: str, groups: list):
             transcript += [f"[{o['persona']}] {_say_of(rnd, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
         blocks = {
             "background": [f"심의 주제: {question}"]
-                          + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else []),
+                          + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else [])
+                          + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
             "results": [r2t[:1500]],
             "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:12],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
