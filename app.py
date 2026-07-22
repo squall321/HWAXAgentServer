@@ -161,7 +161,12 @@ async def lifespan(app: FastAPI):
               f"max_tokens={d_mt or '미전송'}, effort={d_eff or '미전달'}, "
               f"timeout={d_to or '기본'}")
     else:
+        d_t, d_mt, d_eff, d_to = base_t, base_mt, base_eff, base_to
         app.state.delib_llm = app.state.llm
+    # 요청 단위 타임아웃 오버라이드(웹 토글)용 — 같은 temperature/max_tokens/effort 로 timeout 만
+    # 바꿔 재구성하는 팩토리(구성만·연결 없음). 기본 타임아웃도 노출해 오버라이드 필요 판정에 쓴다.
+    app.state.delib_timeout_s = d_to
+    app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff: _mk_llm(_t, _m, _e, ts))
     app.state.llm_nostream = disable_stream
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
@@ -181,6 +186,9 @@ class ChatRequest(BaseModel):
     groups: list[str] = []
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
+    # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
+    # 클램프하므로 raw dict 로 받아도 안전. 미지정 키는 env 기본값. 심의(/심의) 경로에서만 쓰인다.
+    delib_opts: dict | None = None
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -384,7 +392,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
     # 정본은 역량 있는 Claude(개인 Claude via MCP); 이건 GLM 연결 시 포털 챗으로도 되게 하는 진입점.
     if is_deliberation(req.message):
-        stream = run_deliberation(app, strip_trigger(req.message), req.groups)
+        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)

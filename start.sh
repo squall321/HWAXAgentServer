@@ -19,12 +19,17 @@ export MCP_CONFIG="${MCP_CONFIG:-$(pwd)/mcp_servers.json}"
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/pip install -q -r requirements.txt
 
-# 재시작 겸용 — 이 디렉토리의 기존 인스턴스를 먼저 내려야 포트 bind 가 된다(안 그러면
-# 'address already in use'). pkill 패턴은 이 박스의 HWAXAgentServer uvicorn 만 정확히 겨냥한다.
-STOP_PAT="$(pwd)/.venv/bin/uvicorn"
-if pkill -f "$STOP_PAT" 2>/dev/null; then
-  echo "==> stopping previous instance"; sleep 2
-  pkill -9 -f "$STOP_PAT" 2>/dev/null || true   # 안 죽었으면 강제
+# 재시작 겸용 — 이 포트를 잡은 기존 인스턴스를 먼저 내려야 bind 된다(안 그러면 'address already
+# in use'). 포트 리스너 PID 를 직접 종료한다 — uvicorn 이 상대경로(.venv/bin/uvicorn)로 실행돼
+# cmdline 절대경로 pkill 패턴이 빗나가던 것 방지(포트는 우리가 실제로 비워야 하는 대상 그 자체).
+port_pids() { ss -ltnp 2>/dev/null | grep ":${PORT} " | grep -oP 'pid=\K[0-9]+' | sort -u; }
+OLD_PIDS="$(port_pids || true)"
+if [ -n "$OLD_PIDS" ]; then
+  echo "==> stopping previous instance (${OLD_PIDS//$'\n'/ })"
+  kill $OLD_PIDS 2>/dev/null || true
+  sleep 2
+  STILL="$(port_pids || true)"
+  if [ -n "$STILL" ]; then kill -9 $STILL 2>/dev/null || true; sleep 1; fi   # 안 죽었으면 강제
 fi
 
 echo "==> Agent Server on :${PORT}  (vLLM=${VLLM_BASE_URL}, model=${VLLM_MODEL})"
