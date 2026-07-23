@@ -702,7 +702,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("done", {}); return
     yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": "get_agent_session",
                           "personas": [p["key"] for p in personas]})
-    yield _delib("personas", personas=[{"key": p["key"], "role": (p.get("role") or "")[:80]} for p in personas])
+    # 소개 카드용 역할 — 짧은 요약이 아니라 '이 전문가가 뭔지'가 보이게 넉넉히(프론트가 접어 표시).
+    yield _delib("personas", personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
 
     base = (f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
             + (f"\n{ev_inject}" if ev_inject else ""))
