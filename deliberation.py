@@ -73,11 +73,11 @@ def _resolve_opts(req_opts):
     o = SimpleNamespace(
         evidence_prepass=_EVIDENCE_PREPASS, rebut_quote=_REBUT_QUOTE, prose_first=_PROSE_FIRST,
         cross_exam=_CROSS_EXAM, anchor=_ANCHOR, chair_bestof=_CHAIR_BESTOF, chair_cite=_CHAIR_CITE,
-        parse_retries=_PARSE_RETRIES, timeout_s=None,
+        parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-                  "chair_bestof", "chair_cite", "parse_retries"):
+                  "chair_bestof", "chair_cite", "parse_retries", "rounds"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -95,6 +95,7 @@ def _resolve_opts(req_opts):
         o.parse_retries = 2
     o.parse_retries = max(0, min(10, o.parse_retries))   # 방어심층 — 직접 호출 시 재시도 폭주 상한
     o.chair_bestof = max(1, min(5, o.chair_bestof))
+    o.rounds = max(2, min(8, o.rounds))                  # 라운드 수 2~8(기본 3=초기+심화1+수렴)
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
     return o
@@ -703,52 +704,26 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _sse("status", {"step": "참여 전문가: " + ", ".join(p["key"] for p in personas), "tool": "get_agent_session",
                           "personas": [p["key"] for p in personas]})
     # 소개 카드용 역할 — 짧은 요약이 아니라 '이 전문가가 뭔지'가 보이게 넉넉히(프론트가 접어 표시).
-    yield _delib("personas", personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
+    # totalRounds — 프론트 스테퍼/회의록이 라운드 수를 동적으로(r1..rN) 그리는 근거.
+    yield _delib("personas", totalRounds=opts.rounds,
+                 personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
 
     base = (f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
             + (f"\n{ev_inject}" if ev_inject else ""))
 
-    # 3) 다중 라운드 심의 — 발언이 완료되는 순서대로 delib turn 으로 라이브 방출
-    yield _delib("stage", stage="r1", n=len(personas))
-    yield _sse("status", {"step": "1라운드 — 도메인별 초기 입장", "tool": None})
-    r1 = []
-    async for o in _round_live(llm, personas, lambda p: base +
-            "\n당신의 관점(lens — 2~4문장, 구체적으로), 위 주제·근거에 실제로 주어진 정보와 당신 도메인의 "
-            "확립된 표준·경험칙에 대한 해석(reads — 배열, 접근할 수 없는 데이터·수치를 지어내지 말고 "
-            "경험칙에는 (경험칙) 표기), 권장안(recommendation — 2~4문장), "
-            "이 주제에서 당신 도메인이 놓칠 리스크(concerns — 최소 2개), 현재 입장 한 줄 요약(position_short)을 "
-            "JSON {lens,reads:[],recommendation,concerns:[],position_short} 로. 한 줄 요약은 position_short 에만 — "
-            "나머지 필드를 한 줄로 줄이지 마세요.", 1, required=("lens", "recommendation"), opts=opts):
-        r1.append(o)
-        yield _delib("turn", round=1, persona=o["persona"], say=_say_of(1, o),
-                     position=_clip_sent(o.get("position_short"), 90))
-    r1t = "\n".join(f"• {o['persona']}: {_ser(o, ('lens', 'reads', 'recommendation', 'concerns'), primary='lens')}" for o in r1)
+    # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
+    #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.
+    N = opts.rounds
 
-    yield _delib("stage", stage="r2", n=len(personas))
-    yield _sse("status", {"step": "2라운드 — 상호 반박·수치 심화", "tool": None})
+    def _kind(r):  # 라운드 성격 — 프롬프트·직렬화·렌더 분기의 단일 기준
+        return "initial" if r == 1 else "converge" if r == N else "deepen"
 
-    # 교차심문(DELIB_CROSS_EXAM) — R1 완료 순서 기준 라운드로빈으로 반박 표적을 지목하고,
-    # 표적의 원본 전체 + 나머지는 한 줄 입장만 준다. 넓고 얕은 '5인 요약→일반론 반박' 도피로를
-    # 없애 반박을 한 논증에 집중시킨다(GLM 리뷰 §5, 비용 중립). 인용 검증 컨텍스트도 1인 1개.
-    r1_by_key = {o["persona"]: o for o in r1}
-    r1_keys = [o["persona"] for o in r1]
-
-    def _r2_ctx(p) -> tuple:
-        """페르소나별 (2R 컨텍스트, 인용 실재 검증 대상 문자열)."""
-        if not (opts.cross_exam and len(r1) >= 2):
-            return f"[1라운드 전원]\n{r1t}", r1t
-        if p["key"] in r1_keys:
-            tkey = r1_keys[(r1_keys.index(p["key"]) + 1) % len(r1_keys)]
-        else:  # R1 불참(실패) 페르소나 — 첫 완료자를 표적으로
-            tkey = r1_keys[0]
-        tser = _ser(r1_by_key[tkey], ("lens", "reads", "recommendation", "concerns"), primary="lens")
-        others = "\n".join(
-            f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('lens'), 160)}"
-            for o in r1 if o["persona"] != tkey)
-        ctx = (f"[당신의 지정 반박 표적: {tkey} — 1라운드 발언 전체]\n{tser}\n\n"
-               f"[다른 전문가 한 줄 입장]\n{others}\n\n"
-               f"표적({tkey})의 논증에서 특정 주장을 골라 반박하세요. 다른 전문가 언급은 자유.")
-        return ctx, tser
+    def _ser_kind(o, kind):  # 라운드 성격별 직렬화 키(다음 라운드 컨텍스트·회의록용)
+        if kind == "initial":
+            return _ser(o, ("lens", "reads", "recommendation", "concerns"), primary="lens")
+        if kind == "deepen":
+            return _ser(o, ("concede", "rebut", "deepen"), primary="deepen")
+        return _ser(o, ("final_position", "non_negotiable", "vote", "stance"), primary="final_position")
 
     rebut_spec = ("반박(rebut)은 객체 배열 — 각 항목 {target: 상대 키, quote: 상대 발언에서 "
                   "20자 이상 그대로 복사한 문구, counter: 반박 논지, basis: 수치·표준·실패모드}. "
@@ -756,50 +731,94 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   if opts.rebut_quote else
                   "JSON {concede:[],rebut:[],deepen} 로.")
 
-    def _r2_prompt(p) -> str:
-        ctx, _ = _r2_ctx(p)
-        return (base + f"\n{ctx}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
-                f"근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, "
-                f"두루뭉술 금지). {rebut_spec}")
+    rounds_data = []          # [(turns_list, transcript_str), ...] 라운드별
+    r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
 
-    _quote_where = ("당신의 지정 반박 표적의 1라운드 발언 전체" if opts.cross_exam and len(r1) >= 2
-                    else "위 [1라운드 전원] 텍스트")
-    r2_validator_fn = (lambda p: _quote_validator(_r2_ctx(p)[1], _quote_where)) if opts.rebut_quote else None
-    r2 = []
-    async for o in _round_live(llm, personas, _r2_prompt, 2,
-                               required=("deepen", "rebut", "concede"),
-                               validator_fn=r2_validator_fn, opts=opts):
-        r2.append(o)
-        yield _delib("turn", round=2, persona=o["persona"], say=_say_of(2, o))
-    r2t = "\n".join(f"• {o['persona']}: {_ser(o, ('concede', 'rebut', 'deepen'), primary='deepen')}" for o in r2)
+    for rnd in range(1, N + 1):
+        kind = _kind(rnd)
+        prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
+        prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")
+        rlabel = ("도메인별 초기 입장" if kind == "initial"
+                  else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
+        yield _delib("stage", stage=f"r{rnd}", n=len(personas))
+        yield _sse("status", {"step": f"{rnd}라운드 — {rlabel}", "tool": None})
 
-    yield _delib("stage", stage="r3", n=len(personas))
-    yield _sse("status", {"step": "3라운드 — 수렴·최종 입장", "tool": None})
-    def _r3_prompt(p) -> str:
-        # 입장 앵커 재주입(DELIB_ANCHOR) — 약한 모델의 수렴 라운드 동조 붕괴(전원이 평균 입장으로
-        # 뭉개짐) 방어. 자기 1R 핵심을 되돌려주고, 입장 변경엔 새 근거 명시를 요구한다(GLM 리뷰 §5).
-        anchor = ""
-        if opts.anchor:
-            mine = r1_by_key.get(p["key"])
-            if mine:
-                aser = _ser(mine, ("lens", "recommendation"), primary="lens")
-                anchor = (f"\n[당신의 1라운드 입장(앵커)]\n{aser}\n다수 의견에 동조해 당신 도메인의 "
-                          "제약을 희석하지 마세요 — 입장을 바꾼다면 어떤 새 근거 때문인지 "
-                          "final_position 에 명시하세요.\n")
-        return (base + f"\n[2라운드 전원]\n{r2t}\n" + anchor +
-                "\n2R를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
-                "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
-                "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
-                "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
+        if kind == "initial":
+            prompt_fn = lambda p: (base +
+                "\n당신의 관점(lens — 2~4문장, 구체적으로), 위 주제·근거에 실제로 주어진 정보와 당신 도메인의 "
+                "확립된 표준·경험칙에 대한 해석(reads — 배열, 접근할 수 없는 데이터·수치를 지어내지 말고 "
+                "경험칙에는 (경험칙) 표기), 권장안(recommendation — 2~4문장), "
+                "이 주제에서 당신 도메인이 놓칠 리스크(concerns — 최소 2개), 현재 입장 한 줄 요약(position_short)을 "
+                "JSON {lens,reads:[],recommendation,concerns:[],position_short} 로. 한 줄 요약은 position_short 에만 — "
+                "나머지 필드를 한 줄로 줄이지 마세요.")
+            required, validator_fn, render = ("lens", "recommendation"), None, 1
 
-    r3 = []
-    async for o in _round_live(llm, personas, _r3_prompt, 3,
-                               required=("final_position", "vote"), opts=opts):
-        r3.append(o)
-        yield _delib("turn", round=3, persona=o["persona"], say=_say_of(3, o),
-                     position=_clip_sent(o.get("position_short"), 90),
-                     stance=_norm_stance(o.get("stance")))
-    r3t = "\n".join(f"• {o['persona']}: {_ser(o, ('final_position', 'non_negotiable', 'vote', 'stance'), primary='final_position')}" for o in r3)
+        elif kind == "converge":
+            def prompt_fn(p, _pt=prev_t, _pno=prev_no):
+                # 입장 앵커 재주입(DELIB_ANCHOR) — 약한 모델의 수렴 라운드 동조 붕괴(전원이 평균 입장으로
+                # 뭉개짐) 방어. 자기 1R 핵심을 되돌려주고, 입장 변경엔 새 근거 명시를 요구(GLM 리뷰 §5).
+                anchor = ""
+                if opts.anchor and r1_by_key.get(p["key"]):
+                    aser = _ser(r1_by_key[p["key"]], ("lens", "recommendation"), primary="lens")
+                    anchor = (f"\n[당신의 1라운드 입장(앵커)]\n{aser}\n다수 의견에 동조해 당신 도메인의 "
+                              "제약을 희석하지 마세요 — 입장을 바꾼다면 어떤 새 근거 때문인지 "
+                              "final_position 에 명시하세요.\n")
+                return (base + f"\n[{_pno}라운드 전원]\n{_pt}\n" + anchor +
+                        "\n직전 라운드를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
+                        "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
+                        "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
+                        "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
+            required, validator_fn, render = ("final_position", "vote"), None, 3
+
+        else:  # deepen — 직전 라운드에 반박·심화. 교차심문(cross_exam)·인용계약(rebut_quote)은 직전 라운드 대상.
+            prev_keys = [o["persona"] for o in prev_list]
+            prev_by_key = {o["persona"]: o for o in prev_list}
+
+            def _ctx(p, _pl=prev_list, _pk=prev_keys, _pbk=prev_by_key, _pt=prev_t,
+                     _pno=prev_no, _pkind=prev_kind):
+                # (컨텍스트, 인용 실재 검증 대상 문자열)
+                if not (opts.cross_exam and len(_pl) >= 2):
+                    return f"[{_pno}라운드 전원]\n{_pt}", _pt
+                tkey = (_pk[(_pk.index(p["key"]) + 1) % len(_pk)] if p["key"] in _pk else _pk[0])
+                tser = _ser_kind(_pbk[tkey], _pkind)
+                others = "\n".join(
+                    f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('deepen') or o.get('lens'), 160)}"
+                    for o in _pl if o["persona"] != tkey)
+                ctx = (f"[당신의 지정 반박 표적: {tkey} — {_pno}라운드 발언 전체]\n{tser}\n\n"
+                       f"[다른 전문가 한 줄 입장]\n{others}\n\n"
+                       f"표적({tkey})의 논증에서 특정 주장을 골라 반박하세요. 다른 전문가 언급은 자유.")
+                return ctx, tser
+
+            def prompt_fn(p, _ctx=_ctx):
+                ctx, _ = _ctx(p)
+                return (base + f"\n{ctx}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
+                        f"근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, "
+                        f"두루뭉술 금지). {rebut_spec}")
+
+            _where = (f"당신의 지정 반박 표적의 {prev_no}라운드 발언 전체"
+                      if opts.cross_exam and len(prev_list) >= 2 else f"위 [{prev_no}라운드 전원] 텍스트")
+            validator_fn = ((lambda p, _c=_ctx, _w=_where: _quote_validator(_c(p)[1], _w))
+                            if opts.rebut_quote else None)
+            required, render = ("deepen", "rebut", "concede"), 2
+
+        cur = []
+        async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
+                                   validator_fn=validator_fn, opts=opts):
+            cur.append(o)
+            extra = {}
+            if render == 1:
+                extra = {"position": _clip_sent(o.get("position_short"), 90)}
+            elif render == 3:
+                extra = {"position": _clip_sent(o.get("position_short"), 90),
+                         "stance": _norm_stance(o.get("stance"))}
+            yield _delib("turn", round=rnd, persona=o["persona"], say=_say_of(render, o), **extra)
+        if rnd == 1:
+            r1_by_key = {o["persona"]: o for o in cur}
+        ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
+        rounds_data.append((cur, ct))
+
+    # 마지막 라운드(수렴) 데이터 — 집계·tally 용
+    last_list, last_t = rounds_data[-1]
 
     # 4) 의사결정문 합성
     yield _delib("stage", stage="decide")
@@ -809,8 +828,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
                  if opts.chair_cite else "")
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
+    _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
+    rounds_block = "\n\n".join(
+        f"[{i + 1}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
     chair_human = (
-        base + f"\n[1R 초기입장]\n{_cap_ctx(r1t)}\n\n[2R 심화]\n{_cap_ctx(r2t)}\n\n[3R 최종]\n{_cap_ctx(r3t)}\n\n"
+        base + f"\n{rounds_block}\n\n"
         "## 의사결정문 — (1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
         "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
         "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
@@ -853,21 +875,23 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     try:
         # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
         transcript = []
-        for rnd, arr, label in ((1, r1, "1라운드 — 도메인별 초기 입장"),
-                                (2, r2, "2라운드 — 상호 반박·심화"),
-                                (3, r3, "3라운드 — 수렴·최종 입장")):
-            transcript.append(f"— {label} —")
+        for i, (arr, _t) in enumerate(rounds_data):
+            r = i + 1
+            lbl = ("도메인별 초기 입장" if r == 1 else "수렴·최종 입장" if r == N else "상호 반박·심화")
+            transcript.append(f"— {r}라운드 — {lbl} —")
+            render = 1 if r == 1 else 3 if r == N else 2
             # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다.
             # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 2000자)일 뿐.
-            transcript += [f"[{o['persona']}] {_say_of(rnd, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
+            transcript += [f"[{o['persona']}] {_say_of(render, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
+        results_t = rounds_data[N - 2][1] if N >= 3 else rounds_data[0][1]   # 마지막 심화 라운드, 없으면 1R
         blocks = {
             "background": [f"심의 주제: {question}"]
                           + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else [])
                           + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
-            "results": [r2t[:1500]],
+            "results": [results_t[:1500]],
             "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:12],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
-                        "3라운드 심의(R1 초기→R2 심화→R3 수렴)."] + transcript[:40],
+                        f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:40],
         }
         made = _parse_json(await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
@@ -881,8 +905,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
     _KEY = {"동의": "agree", "조건부 동의": "conditional", "반대": "oppose"}
-    tally = {"agree": 0, "conditional": 0, "oppose": 0, "total": len(r3)}
-    for o in r3:
+    tally = {"agree": 0, "conditional": 0, "oppose": 0, "total": len(last_list)}
+    for o in last_list:
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
     yield _delib("decision", text=decision + report_note)
     yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
