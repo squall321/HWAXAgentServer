@@ -74,6 +74,8 @@ def _resolve_opts(req_opts):
         evidence_prepass=_EVIDENCE_PREPASS, rebut_quote=_REBUT_QUOTE, prose_first=_PROSE_FIRST,
         cross_exam=_CROSS_EXAM, anchor=_ANCHOR, chair_bestof=_CHAIR_BESTOF, chair_cite=_CHAIR_CITE,
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
+        # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
+        human_note="", continue_summary="", continue_personas=[],
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
@@ -90,6 +92,16 @@ def _resolve_opts(req_opts):
                 o.timeout_s = float(ts)
             except (ValueError, TypeError):
                 pass
+        hn = req_opts.get("human_note")
+        if isinstance(hn, str):
+            o.human_note = hn[:2000]
+        cs = req_opts.get("continue_summary")
+        if isinstance(cs, str):
+            o.continue_summary = cs[:8000]
+        cp = req_opts.get("personas")
+        if isinstance(cp, list):
+            o.continue_personas = [{"key": str(p.get("key"))[:120], "role": str(p.get("role") or "")[:2000]}
+                                   for p in cp[:12] if isinstance(p, dict) and p.get("key")]
     # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
@@ -671,32 +683,36 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="지식·보고서 검색", text=ev_display[:1500],
                          included=bool(ev_inject))
 
-    # 1) 발굴 — recommend_agents
-    # 스테퍼 순서(환기→발굴)와 정확히 일치하도록, 발굴 stage 는 실제 발굴 작업 직전에 방출한다.
+    # 1) 발굴 — recommend_agents. 단, 이어하기(continue_personas)면 이전 전문가를 재사용해 발굴 생략
+    #    (같은 전문가가 이전 결론을 이어받아 사람 의견에 맞춰 다시 토론해야 스티어링이 일관된다).
     yield _delib("stage", stage="discover")
-    rec = await _call(tools, "recommend_agents", {"q": question})
-    recd = _parse_json(rec)
-    if isinstance(recd, list):
-        items = recd
-    elif isinstance(recd, dict):
-        items = recd.get("recommendations") or recd.get("agents") or recd.get("data") or []
+    if opts.continue_personas:
+        personas = [dict(p) for p in opts.continue_personas]
+        yield _sse("status", {"step": "이어하기 — 이전 전문가 재소집", "tool": None})
     else:
-        items = []
-    personas = []
-    for it in (items[:N_PERSONAS] if isinstance(items, list) else []):
-        it = _first_dict(it)
-        key = it.get("agent_type") or it.get("id")
-        if not key:
-            continue
-        # 2) 각 페르소나 컨텍스트 — get_agent_session (list/dict 방어)
-        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
-        sd = _first_dict(sess.get("data", sess))
-        # role 은 모델 입력(각 페르소나 자신의 시스템 메시지에만 실림 — 인원수에 곱해지지 않는다)
-        # 이라 무절단이 기본. 좁은 컨텍스트 환경만 DELIB_ROLE_CLIP>0 으로 방어.
-        role = sd.get("description") or sd.get("system_prompt") or ""
-        if _ROLE_CLIP > 0:
-            role = role[:_ROLE_CLIP]
-        personas.append({"key": key, "role": role})
+        rec = await _call(tools, "recommend_agents", {"q": question})
+        recd = _parse_json(rec)
+        if isinstance(recd, list):
+            items = recd
+        elif isinstance(recd, dict):
+            items = recd.get("recommendations") or recd.get("agents") or recd.get("data") or []
+        else:
+            items = []
+        personas = []
+        for it in (items[:N_PERSONAS] if isinstance(items, list) else []):
+            it = _first_dict(it)
+            key = it.get("agent_type") or it.get("id")
+            if not key:
+                continue
+            # 2) 각 페르소나 컨텍스트 — get_agent_session (list/dict 방어)
+            sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
+            sd = _first_dict(sess.get("data", sess))
+            # role 은 모델 입력(각 페르소나 자신의 시스템 메시지에만 실림 — 인원수에 곱해지지 않는다)
+            # 이라 무절단이 기본. 좁은 컨텍스트 환경만 DELIB_ROLE_CLIP>0 으로 방어.
+            role = sd.get("description") or sd.get("system_prompt") or ""
+            if _ROLE_CLIP > 0:
+                role = role[:_ROLE_CLIP]
+            personas.append({"key": key, "role": role})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
                              "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
@@ -708,7 +724,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _delib("personas", totalRounds=opts.rounds,
                  personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
 
-    base = (f"[심의 주제]\n{question}\n" + (f"\n{sf_inject}" if sf_inject else "")
+    # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
+    # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
+    cont = ""
+    if opts.continue_summary:
+        cont += f"\n[이전 심의 요약 — 이어서 논의]\n{opts.continue_summary}\n"
+    if opts.human_note:
+        cont += (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하고, 이 방향으로 논의를 진전시켜라]\n"
+                 f"{opts.human_note}\n")
+        yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
+    base = (f"[심의 주제]\n{question}\n" + cont + (f"\n{sf_inject}" if sf_inject else "")
             + (f"\n{ev_inject}" if ev_inject else ""))
 
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
