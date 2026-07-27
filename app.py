@@ -195,6 +195,9 @@ class ChatRequest(BaseModel):
     # 사용자 지정 우선 도구 — AI 의 도구 선택을 100% 신뢰할 수 없어, 사용자가 도구 카탈로그에서
     # 직접 고른 도구를 우선 사용하게 강제한다(바인딩 보장 + 시스템 프롬프트 지시).
     pinned_tools: list[str] = []
+    # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
+    # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
+    pinned_agent: str | None = None
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -459,6 +462,26 @@ def _tool_preview(v, n: int = 220) -> str:
         return ""
 
 
+async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str:
+    """선택 전문가의 역할 원문 로드(get_agent_session) — 프로세스 캐시(불변 가정, 재시작 시 갱신)."""
+    cache = getattr(app.state, "persona_cache", None)
+    if cache is None:
+        cache = app.state.persona_cache = {}
+    if agent_type in cache:
+        return cache[agent_type]
+    role = ""
+    try:
+        tools = await _tools_by_name(app, groups)
+        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
+        sd = _first_dict(sess.get("data", sess))
+        role = str(sd.get("system_prompt") or sd.get("description") or "")[:4000]
+    except Exception as exc:  # noqa: BLE001 — 실패 시 페르소나 없이 일반 챗
+        print(f"[agent] persona load failed for {agent_type}: {exc!r}")
+    if role:
+        cache[agent_type] = role
+    return role
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     yield _sse("status", {"step": "분석 중", "tool": None})
@@ -472,6 +495,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
                              "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
+        # 지정 전문가 페르소나 — 선택 패널에서 고른 전문가의 역할로 답하는 '전문가와 대화' 모드.
+        agent_key = (req.pinned_agent or "").strip()[:120]
+        if agent_key:
+            role = await _persona_role(app, req.groups, agent_key)
+            if role:
+                sys_prompt += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
+                               f"아래 역할과 범위를 지켜 그 전문가로서 답하라.\n{role}\n"
+                               f"이 전문가 도메인의 데이터 조회는 agent_search(\"{agent_key}\", 질문) 를 우선 사용하라.")
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         async for event in agent.astream_events(inputs, version="v2"):
