@@ -903,6 +903,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             except (ValueError, TypeError):
                 decision = cands[0]
 
+    # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
+    #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
+    yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
+    try:
+        _summary = (await _llm_text(
+            llm, "당신은 심의체 의장입니다. 군더더기 없이 핵심만.",
+            "다음 의사결정문을 3~5줄 핵심 요약으로 압축하라 — 각 줄 '- '로 시작하는 한 문장 불릿. "
+            "① 최종 결론 한 줄 ② 핵심 근거 1~2개(가능하면 수치) ③ 소수의견/합의 여부. "
+            f"머리말·제목 없이 불릿만.\n\n{decision[:6000]}")).strip()
+    except Exception as exc:  # noqa: BLE001 — 요약 실패해도 의사결정문은 그대로 저장
+        print(f"[deliberation] summary failed: {exc!r}")
+        _summary = ""
+    if _summary:
+        decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
+
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     yield _delib("stage", stage="report")
     yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
@@ -926,7 +941,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else [])
                           + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
             "results": [results_t[:1500]],
-            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:12],
+            # 맨 앞 '핵심 요약' 문단 + 의사결정문. 요약이 한 슬롯 먹어도 본문이 안 잘리게 +1.
+            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:13],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
                         f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:40],
         }
