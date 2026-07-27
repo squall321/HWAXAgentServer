@@ -76,6 +76,8 @@ def _resolve_opts(req_opts):
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
+        # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
+        delib_tools=[],
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
@@ -102,6 +104,9 @@ def _resolve_opts(req_opts):
         if isinstance(cp, list):
             o.continue_personas = [{"key": str(p.get("key"))[:120], "role": str(p.get("role") or "")[:2000]}
                                    for p in cp[:12] if isinstance(p, dict) and p.get("key")]
+        tl = req_opts.get("tools")
+        if isinstance(tl, list):
+            o.delib_tools = [str(n).strip()[:80] for n in tl[:6] if isinstance(n, str) and str(n).strip()]
     # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
@@ -482,6 +487,36 @@ def _tool_text_ok(s) -> bool:
     return not any(b in head for b in bad)
 
 
+def _delib_tool_result_ok(s: str) -> bool:
+    """지정 도구 응답이 '근거로 쓸 수 있는' 결과인지 — 텍스트 에러 패턴에 더해, 구조화 에러
+    JSON({ok:false} 또는 {errors:[...]} — heax MCP 앱 규약)을 걸러 재시도/스킵을 유도한다."""
+    if not _tool_text_ok(s):
+        return False
+    try:
+        v = json.loads(s)
+        if isinstance(v, dict) and (v.get("ok") is False or v.get("errors")):
+            return False
+    except (ValueError, TypeError):
+        pass  # JSON 아님 — 텍스트 결과는 _tool_text_ok 통과로 충분
+    return True
+
+
+def _tool_schema_brief(t) -> str:
+    """도구 args 스키마를 LLM 인자 구성 프롬프트용 요약으로 — MCP 어댑터의 JSON 스키마 dict 만
+    (pydantic 모델이면 빈 문자열 — 설명만으로 구성 시도). 필드 12개·설명 100자 캡."""
+    schema = getattr(t, "args_schema", None)
+    if not isinstance(schema, dict):
+        return ""
+    props = schema.get("properties", {})
+    req = set(schema.get("required", []) or [])
+    lines = []
+    for k, v in list(props.items())[:12]:
+        if isinstance(v, dict):
+            lines.append(f"- {k}{'(필수)' if k in req else ''}: {v.get('type', 'any')}"
+                         f" — {str(v.get('description', ''))[:100]}")
+    return "\n".join(lines)
+
+
 def _sf_products(alerts: dict) -> list:
     """alert_check 결과에서 경보 제품 코드를 방어적으로 추출(스키마 변동 대비)."""
     out = []
@@ -683,6 +718,58 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="지식·보고서 검색", text=ev_display[:1500],
                          included=bool(ev_inject))
 
+    # 0.7) 사용자 지정 도구 실호출(delib_opts.tools) — 자동 파이프라인 도구만 믿지 않고, 사용자가
+    #      선정 패널에서 직접 고른 도구를 주제 기반 인자로 실제 호출해 정량 근거로 주입한다.
+    #      인자는 LLM 이 도구 스키마를 보고 구성(불가하면 skip) — 도구별 실패는 비치명.
+    tool_inject = ""
+    if opts.delib_tools:
+        _chunks, _used = [], []
+        for _tn in opts.delib_tools:
+            _t = tools.get(_tn)
+            if _t is None:
+                yield _sse("status", {"step": f"지정 도구 없음: {_tn} — 건너뜀", "tool": _tn})
+                continue
+            _brief = _tool_schema_brief(_t)
+            # 인자 구성 → 호출. 도구가 스키마 위반 등 에러 응답(ok:false/errors)을 주면 그 에러를
+            # 피드백해 1회 재시도(self-repair) — 에러 JSON 이 '정량 근거'로 주입되는 것을 막는다.
+            _good, _err_note = "", ""
+            for _attempt in (1, 2):
+                yield _sse("status", {"step": f"지정 도구 인자 구성: {_tn}"
+                                              + (" (재시도)" if _attempt == 2 else ""), "tool": _tn})
+                try:
+                    _argd = _parse_json(await _llm_text(
+                        llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+                        f"[심의 주제]\n{question}\n\n[도구]\n{_tn}: {(getattr(_t, 'description', '') or '')[:300]}\n"
+                        + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
+                        + (f"\n[직전 시도 오류 — 반드시 교정해 다시 구성하라]\n{_err_note}\n" if _err_note else "")
+                        + "\n주제의 정량 분석에 맞게 이 도구를 1회 호출할 인자 JSON 을 출력하라. "
+                          "스키마의 타입을 정확히 지켜라(숫자는 숫자로). 스키마에 없는 키 금지. "
+                          "값을 알 수 없는 필수 인자가 있으면 {\"skip\": true} 만 출력."))
+                except Exception:  # noqa: BLE001
+                    _argd = None
+                if not isinstance(_argd, dict) or _argd.get("skip"):
+                    break
+                yield _sse("status", {"step": f"지정 도구 호출: {_tn}", "tool": _tn,
+                                      "detail": json.dumps(_argd, ensure_ascii=False)[:200]})
+                _out = await _call(tools, _tn, _argd)
+                if not isinstance(_out, str):
+                    _out = json.dumps(_out, ensure_ascii=False, default=str) if _out is not None else ""
+                if _out and _delib_tool_result_ok(_out):
+                    _good = _out
+                    break
+                _err_note = (_out or "(빈 응답)")[:500]
+            if _good:
+                _chunks.append(f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n{_good[:2000]}")
+                _used.append(_tn)
+                yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
+            else:
+                yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
+        if _chunks:
+            tool_inject = ("[사용자 지정 도구 정량 결과 (실호출 — 발언에 인용할 것. 여기 없는 수치는 "
+                           "지어내지 말 것)]\n" + "\n\n".join(_chunks)[:5000] + "\n")
+            yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
+                                  "tools_used": _used})
+
     # 1) 발굴 — recommend_agents. 단, 이어하기(continue_personas)면 이전 전문가를 재사용해 발굴 생략
     #    (같은 전문가가 이전 결론을 이어받아 사람 의견에 맞춰 다시 토론해야 스티어링이 일관된다).
     yield _delib("stage", stage="discover")
@@ -746,7 +833,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                  f"{opts.human_note}\n")
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
     base = (f"[심의 주제]\n{question}\n" + cont + (f"\n{sf_inject}" if sf_inject else "")
-            + (f"\n{ev_inject}" if ev_inject else ""))
+            + (f"\n{ev_inject}" if ev_inject else "")
+            + (f"\n{tool_inject}" if tool_inject else ""))
 
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
     #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.

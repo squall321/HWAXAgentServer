@@ -192,6 +192,9 @@ class ChatRequest(BaseModel):
     message: str
     system_id: str | None = None  # sub-page context → tool scope (portal Phase 2; accepted, not yet used)
     groups: list[str] = []
+    # 사용자 지정 우선 도구 — AI 의 도구 선택을 100% 신뢰할 수 없어, 사용자가 도구 카탈로그에서
+    # 직접 고른 도구를 우선 사용하게 강제한다(바인딩 보장 + 시스템 프롬프트 지시).
+    pinned_tools: list[str] = []
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -275,20 +278,123 @@ _TOOL_PRIORITY = (
 )
 
 
-def _cap_tool_count(tools: list) -> list:
+def _cap_tool_count(tools: list, pinned: list[str] | None = None) -> list:
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
         return tools
     rank = {n: i for i, n in enumerate(_TOOL_PRIORITY)}
-    ordered = sorted(tools, key=lambda t: (rank.get(getattr(t, "name", ""), len(rank)), getattr(t, "name", "")))
+    pin = set(pinned or [])   # 사용자 지정 도구는 캡 상황에서도 반드시 바인딩되게 최우선
+    ordered = sorted(tools, key=lambda t: (0 if getattr(t, "name", "") in pin else 1,
+                                           rank.get(getattr(t, "name", ""), len(rank)),
+                                           getattr(t, "name", "")))
     kept = ordered[:TOOL_MAX]
     print(f"[agent] TOOL_MAX={TOOL_MAX} — {len(tools)}개 중 {len(kept)}개 바인딩(소형 컨텍스트 보호)")
     return kept
 
 
-async def _agent_for(app: FastAPI, groups: list[str]):
+# ── 도구 검색/카탈로그 — 사용자가 직접 도구를 확인·선택하게 하는 진입점 ─────────────
+# 질의 토큰(조사·불용어 제거)과 도구 name+description 의 어휘 겹침으로 관련도 랭킹.
+# recommend_svc 의 어휘 매칭과 같은 원리 — CJK 단일자(휨 등) 유지, 범용어 제거.
+_TOOL_STOP = {
+    "도구", "툴", "tool", "tools", "검색", "추천", "찾아", "찾아줘", "알려", "알려줘", "목록",
+    "리스트", "보여", "보여줘", "가능", "사용", "쓸", "뭐", "뭐가", "무엇", "무슨", "어떤",
+    "있어", "있냐", "있나", "관련", "대해", "대한", "해줘", "좀", "the", "a", "for", "what",
+    "which", "list", "show", "available", "use",
+}
+_JOSA_T = ("으로", "에서", "에게", "까지", "부터", "이나", "을", "를", "이", "가", "은", "는",
+           "의", "에", "과", "와", "도", "로", "만")
+
+
+def _tok_query(text: str) -> set[str]:
+    out = set()
+    for t in re.split(r"[\s,./·|()\[\]{}:;\"'?!]+", (text or "").lower()):
+        if not t:
+            continue
+        for j in sorted(_JOSA_T, key=len, reverse=True):   # 조사 제거(어간 2자+ 남을 때만)
+            if t.endswith(j) and len(t) - len(j) >= 2:
+                t = t[: -len(j)]
+                break
+        if t in _TOOL_STOP:
+            continue
+        if len(t) >= 2 or any("가" <= ch <= "힣" for ch in t):
+            out.add(t)
+    return out
+
+
+def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
+    """게이트웨이 도구를 질의 관련도순으로 — [{name, desc, score}] (score>0 만)."""
+    qtok = _tok_query(query)
+    if not qtok:
+        return []
+    scored = []
+    for name, t in tools.items():
+        profile = f"{name} {getattr(t, 'description', '') or ''}".lower().replace("_", " ")
+        hits = sum(1 for tk in qtok if tk in profile)
+        if hits:
+            scored.append((hits / len(qtok), name, (getattr(t, "description", "") or "")[:160]))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [{"name": n, "desc": d, "score": round(s, 3)} for s, n, d in scored[:top_k]]
+
+
+def _tool_catalog(tools: dict) -> list[dict]:
+    return [{"name": n, "desc": (getattr(t, "description", "") or "")[:160]}
+            for n, t in sorted(tools.items())]
+
+
+_TOOL_SEARCH_TRIGGERS = ("/도구", "/tools", "/tool")
+_TOOL_SEARCH_RE = re.compile(r"(도구|툴|tool)\w*\s*(검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)", re.IGNORECASE)
+
+
+def is_tool_search(message: str) -> bool:
+    m = (message or "").strip()
+    if any(m.startswith(t) for t in _TOOL_SEARCH_TRIGGERS):
+        return True
+    # 짧은 발화의 '도구 뭐 있어/추천해줘' 류만 — 긴 작업 지시문('~도구를 사용해 분석하라')은 오탐 방지
+    return len(m) <= 80 and bool(_TOOL_SEARCH_RE.search(m))
+
+
+def strip_tool_trigger(message: str) -> str:
+    m = (message or "").strip()
+    for t in _TOOL_SEARCH_TRIGGERS:
+        if m.startswith(t):
+            return m[len(t):].strip()
+    return m
+
+
+async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
+    """도구 카탈로그 SSE — 코드가 결정적으로 처리(LLM 미경유). 프론트가 tools 이벤트를 받아
+    선택 UI 를 그리고, 사용자가 고른 도구는 다음 발화부터 pinned_tools 로 실린다."""
+    yield _sse("status", {"step": "사용 가능 도구 검색 중", "tool": None})
+    try:
+        tools = await _tools_by_name(app, groups)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tools] load failed: {exc!r}")
+        tools = {}
+    if not tools:
+        yield _sse("result", {"type": "text", "content": "게이트웨이 도구를 불러오지 못했습니다 — 게이트웨이 상태를 확인하세요."})
+        yield _sse("done", {})
+        return
+    recommended = _rank_tools(tools, query)
+    catalog = _tool_catalog(tools)
+    yield _sse("tools", {"query": query, "recommended": recommended, "all": catalog})
+    if recommended:
+        head = ", ".join(r["name"] for r in recommended[:5])
+        text = (f"질의와 관련된 도구 {len(recommended)}개를 추천합니다(상위: {head}). "
+                f"전체 {len(catalog)}개 중 아래 카드에서 직접 선택·추가하면 이후 대화에서 그 도구를 우선 사용합니다.")
+    else:
+        text = (f"사용 가능한 도구 {len(catalog)}개입니다. 아래 카드에서 검색해 직접 선택하면 "
+                f"이후 대화에서 그 도구를 우선 사용합니다.")
+    yield _sse("token", {"delta": text})
+    yield _sse("result", {"type": "text", "content": text})
+    yield _sse("done", {})
+
+
+async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
-    Cached by group-set; the tools carry the groups header so tool *calls* are scoped too."""
-    key = frozenset(groups)
+    Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
+    pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
+    (무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 우선순위 반영)."""
+    pin_key = tuple(sorted(pinned)) if (pinned and TOOL_MAX > 0) else ()
+    key = (frozenset(groups), pin_key)
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
@@ -297,7 +403,8 @@ async def _agent_for(app: FastAPI, groups: list[str]):
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = _cap_tool_count([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()])
+                tools = _cap_tool_count([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()],
+                                        pinned)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
@@ -356,8 +463,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
-        agent = await _agent_for(app, req.groups)
-        messages = [("system", SYSTEM_PROMPT), *_history_messages(req.history), ("user", req.message)]
+        # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
+        # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
+        pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
+        agent = await _agent_for(app, req.groups, pinned)
+        sys_prompt = SYSTEM_PROMPT
+        if pinned:
+            sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
+                           + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
+                             "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
+        messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         async for event in agent.astream_events(inputs, version="v2"):
             kind = event["event"]
@@ -410,6 +525,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)
+    elif is_tool_search(req.message):
+        # "/도구 <질의>" 또는 '도구 뭐 있어' 류 → 도구 카탈로그+추천을 SSE tools 이벤트로(결정적).
+        # 프론트가 선택 UI 를 그리고, 고른 도구는 다음 발화부터 pinned_tools 로 우선 사용된다.
+        stream = run_tool_search(app, strip_tool_trigger(req.message), req.groups)
     else:
         stream = _agent_stream(app, req)
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)
@@ -495,7 +614,17 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         print(f"[experts] list_agents failed: {exc!r}")
 
-    return {"recommended": recommended, "candidates": candidates, "pool": pool}
+    # 도구 — 파이프라인이 자동 쓰는 도구(정보 표시) + 주제 관련 추천 + 전체 카탈로그(검색 추가용).
+    # 사용자가 고른 도구(delib_opts.tools)는 심의에서 실제 호출돼 정량 근거로 주입된다.
+    _PIPELINE_TOOLS = ("recommend_agents", "get_agent_session", "alert_check", "daily_briefing",
+                       "query_voc", "hybrid_search", "search_knowledge", "search_reports",
+                       "create_report_draft")
+    tools_info = {
+        "recommended": _rank_tools(tools, req.message),
+        "pipeline": [n for n in _PIPELINE_TOOLS if n in tools],
+        "all": _tool_catalog(tools),
+    }
+    return {"recommended": recommended, "candidates": candidates, "pool": pool, "tools": tools_info}
 
 
 @app.get("/health")
