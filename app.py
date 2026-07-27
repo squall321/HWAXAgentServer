@@ -465,24 +465,27 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
                 "role": (d.get("description") or "")[:280],
                 "tags": list(d.get("common_tags") or [])}
 
-    # 자동 추천(상위 N) — 점수·근거 포함
-    recommended: list[dict] = []
+    # 질문 연관 순위 — recommend_agents 를 넉넉히(top_k=CAND) 받아 관련도순 후보로 쓴다.
+    # recommended = 상위 N(기본 선택), candidates = 관련 전문가 목록(수동 추가 기본 노출·검색 우선).
+    cand_k = int(os.environ.get("EXPERT_CANDIDATE_TOP_K", "40"))
+    candidates: list[dict] = []
     try:
-        recd = _parse_json(await _call(tools, "recommend_agents", {"q": req.message, "top_k": N_PERSONAS}))
+        recd = _parse_json(await _call(tools, "recommend_agents", {"q": req.message, "top_k": cand_k}))
         items = recd if isinstance(recd, list) else (
             (recd or {}).get("recommendations") or (recd or {}).get("agents") or (recd or {}).get("data") or [])
-        for it in (items or [])[:N_PERSONAS]:
+        for it in (items or [])[:cand_k]:
             it = _first_dict(it)
             n = _norm(it)
             if not n["key"]:
                 continue
             n["score"] = it.get("score")
             n["why"] = it.get("why") or ""
-            recommended.append(n)
+            candidates.append(n)
     except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
         print(f"[experts] recommend failed: {exc!r}")
+    recommended = candidates[:N_PERSONAS]
 
-    # 전체 풀(compact — 수동 추가·도메인 검색용). 647+ 규모라 role 은 짧게.
+    # 전체 풀(compact — 관련도 밖 전문가까지 키워드로 찾을 때). 647+ 규모라 role 은 싣지 않는다.
     pool: list[dict] = []
     try:
         for a in _parse_json_multi(await _call(tools, "list_agents", {"compact": True})):
@@ -492,7 +495,7 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         print(f"[experts] list_agents failed: {exc!r}")
 
-    return {"recommended": recommended, "pool": pool}
+    return {"recommended": recommended, "candidates": candidates, "pool": pool}
 
 
 @app.get("/health")
