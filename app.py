@@ -39,8 +39,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
 from deliberation import (
+    N_PERSONAS,
+    _call,
     _env_float,
     _env_int,
+    _first_dict,
+    _parse_json,
+    _tools_by_name,
     is_deliberation,
     is_report_save,
     run_deliberation,
@@ -408,6 +413,86 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     else:
         stream = _agent_stream(app, req)
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+class ExpertsRequest(BaseModel):
+    message: str
+    groups: list[str] = []
+
+
+def _parse_json_multi(text) -> list:
+    """AIDH list 반환 툴은 원소별 content 로 직렬화돼 _call 이 이어붙인다 — 연결된 JSON
+    객체들을 모두 추출해 리스트로. (단일 배열/객체도 지원.)"""
+    if isinstance(text, list):
+        return text
+    s = str(text or "").strip()
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, list) else [v]
+    except Exception:
+        pass
+    dec = json.JSONDecoder()
+    out: list = []
+    i = 0
+    while i < len(s):
+        while i < len(s) and s[i] not in "{[":
+            i += 1
+        if i >= len(s):
+            break
+        try:
+            o, end = dec.raw_decode(s, i)
+            out.append(o)
+            i = end
+        except Exception:
+            i += 1
+    return out
+
+
+@app.post("/deliberate/experts")
+async def deliberate_experts(req: ExpertsRequest) -> dict:
+    """심의 전 전문가 선정 미리보기 — 자동 추천(recommend_agents) + 전체 풀(list_agents compact).
+    프론트가 추천을 미리 보여주고, 사용자가 확인·수동추가한 personas 로 심의를 실행한다."""
+    tools = await _tools_by_name(app, req.groups)
+    if not tools:
+        return {"recommended": [], "pool": [], "error": "gateway_unavailable"}
+
+    def _norm(d: dict) -> dict:
+        d = _first_dict(d)
+        key = d.get("agent_type") or d.get("id") or ""
+        return {"key": key, "name": d.get("name") or key,
+                "role": (d.get("description") or "")[:280],
+                "tags": list(d.get("common_tags") or [])}
+
+    # 자동 추천(상위 N) — 점수·근거 포함
+    recommended: list[dict] = []
+    try:
+        recd = _parse_json(await _call(tools, "recommend_agents", {"q": req.message, "top_k": N_PERSONAS}))
+        items = recd if isinstance(recd, list) else (
+            (recd or {}).get("recommendations") or (recd or {}).get("agents") or (recd or {}).get("data") or [])
+        for it in (items or [])[:N_PERSONAS]:
+            it = _first_dict(it)
+            n = _norm(it)
+            if not n["key"]:
+                continue
+            n["score"] = it.get("score")
+            n["why"] = it.get("why") or ""
+            recommended.append(n)
+    except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
+        print(f"[experts] recommend failed: {exc!r}")
+
+    # 전체 풀(compact — 수동 추가·도메인 검색용). 647+ 규모라 role 은 짧게.
+    pool: list[dict] = []
+    try:
+        for a in _parse_json_multi(await _call(tools, "list_agents", {"compact": True})):
+            n = _norm(a)
+            if n["key"]:
+                pool.append({"key": n["key"], "name": n["name"], "tags": n["tags"]})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[experts] list_agents failed: {exc!r}")
+
+    return {"recommended": recommended, "pool": pool}
 
 
 @app.get("/health")

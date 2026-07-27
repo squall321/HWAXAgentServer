@@ -688,7 +688,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _delib("stage", stage="discover")
     if opts.continue_personas:
         personas = [dict(p) for p in opts.continue_personas]
-        yield _sse("status", {"step": "이어하기 — 이전 전문가 재소집", "tool": None})
+        # 수동 지정/추가된 전문가는 role 이 비어 올 수 있다(풀은 compact) — get_agent_session 으로
+        # 역할을 백필해 발언 품질을 유지한다(이어하기·수동선택 공통).
+        for p in personas:
+            if not str(p.get("role") or "").strip():
+                try:
+                    sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": p["key"]})))
+                    sd = _first_dict(sess.get("data", sess))
+                    p["role"] = sd.get("description") or sd.get("system_prompt") or ""
+                except Exception:  # noqa: BLE001 — 백필 실패해도 key 로 참여
+                    pass
+        yield _sse("status", {"step": "지정 전문가 소집", "tool": None})
     else:
         rec = await _call(tools, "recommend_agents", {"q": question})
         recd = _parse_json(rec)
