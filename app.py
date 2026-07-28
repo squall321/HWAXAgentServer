@@ -484,6 +484,76 @@ _TOOL_PRIORITY = (
 )
 
 
+# ── 도구 시맨틱 검색 — AIDH 다국어 e5 임베더 재사용(모델 중복 로딩 없음) ─────────────
+# 어휘 매칭은 정확한 도구명에 강하고 임베딩은 표현이 다른 질의("김서림 방지" ↔ fogging)에
+# 강하다 → 둘을 RRF 로 합친다. e5 는 절대 유사도가 전반적으로 높아(무관 쌍도 0.8+) 임계값이
+# 아니라 상대 순위로만 쓴다.
+AIDH_HTTP = os.environ.get("AIDH_HTTP_BASE", "http://127.0.0.1:8001")
+_TOOL_VEC: dict = {"sig": "", "names": [], "vecs": []}
+
+
+def _embed(texts: list, kind: str = "passage") -> list:
+    import urllib.request
+    if not texts:
+        return []
+    body = json.dumps({"texts": texts, "kind": kind}).encode()
+    req = urllib.request.Request(f"{AIDH_HTTP}/api/embed", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return (json.loads(r.read()) or {}).get("vectors") or []
+
+
+def _ensure_tool_vecs(tools: list) -> None:
+    """도구 벡터 캐시 — 도구 구성이 바뀔 때만 재계산(수백 개도 수 초)."""
+    names = sorted(getattr(t, "name", "") for t in tools)
+    sig = str(len(names)) + "|" + (names[0] if names else "") + "|" + (names[-1] if names else "")
+    if _TOOL_VEC["sig"] == sig and _TOOL_VEC["vecs"]:
+        return
+    by = {getattr(t, "name", ""): t for t in tools}
+    texts = [f"{n}: {(getattr(by[n], 'description', '') or '')[:400]}" for n in names]
+    try:
+        vecs = _embed(texts, "passage")
+    except Exception as exc:  # noqa: BLE001 — 임베딩 미가용이면 어휘 매칭만으로 동작(회귀 0)
+        print(f"[tools] embed failed: {exc!r}")
+        return
+    if len(vecs) == len(names):
+        _TOOL_VEC.update({"sig": sig, "names": names, "vecs": vecs})
+        print(f"[tools] semantic index: {len(names)}개")
+
+
+def _semantic_order(query: str, tools: list) -> list:
+    """질의 임베딩 코사인 내림차순 도구 이름 목록(미가용이면 빈 목록)."""
+    if not query.strip():
+        return []
+    _ensure_tool_vecs(tools)
+    if not _TOOL_VEC["vecs"]:
+        return []
+    try:
+        qv = _embed([query], "query")
+    except Exception:  # noqa: BLE001
+        return []
+    if not qv:
+        return []
+    import math
+    q = qv[0]
+    qn = math.sqrt(sum(x * x for x in q)) or 1.0
+    scored = []
+    for n, v in zip(_TOOL_VEC["names"], _TOOL_VEC["vecs"]):
+        vn = math.sqrt(sum(x * x for x in v)) or 1.0
+        scored.append((sum(a * b for a, b in zip(q, v)) / (qn * vn), n))
+    scored.sort(reverse=True)
+    return [n for _, n in scored]
+
+
+def _rrf(*orders, k: int = 60) -> dict:
+    """Reciprocal Rank Fusion — 어휘·시맨틱 순위를 점수 스케일 차이 없이 결합."""
+    out: dict = {}
+    for order in orders:
+        for i, name in enumerate(order):
+            out[name] = out.get(name, 0.0) + 1.0 / (k + i + 1)
+    return out
+
+
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None) -> list:
     """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
     '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 사용자 지정(핀) ② 질의 어휘 관련도
@@ -500,11 +570,15 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
         prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
         hit = sum(1 for k in qtok if k in prof)
         return hit / len(qtok)
+    lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools))]
+    sem_order = _semantic_order(query, tools)
+    fused = _rrf(lex_order, sem_order) if sem_order else {}
     scored = [(t, rel(t)) for t in tools]
     ordered = sorted(scored, key=lambda x: (
-        0 if getattr(x[0], "name", "") in pin else 1,   # 핀 최우선
-        -round(x[1], 3),                                 # 질의 관련도 높은 순
-        core.get(getattr(x[0], "name", ""), len(core)),  # 상시 핵심
+        0 if getattr(x[0], "name", "") in pin else 1,            # 핀 최우선
+        -round(fused.get(getattr(x[0], "name", ""), 0.0), 6),    # 어휘+시맨틱 융합 순위
+        -round(x[1], 3),                                          # 어휘 관련도(융합 미가용 시)
+        core.get(getattr(x[0], "name", ""), len(core)),           # 상시 핵심
         getattr(x[0], "name", ""),
     ))
     kept = [t for t, _ in ordered[:TOOL_MAX]]
@@ -599,6 +673,17 @@ def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
         if hits:
             scored.append((hits / len(qtok), name, (getattr(t, "description", "") or "")[:160]))
     scored.sort(key=lambda x: (-x[0], x[1]))
+    # 시맨틱 순위와 융합 — 어휘로 못 잡는 표현 차이(김서림↔fogging)를 임베딩이 보완.
+    sem = _semantic_order(query, list(tools.values()))
+    if sem:
+        lex = [n for _, n, _ in scored]
+        fused = _rrf(lex, sem)
+        pool = {n: (s_, d_) for s_, n, d_ in scored}
+        for n in sem[:top_k * 2]:
+            if n not in pool and n in tools:
+                pool[n] = (0.0, (getattr(tools[n], "description", "") or "")[:160])
+        scored = sorted(((v[0], n, v[1]) for n, v in pool.items()),
+                        key=lambda x: -fused.get(x[1], 0.0))
     out = []
     for sc, n, d in scored[:top_k]:
         gk, gl = _group_of(n)
@@ -946,8 +1031,24 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     _PIPELINE_TOOLS = ("recommend_agents", "get_agent_session", "alert_check", "daily_briefing",
                        "query_voc", "hybrid_search", "search_knowledge", "search_reports",
                        "create_report_draft")
+    # 전문가가 쓰는 도구 — AIDH recommend_agents 가 주는 relevant_tools(compatible_agents).
+    expert_tools = []
+    try:
+        for rt in ((recd or {}).get("relevant_tools") or []) if isinstance(recd, dict) else []:
+            rt = _first_dict(rt)
+            nm = rt.get("name")
+            if nm:
+                gk, gl = _group_of(nm)
+                expert_tools.append({
+                    "name": nm, "desc": (rt.get("description") or "")[:160],
+                    "score": rt.get("score"), "group": gk, "group_label": gl,
+                    "agents": list(rt.get("compatible_agents") or [])[:8],
+                })
+    except Exception as exc:  # noqa: BLE001 — 연결 정보 없으면 생략
+        print(f"[experts] relevant_tools failed: {exc!r}")
     tools_info = {
         "recommended": _rank_tools(tools, req.message),
+        "expert_tools": expert_tools,
         "pipeline": [n for n in _PIPELINE_TOOLS if n in tools],
         "all": _tool_catalog(tools),
     }
