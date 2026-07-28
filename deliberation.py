@@ -667,7 +667,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None):
 
 
 async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS):
-    """포털 챗 심의 모드의 SSE 제너레이터. 5단계 파이프라인을 코드로 돌리고 진행을 스트리밍한다."""
+    """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
     llm = getattr(app.state, "delib_llm", None) or app.state.llm
     # 요청 단위 타임아웃 오버라이드(웹 토글) — 기동값과 다르면 같은 파라미터로 새 인스턴스(구성만, 저렴).
@@ -1008,7 +1008,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 4c) 쉬운 설명 — 의사결정문은 전문 용어·수치로 촘촘해 비전문가·경영층이 '그래서 뭘 하라는
     #     건지' 못 읽는다. 맨 뒤에 한마디 결론 + 왜 그런지 + 당장/다음/금지 를 평이한 말로 붙인다.
-    yield _sse("status", {"step": "쉬운 설명 생성 중", "tool": None})
+    # 정식 절차로 승격 — 스테퍼에 단계로 표시되고, 구조화 이벤트로도 방출된다.
+    yield _delib("stage", stage="explain")
+    yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
     try:
         _plain = (await _llm_text(
             llm, "당신은 어려운 기술 결정을 비전문가에게 설명하는 사람입니다. 쉬운 말로, 과장 없이.",
@@ -1023,6 +1025,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _plain = ""
     if _plain:
         decision = f"{decision}\n\n---\n\n■ 쉬운 설명\n{_plain}"
+        # 별도 이벤트로도 내보내 프론트가 결정문과 분리된 카드로 렌더할 수 있게 한다.
+        yield _delib("plain", text=_plain)
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     yield _delib("stage", stage="report")
