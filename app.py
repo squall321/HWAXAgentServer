@@ -292,6 +292,22 @@ def _rewrite_local_urls(s: str) -> str:
 _turn_images: contextvars.ContextVar = contextvars.ContextVar("turn_images", default=None)
 
 
+ARTIFACT_KEEP = int(os.environ.get("ARTIFACT_KEEP", "500"))
+
+
+def _prune_artifacts() -> None:
+    """아티팩트 무한 증가 방지 — 최신 ARTIFACT_KEEP 개만 남긴다(챗 이미지는 단명 자원)."""
+    try:
+        fs = [os.path.join(ARTIFACT_DIR, f) for f in os.listdir(ARTIFACT_DIR)]
+        fs = [f for f in fs if os.path.isfile(f)]
+        if len(fs) <= ARTIFACT_KEEP:
+            return
+        for f in sorted(fs, key=os.path.getmtime)[:len(fs) - ARTIFACT_KEEP]:
+            os.remove(f)
+    except Exception:  # noqa: BLE001 — 정리 실패가 응답을 막으면 안 된다
+        pass
+
+
 def _stash_image_items(items) -> list:
     """MCP content 의 이미지 블록(base64)을 파일로 저장하고 서빙 URL 목록을 돌려준다."""
     import base64
@@ -312,6 +328,7 @@ def _stash_image_items(items) -> list:
         name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT.get(mime, "png")
         with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
             f.write(raw)
+        _prune_artifacts()
         urls.append(f"/agent/artifacts/{name}")
     bag = _turn_images.get()
     if bag is not None:
@@ -474,7 +491,9 @@ def _prep_tool(tool):
 
 # 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.
 # TOOL_MAX(0=무제한, prod 기본)로 바인딩 개수를 캡하고, 자주 쓰는 핵심 도구를 우선 남긴다.
-TOOL_MAX = int(os.environ.get("TOOL_MAX", "0"))
+# 기본 80 — 0(무제한)이면 랭킹이 아예 안 돌아 도구가 수백 개가 될 때 평평하게 쏟아진다.
+# 명시적으로 TOOL_MAX=0 을 주면 종전처럼 전체 바인딩(탈출구 유지).
+TOOL_MAX = int(os.environ.get("TOOL_MAX", "80"))
 _TOOL_PRIORITY = (
     "recommend_agents", "get_agent_session", "agent_search", "semantic_search", "list_records",
     "data_aggregate", "alert_check", "daily_briefing", "query_voc", "search_voc", "get_top_issues",
@@ -505,8 +524,10 @@ def _embed(texts: list, kind: str = "passage") -> list:
 
 def _ensure_tool_vecs(tools: list) -> None:
     """도구 벡터 캐시 — 도구 구성이 바뀔 때만 재계산(수백 개도 수 초)."""
+    import hashlib
     names = sorted(getattr(t, "name", "") for t in tools)
-    sig = str(len(names)) + "|" + (names[0] if names else "") + "|" + (names[-1] if names else "")
+    # 개수+첫/끝만 보면 중간 교체를 놓친다 — 전체 이름 해시로 정확히 무효화.
+    sig = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
     if _TOOL_VEC["sig"] == sig and _TOOL_VEC["vecs"]:
         return
     by = {getattr(t, "name", ""): t for t in tools}
@@ -768,8 +789,10 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = _select_tools([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()],
-                                      query, pinned)
+                import asyncio as _aio
+                _raw = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
+                # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
+                tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
