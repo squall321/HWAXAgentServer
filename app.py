@@ -721,6 +721,87 @@ def _tool_catalog(tools: dict) -> list[dict]:
     return out
 
 
+# 에이전트(전문가) 검색 — 도구와 같은 구조적 문제. LLM 에 659명을 나열시키면 결과 절단 캡에
+# 걸려 중간에 잘린다. 코드가 결정적으로 추천+분야 요약을 만들어 답한다(LLM 미경유).
+_AGENT_SEARCH_TRIGGERS = ("/전문가", "/에이전트", "/agents", "/agent")
+_AGENT_SEARCH_RE = re.compile(
+    r"(전문가|에이전트|agent)\w*\s*(검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)", re.IGNORECASE)
+
+
+def is_agent_search(message: str) -> bool:
+    m = (message or "").strip()
+    if any(m.startswith(t) for t in _AGENT_SEARCH_TRIGGERS):
+        return True
+    return len(m) <= 80 and bool(_AGENT_SEARCH_RE.search(m))
+
+
+def strip_agent_trigger(message: str) -> str:
+    m = (message or "").strip()
+    for t in _AGENT_SEARCH_TRIGGERS:
+        if m.startswith(t):
+            return m[len(t):].strip()
+    return m
+
+
+async def run_agent_search(app: FastAPI, query: str, groups: list[str]):
+    """전문가 카탈로그 SSE — 추천(관련도순) + 분야별 인원 요약을 결정적으로 만든다."""
+    yield _sse("status", {"step": "전문가 검색 중", "tool": "recommend_agents"})
+    try:
+        tools = await _tools_by_name(app, groups)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[agents] tools load failed: {exc!r}")
+        tools = {}
+    if not tools:
+        msg = "게이트웨이 도구를 불러오지 못했습니다 — 게이트웨이 상태를 확인하세요."
+        yield _sse("token", {"delta": msg}); yield _sse("result", {"type": "text", "content": msg})
+        yield _sse("done", {}); return
+
+    rec = []
+    if query.strip():
+        try:
+            recd = _parse_json(await _call(tools, "recommend_agents", {"q": query, "top_k": 10}))
+            items = recd if isinstance(recd, list) else (
+                (recd or {}).get("recommendations") or (recd or {}).get("agents") or (recd or {}).get("data") or [])
+            for it in (items or [])[:10]:
+                it = _first_dict(it)
+                k = it.get("agent_type") or it.get("id")
+                if k:
+                    rec.append({"key": k, "name": it.get("name") or k,
+                                "desc": (it.get("description") or "")[:160]})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agents] recommend failed: {exc!r}")
+
+    pool = []
+    try:
+        for a in _parse_json_multi(await _call(tools, "list_agents", {"compact": True})):
+            a = _first_dict(a)
+            k = a.get("agent_type") or a.get("id")
+            if k:
+                pool.append({"key": k, "name": a.get("name") or k})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[agents] list_agents failed: {exc!r}")
+
+    doms: dict = {}
+    for a in pool:
+        d = a["key"].split("-")[0] or "기타"
+        doms[d] = doms.get(d, 0) + 1
+    yield _sse("agents", {"query": query, "recommended": rec, "pool": pool,
+                          "domains": sorted(doms.items(), key=lambda x: -x[1])})
+
+    lines = [f"전문가 {len(pool)}명이 등록돼 있습니다."]
+    if rec:
+        lines.append(f"\n'{query}' 관련 추천 {len(rec)}명:")
+        lines += [f"- {r['name']} (`{r['key']}`)" + (f" — {r['desc'][:90]}" if r["desc"] else "") for r in rec]
+    if doms:
+        top = ", ".join(f"{d} {n}명" for d, n in sorted(doms.items(), key=lambda x: -x[1])[:10])
+        lines.append(f"\n분야별: {top}")
+    lines.append("\n특정 전문가와 대화하려면 챗 시작 화면의 '전문가·도구 고르고 시작'에서 고르세요.")
+    text = "\n".join(lines)
+    yield _sse("token", {"delta": text})
+    yield _sse("result", {"type": "text", "content": text})
+    yield _sse("done", {})
+
+
 _TOOL_SEARCH_TRIGGERS = ("/도구", "/tools", "/tool")
 _TOOL_SEARCH_RE = re.compile(r"(도구|툴|tool)\w*\s*(검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)", re.IGNORECASE)
 
@@ -960,6 +1041,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)
+    elif is_agent_search(req.message):
+        # "전문가 뭐 있어" 류 → 추천+분야 요약을 코드가 결정적으로 생성(LLM 나열 절단 방지).
+        stream = run_agent_search(app, strip_agent_trigger(req.message), req.groups)
     elif is_tool_search(req.message):
         # "/도구 <질의>" 또는 '도구 뭐 있어' 류 → 도구 카탈로그+추천을 SSE tools 이벤트로(결정적).
         # 프론트가 선택 UI 를 그리고, 고른 도구는 다음 발화부터 pinned_tools 로 우선 사용된다.
