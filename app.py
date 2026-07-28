@@ -219,10 +219,12 @@ def _sse(event: str, data: dict) -> bytes:
 # 불필요하게 잘린다 → 기본을 32000 으로 올리고, 소형 모델 박스만 .env 로 낮춘다.
 # 0 이면 무제한(권장 안 함 — 안전밸브 해제).
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "32000"))
-TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "240"))  # 도구 description 절단(문자) — 스키마 슬림
-HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "4000"))  # history 항목별 절단(문자)
-HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "16000"))  # history 전체 예산(문자) — 최신 우선
-HIST_MAX_ITEMS = 40  # history 최대 항목 수
+# 아래 기본값은 모두 대형 컨텍스트(prod B300 8기·GLM) 기준으로 넉넉하게 잡는다.
+# 소형 모델 박스(dev qwen 16K)만 .env 로 낮춘다 — 반대로 잡으면 prod 가 dev 사이즈에 묶인다.
+TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "1200"))  # 도구 description 절단(문자)
+HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "24000"))  # history 항목별 절단(문자)
+HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "200000"))  # history 전체 예산(문자) — 최신 우선
+HIST_MAX_ITEMS = int(os.environ.get("HIST_MAX_ITEMS", "80"))  # history 최대 항목 수
 
 
 def _cap(text, limit=None):

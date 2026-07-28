@@ -47,7 +47,7 @@ def _env_float(name: str, default: float) -> float:
 #   화면(회의 버블) — 가독성용 절단 유지, DELIB_CLIP_SCALE 로 배율 조절.
 N_PERSONAS = _env_int("DELIB_PERSONAS", 5)          # 참여 페르소나 수
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
-_TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 2000)  # RA 회의록 발언당 상한(API 보호용)
+_TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
 _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
