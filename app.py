@@ -27,14 +27,15 @@ Env:
   MCP_SERVERS     fallback: comma-separated name=url pairs (no per-server auth headers).
 """
 
+import contextvars
 import json
 import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
@@ -77,7 +78,10 @@ SYSTEM_PROMPT = (
     "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요. "
     "그래프·차트·시각화를 요청받으면 도구로 데이터를 조회한 뒤, 외부 리소스 없이 "
     "자체 완결된(self-contained, 인라인 SVG/스크립트) HTML을 ```html 코드블록으로 출력하세요 — "
-    "챗이 미리보기로 렌더링합니다.\n\n"
+    "챗이 미리보기로 렌더링합니다. "
+    "도구 결과에 이미지 URL(captured.images[].url 의 /agent/artifacts/… 또는 attachment 의 /ai-data-hub/attachments/… 형태)이 있으면 그 그래프를 "
+    "반드시 마크다운 이미지 문법 ![설명](url) 로 본문에 포함하세요 — 챗이 이미지로 렌더링합니다. "
+    "이미지 URL 이 있으면 HTML 차트를 새로 만들지 말고 그 이미지 포함을 우선하세요.\n\n"
     "포털 사용법·시작 방법을 물으면 다음을 안내하세요(도구 호출 불필요). "
     "권장 사용법은 이 웹 챗이 아니라 개인 Claude(Desktop/Claude Code)에 이 포털을 MCP로 연결해 쓰는 것입니다 — "
     "웹 챗은 가벼운 확인·데모용이며 본격 업무 사용은 권장되지 않습니다. 연결 방법: "
@@ -224,6 +228,120 @@ def _cap(text, limit=None):
     return s[:limit] + f"\n…[도구 출력 {len(s)}자 → {limit}자로 절단. 필요하면 limit/필터로 좁혀 다시 조회하세요]"
 
 
+# ── 도구 산출 이미지 아티팩트 — base64 캡처를 파일로 저장하고 URL 로 치환 ─────────────
+# AIDH 러너의 captured.images[].data(base64)가 그대로 LLM 에 가면 절단 캡에 깨지고 컨텍스트를
+# 태운다. 파일로 강등해 /artifacts 로 서빙하고, 결과에는 짧은 url 만 남긴다(챗 이미지 렌더 근원).
+ARTIFACT_DIR = os.environ.get(
+    "ARTIFACT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts"))
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+_ARTIFACT_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+                 "image/webp": "webp", "image/svg+xml": "svg"}
+
+
+def _stash_artifacts(obj, path_map: list | None = None) -> bool:
+    import base64
+    import hashlib
+    changed = False
+
+    def walk(v):
+        nonlocal changed
+        if isinstance(v, dict):
+            imgs = v.get("images")
+            if isinstance(imgs, list):
+                for im in imgs:
+                    if isinstance(im, dict) and isinstance(im.get("data"), str) and len(im["data"]) > 256:
+                        try:
+                            raw = base64.b64decode(im["data"])
+                        except Exception:  # noqa: BLE001 — 손상 base64 는 그대로 둔다
+                            continue
+                        ext = _ARTIFACT_EXT.get(str(im.get("mime")), "png")
+                        name = hashlib.sha256(raw).hexdigest()[:20] + "." + ext
+                        with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
+                            f.write(raw)
+                        im.pop("data", None)
+                        im["url"] = f"/agent/artifacts/{name}"
+                        if path_map is not None and im.get("path"):
+                            path_map.append((f"/work/{im['path']}", im["url"]))
+                        changed = True
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(obj)
+    return changed
+
+
+# AIDH 가 결과에 싣는 자기 로컬 원점(첨부 URL 등) → 포털 공개 경로 재작성.
+# 예: http://127.0.0.1:8001/attachments/… → /ai-data-hub/attachments/… (nginx 라우트 경유,
+# 브라우저에서 로드 가능). env 로 원점/공개경로 오버라이드 가능.
+_AIDH_LOCAL_ORIGINS = tuple(o.strip() for o in os.environ.get(
+    "AIDH_LOCAL_ORIGINS", "http://127.0.0.1:8001,http://localhost:8001").split(",") if o.strip())
+_AIDH_PUBLIC_BASE = os.environ.get("AIDH_PUBLIC_BASE", "/ai-data-hub")
+
+
+def _rewrite_local_urls(s: str) -> str:
+    for o in _AIDH_LOCAL_ORIGINS:
+        if o in s:
+            s = s.replace(o, _AIDH_PUBLIC_BASE)
+    return s
+
+
+# 이번 턴에 생성된 이미지 URL — 약한 모델이 ![](url) 인용을 빠뜨려도 결정적으로 첨부한다.
+_turn_images: contextvars.ContextVar = contextvars.ContextVar("turn_images", default=None)
+
+
+def _stash_image_items(items) -> list:
+    """MCP content 의 이미지 블록(base64)을 파일로 저장하고 서빙 URL 목록을 돌려준다."""
+    import base64
+    import hashlib
+    urls = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        # 키 이름은 계층마다 다르다 — MCP SDK(data/mimeType) vs 게이트웨이 정규화(base64/mime_type).
+        data = it.get("data") or it.get("base64")
+        mime = it.get("mimeType") or it.get("mime_type") or it.get("mime") or ""
+        if not (isinstance(data, str) and len(data) > 256 and str(mime).startswith("image/")):
+            continue
+        try:
+            raw = base64.b64decode(data)
+        except Exception:  # noqa: BLE001 — 손상 base64 는 건너뜀
+            continue
+        name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT.get(mime, "png")
+        with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
+            f.write(raw)
+        urls.append(f"/agent/artifacts/{name}")
+    bag = _turn_images.get()
+    if bag is not None:
+        for u in urls:
+            if u not in bag:
+                bag.append(u)
+    return urls
+
+
+def _extract_artifacts_text(s):
+    """도구 결과 문자열에서 captured.images base64 → 파일+url 치환 + 로컬 URL 공개경로 재작성."""
+    if isinstance(s, str):
+        s = _rewrite_local_urls(s)
+    if not isinstance(s, str) or '"images"' not in s or '"data"' not in s:
+        return s
+    try:
+        obj = json.loads(s)
+    except (ValueError, TypeError):
+        return s
+    pm: list = []
+    if _stash_artifacts(obj, pm):
+        out = json.dumps(obj, ensure_ascii=False)
+        # 결과 텍스트(stdout 의 out_path 등)에 남은 샌드박스 경로를 서빙 URL 로 치환 —
+        # LLM 이 /work/out.png 를 그대로 인용해 깨진 이미지가 되는 것을 막는다(실측).
+        for old_p, url in pm:
+            out = out.replace(old_p, url).replace(old_p.replace("/", "\\/"), url)
+        return out
+    return s
+
+
 def _cap_tool(tool):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
     프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384)."""
@@ -231,11 +349,24 @@ def _cap_tool(tool):
     if orig is None:
         return tool
 
+    def _norm(v):
+        # MCP content-item 리스트 처리. str(list) 파이썬 repr 로 문자열화되면 URL 재작성·
+        # 아티팩트 추출이 전부 우회된다(실측: 튜플 content 도 리스트).
+        # 이미지 블록(type=image, base64 data)은 AIDH 가 JSON 밖 ImageContent 로 보내므로
+        # 여기서 파일로 저장하고 URL 을 텍스트에 덧붙여야 LLM 이 ![](url) 로 인용할 수 있다.
+        if isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
+            texts = [str(i.get("text", "")) for i in v if "text" in i]
+            urls = _stash_image_items(v)
+            v = "".join(texts)
+            if urls:
+                v += "\n[생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n" + "\n".join(urls)
+        return _extract_artifacts_text(v)
+
     async def capped(*a, **kw):
         out = await orig(*a, **kw)
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            return (_cap(out[0]), out[1])
-        return _cap(out)
+            return (_cap(_norm(out[0])), out[1])
+        return _cap(_norm(out))
 
     tool.coroutine = capped
     return tool
@@ -323,6 +454,39 @@ def _tok_query(text: str) -> set[str]:
     return out
 
 
+# 도구 → 소유 MCP 앱(백엔드) 매핑 — 166개가 평평하게 쏟아지면 고르기 어려워, 게이트웨이의
+# /tools-map 으로 '어느 앱의 기능인지'를 붙여 계층 선택이 되게 한다(짧은 TTL 캐시).
+_GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
+_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}}
+_GROUP_LABEL = {
+    "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
+    "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
+    "heax-thermal_shock_mcp": "열충격 해석", "heax-materialtwin_web": "재료 물성(MaterialTwin)",
+    "heax-laminate_analyzer_mcp": "적층 복합재 해석", "heax-web_design_agents": "웹 디자인 에이전트",
+}
+
+
+def _tools_map() -> dict:
+    import time
+    import urllib.request
+    now = time.time()
+    if _TOOLS_MAP_CACHE["map"] and now - _TOOLS_MAP_CACHE["at"] < 300:
+        return _TOOLS_MAP_CACHE["map"]
+    try:
+        with urllib.request.urlopen(f"{_GW_HTTP}/tools-map", timeout=5) as r:
+            m = (json.loads(r.read()) or {}).get("map") or {}
+        if m:
+            _TOOLS_MAP_CACHE.update({"at": now, "map": m})
+    except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
+        print(f"[tools] map fetch failed: {exc!r}")
+    return _TOOLS_MAP_CACHE["map"]
+
+
+def _group_of(name: str) -> tuple:
+    key = _tools_map().get(name, "")
+    return key, _GROUP_LABEL.get(key, key or "기타")
+
+
 def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
     """게이트웨이 도구를 질의 관련도순으로 — [{name, desc, score}] (score>0 만)."""
     qtok = _tok_query(query)
@@ -335,12 +499,20 @@ def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
         if hits:
             scored.append((hits / len(qtok), name, (getattr(t, "description", "") or "")[:160]))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    return [{"name": n, "desc": d, "score": round(s, 3)} for s, n, d in scored[:top_k]]
+    out = []
+    for sc, n, d in scored[:top_k]:
+        gk, gl = _group_of(n)
+        out.append({"name": n, "desc": d, "score": round(sc, 3), "group": gk, "group_label": gl})
+    return out
 
 
 def _tool_catalog(tools: dict) -> list[dict]:
-    return [{"name": n, "desc": (getattr(t, "description", "") or "")[:160]}
-            for n, t in sorted(tools.items())]
+    out = []
+    for n, t in sorted(tools.items()):
+        gk, gl = _group_of(n)
+        out.append({"name": n, "desc": (getattr(t, "description", "") or "")[:160],
+                    "group": gk, "group_label": gl})
+    return out
 
 
 _TOOL_SEARCH_TRIGGERS = ("/도구", "/tools", "/tool")
@@ -484,6 +656,8 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
 
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
+    turn_imgs: list = []
+    _turn_images.set(turn_imgs)
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
@@ -528,7 +702,15 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
                                       **({"detail": args} if args else {})})
             elif kind == "on_tool_end":
-                out = _tool_preview(event.get("data", {}).get("output"))
+                # 도구 출력에 실린 아티팩트 URL 수집 — contextvar 는 LangGraph 실행 컨텍스트를
+                # 넘지 못해(실측 빈 값) 스트림 쪽에서 직접 회수한다.
+                _raw = event.get("data", {}).get("output")
+                _txt = getattr(_raw, "content", _raw)
+                if isinstance(_txt, str):
+                    for _u in re.findall(r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]*", _txt):
+                        if _u not in turn_imgs:
+                            turn_imgs.append(_u)
+                out = _tool_preview(_raw)
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
                                       **({"result_preview": out} if out else {})})
     except Exception as exc:
@@ -543,7 +725,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         yield _sse("error", {"code": "agent_error", "message": f"에이전트 처리 중 오류{detail}"})
         yield _sse("done", {})
         return
-    yield _sse("result", {"type": "text", "content": "".join(full)})
+    text = "".join(full)
+    # 도구가 만든 그래프를 모델이 인용하지 않았으면 코드가 붙인다 — 소형 모델의 지시 누락으로
+    # 생성된 이미지가 화면에서 사라지는 것을 막는 결정적 보강(중복 첨부는 방지).
+    # 마크다운 이미지 형태(](url))가 없으면 첨부 — 모델이 URL 을 본문에 평문으로만 적은 경우도 보강.
+    missing = [u for u in turn_imgs if f"]({u})" not in text]
+    if missing:
+        add = "\n\n" + "\n".join(f"![생성된 그래프]({u})" for u in missing)
+        text += add
+        yield _sse("token", {"delta": add})
+    yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
 
 
@@ -695,6 +886,17 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
     except Exception as exc:  # noqa: BLE001
         print(f"[catalog] records failed: {exc!r}")
     return out
+
+
+@app.get("/artifacts/{name}")
+def get_artifact(name: str) -> FileResponse:
+    """도구 산출 이미지 서빙 — _stash_artifacts 가 저장한 파일만(이름은 해시라 열거 불가)."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", name) or ".." in name:
+        raise HTTPException(status_code=404)
+    p = os.path.join(ARTIFACT_DIR, name)
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404)
+    return FileResponse(p)
 
 
 @app.get("/health")
