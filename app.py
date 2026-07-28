@@ -213,7 +213,12 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "6000"))  # 도구 결과 절단(문자) — 컨텍스트 보호
+# 도구 결과 절단(문자) — 컨텍스트 보호용 안전밸브. 무제한이면 대량 조회(VOC 수천 건)가
+# 프롬프트를 넘겨 'maximum context length' 로 챗 전체가 죽는다(dev 16K 실측).
+# 다만 6000 은 dev(16K) 기준값이라 대형 컨텍스트 모델(prod GLM)에 그대로 쓰면 목록이
+# 불필요하게 잘린다 → 기본을 32000 으로 올리고, 소형 모델 박스만 .env 로 낮춘다.
+# 0 이면 무제한(권장 안 함 — 안전밸브 해제).
+TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "32000"))
 TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "240"))  # 도구 description 절단(문자) — 스키마 슬림
 HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "4000"))  # history 항목별 절단(문자)
 HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "16000"))  # history 전체 예산(문자) — 최신 우선
@@ -225,7 +230,10 @@ def _cap(text, limit=None):
     s = text if isinstance(text, str) else str(text)
     if len(s) <= limit:
         return s
-    return s[:limit] + f"\n…[도구 출력 {len(s)}자 → {limit}자로 절단. 필요하면 limit/필터로 좁혀 다시 조회하세요]"
+    # 잘린 사실과 대처를 모델이 오해 없이 알도록 명시 — '이게 전부'로 착각해 잘못 답하는 것 방지.
+    return s[:limit] + (
+        f"\n…[경고: 도구 출력이 {len(s)}자였고 {limit}자에서 잘렸습니다. 이건 전체가 아닙니다. "
+        f"전체 목록을 나열하지 말고, limit/필터/기간으로 좁혀 다시 조회하거나 집계 도구를 쓰세요.]")
 
 
 # ── 도구 산출 이미지 아티팩트 — base64 캡처를 파일로 저장하고 URL 로 치환 ─────────────
