@@ -79,6 +79,8 @@ SYSTEM_PROMPT = (
     "그래프·차트·시각화를 요청받으면 도구로 데이터를 조회한 뒤, 외부 리소스 없이 "
     "자체 완결된(self-contained, 인라인 SVG/스크립트) HTML을 ```html 코드블록으로 출력하세요 — "
     "챗이 미리보기로 렌더링합니다. "
+    "지식 구조도·관계도·흐름도·계통도를 그릴 때는 ASCII 나 코드가 아니라 반드시 ```mermaid 코드블록으로 "
+    "출력하세요(graph TD / flowchart LR / mindmap 등) — 챗이 실제 다이어그램으로 렌더링합니다. "
     "도구 결과에 이미지 URL(captured.images[].url 의 /agent/artifacts/… 또는 attachment 의 /ai-data-hub/attachments/… 형태)이 있으면 그 그래프를 "
     "반드시 마크다운 이미지 문법 ![설명](url) 로 본문에 포함하세요 — 챗이 이미지로 렌더링합니다. "
     "이미지 URL 이 있으면 HTML 차트를 새로 만들지 말고 그 이미지 포함을 우선하세요.\n\n"
