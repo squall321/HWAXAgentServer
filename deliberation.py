@@ -1006,6 +1006,24 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
 
+    # 4c) 쉬운 설명 — 의사결정문은 전문 용어·수치로 촘촘해 비전문가·경영층이 '그래서 뭘 하라는
+    #     건지' 못 읽는다. 맨 뒤에 한마디 결론 + 왜 그런지 + 당장/다음/금지 를 평이한 말로 붙인다.
+    yield _sse("status", {"step": "쉬운 설명 생성 중", "tool": None})
+    try:
+        _plain = (await _llm_text(
+            llm, "당신은 어려운 기술 결정을 비전문가에게 설명하는 사람입니다. 쉬운 말로, 과장 없이.",
+            "다음 의사결정문을 처음 보는 사람도 이해하게 정리하라. 형식:\n"
+            "### 한마디로\n(무엇을 하라는 것인지 한 문장)\n"
+            "### 왜 그런가\n(핵심 근거 2~3개 — 수치가 있으면 쉬운 말로 풀어서)\n"
+            "### 당장 할 일 / 다음에 할 일 / 하지 말 것\n(각 2~4개 불릿, 전문용어는 괄호로 풀어쓰기)\n"
+            "새로운 내용을 지어내지 말고 원문에 있는 것만 쉽게 바꿔라.\n\n"
+            f"{decision[:7000]}")).strip()
+    except Exception as exc:  # noqa: BLE001 — 실패해도 의사결정문은 그대로
+        print(f"[deliberation] plain summary failed: {exc!r}")
+        _plain = ""
+    if _plain:
+        decision = f"{decision}\n\n---\n\n■ 쉬운 설명\n{_plain}"
+
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     yield _delib("stage", stage="report")
     yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
@@ -1030,7 +1048,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
             "results": [results_t[:1500]],
             # 맨 앞 '핵심 요약' 문단 + 의사결정문. 요약이 한 슬롯 먹어도 본문이 안 잘리게 +1.
-            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:13],
+            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:20],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
                         f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:40],
         }
