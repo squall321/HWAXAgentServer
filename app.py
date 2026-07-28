@@ -658,6 +658,45 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     return {"recommended": recommended, "candidates": candidates, "pool": pool, "tools": tools_info}
 
 
+class AgentDetailRequest(BaseModel):
+    key: str
+    groups: list[str] = []
+
+
+@app.post("/catalog/agent")
+async def catalog_agent(req: AgentDetailRequest) -> dict:
+    """전문가 상세 + 보유 지식(레코드 목록) — 브라우즈 UI 용(결정적·LLM 미경유).
+    LLM 텍스트 나열은 결과 절단 캡에 걸려 잘리므로, 탐색은 이 데이터로 UI 가 그린다."""
+    tools = await _tools_by_name(app, req.groups)
+    if not tools:
+        return {"error": "gateway_unavailable"}
+    key = req.key.strip()[:120]
+    out: dict = {"key": key, "name": key, "role": "", "tags": [], "samples": [], "records": []}
+    try:
+        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
+        sd = _first_dict(sess.get("data", sess))
+        out["name"] = sd.get("name") or key
+        out["role"] = str(sd.get("description") or "")[:2000]
+        out["tags"] = list(sd.get("common_tags") or [])[:30]
+        out["samples"] = [str(s)[:200] for s in (sd.get("sample_queries") or [])][:5]
+    except Exception as exc:  # noqa: BLE001 — 상세 실패해도 지식 목록은 시도
+        print(f"[catalog] agent session failed: {exc!r}")
+    try:
+        raw = _parse_json(await _call(tools, "list_records", {"agents": [key], "limit": 20}))
+        recs = raw if isinstance(raw, list) else (
+            (raw or {}).get("records") or (raw or {}).get("items") or (raw or {}).get("data") or [])
+        for r in recs[:20]:
+            r = _first_dict(r)
+            rid = r.get("id") or r.get("record_id") or ""
+            title = r.get("title") or ""
+            if rid or title:
+                out["records"].append({"id": str(rid)[:80], "title": str(title)[:160],
+                                       "data_type": str(r.get("data_type") or "")[:20]})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[catalog] records failed: {exc!r}")
+    return out
+
+
 @app.get("/health")
 def health() -> dict:
     return {
