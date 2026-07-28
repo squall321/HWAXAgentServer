@@ -463,6 +463,7 @@ _GROUP_LABEL = {
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
     "heax-thermal_shock_mcp": "열충격 해석", "heax-materialtwin_web": "재료 물성(MaterialTwin)",
     "heax-laminate_analyzer_mcp": "적층 복합재 해석", "heax-web_design_agents": "웹 디자인 에이전트",
+    "_gateway": "게이트웨이 공통",
 }
 
 
@@ -482,9 +483,20 @@ def _tools_map() -> dict:
     return _TOOLS_MAP_CACHE["map"]
 
 
+def _pretty_group(key: str) -> str:
+    """미등록 앱의 표시 이름 자동 생성 — 새 MCP 앱이 붙어도 코드 수정 없이 읽을 만하게 뜬다.
+    예: heax-voice_recorder → Voice Recorder, my-new-app → My New App."""
+    if not key:
+        return "기타"
+    k = key[5:] if key.startswith("heax-") else key
+    k = k.removesuffix("_mcp").removesuffix("-mcp")
+    words = [w for w in re.split(r"[-_\s]+", k) if w]
+    return " ".join(w if w.isupper() else w.capitalize() for w in words) or key
+
+
 def _group_of(name: str) -> tuple:
     key = _tools_map().get(name, "")
-    return key, _GROUP_LABEL.get(key, key or "기타")
+    return key, _GROUP_LABEL.get(key) or _pretty_group(key)
 
 
 def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
