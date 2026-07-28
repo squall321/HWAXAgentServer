@@ -362,11 +362,48 @@ def _cap_tool(tool):
                 v += "\n[생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n" + "\n".join(urls)
         return _extract_artifacts_text(v)
 
+    def _arg_hint() -> str:
+        """도구 인자 스키마 요약 — 실패 시 되돌려 LLM 이 인자명·타입·단위를 교정하게 한다."""
+        sc = getattr(tool, "args_schema", None)
+        if not isinstance(sc, dict):
+            return ""
+        req = set(sc.get("required") or [])
+        rows = []
+        for k, v in list((sc.get("properties") or {}).items())[:14]:
+            if isinstance(v, dict):
+                rows.append(f"{k}{'*' if k in req else ''}:{v.get('type','any')}"
+                            + (f" — {str(v.get('description',''))[:60]}" if v.get("description") else ""))
+        return " | ".join(rows)
+
+    def _maybe_repair_hint(s):
+        # 인자 검증 실패(누락·타입·단위)는 스키마만 다시 보여주면 다음 시도에서 대개 교정된다.
+        if not isinstance(s, str):
+            return s
+        head = s[:600].lower()
+        # 실측 문구: "3 validation errors for …Arguments / Field required" (pydantic),
+        # "missing required arg" (매니페스트 검증), "입력 스키마 위반" (heax 앱 규약).
+        if any(k in head for k in ("missing required arg", "입력 스키마 위반", "validation error",
+                                   "field required", "unexpected keyword", "invalid arguments",
+                                   "error executing tool")):
+            hint = _arg_hint()
+            if hint:
+                return s + f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출하세요]\n{hint}"
+        return s
+
     async def capped(*a, **kw):
-        out = await orig(*a, **kw)
+        try:
+            out = await orig(*a, **kw)
+        except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
+            # 예외를 그대로 올리면 LangChain 이 원문만 보여줘 LLM 이 같은 실수를 반복한다.
+            # 스키마를 실어 돌려주면 다음 시도에서 인자명·타입·단위가 교정된다.
+            hint = _arg_hint()
+            msg = f"도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
+            msg += f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{hint}" if hint else ""
+            # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
+            return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            return (_cap(_norm(out[0])), out[1])
-        return _cap(_norm(out))
+            return (_maybe_repair_hint(_cap(_norm(out[0]))), out[1])
+        return _maybe_repair_hint(_cap(_norm(out)))
 
     tool.coroutine = capped
     return tool
@@ -395,9 +432,44 @@ def _slim_tool(tool):
     return tool
 
 
+def _tag_tool_app(tool):
+    """도구 설명 앞에 소유 앱 라벨을 붙인다 — get_*/list_* 처럼 이름이 겹치는 도구가 여러 앱에
+    걸쳐 있어(실측: get_* 7개 앱) LLM 이 도메인을 혼동한다. 이름을 안 바꾸므로 호출 계약은 불변."""
+    try:
+        _, label = _group_of(getattr(tool, "name", ""))
+        if label and label != "기타" and not str(tool.description or "").startswith("["):
+            tool.description = f"[{label}] {tool.description or ''}"
+    except Exception:  # noqa: BLE001 — 태깅 실패해도 도구는 살린다
+        pass
+    return tool
+
+
+def _attach_validation_hint(tool):
+    """인자 검증 실패는 코루틴 진입 전(StructuredTool.ainvoke 의 pydantic 검증)에 발생해
+    결과 래퍼로는 못 잡는다(실측). LangChain 의 handle_validation_error 훅에 스키마 힌트를
+    실어, 인자명·타입·단위를 틀려도 다음 시도에서 교정되게 한다."""
+    try:
+        sc = getattr(tool, "args_schema", None)
+        hint = ""
+        if isinstance(sc, dict):
+            req = set(sc.get("required") or [])
+            rows = []
+            for k, v in list((sc.get("properties") or {}).items())[:14]:
+                if isinstance(v, dict):
+                    rows.append(f"{k}{'*' if k in req else ''}:{v.get('type','any')}"
+                                + (f" — {str(v.get('description',''))[:60]}" if v.get("description") else ""))
+            hint = " | ".join(rows)
+        if hint:
+            tool.handle_validation_error = (
+                lambda e, _h=hint: f"인자 오류: {e}\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{_h}")
+    except Exception:  # noqa: BLE001 — 훅 부착 실패해도 도구는 살린다
+        pass
+    return tool
+
+
 def _prep_tool(tool):
-    """도구 로드 직후 한 번에 적용하는 체인: 스키마 슬림 + 결과 절단."""
-    return _cap_tool(_slim_tool(tool))
+    """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단."""
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool))))
 
 
 # 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.
@@ -412,16 +484,32 @@ _TOOL_PRIORITY = (
 )
 
 
-def _cap_tool_count(tools: list, pinned: list[str] | None = None) -> list:
+def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None) -> list:
+    """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
+    '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 사용자 지정(핀) ② 질의 어휘 관련도
+    ③ 상시 핵심(라우팅·검색) ④ 나머지. 캡 미설정(0)이면 전부 바인딩(회귀 0)."""
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
         return tools
-    rank = {n: i for i, n in enumerate(_TOOL_PRIORITY)}
-    pin = set(pinned or [])   # 사용자 지정 도구는 캡 상황에서도 반드시 바인딩되게 최우선
-    ordered = sorted(tools, key=lambda t: (0 if getattr(t, "name", "") in pin else 1,
-                                           rank.get(getattr(t, "name", ""), len(rank)),
-                                           getattr(t, "name", "")))
-    kept = ordered[:TOOL_MAX]
-    print(f"[agent] TOOL_MAX={TOOL_MAX} — {len(tools)}개 중 {len(kept)}개 바인딩(소형 컨텍스트 보호)")
+    pin = set(pinned or [])
+    core = {n: i for i, n in enumerate(_TOOL_PRIORITY)}
+    # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
+    qtok = _tok_query(query)
+    def rel(t) -> float:
+        if not qtok:
+            return 0.0
+        prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
+        hit = sum(1 for k in qtok if k in prof)
+        return hit / len(qtok)
+    scored = [(t, rel(t)) for t in tools]
+    ordered = sorted(scored, key=lambda x: (
+        0 if getattr(x[0], "name", "") in pin else 1,   # 핀 최우선
+        -round(x[1], 3),                                 # 질의 관련도 높은 순
+        core.get(getattr(x[0], "name", ""), len(core)),  # 상시 핵심
+        getattr(x[0], "name", ""),
+    ))
+    kept = [t for t, _ in ordered[:TOOL_MAX]]
+    n_rel = sum(1 for t, sc in ordered[:TOOL_MAX] if sc > 0)
+    print(f"[agent] tool select: {len(tools)}개 → {len(kept)}개 (질의관련 {n_rel}, 핀 {len(pin)})")
     return kept
 
 
@@ -575,13 +663,18 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
     yield _sse("done", {})
 
 
-async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None):
+
+async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
+                     query: str = ""):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
     (무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 우선순위 반영)."""
     pin_key = tuple(sorted(pinned)) if (pinned and TOOL_MAX > 0) else ()
-    key = (frozenset(groups), pin_key)
+    # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
+    # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
+    q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
+    key = (frozenset(groups), pin_key, q_key)
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
@@ -590,8 +683,8 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         if connections:
             try:
                 scoped = _with_groups(connections, sorted(groups))
-                tools = _cap_tool_count([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()],
-                                        pinned)
+                tools = _select_tools([_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()],
+                                      query, pinned)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
@@ -675,7 +768,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
-        agent = await _agent_for(app, req.groups, pinned)
+        agent = await _agent_for(app, req.groups, pinned, req.message)
         sys_prompt = SYSTEM_PROMPT
         if pinned:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
