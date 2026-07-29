@@ -63,6 +63,8 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen2.5-7b-dev")
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY") or "EMPTY"
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "")
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
+from urllib.parse import quote  # 그룹 헤더 안전 인코딩
+
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
 SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 반드시 한국어로만 답하세요 — "
@@ -116,7 +118,11 @@ def _load_mcp_config() -> dict:
 def _with_groups(connections: dict, groups: list[str]) -> dict:
     """Clone the MCP connection config, injecting the caller's groups header so the gateway
     can filter the tool list (and guard tool calls). Does not mutate the input."""
-    hdr = ",".join(groups)
+    # HTTP 헤더는 latin-1 만 담을 수 있다. '연구소' 같은 한글 그룹명을 그대로 실으면
+    # UnicodeEncodeError 로 도구 로딩 전체가 실패하고, 그 사용자는 조용히 '도구 0개'가 된다
+    # (실측 로그: tool load FAILED groups=['연구소'] UnicodeEncodeError). 퍼센트 인코딩해
+    # 보내고 게이트웨이가 디코드한다 — ASCII 그룹명은 인코딩해도 그대로라 하위호환된다.
+    hdr = quote(",".join(groups), safe=",")
     out = {}
     for name, cfg in connections.items():
         cfg = dict(cfg)
@@ -186,6 +192,10 @@ async def lifespan(app: FastAPI):
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
     app.state.agent_cache = {}  # frozenset(groups) -> compiled ReAct agent
+    # 도구 로딩 오류는 그룹셋별로 보관한다. 전역 스칼라로 두면 한 그룹의 일시적 실패가
+    # 다른 사용자 턴까지 '도구 없음'으로 오염시키고, 캐시 적중 경로에선 해제조차 안 돼
+    # 영구 고착된다(실측: 실패한 적 없는 그룹이 계속 "도구 연결 복구되면 다시" 응답).
+    app.state.tool_load_error = {}  # frozenset(groups) -> 마지막 실패 사유
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
     yield
 
@@ -912,10 +922,11 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     detail = f"HTTP {_st}"
                 else:
                     detail = f"{type(_root).__name__}: {str(_root)[:120]}"
-                app.state.tool_load_error = detail
+                app.state.tool_load_error[frozenset(groups)] = detail
                 print(f"[agent] tool load FAILED groups={sorted(groups)} {detail} ({exc!r}); no tools")
         if not load_failed:
-            app.state.tool_load_error = None
+            # 성공했으면 이 그룹셋의 과거 오류를 지운다(다른 그룹셋 상태는 건드리지 않는다).
+            app.state.tool_load_error.pop(frozenset(groups), None)
         agent = create_react_agent(app.state.llm, tools)
         if load_failed:
             # 실패 결과는 캐시하지 않는다 — 캐시하면 게이트웨이가 복구돼도 이 그룹은
@@ -1012,7 +1023,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
-        _tool_err = getattr(app.state, "tool_load_error", None)
+        _tool_err = (getattr(app.state, "tool_load_error", None) or {}).get(frozenset(req.groups))
         sys_prompt = SYSTEM_PROMPT
         if _tool_err:
             yield _sse("status", {"step": f"도구 목록을 불러오지 못했습니다({_tool_err}) — 도구 없이 답변합니다",
