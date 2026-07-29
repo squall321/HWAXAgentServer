@@ -888,7 +888,34 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
-                print(f"[agent] tool load failed for groups={sorted(groups)} ({exc}); no tools")
+                # 상태코드를 뽑아 둔다 — prod 에서 '툴콜이 되었다 안 되었다' 할 때 401(토큰)
+                # 인지 타임아웃인지 구분이 안 되면 원인 추적이 불가능하다.
+                # MCP 클라이언트는 실패를 ExceptionGroup 으로 감싸 던진다 — 그대로 두면
+                # "unhandled errors in a TaskGroup" 만 남아 401 인지 타임아웃인지 알 수 없다.
+                # 하위 예외/원인 사슬을 훑어 HTTP 상태나 실제 메시지를 뽑는다.
+                def _root_cause(e, depth=0):
+                    if depth > 6:
+                        return e
+                    subs = getattr(e, "exceptions", None)  # ExceptionGroup
+                    if subs:
+                        return _root_cause(subs[0], depth + 1)
+                    nxt = e.__cause__ or e.__context__
+                    return _root_cause(nxt, depth + 1) if nxt is not None else e
+                _root = _root_cause(exc)
+                _st = getattr(getattr(_root, "response", None), "status_code", None)
+                if _st is None:
+                    _m = re.search(r"\b(4\d\d|5\d\d)\b", str(_root))
+                    _st = int(_m.group(1)) if _m else None
+                if _st == 401:
+                    detail = "HTTP 401 — 게이트웨이 인증 실패(GW_TOKEN 불일치/만료)"
+                elif _st:
+                    detail = f"HTTP {_st}"
+                else:
+                    detail = f"{type(_root).__name__}: {str(_root)[:120]}"
+                app.state.tool_load_error = detail
+                print(f"[agent] tool load FAILED groups={sorted(groups)} {detail} ({exc!r}); no tools")
+        if not load_failed:
+            app.state.tool_load_error = None
         agent = create_react_agent(app.state.llm, tools)
         if load_failed:
             # 실패 결과는 캐시하지 않는다 — 캐시하면 게이트웨이가 복구돼도 이 그룹은
@@ -970,7 +997,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
         agent = await _agent_for(app, req.groups, pinned, req.message)
+        # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
+        # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
+        # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
+        _tool_err = getattr(app.state, "tool_load_error", None)
         sys_prompt = SYSTEM_PROMPT
+        if _tool_err:
+            yield _sse("status", {"step": f"도구 목록을 불러오지 못했습니다({_tool_err}) — 도구 없이 답변합니다",
+                                  "tool": None})
+            sys_prompt += ("\n\n[중요] 이번 턴에는 사용 가능한 도구가 하나도 없다(게이트웨이 연결 실패). "
+                           "도구를 호출하겠다고 말하지 말고, 도구 없이 답할 수 있는 범위만 답한 뒤 "
+                           "도구가 필요하다면 '도구 연결이 복구되면 다시 시도해 달라'고 알려라.")
         if pinned:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
