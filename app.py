@@ -437,9 +437,25 @@ def _cap_tool(tool):
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
             # 예외를 그대로 올리면 LangChain 이 원문만 보여줘 LLM 이 같은 실수를 반복한다.
             # 스키마를 실어 돌려주면 다음 시도에서 인자명·타입·단위가 교정된다.
-            hint = _arg_hint()
+            # ⚠ 모든 예외에 '인자를 고쳐 다시 호출' 힌트를 붙이면 안 된다. 타임아웃·백엔드
+            # 다운·연결거부까지 인자 오류로 둔갑해, 모델이 멀쩡한 인자를 바꿔가며 재호출을
+            # 반복하고 대기 시간만 배로 늘린다(감사 확인). 인자 문제로 보일 때만 힌트를 준다.
+            _e = f"{type(exc).__name__}: {exc}"[:600].lower()
+            _is_transport = any(k in _e for k in (
+                "timeout", "timed out", "connect", "connection", "unavailable", "refused",
+                "backend", "502", "503", "504", "cancelled", "closed"))
+            _is_argerr = (not _is_transport) and any(k in _e for k in (
+                "validation error", "field required", "missing required arg", "unexpected keyword",
+                "invalid arguments", "입력 스키마 위반", "type_error", "value_error"))
+            hint = _arg_hint() if _is_argerr else ""
             msg = f"도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
-            msg += f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{hint}" if hint else ""
+            if hint:
+                msg += f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{hint}"
+            elif _is_transport:
+                # 인자를 바꿔봐야 소용없다는 것을 모델에게 명시해 무의미한 재시도를 끊는다.
+                msg += ("\n[안내] 인자 문제가 아니라 도구 백엔드 연결/시간초과다. "
+                        "같은 도구를 인자만 바꿔 다시 호출하지 말고, 다른 방법으로 답하거나 "
+                        "사용자에게 해당 백엔드가 일시적으로 불가하다고 알려라.")
             # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
             return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
@@ -615,7 +631,11 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
         prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
         hit = sum(1 for k in qtok if k in prof)
         return hit / len(qtok)
-    lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools))]
+    # ⚠ 어휘 무매치(rel=0) 도구는 lex_order 에 넣지 않는다. 넣으면 '알파벳 순 전체 순열'이
+    # 정상 랭킹인 척 RRF 에 들어가, 이름이 앞선 무관 도구가 진짜 관련 도구를 캡 밖으로 밀어낸다
+    # (감사 실측: query_voc/search_voc 가 탈락해 모델이 product_code 를 지어내고 다른 제품
+    # 통계를 답으로 내놓음 — 빈 결과보다 나쁜 '확신에 찬 오답').
+    lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools if rel(t) > 0))]
     sem_order = _semantic_order(query, tools)
     fused = _rrf(lex_order, sem_order) if sem_order else {}
     scored = [(t, rel(t)) for t in tools]
@@ -627,6 +647,21 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
         getattr(x[0], "name", ""),
     ))
     kept = [t for t, _ in ordered[:TOOL_MAX]]
+    # 핵심 도구 예약 슬롯 — 정렬키의 core 타이브레이크는 fused 값이 사실상 유일해 발동하지
+    # 않는다(감사: fused 고유값 167/168 → docstring 의 '③ 상시 핵심'은 죽은 코드였다).
+    # 그래서 순위와 별개로 존재하는 core 전량을 확보한다. 상위 N개만 예약하면 임베딩이
+    # 죽은 경로에서 오히려 회귀하므로(감사 검증) 개수를 자르지 않는다.
+    if TOOL_MAX > 0:
+        kept_names = {getattr(t, "name", "") for t in kept}
+        by_name = {getattr(t, "name", ""): t for t in tools}
+        missing_core = [by_name[n] for n in _TOOL_PRIORITY
+                        if n in by_name and n not in kept_names]
+        if missing_core:
+            # 뒤에서부터(=관련도 낮은 것부터) 비핀 도구를 밀어내고 core 를 넣는다.
+            keep_head = [t for t in kept if getattr(t, "name", "") in pin]
+            rest = [t for t in kept if getattr(t, "name", "") not in pin]
+            room = max(0, TOOL_MAX - len(keep_head) - len(missing_core))
+            kept = keep_head + missing_core + rest[:room]
     n_rel = sum(1 for t, sc in ordered[:TOOL_MAX] if sc > 0)
     print(f"[agent] tool select: {len(tools)}개 → {len(kept)}개 (질의관련 {n_rel}, 핀 {len(pin)})")
     return kept
@@ -1052,7 +1087,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
-        agent = await _agent_for(app, req.groups, pinned, req.message)
+        # 도구 선별 질의에는 최근 히스토리를 함께 넣는다. 현재 메시지만 보면 '다시 제출해줘',
+        # '그럼 그래프로 그려줘' 같은 후속 발화는 토큰이 거의 없어 관련도가 0이 되고, 직전 턴에
+        # 쓰던 도구가 캡 밖으로 사라진다(감사 실측: slurm 14개 → 0개, 모델이 이미 받은 잡 ID를
+        # 되물음). 사용자에겐 아무 오류도 안 보여 '갑자기 도구를 못 쓴다'로만 보인다.
+        _recent = " ".join(
+            str(h.get("content", ""))[:300]
+            for h in (req.history or [])[-2:]
+            if isinstance(h, dict)
+        )
+        _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
+        agent = await _agent_for(app, req.groups, pinned, _sel_q)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
@@ -1138,7 +1183,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             _msgs = (retry or {}).get("messages") or []
             _last = ""
             for m in reversed(_msgs):
+                # ⚠ 반드시 AI 메시지만. 아무 메시지나 집으면 도구 원문(ToolMessage), 사용자
+                # 질문(HumanMessage), 최악의 경우 **시스템 프롬프트 전문**(SystemMessage)이
+                # 그대로 답변으로 나간다(감사에서 실제 노출 확인). 폴백이 유출 경로가 되면 안 된다.
+                if getattr(m, "type", "") != "ai":
+                    continue
                 _c = getattr(m, "content", None)
+                if isinstance(_c, list):  # 멀티파트 방어
+                    _c = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c)
                 if isinstance(_c, str) and _c.strip() and not _looks_like_leaked_tool_call(_c):
                     _last = _c
                     break
@@ -1147,6 +1199,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 yield _sse("token", {"delta": "\n\n" + _last})
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] non-streaming retry failed: {exc!r}")
+            yield _sse("status", {"step": f"도구 호출 재시도 실패({type(exc).__name__})", "tool": None})
 
         # 재시도해도 여전히 누출이면 모델의 호출 능력에 기대지 않는다 — 새어 나온 호출을
         # 코드가 직접 실행하고 그 결과로 답을 만든다. 작은 모델에서도 도구가 '잡히게' 하는
