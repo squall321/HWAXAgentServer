@@ -46,6 +46,8 @@ from deliberation import (
     _env_int,
     _first_dict,
     _parse_json,
+    _call,
+    _llm_text,
     _tools_by_name,
     is_deliberation,
     is_report_save,
@@ -1010,6 +1012,37 @@ def _looks_like_leaked_tool_call(text: str) -> bool:
     return bool(_LEAK_RE.search(stripped))
 
 
+def _extract_leaked_calls(text: str) -> list:
+    """본문에 텍스트로 새어 나온 도구 호출을 구조로 복원한다.
+
+    작은 모델(하이쿠급)이나 파서가 안 맞는 서빙에서는 구조화 tool_call 을 못 내고
+    <tool_call>{"name":…,"arguments":…}</tool_call> 를 그냥 출력해 버린다. 재시도에만
+    기대면 같은 모델이 또 같은 실수를 하므로, 여기서 뽑아 **직접 실행**한다.
+    ```json 예시 블록은 설명 목적일 수 있어 제외한다.
+    """
+    if not text:
+        return []
+    body = re.sub(r"```.*?```", "", text, flags=re.S)
+    out, seen = [], set()
+    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"[^{}]*'
+                         r'"arguments"\s*:\s*(\{.*?\})\s*\}', body, re.S):
+        name = m.group(1)
+        try:
+            args = json.loads(m.group(2))
+        except Exception:  # noqa: BLE001 — 인자 파싱 실패면 빈 인자로 시도
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "arguments": args})
+        if len(out) >= 3:  # 한 턴에 과도 실행 방지
+            break
+    return out
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
@@ -1114,6 +1147,41 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 yield _sse("token", {"delta": "\n\n" + _last})
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] non-streaming retry failed: {exc!r}")
+
+        # 재시도해도 여전히 누출이면 모델의 호출 능력에 기대지 않는다 — 새어 나온 호출을
+        # 코드가 직접 실행하고 그 결과로 답을 만든다. 작은 모델에서도 도구가 '잡히게' 하는
+        # 마지막 방어선이다(모델이 구조화 호출을 영영 못 내도 사용자는 결과를 받는다).
+        if _looks_like_leaked_tool_call(text):
+            calls = _extract_leaked_calls(text)
+            if calls:
+                try:
+                    _tmap = await _tools_by_name(app, req.groups)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[agent] direct-exec tool load failed: {exc!r}")
+                    _tmap = {}
+                results = []
+                for c in calls:
+                    if c["name"] not in _tmap:
+                        continue
+                    yield _sse("status", {"step": f"도구 직접 실행: {c['name']}", "tool": c["name"]})
+                    try:
+                        r = await _call(_tmap, c["name"], c["arguments"])
+                    except Exception as exc:  # noqa: BLE001
+                        r = f"(tool {c['name']} error: {exc})"
+                    results.append((c["name"], _cap(str(r))))
+                if results:
+                    joined = "\n\n".join(f"[{n} 결과]\n{v}" for n, v in results)
+                    try:
+                        final = (await _llm_text(
+                            app.state.llm,
+                            "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
+                            "호출하겠다고 말하지 말고, 아래 결과만으로 답하라.",
+                            f"[사용자 질문]\n{req.message}\n\n{joined}")).strip()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[agent] direct-exec summarize failed: {exc!r}")
+                        final = joined
+                    text = final
+                    yield _sse("token", {"delta": "\n\n" + final})
     # 도구가 만든 그래프를 모델이 인용하지 않았으면 코드가 붙인다 — 소형 모델의 지시 누락으로
     # 생성된 이미지가 화면에서 사라지는 것을 막는 결정적 보강(중복 첨부는 방지).
     # 마크다운 이미지 형태(](url))가 없으면 첨부 — 모델이 URL 을 본문에 평문으로만 적은 경우도 보강.
