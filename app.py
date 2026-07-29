@@ -1063,7 +1063,12 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
     return role
 
 
-_LEAK_RE = re.compile(r'</?tool_call>|<\|tool_call\|>|\{\s*"name"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,\s*"arguments"\s*:')
+# 모델마다 호출 JSON 모양이 다르다. qwen/hermes 는 {"name":…,"arguments":…}, Anthropic 계열은
+# {"type":"tool_use","name":…,"input":…} 를 쓴다(실측: Haiku 가 input 형식으로 출력).
+# 한 형식만 알면 다른 모델에서 안전망이 통째로 무력해지므로 셋 다 인정한다.
+_LEAK_RE = re.compile(
+    r'</?tool_call>|<\|tool_call\|>|"type"\s*:\s*"tool_use"|'
+    r'"name"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"[^{}]{0,80}?"(?:arguments|input|parameters)"\s*:')
 
 
 def _looks_like_leaked_tool_call(text: str, no_tool_ran: bool = False) -> bool:
@@ -1092,8 +1097,13 @@ def _extract_leaked_calls(text: str, no_tool_ran: bool = False) -> list:
         return []
     body = text if no_tool_ran else re.sub(r"```.*?```", "", text, flags=re.S)
     out, seen = [], set()
-    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"[^{}]*'
-                         r'"arguments"\s*:\s*(\{.*?\})\s*\}', body, re.S):
+    # 이름과 인자 블록을 각각 찾는다 — 사이에 "type":"tool_use" 같은 다른 키가 끼어도,
+    # 인자 키가 arguments/input/parameters 중 무엇이어도 복원된다.
+    for m in re.finditer(
+        r'"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+        r'(?:\s*,\s*"[^"]+"\s*:\s*(?:"[^"]*"|null|true|false|-?[0-9.]+))*'
+        r'\s*,\s*"(?:arguments|input|parameters)"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})',
+            body, re.S):
         name = m.group(1)
         try:
             args = json.loads(m.group(2))
@@ -1113,7 +1123,9 @@ def _extract_leaked_calls(text: str, no_tool_ran: bool = False) -> list:
 
 _ANNOUNCE_RE = re.compile(
     r"(확인하겠습니다|조회하겠습니다|호출하겠습니다|가져오겠습니다|검색하겠습니다|알아보겠습니다|"
-    r"조회해\s?보겠습니다|바로\s?(조회|호출|확인)|let me (check|call|search|look)|i(?:'| wi)ll (call|check|search))")
+    r"조회해\s?보겠습니다|바로\s?(조회|호출|확인)|let me (check|call|search|look|get|fetch)|"
+    r"i(?:'| wi)ll (call|check|search|use|fetch)|i(?:'m| am) going to (call|check|use))",
+    re.IGNORECASE)  # "Let me check…" 처럼 문장 첫 글자가 대문자인 경우가 대부분이다
 
 
 def _announced_without_calling(text: str) -> bool:
