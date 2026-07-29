@@ -987,6 +987,18 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
     return role
 
 
+_LEAK_RE = re.compile(r'</?tool_call>|<\|tool_call\|>|\{\s*"name"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,\s*"arguments"\s*:')
+
+
+def _looks_like_leaked_tool_call(text: str) -> bool:
+    """모델이 도구 호출을 실행하지 못하고 호출문을 본문에 그대로 출력했는지 판정.
+    코드블록 안의 예시(```json …)는 설명 목적일 수 있으므로 제외한다."""
+    if not text:
+        return False
+    stripped = re.sub(r"```.*?```", "", text, flags=re.S)
+    return bool(_LEAK_RE.search(stripped))
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
@@ -1069,6 +1081,28 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         yield _sse("done", {})
         return
     text = "".join(full)
+    # 도구 호출이 '텍스트로 샌' 경우 구조 — vLLM 스트리밍 tool-call 파서가 호출을 못 뽑으면
+    # 모델이 낸 <tool_call>{"name":…,"arguments":…}</tool_call> 가 그대로 본문에 실려 오고,
+    # 도구는 하나도 실행되지 않는다. 사용자에겐 "조회했더니 아무것도 안 나온다"로 보인다
+    # (실측: 스트리밍 ON → 호출문 누출·미실행 / OFF → get_training_data 정상 실행).
+    # 캡을 씌우거나 무시하지 말고, 그 턴을 비스트리밍으로 한 번 다시 돌려 실제로 호출시킨다.
+    if _looks_like_leaked_tool_call(text):
+        print("[agent] tool-call leaked into text — 비스트리밍으로 재시도")
+        yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})
+        try:
+            retry = await agent.ainvoke(inputs)
+            _msgs = (retry or {}).get("messages") or []
+            _last = ""
+            for m in reversed(_msgs):
+                _c = getattr(m, "content", None)
+                if isinstance(_c, str) and _c.strip() and not _looks_like_leaked_tool_call(_c):
+                    _last = _c
+                    break
+            if _last:
+                text = _last
+                yield _sse("token", {"delta": "\n\n" + _last})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] non-streaming retry failed: {exc!r}")
     # 도구가 만든 그래프를 모델이 인용하지 않았으면 코드가 붙인다 — 소형 모델의 지시 누락으로
     # 생성된 이미지가 화면에서 사라지는 것을 막는 결정적 보강(중복 첨부는 방지).
     # 마크다운 이미지 형태(](url))가 없으면 첨부 — 모델이 URL 을 본문에 평문으로만 적은 경우도 보강.
