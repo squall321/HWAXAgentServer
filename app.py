@@ -1137,6 +1137,21 @@ def _announced_without_calling(text: str) -> bool:
     return bool(text) and bool(_ANNOUNCE_RE.search(text))
 
 
+# 도구를 부르지 않고 결과를 지어낸 흔적 — 표면이 완벽한 답변이라 사용자가 진짜 데이터로 믿는다.
+# 누출·예고와 달리 실패의 흔적이 없어 가장 위험하다(Haiku 실측: 도구 0회인데 "건수: 342,
+# 최근 언급: 2026-07-25" 같은 구체값을 확정 서술). 오탐이 더 나쁘므로 **고정밀 표지만** 본다.
+_FABRICATED_RE = re.compile(
+    r"^\s*(?:Tool|도구)\s*[:：]\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\)|"      # "Tool: get_x()"
+    r"^\s*(?:Status|상태)\s*[:：]\s*(?:Success|성공|OK)\b|"              # "Status: Success"
+    r"^\s*\[?(?:도구|tool)\s*(?:결과|output|result)\]?\s*[:：]",         # "[도구 결과]:"
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _looks_fabricated_tool_result(text: str) -> bool:
+    """도구를 실행하지 않았는데 '도구 결과'처럼 서술한 응답인지(고정밀 표지 기반)."""
+    return bool(text) and bool(_FABRICATED_RE.search(text))
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
@@ -1249,8 +1264,9 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     _no_tool = _budget["calls"] == 0
     # 예고만 하고 호출하지 않은 턴 — 도구 이름이 없어 복원이 불가하므로 '금지+강제' 지시를
     # 붙여 한 번만 다시 돌린다. 모델의 자발성에 기대지 않고 코드가 한 번 더 기회를 만든다.
-    if _no_tool and _announced_without_calling(text):
-        print("[agent] 도구 예고만 하고 미호출 — 강제 지시로 1회 재시도")
+    _fabricated = _no_tool and _looks_fabricated_tool_result(text)
+    if _no_tool and (_announced_without_calling(text) or _fabricated):
+        print(f"[agent] 도구 미호출({'날조 표지' if _fabricated else '예고만'}) — 강제 지시로 1회 재시도")
         yield _sse("status", {"step": "도구를 실제로 호출하도록 다시 시도합니다", "tool": None})
         try:
             _forced = [("system", sys_prompt + "\n\n[중요] 도구를 쓰겠다고 예고하지 마라. "
@@ -1270,6 +1286,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     break
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] forced-call retry failed: {exc!r}")
+        # 여기까지 왔는데 여전히 도구 0회 + 날조 표지면, 근거 없는 수치를 '조회 결과'처럼
+        # 내보내는 셈이다. 조용히 통과시키지 말고 출처가 없다는 사실을 명시한다.
+        if _budget["calls"] == 0 and _looks_fabricated_tool_result(text):
+            _warn = ("\n\n> ⚠ 이 답변은 **도구를 조회하지 않고 생성**되었습니다. "
+                     "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")
+            text += _warn
+            yield _sse("token", {"delta": _warn})
     if _looks_like_leaked_tool_call(text, _no_tool):
         print(f"[agent] tool-call leaked into text (도구 실행 {_budget['calls']}회) — 비스트리밍 재시도")
         yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})

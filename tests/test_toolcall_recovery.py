@@ -24,6 +24,7 @@ def _load_recovery_fns() -> dict:
         r"_LEAK_RE = .*?return bool\(_LEAK_RE\.search\(stripped\)\)",
         r"def _extract_leaked_calls.*?\n    return out",
         r"_ANNOUNCE_RE = .*?return bool\(text\) and bool\(_ANNOUNCE_RE\.search\(text\)\)",
+        r"_FABRICATED_RE = .*?return bool\(text\) and bool\(_FABRICATED_RE\.search\(text\)\)",
     ]
     for pat in blocks:
         m = re.search(pat, src, re.S)
@@ -36,6 +37,7 @@ FNS = _load_recovery_fns()
 leaked = FNS["_looks_like_leaked_tool_call"]
 extract = FNS["_extract_leaked_calls"]
 announced = FNS["_announced_without_calling"]
+fabricated = FNS["_looks_fabricated_tool_result"]
 
 
 # ── 실제 관측된 실패 출력 ────────────────────────────────────────────────
@@ -68,6 +70,12 @@ CASES = [
      'VOC 상위 이슈 조회 중...\n\n<tool_call>\n{\n  "type": "tool_use",\n  "name": "get_top_issues",\n'
      '  "input": {\n    "product_code": null,\n    "limit": 10\n  }\n}\n</tool_call>',
      True, "extract"),
+    # Haiku 실측 — 도구를 부르지 않고 결과를 통째로 지어냈다(누출도 예고도 없음).
+    # 표면이 완벽한 답변이라 사용자가 진짜 데이터로 믿는 가장 위험한 유형.
+    ("haiku-fabricated-prose",
+     "Tool: get_dataset_summary()\nStatus: Success\n\n열충격 SED 학습 데이터셋 통계\n"
+     "총 샘플 건수: 2,450건\nSED 평균: 0.652",
+     True, "forced-retry"),
     # ── 오탐 금지(정상 응답) ────────────────────────────────────────────
     ("normal-answer",
      "열충격 데이터셋은 총 294건이며 SED 평균은 1.736입니다.",
@@ -84,7 +92,7 @@ def classify(text: str, no_tool_ran: bool) -> str:
     calls = extract(text, no_tool_ran) if leaked(text, no_tool_ran) else []
     if calls:
         return "extract"
-    if no_tool_ran and announced(text):
+    if no_tool_ran and (announced(text) or fabricated(text)):
         return "forced-retry"
     return "none"
 
@@ -114,6 +122,16 @@ def test_supports_anthropic_shape():
     assert calls, "Anthropic 형식을 복원하지 못했다"
     assert calls[0]["name"] == "get_top_issues"
     assert calls[0]["arguments"].get("limit") == 10
+
+
+def test_fabrication_detection_precision():
+    """날조 표지는 고정밀이어야 한다 — 정상 답변을 날조로 몰면 더 나쁘다."""
+    assert fabricated("Tool: get_top_issues()\nStatus: Success\n건수 342")
+    assert fabricated("[도구 결과]: VOC 상위 이슈")
+    # 아래는 전부 정상 — 날조로 잡히면 안 된다
+    assert not fabricated("열충격 데이터셋은 총 294건입니다.")
+    assert not fabricated("도구를 사용해 조회한 결과를 정리했습니다.")
+    assert not fabricated("이 도구: get_top_issues 는 VOC 상위 이슈를 반환합니다")
 
 
 def test_no_runaway_extraction():
