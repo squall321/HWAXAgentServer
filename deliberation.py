@@ -181,6 +181,15 @@ async def _tools_by_name(app, groups: list) -> dict:
         return {}
     scoped = _with_groups(conns, sorted(groups))
     tools = await MultiServerMCPClient(scoped).get_tools()
+    # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
+    # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
+    # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
+    # 늦은 import — app 이 이 모듈을 import 하므로 모듈 로드 시점에 하면 순환이 된다.
+    try:
+        from app import _prep_tool  # noqa: PLC0415
+        tools = [_prep_tool(t) for t in tools]
+    except Exception as exc:  # noqa: BLE001 — 래핑 실패해도 심의는 진행
+        print(f"[deliberation] _prep_tool 적용 실패: {exc!r}")
     return {t.name: t for t in tools}
 
 

@@ -534,6 +534,13 @@ def _prep_tool(tool):
 # 기본 80 — 0(무제한)이면 랭킹이 아예 안 돌아 도구가 수백 개가 될 때 평평하게 쏟아진다.
 # 명시적으로 TOOL_MAX=0 을 주면 종전처럼 전체 바인딩(탈출구 유지).
 TOOL_MAX = int(os.environ.get("TOOL_MAX", "80"))
+# 그래프 재귀 한도 — 미설정 시 LangGraph 기본(25)에 걸려 턴 전체가 폐기된다. 넉넉히 두되
+# 무한은 아니게. 도구 왕복 1회가 노드 2~3개를 쓴다.
+AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "60"))
+# 같은 도구·같은 인자 반복 호출 경고 임계 — 작은 모델의 루프를 사용자에게 드러낸다.
+TOOL_REPEAT_WARN = int(os.environ.get("TOOL_REPEAT_WARN", "3"))
+# 바인딩 도구 스키마의 추정 토큰 상한(0=무제한). 개수 캡만으로는 컨텍스트 초과를 못 막는다.
+TOOL_SCHEMA_BUDGET = int(os.environ.get("TOOL_SCHEMA_BUDGET", "12000"))
 _TOOL_PRIORITY = (
     "recommend_agents", "get_agent_session", "agent_search", "semantic_search", "list_records",
     "data_aggregate", "alert_check", "daily_briefing", "query_voc", "search_voc", "get_top_issues",
@@ -647,6 +654,27 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
         getattr(x[0], "name", ""),
     ))
     kept = [t for t, _ in ordered[:TOOL_MAX]]
+    # 토큰 예산 — TOOL_MAX 는 '개수' 캡이라 실제 프롬프트 비용을 전혀 보장하지 못한다.
+    # 스키마가 큰 도구가 몰리면 캡을 지켜도 컨텍스트 초과 400 으로 챗이 죽고, 사용자는
+    # '에이전트 처리 중 오류'만 본다(감사: dev 로그에 동일 400 3건). 개수와 별개로 추정
+    # 토큰 합계에도 상한을 걸어, 넘치면 관련도 낮은 것부터 떨어뜨린다.
+    if TOOL_SCHEMA_BUDGET > 0:
+        def _cost(t) -> int:
+            try:
+                sch = json.dumps(getattr(t, "args_schema", None) or {}, ensure_ascii=False, default=str)
+            except Exception:  # noqa: BLE001
+                sch = ""
+            # 한글·JSON 혼합에서 대략 3자 ≈ 1토큰(보수적으로 과대평가해 안전측).
+            return (len(getattr(t, "name", "")) + len(getattr(t, "description", "") or "") + len(sch)) // 3 + 8
+        total, budgeted = 0, []
+        for t in kept:
+            c = _cost(t)
+            if budgeted and total + c > TOOL_SCHEMA_BUDGET:
+                continue
+            budgeted.append(t); total += c
+        if len(budgeted) < len(kept):
+            print(f"[agent] tool budget: {len(kept)}개 → {len(budgeted)}개 (추정 {total}토큰 / 상한 {TOOL_SCHEMA_BUDGET})")
+        kept = budgeted
     # 핵심 도구 예약 슬롯 — 정렬키의 core 타이브레이크는 fused 값이 사실상 유일해 발동하지
     # 않는다(감사: fused 고유값 167/168 → docstring 의 '③ 상시 핵심'은 죽은 코드였다).
     # 그래서 순위와 별개로 존재하는 core 전량을 확보한다. 상위 N개만 예약하면 임베딩이
@@ -1038,16 +1066,21 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
 _LEAK_RE = re.compile(r'</?tool_call>|<\|tool_call\|>|\{\s*"name"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,\s*"arguments"\s*:')
 
 
-def _looks_like_leaked_tool_call(text: str) -> bool:
+def _looks_like_leaked_tool_call(text: str, no_tool_ran: bool = False) -> bool:
     """모델이 도구 호출을 실행하지 못하고 호출문을 본문에 그대로 출력했는지 판정.
-    코드블록 안의 예시(```json …)는 설명 목적일 수 있으므로 제외한다."""
+
+    기본은 엄격하게 — 코드블록 안(```json …)은 설명용 예시일 수 있어 제외한다.
+    다만 **이번 턴에 도구가 한 번도 실행되지 않았다면** 얘기가 다르다. 작은 모델은
+    "확인하겠습니다" 하고 인자를 코드펜스에 찍은 뒤 실제 호출은 하지 않는 실패를 자주 낸다
+    (실측: dev 7B 가 ```{"product_code": "GS25U"}``` 를 출력하고 종료). 그 경우엔 펜스도
+    후보로 본다 — 어차피 도구가 안 돌았으므로 '설명용 예시'일 가능성이 낮다."""
     if not text:
         return False
-    stripped = re.sub(r"```.*?```", "", text, flags=re.S)
+    stripped = text if no_tool_ran else re.sub(r"```.*?```", "", text, flags=re.S)
     return bool(_LEAK_RE.search(stripped))
 
 
-def _extract_leaked_calls(text: str) -> list:
+def _extract_leaked_calls(text: str, no_tool_ran: bool = False) -> list:
     """본문에 텍스트로 새어 나온 도구 호출을 구조로 복원한다.
 
     작은 모델(하이쿠급)이나 파서가 안 맞는 서빙에서는 구조화 tool_call 을 못 내고
@@ -1057,7 +1090,7 @@ def _extract_leaked_calls(text: str) -> list:
     """
     if not text:
         return []
-    body = re.sub(r"```.*?```", "", text, flags=re.S)
+    body = text if no_tool_ran else re.sub(r"```.*?```", "", text, flags=re.S)
     out, seen = [], set()
     for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"[^{}]*'
                          r'"arguments"\s*:\s*(\{.*?\})\s*\}', body, re.S):
@@ -1076,6 +1109,20 @@ def _extract_leaked_calls(text: str) -> list:
         if len(out) >= 3:  # 한 턴에 과도 실행 방지
             break
     return out
+
+
+_ANNOUNCE_RE = re.compile(
+    r"(확인하겠습니다|조회하겠습니다|호출하겠습니다|가져오겠습니다|검색하겠습니다|알아보겠습니다|"
+    r"조회해\s?보겠습니다|바로\s?(조회|호출|확인)|let me (check|call|search|look)|i(?:'| wi)ll (call|check|search))")
+
+
+def _announced_without_calling(text: str) -> bool:
+    """도구를 쓰겠다고 '말만' 하고 실제로는 한 번도 호출하지 않은 턴인지.
+
+    작은 모델의 대표적 실패다 — "확인하겠습니다" 뒤에 인자만 코드펜스로 찍고 끝낸다
+    (실측: dev 7B 가 ```{"product_code": "GS25U"}``` 를 출력하고 종료). 이때는 도구 이름이
+    없어 호출문 복원도 불가능하므로, 예고 자체를 신호로 삼아 한 번 더 강제한다."""
+    return bool(text) and bool(_ANNOUNCE_RE.search(text))
 
 
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
@@ -1123,7 +1170,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                f"이 전문가 도메인의 데이터 조회는 agent_search(\"{agent_key}\", 질문) 를 우선 사용하라.")
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
-        async for event in agent.astream_events(inputs, version="v2"):
+        # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
+        # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
+        # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
+        _budget = {"calls": 0, "seen": {}}
+        _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
+        async for event in agent.astream_events(inputs, version="v2", config=_cfg):
             kind = event["event"]
             if kind == "on_chat_model_stream":
                 token = event["data"]["chunk"].content
@@ -1142,6 +1194,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     full.append(content)
                     yield _sse("token", {"delta": content})
             elif kind == "on_tool_start":
+                _budget["calls"] += 1
+                _fp = f"{event.get('name')}|{json.dumps(event.get('data', {}).get('input'), sort_keys=True, ensure_ascii=False, default=str)[:400]}"
+                _budget["seen"][_fp] = _budget["seen"].get(_fp, 0) + 1
+                if _budget["seen"][_fp] == TOOL_REPEAT_WARN:
+                    # 같은 도구·같은 인자 반복 — 더 해도 결과가 달라지지 않는다.
+                    yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
+                                          "tool": event.get("name")})
                 args = _tool_preview(event.get("data", {}).get("input"))
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
                                       **({"detail": args} if args else {})})
@@ -1175,8 +1234,32 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 도구는 하나도 실행되지 않는다. 사용자에겐 "조회했더니 아무것도 안 나온다"로 보인다
     # (실측: 스트리밍 ON → 호출문 누출·미실행 / OFF → get_training_data 정상 실행).
     # 캡을 씌우거나 무시하지 말고, 그 턴을 비스트리밍으로 한 번 다시 돌려 실제로 호출시킨다.
-    if _looks_like_leaked_tool_call(text):
-        print("[agent] tool-call leaked into text — 비스트리밍으로 재시도")
+    _no_tool = _budget["calls"] == 0
+    # 예고만 하고 호출하지 않은 턴 — 도구 이름이 없어 복원이 불가하므로 '금지+강제' 지시를
+    # 붙여 한 번만 다시 돌린다. 모델의 자발성에 기대지 않고 코드가 한 번 더 기회를 만든다.
+    if _no_tool and _announced_without_calling(text):
+        print("[agent] 도구 예고만 하고 미호출 — 강제 지시로 1회 재시도")
+        yield _sse("status", {"step": "도구를 실제로 호출하도록 다시 시도합니다", "tool": None})
+        try:
+            _forced = [("system", sys_prompt + "\n\n[중요] 도구를 쓰겠다고 예고하지 마라. "
+                        "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
+                        "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라."),
+                       *_history_messages(req.history), ("user", req.message)]
+            _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
+            for m in reversed((_r2 or {}).get("messages") or []):
+                if getattr(m, "type", "") != "ai":
+                    continue
+                _c2 = getattr(m, "content", None)
+                if isinstance(_c2, list):
+                    _c2 = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c2)
+                if isinstance(_c2, str) and _c2.strip() and not _announced_without_calling(_c2):
+                    text = _c2
+                    yield _sse("token", {"delta": "\n\n" + _c2})
+                    break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] forced-call retry failed: {exc!r}")
+    if _looks_like_leaked_tool_call(text, _no_tool):
+        print(f"[agent] tool-call leaked into text (도구 실행 {_budget['calls']}회) — 비스트리밍 재시도")
         yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})
         try:
             retry = await agent.ainvoke(inputs)
@@ -1204,8 +1287,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 재시도해도 여전히 누출이면 모델의 호출 능력에 기대지 않는다 — 새어 나온 호출을
         # 코드가 직접 실행하고 그 결과로 답을 만든다. 작은 모델에서도 도구가 '잡히게' 하는
         # 마지막 방어선이다(모델이 구조화 호출을 영영 못 내도 사용자는 결과를 받는다).
-        if _looks_like_leaked_tool_call(text):
-            calls = _extract_leaked_calls(text)
+        if _looks_like_leaked_tool_call(text, _no_tool):
+            calls = _extract_leaked_calls(text, _no_tool)
             if calls:
                 try:
                     _tmap = await _tools_by_name(app, req.groups)
@@ -1215,7 +1298,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 results = []
                 for c in calls:
                     if c["name"] not in _tmap:
-                        continue
+                        # 작은 모델은 도구 이름을 자주 흘린다(get_dataset_summry, queryVoc 등).
+                        # 사람이라면 바로 알아볼 오타 때문에 답을 못 주는 건 낭비다 — 충분히
+                        # 가까운 이름 하나로만 좁혀질 때에 한해 교정한다(모호하면 포기).
+                        import difflib as _dl
+                        _cand = _dl.get_close_matches(c["name"], list(_tmap), n=2, cutoff=0.82)
+                        if len(_cand) == 1:
+                            print(f"[agent] 도구 이름 교정: {c['name']} → {_cand[0]}")
+                            c["name"] = _cand[0]
+                        else:
+                            continue
                     yield _sse("status", {"step": f"도구 직접 실행: {c['name']}", "tool": c["name"]})
                     try:
                         r = await _call(_tmap, c["name"], c["arguments"])
