@@ -348,6 +348,46 @@ def _rewrite_local_urls(s: str) -> str:
 # 이번 턴에 생성된 이미지 URL — 약한 모델이 ![](url) 인용을 빠뜨려도 결정적으로 첨부한다.
 _turn_images: contextvars.ContextVar = contextvars.ContextVar("turn_images", default=None)
 
+# 이번 턴에 '출처가 있는' 정수 — 사용자 발화·이전 대화·앞선 도구 결과에서 본 숫자들.
+# 유령 ID 게이트가 쓴다. 프롬프트만으로는 확률적이라, 최악 케이스(작은 정수를 찍어 남의 진짜
+# 데이터를 받아오는 것)는 코드로 결정적으로 막는다 — 실측: test_id=1 → SUS201_annealed 카드를
+# 받아 'Al6061-T6' 라벨로 재출력. 빈 결과보다 나쁜 '확신에 찬 오답'이다.
+_turn_ids: contextvars.ContextVar = contextvars.ContextVar("turn_ids", default=None)
+# 식별자 인자 이름 — id, test_id, material_id, job_id …
+_ID_ARG_RE = re.compile(r"^(id|.*_id)$")
+# 독립된 정수 토큰만 — \d+ 로 잡으면 "Al6061-T6" 의 부분수열 1 이 test_id=1 을 통과시킨다.
+_INT_TOK_RE = re.compile(r"(?<!\d)\d+(?!\d)")
+_TURN_IDS_MAX = 2000  # 도구 결과에서 걷는 정수 상한(무한 증식 방지)
+
+
+def _int_tokens(text) -> set:
+    """문자열에서 독립 정수 토큰을 뽑아 정수 집합으로. 비문자열은 str() 후 처리."""
+    s = text if isinstance(text, str) else str(text)
+    return {int(m) for m in _INT_TOK_RE.findall(s)}
+
+
+def _learn_ids(text) -> None:
+    """도구 결과에 실린 정수를 이번 턴의 '출처 있는 값'으로 등록한다 — list_materials 가 준
+    id 로 다음 호출이 통과되게 하는 경로다. ⚠ 부모(on_tool_end)가 아니라 자식(도구 코루틴)
+    쪽에서 넣는다. 부모에 두면 병렬 호출 시 순서 경합으로 정상 ID 가 차단될 수 있다."""
+    src = _turn_ids.get()
+    if src is None or len(src) >= _TURN_IDS_MAX:
+        return
+    src |= _int_tokens(text)
+
+
+def _phantom_id_arg(args: dict, src: set):
+    """식별자 인자 중 '이번 턴 어디에도 출처가 없는 정수'를 찾아 (이름, 값) 으로 돌려준다.
+    bool 은 int 의 서브클래스라 명시적으로 제외한다(flag=True 가 id 로 오인되면 안 된다)."""
+    for k, v in (args or {}).items():
+        if not isinstance(k, str) or not _ID_ARG_RE.match(k):
+            continue
+        if isinstance(v, bool) or not isinstance(v, int):
+            continue
+        if v not in src:
+            return k, v
+    return None
+
 
 ARTIFACT_KEEP = int(os.environ.get("ARTIFACT_KEEP", "500"))
 
@@ -466,6 +506,20 @@ def _cap_tool(tool, result_max=None):
         return s
 
     async def capped(*a, **kw):
+        # 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
+        # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
+        src = _turn_ids.get()
+        if src is not None:
+            # 어댑터 버전에 따라 인자가 kw 로 오기도, a 안의 dict 로 오기도 한다(실측은 kw).
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                bad = _phantom_id_arg(_args, src)
+                if bad:
+                    k, v = bad
+                    msg = (f"{k}={v} 는 이번 대화 어디에도 없는 값이다. 추측한 ID 로 부르면 "
+                           f"다른 대상의 진짜 데이터가 돌아와 더 위험하다. 같은 앱의 "
+                           f"list_*/search_* 도구로 이름을 조회해 ID 를 확인한 뒤 다시 호출하라.")
+                    return ((msg, None)
+                            if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         try:
             out = await orig(*a, **kw)
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
@@ -493,8 +547,12 @@ def _cap_tool(tool, result_max=None):
             # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
             return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            return (_maybe_repair_hint(_cap(_norm(out[0]), result_max)), out[1])
-        return _maybe_repair_hint(_cap(_norm(out), result_max))
+            body = _maybe_repair_hint(_cap(_norm(out[0]), result_max))
+            _learn_ids(body)
+            return (body, out[1])
+        body = _maybe_repair_hint(_cap(_norm(out), result_max))
+        _learn_ids(body)
+        return body
 
     tool.coroutine = capped
     return tool
@@ -1187,10 +1245,33 @@ def _looks_fabricated_tool_result(text: str) -> bool:
     return bool(text) and bool(_FABRICATED_RE.search(text))
 
 
+# 도구 0회인데 표·차트를 직접 그린 턴 — _FABRICATED_RE 는 "Tool: x()" 같은 자백형 표지만 보므로
+# 이 유형(실측: 물성표 + Plotly CDN HTML, 자백 표지 없음)을 통째로 놓쳤다. 사용자 화면에는
+# 오류도 경고도 없이 그럴듯한 표와 차트만 남았다.
+_CHART_SURFACE_RE = re.compile(
+    r"```html|<script\s+src=|^\s*\|\s*-{3,}", re.M)
+# 특정 대상을 지목한 질문인지 — 영문+숫자 2자리 이상이 붙은 토큰(Al6061-T6, SUS304, SCM440).
+# 이 조건이 '사용자가 준 숫자로 그리는 정당한 자작'(예: "우리 팀 인원 비율을 도표로")을 살린다.
+_ENTITY_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*\d{2,}[A-Za-z0-9_\-]*\b")
+
+
+def _drew_own_chart(message: str, text: str) -> bool:
+    """DB 에 있을 대상을 지목해 물었는데, 조회 없이 표/차트 표면을 직접 만들어낸 응답인지."""
+    return bool(text) and bool(_CHART_SURFACE_RE.search(text)) and bool(_ENTITY_RE.search(message or ""))
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
+    # 유령 ID 게이트의 출처집합 — 발화와 **전체 history** 의 정수로 시작한다(최근 몇 턴만 보면
+    # "아까 그 재료" 처럼 오래된 ID 를 다시 쓰는 정상 호출이 막힌다). 도구 결과의 정수는
+    # _learn_ids 가 호출 성공 시마다 더한다.
+    _seed_ids = _int_tokens(req.message)
+    for _h in (req.history or []):
+        if isinstance(_h, dict):
+            _seed_ids |= _int_tokens(_h.get("content") or "")
+    _turn_ids.set(_seed_ids)
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
@@ -1300,13 +1381,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 예고만 하고 호출하지 않은 턴 — 도구 이름이 없어 복원이 불가하므로 '금지+강제' 지시를
     # 붙여 한 번만 다시 돌린다. 모델의 자발성에 기대지 않고 코드가 한 번 더 기회를 만든다.
     _fabricated = _no_tool and _looks_fabricated_tool_result(text)
-    if _no_tool and (_announced_without_calling(text) or _fabricated):
-        print(f"[agent] 도구 미호출({'날조 표지' if _fabricated else '예고만'}) — 강제 지시로 1회 재시도")
+    # 자작 표/차트도 같은 취급 — _no_tool 이 앞에 있으므로 도구를 부른 뒤의 자작은 영향 없다.
+    _own_chart = _no_tool and _drew_own_chart(req.message, text)
+    if _no_tool and (_announced_without_calling(text) or _fabricated or _own_chart):
+        _why = "날조 표지" if _fabricated else ("자작 표·차트" if _own_chart else "예고만")
+        print(f"[agent] 도구 미호출({_why}) — 강제 지시로 1회 재시도")
         yield _sse("status", {"step": "도구를 실제로 호출하도록 다시 시도합니다", "tool": None})
         try:
             _forced = [("system", sys_prompt + "\n\n[중요] 도구를 쓰겠다고 예고하지 마라. "
                         "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
-                        "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라."),
+                        "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라. "
+                        "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라."),
                        *_history_messages(req.history), ("user", req.message)]
             _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
             for m in reversed((_r2 or {}).get("messages") or []):
@@ -1323,7 +1408,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             print(f"[agent] forced-call retry failed: {exc!r}")
         # 여기까지 왔는데 여전히 도구 0회 + 날조 표지면, 근거 없는 수치를 '조회 결과'처럼
         # 내보내는 셈이다. 조용히 통과시키지 말고 출처가 없다는 사실을 명시한다.
-        if _budget["calls"] == 0 and _looks_fabricated_tool_result(text):
+        if _budget["calls"] == 0 and (_looks_fabricated_tool_result(text)
+                                      or _drew_own_chart(req.message, text)):
             _warn = ("\n\n> ⚠ 이 답변은 **도구를 조회하지 않고 생성**되었습니다. "
                      "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")
             text += _warn
