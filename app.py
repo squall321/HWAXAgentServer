@@ -651,15 +651,28 @@ AIDH_HTTP = os.environ.get("AIDH_HTTP_BASE", "http://127.0.0.1:8001")
 _TOOL_VEC: dict = {"sig": "", "names": [], "vecs": []}
 
 
+# 임베딩 배치 크기 — 한 요청에 전량(도구 196개)을 보내면 GPU 여유에 따라 터진다. 실측은
+# 엇갈렸다: GPU 가 붐빌 때 128개부터 HTTP 500 "CUDA out of memory"(agent-server.log 에
+# '[tools] embed failed: <HTTPError 500>' 반복), 한산할 때는 196개도 통과. 즉 상시 고장이
+# 아니라 부하 의존 간헐 고장이다 — 더 나쁘다. 실패해도 예외를 삼키고 넘어가므로(_ensure_tool_vecs),
+# _semantic_order 가 빈 리스트를 돌려 RRF 융합이 조용히 죽고 도구 랭킹이 '어휘+상시핵심+
+# 알파벳순'으로 퇴화한 채 아무 신호도 남지 않는다. 64개는 양쪽 조건 모두에서 통과했다.
+EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "64"))
+
+
 def _embed(texts: list, kind: str = "passage") -> list:
     import urllib.request
     if not texts:
         return []
-    body = json.dumps({"texts": texts, "kind": kind}).encode()
-    req = urllib.request.Request(f"{AIDH_HTTP}/api/embed", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return (json.loads(r.read()) or {}).get("vectors") or []
+    out: list = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        chunk = texts[i:i + EMBED_BATCH]
+        body = json.dumps({"texts": chunk, "kind": kind}).encode()
+        req = urllib.request.Request(f"{AIDH_HTTP}/api/embed", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out.extend((json.loads(r.read()) or {}).get("vectors") or [])
+    return out
 
 
 def _ensure_tool_vecs(tools: list) -> None:
