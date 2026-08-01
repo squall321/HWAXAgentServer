@@ -232,7 +232,13 @@ def _sse(event: str, data: dict) -> bytes:
 # 다만 6000 은 dev(16K) 기준값이라 대형 컨텍스트 모델(prod GLM)에 그대로 쓰면 목록이
 # 불필요하게 잘린다 → 기본을 32000 으로 올리고, 소형 모델 박스만 .env 로 낮춘다.
 # 0 이면 무제한(권장 안 함 — 안전밸브 해제).
-TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "32000"))
+# 32000 도 부족했다: recommend_agents(top_k=40) 한 번이 53KB 다(실측). prod 는 GLM(대형 컨텍스트)
+# 이므로 기본을 120000(≈35K 토큰)까지 올린다 — 소형 모델 박스만 .env 로 낮춘다.
+TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "120000"))
+# 결정적 카탈로그 조회(recommend_agents·list_agents·get_agent_session·list_records)는 LLM 프롬프트가
+# 아니라 **코드가 JSON 으로 파싱**한다. 여기에 프롬프트 보호용 절단을 걸면 JSON 이 중간에서 끊겨
+# 파싱이 조용히 실패하고 "추천 0명"·"풀 9명" 같은 빈 결과가 나온다(실측 원인). 사실상 무제한으로 둔다.
+CATALOG_RESULT_MAX = int(os.environ.get("CATALOG_RESULT_MAX", "2000000"))
 # 아래 기본값은 모두 대형 컨텍스트(prod B300 8기·GLM) 기준으로 넉넉하게 잡는다.
 # 소형 모델 박스(dev qwen 16K)만 .env 로 낮춘다 — 반대로 잡으면 prod 가 dev 사이즈에 묶인다.
 TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "1200"))  # 도구 description 절단(문자)
@@ -383,9 +389,10 @@ def _extract_artifacts_text(s):
     return s
 
 
-def _cap_tool(tool):
+def _cap_tool(tool, result_max=None):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
-    프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384)."""
+    프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384).
+    result_max 를 주면 그 값으로 절단한다(결정적 JSON 조회는 CATALOG_RESULT_MAX 를 넘긴다)."""
     orig = tool.coroutine
     if orig is None:
         return tool
@@ -459,8 +466,8 @@ def _cap_tool(tool):
             # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
             return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            return (_maybe_repair_hint(_cap(_norm(out[0]))), out[1])
-        return _maybe_repair_hint(_cap(_norm(out)))
+            return (_maybe_repair_hint(_cap(_norm(out[0]), result_max)), out[1])
+        return _maybe_repair_hint(_cap(_norm(out), result_max))
 
     tool.coroutine = capped
     return tool
@@ -524,9 +531,10 @@ def _attach_validation_hint(tool):
     return tool
 
 
-def _prep_tool(tool):
-    """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool))))
+def _prep_tool(tool, result_max=None):
+    """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
+    result_max 는 결과 절단 한도 — None 이면 TOOL_RESULT_MAX(LLM 경로 기본)."""
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool))), result_max)
 
 
 # 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.
@@ -834,7 +842,7 @@ async def run_agent_search(app: FastAPI, query: str, groups: list[str]):
     """전문가 카탈로그 SSE — 추천(관련도순) + 분야별 인원 요약을 결정적으로 만든다."""
     yield _sse("status", {"step": "전문가 검색 중", "tool": "recommend_agents"})
     try:
-        tools = await _tools_by_name(app, groups)
+        tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 결과를 코드가 파싱 — 절단 금지
     except Exception as exc:  # noqa: BLE001
         print(f"[agents] tools load failed: {exc!r}")
         tools = {}
@@ -1052,7 +1060,7 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
         return cache[agent_type]
     role = ""
     try:
-        tools = await _tools_by_name(app, groups)
+        tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 역할 원문을 JSON 으로 읽는다
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
         sd = _first_dict(sess.get("data", sess))
         role = str(sd.get("system_prompt") or sd.get("description") or "")[:4000]
@@ -1434,7 +1442,7 @@ def _parse_json_multi(text) -> list:
 async def deliberate_experts(req: ExpertsRequest) -> dict:
     """심의 전 전문가 선정 미리보기 — 자동 추천(recommend_agents) + 전체 풀(list_agents compact).
     프론트가 추천을 미리 보여주고, 사용자가 확인·수동추가한 personas 로 심의를 실행한다."""
-    tools = await _tools_by_name(app, req.groups)
+    tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 결과를 코드가 파싱 — 절단 금지
     if not tools:
         return {"recommended": [], "pool": [], "error": "gateway_unavailable"}
 
@@ -1513,7 +1521,7 @@ class AgentDetailRequest(BaseModel):
 async def catalog_agent(req: AgentDetailRequest) -> dict:
     """전문가 상세 + 보유 지식(레코드 목록) — 브라우즈 UI 용(결정적·LLM 미경유).
     LLM 텍스트 나열은 결과 절단 캡에 걸려 잘리므로, 탐색은 이 데이터로 UI 가 그린다."""
-    tools = await _tools_by_name(app, req.groups)
+    tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 상세·레코드를 JSON 으로 읽는다
     if not tools:
         return {"error": "gateway_unavailable"}
     key = req.key.strip()[:120]

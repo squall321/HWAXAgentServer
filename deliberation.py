@@ -175,7 +175,9 @@ def _with_groups(connections: dict, groups: list) -> dict:
     return out
 
 
-async def _tools_by_name(app, groups: list) -> dict:
+async def _tools_by_name(app, groups: list, result_max=None) -> dict:
+    """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
+    결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다."""
     conns = app.state.connections
     if not conns:
         return {}
@@ -187,7 +189,7 @@ async def _tools_by_name(app, groups: list) -> dict:
     # 늦은 import — app 이 이 모듈을 import 하므로 모듈 로드 시점에 하면 순환이 된다.
     try:
         from app import _prep_tool  # noqa: PLC0415
-        tools = [_prep_tool(t) for t in tools]
+        tools = [_prep_tool(t, result_max) for t in tools]
     except Exception as exc:  # noqa: BLE001 — 래핑 실패해도 심의는 진행
         print(f"[deliberation] _prep_tool 적용 실패: {exc!r}")
     return {t.name: t for t in tools}
