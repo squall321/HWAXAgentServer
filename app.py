@@ -113,6 +113,12 @@ SYSTEM_PROMPT = (
     "사용자가 대상을 이름으로 부르면(예: 'SCM440_alloy_steel', 'Al6061-T6') 첫 호출은 반드시 목록·검색 도구입니다 — "
     "list_materials(query=\"SCM440\") 처럼 이름 일부를 넣어 부르고, 그 응답의 id·test_id 로만 "
     "get_material / get_mat_card / plot_curve / get_curve 를 호출하세요. "
+    # 실측: 게이트가 test_id 추측을 막자 모델이 list_materials(category="aluminum") 를 걸었고,
+    # 실제 category 는 "metal" 이라 [] 가 돌아왔다. 그러자 "DB에 없다"로 끝났다(id=19 로 실재).
+    # 지어낸 필터가 빈 결과를 만들고, 빈 결과가 '없음' 오판으로 이어지는 경로를 끊는다.
+    "목록·검색 도구에는 이름 조각만 넣으세요 — category 같은 추가 필터를 스스로 지어내 걸지 마세요"
+    "(값을 틀리면 결과가 비어 '없다'고 오판하게 됩니다). "
+    "결과가 비면 필터를 빼고 더 짧은 이름 조각으로 다시 조회하세요. "
     "다른 도메인도 같습니다 — 식별자를 받는 도구 앞에는 반드시 목록·검색 도구가 옵니다. "
     "도구 결과의 이름이 물어본 대상과 다르면 그 결과를 쓰지 말고 다시 찾으세요. "
     "호출 한 번이 실패했다고 \"없다\"고 단정하지 말고, 목록·검색 도구로 확인한 뒤에만 없다고 답하세요.\n"
@@ -358,6 +364,9 @@ _ID_ARG_RE = re.compile(r"^(id|.*_id)$")
 # 독립된 정수 토큰만 — \d+ 로 잡으면 "Al6061-T6" 의 부분수열 1 이 test_id=1 을 통과시킨다.
 _INT_TOK_RE = re.compile(r"(?<!\d)\d+(?!\d)")
 _TURN_IDS_MAX = 2000  # 도구 결과에서 걷는 정수 상한(무한 증식 방지)
+# 게이트가 막았다는 표지 — 스트림 쪽에서 '실행되지 않은 호출'을 세는 데도 쓴다. 문자열을 두 군데
+# 따로 쓰면 한쪽만 고쳐질 때 조용히 어긋나므로 상수 하나로 묶는다.
+_PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 
 
 def _int_tokens(text) -> set:
@@ -515,9 +524,11 @@ def _cap_tool(tool, result_max=None):
                 bad = _phantom_id_arg(_args, src)
                 if bad:
                     k, v = bad
-                    msg = (f"{k}={v} 는 이번 대화 어디에도 없는 값이다. 추측한 ID 로 부르면 "
+                    msg = (f"{k}={v} {_PHANTOM_ID_MARK}. 추측한 ID 로 부르면 "
                            f"다른 대상의 진짜 데이터가 돌아와 더 위험하다. 같은 앱의 "
-                           f"list_*/search_* 도구로 이름을 조회해 ID 를 확인한 뒤 다시 호출하라.")
+                           f"list_*/search_* 도구로 이름을 조회해 ID 를 확인한 뒤 다시 호출하라. "
+                           f"조회할 때는 이름 조각만 넣고 필터는 지어내지 마라 — 결과가 비면 "
+                           f"필터를 빼고 더 짧은 조각으로 다시 찾아라.")
                     return ((msg, None)
                             if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         try:
@@ -1230,7 +1241,11 @@ def _extract_leaked_calls(text: str, no_tool_ran: bool = False) -> list:
 _ANNOUNCE_RE = re.compile(
     r"(확인하겠습니다|조회하겠습니다|호출하겠습니다|가져오겠습니다|검색하겠습니다|알아보겠습니다|"
     r"조회해\s?보겠습니다|바로\s?(조회|호출|확인)|let me (check|call|search|look|get|fetch)|"
-    r"i(?:'| wi)ll (call|check|search|use|fetch)|i(?:'m| am) going to (call|check|use))",
+    r"i(?:'| wi)ll (call|check|search|use|fetch)|i(?:'m| am) going to (call|check|use)|"
+    # 산문 속 파이썬식 호출문 + 호출 의사 — "list_materials(query=\"Al6061-T6\")를 호출하여 …"
+    # 로 끝나고 실제 호출은 없던 실측 턴을 잡는다. 도구명(…_…)+괄호+인자 형태에 '호출/사용/
+    # 실행' 이 붙은 경우만 본다 — 도구 이름만 언급하는 설명문은 걸리지 않는다.
+    r"[a-z][a-z0-9]*_[a-z0-9_]*\([^)]{0,120}\)\s*(를|을|으로|로)?\s*(호출|사용|실행))",
     re.IGNORECASE)  # "Let me check…" 처럼 문장 첫 글자가 대문자인 경우가 대부분이다
 
 
@@ -1329,7 +1344,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
         # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
-        _budget = {"calls": 0, "seen": {}}
+        # blocked: 유령 ID 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
+        _budget = {"calls": 0, "blocked": 0, "seen": {}}
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
         async for event in agent.astream_events(inputs, version="v2", config=_cfg):
             kind = event["event"]
@@ -1369,6 +1385,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     for _u in re.findall(r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]*", _txt):
                         if _u not in turn_imgs:
                             turn_imgs.append(_u)
+                    # 게이트에 막힌 호출은 '도구를 썼다'로 세면 안 된다. 세면 그 턴이 no-tool 로
+                    # 잡히지 않아 강제 재시도가 발동하지 않고, 모델이 "list_materials 를 부르겠다"
+                    # 고 말만 하고 끝난다(실측 Q3: 유일한 호출이 차단된 plot_curve 였다).
+                    if _PHANTOM_ID_MARK in _txt:
+                        _budget["blocked"] += 1
                 out = _tool_preview(_raw)
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
                                       **({"result_preview": out} if out else {})})
@@ -1390,7 +1411,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 도구는 하나도 실행되지 않는다. 사용자에겐 "조회했더니 아무것도 안 나온다"로 보인다
     # (실측: 스트리밍 ON → 호출문 누출·미실행 / OFF → get_training_data 정상 실행).
     # 캡을 씌우거나 무시하지 말고, 그 턴을 비스트리밍으로 한 번 다시 돌려 실제로 호출시킨다.
-    _no_tool = _budget["calls"] == 0
+    # 실효 호출 0회 = 진짜로 아무 데이터도 못 가져온 턴(차단된 호출은 데이터가 없다).
+    _no_tool = (_budget["calls"] - _budget["blocked"]) <= 0
     # 예고만 하고 호출하지 않은 턴 — 도구 이름이 없어 복원이 불가하므로 '금지+강제' 지시를
     # 붙여 한 번만 다시 돌린다. 모델의 자발성에 기대지 않고 코드가 한 번 더 기회를 만든다.
     _fabricated = _no_tool and _looks_fabricated_tool_result(text)
@@ -1421,7 +1443,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             print(f"[agent] forced-call retry failed: {exc!r}")
         # 여기까지 왔는데 여전히 도구 0회 + 날조 표지면, 근거 없는 수치를 '조회 결과'처럼
         # 내보내는 셈이다. 조용히 통과시키지 말고 출처가 없다는 사실을 명시한다.
-        if _budget["calls"] == 0 and (_looks_fabricated_tool_result(text)
+        if (_budget["calls"] - _budget["blocked"]) <= 0 and (_looks_fabricated_tool_result(text)
                                       or _drew_own_chart(req.message, text)):
             _warn = ("\n\n> ⚠ 이 답변은 **도구를 조회하지 않고 생성**되었습니다. "
                      "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")

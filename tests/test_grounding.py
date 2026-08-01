@@ -114,6 +114,44 @@ def test_포털_안내문은_잡지_않는다():
     assert drew_own_chart(msg, text) is False
 
 
+# ── 산문 속 호출문 예고 ────────────────────────────────────────────────────────
+def _announced():
+    src = APP.read_text(encoding="utf-8")
+    ns: dict = {"re": re}
+    m = re.search(r"_ANNOUNCE_RE = .*?return bool\(text\) and bool\(_ANNOUNCE_RE\.search\(text\)\)",
+                  src, re.S)
+    assert m, "app.py 에서 _ANNOUNCE_RE 블록을 찾지 못했다"
+    exec(m.group(0), ns)  # noqa: S102
+    return ns["_announced_without_calling"]
+
+
+ANNOUNCED = _announced()
+
+
+def test_산문_속_호출문_예고를_잡는다():
+    """실측 Q3 — 게이트가 추측 ID 를 막자 모델이 호출문을 산문으로 쓰고 멈췄다.
+    기존 _LEAK_RE 는 JSON/XML 형식만 봐서 이 형태를 놓쳤다."""
+    assert ANNOUNCED('list_materials(query="Al6061-T6")를 호출하여 material_id를 얻어coming.') is True
+
+
+def test_기존_예고_문구는_그대로_잡는다():
+    assert ANNOUNCED("SCM440_alloy_steel의 물성을 확인하겠습니다.") is True
+
+
+def test_기능_없음_안내는_예고가_아니다():
+    """G2 가드 — 여기서 재시도가 돌면 '없다'는 정답을 뒤집을 수 있다."""
+    assert ANNOUNCED("CFD 유동해석 관련 기능은 없습니다. 외부 소프트웨어를 사용해야 합니다.") is False
+
+
+def test_호출_결과_인용은_예고가_아니다():
+    """괄호가 있어도 '호출/사용/실행' 의사가 없으면 이미 부른 결과를 인용한 것이다."""
+    assert ANNOUNCED("get_material(material_id=12) 결과에 따르면 E는 205 GPa 입니다.") is False
+
+
+def test_포털_안내는_예고가_아니다():
+    assert ANNOUNCED("포털 상단 'API 토큰' 메뉴(/tokens)에서 토큰을 발급합니다.") is False
+
+
 if __name__ == "__main__":  # pytest 없이도 돌릴 수 있게
     fails = 0
     for name, fn in sorted(globals().items()):
