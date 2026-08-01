@@ -41,6 +41,7 @@ from langchain_openai import ChatOpenAI
 
 from deliberation import (
     N_PERSONAS,
+    _PHANTOM_ID_MARK,
     _call,
     _env_float,
     _env_int,
@@ -272,6 +273,9 @@ TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "120000"))
 # 아니라 **코드가 JSON 으로 파싱**한다. 여기에 프롬프트 보호용 절단을 걸면 JSON 이 중간에서 끊겨
 # 파싱이 조용히 실패하고 "추천 0명"·"풀 9명" 같은 빈 결과가 나온다(실측 원인). 사실상 무제한으로 둔다.
 CATALOG_RESULT_MAX = int(os.environ.get("CATALOG_RESULT_MAX", "2000000"))
+# 도구를 LLM 에 바인딩하지 않는 경로(심의)의 설명 한도. 바인딩 프롬프트가 아니므로 절단이 무의미
+# 하고, 오히려 인자 유효값이 잘려 계획자가 값을 지어낸다(실측: units 선택지가 사라져 "MPa" 날조).
+CATALOG_DESC_MAX = int(os.environ.get("CATALOG_DESC_MAX", "4000"))
 # 아래 기본값은 모두 대형 컨텍스트(prod B300 8기·GLM) 기준으로 넉넉하게 잡는다.
 # 소형 모델 박스(dev qwen 16K)만 .env 로 낮춘다 — 반대로 잡으면 prod 가 dev 사이즈에 묶인다.
 TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "1200"))  # 도구 description 절단(문자)
@@ -364,9 +368,8 @@ _ID_ARG_RE = re.compile(r"^(id|.*_id)$")
 # 독립된 정수 토큰만 — \d+ 로 잡으면 "Al6061-T6" 의 부분수열 1 이 test_id=1 을 통과시킨다.
 _INT_TOK_RE = re.compile(r"(?<!\d)\d+(?!\d)")
 _TURN_IDS_MAX = 2000  # 도구 결과에서 걷는 정수 상한(무한 증식 방지)
-# 게이트가 막았다는 표지 — 스트림 쪽에서 '실행되지 않은 호출'을 세는 데도 쓴다. 문자열을 두 군데
-# 따로 쓰면 한쪽만 고쳐질 때 조용히 어긋나므로 상수 하나로 묶는다.
-_PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
+# 게이트 표지 _PHANTOM_ID_MARK 는 deliberation 에서 import 한다 — 심의도 이 문구로 '실행되지
+# 않은 호출'을 판정하므로, 두 군데에 따로 쓰면 한쪽만 고쳐질 때 조용히 어긋난다.
 
 
 def _int_tokens(text) -> set:
@@ -524,6 +527,9 @@ def _cap_tool(tool, result_max=None):
                 bad = _phantom_id_arg(_args, src)
                 if bad:
                     k, v = bad
+                    # 운영 가시성 — 게이트가 무엇을 막았는지 남긴다. 조용히 막으면 "왜 도구가
+                    # 안 도냐"는 문의에 근거가 없다.
+                    print(f"[gate] {getattr(tool, 'name', '?')}({k}={v}) 차단 — 출처 정수 {len(src)}개")
                     msg = (f"{k}={v} {_PHANTOM_ID_MARK}. 추측한 ID 로 부르면 "
                            f"다른 대상의 진짜 데이터가 돌아와 더 위험하다. 같은 앱의 "
                            f"list_*/search_* 도구로 이름을 조회해 ID 를 확인한 뒤 다시 호출하라. "
@@ -569,24 +575,30 @@ def _cap_tool(tool, result_max=None):
     return tool
 
 
-def _cap_desc(s):
-    if isinstance(s, str) and len(s) > TOOL_DESC_MAX:
-        return s[:TOOL_DESC_MAX] + "…"
+def _cap_desc(s, limit=None):
+    limit = limit or TOOL_DESC_MAX
+    if isinstance(s, str) and len(s) > limit:
+        return s[:limit] + "…"
     return s
 
 
-def _slim_tool(tool):
+def _slim_tool(tool, desc_max=None):
     """도구 스키마를 슬림하게 — 99개 도구의 긴 description 이 통째로 프롬프트에 들어가면
     16K 모델에서 첫 호출부터 'maximum context length' 400 이 난다(실측 16385/16384).
     tool.description 을 TOOL_DESC_MAX 로 절단하고, args_schema 가 JSON 스키마 dict 면
-    각 필드 description 도 같은 캡을 적용한다(pydantic 모델이면 건드리지 않음)."""
+    각 필드 description 도 같은 캡을 적용한다(pydantic 모델이면 건드리지 않음).
+
+    desc_max 를 주면 그 값으로 절단한다. 이 캡은 **바인딩 프롬프트 보호용**이라, 도구를 LLM 에
+    바인딩하지 않는 경로(심의의 인자 구성)에서는 오히려 해가 된다 — 실측: TOOL_DESC_MAX=120 인
+    박스에서 get_mat_card 설명이 'units: ton_…' 에서 잘려 유효값(ton_mm_s·kg_m_s·g_mm_ms·
+    kg_mm_ms)과 model 선택지가 사라졌고, 인자 계획자가 units="MPa" 를 지어냈다."""
     try:
-        tool.description = _cap_desc(tool.description)
+        tool.description = _cap_desc(tool.description, desc_max)
         schema = getattr(tool, "args_schema", None)
         if isinstance(schema, dict):  # MCP 어댑터 도구는 JSON 스키마 dict — 필드 description 도 절단
             for prop in schema.get("properties", {}).values():
                 if isinstance(prop, dict) and isinstance(prop.get("description"), str):
-                    prop["description"] = _cap_desc(prop["description"])
+                    prop["description"] = _cap_desc(prop["description"], desc_max)
     except Exception as exc:  # 슬림 실패해도 도구 자체는 살린다
         print(f"[agent] tool slim skipped for {getattr(tool, 'name', '?')}: {exc!r}")
     return tool
@@ -627,10 +639,10 @@ def _attach_validation_hint(tool):
     return tool
 
 
-def _prep_tool(tool, result_max=None):
+def _prep_tool(tool, result_max=None, desc_max=None):
     """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
-    result_max 는 결과 절단 한도 — None 이면 TOOL_RESULT_MAX(LLM 경로 기본)."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool))), result_max)
+    result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값."""
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max)
 
 
 # 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.

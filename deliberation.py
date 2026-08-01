@@ -175,7 +175,7 @@ def _with_groups(connections: dict, groups: list) -> dict:
     return out
 
 
-async def _tools_by_name(app, groups: list, result_max=None) -> dict:
+async def _tools_by_name(app, groups: list, result_max=None, desc_max=None) -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
     결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다."""
     conns = app.state.connections
@@ -189,7 +189,7 @@ async def _tools_by_name(app, groups: list, result_max=None) -> dict:
     # 늦은 import — app 이 이 모듈을 import 하므로 모듈 로드 시점에 하면 순환이 된다.
     try:
         from app import _prep_tool  # noqa: PLC0415
-        tools = [_prep_tool(t, result_max) for t in tools]
+        tools = [_prep_tool(t, result_max, desc_max) for t in tools]
     except Exception as exc:  # noqa: BLE001 — 래핑 실패해도 심의는 진행
         print(f"[deliberation] _prep_tool 적용 실패: {exc!r}")
     return {t.name: t for t in tools}
@@ -488,6 +488,11 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
                 t.cancel()
 
 
+# 유령 ID 게이트(app._cap_tool)가 '실행하지 않았다'는 뜻으로 돌려주는 표지. 챗과 심의 양쪽에서
+# 판정에 쓰이므로 하위 모듈인 여기에 두고 app 이 import 한다(app→deliberation 단방향 유지).
+_PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -500,15 +505,28 @@ def _tool_text_ok(s) -> bool:
 
 def _delib_tool_result_ok(s: str) -> bool:
     """지정 도구 응답이 '근거로 쓸 수 있는' 결과인지 — 텍스트 에러 패턴에 더해, 구조화 에러
-    JSON({ok:false} 또는 {errors:[...]} — heax MCP 앱 규약)을 걸러 재시도/스킵을 유도한다."""
+    JSON({ok:false}/{errors:[…]}/{error:"…"})과 'error: …' 평문을 걸러 재시도/스킵을 유도한다.
+
+    ⚠ 여기서 놓치면 에러 문구가 '[사용자 지정 도구 정량 결과 (실호출 — 발언에 인용할 것)]'
+    으로 심의 라운드에 주입되고 보고서까지 간다. 실측 사고 2건 —
+      · get_material(material_id=6061) → {"error": "재료를 찾을 수 없습니다."}
+      · get_mat_card(units="MPa")      → error: unknown unit system: 'MPa' (choices: …)
+    둘 다 ok:false/errors 가 아니라 통과했고 '근거 확보 3건'으로 집계됐다."""
     if not _tool_text_ok(s):
+        return False
+    head = s.lstrip()[:200]
+    # 유령 ID 게이트의 교정문 — 도구가 실행되지 않았다는 뜻이므로 근거가 아니다. 재시도로 보내면
+    # 그 교정문이 _err_note 로 LLM 에 피드백돼 스스로 ID 를 다시 찾는다(self-repair).
+    if _PHANTOM_ID_MARK in head:
+        return False
+    if head.lower().startswith("error:") or head.startswith("오류:"):
         return False
     try:
         v = json.loads(s)
-        if isinstance(v, dict) and (v.get("ok") is False or v.get("errors")):
+        if isinstance(v, dict) and (v.get("ok") is False or v.get("errors") or v.get("error")):
             return False
     except (ValueError, TypeError):
-        pass  # JSON 아님 — 텍스트 결과는 _tool_text_ok 통과로 충분
+        pass  # JSON 아님 — 텍스트 결과는 위 검사 통과로 충분
     return True
 
 
@@ -692,11 +710,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 print(f"[deliberation] timeout override failed: {exc!r}")
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
-    tools = await _tools_by_name(app, groups)
+    # 심의는 도구를 LLM 에 바인딩하지 않는다 — 전부 _call 로 부르고 결과를 **코드가 JSON 으로
+    # 파싱**한다(페르소나 발굴·역할 로드·지정 도구 근거). 그러므로 프롬프트 보호용 절단을 걸면
+    # 안 된다. 실측 사고: TOOL_RESULT_MAX=6000 인 박스에서 recommend_agents 응답(≈6.5KB)이 잘려
+    # 파싱이 실패했고, 심의가 매번 no_personas 로 죽었다. 라운드에 들어가는 양은 주입 시점의
+    # 별도 캡(_chunks 2000자 / tool_inject 5000자 / _ROLE_CLIP)이 이미 통제한다.
+    from app import CATALOG_DESC_MAX, CATALOG_RESULT_MAX  # noqa: PLC0415 — 순환 방지용 늦은 import
+    tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX)
     if not tools:
         yield _sse("error", {"code": "gateway_unavailable",
                              "message": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
         yield _sse("done", {}); return
+    # 유령 ID 게이트를 심의에도 켠다 — /chat 라우트가 _agent_stream 을 거치지 않고 여기로 바로
+    # 분기하므로 종전엔 fail-open 이었다. 실측: get_material(material_id=6061)·get_mat_card
+    # (test_id=1 → SUS201) 처럼 지어낸 ID 가 그대로 나갔다. 출처는 질문 + 도구 결과에서 늘어난다.
+    from app import _int_tokens, _turn_ids  # noqa: PLC0415
+    _turn_ids.set(_int_tokens(question) | _int_tokens(opts.human_note or ""))
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
@@ -735,7 +764,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tool_inject = ""
     if opts.delib_tools:
         _chunks, _used = [], []
-        for _tn in opts.delib_tools:
+        # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
+        # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
+        # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
+        _ordered = sorted(opts.delib_tools,
+                          key=lambda n: 0 if n.startswith(("list_", "search_", "find_")) else 1)
+        for _tn in _ordered:
             _t = tools.get(_tn)
             if _t is None:
                 yield _sse("status", {"step": f"지정 도구 없음: {_tn} — 건너뜀", "tool": _tn})
@@ -752,9 +786,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
                         f"[심의 주제]\n{question}\n\n[도구]\n{_tn}: {(getattr(_t, 'description', '') or '')[:300]}\n"
                         + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
+                        # 앞서 성공한 도구 결과를 같이 준다 — id·test_id 를 지어내지 않고 여기서
+                        # 가져다 쓰라는 뜻이다. 이게 없으면 각 도구가 서로를 모른 채 호출돼
+                        # 상세 도구가 식별자를 추측한다(실측: list_materials 가 id=19 를 줬는데
+                        # 바로 다음 get_mat_card 가 test_id=1 을 찍었다).
+                        + (f"\n[앞서 조회한 결과 — 여기 있는 id·test_id 를 그대로 쓰고 새로 지어내지 마라]\n"
+                           + "\n".join(_chunks)[:2000] + "\n" if _chunks else "")
                         + (f"\n[직전 시도 오류 — 반드시 교정해 다시 구성하라]\n{_err_note}\n" if _err_note else "")
                         + "\n주제의 정량 분석에 맞게 이 도구를 1회 호출할 인자 JSON 을 출력하라. "
                           "스키마의 타입을 정확히 지켜라(숫자는 숫자로). 스키마에 없는 키 금지. "
+                          "식별자(id·test_id 등)는 위 조회 결과에 있는 값만 쓰고, 없으면 추측하지 마라. "
                           "값을 알 수 없는 필수 인자가 있으면 {\"skip\": true} 만 출력."))
                 except Exception:  # noqa: BLE001
                     _argd = None
