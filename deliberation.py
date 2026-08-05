@@ -984,6 +984,57 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _delib("personas", totalRounds=opts.rounds,
                  personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
 
+    # 페르소나별 주제 지식 주입(결정적 RAG) — 지식카드를 많이 가진 전문가일수록 "지금 주제와
+    # 관련된 것"만 골라 들고 와야 한다(사용자 결정 2026-08-05). 자유 조회(모델 재량)와 달리
+    # 항상 수행되는 기본기다. agent_search 가 전문가별 retrieval_config(top_k·score 임계값·
+    # 태그 가중치)를 자동 적용하므로 검색 폭은 전문가 설정을 따르고, 주입량은 문자 예산으로 자른다
+    # (카드 전문을 통째로 넣으면 인원수 × 라운드로 곱해져 컨텍스트가 폭발한다).
+    knowledge_by_key: dict = {}
+    if _env_int("DELIB_PERSONA_KNOWLEDGE", 1) and "agent_search" in tools:
+        _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
+
+        def _hit_line(h):
+            # agent_search hit 실측 형태(2026-08-05): {record_id, section_id, title,
+            # section_title, snippet, score, tags, …} — 본문은 snippet 에 있다.
+            if not isinstance(h, dict):
+                return str(h)[:300]
+            t = h.get("title") or ""
+            sec = h.get("section_title") or ""
+            x = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
+            head = f"{t}" + (f" › {sec}" if sec else "")
+            if not (head or x):
+                return json.dumps(h, ensure_ascii=False, default=str)[:300]
+            return f"• [{head}] {str(x).strip()}"[:700]
+
+        async def _kn_one(p):
+            try:
+                raw = await _call(tools, "agent_search",
+                                  {"agent_type": p["key"], "q": question, "mode": "hybrid"})
+                d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
+                hits = (d or {}).get("hits") if isinstance(d, dict) else None
+                if not hits or (isinstance(d, dict) and d.get("refused")):
+                    return p["key"], ""
+                lines, total, seen = [], 0, set()
+                for h in hits:
+                    ln = _hit_line(h)
+                    if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
+                        continue
+                    if total + len(ln) > _kb_budget:
+                        break
+                    seen.add(ln); lines.append(ln); total += len(ln)
+                return p["key"], "\n".join(lines)
+            except Exception as exc:  # noqa: BLE001 — 지식 검색 실패는 비치명(그 전문가만 미주입)
+                print(f"[deliberation] 지식카드 검색 실패({p.get('key')}): {exc!r}")
+                return p["key"], ""
+
+        yield _sse("status", {"step": "페르소나별 지식카드 검색(주제 연관 발췌)", "tool": "agent_search"})
+        for _k, _blk in await asyncio.gather(*[_kn_one(p) for p in personas]):
+            if _blk:
+                knowledge_by_key[_k] = _blk
+                yield _delib("evidence", source=f"{_k} · 지식카드", text=_blk[:400], included=True)
+        yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(personas)}명 "
+                                      f"관련 지식 확보", "tool": None})
+
     # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
     # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
     cont = ""
@@ -1090,11 +1141,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 자유 조회 — 발언 전에 각 전문가가 직접 데이터를 조회한다. 수렴 라운드는 새 조회 없이
         # 기존 논의를 정리하는 단계라 건너뛴다. 병렬 실행하되 완료 순서대로 조회 이력을 흘린다 —
         # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
+        _gathered = {}
         if g_agent is not None and kind != "converge":
             _gctx = (prev_t[-1800:] if (rnd > 1 and prev_t) else base[:1800])
             _gt = [asyncio.ensure_future(
                 _free_gather_one(g_agent, p, question, _gctx, opts.tool_budget)) for p in personas]
-            _gathered = {}
             for _fut in asyncio.as_completed(_gt):
                 try:
                     _k, _calls, _blk = await _fut
@@ -1106,13 +1157,23 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
                                      included=True)
                 _gathered[_k] = _blk
-            if any(_gathered.values()):
-                _base_fn = prompt_fn
+        # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
+        # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
+        _kn = knowledge_by_key if kind != "converge" else {}
+        if any(_kn.values()) or any(_gathered.values()):
+            _base_fn = prompt_fn
 
-                def prompt_fn(p, _f=_base_fn, _g=_gathered):
-                    blk = _g.get(p["key"]) or ""
-                    return _f(p) + (("\n\n[당신이 직접 조회한 결과 — 발언에 인용하세요. 여기·공용 "
-                                     "근거에 없는 수치는 (경험칙) 표기]\n" + blk) if blk else "")
+            def prompt_fn(p, _f=_base_fn, _kn=_kn, _g=_gathered):
+                out = _f(p)
+                kb = _kn.get(p["key"]) or ""
+                if kb:
+                    out += ("\n\n[당신의 지식카드에서 — 이 주제 관련 발췌. 발언의 1차 근거로 "
+                            "인용하세요]\n" + kb)
+                blk = _g.get(p["key"]) or ""
+                if blk:
+                    out += ("\n\n[당신이 직접 조회한 결과 — 발언에 인용하세요. 여기·공용 근거에 "
+                            "없는 수치는 (경험칙) 표기]\n" + blk)
+                return out
 
         cur = []
         async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
