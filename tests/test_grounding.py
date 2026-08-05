@@ -152,6 +152,70 @@ def test_포털_안내는_예고가_아니다():
     assert ANNOUNCED("포털 상단 'API 토큰' 메뉴(/tokens)에서 토큰을 발급합니다.") is False
 
 
+# ── 확정 종결: 예고문 속 도구 이름 복원 ───────────────────────────────────────
+def _mentioned():
+    src = APP.read_text(encoding="utf-8")
+    ns: dict = {"re": re}
+    m = re.search(r"def _mentioned_tools.*?\n    return out", src, re.S)
+    assert m, "app.py 에서 _mentioned_tools 를 찾지 못했다"
+    exec(m.group(0), ns)  # noqa: S102
+    return ns["_mentioned_tools"]
+
+
+MENTIONED = _mentioned()
+NAMES = ["list_materials", "get_material", "get_mat_card", "query_voc", "search_reports"]
+
+
+def test_예고문에서_정확한_도구명을_찾는다():
+    t = "먼저 list_materials(query=\"Al6061\")를 호출하여 재료를 찾겠습니다."
+    assert MENTIONED(t, NAMES) == ["list_materials"]
+
+
+def test_오타는_유일_근접일_때만_교정한다():
+    assert MENTIONED("이제 list_material 을 조회하겠습니다.", NAMES) == ["list_materials"]
+
+
+def test_도구명_없는_예고문은_빈_목록():
+    assert MENTIONED("확인해 보겠습니다.", NAMES) == []
+
+
+def test_일반_한국어_영단어를_도구로_오인하지_않는다():
+    assert MENTIONED("performance 개선을 확인하겠습니다.", NAMES) == []
+
+
+# ── 자유 조회 화이트리스트 ────────────────────────────────────────────────────
+def _free_ok():
+    src = (APP.parent / "deliberation.py").read_text(encoding="utf-8")
+    ns: dict = {}
+    for pat in (r"_FREE_ALLOW = \([^)]*\)", r"_FREE_DENY = \([^)]*\)",
+                r"def _free_tool_ok.*?startswith\(_FREE_ALLOW\)"):
+        m = re.search(pat, src, re.S)
+        assert m, f"deliberation.py 에서 블록을 찾지 못했다: {pat[:30]}"
+        exec(m.group(0), ns)  # noqa: S102
+    return ns["_free_tool_ok"]
+
+
+FREE_OK = _free_ok()
+
+
+def test_읽기_전용_도구는_허용():
+    for n in ("list_materials", "get_material_properties", "compute_abd_matrix",
+              "search_by_property", "plot_curve", "hybrid_search", "agent_search"):
+        assert FREE_OK(n), n
+
+
+def test_쓰기·부작용_도구는_전부_차단():
+    """deny-by-default — 화이트리스트 접두사에 없으면 무조건 닫힌다."""
+    for n in ("register_material", "update_material", "create_report_draft", "delete_session",
+              "upload_kfile", "slurm_submit_job", "run_operation", "train_model",
+              "save_conversation", "meeting_start", "render_submit", "bind_records_to_agent"):
+        assert not FREE_OK(n), n
+
+
+def test_페르소나_세션_원문은_조회_근거가_아니다():
+    assert not FREE_OK("get_agent_session")
+
+
 if __name__ == "__main__":  # pytest 없이도 돌릴 수 있게
     fails = 0
     for name, fn in sorted(globals().items()):

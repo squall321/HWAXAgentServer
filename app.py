@@ -43,6 +43,7 @@ from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
     _call,
+    _tool_schema_brief,
     _env_float,
     _env_int,
     _first_dict,
@@ -1300,6 +1301,24 @@ def _drew_own_chart(message: str, text: str) -> bool:
     return bool(text) and bool(_CHART_SURFACE_RE.search(text)) and bool(_ENTITY_RE.search(message or ""))
 
 
+def _mentioned_tools(text: str, names) -> list:
+    """발언 속에서 실제 도구 이름을 찾는다 — '호출하겠습니다'만 남기고 끝난 턴을 코드가
+    이어받을 때 무엇을 부르려 했는지 복원하는 용도. 정확 일치 우선, 오타(밑줄 포함 토큰)는
+    근접 후보가 유일할 때만 교정한다(모호하면 버림 — 엉뚱한 도구 호출이 미호출보다 나쁘다)."""
+    import difflib  # noqa: PLC0415
+    ns = set(names or [])
+    out: list = []
+    for t in re.findall(r"[a-z][a-z0-9_]{2,}", (text or "").lower()):
+        if t in ns:
+            if t not in out:
+                out.append(t)
+        elif "_" in t:
+            close = difflib.get_close_matches(t, list(ns), n=2, cutoff=0.85)
+            if len(close) == 1 and close[0] not in out:
+                out.append(close[0])
+    return out
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
@@ -1414,7 +1433,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         detail = ""
         if os.environ.get("AGENT_DEBUG_ERRORS") == "1":
             detail = f" — {type(exc).__name__}: {str(exc)[:400]}"
-        yield _sse("error", {"code": "agent_error", "message": f"에이전트 처리 중 오류{detail}"})
+        # 부분 응답이 있으면 버리지 않는다 — 여기까지 스트리밍된 내용 + 중단 사실을 명시해
+        # 대화 기록에 남긴다. 아무 설명 없이 초록불만 꺼지는 상태를 만들지 않는다.
+        _partial = "".join(full).strip()
+        if _partial:
+            _note = ("\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다"
+                     f"{detail}. 같은 질문을 다시 보내면 재시도합니다.")
+            yield _sse("token", {"delta": _note})
+            yield _sse("result", {"type": "text", "content": _partial + _note})
+        else:
+            yield _sse("error", {"code": "agent_error", "message": f"에이전트 처리 중 오류{detail}"})
         yield _sse("done", {})
         return
     text = "".join(full)
@@ -1461,6 +1489,77 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                      "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")
             text += _warn
             yield _sse("token", {"delta": _warn})
+    # ── 확정 종결 — "조회하겠습니다"만 남기고 끝나거나 빈 응답으로 끝나는 애매한 턴을 없앤다.
+    # 사용자 요구(2026-08-05): 스트림이 애매하게 꺼지지 말 것 — 도구가 있는지 없는지 판별될
+    # 때까지 진행해서, 있으면 코드가 직접 1회 호출해 결과로 답하고, 없으면 '없다'고 명시하고
+    # 끝낸다. 어느 쪽이든 사용자는 결론을 받는다(누출 케이스는 아래 기존 경로가 처리).
+    if ((_budget["calls"] - _budget["blocked"]) <= 0
+            and (_announced_without_calling(text) or not text.strip())
+            and not _looks_like_leaked_tool_call(text, _no_tool)):
+        yield _sse("status", {"step": "도구 유무 확인 — 확정 종결 절차", "tool": None})
+        try:
+            _tmap = await _tools_by_name(app, req.groups)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] finalizer tool load failed: {exc!r}")
+            _tmap = {}
+        _cand = _mentioned_tools(text, _tmap.keys())
+        if not _cand and _tmap:
+            # 예고문에 도구 이름이 없으면 질의 관련도 상위 1개로 보수적 폴백 — 절반 이상
+            # 어휘가 겹칠 때만(엉뚱한 도구를 부르는 것이 미호출보다 나쁘다).
+            _rk = _rank_tools(_tmap, req.message, top_k=3)
+            if _rk and _rk[0].get("score", 0) >= 0.5:
+                _cand = [_rk[0]["name"]]
+        if _cand and _cand[0] in _tmap:
+            _tn = _cand[0]
+            _brief = _tool_schema_brief(_tmap[_tn])
+            try:
+                _argd = _parse_json(await _llm_text(
+                    app.state.llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+                    f"[사용자 질문]\n{req.message}\n\n[도구]\n{_tn}: "
+                    f"{(getattr(_tmap[_tn], 'description', '') or '')[:300]}\n"
+                    + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
+                    + "\n이 질문에 맞게 이 도구를 1회 호출할 인자 JSON 을 출력하라. "
+                      "스키마 타입을 지켜라. 값을 알 수 없는 필수 인자가 있으면 {\"skip\": true} 만 출력."))
+            except Exception:  # noqa: BLE001
+                _argd = None
+            if not isinstance(_argd, dict) or _argd.get("skip"):
+                _close = (f"\n\n확인 결과 — 도구 `{_tn}` 는 있습니다. 다만 질문만으로 필수 인자를 "
+                          f"확정할 수 없어 호출하지 못했습니다. 필요한 값을 알려주시면 바로 실행합니다."
+                          + (f"\n(인자: {_brief[:200]})" if _brief else ""))
+                text = (text + _close).strip()
+                yield _sse("token", {"delta": _close})
+            else:
+                yield _sse("status", {"step": f"도구 직접 실행: {_tn}", "tool": _tn,
+                                      "detail": json.dumps(_argd, ensure_ascii=False)[:200]})
+                try:
+                    _out = await _call(_tmap, _tn, _argd)
+                except Exception as exc:  # noqa: BLE001
+                    _out = f"(tool {_tn} error: {exc})"
+                _out = _cap(str(_out))
+                yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn})
+                try:
+                    _final = (await _llm_text(
+                        app.state.llm,
+                        "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
+                        "호출하겠다고 말하지 말고, 아래 결과만으로 답하라. 결과가 오류라면 오류라고 "
+                        "명확히 알리고 다음 행동을 제안하라.",
+                        f"[사용자 질문]\n{req.message}\n\n[{_tn} 결과]\n{_out}")).strip()
+                except Exception:  # noqa: BLE001
+                    _final = f"[{_tn} 결과]\n{_out[:1500]}"
+                text = (text + "\n\n" + _final).strip()
+                yield _sse("token", {"delta": "\n\n" + _final})
+        else:
+            _near = ""
+            if _tmap:
+                _rk = _rank_tools(_tmap, req.message, top_k=3)
+                _near = ", ".join(f"`{r['name']}`" for r in _rk) if _rk else ""
+            _close = ("\n\n확인 결과 — 이 요청을 수행할 도구가 현재 연결된 도구 목록"
+                      + (f"({len(_tmap)}개)" if _tmap else "(게이트웨이 미연결 상태)") + "에 없습니다."
+                      + (f" 이름이 가까운 후보: {_near}." if _near else "")
+                      + " 해당 기능이 추가되면 이 채팅에서 바로 사용할 수 있습니다.")
+            text = (text + _close).strip()
+            yield _sse("token", {"delta": _close})
+
     if _looks_like_leaked_tool_call(text, _no_tool):
         print(f"[agent] tool-call leaked into text (도구 실행 {_budget['calls']}회) — 비스트리밍 재시도")
         yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})
