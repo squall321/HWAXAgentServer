@@ -78,10 +78,15 @@ def _resolve_opts(req_opts):
         human_note="", continue_summary="", continue_personas=[],
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
+        # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
+        # 없으면 심의는 시작 시점 근거 스냅샷에 갇힌다(사전 조회의 상상력이 검증 범위의 상한).
+        free_tools=_env_int("DELIB_FREE_TOOLS", 1),
+        tool_budget=_env_int("DELIB_TOOL_BUDGET", 3),
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-                  "chair_bestof", "chair_cite", "parse_retries", "rounds"):
+                  "chair_bestof", "chair_cite", "parse_retries", "rounds",
+                  "free_tools", "tool_budget"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -113,6 +118,7 @@ def _resolve_opts(req_opts):
     o.parse_retries = max(0, min(10, o.parse_retries))   # 방어심층 — 직접 호출 시 재시도 폭주 상한
     o.chair_bestof = max(1, min(5, o.chair_bestof))
     o.rounds = max(2, min(8, o.rounds))                  # 라운드 수 2~8(기본 3=초기+심화1+수렴)
+    o.tool_budget = max(1, min(6, o.tool_budget))        # 자유 조회 1인당 호출 상한
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
     return o
@@ -546,6 +552,91 @@ def _tool_schema_brief(t) -> str:
     return "\n".join(lines)
 
 
+
+# ── 자유 조회(free tools) — 발언 전에 전문가가 스스로 데이터를 조회하는 단계 ─────────────
+# 읽기 전용만 허용한다. 심의가 데이터를 등록·수정하는 부작용을 내면 안 된다 — 접두사
+# 화이트리스트로만 열고, 목록에 없는 이름은 전부 닫는다(deny-by-default).
+_FREE_ALLOW = ("list_", "get_", "search_", "find_", "query_", "compute_", "analyze_",
+               "evaluate_", "predict_", "assess_", "compare_", "estimate_", "solve_",
+               "recover_", "hybrid_", "semantic_", "fts_", "material_", "property_",
+               "database_", "coverage_", "plot_", "check_", "describe_", "ashby_",
+               "stress_", "top_", "catalog_", "agent_search", "daily_", "alert_")
+_FREE_DENY = ("get_agent_session",)   # 페르소나 시스템프롬프트 원문은 조회 근거가 아니다
+
+
+def _free_tool_ok(name: str) -> bool:
+    n = (name or "").lower()
+    return n not in _FREE_DENY and n.startswith(_FREE_ALLOW)
+
+
+def _wrap_cached(tool, cache: dict):
+    """같은 심의 안에서 같은 도구·같은 인자 재호출을 1회로 접는다 — 전문가 여럿이 같은 재료를
+    조회하는 것이 정상 패턴이라 캐시가 곧 예산 절약이다(도구 객체는 이 심의 전용 로드라 안전)."""
+    orig = tool.coroutine
+    if orig is None:
+        return tool
+
+    async def cached(*a, **kw):
+        try:
+            key = (tool.name, json.dumps(kw or (a[0] if a and isinstance(a[0], dict) else {}),
+                                         sort_keys=True, ensure_ascii=False, default=str))
+        except Exception:  # noqa: BLE001 — 키 직렬화 불가면 캐시 없이 그냥 호출
+            return await orig(*a, **kw)
+        if key in cache:
+            return cache[key]
+        out = await orig(*a, **kw)
+        cache[key] = out
+        return out
+
+    tool.coroutine = cached
+    return tool
+
+
+async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budget: int):
+    """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록) 반환. 실패 비치명.
+    발언(JSON 계약)과 분리된 이유: 도구 호출 모델은 왕복 후 스키마 계약을 곧잘 어긴다(실측) —
+    조회는 여기서, 발언은 종전대로 도구 없는 텍스트 턴에서."""
+    sysmsg = (f"당신은 '{persona['key']}' 전문가({str(persona.get('role', ''))[:280]}). "
+              f"지금은 심의 발언 전의 데이터 조회 단계다. 필요한 조회를 도구로 직접 수행하라. "
+              f"규칙: 최대 {budget}회. 대상을 이름으로 찾을 땐 목록·검색 도구 먼저 — 식별자"
+              f"(id·test_id)를 추측해 넣지 마라(차단된다). 끝나면 '조회 요약:' 뒤에 핵심 수치만 "
+              f"3줄 이내로 요약하라. 조회할 것이 없으면 '조회 불필요' 한 줄만 출력하라.")
+    human = (f"[심의 주제]\n{question}\n\n[지금까지의 논의·근거(발췌)]\n{ctx}\n\n"
+             f"당신 발언에 필요한 조회를 지금 수행하라.")
+    calls, summary = [], ""
+    try:
+        res = await g_agent.ainvoke({"messages": [("system", sysmsg), ("user", human)]},
+                                    config={"recursion_limit": budget * 2 + 5})
+        args_by_id = {}
+        for m in (res or {}).get("messages") or []:
+            for tc in (getattr(m, "tool_calls", None) or []):
+                args_by_id[tc.get("id")] = tc.get("args")
+            mtype = getattr(m, "type", "")
+            body = getattr(m, "content", "")
+            if isinstance(body, list):
+                body = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in body)
+            if mtype == "tool":
+                calls.append((getattr(m, "name", "?") or "?",
+                              json.dumps(args_by_id.get(getattr(m, "tool_call_id", None)) or {},
+                                         ensure_ascii=False, default=str)[:140],
+                              str(body)))
+            elif mtype == "ai" and isinstance(body, str) and body.strip():
+                summary = body.strip()
+    except Exception as exc:  # noqa: BLE001 — 조회 실패가 발언을 막지 않는다
+        print(f"[deliberation] free-gather 실패({persona.get('key')}): {exc!r}")
+    calls = calls[:budget]
+    # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
+    # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
+    def _has_content(b: str) -> bool:
+        return _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")
+    good = [(n, ap, b) for n, ap, b in calls if _has_content(b)]
+    if not good:
+        return persona["key"], calls, ""
+    block = "\n".join(f"- {n}({ap}): {b[:900]}" for n, ap, b in good)[:3500]
+    if summary and not summary.startswith("조회 불필요"):
+        block += f"\n(전문가 자체 요약) {summary[:400]}"
+    return persona["key"], calls, block
+
 def _sf_products(alerts: dict) -> list:
     """alert_check 결과에서 경보 제품 코드를 방어적으로 추출(스키마 변동 대비)."""
     out = []
@@ -726,6 +817,24 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (test_id=1 → SUS201) 처럼 지어낸 ID 가 그대로 나갔다. 출처는 질문 + 도구 결과에서 늘어난다.
     from app import _int_tokens, _turn_ids  # noqa: PLC0415
     _turn_ids.set(_int_tokens(question) | _int_tokens(opts.human_note or ""))
+
+    # 자유 조회 에이전트 — 라운드 중 전문가가 직접 데이터를 조회한다(읽기 전용·예산 제한).
+    # 결과가 LLM 프롬프트로 들어가므로 여기서는 **기본 캡**(TOOL_RESULT_MAX)으로 다시 로드한다 —
+    # 위 무절단(CATALOG) 로드를 재사용하면 조회 한 번이 컨텍스트를 삼킨다. 유령 ID 게이트는
+    # _turn_ids 가 이미 시드돼 있어 이 로드의 _prep_tool 래퍼에도 그대로 걸린다.
+    g_agent = None
+    if opts.free_tools:
+        try:
+            from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
+            _fcache: dict = {}
+            _g = {n: _wrap_cached(t, _fcache)
+                  for n, t in (await _tools_by_name(app, groups)).items() if _free_tool_ok(n)}
+            if _g:
+                g_agent = create_react_agent(llm, list(_g.values()))
+                yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종, "
+                                              f"1인당 최대 {opts.tool_budget}회", "tool": None})
+        except Exception as exc:  # noqa: BLE001 — 자유 조회 불가여도 심의는 종전대로 진행
+            print(f"[deliberation] free-tool 준비 실패: {exc!r}")
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
@@ -977,6 +1086,33 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             validator_fn = ((lambda p, _c=_ctx, _w=_where: _quote_validator(_c(p)[1], _w))
                             if opts.rebut_quote else None)
             required, render = ("deepen", "rebut", "concede"), 2
+
+        # 자유 조회 — 발언 전에 각 전문가가 직접 데이터를 조회한다. 수렴 라운드는 새 조회 없이
+        # 기존 논의를 정리하는 단계라 건너뛴다. 병렬 실행하되 완료 순서대로 조회 이력을 흘린다 —
+        # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
+        if g_agent is not None and kind != "converge":
+            _gctx = (prev_t[-1800:] if (rnd > 1 and prev_t) else base[:1800])
+            _gt = [asyncio.ensure_future(
+                _free_gather_one(g_agent, p, question, _gctx, opts.tool_budget)) for p in personas]
+            _gathered = {}
+            for _fut in asyncio.as_completed(_gt):
+                try:
+                    _k, _calls, _blk = await _fut
+                except Exception:  # noqa: BLE001
+                    continue
+                for _tn, _ap, _out in _calls:
+                    yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
+                    if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
+                        yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
+                                     included=True)
+                _gathered[_k] = _blk
+            if any(_gathered.values()):
+                _base_fn = prompt_fn
+
+                def prompt_fn(p, _f=_base_fn, _g=_gathered):
+                    blk = _g.get(p["key"]) or ""
+                    return _f(p) + (("\n\n[당신이 직접 조회한 결과 — 발언에 인용하세요. 여기·공용 "
+                                     "근거에 없는 수치는 (경험칙) 표기]\n" + blk) if blk else "")
 
         cur = []
         async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
