@@ -254,6 +254,11 @@ class ChatRequest(BaseModel):
     # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
     # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
     pinned_agent: str | None = None
+    # 앱(소유 MCP 앱) 단위 우선 지정 — 개별 도구 이름을 고르는 대신 앱을 고른다.
+    # 도구 210개를 평평하게 훑어 12개를 체크하는 UX 는 "무엇을 골라야 하는지 모르겠다"는
+    # 문제를 낳았다. 앱은 10개뿐이고 사용자가 아는 단위라 고를 수 있다. 서버가 앱→도구로
+    # 펼치므로 pinned_tools 의 12개 캡에 걸리지 않는다(앱 하나가 평균 23개·최대 32개다).
+    pinned_apps: list[str] | None = None
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -870,6 +875,39 @@ _GROUP_LABEL = {
 }
 
 
+_APPS_CACHE: dict = {"apps": {}, "at": 0.0}
+
+
+def _gw_apps() -> dict:
+    """게이트웨이 /tools-map 의 apps[] — {앱키: {label, description, tool_count, reachable}}.
+
+    라벨의 정본은 게이트웨이다(heax 앱은 registry name 을 그대로 싣는다). 여기 없을 때만
+    _GROUP_LABEL 표로 폴백한다 — 하드코딩 표는 신규 앱이 붙을 때마다 틀린 이름을 노출한다."""
+    import time
+    import urllib.request
+    now = time.time()
+    if _APPS_CACHE["apps"] and now - _APPS_CACHE["at"] < 300:
+        return _APPS_CACHE["apps"]
+    try:
+        with urllib.request.urlopen(f"{_GW_HTTP}/tools-map", timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        apps = {a["app"]: a for a in (data.get("apps") or []) if a.get("app")}
+        if apps:
+            _APPS_CACHE.update({"apps": apps, "at": now})
+    except Exception:  # noqa: BLE001 — 게이트웨이 불통은 비치명적. 폴백 표로 계속 간다.
+        pass
+    return _APPS_CACHE["apps"]
+
+
+def _app_label(key: str) -> str:
+    a = _gw_apps().get(key) or {}
+    return (a.get("label") or "").strip() or _GROUP_LABEL.get(key) or _pretty_group(key)
+
+
+def _app_desc(key: str) -> str:
+    return ((_gw_apps().get(key) or {}).get("description") or "").strip()
+
+
 def _tools_map() -> dict:
     import time
     import urllib.request
@@ -899,7 +937,7 @@ def _pretty_group(key: str) -> str:
 
 def _group_of(name: str) -> tuple:
     key = _tools_map().get(name, "")
-    return key, _GROUP_LABEL.get(key) or _pretty_group(key)
+    return key, (_app_label(key) if key else "")
 
 
 def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
@@ -1339,6 +1377,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
+        # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
+        # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
+        # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
+        apps = [str(a)[:80] for a in (req.pinned_apps or []) if isinstance(a, str) and a.strip()][:3]
+        if apps:
+            _tm = _tools_map()
+            _from_apps = [n for n, gk in _tm.items() if gk in apps and n not in pinned]
+            pinned = pinned + sorted(_from_apps)
+            yield _sse("status", {"step": f"지정 앱 {len(apps)}개 → 도구 {len(_from_apps)}개 우선",
+                                  "tool": None, "tools_used": apps})
         # 도구 선별 질의에는 최근 히스토리를 함께 넣는다. 현재 메시지만 보면 '다시 제출해줘',
         # '그럼 그래프로 그려줘' 같은 후속 발화는 토큰이 거의 없어 관련도가 0이 되고, 직전 턴에
         # 쓰던 도구가 캡 밖으로 사라진다(감사 실측: slurm 14개 → 0개, 모델이 이미 받은 잡 ID를
@@ -1361,7 +1409,20 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             sys_prompt += ("\n\n[중요] 이번 턴에는 사용 가능한 도구가 하나도 없다(게이트웨이 연결 실패). "
                            "도구를 호출하겠다고 말하지 말고, 도구 없이 답할 수 있는 범위만 답한 뒤 "
                            "도구가 필요하다면 '도구 연결이 복구되면 다시 시도해 달라'고 알려라.")
-        if pinned:
+        # 앱 지정이면 도구 이름 20~30개를 나열하지 않는다 — 프롬프트가 이름 목록으로 뒤덮이면
+        # 모델이 무엇을 왜 쓰는지보다 목록 훑기에 예산을 쓴다. 앱 이름과 개수만 말하고,
+        # 실제 강제는 바인딩 우선순위(pin)가 담당한다.
+        if apps:
+            _labels = ", ".join(_app_label(a) for a in apps)
+            sys_prompt += (f"\n\n[사용자 지정 우선 앱]\n{_labels}\n"
+                           f"사용자가 이 앱(들)의 기능을 쓰라고 직접 골랐다. 이 질문 처리에 적합한 도구가 "
+                           f"그 앱 안에 있으면 반드시 우선 호출하고 결과를 답변에 인용하라"
+                           f"(다른 도구 사용 금지는 아니다). 어떤 도구를 쓸지는 네가 고른다.")
+            if req.pinned_tools:
+                _direct = [n for n in pinned if n in set(req.pinned_tools or [])]
+                if _direct:
+                    sys_prompt += ("\n그중 사용자가 콕 집은 도구: " + ", ".join(_direct[:12]) + " — 가장 우선.")
+        elif pinned:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
                              "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
