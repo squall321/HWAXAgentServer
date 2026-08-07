@@ -136,6 +136,56 @@ def test_모든_근거_종류가_프로파일에_남는다():
         assert n in note
 
 
+# ── 시뮬레이션 심의(2단) ─────────────────────────────────────────────────────
+def test_시뮬_트리거를_일반_심의와_구분한다():
+    assert d.is_sim_deliberation("/시뮬심의 액자형 수축")
+    assert d.is_sim_deliberation("/시뮬레이션심의 낙하 크랙")
+    assert not d.is_sim_deliberation("/심의 일반 주제")
+    assert not d.is_sim_deliberation("시뮬심의 접두사 없음")
+
+
+def test_시뮬_트리거를_떼어낸다():
+    assert d.strip_sim_trigger("/시뮬심의  액자형 수축") == "액자형 수축"
+
+
+def test_의장_템플릿_3종이_있고_기본은_종전이다():
+    """미지정이 종전과 같아야 기존 심의에 회귀가 없다."""
+    assert set(d._CHAIR_ITEMS) == {"default", "mechanism", "sim-plan"}
+    assert d._resolve_opts({}).chair_template == "default"
+    assert d._resolve_opts({"chair_template": "sim-plan"}).chair_template == "sim-plan"
+
+
+def test_모르는_템플릿은_기본으로_떨어진다():
+    """오타·구버전 클라이언트가 의장 프롬프트를 비우지 못하게."""
+    assert d._resolve_opts({"chair_template": "없는것"}).chair_template == "default"
+    assert d._resolve_opts({"chair_template": 123}).chair_template == "default"
+
+
+def test_해석계획서_템플릿이_식별성과_한계를_강제한다():
+    """이 둘이 '그럴듯한 계획서'와 '실제로 돌릴 수 있는 계획'을 가른다."""
+    t = d._CHAIR_ITEMS["sim-plan"]
+    assert "식별성" in t and "퇴화" in t
+    assert "답할 수 없는 것" in t
+    assert "비워두지 마라" in t
+
+
+def test_메커니즘_템플릿이_2단_입력을_뽑는다():
+    """상태변수·지배방정식 후보·미지 파라미터가 없으면 해석 설계가 시작될 수 없다."""
+    t = d._CHAIR_ITEMS["mechanism"]
+    for k in ("상태변수", "지배방정식", "미지 파라미터", "반증 관측"):
+        assert k in t, k
+
+
+def test_고정_CAE_좌석은_발굴에_맡기지_않는다():
+    """현상 어휘에 끌려 방법론·검증 좌석이 빠지는 것을 막는다."""
+    assert "xd-cae-modeling" in d._SIM_FIXED_CAE and "xd-cae-post" in d._SIM_FIXED_CAE
+
+
+def test_물리_유임_좌석이_최소_1석은_보장된다():
+    """CAE 만 모으면 틀린 물리를 아름답게 계산한다."""
+    assert d._SIM_CARRY >= 1
+
+
 # ── 손잡이 기본값 ────────────────────────────────────────────────────────────
 def test_좌석_손잡이는_기본_켜짐이고_탈출구가_있다():
     """깊이 회복 손잡이 7종과 달리 좌석 손잡이는 프롬프트 제약을 늘리지 않으므로 기본 켜짐이다.

@@ -52,11 +52,14 @@ from deliberation import (
     _llm_text,
     _tools_by_name,
     is_deliberation,
+    is_sim_deliberation,
     is_report_save,
     run_deliberation,
+    run_sim_deliberation,
     run_report_save,
     strip_report_trigger,
     strip_trigger,
+    strip_sim_trigger,
 )
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -1645,7 +1648,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
 async def chat(req: ChatRequest) -> StreamingResponse:
     # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
     # 정본은 역량 있는 Claude(개인 Claude via MCP); 이건 GLM 연결 시 포털 챗으로도 되게 하는 진입점.
-    if is_deliberation(req.message):
+    if is_sim_deliberation(req.message):
+        # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
+        # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
+        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts)
+    elif is_deliberation(req.message):
         stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).

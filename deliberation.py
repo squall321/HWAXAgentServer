@@ -10,6 +10,9 @@ from types import SimpleNamespace
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
+# 시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의. 일반 심의보다 먼저
+# 검사해야 한다("/시뮬심의"가 "/심의"로 시작하지 않으므로 순서 의존은 없지만 의도를 명시).
+SIM_DELIBERATE_TRIGGERS = ("/시뮬심의", "/시뮬레이션심의", "/simdeliberate")
 # 대화 → RA 보고서 저장(결정적) — LLM 재량에 맡기지 않고 코드가 blocks 를 만들어 저장한다.
 # "/보고서 <선택: 내 결론>" — 사용자가 직접 끌어낸 결론을 함께 주면 권고안 맨 앞에 실린다.
 REPORT_TRIGGERS = ("/보고서", "/report")
@@ -68,6 +71,40 @@ _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라�
 # 좌석 구성 손잡이 — 위 '깊이 회복 손잡이'와 달리 프롬프트 제약을 늘리지 않고 참가자 집합만
 # 바꾸므로, GLM 의 지시 추종 예산과 무관하다(단일 변수 A/B 원칙의 적용 대상이 아님).
 # 근거: docs/deliberation-quality/plan.md §0-2.
+# 의장 산출 항목 — MCP 워크플로(hwax-deliberate.js)의 chairTemplate 과 같은 계약.
+# 두 경로가 갈리면 웹 결정문과 MCP 결정문의 형식이 어긋난다.
+_CHAIR_ITEMS = {
+    "default":
+        "(1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
+        "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
+        "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
+        "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제.",
+    "mechanism":
+        "(1) 메커니즘 결론 — 무엇이 무엇을 어떤 경로로 바꾸는가를 인과 사슬로, "
+        "(2) 상태변수와 공간·시간 스케일 — 무엇을 추적해야 현상이 기술되는가, "
+        "(3) 지배방정식 후보 — 형태 수준으로(확산·반응·이동·구조·열 등 어느 계열인지와 결합 관계), "
+        "(4) 미지 파라미터 목록 — 값을 모르는 물리량과 단위·예상 범위, "
+        "(5) 반증 관측 — 이 메커니즘이 틀렸다면 무엇이 관측되는가, "
+        "(6) 합의 근거와 소수의견 처리, (7) 신뢰도·전제. "
+        "이 결정문은 후속 해석 설계 심의의 입력이므로 (2)(3)(4)를 특히 구체적으로 쓰라.",
+    "sim-plan":
+        "해석 계획서 10개 항목 — (1) 해석 목적: 이 계산이 답할 질문 하나를 문장으로, "
+        "(2) 지배방정식과 물리 모델: 위 메커니즘 결론에서 승계해 수식 수준으로 확정, "
+        "(3) 해석 종류·차원·기하 축약: 3D full / 2D 평면·축대칭 / 1D 중 무엇이며 그 축약이 정당한 이유, "
+        "(4) 솔버·도구 선택과 근거: 사내 보유 도구를 우선 검토하고 없을 때만 외부 도구, "
+        "(5) 이산화: 메시 전략·시간 적분·수치 기법과 안정성 조건, (6) 경계·초기조건, "
+        "(7) 물성·파라미터 확보 경로와 식별성 판정 — 각 파라미터를 문헌/독립 측정/피팅으로 분류하고, "
+        "피팅 대상이 둘 이상이면 서로 곱으로 붙어 분리되지 않는지(퇴화) 판정하라. "
+        "퇴화가 있으면 그것을 푸는 독립 관측을 지정하라, "
+        "(8) 검증 계획: 해석해·벤치마크·시험 대조, (9) 계산 규모와 일정, "
+        "(10) 이 해석이 답할 수 없는 것. (7)과 (10)은 비워두지 마라 — 비면 계획서가 아니다.",
+}
+
+# 시뮬레이션 심의 2단 좌석 — 고정 CAE 좌석은 발굴에 맡기지 않는다. 현상 어휘에 끌려
+# 방법론·검증 좌석이 빠지는 일이 생긴다.
+_SIM_FIXED_CAE = ("xd-cae-modeling", "xd-cae-post")
+_SIM_CARRY = _env_int("DELIB_SIM_CARRY", 2)           # 2단에 남길 물리 유임 좌석 수
+
 _COUNTER_SEATS = _env_int("DELIB_COUNTER_SEATS", 2)   # 반대 도메인 좌석 수(0=끔, 종전 동작)
 _RESCREEN = _env_int("DELIB_RESCREEN", 1)             # 이어하기 좌석 재심사(0=끔, 종전 동작)
 _RESCREEN_SEATS = _env_int("DELIB_RESCREEN_SEATS", 2)  # 재심사로 더할 신규 좌석 상한
@@ -88,6 +125,8 @@ def _resolve_opts(req_opts):
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
+        # 의장 산출 항목 템플릿 — default | mechanism | sim-plan. 시뮬레이션 심의가 1단/2단에서 지정한다.
+        chair_template="default",
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
         # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
@@ -114,6 +153,9 @@ def _resolve_opts(req_opts):
         hn = req_opts.get("human_note")
         if isinstance(hn, str):
             o.human_note = hn[:2000]
+        ct = req_opts.get("chair_template")
+        if isinstance(ct, str) and ct in _CHAIR_ITEMS:
+            o.chair_template = ct
         cs = req_opts.get("continue_summary")
         if isinstance(cs, str):
             o.continue_summary = cs[:8000]
@@ -160,6 +202,19 @@ def _has_defect_topic(question: str) -> bool:
 def is_deliberation(message: str) -> bool:
     m = (message or "").strip()
     return any(m.startswith(t) for t in DELIBERATE_TRIGGERS)
+
+
+def is_sim_deliberation(message: str) -> bool:
+    m = (message or "").strip()
+    return any(m.startswith(t) for t in SIM_DELIBERATE_TRIGGERS)
+
+
+def strip_sim_trigger(message: str) -> str:
+    m = (message or "").strip()
+    for t in SIM_DELIBERATE_TRIGGERS:
+        if m.startswith(t):
+            return m[len(t):].strip()
+    return m
 
 
 def is_report_save(message: str) -> bool:
@@ -916,6 +971,95 @@ async def _evidence_prepass(tools: dict, llm, question: str):
     return distilled, inject, used
 
 
+async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
+    """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
+
+    라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
+    래퍼는 기존 계약(SSE 이벤트·저장 경로)을 그대로 쓴다.
+
+    좌석 설계가 핵심이다 — CAE 전문가만 모으면 틀린 물리를 아름답게 계산한다. 그래서 2단은
+    고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
+    해석이 물리에서 떠나는 것을 막는 감시자다."""
+    opts = _resolve_opts(req_opts)
+    decision_a, personas_a, nn_a = "", [], []
+
+    def _capture(chunk: bytes):
+        """1단 스트림에서 결정문·좌석·양보 불가 조항을 가로챈다(2단 입력)."""
+        nonlocal decision_a
+        try:
+            if not chunk.startswith(b"data:"):
+                return
+            ev = json.loads(chunk[5:].decode("utf-8").strip())
+        except Exception:  # noqa: BLE001 — 파싱 실패는 무시(캡처 실패가 심의를 죽이지 않게)
+            return
+        kind = ev.get("kind")
+        if kind == "decision":
+            decision_a = ev.get("text") or decision_a
+        elif kind == "personas":
+            for pp in ev.get("personas") or []:
+                if pp.get("key") and not any(x["key"] == pp["key"] for x in personas_a):
+                    personas_a.append({"key": pp["key"], "role": pp.get("role") or ""})
+        elif kind == "turn" and ev.get("non_negotiable"):
+            nn = str(ev["non_negotiable"]).strip()
+            if nn and nn not in nn_a:
+                nn_a.append(nn)
+
+    try:
+        # ── 1단 — 메커니즘 심의 ──────────────────────────────────────────────
+        yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
+        opts_a = _resolve_opts(req_opts)
+        opts_a.chair_template = "mechanism"
+        async for chunk in _deliberation_stream(app, question, groups, opts_a):
+            _capture(chunk)
+            yield chunk
+        if not decision_a:
+            yield _sse("error", {"code": "sim_no_mechanism",
+                                 "message": "1단 메커니즘 심의가 결정문을 내지 못해 해석 설계로 넘어갈 수 없습니다."})
+            yield _sse("done", {}); return
+
+        # ── 좌석 전환 ────────────────────────────────────────────────────────
+        yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
+        tools = await _tools_by_name(app, groups)
+        sim_seats, seen = [], set()
+
+        async def _add(key, origin):
+            if not key or key in seen:
+                return
+            seen.add(key)
+            sim_seats.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
+
+        for k in _SIM_FIXED_CAE:
+            await _add(k, "new")
+        # 1단 결론의 물리 축으로 발굴 — 현상 어휘가 아니라 계산의 성격으로 찾아야 CAE 가 잡힌다.
+        for cand in await _discover(tools, f"{question}\n\n{decision_a[:1500]}\n\n수치해석 시뮬레이션 모델링",
+                                    3, exclude=seen, origin="new"):
+            await _add(cand["key"], "new")
+        # 물리 유임 — 없으면 해석이 물리에서 떠난다. 1단 좌석 앞에서 강제로 채운다.
+        for pa in personas_a[:max(1, _SIM_CARRY)]:
+            await _add(pa["key"], "carry")
+        n_carry = sum(1 for x in sim_seats if x["origin"] == "carry")
+        yield _sse("status", {"step": f"2단 좌석 {len(sim_seats)}인 (CAE {len(sim_seats) - n_carry} · 물리 유임 {n_carry})",
+                              "tool": None, "personas": [x["key"] for x in sim_seats]})
+
+        # ── 2단 — 해석 설계 심의 ─────────────────────────────────────────────
+        yield _sse("status", {"step": "2단 — 해석 설계 심의", "tool": None})
+        opts_b = _resolve_opts(req_opts)
+        opts_b.chair_template = "sim-plan"
+        opts_b.continue_summary = decision_a[:8000]
+        opts_b.continue_non_negotiables = nn_a[:12]
+        opts_b.continue_personas = sim_seats
+        opts_b.human_note = ("사내 보유 도구를 우선 검토하라. 파라미터 식별성 판정과 "
+                             "이 해석이 답할 수 없는 것을 비워두지 마라.")
+        sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
+        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b):
+            yield chunk
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sim-deliberation] fatal: {exc!r}")
+        yield _sse("error", {"code": "sim_deliberation_error",
+                             "message": f"시뮬레이션 심의 처리 중 오류: {str(exc)[:200]}"})
+        yield _sse("done", {})
+
+
 async def run_deliberation(app, question: str, groups: list, req_opts=None):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
@@ -1381,6 +1525,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
                  if opts.chair_cite else "")
     ev_note = _evidence_note(ev_count)
+    chair_items = _CHAIR_ITEMS.get(opts.chair_template, _CHAIR_ITEMS["default"])
+    doc_title = "해석 계획서" if opts.chair_template == "sim-plan" else "의사결정문"
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
     rounds_block = "\n\n".join(
