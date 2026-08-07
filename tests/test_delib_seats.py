@@ -90,6 +90,52 @@ def test_좌석_지정과_독립이다():
     assert o.continue_non_negotiables == ["조항"] and o.continue_personas == []
 
 
+# ── 이어하기 블록 구성(F11) ──────────────────────────────────────────────────
+def test_승계_조항이_구속_문구와_함께_실린다():
+    """조항만 나열하면 참고 자료로 읽힌다 — 구속력과 폐기 조건을 함께 박아야 한다."""
+    b = d._cont_block("이전 결론", ["리셋 전 교체 금지", "파형 미고정 측정 무효"], "")
+    assert "리셋 전 교체 금지" in b and "파형 미고정 측정 무효" in b
+    assert "구속력" in b and "새 근거" in b
+
+
+def test_조항_전건이_빠짐없이_들어간다():
+    """승계 누락은 조용히 일어나므로 건수로 확인한다."""
+    nn = [f"조항 {i}" for i in range(1, 8)]
+    b = d._cont_block("요약", nn, "의견")
+    assert all(x in b for x in nn)
+
+
+def test_조항이_없으면_조항_블록도_없다():
+    b = d._cont_block("이전 결론", [], "")
+    assert "양보 불가" not in b and "이전 결론" in b
+
+
+def test_신규_심의는_빈_블록이다():
+    assert d._cont_block("", [], "") == ""
+
+
+def test_사람_의견은_방향_지시로_들어간다():
+    assert "반드시 반영" in d._cont_block("", [], "이 관측을 다뤄라")
+
+
+# ── 근거 프로파일(F2) ────────────────────────────────────────────────────────
+def test_조회_0건이면_가설_단계로_표기된다():
+    """S26U 결정문은 정량 계측 0건 위에서 확정 결론과 같은 형식으로 나왔다 — 그걸 막는 표기다."""
+    note = d._evidence_note({"tool": 0, "knowledge": 30, "voc": 1, "prepass": 0})
+    assert "가설 단계" in note and "도구 조회 0건" in note
+
+
+def test_조회가_있으면_가설_표기가_없다():
+    note = d._evidence_note({"tool": 12, "knowledge": 30, "voc": 1, "prepass": 2})
+    assert "가설 단계" not in note and "도구 조회 12건" in note
+
+
+def test_모든_근거_종류가_프로파일에_남는다():
+    note = d._evidence_note({"tool": 3, "knowledge": 4, "voc": 5, "prepass": 6})
+    for n in ("3건", "4건", "5건", "6건"):
+        assert n in note
+
+
 # ── 손잡이 기본값 ────────────────────────────────────────────────────────────
 def test_좌석_손잡이는_기본_켜짐이고_탈출구가_있다():
     """깊이 회복 손잡이 7종과 달리 좌석 손잡이는 프롬프트 제약을 늘리지 않으므로 기본 켜짐이다.

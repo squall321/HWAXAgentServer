@@ -141,6 +141,36 @@ def test_승계되지_않은_조항은_보존율에서_빠진다():
     assert metrics_layer_b(lost, prev)["non_negotiable_보존율"] == 0.0
 
 
+# ── 웹 경로 파서 ─────────────────────────────────────────────────────────────
+def test_save_conversation_형식을_읽는다(tmp_path):
+    """웹·MCP 산출물을 같은 자로 재려면 대화 저장 형식도 판독해야 한다.
+    픽스처는 포털에 실제로 저장한 S26U 대화(b2ecb437)의 메시지 구조다."""
+    from tools.delib_metrics import load_conversation
+    f = tmp_path / "conv.json"
+    f.write_text(json.dumps({"messages": [
+        {"role": "user", "content": "심의 주제"},
+        {"role": "persona", "persona": "disp-burnin", "round": 1, "content": "초기 입장"},
+        {"role": "persona", "persona": "sw-color-management", "round": 1, "content": "초기 입장"},
+        {"role": "persona", "persona": "disp-burnin", "round": 2, "content": "심화"},
+        {"role": "persona", "persona": "sw-color-management", "round": 2, "content": "심화"},
+        {"role": "assistant", "content": "## 의사결정문\n\n본문"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    doc = load_conversation(f)
+    assert doc["personas"] == ["disp-burnin", "sw-color-management"]
+    assert [len(r) for r in doc["rounds"]] == [2, 2]
+    assert doc["decision"].startswith("## 의사결정문")
+    assert metrics_layer_b(doc)["착석_도메인_수"] == 2
+
+
+def test_대화_형식의_역할설명도_정규화된다(tmp_path):
+    from tools.delib_metrics import load_conversation
+    f = tmp_path / "conv.json"
+    f.write_text(json.dumps({"messages": [
+        {"role": "persona", "persona": "disp-upc — UPC 영역 전문가", "round": 1, "content": "발언"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    assert load_conversation(f)["personas"] == ["disp-upc"]
+
+
 # ── 저널 파서 ────────────────────────────────────────────────────────────────
 def test_저널에서_라운드를_스키마로_가른다(tmp_path):
     """저널에 라운드 경계가 없으므로 필드로 판정한다 — lens=초기, final_position=수렴, 나머지=심화."""

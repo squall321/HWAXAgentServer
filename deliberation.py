@@ -740,6 +740,33 @@ async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: i
     return out[:limit]
 
 
+def _cont_block(summary: str, non_negotiables: list, human_note: str) -> str:
+    """이어하기 컨텍스트 블록 — 요약·양보 불가 조항·사람 의견.
+
+    조항을 요약 문자열과 분리해 싣는 이유는 승계 보장이다. 요약은 호출자가 만드는 자유
+    텍스트라 조항이 빠져도 아무도 모르는데, 조항이 사라지면 이전 결정이 소리 없이 되돌아간다."""
+    out = ""
+    if summary:
+        out += f"\n[이전 심의 요약 — 이어서 논의]\n{summary}\n"
+    if non_negotiables:
+        body = "\n".join(f"- {x}" for x in non_negotiables)
+        out += (f"\n[이전 심의의 양보 불가 조항 — 이번 라운드에서도 구속력을 가진다]\n{body}\n"
+                "이 조항을 뒤집으려면 어떤 새 근거 때문인지 반드시 명시하라. 근거 없는 폐기는 불인정.\n")
+    if human_note:
+        out += (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하고, 이 방향으로 논의를 진전시켜라]\n"
+                f"{human_note}\n")
+    return out
+
+
+def _evidence_note(ev: dict) -> str:
+    """결정문 헤더에 실을 근거 프로파일 — 형식의 권위와 근거의 강도를 일치시킨다."""
+    note = ("근거 프로파일 — 도구 조회 {tool}건 · 지식카드 인용 {knowledge}건 · "
+            "VOC {voc}건 · 사전 검색 {prepass}건").format(**ev)
+    if not ev.get("tool"):
+        note += " · 실측 데이터 0건(가설 단계)"
+    return note
+
+
 def _seat_note(personas: list) -> str:
     """좌석 구성을 의장 프롬프트용 한 줄로 만든다 — 결정문이 커버리지 한계를 스스로 밝히게 한다."""
     by = {}
@@ -1160,19 +1187,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
     # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
-    cont = ""
-    if opts.continue_summary:
-        cont += f"\n[이전 심의 요약 — 이어서 논의]\n{opts.continue_summary}\n"
-    # 양보 불가 조항 승계(F11) — 이전 심의가 조항으로 못박은 제약이 이어하기에서 조용히
-    # 사라지면 결정이 되돌아간다. 요약 문자열에 의존하지 않고 별도로 실어 구속력을 명시한다.
+    # 이어하기 블록(F11) — 조항 승계를 요약 문자열에 의존하지 않는다.
+    cont = _cont_block(opts.continue_summary, opts.continue_non_negotiables, opts.human_note)
     if opts.continue_non_negotiables:
-        _nn = "\n".join(f"- {x}" for x in opts.continue_non_negotiables)
-        cont += (f"\n[이전 심의의 양보 불가 조항 — 이번 라운드에서도 구속력을 가진다]\n{_nn}\n"
-                 "이 조항을 뒤집으려면 어떤 새 근거 때문인지 반드시 명시하라. 근거 없는 폐기는 불인정.\n")
-        yield _delib("evidence", source="이전 심의 양보 불가 조항", text=_nn[:1500], included=True)
+        yield _delib("evidence", source="이전 심의 양보 불가 조항",
+                     text="\n".join(f"- {x}" for x in opts.continue_non_negotiables)[:1500], included=True)
     if opts.human_note:
-        cont += (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하고, 이 방향으로 논의를 진전시켜라]\n"
-                 f"{opts.human_note}\n")
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
     _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
              + (f"\n{tool_inject}" if tool_inject else ""))
@@ -1342,10 +1362,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     cite_note = ("각 결정사항 항목 끝에 근거가 된 라운드 발언 출처를 [R2·페르소나키] 형식으로 표기하고, "
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
                  if opts.chair_cite else "")
-    ev_note = ("근거 프로파일 — 도구 조회 {tool}건 · 지식카드 인용 {knowledge}건 · "
-               "VOC {voc}건 · 사전 검색 {prepass}건").format(**ev_count)
-    if ev_count["tool"] == 0:
-        ev_note += " · 실측 데이터 0건(가설 단계)"
+    ev_note = _evidence_note(ev_count)
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
     rounds_block = "\n\n".join(
