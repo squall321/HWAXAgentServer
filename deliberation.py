@@ -65,6 +65,13 @@ _ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주�
 _CHAIR_BESTOF = _env_int("DELIB_CHAIR_BESTOF", 1)    # 의장 후보 n개→심판 선택(1=끔, temp>0 필요)
 _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라운드·페르소나] 출처 태깅
 
+# 좌석 구성 손잡이 — 위 '깊이 회복 손잡이'와 달리 프롬프트 제약을 늘리지 않고 참가자 집합만
+# 바꾸므로, GLM 의 지시 추종 예산과 무관하다(단일 변수 A/B 원칙의 적용 대상이 아님).
+# 근거: docs/deliberation-quality/plan.md §0-2.
+_COUNTER_SEATS = _env_int("DELIB_COUNTER_SEATS", 2)   # 반대 도메인 좌석 수(0=끔, 종전 동작)
+_RESCREEN = _env_int("DELIB_RESCREEN", 1)             # 이어하기 좌석 재심사(0=끔, 종전 동작)
+_RESCREEN_SEATS = _env_int("DELIB_RESCREEN_SEATS", 2)  # 재심사로 더할 신규 좌석 상한
+
 
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
@@ -637,6 +644,59 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         block += f"\n(전문가 자체 요약) {summary[:400]}"
     return persona["key"], calls, block
 
+async def _restore_role(tools: dict, key: str, fallback: str = "") -> str:
+    """페르소나 역할 원본을 get_agent_session 으로 복원한다(실패 시 fallback)."""
+    try:
+        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
+        sd = _first_dict(sess.get("data", sess))
+        full = sd.get("description") or sd.get("system_prompt") or ""
+        if full:
+            return full[:_ROLE_CLIP] if _ROLE_CLIP > 0 else full
+    except Exception:  # noqa: BLE001 — 실패해도 제공된 role/key 로 참여
+        pass
+    return fallback
+
+
+async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
+                    origin: str = "primary") -> list:
+    """recommend_agents 로 좌석을 발굴해 [{key, role, origin}] 로 돌려준다.
+
+    반대 도메인 좌석(F1)·이어하기 재심사(F10)가 같은 코드를 쓴다 — 질의문만 다르다.
+    도구 실패·빈 결과는 비치명적으로 빈 목록을 돌려준다. 좌석이 없어도 심의는 진행하고,
+    그 사실은 origin 표시가 없는 것으로 결정문에 남는다."""
+    try:
+        recd = _parse_json(await _call(tools, "recommend_agents", {"q": q}))
+    except Exception:  # noqa: BLE001
+        return []
+    if isinstance(recd, list):
+        items = recd
+    elif isinstance(recd, dict):
+        items = recd.get("recommendations") or recd.get("agents") or recd.get("data") or []
+    else:
+        items = []
+    out = []
+    for it in (items if isinstance(items, list) else []):
+        if len(out) >= limit:
+            break
+        it = _first_dict(it)
+        key = it.get("agent_type") or it.get("id")
+        if not key or key in exclude or any(p["key"] == key for p in out):
+            continue
+        out.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
+    return out
+
+
+def _seat_note(personas: list) -> str:
+    """좌석 구성을 의장 프롬프트용 한 줄로 만든다 — 결정문이 커버리지 한계를 스스로 밝히게 한다."""
+    by = {}
+    for p in personas:
+        by.setdefault(p.get("origin", "primary"), []).append(p["key"])
+    label = {"primary": "주 도메인", "counter": "반대 도메인", "carry": "유임", "new": "이어하기 신규"}
+    parts = [f"{label.get(k, k)} {len(v)}명({', '.join(v)})" for k, v in by.items()]
+    domains = sorted({(k.split("-", 1)[0] if "-" in k else k) for k in (p["key"] for p in personas)})
+    return f"참여 좌석 — {' / '.join(parts)}. 착석 도메인 {len(domains)}종: {', '.join(domains)}."
+
+
 def _sf_products(alerts: dict) -> list:
     """alert_check 결과에서 경보 제품 코드를 방어적으로 추출(스키마 변동 대비)."""
     out = []
@@ -931,48 +991,49 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
                                   "tools_used": _used})
 
-    # 1) 발굴 — recommend_agents. 단, 이어하기(continue_personas)면 이전 전문가를 재사용해 발굴 생략
-    #    (같은 전문가가 이전 결론을 이어받아 사람 의견에 맞춰 다시 토론해야 스티어링이 일관된다).
+    # 1) 발굴 — recommend_agents. 이어하기(continue_personas)는 이전 전문가를 유임시키되,
+    #    사람 의견이 주제를 옮겼을 수 있으므로 실효 질문으로 재심사해 신규 좌석을 더한다(F10).
     yield _delib("stage", stage="discover")
     if opts.continue_personas:
         personas = [dict(p) for p in opts.continue_personas]
+        for p in personas:
+            p.setdefault("origin", "carry")
         # 지정/이어하기 전문가의 역할을 get_agent_session 으로 원본 복원한다 — 수동 추가는 role 이
         # 비어 오고(풀은 compact), 이어하기·추천은 소개용 축약본이라, 원본 역할로 채워 발언 품질을
         # auto 경로와 동일하게(_ROLE_CLIP 동일 적용) 유지한다. 실패 시 제공된 role 을 폴백.
         for p in personas:
-            try:
-                sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": p["key"]})))
-                sd = _first_dict(sess.get("data", sess))
-                full = sd.get("description") or sd.get("system_prompt") or ""
-                if full:
-                    p["role"] = full[:_ROLE_CLIP] if _ROLE_CLIP > 0 else full
-            except Exception:  # noqa: BLE001 — 실패해도 제공된 role/key 로 참여
-                pass
+            p["role"] = await _restore_role(tools, p["key"], p.get("role") or "")
         yield _sse("status", {"step": "지정 전문가 소집", "tool": "get_agent_session"})
+        # 이어하기 좌석 재심사(F10) — 이어하기의 실효 질문은 원 질문이 아니라
+        # '원 질문 + 이전 결론 + 사람 의견'이다. 좌석을 그 위에서 다시 뽑아 새 도메인을 연다.
+        # 유임은 전원 유지하고 신규만 더한다(정원 확대) — 좌석을 빼면 그 도메인의 이전 발언에
+        # 대한 책임 주체가 사라지기 때문. DELIB_RESCREEN=0 으로 종전 동작(재심사 없음) 복귀.
+        if _RESCREEN and (opts.continue_summary or opts.human_note):
+            eff_q = (f"{question}\n\n[이전 결론]\n{(opts.continue_summary or '')[:2000]}"
+                     f"\n\n[사람 의견]\n{(opts.human_note or '')[:1000]}")
+            added = await _discover(tools, eff_q, _RESCREEN_SEATS,
+                                    exclude={p["key"] for p in personas}, origin="new")
+            if added:
+                personas.extend(added)
+                yield _sse("status", {"step": "이어하기 재심사 — 신규 좌석 " +
+                                              ", ".join(p["key"] for p in added),
+                                      "tool": "recommend_agents"})
     else:
-        rec = await _call(tools, "recommend_agents", {"q": question})
-        recd = _parse_json(rec)
-        if isinstance(recd, list):
-            items = recd
-        elif isinstance(recd, dict):
-            items = recd.get("recommendations") or recd.get("agents") or recd.get("data") or []
-        else:
-            items = []
-        personas = []
-        for it in (items[:N_PERSONAS] if isinstance(items, list) else []):
-            it = _first_dict(it)
-            key = it.get("agent_type") or it.get("id")
-            if not key:
-                continue
-            # 2) 각 페르소나 컨텍스트 — get_agent_session (list/dict 방어)
-            sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
-            sd = _first_dict(sess.get("data", sess))
-            # role 은 모델 입력(각 페르소나 자신의 시스템 메시지에만 실림 — 인원수에 곱해지지 않는다)
-            # 이라 무절단이 기본. 좁은 컨텍스트 환경만 DELIB_ROLE_CLIP>0 으로 방어.
-            role = sd.get("description") or sd.get("system_prompt") or ""
-            if _ROLE_CLIP > 0:
-                role = role[:_ROLE_CLIP]
-            personas.append({"key": key, "role": role})
+        personas = await _discover(tools, question, N_PERSONAS, origin="primary")
+        # 반대 도메인 좌석(F1) — 질문의 어휘가 도메인을 고정하면 그 밖의 가설은 발생 경로가 없다.
+        # 역질의로 '선정된 분야 밖'을 한 번 더 뽑아 강제 착석시킨다. 실측 근거: S26U 심의는
+        # 디스플레이 6인만 앉아 화학·재료 좌석이 없었고, 주가설(산소 소광)이 5라운드 동안
+        # 한 번도 제기되지 않았다. DELIB_COUNTER_SEATS=0 으로 종전 동작 복귀.
+        if _COUNTER_SEATS and personas:
+            names = ", ".join(p["key"] for p in personas)
+            counter_q = (f"{question}\n\n위 문제의 원인이 다음 분야 밖에 있다면 어느 분야인가 — {names}")
+            counter = await _discover(tools, counter_q, _COUNTER_SEATS,
+                                      exclude={p["key"] for p in personas}, origin="counter")
+            if counter:
+                personas.extend(counter)
+                yield _sse("status", {"step": "반대 도메인 좌석 — " +
+                                              ", ".join(p["key"] for p in counter),
+                                      "tool": "recommend_agents"})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
                              "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
@@ -981,8 +1042,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           "personas": [p["key"] for p in personas]})
     # 소개 카드용 역할 — 짧은 요약이 아니라 '이 전문가가 뭔지'가 보이게 넉넉히(프론트가 접어 표시).
     # totalRounds — 프론트 스테퍼/회의록이 라운드 수를 동적으로(r1..rN) 그리는 근거.
+    # origin — primary/counter/carry/new. 프론트가 좌석 성격 라벨을 그리고, 결정문이 커버리지를 기록한다.
     yield _delib("personas", totalRounds=opts.rounds,
-                 personas=[{"key": p["key"], "role": (p.get("role") or "")[:280]} for p in personas])
+                 personas=[{"key": p["key"], "role": (p.get("role") or "")[:280],
+                            "origin": p.get("origin", "primary")} for p in personas])
+    seat_note = _seat_note(personas)
 
     # 페르소나별 주제 지식 주입(결정적 RAG) — 지식카드를 많이 가진 전문가일수록 "지금 주제와
     # 관련된 것"만 골라 들고 와야 한다(사용자 결정 2026-08-05). 자유 조회(모델 재량)와 달리
@@ -1207,7 +1271,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         f"[{i + 1}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
     chair_human = (
         base + f"\n{rounds_block}\n\n"
-        "## 의사결정문 — (1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
+        f"[{seat_note}]\n"
+        "## 의사결정문 — (0) 참여 도메인과 커버리지 한계 — 위 좌석 구성을 한 문단으로 기록하고, "
+        "이 문제에 관련되나 착석하지 않은 인접 도메인이 있으면 명시하라(없으면 없다고 쓰라), "
+        "(1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
         "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
         "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
         "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. " + cite_note +
