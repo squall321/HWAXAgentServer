@@ -979,6 +979,21 @@ def _tool_catalog(tools: dict) -> list[dict]:
     return out
 
 
+def _app_catalog(tools: dict) -> list[dict]:
+    """카탈로그에 실린 도구가 속한 앱 목록 — 앱 단위 선택(pinned_apps) UI 의 입력.
+
+    개수는 게이트웨이의 tool_count 가 아니라 지금 이 사용자에게 보이는 도구로 센다.
+    그룹 권한으로 걸러진 뒤라 두 값이 다를 수 있고, 화면 개수와 실제 실릴 개수가
+    어긋나면 사용자가 고른 것과 다른 것이 실린다."""
+    n_by: dict[str, int] = {}
+    for n in tools:
+        gk, _ = _group_of(n)
+        if gk:
+            n_by[gk] = n_by.get(gk, 0) + 1
+    return [{"app": k, "label": _app_label(k), "desc": _app_desc(k)[:200], "tool_count": v}
+            for k, v in sorted(n_by.items(), key=lambda kv: -kv[1])]
+
+
 # 에이전트(전문가) 검색 — 도구와 같은 구조적 문제. LLM 에 659명을 나열시키면 결과 절단 캡에
 # 걸려 중간에 잘린다. 코드가 결정적으로 추천+분야 요약을 만들어 답한다(LLM 미경유).
 _AGENT_SEARCH_TRIGGERS = ("/전문가", "/에이전트", "/agents", "/agent")
@@ -1095,7 +1110,8 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
         return
     recommended = _rank_tools(tools, query)
     catalog = _tool_catalog(tools)
-    yield _sse("tools", {"query": query, "recommended": recommended, "all": catalog})
+    yield _sse("tools", {"query": query, "recommended": recommended, "all": catalog,
+                         "apps": _app_catalog(tools)})
     if recommended:
         head = ", ".join(r["name"] for r in recommended[:5])
         text = (f"질의와 관련된 도구 {len(recommended)}개를 추천합니다(상위: {head}). "
@@ -1835,6 +1851,7 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         "expert_tools": expert_tools,
         "pipeline": [n for n in _PIPELINE_TOOLS if n in tools],
         "all": _tool_catalog(tools),
+        "apps": _app_catalog(tools),
     }
     return {"recommended": recommended, "candidates": candidates, "pool": pool, "tools": tools_info}
 
