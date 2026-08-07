@@ -83,6 +83,8 @@ def _resolve_opts(req_opts):
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
+        # 이전 심의의 양보 불가 조항 — 요약에 넣지 않으면 소실되므로 별도 필드로 승계한다(F11).
+        continue_non_negotiables=[],
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
         # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
@@ -112,6 +114,10 @@ def _resolve_opts(req_opts):
         cs = req_opts.get("continue_summary")
         if isinstance(cs, str):
             o.continue_summary = cs[:8000]
+        # 이전 심의의 양보 불가 조항(F11) — 요약 문자열에 섞으면 소실되므로 별도 필드로 받는다.
+        nn = req_opts.get("non_negotiables") or req_opts.get("continue_non_negotiables")
+        if isinstance(nn, list):
+            o.continue_non_negotiables = [str(x)[:1200] for x in nn if str(x).strip()][:12]
         cp = req_opts.get("personas")
         if isinstance(cp, list):
             o.continue_personas = [{"key": str(p.get("key"))[:120], "role": str(p.get("role") or "")[:2000]}
@@ -897,6 +903,9 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None):
 async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS):
     """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
+    # 근거 계수(F2) — 결정문 헤더에 실을 프로파일. 형식의 권위가 근거의 강도를 넘지 않게,
+    # 조회 0건 심의가 확정 결론과 같은 모습으로 유통되는 것을 막는다.
+    ev_count = {"tool": 0, "knowledge": 0, "voc": 0, "prepass": 0}
     llm = getattr(app.state, "delib_llm", None) or app.state.llm
     # 요청 단위 타임아웃 오버라이드(웹 토글) — 기동값과 다르면 같은 파라미터로 새 인스턴스(구성만, 저렴).
     if opts.timeout_s is not None:
@@ -958,6 +967,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("status", {"step": "불량 환기 완료", "tool": None, "tools_used": sf_used})
         if sf_display:
             stream_head = sf_display + "\n\n"
+            ev_count["voc"] += 1
             yield _delib("evidence", source="SignalForge VOC", text=sf_display, included=bool(sf_inject))
             yield _sse("token", {"delta": stream_head})
 
@@ -972,6 +982,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if ev_used:
             yield _sse("status", {"step": "정량 근거 수집 완료", "tool": None, "tools_used": ev_used})
         if ev_display:
+            ev_count["prepass"] += 1
             yield _delib("evidence", source="지식·보고서 검색", text=ev_display[:1500],
                          included=bool(ev_inject))
 
@@ -1030,6 +1041,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if _good:
                 _chunks.append(f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n{_good[:2000]}")
                 _used.append(_tn)
+                ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
@@ -1141,6 +1153,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         for _k, _blk in await asyncio.gather(*[_kn_one(p) for p in personas]):
             if _blk:
                 knowledge_by_key[_k] = _blk
+                ev_count["knowledge"] += 1
                 yield _delib("evidence", source=f"{_k} · 지식카드", text=_blk[:400], included=True)
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(personas)}명 "
                                       f"관련 지식 확보", "tool": None})
@@ -1150,13 +1163,30 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     cont = ""
     if opts.continue_summary:
         cont += f"\n[이전 심의 요약 — 이어서 논의]\n{opts.continue_summary}\n"
+    # 양보 불가 조항 승계(F11) — 이전 심의가 조항으로 못박은 제약이 이어하기에서 조용히
+    # 사라지면 결정이 되돌아간다. 요약 문자열에 의존하지 않고 별도로 실어 구속력을 명시한다.
+    if opts.continue_non_negotiables:
+        _nn = "\n".join(f"- {x}" for x in opts.continue_non_negotiables)
+        cont += (f"\n[이전 심의의 양보 불가 조항 — 이번 라운드에서도 구속력을 가진다]\n{_nn}\n"
+                 "이 조항을 뒤집으려면 어떤 새 근거 때문인지 반드시 명시하라. 근거 없는 폐기는 불인정.\n")
+        yield _delib("evidence", source="이전 심의 양보 불가 조항", text=_nn[:1500], included=True)
     if opts.human_note:
         cont += (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하고, 이 방향으로 논의를 진전시켜라]\n"
                  f"{opts.human_note}\n")
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
-    base = (f"[심의 주제]\n{question}\n" + cont + (f"\n{sf_inject}" if sf_inject else "")
-            + (f"\n{ev_inject}" if ev_inject else "")
-            + (f"\n{tool_inject}" if tool_inject else ""))
+    _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
+             + (f"\n{tool_inject}" if tool_inject else ""))
+    base = f"[심의 주제]\n{question}\n" + cont + _tail
+    # 신규 좌석 앵커링 차단(F12) — 재심사로 새로 합류한 좌석에게 이전 결론을 먼저 읽히면
+    # 동조 압력을 받아 '새 관점을 얻으려고 불렀다'는 목적이 사라진다. 1라운드에 한해 이전 요약을
+    # 감추고 독립 판단을 받는다. 그 판단이 기존 결론과 충돌하면 그게 이어하기의 최대 소득이다.
+    _cont_blind = ""
+    if opts.human_note:
+        _cont_blind = (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하라]\n{opts.human_note}\n")
+    base_blind = (f"[심의 주제]\n{question}\n" + _cont_blind + _tail +
+                  "\n[안내] 당신은 이번 회차에 새로 합류했다. 이전 논의 결과는 의도적으로 제공하지 "
+                  "않는다 — 먼저 당신 도메인의 독립적 판단을 내라. 다음 라운드에서 이전 결론을 받는다.\n")
+    _has_blind = any(p.get("origin") == "new" for p in personas) and bool(opts.continue_summary)
 
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
     #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.
@@ -1191,7 +1221,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": f"{rnd}라운드 — {rlabel}", "tool": None})
 
         if kind == "initial":
-            prompt_fn = lambda p: (base +
+            prompt_fn = lambda p: ((base_blind if (_has_blind and p.get("origin") == "new") else base) +
                 "\n당신의 관점(lens — 2~4문장, 구체적으로), 위 주제·근거에 실제로 주어진 정보와 당신 도메인의 "
                 "확립된 표준·경험칙에 대한 해석(reads — 배열, 접근할 수 없는 데이터·수치를 지어내지 말고 "
                 "경험칙에는 (경험칙) 표기), 권장안(recommendation — 2~4문장), "
@@ -1264,6 +1294,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 for _tn, _ap, _out in _calls:
                     yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
                     if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
+                        ev_count["tool"] += 1
                         yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
                                      included=True)
                 _gathered[_k] = _blk
@@ -1311,14 +1342,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     cite_note = ("각 결정사항 항목 끝에 근거가 된 라운드 발언 출처를 [R2·페르소나키] 형식으로 표기하고, "
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
                  if opts.chair_cite else "")
+    ev_note = ("근거 프로파일 — 도구 조회 {tool}건 · 지식카드 인용 {knowledge}건 · "
+               "VOC {voc}건 · 사전 검색 {prepass}건").format(**ev_count)
+    if ev_count["tool"] == 0:
+        ev_note += " · 실측 데이터 0건(가설 단계)"
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
     rounds_block = "\n\n".join(
         f"[{i + 1}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
     chair_human = (
         base + f"\n{rounds_block}\n\n"
-        f"[{seat_note}]\n"
-        "## 의사결정문 — (0) 참여 도메인과 커버리지 한계 — 위 좌석 구성을 한 문단으로 기록하고, "
+        f"[{seat_note}]\n[{ev_note}]\n"
+        "## 의사결정문 — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
+        + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
+           "명시하라. " if ev_count["tool"] == 0 else "") +
+        "(0) 참여 도메인과 커버리지 한계 — 위 좌석 구성을 한 문단으로 기록하고, "
         "이 문제에 관련되나 착석하지 않은 인접 도메인이 있으면 명시하라(없으면 없다고 쓰라), "
         "(1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
         "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
