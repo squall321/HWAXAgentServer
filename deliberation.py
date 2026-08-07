@@ -644,6 +644,12 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         block += f"\n(전문가 자체 요약) {summary[:400]}"
     return persona["key"], calls, block
 
+def _dom_of(key: str) -> str:
+    """페르소나 키의 도메인 접두사 — disp-burnin → disp. 커버리지 판정의 단위다."""
+    k = str(key or "")
+    return k.split("-", 1)[0] if "-" in k else k
+
+
 async def _restore_role(tools: dict, key: str, fallback: str = "") -> str:
     """페르소나 역할 원본을 get_agent_session 으로 복원한다(실패 시 fallback)."""
     try:
@@ -684,6 +690,48 @@ async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
             continue
         out.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
     return out
+
+
+async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: int) -> list:
+    """착석 좌석이 보지 못하는 원인 축을 명명하게 하고, 그 축의 짧은 질의로 좌석을 발굴한다.
+
+    원 질문에 "이 분야들 밖"을 덧붙이는 역질의는 작동하지 않는다 — 질의의 대부분이 원 질문이라
+    임베딩 이웃이 그대로 돌아온다(실측 2026-08-07: S26U 화두 역질의 상위 5 중 4가 기존 좌석과
+    동일, 신규 1명도 같은 도메인). 부정은 검색이 아니라 추론으로 처리해야 한다.
+
+    같은 실측에서 짧은 도메인 질의는 정확히 다른 좌석을 돌려줬다 — '봉지 수분 산소 침투 신뢰성'
+    → rel-chemical-corrosion, '접착제 OCA 경화 잔류물' → disp-module-bonding. 풀에는 있는데
+    질의가 못 닿고 있었을 뿐이다.
+
+    도메인 신규성을 강제한다 — 이미 착석한 도메인의 후보는 버린다. 그러지 않으면 축만 바꾼
+    같은 도메인 좌석이 들어와 커버리지가 그대로다."""
+    seated_keys = {p["key"] for p in seated}
+    seated_domains = {_dom_of(k) for k in seated_keys}
+    try:
+        raw = await _llm_text(
+            llm,
+            "당신은 심의체 좌석 구성을 검토하는 조정자입니다. 짧고 건조하게 답하세요.",
+            f"[질문]\n{question[:1500]}\n\n[이미 착석한 전문가]\n{', '.join(sorted(seated_keys))}\n\n"
+            "이 전문가들의 담당 범위로는 보이지 않는 원인 축을 3개 제시하라. "
+            "각 축을 전문가 검색에 쓸 짧은 명사구 한 줄로만 쓰고(8단어 이내), 설명·번호·기호 없이 "
+            "줄바꿈으로 구분하라. 이미 착석한 분야를 다시 쓰지 마라.")
+    except Exception:  # noqa: BLE001 — 축 명명 실패는 비치명적. 반대 도메인 좌석 없이 진행한다.
+        return []
+    axes = [ln.strip(" -•·\t") for ln in (raw or "").splitlines() if ln.strip()][:3]
+    out = []
+    for axis in axes:
+        if len(out) >= limit:
+            break
+        for c in await _discover(tools, axis, limit=3, exclude=seated_keys, origin="counter"):
+            d = _dom_of(c["key"])
+            if d in seated_domains:
+                continue          # 축만 바꾼 같은 도메인 — 커버리지가 늘지 않는다
+            c["axis"] = axis
+            out.append(c)
+            seated_domains.add(d)
+            seated_keys.add(c["key"])
+            break                 # 축당 1명 — 축 다양성이 인원수보다 중요하다
+    return out[:limit]
 
 
 def _seat_note(personas: list) -> str:
@@ -1011,8 +1059,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _RESCREEN and (opts.continue_summary or opts.human_note):
             eff_q = (f"{question}\n\n[이전 결론]\n{(opts.continue_summary or '')[:2000]}"
                      f"\n\n[사람 의견]\n{(opts.human_note or '')[:1000]}")
-            added = await _discover(tools, eff_q, _RESCREEN_SEATS,
-                                    exclude={p["key"] for p in personas}, origin="new")
+            _seated_dom = {_dom_of(p["key"]) for p in personas}
+            added = [c for c in await _discover(tools, eff_q, _RESCREEN_SEATS * 3,
+                                                exclude={p["key"] for p in personas}, origin="new")
+                     if _dom_of(c["key"]) not in _seated_dom][:_RESCREEN_SEATS]
             if added:
                 personas.extend(added)
                 yield _sse("status", {"step": "이어하기 재심사 — 신규 좌석 " +
@@ -1021,19 +1071,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     else:
         personas = await _discover(tools, question, N_PERSONAS, origin="primary")
         # 반대 도메인 좌석(F1) — 질문의 어휘가 도메인을 고정하면 그 밖의 가설은 발생 경로가 없다.
-        # 역질의로 '선정된 분야 밖'을 한 번 더 뽑아 강제 착석시킨다. 실측 근거: S26U 심의는
-        # 디스플레이 6인만 앉아 화학·재료 좌석이 없었고, 주가설(산소 소광)이 5라운드 동안
-        # 한 번도 제기되지 않았다. DELIB_COUNTER_SEATS=0 으로 종전 동작 복귀.
+        # 착석 좌석이 못 보는 원인 축을 명명하게 하고 그 축으로 발굴한다(_counter_seats 주석에
+        # 실측 근거). DELIB_COUNTER_SEATS=0 으로 종전 동작 복귀.
         if _COUNTER_SEATS and personas:
-            names = ", ".join(p["key"] for p in personas)
-            counter_q = (f"{question}\n\n위 문제의 원인이 다음 분야 밖에 있다면 어느 분야인가 — {names}")
-            counter = await _discover(tools, counter_q, _COUNTER_SEATS,
-                                      exclude={p["key"] for p in personas}, origin="counter")
+            counter = await _counter_seats(tools, llm, question, personas, _COUNTER_SEATS)
             if counter:
                 personas.extend(counter)
-                yield _sse("status", {"step": "반대 도메인 좌석 — " +
-                                              ", ".join(p["key"] for p in counter),
-                                      "tool": "recommend_agents"})
+                yield _sse("status", {"step": "반대 도메인 좌석 — " + ", ".join(
+                    f"{p['key']}({p.get('axis', '')})" for p in counter),
+                    "tool": "recommend_agents"})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
                              "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
