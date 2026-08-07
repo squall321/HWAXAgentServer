@@ -85,6 +85,9 @@ def _resolve_opts(req_opts):
         human_note="", continue_summary="", continue_personas=[],
         # 이전 심의의 양보 불가 조항 — 요약에 넣지 않으면 소실되므로 별도 필드로 승계한다(F11).
         continue_non_negotiables=[],
+        # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
+        # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
+        stop_after_round=0,
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
         # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
@@ -95,7 +98,7 @@ def _resolve_opts(req_opts):
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
-                  "free_tools", "tool_budget"):
+                  "free_tools", "tool_budget", "stop_after_round"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -1355,6 +1358,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
         rounds_data.append((cur, ct))
+        # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
+        # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
+        if opts.stop_after_round == 1 and rnd == 1:
+            _cp = (f"[체크포인트 — {rnd}라운드(초기입장)에서 멈춤]\n{seat_note}\n\n"
+                   f"{ct}\n\n빠진 관점이나 추가 관측이 있으면 의견으로 넣어 이어가라. "
+                   "좌석 재심사가 그 방향에 맞는 도메인을 불러온다.")
+            yield _delib("decision", text=_cp)
+            yield _sse("status", {"step": "체크포인트 — 사람 검토 대기(의견을 넣어 이어가기)", "tool": None})
+            yield _sse("result", {"type": "text", "content": _cp})
+            yield _sse("done", {})
+            return
 
     # 마지막 라운드(수렴) 데이터 — 집계·tally 용
     last_list, last_t = rounds_data[-1]
