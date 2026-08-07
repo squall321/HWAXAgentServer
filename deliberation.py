@@ -1344,8 +1344,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if render == 1:
                 extra = {"position": _clip_sent(o.get("position_short"), 90)}
             elif render == 3:
+                # non_negotiable 을 턴에 실어 보내는 이유 — 프론트가 이어하기 호출에 조항을 승계해야
+                # 이전 결정이 소리 없이 되돌아가는 것을 막는다(F11). say 는 표시용으로 절단되므로
+                # 승계용 원문을 따로 준다.
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
-                         "stance": _norm_stance(o.get("stance"))}
+                         "stance": _norm_stance(o.get("stance")),
+                         "non_negotiable": str(o.get("non_negotiable") or "")[:1200]}
             yield _delib("turn", round=rnd, persona=o["persona"], say=_say_of(render, o), **extra)
         if rnd == 1:
             r1_by_key = {o["persona"]: o for o in cur}
