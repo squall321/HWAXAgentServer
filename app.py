@@ -1250,6 +1250,77 @@ async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str
     return role
 
 
+# 지정 전문가의 지식카드 주입 예산(문자). 심의 경로(DELIB_KNOWLEDGE_BUDGET)와 같은 기본값이다 —
+# 챗은 인원 1명·라운드 1회라 심의처럼 곱해지지 않으므로 더 조일 이유가 없다.
+CHAT_KNOWLEDGE_BUDGET = _env_int("CHAT_KNOWLEDGE_BUDGET", 3500)
+
+# 지식 조회용 도구 핸들 캐시(그룹셋별, 300초) — _tools_by_name 은 매번 백엔드 5곳의 도구 목록을
+# 다시 받아 온다. 페르소나 대화는 매 발화마다 이 경로를 타므로 캐시가 없으면 발화마다 그 왕복이
+# 통째로 붙는다. agent_cache 가 이미 도구를 품은 에이전트를 무기한 캐시하므로 300초는 그보다 짧다.
+_KTOOLS_CACHE: dict = {}
+
+
+async def _knowledge_tools(app: FastAPI, groups: list[str]) -> dict:
+    import time
+    key = frozenset(groups)
+    hit = _KTOOLS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 히트를 코드가 파싱 — 절단 금지
+    if tools:
+        _KTOOLS_CACHE[key] = (time.time(), tools)
+    return tools
+
+
+def _knowledge_line(h) -> str:
+    """agent_search hit 한 건 → 한 줄. 실측 형태(2026-08-05)는
+    {record_id, section_id, title, section_title, snippet, score, tags, …} 로 본문은 snippet 에 있다."""
+    if not isinstance(h, dict):
+        return str(h)[:300]
+    title = h.get("title") or ""
+    sec = h.get("section_title") or ""
+    body = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
+    head = title + (f" › {sec}" if sec else "")
+    if not (head or body):
+        return json.dumps(h, ensure_ascii=False, default=str)[:300]
+    return f"• [{head}] {str(body).strip()}"[:700]
+
+
+async def _persona_knowledge(app: FastAPI, groups: list[str], agent_type: str, query: str) -> str:
+    """지정 전문가의 주제 연관 지식카드를 코드가 미리 조회해 발췌한다(결정적 RAG).
+
+    모델에게 'agent_search 를 써라'고 지시만 하면 안 부르면 그만이고, 사용자에게는 그 전문가가
+    아는 것이 없는 것처럼 보인다. 심의 경로가 이미 같은 이유로 결정적 조회를 하고 있어
+    (deliberation.DELIB_PERSONA_KNOWLEDGE) 그 형태를 따른다.
+
+    캐시하지 않는다 — 질의가 발화마다 달라 적중률이 낮고, 낡은 발췌를 주면 방금 물은 것과
+    무관한 지식이 붙는다. 실패는 비치명이다(지식 없이 페르소나만으로 답한다)."""
+    try:
+        tools = await _knowledge_tools(app, groups)
+        if "agent_search" not in tools:
+            return ""
+        raw = await _call(tools, "agent_search",
+                          {"agent_type": agent_type, "q": query, "mode": "hybrid"})
+        d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
+        hits = d.get("hits") if isinstance(d, dict) else None
+        if not hits or (isinstance(d, dict) and d.get("refused")):
+            return ""
+        lines, total, seen = [], 0, set()
+        for h in hits:
+            ln = _knowledge_line(h)
+            if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
+                continue
+            if total + len(ln) > CHAT_KNOWLEDGE_BUDGET:
+                break
+            seen.add(ln)
+            lines.append(ln)
+            total += len(ln)
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001 — 지식 검색 실패는 비치명(페르소나만으로 계속)
+        print(f"[agent] 지식카드 검색 실패({agent_type}): {exc!r}")
+        return ""
+
+
 # 모델마다 호출 JSON 모양이 다르다. qwen/hermes 는 {"name":…,"arguments":…}, Anthropic 계열은
 # {"type":"tool_use","name":…,"input":…} 를 쓴다(실측: Haiku 가 input 형식으로 출력).
 # 한 형식만 알면 다른 모델에서 안전망이 통째로 무력해지므로 셋 다 인정한다.
@@ -1450,6 +1521,23 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 sys_prompt += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
                                f"아래 역할과 범위를 지켜 그 전문가로서 답하라.\n{role}\n"
                                f"이 전문가 도메인의 데이터 조회는 agent_search(\"{agent_key}\", 질문) 를 우선 사용하라.")
+            # 그 전문가의 지식카드를 코드가 미리 조회해 붙인다. 위 지시만으로는 모델이 안 부르면
+            # 그만이고, 사용자에겐 '이 전문가는 아는 게 없다'로만 보인다. 질의는 도구 선별과 같은
+            # _sel_q(최근 히스토리 + 현재 발화) 를 쓴다 — 현재 발화만 넣으면 '그럼 더 자세히' 같은
+            # 후속 질의에서 관련도가 무너지는 문제가 도구 선별에서 이미 실측됐다.
+            yield _sse("status", {"step": f"{agent_key} 지식카드 검색", "tool": "agent_search"})
+            know = await _persona_knowledge(app, req.groups, agent_key, _sel_q)
+            if know:
+                sys_prompt += (f"\n\n[{agent_key} 지식카드 — 이번 질문 연관 발췌]\n{know}\n"
+                               f"이 발췌는 그 전문가가 실제로 보유한 사내 지식이다. 답변에 해당하는 내용이 "
+                               f"있으면 반드시 근거로 인용하되, 발췌에 없는 것을 있는 것처럼 말하지 마라. "
+                               f"더 필요하면 agent_search(\"{agent_key}\", 구체적 질의) 로 추가 조회하라.")
+                yield _sse("status", {"step": f"지식카드 {len(know):,}자 주입", "tool": None})
+            else:
+                # 0히트를 침묵하면 모델이 일반 지식으로 메우고 사용자는 그것을 사내 지식으로 읽는다.
+                sys_prompt += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
+                               f"일반 지식으로 답하되 '사내 지식카드에는 관련 내용이 없다'고 먼저 밝혀라.")
+                yield _sse("status", {"step": "연관 지식카드 없음 — 일반 지식으로 답변", "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
