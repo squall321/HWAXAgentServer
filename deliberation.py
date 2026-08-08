@@ -129,6 +129,9 @@ def _resolve_opts(req_opts):
         chair_template="default",
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
+        # 사용자 지정 앱 — 전문가 자유 조회 범위를 이 앱들로 좁힌다. delib_tools 처럼 전량 호출하지
+        # 않는다(도구 하나당 LLM 인자 구성이 붙어, 앱을 20~30개로 펼치면 예산이 터진다).
+        delib_apps=[],
         # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
         # 없으면 심의는 시작 시점 근거 스냅샷에 갇힌다(사전 조회의 상상력이 검증 범위의 상한).
         free_tools=_env_int("DELIB_FREE_TOOLS", 1),
@@ -170,6 +173,9 @@ def _resolve_opts(req_opts):
         tl = req_opts.get("tools")
         if isinstance(tl, list):
             o.delib_tools = [str(n).strip()[:80] for n in tl[:6] if isinstance(n, str) and str(n).strip()]
+        ap = req_opts.get("apps")
+        if isinstance(ap, list):
+            o.delib_apps = [str(a).strip()[:80] for a in ap[:3] if isinstance(a, str) and str(a).strip()]
     # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
@@ -638,6 +644,18 @@ _FREE_DENY = ("get_agent_session",)   # 페르소나 시스템프롬프트 원�
 def _free_tool_ok(name: str) -> bool:
     n = (name or "").lower()
     return n not in _FREE_DENY and n.startswith(_FREE_ALLOW)
+
+
+def _app_of_tools() -> dict:
+    """{도구명: 소속 앱키} — 게이트웨이 /tools-map 이 정본. 실패하면 {}(좁히지 않는다).
+
+    늦은 import — app 이 이 모듈을 import 하므로 모듈 로드 시점에 하면 순환이 된다."""
+    try:
+        from app import _tools_map  # noqa: PLC0415
+        return _tools_map()
+    except Exception as exc:  # noqa: BLE001 — 매핑 없으면 범위 제한을 포기하고 전체로 간다
+        print(f"[deliberation] 도구-앱 매핑 로드 실패: {exc!r}")
+        return {}
 
 
 def _wrap_cached(tool, cache: dict):
@@ -1120,6 +1138,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _fcache: dict = {}
             _g = {n: _wrap_cached(t, _fcache)
                   for n, t in (await _tools_by_name(app, groups)).items() if _free_tool_ok(n)}
+            # 사용자가 앱을 골랐으면 자유 조회를 그 앱들로 좁힌다. 166종을 그대로 주면 전문가가
+            # 1인당 몇 회 안 되는 예산을 엉뚱한 앱을 헤매는 데 쓴다. agent_search 는 앱과 무관하게
+            # 남긴다 — 페르소나 지식 조회 통로라 이걸 닫으면 전문가가 자기 지식을 못 본다.
+            if opts.delib_apps:
+                _amap = _app_of_tools()
+                _narrow = {n: t for n, t in _g.items()
+                           if n == "agent_search" or _amap.get(n) in set(opts.delib_apps)}
+                # 매핑을 못 받았거나(게이트웨이 불통) 결과가 agent_search 뿐이면 좁히지 않는다 —
+                # 조용히 도구 0종이 되면 자유 조회가 죽은 채 심의만 계속된다.
+                if len(_narrow) > 1:
+                    yield _sse("status", {"step": f"자유 조회 범위 제한 — 지정 앱 {len(opts.delib_apps)}개 "
+                                                  f"({len(_g)}종 → {len(_narrow)}종)", "tool": None})
+                    _g = _narrow
+                else:
+                    yield _sse("status", {"step": "지정 앱의 조회 도구를 찾지 못해 전체 범위로 진행",
+                                          "tool": None})
             if _g:
                 g_agent = create_react_agent(llm, list(_g.values()))
                 yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종, "
