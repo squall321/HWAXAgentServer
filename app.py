@@ -254,6 +254,9 @@ class ChatRequest(BaseModel):
     # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
     # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
     pinned_agent: str | None = None
+    # 웹 리서치 소스 토글 — None 이면 종전 동작(전부), 리스트면 그 소스만 바인딩한다.
+    # 빈 리스트는 '전부 끔'이라 나가는 도구가 하나도 실리지 않는다.
+    search_sources: list[str] | None = None
     # 앱(소유 MCP 앱) 단위 우선 지정 — 개별 도구 이름을 고르는 대신 앱을 고른다.
     # 도구 210개를 평평하게 훑어 12개를 체크하는 UX 는 "무엇을 골라야 하는지 모르겠다"는
     # 문제를 낳았다. 앱은 10개뿐이고 사용자가 아는 단위라 고를 수 있다. 서버가 앱→도구로
@@ -760,6 +763,23 @@ def _rrf(*orders, k: int = 60) -> dict:
     return out
 
 
+# 웹 리서치 소스별 도구 — 토글이 꺼지면 **바인딩하지 않는다**. 모델에게 "쓰지 마라"고
+# 지시하는 것과 도구가 존재하지 않는 것은 다르다. 사내 질의가 외부로 나가는 기능에서
+# 그 차이는 사고와 안전의 차이다. 나가지 않는 도구(search_internal 등)는 대상이 아니다.
+_SOURCE_TOOLS = {"scholar": {"search_scholar"}, "web": {"search_web"}}
+_ALL_SOURCE_TOOLS = {n for v in _SOURCE_TOOLS.values() for n in v}
+
+
+def gate_sources(tools: list, sources: list[str] | None) -> list:
+    """켜지 않은 소스의 도구를 목록에서 뺀다. sources 가 None 이면 종전대로 전부 통과."""
+    if sources is None:
+        return tools
+    allow = {n for k in sources if k in _SOURCE_TOOLS for n in _SOURCE_TOOLS[k]}
+    return [t for t in tools
+            if getattr(t, "name", "") not in _ALL_SOURCE_TOOLS
+            or getattr(t, "name", "") in allow]
+
+
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None) -> list:
     """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
     '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 사용자 지정(핀) ② 질의 어휘 관련도
@@ -1126,7 +1146,7 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
-                     query: str = ""):
+                     query: str = "", sources: list[str] | None = None):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
@@ -1135,7 +1155,9 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
     # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
-    key = (frozenset(groups), pin_key, q_key)
+    # 소스 토글은 바인딩 구성을 바꾸므로 캐시 키에 들어가야 한다 — 안 넣으면 앞 대화의
+    # 캐시된 에이전트가 재사용돼 토글이 무시된다(조용히 켜진 채로 남는다).
+    key = (frozenset(groups), pin_key, q_key, tuple(sorted(sources)) if sources is not None else None)
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
@@ -1146,6 +1168,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 scoped = _with_groups(connections, sorted(groups))
                 import asyncio as _aio
                 _raw = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
+                _raw = gate_sources(_raw, sources)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
                 tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
@@ -1484,7 +1507,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             if isinstance(h, dict)
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
-        agent = await _agent_for(app, req.groups, pinned, _sel_q)
+        agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.

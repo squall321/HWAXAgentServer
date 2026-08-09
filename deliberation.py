@@ -132,6 +132,9 @@ def _resolve_opts(req_opts):
         # 사용자 지정 앱 — 전문가 자유 조회 범위를 이 앱들로 좁힌다. delib_tools 처럼 전량 호출하지
         # 않는다(도구 하나당 LLM 인자 구성이 붙어, 앱을 20~30개로 펼치면 예산이 터진다).
         delib_apps=[],
+        # 웹 리서치 소스 토글 — None 이면 종전 동작(전부), 리스트면 그 소스만 자유 조회에 실린다.
+        # 빈 리스트는 '전부 끔'이다. 차단은 프롬프트가 아니라 바인딩에서 한다.
+        search_sources=None,
         # 자유 조회 — 라운드 발언 전에 각 전문가가 읽기 전용 도구를 직접 호출하는 단계.
         # 없으면 심의는 시작 시점 근거 스냅샷에 갇힌다(사전 조회의 상상력이 검증 범위의 상한).
         free_tools=_env_int("DELIB_FREE_TOOLS", 1),
@@ -176,6 +179,10 @@ def _resolve_opts(req_opts):
         ap = req_opts.get("apps")
         if isinstance(ap, list):
             o.delib_apps = [str(a).strip()[:80] for a in ap[:3] if isinstance(a, str) and str(a).strip()]
+        srcs = req_opts.get("search_sources")
+        if isinstance(srcs, list):
+            o.search_sources = [str(x).strip()[:20] for x in srcs[:4]
+                                if isinstance(x, str) and str(x).strip()]
     # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
@@ -1138,6 +1145,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _fcache: dict = {}
             _g = {n: _wrap_cached(t, _fcache)
                   for n, t in (await _tools_by_name(app, groups)).items() if _free_tool_ok(n)}
+            # 웹 리서치 소스 토글 — 켜지 않은 소스의 도구는 목록에서 뺀다. 모델에게 금지를
+            # 지키게 하는 것과 도구가 존재하지 않는 것은 다르다.
+            if opts.search_sources is not None:
+                from app import _SOURCE_TOOLS, _ALL_SOURCE_TOOLS  # noqa: PLC0415 — 늦은 import(순환 회피)
+                _allow = {n for k in opts.search_sources if k in _SOURCE_TOOLS
+                          for n in _SOURCE_TOOLS[k]}
+                _off = [n for n in _g if n in _ALL_SOURCE_TOOLS and n not in _allow]
+                for n in _off:
+                    _g.pop(n, None)
+                if _off:
+                    yield _sse("status", {"step": f"웹 리서치 소스 제한 — {len(_off)}개 도구 미바인딩 "
+                                                  f"({', '.join(_off)})", "tool": None})
             # 사용자가 앱을 골랐으면 자유 조회를 그 앱들로 좁힌다. 166종을 그대로 주면 전문가가
             # 1인당 몇 회 안 되는 예산을 엉뚱한 앱을 헤매는 데 쓴다. agent_search 는 앱과 무관하게
             # 남긴다 — 페르소나 지식 조회 통로라 이걸 닫으면 전문가가 자기 지식을 못 본다.
