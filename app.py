@@ -2017,6 +2017,23 @@ def get_artifact(name: str) -> FileResponse:
     return FileResponse(p)
 
 
+def _search_capability() -> dict:
+    """웹 리서치로 지금 무엇이 가능한가. 프론트가 토글을 비활성으로 그릴 근거다.
+
+    전역이 꺼져 있는데 UI 에서 켤 수 있으면 사용자는 켰다고 믿고 결과를 기다린다 —
+    아무것도 안 나가는데 '검색이 잘 안 되는 도구'로만 보인다. 그게 이 기능의 가장
+    현실적인 실패 모드다."""
+    tm = _tools_map()
+    have = {"scholar": "search_scholar" in tm, "web": "search_web" in tm}
+    return {"sources": {k: {"available": v} for k, v in have.items()},
+            "note": "available=false 면 서버가 그 소스를 제공하지 않습니다(도구 미등록 또는 전역 차단)."}
+
+
+@app.get("/search-capability")
+def search_capability() -> dict:
+    return _search_capability()
+
+
 @app.get("/health")
 def health() -> dict:
     return {

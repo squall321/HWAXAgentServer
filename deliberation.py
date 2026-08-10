@@ -183,6 +183,11 @@ def _resolve_opts(req_opts):
         if isinstance(srcs, list):
             o.search_sources = [str(x).strip()[:20] for x in srcs[:4]
                                 if isinstance(x, str) and str(x).strip()]
+            # 외부 근거가 섞이는 순간 인용 계약은 선택 사항이 아니다. 켜는 게 아니라
+            # **끌 수 없게** 만든다 — 출처 없는 외부 주장이 결정문에 들어가면 되돌릴 수 없다.
+            if o.search_sources:
+                o.rebut_quote = 1
+                o.chair_cite = 1
     # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
@@ -839,6 +844,41 @@ def _cont_block(summary: str, non_negotiables: list, human_note: str) -> str:
         out += (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하고, 이 방향으로 논의를 진전시켜라]\n"
                 f"{human_note}\n")
     return out
+
+
+# 웹 인용 표기 [W:d_xxxxxxxxxxxx#12] — 원장에 실재하는 문장만 통과한다.
+# 이것이 '날조 인용 0%'의 구조적 근거다. 다만 **잘못된 문장을 고르는 것은 막지 못한다** —
+# 번호가 실재한다는 것과 그 문장이 그 주장을 뒷받침한다는 것은 다른 문제다.
+_WEB_CITE = re.compile(r"\[W:(d_[0-9a-f]{12})#(\d+)\]")
+
+
+async def _verify_web_citations(app, groups: list, text: str) -> tuple[int, int, list]:
+    """결정문의 웹 인용을 원장과 대조한다. 반환은 (검증됨, 날조, 날조 목록).
+
+    대조는 get_quote 도구로 한다 — 브로커 앱이 유일한 원장 소유자이고, 여기서 직접
+    파일을 읽으면 앱 경계를 넘어 배포가 어긋날 때 조용히 깨진다."""
+    cites = _WEB_CITE.findall(text or "")
+    if not cites:
+        return 0, 0, []
+    try:
+        tools = await _tools_by_name(app, groups)
+    except Exception:  # noqa: BLE001
+        return 0, 0, []
+    if "get_quote" not in tools:
+        return 0, 0, []
+    ok_n, bad = 0, []
+    for doc_id, idx in cites[:40]:
+        try:
+            raw = await _call(tools, "get_quote", {"doc_id": doc_id, "index": int(idx)})
+            d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
+        except Exception:  # noqa: BLE001
+            bad.append(f"[W:{doc_id}#{idx}]")
+            continue
+        if isinstance(d, dict) and d.get("ok") and (d.get("data") or {}).get("text"):
+            ok_n += 1
+        else:
+            bad.append(f"[W:{doc_id}#{idx}]")
+    return ok_n, len(bad), bad
 
 
 def _evidence_note(ev: dict) -> str:
@@ -1705,6 +1745,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tally = {"agree": 0, "conditional": 0, "oppose": 0, "total": len(last_list)}
     for o in last_list:
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
+    # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
+    # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
+    if opts.search_sources:
+        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision)
+        if _ok_n or _bad_n:
+            yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건",
+                                  "tool": "get_quote"})
+            if _bad_n:
+                decision += ("\n\n> ⚠ 아래 인용은 원장에서 확인되지 않았습니다(날조 가능) — "
+                             + ", ".join(_bad[:8])
+                             + "\n> 이 항목의 근거는 신뢰하지 마세요.")
+            else:
+                decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
+                             "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
+                             "별도 판단입니다.")
     yield _delib("decision", text=decision + report_note)
     yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
                  tally=tally, unanimous=(tally["agree"] == tally["total"] and tally["total"] > 0))
