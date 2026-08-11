@@ -8,9 +8,29 @@ cd "$(dirname "$0")"
 # 관대하게 소싱 — 한 줄이 잘못돼도(등호 양옆 공백·오타 등) errexit 로 기동 전체가 죽지 않게
 # errexit 를 잠깐 끈다. 나쁜 줄은 건너뛰고 그 변수는 아래 기본값으로 진행(서버는 뜬다).
 if [ -f .env ]; then
-  set +e
-  set -a; . ./.env; set +a
-  set -e
+  # `. ./.env` 는 '나쁜 줄만 건너뛰지' 않는다. 따옴표 불균형 같은 파스 에러가 있으면 그 줄
+  # 이후가 통째로 버려진다(실측: 2행에 열린 따옴표 → 3·4행이 미설정). 그러면 아래 @FROM_RA
+  # 마커 가드가 검사할 VLLM_BASE_URL 자체가 없어 가드까지 무력화되고, 서버는 기본값으로 떠서
+  # 왜 상암 GLM 이 아니라 로컬을 보는지 알 수 없게 된다.
+  # KEY=VALUE 로 읽히는 줄만 골라 export 하고, 건너뛴 줄은 말한다.
+  _skipped=0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    if printf '%s' "$_line" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*='; then
+      _k="${_line%%=*}"; _v="${_line#*=}"
+      # 양끝 따옴표만 벗긴다(값 안의 따옴표는 그대로 둔다)
+      _q1='"'; _q2="'"
+      case "$_v" in
+        "$_q1"*"$_q1") _v="${_v#$_q1}"; _v="${_v%$_q1}" ;;
+        "$_q2"*"$_q2") _v="${_v#$_q2}"; _v="${_v%$_q2}" ;;
+      esac
+      export "$_k=$_v"
+    else
+      _skipped=$((_skipped+1))
+      echo "  ⚠ .env 형식 아님 — 건너뜀: $(printf '%.60s' "$_line")" >&2
+    fi
+  done < .env
+  [ "$_skipped" -gt 0 ] && echo "  ⚠ .env 에서 ${_skipped}줄을 건너뛰었다 — 그 키들은 기본값으로 진행한다" >&2
 fi
 
 PORT="${AGENT_PORT:-9009}"                                   # 9000 is taken by MinIO on this box
