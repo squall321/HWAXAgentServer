@@ -400,6 +400,55 @@ def _learn_ids(text) -> None:
     src |= _int_tokens(text)
 
 
+# ── 재촉 → 이어하기 ─────────────────────────────────────────────────────────
+# 응답이 끊긴 뒤 사용자가 "야! 하라니까!" 처럼 재촉하면, 그 발화 자체는 아무 내용이 없다.
+# 모델에 그대로 넘기면 재촉을 새 질문으로 읽고 "무엇을 도와드릴까요" 로 답하거나, 운이 좋아야
+# 이어간다 — 확률적이다. 직전 턴이 실제로 끊겼는지 코드가 판정하고, 끊겼으면 원래 질문을
+# 복원해 "이어서 완료하라" 로 바꿔 넣는다.
+_NUDGE_RE = re.compile(
+    r"^\s*(?:야+[!.,~\s]*)?"
+    r"(?:하라니까|해라|해줘|하라고|계속|이어서|왜\s*안\s*해|다시|진행|ㄱㄱ+|고고|"
+    r"응답\s*없|answer|continue|go on|keep going)"
+    r"[\s!.,~?ㅋㅎ]*$", re.I)
+# 직전 답변이 '끊긴' 표지 — 내부 오류 중단 문구, 예고만 하고 끝난 문장, 빈 응답.
+_INTERRUPTED_RE = re.compile(
+    r"처리 중 내부 오류로 응답이 여기서 중단|응답이 여기서 중단되었습니다|"
+    r"도구를 조회하지 않고 생성|조회하겠습니다\s*$|확인해 보겠습니다\s*$")
+_NUDGE_MAX_LEN = 24   # 재촉은 짧다. 길면 진짜 새 질문일 가능성이 높다.
+
+
+def _is_nudge(msg: str) -> bool:
+    """내용 없는 재촉인가. 길면 새 질문으로 본다(오판이 재촉 무시보다 나쁘다)."""
+    s = (msg or "").strip()
+    return bool(s) and len(s) <= _NUDGE_MAX_LEN and bool(_NUDGE_RE.match(s))
+
+
+def _resume_target(history: list) -> tuple:
+    """(원래 질문, 직전 부분응답) — 이어할 것이 있으면 돌려준다. 없으면 (None, None).
+
+    직전 assistant 턴이 비었거나 중단 표지를 달고 있을 때만 이어하기로 본다. 정상 답변 뒤의
+    "계속"은 '더 말해달라'는 새 요구이므로 건드리지 않는다.
+    """
+    if not isinstance(history, list):
+        return (None, None)
+    last_a, last_q = None, None
+    for h in reversed(history):
+        if not isinstance(h, dict):
+            continue
+        role, content = h.get("role"), str(h.get("content") or "")
+        if last_a is None and role == "assistant":
+            last_a = content
+            continue
+        if last_a is not None and role == "user":
+            last_q = content
+            break
+    if last_q is None:
+        return (None, None)
+    if last_a is not None and last_a.strip() and not _INTERRUPTED_RE.search(last_a):
+        return (None, None)          # 정상적으로 끝난 답변 — 이어하기 아님
+    return (last_q, (last_a or "").strip())
+
+
 # ── 근거 표기 ───────────────────────────────────────────────────────────────
 # 프롬프트로 "근거를 대라"고 시키는 것은 확률적이라 모델이 바뀌면 무너진다. 심의는 이미
 # 코드 검증(quote 가 원문에 실재하는가)으로 이 문제를 풀었는데(deliberation._quote_validator),
@@ -1560,6 +1609,18 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         if isinstance(_h, dict):
             _seed_ids |= _int_tokens(_h.get("content") or "")
     _turn_ids.set(_seed_ids)
+    # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
+    # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
+    # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
+    if _is_nudge(req.message):
+        _orig, _part = _resume_target(req.history or [])
+        if _orig:
+            yield _sse("status", {"step": "직전 요청 이어서 진행", "tool": None})
+            req = req.model_copy(update={"message": (
+                f"{_orig}\n\n[이어하기] 직전 답변이 중간에 끊겼습니다. 위 요청을 처음부터 다시 "
+                f"수행해 끝까지 답하세요. 필요한 도구는 다시 호출하십시오."
+                + (f"\n[끊긴 지점까지 나온 내용]\n{_part[:2000]}" if _part else ""))})
+            print(f"[agent] nudge→resume: {_orig[:60]!r}")
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
@@ -1911,6 +1972,20 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         add = "\n\n" + "\n".join(f"![생성된 그래프]({u})" for u in missing)
         text += add
         yield _sse("token", {"delta": add})
+    # 빈 응답 구제 — 도구는 돌았는데 모델이 마무리 텍스트를 내지 않은 턴. 기존 보강기는
+    # '도구 0회' 조건이 붙어 있어 이 경우를 통과시켰고, 화면에는 '(응답이 없습니다)' 만 남았다.
+    # 사용자에겐 초록불이 꺼지고 아무것도 안 나온 것으로 보인다 — 조회는 이미 다 해 놓고서다.
+    # 도구 결과가 손에 있으므로 그것으로 최소 응답을 만든다. 없는 말을 지어내지 않고,
+    # 조회한 사실과 결과 발췌만 싣는다.
+    if not text.strip() and turn_calls:
+        _names = ", ".join(dict.fromkeys(n for n, _ in turn_calls))
+        _excerpt = "\n".join(turn_out)[:1200].strip()
+        _fb = (f"조회는 완료했으나 모델이 요약을 생성하지 못했습니다. 조회한 도구는 `{_names}` 입니다.\n\n"
+               + (f"조회 결과 발췌\n\n```\n{_excerpt}\n```\n\n" if _excerpt else "")
+               + "> 같은 질문을 다시 보내거나 “계속”이라고 하시면 이 결과로 이어서 답합니다.")
+        text = _fb
+        yield _sse("token", {"delta": _fb})
+        print(f"[agent] empty-final rescued — tools={_names}")
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
     # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.

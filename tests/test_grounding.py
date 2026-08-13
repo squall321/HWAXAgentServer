@@ -29,6 +29,11 @@ def _load() -> dict:
         r"def _sig_numbers.*?\n    return out",
         r"def _unsourced_numbers.*?\n    return bad",
         r"def _evidence_block.*?\n    return \"\\n\"\.join\(lines\)",
+        r"_NUDGE_RE = re\.compile\(.*?\)\n",
+        r"_INTERRUPTED_RE = re\.compile\(.*?\)\n",
+        r"_NUDGE_MAX_LEN = \d+",
+        r"def _is_nudge.*?\n    return bool\(s\)[^\n]*\n",
+        r"def _resume_target.*?\n    return \(last_q, \(last_a or \"\"\)\.strip\(\)\)",
     ]
     for pat in blocks:
         m = re.search(pat, src, re.S)
@@ -43,6 +48,8 @@ phantom = FNS["_phantom_id_arg"]
 drew_own_chart = FNS["_drew_own_chart"]
 unsourced = FNS["_unsourced_numbers"]
 evidence_block = FNS["_evidence_block"]
+is_nudge = FNS["_is_nudge"]
+resume_target = FNS["_resume_target"]
 
 
 # ── 정수 토큰 추출 ────────────────────────────────────────────────────────────
@@ -279,3 +286,44 @@ def test_근거_블록은_도구_호출이_있을_때만_만든다():
 def test_근거_블록에_출처없는_수치가_실린다():
     out = evidence_block([("get_material", "id=1234")], ["310.5"])
     assert "310.5" in out and "확인되지 않았습니다" in out
+
+
+# ── 재촉 → 이어하기 ───────────────────────────────────────────────────────────
+# 응답이 끊긴 뒤의 "야! 하라니까!" 는 내용이 없어, 그대로 넘기면 모델이 새 질문으로 읽는다.
+# 오판(진짜 새 질문을 재촉으로 봄)이 재촉을 놓치는 것보다 나쁘므로 판정을 좁게 잡는다.
+def test_짧은_재촉을_잡는다():
+    for s in ("야! 하라니까!", "계속", "ㄱㄱ", "왜 안해?", "continue", "다시"):
+        assert is_nudge(s), s
+
+
+def test_내용이_있으면_재촉이_아니다():
+    """'계속해서 …' 처럼 접두만 같은 새 질문을 재촉으로 보면 원래 질문이 통째로 무시된다."""
+    for s in ("계속해서 배터리 스웰링 원인을 알려줘", "야 그런데 이거 말고 다른 재료는?",
+              "Al6061-T6 물성 알려줘", ""):
+        assert not is_nudge(s), s
+
+
+def test_끊긴_턴만_이어한다():
+    interrupted = [{"role": "user", "content": "Al6061 물성 알려줘"},
+                   {"role": "assistant", "content": "조회하겠습니다"}]
+    q, _ = resume_target(interrupted)
+    assert q == "Al6061 물성 알려줘"
+
+
+def test_내부오류_중단도_이어한다():
+    h = [{"role": "user", "content": "낙하 해석 돌려줘"},
+         {"role": "assistant", "content": "부분…\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다."}]
+    q, part = resume_target(h)
+    assert q == "낙하 해석 돌려줘" and part
+
+
+def test_빈_응답도_이어한다():
+    h = [{"role": "user", "content": "물성표 만들어줘"}, {"role": "assistant", "content": ""}]
+    assert resume_target(h)[0] == "물성표 만들어줘"
+
+
+def test_정상_답변_뒤에는_이어하지_않는다():
+    """정상 종료 뒤의 '계속' 은 '더 말해달라' 는 새 요구다 — 원래 질문을 다시 돌리면 안 된다."""
+    h = [{"role": "user", "content": "물성 알려줘"},
+         {"role": "assistant", "content": "Al6061-T6 의 항복강도는 276 MPa 입니다. 자세한 값은…"}]
+    assert resume_target(h) == (None, None)
