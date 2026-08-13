@@ -400,6 +400,79 @@ def _learn_ids(text) -> None:
     src |= _int_tokens(text)
 
 
+# ── 근거 표기 ───────────────────────────────────────────────────────────────
+# 프롬프트로 "근거를 대라"고 시키는 것은 확률적이라 모델이 바뀌면 무너진다. 심의는 이미
+# 코드 검증(quote 가 원문에 실재하는가)으로 이 문제를 풀었는데(deliberation._quote_validator),
+# 챗에는 그 장치가 없어 도구를 부르고도 답변이 그 범위를 넘어서면 아무도 못 잡았다.
+# 여기서는 두 가지를 코드로 한다 — 근거 블록을 실행 기록에서 만들고(지어낼 수 없다),
+# 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 표시한다.
+
+# 답변에서 뽑을 수치 토큰 — 천단위 콤마와 소수점을 포함해 원문 표기 그대로 잡는다.
+_NUM_TOK_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])")
+
+
+def _sig_numbers(text: str) -> list:
+    """대조할 가치가 있는 수치만. 오탐을 줄이려고 범위를 좁게 잡는다.
+
+    작은 정수(0~99)는 개수·순번·백분율로 정상 생성되는 값이라 제외한다 — 여기까지 잡으면
+    경고가 남발돼 표시 자체를 아무도 안 보게 된다. 소수점이 있거나 100 이상인 값만 본다.
+    """
+    out = []
+    for m in _NUM_TOK_RE.finditer(text or ""):
+        raw = m.group(0)
+        norm = raw.replace(",", "")
+        try:
+            val = float(norm)
+        except ValueError:
+            continue
+        if "." not in norm and val < 100:
+            continue
+        out.append((raw, norm))
+    return out
+
+
+def _unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
+    """답변의 수치 중 도구 출력·사용자 발화 어디에도 없는 것.
+
+    부분문자열로 대조한다 — '48039.32' 가 원문에 그대로 있으면 근거 있는 값으로 본다.
+    부분 일치라 '232' 가 '1232' 에 걸려 통과하는 느슨함이 있는데, 이 방향의 오차는
+    '근거 있다고 잘못 보는' 쪽이라 경고 남발보다 낫다(과다 경고는 기능을 죽인다).
+    """
+    if not sources:
+        return []
+    src_norm = sources.replace(",", "")
+    seen, bad = set(), []
+    for raw, norm in _sig_numbers(answer):
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if norm not in src_norm:
+            bad.append(raw)
+        if len(bad) >= limit:
+            break
+    return bad
+
+
+def _evidence_block(calls: list, unsourced: list) -> str:
+    """이번 턴의 근거 블록. 모델이 아니라 코드가 실행 기록에서 만든다 — 그래서 지어낼 수 없다.
+
+    도구를 한 번도 안 쓴 턴에는 붙이지 않는다. 그 경우는 기존 '도구 미조회' 경고가 담당한다.
+    """
+    if not calls:
+        return ""
+    lines = ["\n\n---", "**근거** — 이번 답변이 실제로 조회한 것"]
+    for name, args in calls[:8]:
+        lines.append(f"- `{name}`" + (f" · {args}" if args else ""))
+    if len(calls) > 8:
+        lines.append(f"- … 외 {len(calls) - 8}건")
+    if unsourced:
+        lines.append("")
+        lines.append("> ⚠ 다음 수치는 위 조회 결과에서 확인되지 않았습니다 — "
+                     "추론이거나 계산된 값일 수 있으니 그대로 인용하지 마십시오: "
+                     + ", ".join(f"`{v}`" for v in unsourced))
+    return "\n".join(lines)
+
+
 def _phantom_id_arg(args: dict, src: set):
     """식별자 인자 중 '이번 턴 어디에도 출처가 없는 정수'를 찾아 (이름, 값) 으로 돌려준다.
     bool 은 int 의 서브클래스라 명시적으로 제외한다(flag=True 가 id 로 오인되면 안 된다)."""
@@ -1474,6 +1547,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
+    # 근거 블록·수치 대조용 — 이번 턴에 실제로 실행된 도구와 그 출력 원문.
+    # contextvar 가 아니라 지역 리스트인 이유는 turn_imgs 와 같다: LangGraph 실행 컨텍스트를
+    # 넘지 못해 스트림 쪽에서 직접 회수해야 한다(실측 빈 값).
+    turn_calls: list = []          # [(도구명, 인자요약)]
+    turn_out: list = []            # 도구 출력 원문 조각(수치 대조용)
     # 유령 ID 게이트의 출처집합 — 발화와 **전체 history** 의 정수로 시작한다(최근 몇 턴만 보면
     # "아까 그 재료" 처럼 오래된 ID 를 다시 쓰는 정상 호출이 막힌다). 도구 결과의 정수는
     # _learn_ids 가 호출 성공 시마다 더한다.
@@ -1596,6 +1674,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
                                           "tool": event.get("name")})
                 args = _tool_preview(event.get("data", {}).get("input"))
+                turn_calls.append((str(event.get("name") or "?"), args or ""))
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
                                       **({"detail": args} if args else {})})
             elif kind == "on_tool_end":
@@ -1604,6 +1683,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 _raw = event.get("data", {}).get("output")
                 _txt = getattr(_raw, "content", _raw)
                 if isinstance(_txt, str):
+                    # 수치 대조용 원문 적재 — 총량을 묶어 두지 않으면 대용량 조회 한 번에
+                    # 메모리가 튄다. 앞부분만 남겨도 수치는 대개 초반에 실린다.
+                    if sum(len(x) for x in turn_out) < 400_000:
+                        turn_out.append(_txt[:120_000])
                     for _u in re.findall(r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]*", _txt):
                         if _u not in turn_imgs:
                             turn_imgs.append(_u)
@@ -1828,6 +1911,19 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         add = "\n\n" + "\n".join(f"![생성된 그래프]({u})" for u in missing)
         text += add
         yield _sse("token", {"delta": add})
+    # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
+    # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
+    # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.
+    if turn_calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0":
+        try:
+            _src = "\n".join(turn_out) + "\n" + (req.message or "")
+            _bad = _unsourced_numbers(text, _src)
+            _ev = _evidence_block(turn_calls, _bad)
+            if _ev:
+                text += _ev
+                yield _sse("token", {"delta": _ev})
+        except Exception as exc:  # noqa: BLE001 — 근거 표기 실패가 답변을 못 죽인다
+            print(f"[agent] evidence block failed: {exc!r}")
     yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
 

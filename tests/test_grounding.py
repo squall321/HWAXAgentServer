@@ -25,6 +25,10 @@ def _load() -> dict:
         r"def _int_tokens.*?\n    return \{int\(m\) for m in _INT_TOK_RE\.findall\(s\)\}",
         r"def _phantom_id_arg.*?\n    return None",
         r"_CHART_SURFACE_RE = .*?bool\(_ENTITY_RE\.search\(message or \"\"\)\)",
+        r"_NUM_TOK_RE = re\.compile\(r\"[^\n]*\"\)",
+        r"def _sig_numbers.*?\n    return out",
+        r"def _unsourced_numbers.*?\n    return bad",
+        r"def _evidence_block.*?\n    return \"\\n\"\.join\(lines\)",
     ]
     for pat in blocks:
         m = re.search(pat, src, re.S)
@@ -37,6 +41,8 @@ FNS = _load()
 int_tokens = FNS["_int_tokens"]
 phantom = FNS["_phantom_id_arg"]
 drew_own_chart = FNS["_drew_own_chart"]
+unsourced = FNS["_unsourced_numbers"]
+evidence_block = FNS["_evidence_block"]
 
 
 # ── 정수 토큰 추출 ────────────────────────────────────────────────────────────
@@ -228,3 +234,48 @@ if __name__ == "__main__":  # pytest 없이도 돌릴 수 있게
                 print(f"  ✗ {name}: {exc}")
     print(f"\n{'실패 ' + str(fails) + '건' if fails else '전부 통과'}")
     sys.exit(1 if fails else 0)
+
+
+# ── 답변 수치 대조 ────────────────────────────────────────────────────────────
+# 도구를 부르고도 답변이 그 범위를 넘어서는 경우를 잡는 안전망. 유령 ID 게이트가 도구 '인자'를
+# 막는다면 이쪽은 답변 '본문'을 본다. 과다 경고는 기능을 죽이므로 오탐 억제가 설계의 핵심이다.
+TOOL_OUT = '{"name":"Al6061-T6","yield_mpa":276.0,"E_gpa":68.9,"id":1234,"count":12}'
+
+
+def test_도구_값을_그대로_인용하면_경고하지_않는다():
+    assert unsourced("항복 276.0 MPa, 탄성계수 68.9 GPa 입니다.", TOOL_OUT) == []
+
+
+def test_도구에_없는_수치는_잡는다():
+    """이 경우가 '확신에 찬 오답' 이다 — 조회는 했는데 답이 조회 밖으로 나간 것."""
+    assert unsourced("항복강도는 310.5 MPa 입니다.", TOOL_OUT) == ["310.5"]
+
+
+def test_작은_정수와_백분율은_잡지_않는다():
+    """개수·순번·백분율은 정상 생성값이다. 여기까지 경고하면 아무도 표시를 안 본다."""
+    assert unsourced("재료 3종 중 2번째, 총 12개이며 약 45% 입니다.", TOOL_OUT) == []
+
+
+def test_천단위_콤마_표기를_같은_값으로_본다():
+    """모델은 21,279 로 쓰고 도구는 21279 로 준다 — 표기 차이를 날조로 보면 안 된다."""
+    assert unsourced("물성값은 21,279 건입니다.", '{"property_values":21279}') == []
+
+
+def test_사용자가_준_수치는_출처로_인정한다():
+    assert unsourced("두께 2.5mm 기준입니다.", TOOL_OUT + "\n두께 2.5mm 로 계산해줘") == []
+
+
+def test_도구_출력이_없으면_판정하지_않는다():
+    """도구 0회 턴은 기존 '도구 미조회' 경고가 담당한다 — 여기서 중복 경고하지 않는다."""
+    assert unsourced("아무 값 999.9", "") == []
+
+
+def test_근거_블록은_도구_호출이_있을_때만_만든다():
+    assert evidence_block([], []) == ""
+    out = evidence_block([("list_materials", "query=Al6061")], [])
+    assert "list_materials" in out and "근거" in out
+
+
+def test_근거_블록에_출처없는_수치가_실린다():
+    out = evidence_block([("get_material", "id=1234")], ["310.5"])
+    assert "310.5" in out and "확인되지 않았습니다" in out
