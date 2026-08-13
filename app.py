@@ -503,6 +503,11 @@ def _unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
     return bad
 
 
+# 근거 블록의 고정 표지 — 생성부와 '다음 턴 출처 판정'이 이 문자열로 맞물린다.
+# 두 군데에 따로 쓰면 한쪽만 고쳐질 때 조용히 어긋난다(유령 ID 게이트가 세탁을 허용하게 된다).
+_EVIDENCE_MARK = "**근거** — 이번 답변이 실제로 조회한 것"
+
+
 def _evidence_block(calls: list, unsourced: list) -> str:
     """이번 턴의 근거 블록. 모델이 아니라 코드가 실행 기록에서 만든다 — 그래서 지어낼 수 없다.
 
@@ -510,7 +515,7 @@ def _evidence_block(calls: list, unsourced: list) -> str:
     """
     if not calls:
         return ""
-    lines = ["\n\n---", "**근거** — 이번 답변이 실제로 조회한 것"]
+    lines = ["\n\n---", _EVIDENCE_MARK]
     for name, args in calls[:8]:
         lines.append(f"- `{name}`" + (f" · {args}" if args else ""))
     if len(calls) > 8:
@@ -1607,8 +1612,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # _learn_ids 가 호출 성공 시마다 더한다.
     _seed_ids = _int_tokens(req.message)
     for _h in (req.history or []):
-        if isinstance(_h, dict):
-            _seed_ids |= _int_tokens(_h.get("content") or "")
+        if not isinstance(_h, dict):
+            continue
+        _hc = _h.get("content") or ""
+        # 사용자 발화는 그대로 출처로 인정한다. assistant 발화는 다르다 — 모델이 지어낸 정수가
+        # 다음 턴에 '이전 대화에 있던 값'이 되어 게이트를 통과하는 세탁 경로가 된다
+        # (1턴에 찍은 test_id=1 → 2턴에 통과 → 남의 재료 카드를 받아 온다).
+        # 도구가 실제로 돌았던 턴(근거 블록이 붙은 답변)만 출처로 본다. 도구 0회 턴의 수치는
+        # 근거가 없으므로 다음 턴에서도 근거가 아니다.
+        if _h.get("role") == "assistant" and _EVIDENCE_MARK not in _hc:
+            continue
+        _seed_ids |= _int_tokens(_hc)
     _turn_ids.set(_seed_ids)
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다

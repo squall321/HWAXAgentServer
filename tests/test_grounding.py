@@ -29,6 +29,7 @@ def _load() -> dict:
         r"def _sig_numbers.*?\n    return out",
         r"def _unsourced_numbers.*?\n    return bad",
         r"def _evidence_block.*?\n    return \"\\n\"\.join\(lines\)",
+        r"_EVIDENCE_MARK = .*?\n",
         r"_NUDGE_RE = re\.compile\(.*?\)\n",
         r"_INTERRUPTED_RE = re\.compile\(.*?\)\n",
         r"_NUDGE_MAX_LEN = \d+",
@@ -50,6 +51,18 @@ unsourced = FNS["_unsourced_numbers"]
 evidence_block = FNS["_evidence_block"]
 is_nudge = FNS["_is_nudge"]
 resume_target = FNS["_resume_target"]
+EVIDENCE_MARK = FNS["_EVIDENCE_MARK"]
+
+
+def _seed(message: str, history: list) -> set:
+    """app.py 의 유령 ID 게이트 출처집합 구성과 같은 규칙(테스트용 재현)."""
+    s = int_tokens(message)
+    for h in history:
+        c = h.get("content") or ""
+        if h.get("role") == "assistant" and EVIDENCE_MARK not in c:
+            continue
+        s |= int_tokens(c)
+    return s
 
 
 # ── 정수 토큰 추출 ────────────────────────────────────────────────────────────
@@ -327,3 +340,26 @@ def test_정상_답변_뒤에는_이어하지_않는다():
     h = [{"role": "user", "content": "물성 알려줘"},
          {"role": "assistant", "content": "Al6061-T6 의 항복강도는 276 MPa 입니다. 자세한 값은…"}]
     assert resume_target(h) == (None, None)
+
+
+# ── 멀티턴 근거 세탁 방지 ─────────────────────────────────────────────────────
+# history 는 텍스트만 넘어와 도구 결과가 없다. role 구분 없이 정수를 흡수하면 1턴에 모델이
+# 지어낸 test_id 가 2턴에 '이전 대화에 있던 값'이 되어 게이트를 통과한다 — 게이트가 막으려던
+# 바로 그 사고(남의 재료 카드를 받아 오기)가 한 턴만 지나면 되살아난다.
+def test_도구없이_지어낸_정수는_다음턴_출처가_아니다():
+    h = [{"role": "user", "content": "Al6061 물성"},
+         {"role": "assistant", "content": "test_id=1 의 카드는 다음과 같습니다"}]
+    assert 1 not in _seed("그거 카드 만들어줘", h)
+
+
+def test_근거블록이_붙은_답변의_정수는_출처로_인정한다():
+    """도구가 실제로 돈 턴이다 — 여기까지 막으면 '아까 그 재료' 이어쓰기가 깨진다."""
+    h = [{"role": "user", "content": "Al6061 물성"},
+         {"role": "assistant",
+          "content": f"Al6061-T6 (id 19) 입니다.\n\n---\n{EVIDENCE_MARK}\n- `list_materials`"}]
+    assert 19 in _seed("그거 카드 만들어줘", h)
+
+
+def test_사용자_발화의_정수는_항상_출처다():
+    h = [{"role": "user", "content": "test_id 42 로 해줘"}, {"role": "assistant", "content": "네"}]
+    assert 42 in _seed("진행해", h)
