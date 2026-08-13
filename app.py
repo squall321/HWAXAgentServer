@@ -27,6 +27,7 @@ Env:
   MCP_SERVERS     fallback: comma-separated name=url pairs (no per-server auth headers).
 """
 
+import asyncio
 import contextvars
 import json
 import os
@@ -1777,7 +1778,54 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             yield _sse("token", {"delta": _note})
             yield _sse("result", {"type": "text", "content": _partial + _note})
         else:
-            yield _sse("error", {"code": "agent_error", "message": f"에이전트 처리 중 오류{detail}"})
+            # 부분 응답조차 없으면 사용자는 오류 한 줄만 받는다. 일시적 실패(스트림 끊김·
+            # 상류 5xx·파서 오류)가 대부분이라 한 번은 자동으로 다시 해 본다 — 사용자가
+            # "야" 하고 재촉해야 다시 도는 것은 시스템이 할 일을 사람에게 미루는 것이다.
+            # 스트리밍이 아니라 단발 호출로 간다(스트림 경로가 방금 실패한 그 경로다).
+            _rescued = ""
+            # 즉시 1회로는 순간 장애를 못 넘긴다. 상류가 잠깐 끊긴 경우가 대부분이라
+            # 짧게 쉬었다 다시 한다. 간격 없이 붙이면 같은 실패를 그대로 다시 받는다.
+            _tries = max(0, int(os.environ.get("CHAT_AUTO_RETRY", "2") or 0))
+            for _attempt in range(1, _tries + 1):
+                yield _sse("status", {"step": f"오류 발생 — 자동 재시도 {_attempt}/{_tries}",
+                                      "tool": None})
+                if _attempt > 1:
+                    await asyncio.sleep(min(4.0, 1.5 * (_attempt - 1)))
+                try:
+                    _msgs = [("system", sys_prompt), *_history_messages(req.history),
+                             ("user", req.message)]
+                    # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
+                    _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
+                    _r4 = await agent.ainvoke({"messages": _msgs}, config=_cfg4)
+                    for m in reversed((_r4 or {}).get("messages") or []):
+                        if getattr(m, "type", "") != "ai":
+                            continue
+                        _c4 = getattr(m, "content", None)
+                        if isinstance(_c4, list):
+                            _c4 = "".join(p.get("text", "") if isinstance(p, dict) else str(p)
+                                          for p in _c4)
+                        if isinstance(_c4, str) and _c4.strip():
+                            _rescued = _c4.strip()
+                            break
+                    if _rescued:
+                        break
+                except Exception as exc2:  # noqa: BLE001
+                    print(f"[agent] auto-retry {_attempt}/{_tries} failed: {exc2!r}")
+                    exc = exc2          # 마지막 실패 원인으로 메시지를 만든다
+            if _rescued:
+                print(f"[agent] auto-retry 성공 — 오류 턴 복구(시도 {_attempt}회)")
+                yield _sse("token", {"delta": _rescued})
+                yield _sse("result", {"type": "text", "content": _rescued})
+            else:
+                # 원인을 뭉뚱그리지 않는다. LLM 미도달은 '에이전트 오류' 가 아니라 인프라
+                # 문제이고, 사용자가 질문을 바꿔도 해결되지 않는다 — 그렇게 말해 줘야 한다.
+                _kind = type(exc).__name__
+                if "APIConnection" in _kind or "APITimeout" in _kind or "Connection" in _kind:
+                    _msg = ("LLM 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요 — "
+                            f"질문을 바꿔도 해결되지 않습니다.{detail}")
+                else:
+                    _msg = f"에이전트 처리 중 오류{detail} (자동 재시도 {_tries}회 모두 실패)"
+                yield _sse("error", {"code": "agent_error", "message": _msg})
         yield _sse("done", {})
         return
     text = "".join(full)
@@ -1979,13 +2027,41 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 조회한 사실과 결과 발췌만 싣는다.
     if not text.strip() and turn_calls:
         _names = ", ".join(dict.fromkeys(n for n, _ in turn_calls))
-        _excerpt = "\n".join(turn_out)[:1200].strip()
-        _fb = (f"조회는 완료했으나 모델이 요약을 생성하지 못했습니다. 조회한 도구는 `{_names}` 입니다.\n\n"
-               + (f"조회 결과 발췌\n\n```\n{_excerpt}\n```\n\n" if _excerpt else "")
-               + "> 같은 질문을 다시 보내거나 “계속”이라고 하시면 이 결과로 이어서 답합니다.")
-        text = _fb
-        yield _sse("token", {"delta": _fb})
-        print(f"[agent] empty-final rescued — tools={_names}")
+        _excerpt = "\n".join(turn_out)[:12000].strip()
+        print(f"[agent] empty final after tools({_names}) — 자동 재시도")
+        yield _sse("status", {"step": "응답이 비어 자동 재시도", "tool": None})
+        # 재시도는 '요약만' 시킨다 — 도구를 다시 부르면 같은 조회를 반복하고 같은 자리에서
+        # 또 빌 수 있다. 이미 받은 결과를 컨텍스트로 주고 답만 쓰게 하는 것이 확실하다.
+        try:
+            # 도구를 다시 부르지 않게 한다 — 같은 조회를 반복하면 같은 자리에서 또 빈다.
+            # 이미 받은 결과만 주고 요약을 시킨다.
+            _msgs = [("system", "조회 결과를 사용자에게 설명하는 역할이다. 아래 결과에 있는 "
+                                "내용만 쓰고 없는 값을 지어내지 마라. 도구를 새로 호출하지 마라. "
+                                "결과가 비었으면 비었다고 말하라."),
+                     ("user", f"[사용자 질문]\n{req.message}\n\n[조회한 도구]\n{_names}\n\n"
+                              f"[조회 결과]\n{_excerpt}\n\n위 결과로 질문에 답하라.")]
+            _r3 = await agent.ainvoke({"messages": _msgs}, config=_cfg)
+            _c3 = None
+            for m in reversed((_r3 or {}).get("messages") or []):
+                if getattr(m, "type", "") == "ai":
+                    _c3 = getattr(m, "content", None)
+                    break
+            if isinstance(_c3, list):
+                _c3 = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c3)
+            if isinstance(_c3, str) and _c3.strip():
+                text = _c3.strip()
+                yield _sse("token", {"delta": text})
+                print("[agent] empty-final retry 성공")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] empty-final retry failed: {exc!r}")
+        # 재시도까지 실패하면 조회 결과라도 내보낸다. 조회는 이미 끝났으므로 이것을 버리면
+        # 사용자는 아무것도 못 받는다(초록불만 꺼지는 그 상태다).
+        if not text.strip():
+            _short = _excerpt[:1200]
+            text = (f"조회는 완료했으나 요약 생성에 실패했습니다. 조회한 도구는 `{_names}` 입니다.\n\n"
+                    + (f"조회 결과 발췌\n\n```\n{_short}\n```\n" if _short else ""))
+            yield _sse("token", {"delta": text})
+            print("[agent] empty-final retry 실패 — 원문 발췌로 대체")
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
     # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.
