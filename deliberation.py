@@ -13,6 +13,11 @@ DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
 # 시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의. 일반 심의보다 먼저
 # 검사해야 한다("/시뮬심의"가 "/심의"로 시작하지 않으므로 순서 의존은 없지만 의도를 명시).
 SIM_DELIBERATE_TRIGGERS = ("/시뮬심의", "/시뮬레이션심의", "/simdeliberate")
+# 시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정한다. 해석은 물성이 없으면 시작할 수
+# 없는데, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는 사람이 매번 손으로 대조한다.
+# 물성 공백은 도구로 조회되고(coverage_gaps 등), 우선순위는 관점이 갈린다(시험 자원 vs
+# 해석 민감도 vs 측정 난이도 vs 개발 일정) — 심의가 푸는 형태다.
+TEST_PLAN_TRIGGERS = ("/시험계획", "/시험설계", "/testplan", "/DOE")
 # 대화 → RA 보고서 저장(결정적) — LLM 재량에 맡기지 않고 코드가 blocks 를 만들어 저장한다.
 # "/보고서 <선택: 내 결론>" — 사용자가 직접 끌어낸 결론을 함께 주면 권고안 맨 앞에 실린다.
 REPORT_TRIGGERS = ("/보고서", "/report")
@@ -103,11 +108,36 @@ _CHAIR_ITEMS = {
         "퇴화가 있으면 그것을 푸는 독립 관측을 지정하라, "
         "(8) 검증 계획: 해석해·벤치마크·시험 대조, (9) 계산 규모와 일정, "
         "(10) 이 해석이 답할 수 없는 것. (7)과 (10)은 비워두지 마라 — 비면 계획서가 아니다.",
+    # 시험 계획서 — "무엇을 먼저 측정할 것인가". 계획서가 그대로 시험 의뢰서가 되어야 하므로
+    # 항목·조건·수량·판정까지 내려간다. 우선순위 근거(3)와 미확보 항목(9)이 이 문서의 값어치다.
+    "test-plan":
+        "시험 계획서 9개 항목 — "
+        "(1) 시험 목적: 이 시험이 풀어야 할 해석·판단을 한 문장으로. 어떤 결정을 막고 있는지 명시, "
+        "(2) 대상 물성과 현재 근거: 필요한 물성을 나열하고 위 [물성 근거 현황] 과 대조해 각각을 "
+        "실측 보유 / 카탈로그·계열값 / 가정 / 미보유 로 판정하라. 이미 실측이 있는 항목은 "
+        "다시 측정하지 마라 — 중복 측정은 자원 낭비이고 계획서의 신뢰를 깎는다, "
+        "(3) 우선순위와 근거: 해석 결과에 대한 민감도 × 근거 공백 × 확보 난이도로 서열화하라. "
+        "'다 필요하다' 는 답이 아니다. 하나만 먼저 한다면 무엇인지 답하고 그 이유를 쓰라, "
+        "(4) 시험 항목별 방법·장비·규격: 사내 보유 장비를 우선 검토하고, 없으면 외주·신규 도입으로 "
+        "구분하라. 규격이 있으면 규격 번호를 쓰라, "
+        "(5) 조건축 설계: 온도·습도·속도·하중 등 어떤 축을 어느 수준으로 몇 점 잡을지. "
+        "수준 수와 표본 수를 곱해 총 시험 횟수를 명시하라. 전수 조합이 불가하면 어떤 설계로 줄일지, "
+        "(6) 시편과 수량: 형상·전처리·반복 수. 파괴시험이면 소모량까지, "
+        "(7) 일정과 착수 순서: 경시·수명 항목은 결과가 나오는 데 수개월이 걸리므로 먼저 착수하고 "
+        "단기 항목을 병행하라. 무엇이 임계경로인지 명시하라, "
+        "(8) 판정 기준: 어떤 값이 나오면 확보로 보고 어떤 경우 재시험인가. 산포가 크면 어떻게 다룰지, "
+        "(9) 이 시험으로도 확보되지 않는 것: 남는 가정과 그 영향. "
+        "(3)과 (9)는 비워두지 마라 — 비면 우선순위 없는 희망 목록일 뿐이다.",
 }
 
 # 시뮬레이션 심의 2단 좌석 — 고정 CAE 좌석은 발굴에 맡기지 않는다. 현상 어휘에 끌려
 # 방법론·검증 좌석이 빠지는 일이 생긴다.
 _SIM_FIXED_CAE = ("xd-cae-modeling", "xd-cae-post")
+# 시험 계획 고정 좌석 — 이 셋이 빠지면 계획서가 한쪽으로 기운다.
+#   계측·시험    측정 가능성과 장비·규격을 아는 쪽. 없으면 '측정할 수 없는 것'을 계획에 넣는다
+#   해석         민감도를 아는 쪽. 없으면 결과에 영향 없는 물성을 최우선으로 올린다
+#   프로그램·일정 자원과 임계경로를 보는 쪽. 없으면 전부 1순위인 목록이 나온다
+_TEST_FIXED = ("rel-test-measurement", "xd-cae-modeling", "xd-program")
 _SIM_CARRY = _env_int("DELIB_SIM_CARRY", 2)           # 2단에 남길 물리 유임 좌석 수
 
 _COUNTER_SEATS = _env_int("DELIB_COUNTER_SEATS", 2)   # 반대 도메인 좌석 수(0=끔, 종전 동작)
@@ -240,6 +270,19 @@ def strip_sim_trigger(message: str) -> str:
     return m
 
 
+def is_test_plan(message: str) -> bool:
+    m = (message or "").strip()
+    return any(m.startswith(t) for t in TEST_PLAN_TRIGGERS)
+
+
+def strip_test_plan_trigger(message: str) -> str:
+    m = (message or "").strip()
+    for t in TEST_PLAN_TRIGGERS:
+        if m.startswith(t):
+            return m[len(t):].strip()
+    return m
+
+
 def is_report_save(message: str) -> bool:
     m = (message or "").strip()
     return any(m.startswith(t) for t in REPORT_TRIGGERS)
@@ -366,6 +409,44 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
     return ("[사내 자산 현황 — 실제 조회 결과]\n" + body +
             "\n\n※ 위에 없는 물성·도구는 '미보유'로 보고 확보 경로를 쓰십시오. 있는 것을 없다고, "
             "없는 것을 있다고 쓰지 마십시오.")
+
+
+async def _material_evidence_snapshot(tools: dict, question: str) -> str:
+    """시험 계획용 물성 근거 현황. '무엇이 없는가' 를 코드가 조회해 근거로 깐다.
+
+    시험 계획의 값어치는 '이미 있는 것을 다시 재지 않는 것' 과 '없는 것을 놓치지 않는 것'
+    양쪽에서 나온다. 둘 다 보유 현황을 봐야 판단되는데, 지금은 사람이 매번 손으로 대조한다.
+    """
+    parts: list[str] = []
+
+    _s = await _call(tools, "database_summary", {})
+    if _s:
+        parts.append(f"[물성 DB 전체 현황]\n{str(_s)[:900]}")
+    # 요구 대비 공백 — 시험 계획의 1차 입력이다. 무엇이 비었는지가 곧 후보 목록이다.
+    _cov = await _call(tools, "coverage_gaps", {})
+    if _cov:
+        parts.append(f"[요구 대비 공백 — 미보유·근거 부족]\n{str(_cov)[:1200]}")
+    # 출처 등급 분포 — 실측/카탈로그/가정 비율. '채움률은 높은데 실측이 낮은' 상태를 드러낸다.
+    _pd = await _call(tools, "property_distribution", {})
+    if _pd:
+        parts.append(f"[출처 등급 분포]\n{str(_pd)[:700]}")
+    # 질문에 걸리는 재료의 현재 보유 물성 — 중복 측정 방지의 근거.
+    _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
+    if _m:
+        parts.append(f"[질문 관련 재료와 보유 물성]\n{str(_m)[:800]}")
+    # 물성 정의 목록 — 어떤 항목이 도메인별로 정의돼 있는지. '무엇을 잴 수 있는가'의 사전이다.
+    # (기보유 시험 피팅은 get_fits 가 test_id 필수라 여기서 일괄 조회할 수 없다 — 좌석이
+    #  자유 조회로 개별 확인한다.)
+    _pdef = await _call(tools, "list_property_definitions", {})
+    if _pdef:
+        parts.append(f"[정의된 물성 항목]\n{str(_pdef)[:700]}")
+
+    if not parts:
+        return ("[물성 근거 현황] 조회하지 못했습니다(도구 미연결). 보유 여부를 단정하지 말고, "
+                "각 물성을 '보유 확인 필요' 로 표시한 뒤 확인 절차를 계획에 넣으십시오.")
+    return ("[물성 근거 현황 — 실제 조회 결과]\n" + "\n\n".join(parts)[:_ASSET_SNAP_MAX] +
+            "\n\n※ 이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마십시오. "
+            "위에 없는 항목은 미보유로 보되, 조회되지 않은 것과 실제로 없는 것을 구분해 쓰십시오.")
 
 
 def _first_dict(x):
@@ -1208,6 +1289,44 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None):
     except Exception as exc:  # noqa: BLE001
         print(f"[deliberation] fatal: {exc!r}")
         yield _sse("error", {"code": "deliberation_error", "message": f"심의 처리 중 오류: {str(exc)[:200]}"})
+        yield _sse("done", {})
+
+
+async def run_test_plan(app, question: str, groups: list, req_opts=None):
+    """시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정해 시험 계획서를 낸다.
+
+    해석은 물성이 없으면 시작할 수 없고, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는
+    지금 사람이 매번 손으로 대조한다. 공백은 도구로 조회되므로 코드가 먼저 깔고, 우선순위는
+    관점이 갈리므로(시험 자원 vs 해석 민감도 vs 측정 난이도 vs 개발 일정) 심의가 정한다.
+
+    좌석에 계측·해석·일정을 고정으로 넣는 이유는 하나씩 빠질 때 나오는 실패가 분명해서다 —
+    계측이 빠지면 측정할 수 없는 것을 계획에 넣고, 해석이 빠지면 결과에 영향 없는 물성을
+    최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
+    """
+    opts = _resolve_opts(req_opts)
+    opts.chair_template = "test-plan"
+    # 고정 좌석을 앞에 세우고 나머지는 질문으로 발굴하게 둔다(재료 계열·현상 도메인).
+    opts.continue_personas = [{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
+    opts.human_note = ("이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마라. "
+                       "우선순위는 '민감도 × 근거 공백 × 확보 난이도' 로 서열화하고, "
+                       "하나만 먼저 한다면 무엇인지 반드시 답하라. "
+                       "경시·수명 항목은 결과까지 수개월이 걸리므로 착수 순서에서 앞에 두라.")
+    try:
+        # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
+        try:
+            yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
+            _tools = await _tools_by_name(app, groups)
+            opts.human_note += "\n\n" + await _material_evidence_snapshot(_tools, question)
+        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+            print(f"[test-plan] snapshot failed: {exc!r}")
+        q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
+             f"목적: {question}")
+        async for chunk in _deliberation_stream(app, q, groups, opts):
+            yield chunk
+    except Exception as exc:  # noqa: BLE001
+        print(f"[test-plan] fatal: {exc!r}")
+        yield _sse("error", {"code": "test_plan_error",
+                             "message": f"시험 계획 심의 처리 중 오류: {str(exc)[:200]}"})
         yield _sse("done", {})
 
 

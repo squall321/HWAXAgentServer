@@ -54,13 +54,16 @@ from deliberation import (
     _tools_by_name,
     is_deliberation,
     is_sim_deliberation,
+    is_test_plan,
     is_report_save,
     run_deliberation,
     run_sim_deliberation,
+    run_test_plan,
     run_report_save,
     strip_report_trigger,
     strip_trigger,
     strip_sim_trigger,
+    strip_test_plan_trigger,
 )
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -2101,6 +2104,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts)
+    elif is_test_plan(req.message):
+        # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
+        # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
+        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts)
     elif is_deliberation(req.message):
         stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts)
     elif is_report_save(req.message):

@@ -148,9 +148,9 @@ def test_시뮬_트리거를_떼어낸다():
     assert d.strip_sim_trigger("/시뮬심의  액자형 수축") == "액자형 수축"
 
 
-def test_의장_템플릿_3종이_있고_기본은_종전이다():
+def test_의장_템플릿_4종이_있고_기본은_종전이다():
     """미지정이 종전과 같아야 기존 심의에 회귀가 없다."""
-    assert set(d._CHAIR_ITEMS) == {"default", "mechanism", "sim-plan"}
+    assert set(d._CHAIR_ITEMS) == {"default", "mechanism", "sim-plan", "test-plan"}
     assert d._resolve_opts({}).chair_template == "default"
     assert d._resolve_opts({"chair_template": "sim-plan"}).chair_template == "sim-plan"
 
@@ -213,3 +213,41 @@ if __name__ == "__main__":  # pytest 없이도 돌릴 수 있게
                 print(f"  ✗ {name}: {exc}")
     print(f"\n{'실패 ' + str(fails) + '건' if fails else '전부 통과'}")
     sys.exit(1 if fails else 0)
+
+
+# ── 시험 계획 심의 ────────────────────────────────────────────────────────────
+# 해석은 물성이 없으면 시작할 수 없다. "무엇을 먼저 측정할 것인가" 는 우선순위 문제이고,
+# 우선순위 없는 목록은 계획서가 아니라 희망 목록이다.
+def test_시험계획_트리거가_다른_모드와_겹치지_않는다():
+    assert d.is_test_plan("/시험계획 낙하 물성 확보")
+    assert d.is_test_plan("/DOE 폴더블 벤딩")
+    assert not d.is_test_plan("/심의 낙하 불량 원인")
+    assert not d.is_test_plan("/시뮬심의 결로 메커니즘")
+    assert not d.is_test_plan("시험계획 세워줘")          # 트리거는 슬래시로 시작한다
+    assert not d.is_deliberation("/시험계획 x")
+    assert not d.is_sim_deliberation("/시험계획 x")
+
+
+def test_시험계획_트리거_제거():
+    assert d.strip_test_plan_trigger("/시험계획 낙하 해석용 물성 확보") == "낙하 해석용 물성 확보"
+
+
+def test_시험계획서_템플릿이_우선순위와_미확보를_강제한다():
+    """(3) 우선순위와 (9) 미확보가 이 문서의 값어치다 — 비면 희망 목록이 된다."""
+    t = d._CHAIR_ITEMS["test-plan"]
+    assert "우선순위" in t and "하나만 먼저 한다면" in t
+    assert "확보되지 않는 것" in t
+    assert "비워두지 마라" in t
+    # 중복 측정 방지 — 이미 실측이 있는 항목을 다시 재면 자원 낭비다
+    assert "다시 측정하지 마라" in t
+    # 장기 항목 선착수 — 경시 시험은 결과까지 수개월이라 임계경로가 된다
+    assert "먼저 착수" in t
+
+
+def test_시험계획_고정좌석이_셋다_있다():
+    """계측이 빠지면 못 재는 것을 계획하고, 해석이 빠지면 안 중요한 것을 1순위로 올리고,
+    일정이 빠지면 전부 1순위가 된다."""
+    assert len(d._TEST_FIXED) == 3
+    assert any("test" in k or "measure" in k for k in d._TEST_FIXED)
+    assert any("cae" in k for k in d._TEST_FIXED)
+    assert any("program" in k for k in d._TEST_FIXED)
