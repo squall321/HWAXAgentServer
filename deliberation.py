@@ -91,9 +91,13 @@ _CHAIR_ITEMS = {
         "해석 계획서 10개 항목 — (1) 해석 목적: 이 계산이 답할 질문 하나를 문장으로, "
         "(2) 지배방정식과 물리 모델: 위 메커니즘 결론에서 승계해 수식 수준으로 확정, "
         "(3) 해석 종류·차원·기하 축약: 3D full / 2D 평면·축대칭 / 1D 중 무엇이며 그 축약이 정당한 이유, "
-        "(4) 솔버·도구 선택과 근거: 사내 보유 도구를 우선 검토하고 없을 때만 외부 도구, "
+        "(4) 솔버·도구 선택과 근거: 위 [사내 자산 현황] 에 실제로 있는 도구에서 고르고, "
+        "각 단계(전처리·솔버·실행·후처리)마다 무엇을 쓸지 지목하라. 목록에 없으면 '미보유' 라고 "
+        "쓰고 확보 경로를 제시하라 — 보유 여부를 짐작해 쓰지 마라, "
         "(5) 이산화: 메시 전략·시간 적분·수치 기법과 안정성 조건, (6) 경계·초기조건, "
-        "(7) 물성·파라미터 확보 경로와 식별성 판정 — 각 파라미터를 문헌/독립 측정/피팅으로 분류하고, "
+        "(7) 물성·파라미터 확보 경로와 식별성 판정 — 이 해석에 필요한 물성을 먼저 나열하고, "
+        "위 [사내 자산 현황] 과 대조해 각각을 보유(실측)/보유(카탈로그·가정)/미보유 로 판정하라. "
+        "미보유는 문헌/독립 측정/피팅 중 어떤 경로로 확보할지 쓰고, "
         "피팅 대상이 둘 이상이면 서로 곱으로 붙어 분리되지 않는지(퇴화) 판정하라. "
         "퇴화가 있으면 그것을 푸는 독립 관측을 지정하라, "
         "(8) 검증 계획: 해석해·벤치마크·시험 대조, (9) 계산 규모와 일정, "
@@ -304,6 +308,54 @@ async def _call(tools: dict, name: str, args: dict):
         return out
     except Exception as exc:  # noqa: BLE001 — 도구 실패가 심의를 죽이지 않게
         return f"(tool {name} error: {exc})"
+
+
+# ── 해석 설계 심의용 사내 자산 스냅샷 ────────────────────────────────────────
+# 해석 계획서의 (4) 도구 선택과 (7) 물성 확보 경로는 "무엇을 보유하고 있는가"를 알아야 쓸 수
+# 있다. 지금은 '사내 보유 도구를 우선 검토하라' 는 지시만 있어, 모델이 아는 범위에서 답하고
+# 실제 보유 목록과 어긋난다. 보유 현황을 조회해 근거로 깔면 '있는 것'과 '없는 것'을 구분해
+# 쓸 수 있다 — 없으면 없다고 쓰는 것이 계획서의 값어치다.
+_ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 3500)   # 주입 상한(자)
+
+
+async def _asset_snapshot(tools: dict, question: str) -> str:
+    """물성·도구 보유 현황을 조회해 2단 근거로 쓸 텍스트를 만든다.
+
+    실패·미연결은 조용히 건너뛴다 — 스냅샷이 없다고 심의가 서면 안 된다. 다만 '조회하지
+    못했다'는 사실은 남긴다. 빈 결과와 미조회는 다르고, 그 구분이 계획서의 신뢰도를 정한다.
+    """
+    parts: list[str] = []
+
+    # 물성 — 질문에 등장한 재료를 먼저 찾고, 없으면 카탈로그 전반 현황으로 대신한다.
+    if "search_catalog_property" in tools or "database_summary" in tools:
+        _s = await _call(tools, "database_summary", {})
+        if _s:
+            parts.append(f"[물성 DB 현황]\n{str(_s)[:900]}")
+        _cov = await _call(tools, "coverage_gaps", {})
+        if _cov:
+            parts.append(f"[물성 공백 — 요구 대비 미보유]\n{str(_cov)[:900]}")
+    if "list_materials" in tools:
+        _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
+        if _m:
+            parts.append(f"[질문 관련 재료 후보]\n{str(_m)[:700]}")
+
+    # 해석 도구 — 전처리 오퍼레이션과 계산 자원.
+    if "list_operations" in tools:
+        _op = await _call(tools, "list_operations", {})
+        if _op:
+            parts.append(f"[보유 전처리 오퍼레이션(DynaForge)]\n{str(_op)[:800]}")
+    if "slurm_list_templates" in tools:
+        _t = await _call(tools, "slurm_list_templates", {})
+        if _t:
+            parts.append(f"[제출 가능한 잡 템플릿(전사 디지털 트윈 서버)]\n{str(_t)[:500]}")
+
+    if not parts:
+        return ("[사내 자산 현황] 조회하지 못했습니다(도구 미연결). 보유 여부를 단정하지 말고, "
+                "필요한 물성·도구를 '확인 필요' 로 명시하십시오.")
+    body = "\n\n".join(parts)[:_ASSET_SNAP_MAX]
+    return ("[사내 자산 현황 — 실제 조회 결과]\n" + body +
+            "\n\n※ 위에 없는 물성·도구는 '미보유'로 보고 확보 경로를 쓰십시오. 있는 것을 없다고, "
+            "없는 것을 있다고 쓰지 마십시오.")
 
 
 def _first_dict(x):
@@ -1115,6 +1167,16 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
         opts_b.continue_personas = sim_seats
         opts_b.human_note = ("사내 보유 도구를 우선 검토하라. 파라미터 식별성 판정과 "
                              "이 해석이 답할 수 없는 것을 비워두지 마라.")
+        # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
+        # 실제 보유 목록과 어긋난다 — 계획서가 없는 도구를 쓰자고 하거나, 있는 물성을 새로
+        # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
+        try:
+            yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
+            _tools_b = await _tools_by_name(app, groups)
+            _snap = await _asset_snapshot(_tools_b, question)
+            opts_b.human_note += "\n\n" + _snap
+        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+            print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b):
             yield chunk
