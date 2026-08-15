@@ -57,6 +57,11 @@ N_PERSONAS = _env_int("DELIB_PERSONAS", 5)          # 참여 페르소나 수
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
+# RA rich_text 는 **항목당 2000자**가 서버 스키마 상한이다(초과 시 create_report_draft 가
+# "Content invalid" 로 통째 거절). _TRANSCRIPT_CLIP(기본 12000)은 그보다 크므로, 발언이 길면
+# 저장이 매번 실패하고 except 의 print 한 줄로만 남는다 — 실제로 그렇게 조용히 실패해 왔다.
+# 그래서 절단이 아니라 **분할**로 푼다. 상한을 넘기면 문장 경계로 쪼개 전부 싣는다.
+_RA_ITEM_MAX = _env_int("DELIB_RA_ITEM_MAX", 1900)   # 서버 상한 2000 에 대한 여유값
 _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
@@ -241,6 +246,42 @@ _DEFAULT_OPTS = _resolve_opts(None)   # env 기본값 스냅샷 — 요청 미�
 def _c(n: int) -> int:
     """회의 버블 절단 상한에 DELIB_CLIP_SCALE 배율 적용 — 환경별로 발언 표시 길이를 조절."""
     return int(n * _CLIP_SCALE)
+
+
+# 문장 끝(마침표·물음표·느낌표·'다.') 또는 줄바꿈에서 자른다.
+_RA_SPLIT_RE = re.compile(r"(?<=[.!?。])\s+|\n")
+
+
+def _ra_split(s: str) -> list[str]:
+    """긴 문자열을 _RA_ITEM_MAX 이하 조각으로 나눈다 — 내용을 버리지 않는다."""
+    s = str(s or "")
+    if len(s) <= _RA_ITEM_MAX:
+        return [s] if s else []
+    out: list[str] = []
+    buf = ""
+    for part in _RA_SPLIT_RE.split(s):
+        if not part:
+            continue
+        if len(buf) + len(part) + 1 > _RA_ITEM_MAX:
+            if buf:
+                out.append(buf.strip())
+                buf = ""
+            while len(part) > _RA_ITEM_MAX:      # 한 문장이 상한을 넘으면 그때만 강제 절단
+                out.append(part[:_RA_ITEM_MAX])
+                part = part[_RA_ITEM_MAX:]
+        buf = f"{buf}\n{part}" if buf else part
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _ra_blocks(blocks: dict) -> dict:
+    """create_report_draft 에 넣기 직전, 모든 rich_text 항목을 서버 상한 이하로 분할한다.
+
+    RA 는 항목 하나라도 2000자를 넘으면 보고서 전체를 거절한다. 호출부마다 제각각인
+    [:1500]·[:2000] 슬라이스에 의존하지 말고 여기서 한 번에 보장한다.
+    """
+    return {k: [c for item in v for c in _ra_split(item)] for k, v in blocks.items()}
 
 # 화두에 불량/품질 얘기가 있으면 SignalForge(VOC)에서 최근 불량 이슈를 먼저 환기한다.
 _DEFECT_RE = re.compile(
@@ -1923,7 +1964,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         }
         made = _parse_json(await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
-            "title": f"심의 — {question[:50]}", "blocks": blocks,
+            "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
             "tags": ["심의", "chat-deliberation"]}))
         rid = ((made or {}).get("report") or {}).get("id")
         if rid:
@@ -1999,7 +2040,7 @@ async def run_report_save(app, note: str, history: list, groups: list):
         tools = await _tools_by_name(app, groups)
         made = _parse_json(await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
-            "title": title, "blocks": blocks,
+            "title": title, "blocks": _ra_blocks(blocks),
             "tags": ["심의", "conversation-report"]}))
         rid = ((made or {}).get("report") or {}).get("id")
     except Exception as exc:  # noqa: BLE001 — RA 미가용(cae00 등)은 비치명적 폴백
