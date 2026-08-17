@@ -77,6 +77,7 @@ MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
 from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
+USER_HEADER = "X-HWAX-User"      # 호출자 이메일 — 게이트웨이가 사용자별 백엔드 자격증명으로 갈아탄다
 SYSTEM_PROMPT = (
     "당신은 HWAX 포털의 어시스턴트입니다. 반드시 한국어로만 답하세요 — "
     "중국어·영어 등 다른 언어로 절대 전환하지 마세요. 간결·정확하게. "
@@ -159,18 +160,23 @@ def _load_mcp_config() -> dict:
     return _parse_servers(MCP_SERVERS)
 
 
-def _with_groups(connections: dict, groups: list[str]) -> dict:
+def _with_groups(connections: dict, groups: list[str], user: str = "") -> dict:
     """Clone the MCP connection config, injecting the caller's groups header so the gateway
-    can filter the tool list (and guard tool calls). Does not mutate the input."""
+    can filter the tool list (and guard tool calls). Does not mutate the input.
+
+    user 는 '누구인가'다 — groups 가 부류라면 이쪽은 개인이고, 백엔드가 사용자별로
+    데이터를 스코프할 때(DynaForge 세션 등) 게이트웨이가 그 사용자 자격증명으로 갈아탄다.
+    비면 종전대로 서비스 계정 시야다."""
     # HTTP 헤더는 latin-1 만 담을 수 있다. '연구소' 같은 한글 그룹명을 그대로 실으면
     # UnicodeEncodeError 로 도구 로딩 전체가 실패하고, 그 사용자는 조용히 '도구 0개'가 된다
     # (실측 로그: tool load FAILED groups=['연구소'] UnicodeEncodeError). 퍼센트 인코딩해
     # 보내고 게이트웨이가 디코드한다 — ASCII 그룹명은 인코딩해도 그대로라 하위호환된다.
     hdr = quote(",".join(groups), safe=",")
+    extra = {USER_HEADER: quote(user.strip().lower(), safe="@.")} if (user or "").strip() else {}
     out = {}
     for name, cfg in connections.items():
         cfg = dict(cfg)
-        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr}
+        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr, **extra}
         out[name] = cfg
     return out
 
@@ -266,6 +272,10 @@ class ChatRequest(BaseModel):
     # 문제를 낳았다. 앱은 10개뿐이고 사용자가 아는 단위라 고를 수 있다. 서버가 앱→도구로
     # 펼치므로 pinned_tools 의 12개 캡에 걸리지 않는다(앱 하나가 평균 23개·최대 32개다).
     pinned_apps: list[str] | None = None
+    # 호출자 이메일 — 포털 백엔드가 세션/PAT 주체에서 채운다(클라이언트가 보내는 값이 아니다).
+    # 게이트웨이가 이 값으로 사용자별 백엔드 자격증명을 쓴다: 없으면 DynaForge 같은 사용자
+    # 스코프 앱은 서비스 계정 시야로 답하고, 그건 '내 모델이 하나도 없다'로 보인다.
+    user_email: str = ""
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -1277,7 +1287,7 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
-                     query: str = "", sources: list[str] | None = None):
+                     query: str = "", sources: list[str] | None = None, user: str = ""):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
@@ -1288,7 +1298,12 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
     # 소스 토글은 바인딩 구성을 바꾸므로 캐시 키에 들어가야 한다 — 안 넣으면 앞 대화의
     # 캐시된 에이전트가 재사용돼 토글이 무시된다(조용히 켜진 채로 남는다).
-    key = (frozenset(groups), pin_key, q_key, tuple(sorted(sources)) if sources is not None else None)
+    # ⚠ 호출자 신원은 반드시 키에 있어야 한다. 도구는 생성 시점의 헤더를 물고 있어서,
+    # 신원을 빼면 A 가 만든 에이전트를 B 가 재사용하며 B 의 도구 호출이 A 의 자격증명으로
+    # 나간다 — 그룹이 같으면 조용히 남의 데이터가 보인다.
+    key = (frozenset(groups), pin_key, q_key,
+           tuple(sorted(sources)) if sources is not None else None,
+           (user or "").strip().lower())
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
@@ -1296,7 +1311,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         connections = app.state.connections
         if connections:
             try:
-                scoped = _with_groups(connections, sorted(groups))
+                scoped = _with_groups(connections, sorted(groups), user)
                 import asyncio as _aio
                 _raw = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
                 _raw = gate_sources(_raw, sources)
@@ -1664,7 +1679,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             if isinstance(h, dict)
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
-        agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources)
+        agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources, req.user_email)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
@@ -1898,7 +1913,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             and not _looks_like_leaked_tool_call(text, _no_tool)):
         yield _sse("status", {"step": "도구 유무 확인 — 확정 종결 절차", "tool": None})
         try:
-            _tmap = await _tools_by_name(app, req.groups)
+            _tmap = await _tools_by_name(app, req.groups, user=req.user_email)
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] finalizer tool load failed: {exc!r}")
             _tmap = {}
@@ -1993,7 +2008,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             calls = _extract_leaked_calls(text, _no_tool)
             if calls:
                 try:
-                    _tmap = await _tools_by_name(app, req.groups)
+                    _tmap = await _tools_by_name(app, req.groups, user=req.user_email)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[agent] direct-exec tool load failed: {exc!r}")
                     _tmap = {}
@@ -2103,13 +2118,13 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
-        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts)
+        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts, req.user_email)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
-        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts)
+        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts, req.user_email)
     elif is_deliberation(req.message):
-        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts)
+        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts, req.user_email)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)

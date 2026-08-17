@@ -7,6 +7,7 @@ import os
 import re
 import asyncio
 from types import SimpleNamespace
+from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
@@ -22,6 +23,7 @@ TEST_PLAN_TRIGGERS = ("/시험계획", "/시험설계", "/testplan", "/DOE")
 # "/보고서 <선택: 내 결론>" — 사용자가 직접 끌어낸 결론을 함께 주면 권고안 맨 앞에 실린다.
 REPORT_TRIGGERS = ("/보고서", "/report")
 GROUPS_HEADER = "x-hwax-groups"
+USER_HEADER = "x-hwax-user"   # 호출자 이메일 — 게이트웨이가 사용자별 백엔드 자격증명으로 갈아탄다
 
 
 def _env_int(name: str, default: int) -> int:
@@ -349,23 +351,26 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _with_groups(connections: dict, groups: list) -> dict:
+def _with_groups(connections: dict, groups: list, user: str = "") -> dict:
+    # user 는 호출자 이메일. 게이트웨이가 이 값으로 사용자별 백엔드 자격증명을 쓴다 —
+    # 없으면 DynaForge 같은 사용자 스코프 앱은 서비스 계정 시야(=아무 모델도 없음)로 답한다.
     hdr = ",".join(groups)
+    extra = {USER_HEADER: quote(user.strip().lower(), safe="@.")} if (user or "").strip() else {}
     out = {}
     for name, cfg in connections.items():
         cfg = dict(cfg)
-        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr}
+        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr, **extra}
         out[name] = cfg
     return out
 
 
-async def _tools_by_name(app, groups: list, result_max=None, desc_max=None) -> dict:
+async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "") -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
     결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다."""
     conns = app.state.connections
     if not conns:
         return {}
-    scoped = _with_groups(conns, sorted(groups))
+    scoped = _with_groups(conns, sorted(groups), user)
     tools = await MultiServerMCPClient(scoped).get_tools()
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
@@ -1252,7 +1257,7 @@ async def _evidence_prepass(tools: dict, llm, question: str):
     return distilled, inject, used
 
 
-async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
+async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = ""):
     """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
 
     라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
@@ -1290,7 +1295,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
         yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
         opts_a = _resolve_opts(req_opts)
         opts_a.chair_template = "mechanism"
-        async for chunk in _deliberation_stream(app, question, groups, opts_a):
+        async for chunk in _deliberation_stream(app, question, groups, opts_a, user):
             _capture(chunk)
             yield chunk
         if not decision_a:
@@ -1300,7 +1305,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
 
         # ── 좌석 전환 ────────────────────────────────────────────────────────
         yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
-        tools = await _tools_by_name(app, groups)
+        tools = await _tools_by_name(app, groups, user=user)
         sim_seats, seen = [], set()
 
         async def _add(key, origin):
@@ -1336,13 +1341,13 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
         # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
         try:
             yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
-            _tools_b = await _tools_by_name(app, groups)
+            _tools_b = await _tools_by_name(app, groups, user=user)
             _snap = await _asset_snapshot(_tools_b, question)
             opts_b.human_note += "\n\n" + _snap
         except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
             print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
-        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b):
+        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[sim-deliberation] fatal: {exc!r}")
@@ -1351,13 +1356,13 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None):
         yield _sse("done", {})
 
 
-async def run_deliberation(app, question: str, groups: list, req_opts=None):
+async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = ""):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     opts = _resolve_opts(req_opts)
     try:
-        async for chunk in _deliberation_stream(app, question, groups, opts):
+        async for chunk in _deliberation_stream(app, question, groups, opts, user):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[deliberation] fatal: {exc!r}")
@@ -1365,7 +1370,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None):
         yield _sse("done", {})
 
 
-async def run_test_plan(app, question: str, groups: list, req_opts=None):
+async def run_test_plan(app, question: str, groups: list, req_opts=None, user: str = ""):
     """시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정해 시험 계획서를 낸다.
 
     해석은 물성이 없으면 시작할 수 없고, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는
@@ -1388,13 +1393,13 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None):
         # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
         try:
             yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
-            _tools = await _tools_by_name(app, groups)
+            _tools = await _tools_by_name(app, groups, user=user)
             opts.human_note += "\n\n" + await _material_evidence_snapshot(_tools, question)
         except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
             print(f"[test-plan] snapshot failed: {exc!r}")
         q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
              f"목적: {question}")
-        async for chunk in _deliberation_stream(app, q, groups, opts):
+        async for chunk in _deliberation_stream(app, q, groups, opts, user):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[test-plan] fatal: {exc!r}")
@@ -1403,7 +1408,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None):
         yield _sse("done", {})
 
 
-async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS):
+async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS, user: str = ""):
     """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
     # 근거 계수(F2) — 결정문 헤더에 실을 프로파일. 형식의 권위가 근거의 강도를 넘지 않게,
@@ -1427,7 +1432,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 파싱이 실패했고, 심의가 매번 no_personas 로 죽었다. 라운드에 들어가는 양은 주입 시점의
     # 별도 캡(_chunks 2000자 / tool_inject 5000자 / _ROLE_CLIP)이 이미 통제한다.
     from app import CATALOG_DESC_MAX, CATALOG_RESULT_MAX  # noqa: PLC0415 — 순환 방지용 늦은 import
-    tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX)
+    tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX, user=user)
     if not tools:
         yield _sse("error", {"code": "gateway_unavailable",
                              "message": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
@@ -1448,7 +1453,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
             _fcache: dict = {}
             _g = {n: _wrap_cached(t, _fcache)
-                  for n, t in (await _tools_by_name(app, groups)).items() if _free_tool_ok(n)}
+                  for n, t in (await _tools_by_name(app, groups, user=user)).items() if _free_tool_ok(n)}
             # 웹 리서치 소스 토글 — 켜지 않은 소스의 도구는 목록에서 뺀다. 모델에게 금지를
             # 지키게 하는 것과 도구가 존재하지 않는 것은 다르다.
             if opts.search_sources is not None:
