@@ -400,7 +400,9 @@ async def _call(tools: dict, name: str, args: dict):
 # 있다. 지금은 '사내 보유 도구를 우선 검토하라' 는 지시만 있어, 모델이 아는 범위에서 답하고
 # 실제 보유 목록과 어긋난다. 보유 현황을 조회해 근거로 깔면 '있는 것'과 '없는 것'을 구분해
 # 쓸 수 있다 — 없으면 없다고 쓰는 것이 계획서의 값어치다.
-_ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 3500)   # 주입 상한(자)
+# 주입 상한(자). 근거를 추가할 때는 이 값도 함께 본다 — 상한이 그대로면 뒤에 붙은 근거가
+# 통째로 잘려 나가는데, 로그도 안 남아서 "넣었는데 안 쓴다"로 보인다(실측 2026-08-17).
+_ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 6000)
 
 
 async def _asset_snapshot(tools: dict, question: str) -> str:
@@ -438,6 +440,20 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
         _op = await _call(tools, "list_operations", {})
         if _op:
             parts.append(f"[보유 전처리 오퍼레이션(DynaForge)]\n{str(_op)[:800]}")
+    # 관행 — 카탈로그는 '무엇이 있나'만 말한다. 조직이 실제로 무엇을 쓰는지는 별개이고,
+    # 해석 설계에서 더 강한 근거다(가능한 것 ≠ 하던 것). 개인 식별 없는 전사 집계.
+    if "operation_usage" in tools:
+        _ou = await _call(tools, "operation_usage", {})
+        if _ou:
+            parts.append(f"[실제 사용 관행 — 오퍼레이션 실행 이력(전사 집계)]\n{str(_ou)[:700]}")
+    if "section_contact_usage" in tools:
+        _sc = await _call(tools, "section_contact_usage", {})
+        if _sc:
+            parts.append(f"[요소 정식·접촉 카드 사용 분포(전사 집계)]\n{str(_sc)[:700]}")
+    if "corpus_summary" in tools:
+        _cs = await _call(tools, "corpus_summary", {})
+        if _cs:
+            parts.append(f"[모델 규모 감각 — 이 조직이 다루는 메시 크기(전사 집계)]\n{str(_cs)[:600]}")
     if "slurm_list_templates" in tools:
         _t = await _call(tools, "slurm_list_templates", {})
         if _t:
@@ -446,7 +462,11 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
     if not parts:
         return ("[사내 자산 현황] 조회하지 못했습니다(도구 미연결). 보유 여부를 단정하지 말고, "
                 "필요한 물성·도구를 '확인 필요' 로 명시하십시오.")
-    body = "\n\n".join(parts)[:_ASSET_SNAP_MAX]
+    _full = "\n\n".join(parts)
+    body = _full[:_ASSET_SNAP_MAX]
+    if len(_full) > _ASSET_SNAP_MAX:
+        print(f"[asset-snapshot] {len(_full)}자 → {_ASSET_SNAP_MAX}자로 절단 "
+              f"({len(parts)}개 항목 중 뒤쪽 근거가 잘렸다)")
     return ("[사내 자산 현황 — 실제 조회 결과]\n" + body +
             "\n\n※ 위에 없는 물성·도구는 '미보유'로 보고 확보 경로를 쓰십시오. 있는 것을 없다고, "
             "없는 것을 있다고 쓰지 마십시오.")
@@ -475,6 +495,18 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
     _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
     if _m:
         parts.append(f"[질문 관련 재료와 보유 물성]\n{str(_m)[:800]}")
+    # 실사용 빈도 — 우선순위를 '민감도 추정' 이 아니라 '실제로 몇 개 해석 모델이 이 물성을
+    # 쓰는가' 로 잡는다. 추정과 조회는 근거의 급이 다르다.
+    _mu = await _call(tools, "material_usage", {})
+    if _mu:
+        parts.append("[해석 모델의 실제 물성 카드 사용 빈도(DynaForge 전사 집계)]\n"
+                     f"{str(_mu)[:900]}\n"
+                     "※ files = 그 카드가 등장한 K파일 수. 많이 쓰이는 물성은 근거가 없을 때 "
+                     "영향 범위가 넓다 — 우선순위 서열의 근거로 쓰라.")
+    # 해석 결과 — 반복되는 실패모드가 있으면 그것이 곧 시험 대상이다.
+    _rc = await _call(tools, "report_corpus", {})
+    if _rc:
+        parts.append(f"[해석 결과 코퍼스 — 반복되는 findings(전사 집계)]\n{str(_rc)[:700]}")
     # 물성 정의 목록 — 어떤 항목이 도메인별로 정의돼 있는지. '무엇을 잴 수 있는가'의 사전이다.
     # (기보유 시험 피팅은 get_fits 가 test_id 필수라 여기서 일괄 조회할 수 없다 — 좌석이
     #  자유 조회로 개별 확인한다.)
