@@ -407,7 +407,11 @@ async def _call(tools: dict, name: str, args: dict):
 # 쓸 수 있다 — 없으면 없다고 쓰는 것이 계획서의 값어치다.
 # 주입 상한(자). 근거를 추가할 때는 이 값도 함께 본다 — 상한이 그대로면 뒤에 붙은 근거가
 # 통째로 잘려 나가는데, 로그도 안 남아서 "넣었는데 안 쓴다"로 보인다(실측 2026-08-17).
-_ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 6000)
+# 근거 스냅샷 상한. 근거는 심의의 재료라 자르면 그만큼 못 본다 — 상한은 프롬프트가
+# 터지지 않게 하는 최후의 방벽이지, 평상시 동작하라고 둔 값이 아니다. 실측 합계가
+# 9.5KB(2026-08-19, 장비 근거 추가 후)라 6000 은 뒤쪽 블록을 통째로 날리던 값이었다.
+# 걸리면 경고를 찍으므로, 경고가 보이면 값을 올리지 블록을 줄이지 마라.
+_ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 24000)
 
 
 async def _asset_snapshot(tools: dict, question: str) -> str:
@@ -431,7 +435,7 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
     if "search_catalog_property" in tools or "database_summary" in tools:
         _s = await _call(tools, "database_summary", {})
         if _s:
-            parts.append(f"[물성 DB 현황]\n{str(_s)[:900]}")
+            parts.append(f"[물성 DB 현황]\n{_s}")
         _cov = await _call(tools, "coverage_gaps", {})
         if _cov:
             parts.append(f"[물성 공백 — 요구 대비 미보유]\n{str(_cov)[:900]}")
@@ -487,15 +491,15 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
 
     _s = await _call(tools, "database_summary", {})
     if _s:
-        parts.append(f"[물성 DB 전체 현황]\n{str(_s)[:900]}")
+        parts.append(f"[물성 DB 전체 현황]\n{_s}")
     # 요구 대비 공백 — 시험 계획의 1차 입력이다. 무엇이 비었는지가 곧 후보 목록이다.
     _cov = await _call(tools, "coverage_gaps", {})
     if _cov:
-        parts.append(f"[요구 대비 공백 — 미보유·근거 부족]\n{str(_cov)[:1200]}")
+        parts.append(f"[요구 대비 공백 — 미보유·근거 부족]\n{_cov}")
     # 출처 등급 분포 — 실측/카탈로그/가정 비율. '채움률은 높은데 실측이 낮은' 상태를 드러낸다.
     _pd = await _call(tools, "property_distribution", {})
     if _pd:
-        parts.append(f"[출처 등급 분포]\n{str(_pd)[:700]}")
+        parts.append(f"[출처 등급 분포]\n{_pd}")
     # 질문에 걸리는 재료의 현재 보유 물성 — 중복 측정 방지의 근거.
     _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
     if _m:
@@ -505,24 +509,51 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
     _mu = await _call(tools, "material_usage", {})
     if _mu:
         parts.append("[해석 모델의 실제 물성 카드 사용 빈도(DynaForge 전사 집계)]\n"
-                     f"{str(_mu)[:900]}\n"
+                     f"{_mu}\n"
                      "※ files = 그 카드가 등장한 K파일 수. 많이 쓰이는 물성은 근거가 없을 때 "
                      "영향 범위가 넓다 — 우선순위 서열의 근거로 쓰라.")
     # 해석 결과 — 반복되는 실패모드가 있으면 그것이 곧 시험 대상이다.
     _rc = await _call(tools, "report_corpus", {})
     if _rc:
-        parts.append(f"[해석 결과 코퍼스 — 반복되는 findings(전사 집계)]\n{str(_rc)[:700]}")
+        parts.append(f"[해석 결과 코퍼스 — 반복되는 findings(전사 집계)]\n{_rc}")
     # 물성 정의 목록 — 어떤 항목이 도메인별로 정의돼 있는지. '무엇을 잴 수 있는가'의 사전이다.
     # (기보유 시험 피팅은 get_fits 가 test_id 필수라 여기서 일괄 조회할 수 없다 — 좌석이
     #  자유 조회로 개별 확인한다.)
+    # 이것만 상한을 둔다 — 정의 목록이 58KB 라 통째로 실으면 다른 근거를 밀어낸다.
+    # 자른다는 사실을 본문에 적어, 좌석이 "목록에 없으니 정의가 없다"고 잘못 읽지 않게 한다.
     _pdef = await _call(tools, "list_property_definitions", {})
     if _pdef:
-        parts.append(f"[정의된 물성 항목]\n{str(_pdef)[:700]}")
+        _t = str(_pdef)
+        parts.append(f"[정의된 물성 항목]\n{_t[:2500]}"
+                     + ("\n※ 목록이 길어 앞부분만 실었다 — 여기 없다고 미정의가 아니다. "
+                        "필요하면 list_property_definitions 를 직접 조회하라." if len(_t) > 2500 else ""))
+    # ── 측정 수단 ─────────────────────────────────────────────────────────────
+    # 시험 계획이 '무엇을 먼저 잴 것인가' 를 정하는데, 정작 **잴 수 있는지** 를 모르면
+    # 계획이 실행 불가능한 항목을 1순위로 올린다. 물성 공백과 측정 수단은 같이 봐야 한다.
+    _is = await _call(tools, "instrument_summary", {})
+    if _is:
+        parts.append(f"[시험장비 카탈로그 현황]\n{_is}\n"
+                     "※ catalog_instruments 는 카탈로그를 확보한 장비 수이지 보유 수가 아니다. "
+                     "owned_instruments 가 사내 보유 확인분이고, 이 값이 0이면 어떤 물성도 "
+                     "사내에서 잴 수 있다고 전제하지 마라 — 외주·신규 도입이 계획에 들어가야 한다.")
+    # 방법 자체가 없는 물성 — 값은 쌓였는데 재는 법을 모르는 것들. 시험 계획이 아니라
+    # '방법 조사' 가 먼저인 항목이라, 다른 결핍과 섞으면 계획이 틀린다.
+    _mg = await _call(tools, "measurement_gaps", {"limit": 12})
+    if _mg:
+        parts.append(f"[측정 수단이 알려지지 않은 물성(값은 쌓여 있음)]\n{_mg}\n"
+                     "※ 이 항목들은 '언제 잴까' 가 아니라 '어떻게 재나' 부터 정해야 한다. "
+                     "시험 일정에 바로 넣으면 실행되지 않는다.")
 
     if not parts:
         return ("[물성 근거 현황] 조회하지 못했습니다(도구 미연결). 보유 여부를 단정하지 말고, "
                 "각 물성을 '보유 확인 필요' 로 표시한 뒤 확인 절차를 계획에 넣으십시오.")
-    return ("[물성 근거 현황 — 실제 조회 결과]\n" + "\n\n".join(parts)[:_ASSET_SNAP_MAX] +
+    _full = "\n\n".join(parts)
+    # 절단은 조용히 일어나면 안 된다 — 근거 블록을 늘려 놓고 뒤쪽이 잘려 나가면, 심의는
+    # 그 근거가 애초에 없었던 것처럼 답한다(실제로 자산 스냅샷에서 겪었다: 3블록 중 1개만 살았다).
+    if len(_full) > _ASSET_SNAP_MAX:
+        print(f"[material-snapshot] {len(_full)}자 → {_ASSET_SNAP_MAX}자로 절단 "
+              f"(블록 {len(parts)}개, 뒤쪽 근거가 잘렸다 — DELIB_ASSET_SNAP_MAX 를 올려라)")
+    return ("[물성 근거 현황 — 실제 조회 결과]\n" + _full[:_ASSET_SNAP_MAX] +
             "\n\n※ 이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마십시오. "
             "위에 없는 항목은 미보유로 보되, 조회되지 않은 것과 실제로 없는 것을 구분해 쓰십시오.")
 
