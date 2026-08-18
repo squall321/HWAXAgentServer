@@ -2127,7 +2127,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts, req.user_email)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
-        stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups)
+        stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups, req.user_email)
     elif is_agent_search(req.message):
         # "전문가 뭐 있어" 류 → 추천+분야 요약을 코드가 결정적으로 생성(LLM 나열 절단 방지).
         stream = run_agent_search(app, strip_agent_trigger(req.message), req.groups)

@@ -2071,7 +2071,72 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _sse("done", {})
 
 
-async def run_report_save(app, note: str, history: list, groups: list):
+# ── 보고서 정리본 ────────────────────────────────────────────────────────────
+_TIDY_PROMPT = """다음은 엔지니어링 포털에서 오간 대화 이력이다. 그대로 요약하지 말고,
+읽는 사람이 판단에 쓸 수 있는 **보고서**로 재구성하라.
+
+규칙:
+- 결론을 먼저 쓴다. 무엇을 하기로 했는지/무엇이 밝혀졌는지가 첫 절이다.
+- 근거는 대화에 실제로 나온 것만 쓴다. 수치는 원문 그대로 옮기고, 없는 값을 지어내지 않는다.
+- 결론이 나지 않은 것은 '미결'로 따로 모은다. 억지로 결론을 만들지 않는다.
+- 누가 말했는지는 옮기지 않는다. 문서는 대화록이 아니다.
+- 한국어. 문장은 마침표로 끝낸다.
+
+형식(마크다운):
+# <내용을 담은 짧은 제목>
+## 요약
+## 결론과 근거
+## 미결·확인 필요
+## 상세
+
+대화 이력:
+"""
+
+
+async def _tidy_markdown(app, groups: list, history: list, note: str, user: str) -> str:
+    """대화를 보고서 마크다운으로 재구성. 실패하면 빈 문자열(호출부가 실패로 처리한다)."""
+    lines = []
+    for m in history:
+        c = str(m.get("content", "")).strip()
+        if c:
+            who = "질문" if m.get("role") == "user" else "응답"
+            lines.append(f"[{who}] {c}")
+    body = "\n\n".join(lines)[:60000]
+    if note:
+        body += f"\n\n[사용자가 직접 끌어낸 결론] {note}"
+    try:
+        from app import _agent_for  # noqa: PLC0415 — 순환 import 회피(모듈 로드 시점 아님)
+        agent = await _agent_for(app, groups, user=user)
+        out = await agent.ainvoke({"messages": [("user", _TIDY_PROMPT + body)]})
+        msgs = out.get("messages") or []
+        return str(getattr(msgs[-1], "content", "") if msgs else "").strip()
+    except Exception as exc:  # noqa: BLE001 — 실패는 호출부가 사용자에게 알린다
+        print(f"[report-tidy] 실패: {exc!r}")
+        return ""
+
+
+def _split_md_sections(md: str) -> dict:
+    """정리본 마크다운을 절 이름 → 본문 으로 나눈다. 제목은 _title, 머리말은 _head."""
+    out, cur, buf = {}, None, []
+    for line in (md or "").splitlines():
+        if line.startswith("# ") and "_title" not in out:
+            out["_title"] = line[2:].strip(); continue
+        if line.startswith("## "):
+            if cur:
+                out[cur] = "\n".join(buf).strip()
+            elif buf:
+                out["_head"] = "\n".join(buf).strip()
+            cur, buf = line[3:].strip(), []
+            continue
+        buf.append(line)
+    if cur:
+        out[cur] = "\n".join(buf).strip()
+    elif buf and "_head" not in out:
+        out["_head"] = "\n".join(buf).strip()
+    return out
+
+
+async def run_report_save(app, note: str, history: list, groups: list, user: str = ""):
     """대화 이력 → Report Archive 보고서(결정적). LLM 을 거치지 않고 코드가 blocks 를 만든다.
 
     GLM 이 create_report_draft 를 텍스트로 에코해버리는(도구 미호출) 불안정성을 피하려는 설계 —
@@ -2079,6 +2144,17 @@ async def run_report_save(app, note: str, history: list, groups: list):
     [{"role":"user"|"assistant","content":str}, …] (오래된 것→최신, 이번 /보고서 턴 미포함).
     note 는 사용자가 직접 끌어낸 결론(있으면 권고안 맨 앞).
     """
+    # '/보고서 정리' → LLM 이 읽고 재구성한 보고서. 기본(원문 보존)은 코드가 결정적으로 만든다.
+    # 두 갈래를 둔 이유: 원문 보존은 기록이고 정리본은 판단 자료다. 하나로 합치면 둘 다 어정쩡해진다.
+    # 정리본은 LLM 왕복이라 실패할 수 있고, 그때 원문형으로 조용히 대체하지 않는다 —
+    # 정리를 기대한 사람에게 회의록을 주면 '정리가 안 됐다'로 보이지 '실패했다'로 보이지 않는다.
+    _tidy = False
+    _n = (note or "").strip()
+    for _kw in ("정리", "tidy", "summary"):
+        if _n == _kw or _n.startswith(_kw + " "):
+            _tidy, note = True, _n[len(_kw):].strip()
+            break
+
     users = [m.get("content", "") for m in history if m.get("role") == "user"]
     bots = [m.get("content", "") for m in history if m.get("role") == "assistant"]
     if not users and not note:
@@ -2103,9 +2179,28 @@ async def run_report_save(app, note: str, history: list, groups: list):
                           + ([p.strip() for p in bots[-1].split("\n\n") if p.strip()][:10] if bots else []),
         "minutes": minutes[:40],
     }
+    if _tidy:
+        yield _sse("status", {"step": "대화를 보고서로 재구성 중(LLM)", "tool": None})
+        _md = await _tidy_markdown(app, groups, history, note, user)
+        if not _md:
+            yield _sse("result", {"type": "text", "content":
+                "정리본 생성에 실패했습니다 — LLM 응답이 없습니다. "
+                "'/보고서' (원문 보존형)는 그대로 동작합니다."})
+            yield _sse("done", {})
+            return
+        _sec = _split_md_sections(_md)
+        title = f"정리 — {(_sec.get('_title') or question)[:50]}"
+        blocks = {
+            "background": [_sec.get("요약") or _sec.get("_head") or question],
+            "results": [x for x in [_sec.get("결론과 근거"), _sec.get("상세")] if x],
+            "recommendation": ([f"사용자 결론: {note}"] if note else [])
+                              + [x for x in [_sec.get("미결·확인 필요")] if x],
+            "minutes": minutes[:40],
+        }
+
     rid = None
     try:
-        tools = await _tools_by_name(app, groups)
+        tools = await _tools_by_name(app, groups, user=user)
         made = _parse_json(await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
             "title": title, "blocks": _ra_blocks(blocks),
