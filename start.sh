@@ -34,6 +34,20 @@ if [ -f .env ]; then
 fi
 
 PORT="${AGENT_PORT:-9009}"                                   # 9000 is taken by MinIO on this box
+# ⚠ 루프백에 묶는다. 이 서버에는 인증이 없다 — 엔드포인트에 Depends 가 하나도 없고,
+# 인가에 쓰는 groups·user_email 을 요청 본문에서 받아 그대로 게이트웨이에 신원으로 싣는다
+# (app.py 의 _with_groups). 게이트웨이는 GW_TOKEN 분기에서 그 헤더를 "내부 에이전트"로
+# 신뢰한다. 즉 9009 에 닿는 누구든 로그인 없이 임의 사내 이메일을 자칭해 도구를 돌릴 수 있다.
+#
+# 초기 커밋(3dd6676, dev minimal)부터 --host 0.0.0.0 이 하드코딩돼 있었다. 이 박스는
+# enp13s0 에 공인 IP 가 직접 붙어 있고 iptables INPUT policy 가 ACCEPT 라, 실측으로
+# 공인 IP:9009/health 가 자격증명 없이 200 을 줬다. 게이트웨이는 같은 문제를
+# GW.get("host","127.0.0.1") 로 이미 막아 뒀다 — 원칙이 한쪽에만 적용돼 있었다.
+#
+# 소비자는 전부 같은 박스다(포털 config.py agent_server_url, services.yaml health,
+# update-all·verify-e2e 프로브 — 전수 확인 결과 모두 127.0.0.1/localhost). 다른 박스에서
+# 붙여야 하면 AGENT_HOST 로 열되, 그때는 이 서버 앞에 인증을 먼저 두어야 한다.
+HOST="${AGENT_HOST:-127.0.0.1}"
 export VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8000/v1}"
 export VLLM_MODEL="${VLLM_MODEL:-qwen2.5-7b-dev}"
 # 미치환 마커 가드 — .env 가 apply-envs.sh 치환 없이 킷을 그대로 복사·수동편집돼 @FROM_RA:...@
@@ -78,7 +92,7 @@ echo "==> Agent Server on :${PORT}  (vLLM=${VLLM_BASE_URL}, model=${VLLM_MODEL})
 # (SSH 끊겨도 유지). 로그는 AGENT_LOG(기본 ./agent-server.log).
 if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--daemon" ]; then
   LOG="${AGENT_LOG:-$(pwd)/agent-server.log}"
-  nohup .venv/bin/uvicorn app:app --host 0.0.0.0 --port "$PORT" >"$LOG" 2>&1 &
+  nohup .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT" >"$LOG" 2>&1 &
   NEWPID=$!
   # 기동 자체 검증 — 포트가 타 유저 프로세스에 잡혀 bind 실패하면 nohup 이 조용히 죽는다.
   # '떴다'고 오인하지 않게(전에 stale 서버가 계속 응답하던 그 부류) 실제 리슨을 확인한다.
@@ -97,5 +111,5 @@ if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--daemon" ]; then
     exit 1
   fi
 else
-  exec .venv/bin/uvicorn app:app --host 0.0.0.0 --port "$PORT"
+  exec .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT"
 fi
