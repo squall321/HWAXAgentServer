@@ -390,12 +390,18 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         # 챗과 같은 칸에 남긴다 — 심의에는 print 만 두면 "챗에만 있고 심의에는 없던 비대칭"
         # 이 폴백에서 관측성으로 자리만 옮긴 것이 된다. 소비자는 이 값을 '도구 0개' 가 아니라
         # '서비스 계정 시야' 로 읽는다(app.state.tool_load_error 와 다른 칸이다).
+        # ⚠ 여기에 쓰기만 하면 안 된다. 심의에는 이 값을 읽는 곳이 없고 지우는 곳도 없어서,
+        # 심의에서 한 번 실패하면 나중 '챗' 턴에 거짓 강등 배너가 뜬다(챗 소비자가 같은 칸을
+        # 읽는다). 쓰는 쪽이 정리까지 책임진다 — 심의는 이 턴에서만 의미가 있으므로 끝나면 지운다.
+        _dk = (frozenset(groups), (user or "").strip().lower())
         try:
-            app.state.tool_degraded[(frozenset(groups), (user or "").strip().lower())] = repr(_pe)[:200]
+            app.state.tool_degraded[_dk] = repr(_pe)[:200]
         except Exception:  # noqa: BLE001 — 관측 실패가 심의를 막지 않는다
             pass
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await MultiServerMCPClient(scoped).get_tools()
+        # 이 턴에서만 유효한 사실이다. 남겨 두면 나중 챗 턴이 같은 칸을 읽어 거짓 배너를 띄운다.
+        app.state.tool_degraded.pop(_dk, None)
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
@@ -462,7 +468,10 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
             parts.append(f"[물성 DB 현황]\n{_s}")
         _cov = await _call(tools, "coverage_gaps", {})
         if _cov:
-            parts.append(f"[물성 공백 — 요구 대비 미보유]\n{str(_cov)[:900]}")
+            # 전체 스냅샷 상한(_ASSET_SNAP_MAX)이 이미 있으므로 항목별로 또 자르지 않는다.
+            # 51834b0 이 절단 상한을 걷어냈다고 적었는데 이 한 줄만 900자로 남아 있었다 —
+            # 물성 공백은 시험계획 심의의 핵심 근거라 여기서 잘리면 결정이 근거 없이 난다.
+            parts.append(f"[물성 공백 — 요구 대비 미보유]\n{_cov}")
     if "list_materials" in tools:
         _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
         if _m:
