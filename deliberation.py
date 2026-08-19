@@ -399,9 +399,13 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         except Exception:  # noqa: BLE001 — 관측 실패가 심의를 막지 않는다
             pass
         scoped = _with_groups(conns, sorted(groups), user, "")
-        tools = await MultiServerMCPClient(scoped).get_tools()
-        # 이 턴에서만 유효한 사실이다. 남겨 두면 나중 챗 턴이 같은 칸을 읽어 거짓 배너를 띄운다.
-        app.state.tool_degraded.pop(_dk, None)
+        try:
+            tools = await MultiServerMCPClient(scoped).get_tools()
+        finally:
+            # ⚠ finally 다. 성공 경로에만 두면, 서비스 계정 재시도까지 실패했을 때
+            # (게이트웨이가 아예 내려간 경우) 표식이 남아 나중 챗 턴에 거짓 배너가 뜬다 —
+            # 고치려던 증상 그대로다. 이 표식은 이 턴에서만 유효하다.
+            app.state.tool_degraded.pop(_dk, None)
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
