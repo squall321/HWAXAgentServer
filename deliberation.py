@@ -389,23 +389,13 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
         # 챗과 같은 칸에 남긴다 — 심의에는 print 만 두면 "챗에만 있고 심의에는 없던 비대칭"
         # 이 폴백에서 관측성으로 자리만 옮긴 것이 된다. 소비자는 이 값을 '도구 0개' 가 아니라
-        # '서비스 계정 시야' 로 읽는다(app.state.tool_load_error 와 다른 칸이다).
-        # ⚠ 여기에 쓰기만 하면 안 된다. 심의에는 이 값을 읽는 곳이 없고 지우는 곳도 없어서,
-        # 심의에서 한 번 실패하면 나중 '챗' 턴에 거짓 강등 배너가 뜬다(챗 소비자가 같은 칸을
-        # 읽는다). 쓰는 쪽이 정리까지 책임진다 — 심의는 이 턴에서만 의미가 있으므로 끝나면 지운다.
-        _dk = (frozenset(groups), (user or "").strip().lower())
-        try:
-            app.state.tool_degraded[_dk] = repr(_pe)[:200]
-        except Exception:  # noqa: BLE001 — 관측 실패가 심의를 막지 않는다
-            pass
+        # app.state.tool_degraded 에는 쓰지 않는다.
+        #   그 칸의 유일한 소비자는 챗 SSE(app.py)이고 그건 다른 요청이다. 여기서 쓰면
+        #   ① 안 지우면 나중 챗 턴에 거짓 배너가 뜨고 ② 지우면 쓰자마자 사라져 아무도
+        #   못 읽는 죽은 코드가 된다 — 실제로 두 번 다 겪었다. 심의에는 이 값을 읽는
+        #   경로가 없으므로 애초에 쓰지 않는 것이 맞다. 관측은 로그로 남긴다.
         scoped = _with_groups(conns, sorted(groups), user, "")
-        try:
-            tools = await MultiServerMCPClient(scoped).get_tools()
-        finally:
-            # ⚠ finally 다. 성공 경로에만 두면, 서비스 계정 재시도까지 실패했을 때
-            # (게이트웨이가 아예 내려간 경우) 표식이 남아 나중 챗 턴에 거짓 배너가 뜬다 —
-            # 고치려던 증상 그대로다. 이 표식은 이 턴에서만 유효하다.
-            app.state.tool_degraded.pop(_dk, None)
+        tools = await MultiServerMCPClient(scoped).get_tools()
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
