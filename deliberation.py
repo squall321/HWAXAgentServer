@@ -73,7 +73,10 @@ _DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라�
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
 # 동시 적용 시 지시 추종이 분산돼 효과가 상쇄되므로(§5 실행 순서) 한 번에 하나씩 A/B 할 것.
 _EVIDENCE_PREPASS = _env_int("DELIB_EVIDENCE_PREPASS", 0)  # T1 정량 근거 선주입(도구 조회→발췌)
-_REBUT_QUOTE = _env_int("DELIB_REBUT_QUOTE", 0)      # T2 반박 인용 계약 — quote 실재를 코드 검증
+# T2 반박 인용 계약 — quote 실재를 코드 검증. **기본 켜짐**.
+# 종전 기본값은 0 이었다. 즉 "코드로 검증 가능한 유일한 깊이 레버" 라고 적어 둔 장치가
+# 운영에서 한 번도 돌지 않았다. 끄려면 DELIB_REBUT_QUOTE=0.
+_REBUT_QUOTE = _env_int("DELIB_REBUT_QUOTE", 1)
 _PROSE_FIRST = _env_int("DELIB_PROSE_FIRST", 0)      # T3 산문 논증 후 JSON(형식 강제 완화)
 _CROSS_EXAM = _env_int("DELIB_CROSS_EXAM", 0)        # 2R 교차심문 — 지목 표적의 원본 전체에 반박
 _ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주입(동조 붕괴 방어)
@@ -729,16 +732,66 @@ def _norm_ws(s) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
 
+_SUBSTANTIVE_RE = re.compile(r"[0-9A-Za-z가-힣]")
+
+
+def _quotable_corpus(ctx: str) -> list[str]:
+    """인용 대상이 되는 **발언 값만** 뽑는다 — 직렬화 뼈대는 인용 대상이 아니다.
+
+    ctx 는 `• <persona>: {json}` 줄들이다(_ser → json.dumps). 이 문자열 전체를 대조
+    대상으로 삼으면 `• mfg-smt: {"deepen": "` 같은 JSON 구두점 23자가 유효 인용이 된다
+    (실측으로 통과했다). 값만 모으면 그 경로가 막힌다.
+
+    파싱에 실패하면 원문을 그대로 쓴다 — 형식이 바뀌어도 검증이 통째로 무너지지 않게.
+    """
+    out: list[str] = []
+
+    def walk(v):
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+        elif isinstance(v, dict):
+            for x in v.values():   # 키는 넣지 않는다 — 'deepen' 을 인용해도 반박이 아니다
+                walk(x)
+
+    ok = False
+    for line in str(ctx or "").splitlines():
+        body = line.split(": ", 1)[1] if ": " in line else line
+        try:
+            walk(json.loads(body))
+            ok = True
+        except (ValueError, TypeError):
+            continue
+    if not ok:
+        return [str(ctx or "")]
+    return out
+
+
 def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
-    """반박 인용 계약(DELIB_REBUT_QUOTE) 검증기 — quote 가 모델이 실제로 본 라운드 직렬화
-    문자열(절단 포함)에 실재해야 반박으로 인정. 항목 하나라도 유효하면 통과(재시도 폭주 방지).
-    허수아비 반박('동의하지만 추가 고려 필요')을 구조적으로 차단하는, 코드로 검증 가능한
-    유일한 깊이 레버(GLM 리뷰 §5). where 는 재시도 힌트의 복사 출처 문구(교차심문은 표적 명시).
-    ctx 는 json.dumps 직렬화라 값 안의 개행이 리터럴 \\n, 따옴표가 \\" 로 실린다 — 모델이
-    화면 그대로 복사한 quote 는 JSON 디코드 후 실제 개행·따옴표가 되므로, 이스케이프를 해제한
-    변형 컨텍스트도 병행 매칭한다(완벽한 verbatim 인용이 다행 값에서 실패하던 비대칭 제거)."""
-    nctx = _norm_ws(ctx)
-    nctx_unesc = _norm_ws(str(ctx).replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\"))
+    """반박 인용 계약(DELIB_REBUT_QUOTE) 검증기.
+
+    계약 — rebut 항목 중 **적어도 하나**가 (a) 상대 발언의 실제 값에서 15자 이상 그대로
+    복사한 quote 를 갖고, (b) 그 quote 에 실질 문자(한글·영숫자)가 충분하며,
+    (c) 반박 논지(counter)가 실제로 있어야 한다.
+
+    '적어도 하나' 는 재시도 폭주 방지용 완화다(parse_retries 가 작아 전량 요구 시 라운드가
+    통째로 유실된다). 대신 통과 기준 자체를 아래 셋으로 좁혔다.
+
+    ⚠ 종전에는 (a) 만 봤고 그마저 직렬화 문자열 전체를 대조했다. 그래서
+      · {"quote": "…"} 필드 하나만 있어도 통과했고(target·counter·basis 를 안 읽었다),
+      · `• mfg-smt: {"deepen": "` 같은 JSON 뼈대 23자로도 통과했다.
+      셋 다 실측으로 확인하고 막았다. 독스트링이 '허수아비 반박을 구조적으로 차단한다'고
+      적어 놨는데 실제로는 차단하지 않고 있었다.
+    """
+    corpus = _quotable_corpus(ctx)
+    ncorpus = [_norm_ws(c) for c in corpus]
+    # 이스케이프 해제본도 함께 본다 — 모델이 화면의 \n·\" 를 그대로 복사한 경우.
+    ncorpus += [_norm_ws(str(c).replace("\\n", " ").replace('\\"', '"')) for c in corpus]
+
+    def _in_corpus(q: str) -> bool:
+        return any(q in c for c in ncorpus if c)
 
     def check(d: dict):
         rebs = d.get("rebut")
@@ -746,21 +799,34 @@ def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
             return ("rebut 이 비어 있습니다 — 최소 1개, "
                     "{target,quote,counter,basis} 객체 배열로 작성하세요.")
         any_dict = False
+        quoted_ok = False        # 인용은 맞았는데 counter 가 빈 경우를 구분해 알려주기 위해
         for r in rebs:
             if not isinstance(r, dict):
                 continue
             any_dict = True
             q = _norm_ws(r.get("quote"))
-            if len(q) >= 15 and (q in nctx or q in nctx_unesc):
-                return None
+            if len(q) < 15 or not _in_corpus(q):
+                continue
+            # 구두점·괄호만으로 채운 인용을 막는다. 직렬화 뼈대를 값에서 못 찾게 했지만,
+            # 값 안의 기호 나열을 베끼는 길이 남는다.
+            if len(_SUBSTANTIVE_RE.findall(q)) < 10:
+                continue
+            quoted_ok = True
+            counter = str(r.get("counter") or "").strip()
+            if len(_SUBSTANTIVE_RE.findall(counter)) < 10:
+                continue
+            return None
         if not any_dict:
             return ("rebut 항목이 문자열입니다 — {target,quote,counter,basis} 객체 배열로 다시. "
                     f"quote 는 {where}에서 20자 이상 그대로 복사하세요.")
+        if quoted_ok:
+            return ("인용은 실재하지만 counter(반박 논지)가 비었습니다 — 인용한 문구의 "
+                    "어디가 왜 틀렸는지를 counter 에 쓰세요. 인용만으로는 반박이 아닙니다.")
         return (f"rebut 의 quote 가 상대 발언 원문에 실재하지 않습니다 — {where}에서 "
-                "문구를 20자 이상 그대로(변형 없이) 복사해 quote 에 넣으세요.")
+                "상대가 실제로 쓴 문장을 20자 이상 그대로(변형 없이) 복사해 quote 에 넣으세요. "
+                "JSON 키나 기호가 아니라 발언 내용이어야 합니다.")
 
     return check
-
 
 def _item_text(x) -> str:
     """배열 항목 → 대화체 문구. 인용 반박 계약의 dict({target,quote,counter,basis})는
