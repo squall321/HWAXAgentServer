@@ -387,6 +387,13 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         if not user_pat:
             raise
         print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
+        # 챗과 같은 칸에 남긴다 — 심의에는 print 만 두면 "챗에만 있고 심의에는 없던 비대칭"
+        # 이 폴백에서 관측성으로 자리만 옮긴 것이 된다. 소비자는 이 값을 '도구 0개' 가 아니라
+        # '서비스 계정 시야' 로 읽는다(app.state.tool_load_error 와 다른 칸이다).
+        try:
+            app.state.tool_degraded[(frozenset(groups), (user or "").strip().lower())] = repr(_pe)[:200]
+        except Exception:  # noqa: BLE001 — 관측 실패가 심의를 막지 않는다
+            pass
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await MultiServerMCPClient(scoped).get_tools()
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로

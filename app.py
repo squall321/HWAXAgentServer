@@ -253,6 +253,8 @@ async def lifespan(app: FastAPI):
     app.state.connections = _load_mcp_config()
     # 삽입 순서를 LRU 로 쓴다(dict 는 순서를 보존한다). 상한은 _agent_for 가 강제한다.
     app.state.agent_cache = {}  # (groups, pins, query, sources, user, cred) -> ReAct agent
+    # '도구 0개'(tool_load_error)와 '강등'(tool_degraded)은 다른 사실이라 칸을 나눈다.
+    app.state.tool_degraded = {}  # (groups, user) -> 사유
     # 도구 로딩 오류는 그룹셋별로 보관한다. 전역 스칼라로 두면 한 그룹의 일시적 실패가
     # 다른 사용자 턴까지 '도구 없음'으로 오염시키고, 캐시 적중 경로에선 해제조차 안 돼
     # 영구 고착된다(실측: 실패한 적 없는 그룹이 계속 "도구 연결 복구되면 다시" 응답).
@@ -1407,11 +1409,17 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         # 계속 서비스 계정으로 돈다 — 위 불변식("자격증명도 키에 있어야 한다")과 어긋난다.
         # 서비스 계정 키에 넣어 두면 재사용은 되면서 다음 요청이 사용자 PAT 를 다시 시도한다.
         store_key = key
+        _who = (frozenset(groups), (user or "").strip().lower())
         if degraded:
             store_key = key[:-1] + (hashlib.sha256(b"").hexdigest()[:16],)
-            app.state.tool_load_error[frozenset(groups)] = (
-                "사용자 자격증명으로 도구를 받지 못해 서비스 계정으로 동작 중입니다 "
-                f"— {degraded}")
+            # ⚠ tool_load_error 에 쓰면 안 된다. 그 칸의 뜻은 "도구가 0개" 하나뿐이고,
+            # 소비자가 그렇게 읽어 모델에게 "도구를 호출하지 마라"를 주입한다 — 폴백이
+            # 살려 낸 도구 전량을 폴백 자신이 봉인하는 셈이 된다(실제로 그랬다).
+            # 강등은 "도구는 있는데 서비스 계정 시야"라는 다른 사실이므로 칸을 나눈다.
+            # 키에 사용자를 넣는 이유 — 강등은 그 사람의 자격증명 사건이지 그룹 사건이 아니다.
+            app.state.tool_degraded[_who] = degraded
+        else:
+            app.state.tool_degraded.pop(_who, None)
         # 상한이 0 이하면 축출 루프가 빈 dict 에서 next() 를 불러 StopIteration 이 된다.
         while AGENT_CACHE_MAX > 0 and len(cache) >= AGENT_CACHE_MAX:
             cache.pop(next(iter(cache)))
@@ -1750,7 +1758,15 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
         _tool_err = (getattr(app.state, "tool_load_error", None) or {}).get(frozenset(req.groups))
+        # 강등은 '도구 없음' 이 아니다 — 서비스 계정 시야로 돌 뿐 도구는 다 있다. 그래서
+        # 도구 호출을 막지 않고, 사용자에게만 그 사실을 알린다(사용자별 칸이라 남에게 안 번진다).
+        _tool_deg = (getattr(app.state, "tool_degraded", None) or {}).get(
+            (frozenset(req.groups), (req.user_email or "").strip().lower()))
         sys_prompt = SYSTEM_PROMPT
+        if _tool_deg and not _tool_err:
+            yield _sse("status", {"step": "내 자격증명으로 도구에 붙지 못해 공용 권한으로 답합니다 "
+                                          "— 내 대화 검색·저장은 이번 턴에 안 됩니다",
+                                  "tool": None})
         if _tool_err:
             yield _sse("status", {"step": f"도구 목록을 불러오지 못했습니다({_tool_err}) — 도구 없이 답변합니다",
                                   "tool": None})
