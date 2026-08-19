@@ -1962,7 +1962,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             and not _looks_like_leaked_tool_call(text, _no_tool)):
         yield _sse("status", {"step": "도구 유무 확인 — 확정 종결 절차", "tool": None})
         try:
-            _tmap = await _tools_by_name(app, req.groups, user=req.user_email)
+            _tmap = await _tools_by_name(app, req.groups, user=req.user_email, user_pat=req.user_pat)
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] finalizer tool load failed: {exc!r}")
             _tmap = {}
@@ -2057,7 +2057,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             calls = _extract_leaked_calls(text, _no_tool)
             if calls:
                 try:
-                    _tmap = await _tools_by_name(app, req.groups, user=req.user_email)
+                    _tmap = await _tools_by_name(app, req.groups, user=req.user_email, user_pat=req.user_pat)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[agent] direct-exec tool load failed: {exc!r}")
                     _tmap = {}
@@ -2167,16 +2167,20 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
-        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts, req.user_email)
+        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts,
+                                      req.user_email, req.user_pat)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
-        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts, req.user_email)
+        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts,
+                               req.user_email, req.user_pat)
     elif is_deliberation(req.message):
-        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts, req.user_email)
+        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts,
+                                  req.user_email, req.user_pat)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
-        stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups, req.user_email)
+        stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
+                                 req.user_email, req.user_pat)
     elif is_agent_search(req.message):
         # "전문가 뭐 있어" 류 → 추천+분야 요약을 코드가 결정적으로 생성(LLM 나열 절단 방지).
         stream = run_agent_search(app, strip_agent_trigger(req.message), req.groups)
