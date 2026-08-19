@@ -1876,18 +1876,28 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _gctx = (prev_t[-1800:] if (rnd > 1 and prev_t) else base[:1800])
             _gt = [asyncio.ensure_future(
                 _free_gather_one(g_agent, p, question, _gctx, opts.tool_budget)) for p in personas]
-            for _fut in asyncio.as_completed(_gt):
-                try:
-                    _k, _calls, _blk = await _fut
-                except Exception:  # noqa: BLE001
-                    continue
-                for _tn, _ap, _out in _calls:
-                    yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
-                    if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
-                        ev_count["tool"] += 1
-                        yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
-                                     included=True)
-                _gathered[_k] = _blk
+            # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
+            # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
+            # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,
+            # 남은 자유조회 태스크는 아무도 기다리지 않는 채 계속 돈다 — 사람당 도구 호출이
+            # tool_budget 만큼이라 취소를 놓치면 게이트웨이·백엔드 부하가 그대로 남는다.
+            try:
+                for _fut in asyncio.as_completed(_gt):
+                    try:
+                        _k, _calls, _blk = await _fut
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for _tn, _ap, _out in _calls:
+                        yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
+                        if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
+                            ev_count["tool"] += 1
+                            yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
+                                         included=True)
+                    _gathered[_k] = _blk
+            finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
+                for _t in _gt:
+                    if not _t.done():
+                        _t.cancel()
         # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
         # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
         _kn = knowledge_by_key if kind != "converge" else {}
