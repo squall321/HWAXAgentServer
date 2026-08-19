@@ -387,9 +387,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         if not user_pat:
             raise
         print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
-        # 챗과 같은 칸에 남긴다 — 심의에는 print 만 두면 "챗에만 있고 심의에는 없던 비대칭"
-        # 이 폴백에서 관측성으로 자리만 옮긴 것이 된다. 소비자는 이 값을 '도구 0개' 가 아니라
-        # app.state.tool_degraded 에는 쓰지 않는다.
+        # 강등 사실은 위 print 로만 남긴다 — app.state.tool_degraded 에는 쓰지 않는다.
         #   그 칸의 유일한 소비자는 챗 SSE(app.py)이고 그건 다른 요청이다. 여기서 쓰면
         #   ① 안 지우면 나중 챗 턴에 거짓 배너가 뜨고 ② 지우면 쓰자마자 사라져 아무도
         #   못 읽는 죽은 코드가 된다 — 실제로 두 번 다 겪었다. 심의에는 이 값을 읽는
