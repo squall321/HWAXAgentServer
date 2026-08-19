@@ -27,6 +27,7 @@ Env:
   MCP_SERVERS     fallback: comma-separated name=url pairs (no per-server auth headers).
 """
 
+import hashlib
 import asyncio
 import contextvars
 import json
@@ -160,7 +161,8 @@ def _load_mcp_config() -> dict:
     return _parse_servers(MCP_SERVERS)
 
 
-def _with_groups(connections: dict, groups: list[str], user: str = "") -> dict:
+def _with_groups(connections: dict, groups: list[str], user: str = "",
+                 user_pat: str = "") -> dict:
     """Clone the MCP connection config, injecting the caller's groups header so the gateway
     can filter the tool list (and guard tool calls). Does not mutate the input.
 
@@ -177,6 +179,12 @@ def _with_groups(connections: dict, groups: list[str], user: str = "") -> dict:
     for name, cfg in connections.items():
         cfg = dict(cfg)
         cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr, **extra}
+        # 포털이 이 챗용으로 발급한 사용자 PAT 가 있으면 서비스 계정(GW_TOKEN) 대신 그것으로
+        # 붙는다. 헤더로 "누구"라고 알리는 것과 실제로 그 사람의 자격증명으로 붙는 것은 다르다
+        # — 게이트웨이가 포털에 되물어야 하는 도구(대화 검색·저장)는 후자가 없으면 401 이다.
+        # 없으면 종전대로 서비스 계정으로 돈다(발급 실패가 챗을 막지 않는다).
+        if user_pat:
+            cfg["headers"]["Authorization"] = f"Bearer {user_pat}"
         out[name] = cfg
     return out
 
@@ -276,6 +284,10 @@ class ChatRequest(BaseModel):
     # 게이트웨이가 이 값으로 사용자별 백엔드 자격증명을 쓴다: 없으면 DynaForge 같은 사용자
     # 스코프 앱은 서비스 계정 시야로 답하고, 그건 '내 모델이 하나도 없다'로 보인다.
     user_email: str = ""
+    # 포털이 이 챗용으로 발급한 단명 사용자 PAT. 게이트웨이에 '이 사람으로' 붙기 위한 것이다
+    # — 헤더로 누구인지 알리는 것만으로는 포털에 되묻는 도구(대화 검색·저장)가 401 이 된다.
+    # 없으면 종전대로 서비스 계정(GW_TOKEN)으로 돈다.
+    user_pat: str = ""
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -1287,7 +1299,8 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
-                     query: str = "", sources: list[str] | None = None, user: str = ""):
+                     query: str = "", sources: list[str] | None = None, user: str = "",
+                     user_pat: str = ""):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
@@ -1301,9 +1314,13 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # ⚠ 호출자 신원은 반드시 키에 있어야 한다. 도구는 생성 시점의 헤더를 물고 있어서,
     # 신원을 빼면 A 가 만든 에이전트를 B 가 재사용하며 B 의 도구 호출이 A 의 자격증명으로
     # 나간다 — 그룹이 같으면 조용히 남의 데이터가 보인다.
+    # ⚠ 자격증명도 키에 있어야 한다. 도구는 만들 때의 Authorization 헤더를 물고 있어서,
+    # PAT 가 갱신돼도 캐시된 에이전트는 옛 토큰으로 계속 돌다가 만료되는 순간 도구가 조용히
+    # 죽는다. 포털이 30분 창에 맞춰 같은 토큰을 주므로 캐시 적중은 그대로다.
     key = (frozenset(groups), pin_key, q_key,
            tuple(sorted(sources)) if sources is not None else None,
-           (user or "").strip().lower())
+           (user or "").strip().lower(),
+           hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
     cache = app.state.agent_cache
     if key not in cache:
         tools = []
@@ -1311,7 +1328,12 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         connections = app.state.connections
         if connections:
             try:
-                scoped = _with_groups(connections, sorted(groups), user)
+                # 어느 자격증명으로 도는지는 운영에서 반드시 보여야 한다 — 사용자 PAT 가
+                # 안 실려 오면 대화 검색·저장이 조용히 401 이 되고, 로그가 없으면 그 이유를
+                # 밖에서 알 방법이 없다.
+                print(f"[agent] tool load: user={user or '-'} "
+                      f"creds={'user-pat' if user_pat else 'service-account'}")
+                scoped = _with_groups(connections, sorted(groups), user, user_pat)
                 import asyncio as _aio
                 _raw = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
                 _raw = gate_sources(_raw, sources)
@@ -1679,7 +1701,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             if isinstance(h, dict)
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
-        agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources, req.user_email)
+        agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
+                                 req.user_email, req.user_pat)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
