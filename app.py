@@ -74,6 +74,8 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen2.5-7b-dev")
 # 인증 있는 OpenAI 호환 서버(상암 B300 등)용 — 미설정이면 "EMPTY"(로컬 vLLM 무인증과 동일).
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY") or "EMPTY"
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "")
+# 에이전트 캐시 상한. 사용자 × 30분 창 × 질의선택 조합이라 상한이 없으면 계속 는다.
+AGENT_CACHE_MAX = int(os.environ.get("AGENT_CACHE_MAX", "64"))
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
 from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
@@ -249,7 +251,8 @@ async def lifespan(app: FastAPI):
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
-    app.state.agent_cache = {}  # frozenset(groups) -> compiled ReAct agent
+    # 삽입 순서를 LRU 로 쓴다(dict 는 순서를 보존한다). 상한은 _agent_for 가 강제한다.
+    app.state.agent_cache = {}  # (groups, pins, query, sources, user, cred) -> ReAct agent
     # 도구 로딩 오류는 그룹셋별로 보관한다. 전역 스칼라로 두면 한 그룹의 일시적 실패가
     # 다른 사용자 턴까지 '도구 없음'으로 오염시키고, 캐시 적중 경로에선 해제조차 안 돼
     # 영구 고착된다(실측: 실패한 적 없는 그룹이 계속 "도구 연결 복구되면 다시" 응답).
@@ -1335,7 +1338,22 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                       f"creds={'user-pat' if user_pat else 'service-account'}")
                 scoped = _with_groups(connections, sorted(groups), user, user_pat)
                 import asyncio as _aio
-                _raw = [_prep_tool(t) for t in await MultiServerMCPClient(scoped).get_tools()]
+                try:
+                    _got = await MultiServerMCPClient(scoped).get_tools()
+                except Exception:
+                    # ⚠ 사용자 PAT 로 붙는 데 실패하면 서비스 계정으로 한 번 되돌아간다.
+                    # 챗의 도구 연결은 게이트웨이 하나뿐이라(mcp_servers.json), 이 한 번의
+                    # 거절이 대화검색만이 아니라 도구 전량을 0개로 만든다. 포털 키 회전·
+                    # 게이트웨이 재기동·PAT 검증 설정 누락 어느 하나로도 그렇게 된다.
+                    # 자격증명을 바꾼 대가로 가용성을 잃지 않게, 이전 동작으로 내려앉는다.
+                    # (대화 도구는 서비스 계정에선 CONV_UNAVAILABLE 로 명시적으로 실패한다 —
+                    #  조용한 오답이 아니라 눈에 보이는 실패라 이 강등은 안전하다.)
+                    if not user_pat:
+                        raise
+                    print("[agent] tool load: 사용자 PAT 로 실패 — 서비스 계정으로 재시도")
+                    scoped = _with_groups(connections, sorted(groups), user, "")
+                    _got = await MultiServerMCPClient(scoped).get_tools()
+                _raw = [_prep_tool(t) for t in _got]
                 _raw = gate_sources(_raw, sources)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
                 tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
@@ -1376,7 +1394,15 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
             # 재시작 전까지 영구 no-tool 이 된다(조용한 최악의 실패 모드). 이번 요청만
             # 도구 없이 응답하고, 다음 요청에서 재시도한다.
             return agent
+        # ⚠ 상한 없는 dict 였다. 키에 그룹/사용자만 있을 땐 항목 수가 사람 수로 수렴했지만,
+        # 자격증명 해시가 키에 들어오면서 사용자마다 30분에 하나씩 새 항목이 생기고 옛 항목은
+        # 영영 남는다(도구 수백 개를 품은 객체라 가볍지도 않다). 오래된 것부터 버린다.
+        while len(cache) >= AGENT_CACHE_MAX:
+            cache.pop(next(iter(cache)))
         cache[key] = agent
+    else:
+        # 재사용된 항목은 최근 것으로 옮긴다 — 그래야 위 축출이 '가장 안 쓴 것'을 버린다.
+        cache[key] = cache.pop(key)
     return cache[key]
 
 
