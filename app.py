@@ -1328,6 +1328,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     if key not in cache:
         tools = []
         load_failed = False
+        degraded = ""   # 사용자 PAT 로 못 붙어 서비스 계정으로 내려앉았다면 그 이유
         connections = app.state.connections
         if connections:
             try:
@@ -1340,7 +1341,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 import asyncio as _aio
                 try:
                     _got = await MultiServerMCPClient(scoped).get_tools()
-                except Exception:
+                except Exception as _pe:
                     # ⚠ 사용자 PAT 로 붙는 데 실패하면 서비스 계정으로 한 번 되돌아간다.
                     # 챗의 도구 연결은 게이트웨이 하나뿐이라(mcp_servers.json), 이 한 번의
                     # 거절이 대화검색만이 아니라 도구 전량을 0개로 만든다. 포털 키 회전·
@@ -1350,7 +1351,11 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     #  조용한 오답이 아니라 눈에 보이는 실패라 이 강등은 안전하다.)
                     if not user_pat:
                         raise
-                    print("[agent] tool load: 사용자 PAT 로 실패 — 서비스 계정으로 재시도")
+                    # 원인을 반드시 남긴다. 예외를 이름도 없이 삼키고 고정 문구만 찍으면,
+                    # 재시도가 성공했을 때 401(PAT 무효)인지 타임아웃인지 알 길이 없다 —
+                    # '되돌아갈 길 없음' 을 '원인 알 길 없음' 으로 바꾸는 셈이다.
+                    degraded = repr(_pe)[:200]
+                    print(f"[agent] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({degraded})")
                     scoped = _with_groups(connections, sorted(groups), user, "")
                     _got = await MultiServerMCPClient(scoped).get_tools()
                 _raw = [_prep_tool(t) for t in _got]
@@ -1397,9 +1402,21 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         # ⚠ 상한 없는 dict 였다. 키에 그룹/사용자만 있을 땐 항목 수가 사람 수로 수렴했지만,
         # 자격증명 해시가 키에 들어오면서 사용자마다 30분에 하나씩 새 항목이 생기고 옛 항목은
         # 영영 남는다(도구 수백 개를 품은 객체라 가볍지도 않다). 오래된 것부터 버린다.
-        while len(cache) >= AGENT_CACHE_MAX:
+        # ⚠ 강등된 에이전트를 사용자 PAT 키에 넣으면 안 된다. 넣으면 일시적 거절 한 번이
+        # PAT 창(30분) 내내 조용한 강등으로 고착되고, 게이트웨이가 곧 복구돼도 그 사용자는
+        # 계속 서비스 계정으로 돈다 — 위 불변식("자격증명도 키에 있어야 한다")과 어긋난다.
+        # 서비스 계정 키에 넣어 두면 재사용은 되면서 다음 요청이 사용자 PAT 를 다시 시도한다.
+        store_key = key
+        if degraded:
+            store_key = key[:-1] + (hashlib.sha256(b"").hexdigest()[:16],)
+            app.state.tool_load_error[frozenset(groups)] = (
+                "사용자 자격증명으로 도구를 받지 못해 서비스 계정으로 동작 중입니다 "
+                f"— {degraded}")
+        # 상한이 0 이하면 축출 루프가 빈 dict 에서 next() 를 불러 StopIteration 이 된다.
+        while AGENT_CACHE_MAX > 0 and len(cache) >= AGENT_CACHE_MAX:
             cache.pop(next(iter(cache)))
-        cache[key] = agent
+        cache[store_key] = agent
+        return agent
     else:
         # 재사용된 항목은 최근 것으로 옮긴다 — 그래야 위 축출이 '가장 안 쓴 것'을 버린다.
         cache[key] = cache.pop(key)

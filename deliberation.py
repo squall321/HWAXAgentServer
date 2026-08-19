@@ -378,7 +378,17 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     if not conns:
         return {}
     scoped = _with_groups(conns, sorted(groups), user, user_pat)
-    tools = await MultiServerMCPClient(scoped).get_tools()
+    try:
+        tools = await MultiServerMCPClient(scoped).get_tools()
+    except Exception as _pe:
+        # 챗(app._agent_for)과 같은 안전망을 여기에도 둔다. 심의가 사용자 PAT 로 갈아탄
+        # 뒤로는 게이트웨이가 그 PAT 를 거절하면 /심의·/시뮬심의·/시험계획·/보고서 가
+        # 통째로 죽는다 — 챗만 폴백이 있고 심의에는 없던 비대칭이 실제 회귀였다.
+        if not user_pat:
+            raise
+        print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
+        scoped = _with_groups(conns, sorted(groups), user, "")
+        tools = await MultiServerMCPClient(scoped).get_tools()
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
@@ -1111,7 +1121,8 @@ def _cont_block(summary: str, non_negotiables: list, human_note: str) -> str:
 _WEB_CITE = re.compile(r"\[W:(d_[0-9a-f]{12})#(\d+)\]")
 
 
-async def _verify_web_citations(app, groups: list, text: str) -> tuple[int, int, list]:
+async def _verify_web_citations(app, groups: list, text: str,
+                                user: str = "", user_pat: str = "") -> tuple[int, int, list]:
     """결정문의 웹 인용을 원장과 대조한다. 반환은 (검증됨, 날조, 날조 목록).
 
     대조는 get_quote 도구로 한다 — 브로커 앱이 유일한 원장 소유자이고, 여기서 직접
@@ -1120,7 +1131,7 @@ async def _verify_web_citations(app, groups: list, text: str) -> tuple[int, int,
     if not cites:
         return 0, 0, []
     try:
-        tools = await _tools_by_name(app, groups)
+        tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
     except Exception:  # noqa: BLE001
         return 0, 0, []
     if "get_quote" not in tools:
@@ -2059,7 +2070,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
     if opts.search_sources:
-        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision)
+        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision,
+                                                          user, user_pat)
         if _ok_n or _bad_n:
             yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건",
                                   "tool": "get_quote"})
