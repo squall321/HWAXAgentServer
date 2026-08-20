@@ -2291,10 +2291,18 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
                 continue
             n["score"] = it.get("score")
             n["why"] = it.get("why") or ""
+            n["low_confidence"] = bool(it.get("low_confidence"))
+            n["desc_match"] = it.get("desc_match")
             candidates.append(n)
     except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
         print(f"[experts] recommend failed: {exc!r}")
     recommended = candidates[:N_PERSONAS]
+
+    # 풀에 맞는 전문가가 없을 때 화면이 그렇게 말할 수 있게 올려 보낸다. AIDataHub 가
+    # 역할/설명 어휘 일치로 판정한다 — score 로는 못 한다(e5 코사인은 무관해도 0.87~0.90).
+    # 실제 사고: 'OCA 의 산소 확산 계수' 질의에 백플레인 TFT·안테나 OTA 가 추천됐는데,
+    # 랭킹 버그가 아니라 풀에 그 전문성이 아예 없었다.
+    low_conf = bool(recommended and all(r.get("low_confidence") for r in recommended))
 
     # 전체 풀(compact — 관련도 밖 전문가까지 키워드로 찾을 때). 647+ 규모라 role 은 싣지 않는다.
     pool: list[dict] = []
@@ -2333,7 +2341,8 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         "all": _tool_catalog(tools),
         "apps": _app_catalog(tools),
     }
-    return {"recommended": recommended, "candidates": candidates, "pool": pool, "tools": tools_info}
+    return {"recommended": recommended, "candidates": candidates, "pool": pool,
+            "tools": tools_info, "low_confidence": low_conf}
 
 
 class AgentDetailRequest(BaseModel):
