@@ -992,8 +992,28 @@ _FREE_ALLOW = ("list_", "get_", "search_", "find_", "query_", "compute_", "analy
                "evaluate_", "predict_", "assess_", "compare_", "estimate_", "solve_",
                "recover_", "hybrid_", "semantic_", "fts_", "material_", "property_",
                "database_", "coverage_", "plot_", "check_", "describe_", "ashby_",
-               "stress_", "top_", "catalog_", "agent_search", "daily_", "alert_")
+               "stress_", "top_", "catalog_", "agent_search", "daily_", "alert_",
+               # 물성 DB 의 읽기 전용 조회인데 접두어 규칙에 안 걸리는 것들 —
+               # 이름이 동사로 시작해 새는 자리다. 셋 다 조회만 한다.
+               "how_to_measure", "test_plan_for_material", "measurement_gaps")
 _FREE_DENY = ("get_agent_session",)   # 페르소나 시스템프롬프트 원문은 조회 근거가 아니다
+
+# 물성 DB(MaterialTwin) 조회 도구 — 앱 제한과 무관하게 **항상** 바인딩한다.
+#
+# 왜 예외인가. 심의에서 수치 근거가 필요한 순간의 상당수가 '이 재료의 물성이 얼마인가'다.
+# 그런데 사용자가 delib_apps 로 앱을 좁히면(예: 열해석 앱만 선택) 물성 도구가 통째로 빠지고,
+# 전문가는 물성을 **기억으로 말하게 된다** — '수치는 기억이 아니라 조회 기록'이라는 이 심의의
+# 계약이 그 순간 깨진다. agent_search 를 앱 제한에서 빼 둔 것과 같은 이유다.
+#
+# 쓰기 계열(register_·update_·recompute_)은 넣지 않는다. 자유 조회는 읽기 전용이다.
+_MATERIAL_TOOLS = (
+    "list_materials", "get_material", "get_material_properties", "get_mat_card",
+    "search_by_property", "search_catalog_property", "find_materials_by_metadata",
+    "find_materials_in_property_range", "compare_materials", "material_taxonomy",
+    "list_property_definitions", "property_distribution", "catalog_property_distribution",
+    "get_curve", "ashby_data", "how_to_measure", "test_plan_for_material",
+    "measurement_gaps",
+)
 
 
 def _free_tool_ok(name: str) -> bool:
@@ -1043,7 +1063,15 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     sysmsg = (f"당신은 '{persona['key']}' 전문가({str(persona.get('role', ''))[:280]}). "
               f"지금은 심의 발언 전의 데이터 조회 단계다. 필요한 조회를 도구로 직접 수행하라. "
               f"규칙: 최대 {budget}회. 대상을 이름으로 찾을 땐 목록·검색 도구 먼저 — 식별자"
-              f"(id·test_id)를 추측해 넣지 마라(차단된다). 끝나면 '조회 요약:' 뒤에 핵심 수치만 "
+              f"(id·test_id)를 추측해 넣지 마라(차단된다). "
+              # 물성은 기억으로 말하면 안 된다. 도구를 붙여 놔도 모델은 '아는 값'이라고 여기면
+              # 조회를 건너뛴다 — 그러면 근거 패널에 출처 없는 수치가 남는다.
+              f"⚠ 재료 물성(탄성계수·열전도율·CTE·유전율·점탄성 등)을 발언에 쓸 것이라면 "
+              f"반드시 물성 DB 도구로 조회해 실제 값과 출처를 확보하라. list_materials·"
+              f"search_by_property 로 대상을 찾고 get_material_properties·get_mat_card 로 값을 "
+              f"받는다. 기억이나 일반 상식으로 수치를 말하지 마라 — 조회 기록이 없는 수치는 "
+              f"근거로 인정되지 않는다. DB 에 없으면 '없음'을 확인한 사실로 보고하라. "
+              f"끝나면 '조회 요약:' 뒤에 핵심 수치만 "
               f"3줄 이내로 요약하라. 조회할 것이 없으면 '조회 불필요' 한 줄만 출력하라.")
     human = (f"[심의 주제]\n{question}\n\n[지금까지의 논의·근거(발췌)]\n{ctx}\n\n"
              f"당신 발언에 필요한 조회를 지금 수행하라.")
@@ -1599,7 +1627,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if opts.delib_apps:
                 _amap = _app_of_tools()
                 _narrow = {n: t for n, t in _g.items()
-                           if n == "agent_search" or _amap.get(n) in set(opts.delib_apps)}
+                           if n == "agent_search" or n in _MATERIAL_TOOLS
+                           or _amap.get(n) in set(opts.delib_apps)}
                 # 매핑을 못 받았거나(게이트웨이 불통) 결과가 agent_search 뿐이면 좁히지 않는다 —
                 # 조용히 도구 0종이 되면 자유 조회가 죽은 채 심의만 계속된다.
                 if len(_narrow) > 1:
