@@ -6,9 +6,17 @@ import json
 import os
 import re
 import asyncio
+import contextvars
 from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
+# _tools_by_name 이 세우고, _evidence_note(결정문 헤더)와 스트림(라이브 배너)이 읽는다.
+# 강등을 로그로만 남기면 아무도 못 본다 — 심의가 남의 시야로 근거를 모으고도 정상처럼
+# 보인다(무음 강등). 사용자에게 보이는 두 층(라이브 SSE·결정문)에 모두 찍는다.
+_pat_degraded: contextvars.ContextVar = contextvars.ContextVar("pat_degraded", default=None)
+
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
 # 시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의. 일반 심의보다 먼저
@@ -390,11 +398,11 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         if not user_pat:
             raise
         print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
-        # 강등 사실은 위 print 로만 남긴다 — app.state.tool_degraded 에는 쓰지 않는다.
-        #   그 칸의 유일한 소비자는 챗 SSE(app.py)이고 그건 다른 요청이다. 여기서 쓰면
-        #   ① 안 지우면 나중 챗 턴에 거짓 배너가 뜨고 ② 지우면 쓰자마자 사라져 아무도
-        #   못 읽는 죽은 코드가 된다 — 실제로 두 번 다 겪었다. 심의에는 이 값을 읽는
-        #   경로가 없으므로 애초에 쓰지 않는 것이 맞다. 관측은 로그로 남긴다.
+        # ⚠ app.state.tool_degraded 에는 쓰지 않는다 — 그 칸의 소비자는 챗 SSE(다른 요청)라
+        #   여기서 쓰면 나중 챗 턴에 거짓 배너가 뜬다(실측). 대신 요청 단위 ContextVar 에
+        #   세운다. _evidence_note(결정문)와 심의 스트림(라이브 배너)이 이 표식을 읽어
+        #   '이 심의는 서비스 계정으로 근거를 모았다'를 사용자에게 보인다. 무음 강등을 막는다.
+        _pat_degraded.set("사용자 자격증명이 게이트웨이에 거절돼 서비스 계정으로 조회함")
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await MultiServerMCPClient(scoped).get_tools()
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
@@ -1259,6 +1267,11 @@ def _evidence_note(ev: dict) -> str:
             "VOC {voc}건 · 사전 검색 {prepass}건").format(**ev)
     if not ev.get("tool"):
         note += " · 실측 데이터 0건(가설 단계)"
+    # 자격증명 강등을 결정문 헤더에 남긴다 — 결정문은 이 심의의 내구 기록이다. 여기가
+    # 근거 프로파일의 단일 관문이라, 어느 플로우의 결정문이든 강등이면 이 줄이 붙는다.
+    deg = _pat_degraded.get()
+    if deg:
+        note += f" · ⚠ 자격증명 강등({deg}) — 근거가 요청자 시야가 아닐 수 있음"
     return note
 
 
@@ -1579,6 +1592,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 llm = mk(opts.timeout_s)
             except Exception as exc:  # noqa: BLE001 — 팩토리 실패 시 기본 delib_llm 유지
                 print(f"[deliberation] timeout override failed: {exc!r}")
+    # 요청 단위 강등 표식 초기화 — 이 태스크가 재사용되는 경우에도 이전 요청의 값이 새지 않게.
+    _pat_degraded.set(None)
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
     # 심의는 도구를 LLM 에 바인딩하지 않는다 — 전부 _call 로 부르고 결과를 **코드가 JSON 으로
@@ -1592,6 +1607,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("error", {"code": "gateway_unavailable",
                              "message": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
         yield _sse("done", {}); return
+
+    # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
+    # 결정문 헤더(_evidence_note)에도 남지만, 심의가 도는 동안 보는 사람이 먼저 알아야 한다.
+    if _pat_degraded.get():
+        yield _sse("warning", {"code": "credential_degraded",
+                               "message": "이 심의는 요청자 자격증명이 아니라 서비스 계정으로 근거를 조회합니다 — 결과가 요청자 시야와 다를 수 있습니다."})
     # 유령 ID 게이트를 심의에도 켠다 — /chat 라우트가 _agent_stream 을 거치지 않고 여기로 바로
     # 분기하므로 종전엔 fail-open 이었다. 실측: get_material(material_id=6061)·get_mat_card
     # (test_id=1 → SUS201) 처럼 지어낸 ID 가 그대로 나갔다. 출처는 질문 + 도구 결과에서 늘어난다.
