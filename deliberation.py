@@ -149,8 +149,17 @@ _CHAIR_ITEMS = {
 }
 
 # 시뮬레이션 심의 2단 좌석 — 고정 CAE 좌석은 발굴에 맡기지 않는다. 현상 어휘에 끌려
-# 방법론·검증 좌석이 빠지는 일이 생긴다.
-_SIM_FIXED_CAE = ("xd-cae-modeling", "xd-cae-post")
+# 방법론·검증 좌석이 빠지는 일이 생긴다. 방법론 2석에 더해 수치 스파인을 고정한다 —
+# 정식화→이산화→검증이 방법을 세우고 리뷰어 2석이 가로질러 반증·근거요구한다
+# (roster-gap-numerical-spine.md §3). 발굴은 축당1명·최대3석이라 스파인이 세트로 못 앉으므로 고정.
+_SIM_FIXED_METHOD = ("xd-cae-modeling", "xd-cae-post")
+_SIM_SPINE_CORE = ("xd-cae-formulation", "xd-cae-discretization", "xd-cae-verification")
+_SIM_SPINE_REVIEW = ("xd-cae-rigor-review", "xd-cae-theory-grounding")
+_SIM_SPINE = _env_int("DELIB_SIM_SPINE", 1)                   # 1=수치 스파인 고정(기본), 0=종전 방법론 2석만
+_SIM_SPINE_REVIEWERS = _env_int("DELIB_SIM_SPINE_REVIEW", 1)  # 1=리뷰어 2석 포함(기본), 0=핵심 3석만
+_SIM_FIXED_CAE = _SIM_FIXED_METHOD + (
+    (_SIM_SPINE_CORE + (_SIM_SPINE_REVIEW if _SIM_SPINE_REVIEWERS else ())) if _SIM_SPINE else ()
+)
 # 시험 계획 고정 좌석 — 이 셋이 빠지면 계획서가 한쪽으로 기운다.
 #   계측·시험    측정 가능성과 장비·규격을 아는 쪽. 없으면 '측정할 수 없는 것'을 계획에 넣는다
 #   해석         민감도를 아는 쪽. 없으면 결과에 영향 없는 물성을 최우선으로 올린다
