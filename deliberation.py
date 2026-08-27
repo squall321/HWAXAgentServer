@@ -2084,7 +2084,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                  if opts.chair_cite else "")
     ev_note = _evidence_note(ev_count)
     chair_items = _CHAIR_ITEMS.get(opts.chair_template, _CHAIR_ITEMS["default"])
-    doc_title = "해석 계획서" if opts.chair_template == "sim-plan" else "의사결정문"
+    doc_title = {"sim-plan": "해석 계획서", "test-plan": "시험 계획서",
+                 "build-plan": "구축 계획서"}.get(opts.chair_template, "의사결정문")
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
     rounds_block = "\n\n".join(
@@ -2092,15 +2093,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     chair_human = (
         base + f"\n{rounds_block}\n\n"
         f"[{seat_note}]\n[{ev_note}]\n"
-        "## 의사결정문 — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
+        f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
         "(0) 참여 도메인과 커버리지 한계 — 위 좌석 구성을 한 문단으로 기록하고, "
         "이 문제에 관련되나 착석하지 않은 인접 도메인이 있으면 명시하라(없으면 없다고 쓰라), "
-        "(1) 결정사항(번호매김·실행가능), (2) 합의 근거(라운드로 어떻게 수렴했는지), "
-        "(3) 소수의견과 처리 — 페르소나가 명시한 non_negotiable(양보 불가 제약)과 stance 를 반영하되, "
-        "명시하지 않은 페르소나는 '미표명'으로 기록하고 지어내지 마라, "
-        "(4) 미해결 쟁점+담당·다음 액션, (5) 신뢰도·전제. " + cite_note +
+        + chair_items + " " + cite_note +
         "라운드별 심화·수렴을 드러내라.")
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
