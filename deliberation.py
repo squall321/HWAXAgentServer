@@ -200,6 +200,9 @@ def _resolve_opts(req_opts):
         human_note="", continue_summary="", continue_personas=[],
         # 이전 심의의 양보 불가 조항 — 요약에 넣지 않으면 소실되므로 별도 필드로 승계한다(F11).
         continue_non_negotiables=[],
+        # 챗 워크스페이스가 정리해 넘긴 원천 근거(도구결과+출처) — 심의가 '검증 대상·결론 아님'으로
+        # 좌석에 주입한다(요약 아닌 날것). 브리프의 결론이 심의를 오염시키지 않게 — 핸드오프 P1.
+        evidence=[],
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
@@ -257,6 +260,23 @@ def _resolve_opts(req_opts):
         ap = req_opts.get("apps")
         if isinstance(ap, list):
             o.delib_apps = [str(a).strip()[:80] for a in ap[:3] if isinstance(a, str) and str(a).strip()]
+        # 챗 핸드오프 원천 근거 — 항목당 {source, tool, args, result} 로 정규화·클램프(≤12항목).
+        # 결과 없는 항목은 근거가 아니므로 버린다.
+        ev = req_opts.get("evidence")
+        if isinstance(ev, list):
+            o.evidence = []
+            for it in ev[:12]:
+                if not isinstance(it, dict):
+                    continue
+                res = str(it.get("result") or "").strip()
+                if not res:
+                    continue
+                o.evidence.append({
+                    "source": str(it.get("source") or it.get("source_app") or "챗")[:120],
+                    "tool": str(it.get("tool") or "")[:80],
+                    "args": str(it.get("args") or "")[:400],
+                    "result": res[:2000],
+                })
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
             o.search_sources = [str(x).strip()[:20] for x in srcs[:4]
@@ -1905,8 +1925,28 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      text="\n".join(f"- {x}" for x in opts.continue_non_negotiables)[:1500], included=True)
     if opts.human_note:
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
+    # 챗 워크스페이스 핸드오프 원천 근거(P1) — 요약이 아니라 날것 도구결과+출처를 좌석에 준다.
+    # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
+    # 예산(≈11KB) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).
+    chat_ev_inject = ""
+    if opts.evidence:
+        _items, _budget = [], 0
+        for _e in opts.evidence:
+            _src, _res = _e.get("source") or "챗", _e.get("result", "")
+            _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
+            _line = f"· [{_src}{_meta}] {_res}"
+            if _budget + len(_line) > 11000 and _items:
+                break
+            _items.append(_line)
+            _budget += len(_line)
+            yield _delib("evidence", source=f"챗 정리 · {_src}", text=_res[:1500], included=True)
+            ev_count["tool"] += 1
+        if _items:
+            chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
+                              "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라]\n" + "\n".join(_items))
     _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
-             + (f"\n{tool_inject}" if tool_inject else ""))
+             + (f"\n{tool_inject}" if tool_inject else "")
+             + (f"\n{chat_ev_inject}" if chat_ev_inject else ""))
     base = f"[심의 주제]\n{question}\n" + cont + _tail
     # 신규 좌석 앵커링 차단(F12) — 재심사로 새로 합류한 좌석에게 이전 결론을 먼저 읽히면
     # 동조 압력을 받아 '새 관점을 얻으려고 불렀다'는 목적이 사라진다. 1라운드에 한해 이전 요약을
