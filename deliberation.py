@@ -338,6 +338,31 @@ def _modifier_note(mods):
     return "\n\n[얹을 층 — 아래 방식을 심의 전체에 적용하라]\n" + "\n".join(blocks)
 
 
+# 신규 Job 전용 지정 좌석 — 방법론의 반대/반증 역할을 "좌석 구조"로 보장한다. 프롬프트로 역할을
+# 요청만 하면 그 역할을 맡을 좌석이 없을 수 있어(발굴이 반대석을 안 뽑음), 합성 좌석을 못박아 앉힌다.
+# 합성 키(레지스트리에 없음)라 지식카드 RAG 는 빈값(try/except 안전), 역할은 시스템 프롬프트에 직접 실린다.
+_CHAIR_ADVERSARY = {
+    "credibility": {
+        "key": "delib-redteam", "label": "red-team 지정석",
+        "role": "이 심의의 red-team(반대 지정석). 결론을 지지하지 말고 깨는 것이 임무 — 가장 약한 가정·가장 "
+                "위태로운 외삽·미검증 Validation 공백·간과된 물리를 집요하게 파고들어 '이 결과를 믿으면 안 되는 "
+                "이유'를 대라. 근거 없는 go 를 쉽게 내주지 말고, 정말 살아남는 예측만 인정하라.",
+    },
+    "diagnosis": {
+        "key": "delib-disconfirm", "label": "반증 지정석",
+        "role": "이 진단의 반증 지정석. 지배원인 후보를 적극적으로 반증하라 — is/is-not 경계에서 그 원인이면 "
+                "설명 안 되는 관측·아직 배제 안 된 대안 원인·증거의 과대해석을 지적하고, 팀이 '가장 그럴듯한 "
+                "하나'로 성급히 수렴하는 것을 막아 미지영역을 드러내라.",
+    },
+    "option-select": {
+        "key": "delib-contrarian", "label": "반대 지정석",
+        "role": "이 선택의 반대 지정석. 유력안을 의심하라 — 숨은 비용·실패모드·양산 리스크를 파고들고, 기준·"
+                "가중이 특정 안에 유리하게 짜였는지·뒤집힘 임계가 얼마나 아슬아슬한지 지적하라. 만장일치를 "
+                "경계하고 열등해 보이는 안의 강점을 대변하라.",
+    },
+}
+
+
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
     미지정 키는 env 기본값 유지(하위호환). 값은 화이트리스트 키만 읽고 정수/실수로 강제·클램프
@@ -2012,6 +2037,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": "반대 도메인 좌석 — " + ", ".join(
                     f"{p['key']}({p.get('axis', '')})" for p in counter),
                     "tool": "recommend_agents"})
+    # 신규 Job 지정 좌석 — credibility=red-team, diagnosis=반증, option-select=반대. 좌석 구조로 역할 보장
+    # (프롬프트만으로는 그 역할석이 발굴 안 되면 아무도 안 맡는다). 이미 있으면(이어하기 승계) 중복 안 함.
+    _adv = _CHAIR_ADVERSARY.get(opts.chair_template)
+    if _adv and not any(p.get("key") == _adv["key"] for p in personas):
+        personas.append({"key": _adv["key"], "role": _adv["role"], "origin": "counter"})
+        yield _sse("status", {"step": f"지정 좌석 — {_adv['label']}", "tool": None})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
                              "message": "관련 전문 페르소나를 충분히 찾지 못했습니다(AIDataHub 에이전트 등록 확인)."})
@@ -2121,7 +2152,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     base_blind = (f"[심의 주제]\n{question}\n" + _cont_blind + _tail +
                   "\n[안내] 당신은 이번 회차에 새로 합류했다. 이전 논의 결과는 의도적으로 제공하지 "
                   "않는다 — 먼저 당신 도메인의 독립적 판단을 내라. 다음 라운드에서 이전 결론을 받는다.\n")
-    _has_blind = any(p.get("origin") == "new" for p in personas) and bool(opts.continue_summary)
+    _anon1r = "anon1r" in (opts.modifiers or [])
+    # 익명 1R(anon1r) — 이어하기에서 기존 좌석도 1R 에는 이전 결론을 가려 독립 재추정을 강제한다
+    # (1R 은 좌석 간엔 이미 병렬 독립이므로, 남은 구조적 레버는 '이전 결론 은닉'이다).
+    _has_blind = (any(p.get("origin") == "new" for p in personas) or _anon1r) and bool(opts.continue_summary)
 
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
     #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.
@@ -2156,7 +2190,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": f"{rnd}라운드 — {rlabel}", "tool": None})
 
         if kind == "initial":
-            prompt_fn = lambda p: ((base_blind if (_has_blind and p.get("origin") == "new") else base) +
+            prompt_fn = lambda p: ((base_blind if (_has_blind and (_anon1r or p.get("origin") == "new")) else base) +
                 "\n당신의 관점(lens — 2~4문장, 구체적으로), 위 주제·근거에 실제로 주어진 정보와 당신 도메인의 "
                 "확립된 표준·경험칙에 대한 해석(reads — 배열, 접근할 수 없는 데이터·수치를 지어내지 말고 "
                 "경험칙에는 (경험칙) 표기), 권장안(recommendation — 2~4문장), "
