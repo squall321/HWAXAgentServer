@@ -1512,7 +1512,7 @@ def _seat_note(personas: list) -> str:
     by = {}
     for p in personas:
         by.setdefault(p.get("origin", "primary"), []).append(p["key"])
-    label = {"primary": "주 도메인", "counter": "반대 도메인", "carry": "유임", "new": "이어하기 신규"}
+    label = {"primary": "주 도메인", "counter": "반대 도메인", "adversary": "지정 반대석", "carry": "유임", "new": "이어하기 신규"}
     parts = [f"{label.get(k, k)} {len(v)}명({', '.join(v)})" for k, v in by.items()]
     domains = sorted({(k.split("-", 1)[0] if "-" in k else k) for k in (p["key"] for p in personas)})
     return f"참여 좌석 — {' / '.join(parts)}. 착석 도메인 {len(domains)}종: {', '.join(domains)}."
@@ -2041,7 +2041,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (프롬프트만으로는 그 역할석이 발굴 안 되면 아무도 안 맡는다). 이미 있으면(이어하기 승계) 중복 안 함.
     _adv = _CHAIR_ADVERSARY.get(opts.chair_template)
     if _adv and not any(p.get("key") == _adv["key"] for p in personas):
-        personas.append({"key": _adv["key"], "role": _adv["role"], "origin": "counter"})
+        personas.append({"key": _adv["key"], "role": _adv["role"], "origin": "adversary"})
         yield _sse("status", {"step": f"지정 좌석 — {_adv['label']}", "tool": None})
     if len(personas) < 2:
         yield _sse("error", {"code": "no_personas",
