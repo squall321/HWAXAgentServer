@@ -131,7 +131,14 @@ _CHAIR_ITEMS = {
         "(9) 계산 규모·자원: 메시·시간스텝·케이스 수에서 실제 자원 수치 — 클러스터(예: stc)·코어시간·"
         "벽시계·라이선스 좌석·저장용량·임계경로. '크다/작다'가 아니라 숫자여야 한다, "
         "(10) 이 해석이 답할 수 없는 것. (7)(8)(9)(10)은 비워두지 마라 — 비면 '그럴듯하지만 돌릴 수도 "
-        "믿을 수도 없는' 계획서다.",
+        "믿을 수도 없는' 계획서다. 끝으로 결정문 산문 뒤에 위 변수·산출·모델·자원을 기계판독 규격 "
+        "sim_spec 으로 ```json 펜스 블록에 함께 내라 — "
+        "parameters:[{name,symbol,unit,role(state|material|BC|geometry),source(문헌|측정|피팅),"
+        "value_or_range,identifiability(식별가능|퇴화),degeneracy_note,resolving_obs}], "
+        "outputs:[{quantity,symbol,unit,uncertainty_band,acceptance_criterion,validity_range}], "
+        "model:{eq_family,dim,reduction,solver,discretization}, "
+        "compute:{cluster,cores,wallclock,license}. 값은 산문 (7)(8)(9)와 일치해야 하고, 지어내지 "
+        "말고 모르면 빈 문자열로. 이 규격을 다음 단계(구축 계획·비교)가 재파싱 없이 승계한다.",
     # 시험 계획서 — "무엇을 먼저 측정할 것인가". 계획서가 그대로 시험 의뢰서가 되어야 하므로
     # 항목·조건·수량·판정까지 내려간다. 우선순위 근거(3)와 미확보 항목(9)이 이 문서의 값어치다.
     "test-plan":
