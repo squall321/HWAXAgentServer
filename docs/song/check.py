@@ -81,6 +81,52 @@ def parse(path):
     return div, out
 
 
+def lead_pitches():
+    ps = [p for data in (mg.VERSE_MEL, mg.PRE_MEL, mg.CHORUS_MEL, mg.BRIDGE_MEL)
+          for *_x, p, _s in [(d[0], d[1], d[2], d[3], d[4]) for d in data]]
+    ps += [p + 2 for *_x, p, _s in [(d[0], d[1], d[2], d[3], d[4]) for d in mg.CHORUS_MEL]]
+    ps += [p for _bt, _d, p in mg.MOTIF if _bt < 12.0] + [p for _bt, _d, p, _s in mg.POST_TAG]
+    return ps
+
+
+def fit_report(lo_in, hi_in):
+    """가수 음역을 주면, 어느 조옮김이 그 안에 들어오는지 표로 보여준다."""
+    def pitch(x):
+        if x.lstrip('-').isdigit():
+            return int(x)
+        acc = 1 if '#' in x else (-1 if 'b' in x else 0)
+        letter = x[0].upper()
+        octv = int(x[-1] if x[-1] != '-' else x[-2:])
+        return 12 * (octv + 1) + N.index(letter) + acc
+
+    lo_s, hi_s = pitch(lo_in), pitch(hi_in)
+    lead = lead_pitches()
+    ch = mg.mel_events(mg.CHORUS_MEL, 17)
+    harm = [p for _b, _d, p in mg.harmonize(ch, below=True)] + \
+           [p + 2 for _b, _d, p in mg.harmonize(ch, below=True)] + \
+           [p for _b, _d, p in mg.harmonize(ch, below=False)] + \
+           [p + 2 for _b, _d, p in mg.harmonize(ch, below=False)]
+    KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    WHISTLE = (62, 86)                      # 로우 D 휘슬
+    print(f'\n가수 음역 {nm(lo_s)}–{nm(hi_s)} 기준 조옮김 적합도\n')
+    print('| TRANSPOSE | 조 | 리드 | 하모니 전체 | 가수 음역 | 로우휘슬 |')
+    print('|---|---|---|---|---|---|')
+    for t in range(-6, 7):
+        l1, l2 = min(lead) + t, max(lead) + t
+        h1, h2 = min(harm) + t, max(harm) + t
+        v_ok = lo_s <= min(l1, h1) and max(l2, h2) <= hi_s
+        w1, w2 = min(p for _b, _d, p in mg.MOTIF) + t, max(p for _b, _d, p in mg.MOTIF) + t + 2
+        w_ok = WHISTLE[0] <= w1 and w2 <= WHISTLE[1]
+        mark = '★' if t == mg.TRANSPOSE else ' '
+        print(f'| {mark}{t:+d} | {KEYS[(2 + t) % 12]} | {nm(l1)}–{nm(l2)} | {nm(h1)}–{nm(h2)} | '
+              f'{"✔" if v_ok else "✘"} | {"✔" if w_ok else "✘ 옥타브 위로 더블링 필요"} |')
+    print('\n★ = 현재 설정. 두 열이 모두 ✔ 인 줄이 후보다.')
+
+
+if len(sys.argv) > 1 and sys.argv[1] == '--fit':
+    fit_report(sys.argv[2], sys.argv[3])
+    sys.exit(0)
+
 print('\n[1] MIDI 구조 · 미결 노트')
 div, tracks = parse(os.path.join(HERE, '03_full.mid'))
 played = {}
@@ -102,6 +148,8 @@ print('\n[2] 음역 — 편곡 스펙 및 실제 악기 물리 음역')
 for name, ps in played.items():
     lo, hi = min(ps), max(ps)
     (slo, shi), (ilo, ihi), why = RANGES[name]
+    slo, shi = slo + mg.TRANSPOSE, shi + mg.TRANSPOSE   # 스펙은 조옮김을 따라간다
+                                                        # (물리 음역은 따라가지 않는다 — 그게 요점)
     check(slo <= lo and hi <= shi,
           f'{name}: {nm(lo)}–{nm(hi)} (스펙 {nm(slo)}–{nm(shi)})' + (f' — {why}' if why else ''))
     check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)

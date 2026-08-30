@@ -13,6 +13,11 @@ import os, struct
 
 PPQ = 480
 BPM = 112
+
+# 곡 전체의 조옮김(반음). 0 = 원조 D major.
+# 보컬이 정해지면 이 값 하나만 바꾼다 — 드럼을 뺀 모든 파트가 따라 움직인다.
+# 어떤 값이 그 가수에게 맞는지는 `python3 check.py --fit <최저음> <최고음>` 이 알려준다.
+TRANSPOSE = 0
 OUT = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────── MIDI 최소 구현
@@ -34,6 +39,8 @@ class Track:
     def note(self, beat, dur, pitch, vel=90):
         if pitch is None:
             return
+        if self.ch != 9:                       # 드럼맵은 조옮김하지 않는다
+            pitch += TRANSPOSE
         t0 = int(round(beat * PPQ))
         t1 = max(t0 + 20, int(round((beat + dur) * PPQ)) - 8)   # 살짝 띄어 레가토 방지
         self.ev.append((t1, 0, bytes([0x80 | self.ch, pitch, 0])))
@@ -62,7 +69,8 @@ def write_midi(path, tracks):
     meta += b'\x00\xff\x03\x08Moongate'
     meta += b'\x00\xff\x51\x03' + struct.pack('>I', int(60_000_000 / BPM))[1:]
     meta += b'\x00\xff\x58\x04\x04\x02\x18\x08'
-    meta += b'\x00\xff\x59\x02\x02\x00'        # D major (샤프 2개)
+    fifths = ((2 + 7 * TRANSPOSE + 5) % 12) - 5           # D major 기준 조표 재계산
+    meta += b'\x00\xff\x59\x02' + bytes([fifths & 0xFF, 0])
     meta += b'\x00\xff\x2f\x00'
     conductor = b'MTrk' + struct.pack('>I', len(meta)) + bytes(meta)
     with open(path, 'wb') as f:
@@ -524,5 +532,8 @@ if __name__ == '__main__':
                [t for t in make_tracks() if t.ev])
 
     total = 76 * 4 * 60 / BPM
+    KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    key = KEYS[(2 + TRANSPOSE) % 12]
     print(f'wrote 01_motif.mid / 02_structure.mid / 03_full.mid  —  76 bars, '
-          f'{int(total // 60)}:{int(total % 60):02d} @ {BPM}BPM')
+          f'{int(total // 60)}:{int(total % 60):02d} @ {BPM}BPM, '
+          f'key {key} major (TRANSPOSE={TRANSPOSE:+d})')
