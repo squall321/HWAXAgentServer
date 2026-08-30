@@ -166,6 +166,25 @@ for name, ps in played.items():
           f'{name}: {nm(lo)}–{nm(hi)} (스펙 {nm(slo)}–{nm(shi)})' + (f' — {why}' if why else ''))
     check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)
 
+print('\n[11] 인스트루멘털 — 보컬이 빠진 자리를 악기가 이어받는가')
+_, itr = parse(os.path.join(HERE, '06_instrumental.mid'))
+lead = set()
+for nme, ev, _t, _l, _i in itr:
+    if nme in ('Signature Whistle', 'Celtic Harp'):       # 선율을 쥘 수 있는 파트만
+        lead.update(int(t / div / 4) + 1 for t, k, _c, _a, b2 in ev if k == 0x90 and b2 > 0)
+gaps, cur = [], None
+for bar in range(1, 77):
+    if bar not in lead:
+        cur = (cur[0], bar) if cur else (bar, bar)
+    elif cur:
+        gaps.append(cur); cur = None
+if cur:
+    gaps.append(cur)
+big = [(a, b2) for a, b2 in gaps if b2 - a + 1 >= 4]
+tot = sum(b2 - a + 1 for a, b2 in gaps)
+check(tot <= 8, f'선율 공백 {tot}마디 ({tot / 76 * 100:.0f}%)')
+check(big == [(61, 64)], f'4마디 이상 구멍은 61~64(낙사비, 로즈 단독)뿐: {big}')
+
 print('\n[10] 의도한 악기 이름(FF 04) 이 파일에 남아 있는가')
 for name, ev, _t, _l, inst in tracks:
     if not any(k == 0x90 and b2 > 0 for _tt, k, _c, _a, b2 in ev):

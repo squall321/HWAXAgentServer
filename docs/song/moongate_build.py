@@ -413,10 +413,29 @@ BRIDGE_MEL = [
 
 # ─────────────────────────────────────────────── 트랙 조립 헬퍼
 
-def put_mel(track, data, start_bar, vel=95, transpose=0, words=None):
+def put_mel(track, data, start_bar, vel=95, transpose=0, words=None, lyrics=True):
     for i, (bar, beat, dur, pitch, syl) in enumerate(data):
         track.note(b(start_bar + bar - 1, beat), dur, pitch + transpose, vel,
-                   lyric=(words[i] if words else syl))
+                   lyric=((words[i] if words else syl) if lyrics else None))
+
+
+def put_topline(whi, hrp, rho):
+    """인스트루멘털 전용 — 보컬이 빠진 자리에서 누가 선율을 이어받는가.
+
+    휘슬에 전부 맡기면 3분 내내 시그니처가 노출돼 라이트모티프가 특별하지 않게 된다.
+    벌스·프리는 하프(옥타브 위), 코러스는 휘슬(제자리), 브릿지는 로즈(옥타브 위),
+    마지막 코러스 앞 4마디(낙사비)는 로즈 단독 — 보컬판의 편성 의도를 그대로 따른다.
+    """
+    sub = lambda data, bars: [d for d in data if d[0] in bars]
+    for sb in (5, 29):
+        put_mel(hrp, VERSE_MEL, sb, 68, transpose=12, lyrics=False)
+    for sb in (13, 37):
+        put_mel(hrp, PRE_MEL, sb, 70, transpose=12, lyrics=False)
+    for sb in (17, 41):
+        put_mel(whi, CHORUS_MEL, sb, 88, lyrics=False)
+    put_mel(rho, BRIDGE_MEL, 53, 78, transpose=12, lyrics=False)
+    put_mel(rho, sub(CHORUS_MEL, {1, 2, 3, 4}), 61, 76, transpose=2, lyrics=False)
+    put_mel(whi, sub(CHORUS_MEL, {5, 6, 7, 8}), 61, 92, transpose=2, lyrics=False)
 
 
 def put_motif(track, start_bar, vel=88, transpose=0, octave=0, expressive=False):
@@ -523,7 +542,7 @@ def build_drums(dr):
             dr.note(b(60, 3.5), 0.5, S, 118)
 
 
-def make_tracks(with_melody=True, with_rhythm=True):
+def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     RNG.seed(SEED)                                           # 호출마다 같은 흔들림
     voc = Track('Lead Vocal (guide)', 54, 0)
     hlo = Track('Vocal Harmony (3rd below)', 54, 7)
@@ -611,6 +630,8 @@ def make_tracks(with_melody=True, with_rhythm=True):
                 voic = CH[name][0]
                 strs.chord(beat, dur, [voic[0] + 12, voic[2] + 12], 54 if bar >= 73 else 66)
 
+    if topline:
+        put_topline(whi, hrp, rho)
     return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr]
 
 
@@ -633,8 +654,10 @@ if __name__ == '__main__':
     write_midi(os.path.join(OUT, '03_full.mid'), tracks)
     write_midi(os.path.join(OUT, '04_vocals.mid'),          # -> Synthesizer V (Mai 2)
                [t for t in tracks if 'Vocal' in t.name])
-    write_midi(os.path.join(OUT, '05_instruments.mid'),     # -> DAW
+    write_midi(os.path.join(OUT, '05_instruments.mid'),     # -> DAW (보컬판의 반주)
                [t for t in tracks if 'Vocal' not in t.name])
+    write_midi(os.path.join(OUT, '06_instrumental.mid'),    # -> 인스트 (선율을 악기가 이어받는다)
+               [t for t in make_tracks(topline=True) if t.ev and 'Vocal' not in t.name])
 
     total = 76 * 4 * 60 / BPM
     KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
