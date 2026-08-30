@@ -2,6 +2,8 @@
 
 기획서: [`../song-plan-moongate.md`](../song-plan-moongate.md)
 빌더: [`moongate_build.py`](moongate_build.py) — `python3 moongate_build.py` 로 MIDI 3종 재생성
+검사: [`check.py`](check.py) — 빌드 후 `python3 check.py`
+사전 점검 프로토콜 · 잔여 작업: [`PREFLIGHT.md`](PREFLIGHT.md)
 
 | 파일 | 단계 | 내용 |
 |---|---|---|
