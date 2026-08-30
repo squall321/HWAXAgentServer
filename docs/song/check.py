@@ -164,6 +164,20 @@ for name, ps in played.items():
           f'{name}: {nm(lo)}–{nm(hi)} (스펙 {nm(slo)}–{nm(shi)})' + (f' — {why}' if why else ''))
     check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)
 
+print('\n[9] 휴머나이즈 — 악기만 흔들렸고 보컬은 격자 위에 있는가')
+GRID = div // 4                                    # 16분음표
+for name, ev, _t, _l in tracks:
+    ons = [(t, b2) for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0]
+    if not ons:
+        continue
+    off = sum(1 for t, _v in ons if t % GRID) / len(ons)
+    vels = {v for _t, v in ons}
+    if 'Vocal' in name:
+        check(off == 0, f'{name}: 전 노트가 16분 격자 위 (휴머나이즈 금지 — SynthV 가 처리한다)')
+    elif name in mg.GROOVE:
+        check(off > 0 or len(vels) > 3,
+              f'{name}: 격자 이탈 {off * 100:.0f}% · 벨로시티 {len(vels)}종')
+
 print('\n[3] 섹션 타임코드 · 전체 길이')
 sec_per_bar = 4 * 60 / mg.BPM
 for label, rng in mg.SECTIONS.items():

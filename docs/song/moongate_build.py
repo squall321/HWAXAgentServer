@@ -9,7 +9,7 @@
 D major / 112 BPM / 76마디(≈2:43), 마지막 코러스와 아웃트로만 E major.
 의존성 없음(표준 라이브러리만). 실행: python3 moongate_build.py
 """
-import os, struct
+import os, random, struct
 
 PPQ = 480
 BPM = 112
@@ -18,6 +18,24 @@ BPM = 112
 # 보컬이 정해지면 이 값 하나만 바꾼다 — 드럼을 뺀 모든 파트가 따라 움직인다.
 # 어떤 값이 그 가수에게 맞는지는 `python3 check.py --fit <최저음> <최고음>` 이 알려준다.
 TRANSPOSE = 0
+
+# ── 휴머나이즈 ────────────────────────────────────────────────
+# 보컬 트랙에는 걸지 않는다. 피치 드리프트·비브라토는 Synthesizer V 가 생성하므로
+# 여기서 흔들면 이중으로 흔들린다. 악기 트랙만 대상. (VOCAL-MAI2.md 참조)
+# 시드를 고정해 빌드가 재현 가능하게 둔다 — 매번 달라지면 검사도 믹스도 의미가 없다.
+SEED = 20260830
+RNG = random.Random(SEED)
+
+# shift: 박 단위 선후(+는 뒤로) / swing8·swing16: 뒷박 밀기 / vel: 벨로시티 흔들기 / len: 길이 흔들기
+GROOVE = {
+    'Guitar (16th chops)': dict(shift=+0.005, swing16=0.035, vel=10, len=0.30),
+    'Drums':               dict(shift=0.0,    swing8=0.020,  vel=8,  len=0.10),
+    'Bass':                dict(shift=-0.015,                vel=7,  len=0.12),
+    'Rhodes':              dict(shift=+0.010,                vel=8,  len=0.15),
+    'Celtic Harp':         dict(shift=+0.008,                vel=12, len=0.20),
+    'Strings':             dict(shift=+0.020,                vel=6,  len=0.08),
+    'Signature Whistle':   dict(shift=+0.012,                vel=6,  len=0.10),
+}
 OUT = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────── MIDI 최소 구현
@@ -34,14 +52,31 @@ def vlq(n):
 class Track:
     def __init__(self, name, program=None, channel=0):
         self.name, self.program, self.ch = name, program, channel
+        self.groove = GROOVE.get(name, {})
         self.ev = []          # (tick, order, data)
+
+    def cc(self, beat, num, val):
+        self.ev.append((max(0, int(round(beat * PPQ))), 0.4,
+                        bytes([0xB0 | self.ch, num, max(0, min(127, int(val)))])))
 
     def note(self, beat, dur, pitch, vel=90, lyric=None):
         if pitch is None:
             return
         if self.ch != 9:                       # 드럼맵은 조옮김하지 않는다
             pitch += TRANSPOSE
-        t0 = int(round(beat * PPQ))
+        g = self.groove
+        if g:                                  # 악기 트랙만 흔든다 (보컬은 GROOVE 에 없다)
+            pos = round(beat % 1.0, 4)
+            if pos == 0.5:
+                beat += g.get('swing8', 0.0)
+            elif pos in (0.25, 0.75):
+                beat += g.get('swing16', 0.0)
+            beat = max(0.0, beat + g.get('shift', 0.0))
+            if g.get('vel'):
+                vel = max(1, min(127, vel + RNG.randint(-g['vel'], g['vel'])))
+            if g.get('len'):
+                dur *= 1.0 + RNG.uniform(-g['len'], g['len'])
+        t0 = max(0, int(round(beat * PPQ)))
         t1 = max(t0 + 20, int(round((beat + dur) * PPQ)) - 8)   # 살짝 띄어 레가토 방지
         self.ev.append((t1, 0, bytes([0x80 | self.ch, pitch, 0])))
         if lyric:                              # Synthesizer V 가 임포트 시 읽어가는 가사 이벤트
@@ -353,9 +388,23 @@ def put_mel(track, data, start_bar, vel=95, transpose=0, words=None):
                    lyric=(words[i] if words else syl))
 
 
-def put_motif(track, start_bar, vel=88, transpose=0, octave=0):
+def put_motif(track, start_bar, vel=88, transpose=0, octave=0, expressive=False):
     for beat, dur, pitch in MOTIF:
-        track.note(b(start_bar, beat), dur, pitch + transpose + 12 * octave, vel)
+        bt = b(start_bar, beat)
+        p = pitch + transpose + 12 * octave
+        if expressive and dur >= 2.0:                        # 켈틱 '컷': 롱톤 앞의 아주 짧은 윗음.
+            track.note(bt, 0.07, p + 2, max(1, vel - 18))    # 이게 없으면 휘슬이 신스처럼 들린다
+            bt += 0.07
+            dur -= 0.07
+        track.note(bt, dur, p, vel)
+        if not expressive:
+            continue
+        track.cc(bt, 11, 88)                                 # 숨: 음 안에서 살짝 부풀린다
+        track.cc(bt + dur * 0.55, 11, 108)
+        if dur >= 1.5:                                       # 롱톤에만 비브라토를 늦게 얹는다
+            for i in range(7):
+                track.cc(bt + dur * 0.45 + dur * 0.5 * i / 6, 1, int(52 * i / 6))
+            track.cc(bt + dur, 1, 0)
 
 
 def build_chords(rhodes, gtr, bass):
@@ -364,6 +413,8 @@ def build_chords(rhodes, gtr, bass):
         bar = bar_of(beat)
         quiet = in_(beat, 'intro') or (61 <= bar <= 64) or (53 <= bar <= 56)
         # 로즈: 섹션 첫 박에 지속 + 8분 백비트 반복
+        rhodes.cc(beat, 64, 127)                             # 코드마다 페달 밟고
+        rhodes.cc(beat + dur - 0.08, 64, 0)                  # 다음 코드 직전에 뗀다
         rhodes.chord(beat, dur, voic, 58 if quiet else 68)
         if not quiet and dur >= 4.0:
             rhodes.chord(beat + 2.5, 1.0, voic, 52)
@@ -442,6 +493,7 @@ def build_drums(dr):
 
 
 def make_tracks(with_melody=True, with_rhythm=True):
+    RNG.seed(SEED)                                           # 호출마다 같은 흔들림
     voc = Track('Lead Vocal (guide)', 54, 0)
     hlo = Track('Vocal Harmony (3rd below)', 54, 7)
     hhi = Track('Vocal Harmony (3rd above)', 54, 8)
@@ -459,7 +511,7 @@ def make_tracks(with_melody=True, with_rhythm=True):
 
     if with_melody:
         # 인트로: 휘슬 모티프 + 하프 아르페지오
-        put_motif(whi, 1, 84)
+        put_motif(whi, 1, 84, expressive=True)
         for beat, dur, name in PROG:
             if in_(beat, 'intro', 'bridge') or 69 <= bar_of(beat) <= 76:
                 voic = CH[name][0]
@@ -479,7 +531,7 @@ def make_tracks(with_melody=True, with_rhythm=True):
                    + [(b(25) + bt, d, p) for bt, d, p, _s in POST_TAG]
         post_syl = {round(b(25) + bt, 3): sl for bt, _d, _p, sl in POST_TAG}
         for sb, evs in ((25, post_voc), (49, move(post_voc, 24))):
-            put_motif(whi, sb, 92)
+            put_motif(whi, sb, 92, expressive=True)
             for bt, d, p in evs:
                 voc.note(bt, d, p, 84, lyric=post_syl.get(round(bt - (sb - 25) * 4, 3), 'oh'))
         # 2회차 포스트코러스만 3도 아래로 갈라 두께를 준다 (1회차는 유니즌으로 남긴다)
@@ -511,8 +563,8 @@ def make_tracks(with_melody=True, with_rhythm=True):
         for o, d, p in ((3.0, 0.5, 71), (3.5, 0.5, 73)):
             whi.note(b(60, o), d, p, 96)
         # 아웃트로: 모티프 2회 (E major)
-        put_motif(whi, 69, 94, transpose=2)
-        put_motif(whi, 73, 84, transpose=2)
+        put_motif(whi, 69, 94, transpose=2, expressive=True)
+        put_motif(whi, 73, 84, transpose=2, expressive=True)
         # 스트링스: 브릿지 후반 · 마지막 코러스 · 아웃트로
         for beat, dur, name in PROG:
             bar = bar_of(beat)
@@ -537,13 +589,17 @@ if __name__ == '__main__':
     write_midi(os.path.join(OUT, '02_structure.mid'),
                [t for t in make_tracks(with_melody=False) if t.ev])
 
-    # STEP 3~6 — 전곡
-    write_midi(os.path.join(OUT, '03_full.mid'),
-               [t for t in make_tracks() if t.ev])
+    # STEP 3~6 — 전곡, 그리고 작업 흐름에 맞춘 분리본
+    tracks = [t for t in make_tracks() if t.ev]
+    write_midi(os.path.join(OUT, '03_full.mid'), tracks)
+    write_midi(os.path.join(OUT, '04_vocals.mid'),          # -> Synthesizer V (Mai 2)
+               [t for t in tracks if 'Vocal' in t.name])
+    write_midi(os.path.join(OUT, '05_instruments.mid'),     # -> DAW
+               [t for t in tracks if 'Vocal' not in t.name])
 
     total = 76 * 4 * 60 / BPM
     KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
     key = KEYS[(2 + TRANSPOSE) % 12]
-    print(f'wrote 01_motif.mid / 02_structure.mid / 03_full.mid  —  76 bars, '
+    print(f'wrote 01~05.mid  —  76 bars, '
           f'{int(total // 60)}:{int(total % 60):02d} @ {BPM}BPM, '
           f'key {key} major (TRANSPOSE={TRANSPOSE:+d})')
