@@ -31,7 +31,7 @@ def check(ok, msg, hard=True):
 # (트랙, 이 곡에서 써도 되는 음역, 악기의 물리적 음역, 근거)
 RANGES = {
     'Lead Vocal (guide)':        ((62, 76), (55, 79), '여성 메조: D4–E5. E5 는 전조 후 클라이맥스 한 음'),
-    'Vocal Harmony (3rd below)': ((55, 71), (55, 79), '같은 가수가 겹녹음 — 저역은 흉성 한계 G3'),
+    'Vocal Harmony (3rd below)': ((55, 73), (55, 79), '같은 가수가 겹녹음. 상한 C#5 = 킬 포인트 D5 의 3도 아래가 전조로 올라간 값'),
     'Vocal Harmony (3rd above)': ((62, 76), (55, 79), '리드 상한을 넘지 않는다'),
     'Signature Whistle':         ((62, 86), (62, 86), '★로우 D 휘슬 D4–D6. 일반 틴휘슬은 D5 가 최저음'),
     'Rhodes':                    ((40, 88), (28, 100), 'MK1'),
@@ -226,7 +226,9 @@ for key in sorted(found):
 check(not (found - set(ACCEPTED) - lead_rubs), '미승인 반음 충돌 없음')
 
 print('\n[6] 가사 음절 그리드 — 1절 대 2절')
-per_bar = collections.Counter(bar for bar, *_ in mg.VERSE_MEL)
+# 당김 음(3.5박)은 뒤따르는 마디의 프레이즈에 속한다 — 그렇게 세야 가사 그리드가 맞는다
+per_bar = collections.Counter(bar + (1 if beat >= 3.5 else 0)
+                              for bar, beat, *_ in mg.VERSE_MEL)
 v2 = mg.VERSE2_WORDS[:]
 ok = True
 for bar in sorted(per_bar):
