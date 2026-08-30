@@ -2146,9 +2146,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 신규 좌석 앵커링 차단(F12) — 재심사로 새로 합류한 좌석에게 이전 결론을 먼저 읽히면
     # 동조 압력을 받아 '새 관점을 얻으려고 불렀다'는 목적이 사라진다. 1라운드에 한해 이전 요약을
     # 감추고 독립 판단을 받는다. 그 판단이 기존 결론과 충돌하면 그게 이어하기의 최대 소득이다.
-    _cont_blind = ""
-    if opts.human_note:
-        _cont_blind = (f"\n[인간 검토자 의견 — 이번 심의에서 반드시 반영하라]\n{opts.human_note}\n")
+    # 요약(이전 결론)은 감추되(앵커링 차단) 양보 불가 조항은 유지한다 — 조항은 매 라운드 구속력이라
+    # 1R 에도 빠지면 안 된다(base 의 cont·JS BASE_BLIND 와 정합). human_note 도 유지. 요약만 뺀다.
+    _cont_blind = _cont_block("", opts.continue_non_negotiables, opts.human_note)
     base_blind = (f"[심의 주제]\n{question}\n" + _cont_blind + _tail +
                   "\n[안내] 당신은 이번 회차에 새로 합류했다. 이전 논의 결과는 의도적으로 제공하지 "
                   "않는다 — 먼저 당신 도메인의 독립적 판단을 내라. 다음 라운드에서 이전 결론을 받는다.\n")

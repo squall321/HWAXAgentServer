@@ -148,11 +148,15 @@ def test_시뮬_트리거를_떼어낸다():
     assert d.strip_sim_trigger("/시뮬심의  액자형 수축") == "액자형 수축"
 
 
-def test_의장_템플릿_4종이_있고_기본은_종전이다():
-    """미지정이 종전과 같아야 기존 심의에 회귀가 없다."""
-    assert set(d._CHAIR_ITEMS) == {"default", "mechanism", "sim-plan", "test-plan"}
+def test_의장_템플릿_8종이_있고_기본은_종전이다():
+    """미지정이 종전(default)과 같아야 기존 심의에 회귀가 없다. 신규 3종·build-plan 미러 포함(JS 와 정합)."""
+    assert set(d._CHAIR_ITEMS) == {
+        "default", "mechanism", "sim-plan", "test-plan",
+        "diagnosis", "option-select", "credibility", "build-plan",
+    }
     assert d._resolve_opts({}).chair_template == "default"
     assert d._resolve_opts({"chair_template": "sim-plan"}).chair_template == "sim-plan"
+    assert d._resolve_opts({"chair_template": "credibility"}).chair_template == "credibility"
 
 
 def test_모르는_템플릿은_기본으로_떨어진다():
@@ -194,10 +198,11 @@ def test_좌석_손잡이는_기본_켜짐이고_탈출구가_있다():
 
 
 def test_깊이_회복_손잡이는_기본_꺼짐을_유지한다():
-    """단일 변수 A/B 원칙(GLM-DELIB-TUNING-REVIEW §T-서열) — 임의 활성화 금지."""
-    for name in ("_EVIDENCE_PREPASS", "_REBUT_QUOTE", "_PROSE_FIRST", "_CROSS_EXAM",
-                 "_ANCHOR", "_CHAIR_CITE"):
+    """단일 변수 A/B 원칙(GLM-DELIB-TUNING-REVIEW §T-서열) — 임의 활성화 금지.
+    _REBUT_QUOTE 는 인용 반박 계약이 운영 표준으로 승격돼 기본 ON(deliberation.py:86-87)이라 제외한다."""
+    for name in ("_EVIDENCE_PREPASS", "_PROSE_FIRST", "_CROSS_EXAM", "_ANCHOR", "_CHAIR_CITE"):
         assert getattr(d, name) == 0, f"{name} 이 켜져 있다 — A/B 판정이 오염된다"
+    assert d._REBUT_QUOTE == 1  # 의도된 기본 ON(운영 표준) — 끄려면 DELIB_REBUT_QUOTE=0
     assert d._CHAIR_BESTOF == 1
 
 
@@ -244,10 +249,53 @@ def test_시험계획서_템플릿이_우선순위와_미확보를_강제한다(
     assert "먼저 착수" in t
 
 
-def test_시험계획_고정좌석이_셋다_있다():
-    """계측이 빠지면 못 재는 것을 계획하고, 해석이 빠지면 안 중요한 것을 1순위로 올리고,
-    일정이 빠지면 전부 1순위가 된다."""
-    assert len(d._TEST_FIXED) == 3
+def test_시험계획_고정좌석이_다섯_있다():
+    """계측·해석·프로그램에 더해 sim 상관·통계신뢰성까지 5석 고정(스파인 보강). 하나라도 빠지면
+    못 재는 것을 계획하거나·안 중요한 것을 1순위로 올리거나·대조 대상 없는 시험이 된다."""
+    assert len(d._TEST_FIXED) == 5
     assert any("test" in k or "measure" in k for k in d._TEST_FIXED)
     assert any("cae" in k for k in d._TEST_FIXED)
     assert any("program" in k for k in d._TEST_FIXED)
+    assert any("correlation" in k for k in d._TEST_FIXED)         # sim 상관 계약
+    assert any("stats" in k or "reliab" in k for k in d._TEST_FIXED)  # 통계·신뢰성
+
+
+# ── 심의 방법 메뉴 — 신규 Job 엔진·얹을 층·지정 좌석·1R 블라인드 (2026-08) ─────────────
+def test_신규_Job_엔진_3종이_비어있지_않다():
+    for k in ("diagnosis", "option-select", "credibility"):
+        assert k in d._CHAIR_ITEMS and d._CHAIR_ITEMS[k].strip()
+
+
+def test_지정_반대석은_신규_Job_에만_있다():
+    """credibility=red-team, diagnosis=반증, option-select=반대. 좌석 구조로 반대 역할 보장."""
+    assert set(d._CHAIR_ADVERSARY) == {"credibility", "diagnosis", "option-select"}
+    assert d._CHAIR_ADVERSARY["credibility"]["key"] == "delib-redteam"
+    for v in d._CHAIR_ADVERSARY.values():
+        assert v["role"].strip() and v["key"].startswith("delib-")
+
+
+def test_얹을_층_화이트리스트_dedup_cap():
+    """중복 제거·순서 보존·화이트리스트·최대 5(JS MOD_LIST 와 정합)."""
+    o = d._resolve_opts({"modifiers": ["voi", "voi", "없는것", "premortem", "toulmin",
+                                       "eliminative", "anon1r", "voi"]})
+    assert o.modifiers == ["voi", "premortem", "toulmin", "eliminative", "anon1r"]
+    assert d._resolve_opts({}).modifiers == []
+    assert d._resolve_opts({"modifiers": "문자열"}).modifiers == []
+
+
+def test_얹을_층_주입_블록은_켠_것만_담고_모르는_건_버린다():
+    note = d._modifier_note(["voi", "없는것", "premortem"])
+    assert "얹을 층" in note and "교착 정산" in note and "사전부검" in note
+    assert "없는것" not in note
+    assert d._modifier_note([]) == "" and d._modifier_note(None) == ""
+
+
+def test_1R_블라인드는_요약만_감추고_양보불가_조항은_유지한다():
+    """FINDING #1 회귀 가드 — base_blind 가 쓰는 _cont_block('', 조항, human) 은 요약을 감추되
+    조항은 유지해야 한다. 조항은 매 라운드 구속력이라 1R 블라인드에서도 빠지면 안 된다(JS BASE_BLIND 정합)."""
+    blind = d._cont_block("", ["저온 UTG 두께 0.03T 유지"], "사람 의견")
+    assert "저온 UTG 두께" in blind          # 조항 유지
+    assert "구속력을 가진다" in blind          # 구속 문구 유지
+    assert "[이전 심의 요약" not in blind      # 요약은 감춤(앵커링 차단)
+    assert "사람 의견" in blind               # human_note 유지
+    assert d._cont_block("", [], "") == ""     # 조항·요약·human 모두 없으면 빈 문자열(무해)
