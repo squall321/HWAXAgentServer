@@ -385,6 +385,8 @@ def _resolve_opts(req_opts):
         chair_template="default",
         # 얹을 층(2층 Modifier) — 심의 굴리는 방식 오버레이. chairTemplate 무관하게 합성한다(0~5개).
         modifiers=[],
+        # 시뮬 심의(/시뮬심의)에서 1=2단(해석 계획) 뒤 3단 구축 계획까지 이어 만든다(기본 꺼짐).
+        build_plan=0,
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
         # 사용자 지정 앱 — 전문가 자유 조회 범위를 이 앱들로 좁힌다. delib_tools 처럼 전량 호출하지
@@ -401,7 +403,7 @@ def _resolve_opts(req_opts):
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
-                  "free_tools", "tool_budget", "stop_after_round"):
+                  "free_tools", "tool_budget", "stop_after_round", "build_plan"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -1665,6 +1667,19 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     해석이 물리에서 떠나는 것을 막는 감시자다."""
     opts = _resolve_opts(req_opts)
     decision_a, personas_a, nn_a = "", [], []
+    decision_b = ""  # 2단(해석 계획) 결정문 — 3단 구축 계획(build_plan) 승계용
+
+    def _capture_b(chunk: bytes):
+        """2단 스트림에서 해석 계획 결정문을 가로챈다(3단 구축 계획 입력)."""
+        nonlocal decision_b
+        try:
+            if not chunk.startswith(b"data:"):
+                return
+            ev = json.loads(chunk[5:].decode("utf-8").strip())
+        except Exception:  # noqa: BLE001
+            return
+        if ev.get("kind") == "decision":
+            decision_b = ev.get("text") or decision_b
 
     def _capture(chunk: bytes):
         """1단 스트림에서 결정문·좌석·양보 불가 조항을 가로챈다(2단 입력)."""
@@ -1745,7 +1760,26 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat):
+            _capture_b(chunk)
             yield chunk
+
+        # ── 3단 — 구축 계획 심의 (opt-in: build_plan) ─────────────────────────────
+        # 2단 해석 계획을 그 문제에 특화된 반복 파라메트릭 모듈로 "구축"하는 계획까지. 2단 결정문
+        # (sim_spec 포함)을 승계로 넘기고 CAE 좌석을 유임한다(carry — 3단 입력이라 가리지 않는다).
+        # build-plan 템플릿이 12항목 산출을 강제한다. build_plan 이 꺼져 있으면 종전 2단 동작 그대로.
+        if opts.build_plan and decision_b:
+            yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
+            opts_c = _resolve_opts(req_opts)
+            opts_c.chair_template = "build-plan"
+            opts_c.continue_summary = decision_b[:20000]
+            opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
+                                        for s in sim_seats]
+            opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
+                                 "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
+            build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
+                       f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
+            async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat):
+                yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[sim-deliberation] fatal: {exc!r}")
         yield _sse("error", {"code": "sim_deliberation_error",

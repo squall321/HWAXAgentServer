@@ -299,3 +299,10 @@ def test_1R_블라인드는_요약만_감추고_양보불가_조항은_유지한
     assert "[이전 심의 요약" not in blind      # 요약은 감춤(앵커링 차단)
     assert "사람 의견" in blind               # human_note 유지
     assert d._cont_block("", [], "") == ""     # 조항·요약·human 모두 없으면 빈 문자열(무해)
+
+
+def test_구축계획_3단_플래그_파싱():
+    """구축 계획 유형 — /시뮬심의 에서 build_plan=1 이면 2단(해석 계획) 뒤 3단(build-plan)까지. 기본 꺼짐."""
+    assert d._resolve_opts({}).build_plan == 0            # 종전 동작(2단까지)
+    assert d._resolve_opts({"build_plan": 1}).build_plan == 1
+    assert d._resolve_opts({"build_plan": "1"}).build_plan == 1  # 신뢰 안 되는 값도 int 강제
