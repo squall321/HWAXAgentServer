@@ -19,6 +19,24 @@ BPM = 112
 # 어떤 값이 그 가수에게 맞는지는 `python3 check.py --fit <최저음> <최고음>` 이 알려준다.
 TRANSPOSE = 0
 
+# ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
+# GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
+# 트랙 이름(FF 03)과 별개로 **악기 이름(FF 04)** 이 있어서, 어떤 음색을 의도했는지
+# 파일 안에 남길 수 있다. GM 프로그램은 그대로 두어 폴백으로 쓴다.
+# 자세한 후보 라이브러리는 INSTRUMENTS.md.
+INSTRUMENTS = {
+    'Lead Vocal (guide)':        'Synthesizer V AI - Mai 2 (English; vocal mode per section)',
+    'Vocal Harmony (3rd below)': 'Synthesizer V AI - Mai 2 (Breathy, under lead)',
+    'Vocal Harmony (3rd above)': 'Synthesizer V AI - Mai 2 (Breathy, under lead)',
+    'Signature Whistle':         'LOW D WHISTLE (bottom note D4) - NOT a standard tin whistle',
+    'Rhodes':                    'Rhodes MK1 electric piano, tremolo; DX7 EP layer for attack',
+    'Guitar (16th chops)':       'Clean Strat + compressor, 16th-note chops, 9th/11th voicings',
+    'Bass':                      'Fingered P-bass, or round analog synth bass',
+    'Celtic Harp':               'Celtic lever harp',
+    'Strings':                   'Small chamber string section (or synth strings)',
+    'Drums':                     'Dry acoustic kit, minimal room (GM drum map)',
+}
+
 # ── 휴머나이즈 ────────────────────────────────────────────────
 # 보컬 트랙에는 걸지 않는다. 피치 드리프트·비브라토는 Synthesizer V 가 생성하므로
 # 여기서 흔들면 이중으로 흔들린다. 악기 트랙만 대상. (VOCAL-MAI2.md 참조)
@@ -91,6 +109,9 @@ class Track:
     def to_bytes(self):
         data = bytearray()
         data += b'\x00\xff\x03' + vlq(len(self.name)) + self.name.encode()
+        want = INSTRUMENTS.get(self.name)
+        if want:                               # FF 04 = Instrument Name (의도한 음색)
+            data += b'\x00\xff\x04' + vlq(len(want)) + want.encode()
         if self.program is not None:
             data += b'\x00' + bytes([0xC0 | self.ch, self.program])
         prev = 0

@@ -6,6 +6,7 @@
 분석: [`analyze.py`](analyze.py) — 킬 포인트·당김/밀기·밀도·공백·베이스 충돌
 사전 점검 프로토콜 · 잔여 작업: [`PREFLIGHT.md`](PREFLIGHT.md)
 보컬(Synthesizer V Mai 2): [`VOCAL-MAI2.md`](VOCAL-MAI2.md)
+악기 지정: [`INSTRUMENTS.md`](INSTRUMENTS.md)
 
 | 파일 | 단계 | 내용 |
 |---|---|---|

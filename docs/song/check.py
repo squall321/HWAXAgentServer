@@ -59,13 +59,15 @@ def parse(path):
     for _ in range(ntrk):
         assert d[i:i + 4] == b'MTrk', 'MTrk 없음'
         ln = struct.unpack('>I', d[i + 4:i + 8])[0]; i += 8; end = i + ln
-        t, name, run, ev, lyr = 0, '', None, [], []
+        t, name, run, ev, lyr, inst = 0, '', None, [], [], []
         while i < end:
             dt, i = vlq(i); t += dt; s = d[i]
             if s == 0xFF:
                 mt = d[i + 1]; l, j = vlq(i + 2)
                 if mt == 0x03:
                     name = d[j:j + l].decode('utf8', 'replace')
+                if mt == 0x04:
+                    inst.append(d[j:j + l].decode('utf8', 'replace'))
                 if mt == 0x05:
                     lyr.append(d[j:j + l].decode('utf8', 'replace'))
                 i = j + l; continue
@@ -79,7 +81,7 @@ def parse(path):
             elif k in (0xC0, 0xD0):
                 i += 1
         assert i == end, '트랙 길이 불일치'
-        out.append((name, ev, t, lyr))
+        out.append((name, ev, t, lyr, inst))
     return div, out
 
 
@@ -132,7 +134,7 @@ if len(sys.argv) > 1 and sys.argv[1] == '--fit':
 print('\n[1] MIDI 구조 · 미결 노트')
 div, tracks = parse(os.path.join(HERE, '03_full.mid'))
 played = {}
-for name, ev, _, _l in tracks:
+for name, ev, _, _l, _i in tracks:
     hung = collections.Counter(); orphan = 0; ps = []
     for t, k, ch, a, b2 in ev:
         if k == 0x90 and b2 > 0:
@@ -147,7 +149,7 @@ for name, ev, _, _l in tracks:
         check(sum(hung.values()) == 0 and orphan == 0, f'{name}: 노트 온/오프 정합')
 
 print('\n[8] 가사 이벤트 커버리지 — Synthesizer V 임포트용')
-for name, ev, _t, lyr in tracks:
+for name, ev, _t, lyr, _i in tracks:
     if 'Vocal' not in name:
         continue
     notes = sum(1 for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0)
@@ -164,9 +166,16 @@ for name, ps in played.items():
           f'{name}: {nm(lo)}–{nm(hi)} (스펙 {nm(slo)}–{nm(shi)})' + (f' — {why}' if why else ''))
     check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)
 
+print('\n[10] 의도한 악기 이름(FF 04) 이 파일에 남아 있는가')
+for name, ev, _t, _l, inst in tracks:
+    if not any(k == 0x90 and b2 > 0 for _tt, k, _c, _a, b2 in ev):
+        continue
+    check(len(inst) == 1 and inst[0] == mg.INSTRUMENTS.get(name),
+          f'{name}: {inst[0] if inst else "★없음"}')
+
 print('\n[9] 휴머나이즈 — 악기만 흔들렸고 보컬은 격자 위에 있는가')
 GRID = div // 4                                    # 16분음표
-for name, ev, _t, _l in tracks:
+for name, ev, _t, _l, _i in tracks:
     ons = [(t, b2) for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0]
     if not ons:
         continue
