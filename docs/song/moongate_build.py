@@ -160,6 +160,79 @@ def in_(beat, *names):
     return any(bar in SECTIONS[n] for n in names)
 
 
+# ─────────────────────────────────────────────── 화성(하모니) 생성기
+# D major 음계 위의 3도 화음. 단, 3도가 그 자리 화음의 구성음이 아니면
+# (예: D6/9 위의 G = 회피음) 한 음 더 비켜나 4도가 된다.
+
+SCALE_D = {2, 4, 6, 7, 9, 11, 1}                       # D E F# G A B C#
+SCALE_P = sorted(p for p in range(36, 96) if p % 12 in SCALE_D)
+
+CHORD_PC = {                                            # 화음별 허용 음(9th·13th 색채 포함)
+    'Gmaj9':  {7, 11, 2, 6, 9},   'A7':      {9, 1, 4, 7, 11},
+    'F#m9':   {6, 9, 1, 4, 8},    'Bm9':     {11, 2, 6, 9, 1},
+    'D69':    {2, 6, 9, 11, 4},   'A7sus4':  {9, 2, 4, 7, 11},
+    'Em9':    {4, 7, 11, 2, 6},   'A13':     {9, 1, 4, 7, 11, 6},
+    'B7b13':  {11, 3, 6, 9, 1, 7},'C#m7b5':  {1, 4, 7, 11},
+    'F#7b9':  {6, 10, 1, 4, 7},   'D/F#':    {2, 6, 9, 4},
+    'Gm6':    {7, 10, 2, 4},
+}
+
+_SPANS = [(bt, bt + dur, nm) for bt, dur, nm in PROG]
+
+
+def chord_at(beat):
+    for st, en, nm in _SPANS:
+        if st <= beat < en:
+            return nm
+    return None
+
+
+def _step(pitch, steps):
+    return SCALE_P[SCALE_P.index(pitch) + steps]
+
+
+def harmonize(events, below=True, ceiling=74, floor=57):
+    """(beat, dur, pitch) 리스트 -> 3도 하모니. 붙일 수 없는 음은 조용히 뺀다.
+
+    회피음이면 한 음 더 비켜나되, 상단 성부에 한해 **다음 음이 한 음 아래로 해결되면
+    그대로 둔다**(4-3 지연해결). 하단 성부에 같은 규칙을 쓰면 근음과 ♭9로 부딪힌다.
+    """
+    d = -1 if below else 1
+    src = [(bt, du, p) for bt, du, p in events if p % 12 in SCALE_D]  # 반음 색채음은 제외
+    raw = [_step(p, 2 * d) for _bt, _du, p in src]
+    fixed = []
+    for (bt, _du, _p), h in zip(src, raw):
+        tones = CHORD_PC.get(chord_at(bt))
+        fixed.append(_step(h, d) if (tones and h % 12 not in tones) else h)
+
+    out = []
+    for i, ((bt, du, _p), h) in enumerate(zip(src, raw)):
+        pick = fixed[i]
+        if (not below and pick != h and i + 1 < len(fixed) and fixed[i + 1] == _step(h, -1)
+                and all(abs(h - v) != 1 for v in CH[chord_at(bt)][0])):
+            pick = h                           # 지연해결이 되고, 울리는 보이싱과 반음이 아니면 매단다
+        tones = CHORD_PC.get(chord_at(bt))
+        if pick == h and tones and h % 12 not in tones and pick == fixed[i]:
+            continue                           # 비켜날 곳도 해결도 없으면 뺀다
+        if not (floor <= pick <= ceiling):     # 음역 밖이면 그 음은 쉰다
+            continue
+        out.append((bt, du, pick))
+    return out
+
+
+def mel_events(data, start_bar, transpose=0):
+    return [(b(start_bar + bar - 1, beat), dur, pitch + transpose)
+            for bar, beat, dur, pitch, _syl in data]
+
+
+def move(events, d_bars, d_pitch=0):
+    return [(bt + d_bars * 4, d, p + d_pitch) for bt, d, p in events]
+
+
+def between(events, first_bar, last_bar):
+    return [e for e in events if first_bar <= bar_of(e[0]) <= last_bar]
+
+
 # ─────────────────────────────────────────────── STEP 1 · 시그니처 모티프
 # "Feather Motif" — G△7|A7|F#m7|Bm7 위 4마디. (beat, dur, pitch)
 MOTIF = [
@@ -168,6 +241,11 @@ MOTIF = [
     (8.0, 1.5, 66), (9.5, 1.5, 74), (11.0, 0.5, 73), (11.5, 0.5, 71),  # F#4→D5 6도 도약
     (12.0, 1.0, 69), (13.0, 3.0, 71),                                  # A4 B4(롱톤)
 ]
+
+# 포스트코러스: 1~3마디는 휘슬과 유니즌 보칼리즈, 4마디는 가사가 붙은 태그로 갈라진다.
+# (휘슬은 B4 롱톤을 유지하고 보컬이 그 밑으로 내려간다 -> 다음 섹션 첫 음 E 로 연결)
+POST_TAG = [(12.0, 0.5, 69, 'moon'), (12.5, 0.5, 71, 'gate'), (13.0, 0.5, 69, 'take'),
+            (13.5, 0.5, 66, 'me'), (14.0, 2.0, 64, 'home')]
 
 # ─────────────────────────────────────────────── STEP 3~5 · 멜로디
 # (마디, 박, 길이, 음, 음절)
@@ -353,6 +431,8 @@ def build_drums(dr):
 
 def make_tracks(with_melody=True, with_rhythm=True):
     voc = Track('Lead Vocal (guide)', 54, 0)
+    hlo = Track('Vocal Harmony (3rd below)', 54, 7)
+    hhi = Track('Vocal Harmony (3rd above)', 54, 8)
     whi = Track('Signature Whistle', 73, 1)
     rho = Track('Rhodes', 4, 2)
     gtr = Track('Guitar (16th chops)', 27, 3)
@@ -382,10 +462,30 @@ def make_tracks(with_melody=True, with_rhythm=True):
         put_mel(voc, CHORUS_MEL, 41)
         put_mel(voc, BRIDGE_MEL, 53)
         put_mel(voc, CHORUS_MEL, 61, transpose=2)          # ★전조 +2도
-        # 포스트코러스: 휘슬 + 보컬 보칼리즈 유니즌
-        for sb in (25, 49):
+        # 포스트코러스: 휘슬 + 보컬. 4마디째는 보칼리즈에서 가사 태그로 갈라진다.
+        post_voc = [(b(25) + bt, d, p) for bt, d, p in MOTIF if bt < 12.0] \
+                   + [(b(25) + bt, d, p) for bt, d, p, _s in POST_TAG]
+        for sb, evs in ((25, post_voc), (49, move(post_voc, 24))):
             put_motif(whi, sb, 92)
-            put_motif(voc, sb, 80)
+            for bt, d, p in evs:
+                voc.note(bt, d, p, 84)
+        # 2회차 포스트코러스만 3도 아래로 갈라 두께를 준다 (1회차는 유니즌으로 남긴다)
+        for bt, d, p in move(harmonize(post_voc, below=True), 24):
+            hlo.note(bt, d, p, 68)
+
+        # 코러스 하모니 — 17~24마디 기준으로 계산해 두 번 옮겨 쓴다
+        ch = mel_events(CHORUS_MEL, 17)
+        lo, hi = harmonize(ch, below=True), harmonize(ch, below=False)
+        for bt, d, p in between(lo, 21, 24):                  # 코러스 1: 후반 4마디만
+            hlo.note(bt, d, p, 66)
+        for bt, d, p in move(lo, 24):                         # 코러스 2: 전체
+            hlo.note(bt, d, p, 72)
+        for bt, d, p in move(between(hi, 21, 24), 24):        # 코러스 2: 후반만 위로도
+            hhi.note(bt, d, p, 64)
+        for bt, d, p in move(between(lo, 21, 24), 44, 2):     # 마지막 코러스: 65~68마디만
+            hlo.note(bt, d, p, 76)                            # (61~64 낙사비는 리드 단독)
+        for bt, d, p in move(between(hi, 21, 24), 44, 2):
+            hhi.note(bt, d, p, 70)
         # 브릿지 56마디: 모티프의 하행 한숨을 Gm6 위 단조로 (하프)
         for o, p in ((0.0, 74), (1.0, 70), (2.0, 69), (3.0, 67)):
             hrp.note(b(56, o), 1.0, p, 70)
@@ -402,7 +502,7 @@ def make_tracks(with_melody=True, with_rhythm=True):
                 voic = CH[name][0]
                 strs.chord(beat, dur, [voic[0] + 12, voic[2] + 12], 54 if bar >= 73 else 66)
 
-    return [voc, whi, rho, gtr, bas, hrp, strs, dr]
+    return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr]
 
 
 if __name__ == '__main__':
