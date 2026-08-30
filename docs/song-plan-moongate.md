@@ -214,8 +214,16 @@ uncluttered mix. Cafe/boutique background music energy.
 > `song/01_motif.mid`(모티프) · `song/02_structure.mid`(구조 골격) · `song/03_full.mid`(전곡 8트랙),
 > 작업 일지와 전체 악보는 [`song/README.md`](song/README.md).
 
-## 10. 남은 결정 사항
+## 10. 결정 / 미결
 
-- 보컬 성별/음역 최종 확정(현 설계는 메조 기준)
-- 제목 후보: **Moongate** / *Feather Weather* / *Another Morning in Erinn*
-- 고유명사 사용 수위(현재 초고는 0개 — 원하면 Erinn/Tir Na Nog를 1회씩 삽입)
+**확정**
+
+- **고유명사 0개로 간다.** Erinn·Tir Na Nog 등을 넣으면 아는 사람에게만 열리는 곡이 되고,
+  카페·편집숍이라는 재생 환경에서 그건 손해다. 깃털·달문·모닥불·시장 같은 **이미지로만** 세계관을
+  전달한다 — 모르는 청자에게는 오래된 연인의 문장으로, 아는 청자에게는 환생 서사로 동시에 읽힌다.
+  (부수 효과: 게임의 가사·멜로디를 직접 참조하지 않으므로 권리 문제도 없다.)
+- 제목 **Moongate**. 후보였던 *Another Morning in Erinn* 은 위 원칙에 따라 탈락.
+
+**미결**
+
+- 보컬 성별/음역 최종 확정 (현 설계는 메조 기준, 최고음 D5 → 전조 후 E5)
