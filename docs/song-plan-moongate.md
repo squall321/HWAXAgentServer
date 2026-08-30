@@ -27,7 +27,7 @@
 | 박자 | 4/4 | — |
 | 길이 | **약 2:50** | 스트리밍/매장 회전율 모두에 맞는 현대 팝 길이 |
 | 보컬 | 여성(또는 중성적) 메조, 숨 섞인 근접 마이킹 | 세련됨 = 지르지 않는 발성 |
-| 최고음 | 코러스 B4 → 전조 후 **C#5** | 애니송식 롱톤 클라이맥스를 낼 수 있는 상한 |
+| 최고음 | 코러스 **D5**("moon") → 전조 후 **E5** | 제목 음절이 정점을 가져간다. 부담되면 그 음만 B4→C#5로 내려도 성립 |
 | 레퍼런스 | Dua Lipa "Levitating"의 그루브 + Jungle의 코드 톤 + 마비노기 OST의 관·현 음색 + 애니 OP의 사비 설계 | — |
 
 ---
@@ -142,16 +142,16 @@ one, two, and we begin
 Open the moongate, let the evening in,
 I have fallen a thousand times just to land here again.
 Give me one white feather and a reason to stay,
-and I'll find you in the morning of another day.
+and I'll find you in the morning of a new day.
 
 [Post-Chorus]  ← 시그니처 모티프와 유니즌
 Oh-oh, oh-oh-oh…  moongate, take me home.
 
-[Verse 2]
-The windmill on the hillside turning slow against the blue,
-a fire down by the water keeps the colder truths from you.
-The world can close on Sunday and still open up on Monday —
-and I'll be standing here, a little older, holding on.
+[Verse 2]   ← 1절과 마디당 음절 수를 맞춰 확정 (6/6/7/7/6/7/7/7)
+Smoke from the kettle rings, the market closing down;
+we camp beside the water and the fire keeps the cold out.
+The world can end Sunday and open up on Monday,
+and I'll still be standing here, growing older, holding on.
 
 [Bridge]
 If this is the last life, tell me now;
@@ -161,7 +161,7 @@ you were the reason I came back at all.
 
 [Final Chorus — 낙사비: 앞 4마디 피아노+보컬]
 Open the moongate, let the evening in…
-…and I'll find you in the mor—ning of another day.   ← C#5 롱톤 (2마디 유지)
+…and I'll find you in the mor—ning of a new day.   ← 전조 후 C#5 롱톤 (2박 유지)
 ```
 
 **이미지 뱅크(추가 개작용)**: 흰 깃털 / 달문 / 모닥불과 마시멜로 / 언덕의 양떼 /
@@ -209,6 +209,10 @@ motif over a city-pop groove. Anime-opening structure: strong post-chorus instru
 quiet piano-only start of the final chorus, key change up a whole step at the end. Clean, airy,
 uncluttered mix. Cafe/boutique background music energy.
 ```
+
+> **확정 산출물** — 위 설계는 `song/` 에 실제 MIDI로 조립되어 있다.
+> `song/01_motif.mid`(모티프) · `song/02_structure.mid`(구조 골격) · `song/03_full.mid`(전곡 8트랙),
+> 작업 일지와 전체 악보는 [`song/README.md`](song/README.md).
 
 ## 10. 남은 결정 사항
 

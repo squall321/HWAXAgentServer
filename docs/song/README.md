@@ -1,0 +1,187 @@
+# "Moongate" — 왕도적 작곡 순서 작업 일지 & 악보
+
+기획서: [`../song-plan-moongate.md`](../song-plan-moongate.md)
+빌더: [`moongate_build.py`](moongate_build.py) — `python3 moongate_build.py` 로 MIDI 3종 재생성
+
+| 파일 | 단계 | 내용 |
+|---|---|---|
+| `01_motif.mid` | STEP 1 | 시그니처 모티프 8마디 (휘슬 + 로즈) |
+| `02_structure.mid` | STEP 2 | 76마디 전체 구조 골격 — 코드·베이스·드럼만, 멜로디 없음 |
+| `03_full.mid` | STEP 3–6 | 전곡 8트랙 |
+
+**03_full.mid 트랙 구성** (괄호는 GM 프로그램)
+
+1 Lead Vocal 가이드 (54) · 2 Signature Whistle (73) · 3 Rhodes (4) ·
+4 Guitar 16th chops (27) · 5 Bass (33) · 6 Celtic Harp (46) · 7 Strings (48) · 8 Drums (ch10)
+
+> DAW에서 열고 각 트랙을 기획서 §5 음색 팔레트대로 교체하면 그대로 편곡 베드가 된다.
+> 휘슬은 틴/로우 휘슬, 로즈는 MK1, 스트링스는 소편성으로.
+
+---
+
+## 왕도 순서대로 실제 결정된 것
+
+### STEP 1 — 모티프 먼저 (외워지지 않으면 나머지는 무의미)
+
+4마디, `G△7 | A7 | F#m7 | Bm7` 위. 이 곡의 전부.
+
+```
+A4(♪) B4(♪) D5(롱톤 2박) | C#5 B4 A4 F#4 | F#4(♩.) → D5(♩. 6도 도약) C#5 B4 | A4 B4(롱톤 3박)
+```
+
+장치는 셋뿐 —
+① 1마디 상행 후 **D5 롱톤 착지**, ② 2마디 **하행 4음(C#–B–A–F#) 한숨**,
+③ 3마디 **F#4→D5 6도 도약**(F#m7 위의 D는 ♭13 → C#로 해결하는 애포지아투라 = JRPG 특유의 애수).
+음역 F#4~D5, 한 옥타브 미만 — 누구나 흥얼거릴 수 있는 상한.
+
+### STEP 2 — 구조를 시간으로 먼저 확정 (가사·멜로디 없이)
+
+76마디 / 112BPM / **2:42**. `02_structure.mid` 로 길이 감각을 먼저 검증했다.
+
+| 마디 | 섹션 | 편성 처리 |
+|---|---|---|
+| 1–4 | Intro | 휘슬 모티프 + 하프, 드럼 없음(셰이커만) |
+| 5–12 | Verse 1 | 브로큰 킥 + 림샷, 기타 16비트 커팅 |
+| 13–16 | Pre 1 | 16비트 하이햇 가속 |
+| 17–24 | **Chorus 1** | 4-on-the-floor 전환 + 크래시 |
+| 25–28 | Post-Chorus 1 | **휘슬 + 보컬 보칼리즈 유니즌** |
+| 29–36 | Verse 2 | V1 편성 + 셰이커 |
+| 37–40 | Pre 2 | |
+| 41–48 | **Chorus 2** | |
+| 49–52 | Post-Chorus 2 | |
+| 53–60 | Bridge | 53–56 로즈+보컬만(드럼 아웃) → 57–60 스트링스 합류·빌드 → 60마디 후반 **G.P. + 필** |
+| 61–68 | **Final Chorus (E)** | 61–64 **낙사비**(로즈+보컬, 베이스·드럼 아웃) → 65–68 풀밴드 |
+| 69–76 | Outro | 휘슬 모티프 ×2 (E), 스트링스, 73마디부터 페이드 |
+
+### STEP 3 — 코러스부터 (팝은 훅 우선)
+
+`G△9 | A7 | F#m9 | Bm9 | G△9 | A7 | D6/9 | A7sus4` (왕도진행 + 귀결·턴어라운드)
+
+멜로디 설계 3원칙:
+- 훅 첫 소절의 **"moon"에 최고음 D5** — 제목이 곡의 정점을 가져가야 각인된다.
+- 7마디 "**mor**—ning"에 **G4→B4 도약 + 2박 롱톤**(마디 넘김) = 애니송식 클라이맥스 롱톤.
+- 마지막 "day"는 **A7sus4 위의 D4** — 해결을 미룬 채 포스트코러스로 넘긴다.
+
+### STEP 4 — 프리코러스와 벌스 (역방향)
+
+- **프리**: `Bm9 | C#m7♭5 F#7♭9 | G△9 | A7sus4 A7`. 2마디 끝 **A#4→B4 "(ooh)"** 애드립이
+  F#7♭9의 3음을 훑고 코러스로 밀어 넣는다. 4마디는 G4→A4→B4 상행으로 압력을 만든다.
+- **벌스**: `Em9 | A13 | F#m9 | B7♭13` 순환. 음역 D4~B4로 좁히고 8분 싱커페이션 —
+  코러스와 대비를 만드는 게 유일한 목적. B7♭13의 **D#4**가 시티팝 특유의 반음 색채.
+
+### STEP 5 — 가사 프로소디 정렬
+
+강세 음절을 강박에 올리는 과정에서 원안 두 곳을 고쳤다.
+
+- 코러스 4행 `of another day` → **`of a new day`** (8마디에 음절이 넘쳐 강세가 밀렸다)
+- 벌스 2절 전면 재작성 — 1절과 **마디당 음절 수를 6/6/7/7/6/7/7/7로 일치**시켰다.
+
+### STEP 6 — 편곡·전조
+
+마지막 코러스에서 **D → E (+2도)**. 코러스 최고음 D5는 전조 후 **E5**가 된다(가이드 MIDI 기준).
+지르지 않는 톤을 유지하려면 믹스보이스 전제 — 부담되면 마지막 코러스의 "moon"만 B4(→전조 C#5)로
+내리면 된다. 나머지 음은 그대로 성립한다.
+
+---
+
+## 최종 가사
+
+```
+[Verse 1]
+Rain on the lantern glass, / the harbor turning gold,
+a fiddle in the market / and a story someone told.
+I've worn a hundred names, / but I keep this one for you —
+the one you called me softly / when the summer was still new.
+
+[Pre-Chorus]
+Every ending is a door / I've walked before (ooh)
+count the feathers on the floor —
+one, two, and we begin
+
+[Chorus]
+Open the moongate, let the evening in,
+I have fallen a thousand times just to land here again.
+Give me one white feather and a reason to stay,
+and I'll find you in the morning of a new day.
+
+[Post-Chorus]   ← 휘슬과 완전 유니즌
+Oh-oh, oh-oh-oh… moongate, take me home.
+
+[Verse 2]
+Smoke from the kettle rings, / the market closing down;
+we camp beside the water / and the fire keeps the cold out.
+The world can end Sunday / and open up on Monday,
+and I'll still be standing here, / growing older, holding on.
+
+[Bridge]
+If this is the last life, tell me now;
+I'll spend it slower, I'll spend it loud.
+No more waiting for the sky to fall —
+you were the reason I came back at all.
+
+[Final Chorus — E major, 앞 4마디는 로즈+보컬만]
+Open the moongate, let the evening in…
+…and I'll find you in the mor—ning of a new day.
+```
+
+---
+
+## 멜로디 (음절 = 음)
+
+**Verse** — 음역 D4~B4
+
+| 마디 | 코드 | 멜로디 |
+|---|---|---|
+| 1 | Em9 | Rain=E4 · on=G4 · the=G4 · lan=A4 · tern=G4 · glass=E4 |
+| 2 | A13 | the=E4 · har=F#4 · bor=A4 · turn=G4 · ing=F#4 · gold=E4 |
+| 3 | F#m9 | a=F#4 · fid=A4 · dle=A4 · in=G4 · the=A4 · mar=B4 · ket=A4 |
+| 4 | B7♭13 | and=F#4 · a=F#4 · sto=G4 · ry=F#4 · some=D#4 · one=E4 · told=F#4 |
+| 5 | Em9 | I've=E4 · worn=G4 · a=G4 · hun=A4 · dred=G4 · names=E4 |
+| 6 | A13 | but=E4 · I=F#4 · keep=A4 · this=G4 · one=F#4 · for=E4 · you=D4 |
+| 7 | F#m9 | the=F#4 · one=A4 · you=A4 · called=B4 · me=A4 · soft=F#4 · ly=E4 |
+| 8 | B7♭13 | when=D#4 · the=E4 · sum=F#4 · mer=E4 · was=D#4 · still=E4 · new=F#4 |
+
+**Pre-Chorus** — 음역 D4~B4
+
+| 마디 | 코드 | 멜로디 |
+|---|---|---|
+| 1 | Bm9 | Ev=F#4 · 'ry=F#4 · end=G4 · ing=F#4 · is=E4 · a=F#4 · door=D4 |
+| 2 | C#m7♭5 → F#7♭9 | I've=E4 · walked=E4 · be=G4 · fore=F#4 · (ooh=A#4 · ooh)=B4 |
+| 3 | G△9 | count=B4 · the=B4 · fea=B4 · thers=A4 · on=B4 · the=A4 · floor=G4 |
+| 4 | A7sus4 → A7 | one=G4 · two=A4 · and=B4 · we=B4 · be=A4 · gin=B4 |
+
+**Chorus** — 음역 D4~D5 (전조 후 E4~E5)
+
+| 마디 | 코드 | 멜로디 |
+|---|---|---|
+| 1 | G△9 | O=A4 · pen=B4 · the=B4 · **moon=D5** · gate=B4 |
+| 2 | A7 | let=A4 · the=B4 · eve=A4 · ning=F#4 · in=E4 |
+| 3 | F#m9 | I=F#4 · have=F#4 · fal=A4 · len=A4 · a=A4 · thou=B4 · sand=A4 · times=F#4 |
+| 4 | Bm9 | just=E4 · to=F#4 · land=A4 · here=F#4 · a=E4 · gain=D4 |
+| 5 | G△9 | Give=G4 · me=A4 · one=B4 · white=B4 · fea=A4 · ther=G4 |
+| 6 | A7 | and=A4 · a=B4 · rea=B4 · son=A4 · to=G4 · stay=F#4 |
+| 7 | D6/9 | and=F#4 · I'll=A4 · find=B4 · you=A4 · in=F#4 · the=G4 · **mor=B4** (2박 롱톤, 마디 넘김) |
+| 8 | A7sus4 | ning=A4 · of=F#4 · a=E4 · new=F#4 · day=D4 |
+
+**Bridge** — 음역 D4~B4
+
+| 마디 | 코드 | 멜로디 |
+|---|---|---|
+| 1 | Bm9 | If=D4 · this=F#4 · is=F#4 · the=F#4 · last=A4 · life=F#4 |
+| 2 | G△9 | tell=G4 · me=A4 · now=B4 (2박) |
+| 3 | D/F# | I'll=F#4 · spend=A4 · it=A4 · slow=B4 · er=A4 |
+| 4 | **Gm6** | I'll=G4 · spend=**A#4** · it=A4 · loud=G4 ← 차용화음의 ♭3, 이 곡 유일의 눈물 음 |
+| 5 | Em9 | No=E4 · more=F#4 · wait=G4 · ing=F#4 · for=E4 · the=F#4 · sky=G4 |
+| 6 | A7sus4 | to=A4 · fall=B4 |
+| 7 | A7 | you=A4 · were=B4 · the=A4 · rea=B4 · son=A4 · I=G4 · came=F#4 · back=E4 |
+| 8 | A7 → G.P. | at=F#4 · all=A4 |
+
+## 모티프의 5회 등장 (라이트모티프 운용)
+
+| 마디 | 편성 | 처리 |
+|---|---|---|
+| 1–4 | 휘슬 + 하프 | 원형 제시 |
+| 25–28 / 49–52 | 휘슬 + **보컬 보칼리즈 유니즌** | 훅 각인 |
+| 56 | 하프 | Gm6 위 하행 한숨을 **단조로**: D5–A#4–A4–G4 |
+| 60 | 휘슬 | 머리 2음(B4–C#5)만 남겨 전조된 마지막 코러스로 밀어 넣음 |
+| 69–76 | 휘슬 + 스트링스 | E major 로 2회 반복 후 페이드 |
