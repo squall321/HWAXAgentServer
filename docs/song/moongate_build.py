@@ -36,7 +36,7 @@ class Track:
         self.name, self.program, self.ch = name, program, channel
         self.ev = []          # (tick, order, data)
 
-    def note(self, beat, dur, pitch, vel=90):
+    def note(self, beat, dur, pitch, vel=90, lyric=None):
         if pitch is None:
             return
         if self.ch != 9:                       # 드럼맵은 조옮김하지 않는다
@@ -44,6 +44,9 @@ class Track:
         t0 = int(round(beat * PPQ))
         t1 = max(t0 + 20, int(round((beat + dur) * PPQ)) - 8)   # 살짝 띄어 레가토 방지
         self.ev.append((t1, 0, bytes([0x80 | self.ch, pitch, 0])))
+        if lyric:                              # Synthesizer V 가 임포트 시 읽어가는 가사 이벤트
+            w = lyric.strip('()').encode()
+            self.ev.append((t0, 0.5, b'\xff\x05' + vlq(len(w)) + w))
         self.ev.append((t0, 1, bytes([0x90 | self.ch, pitch, vel])))
 
     def chord(self, beat, dur, pitches, vel=70):
@@ -345,8 +348,9 @@ BRIDGE_MEL = [
 # ─────────────────────────────────────────────── 트랙 조립 헬퍼
 
 def put_mel(track, data, start_bar, vel=95, transpose=0, words=None):
-    for i, (bar, beat, dur, pitch, _syl) in enumerate(data):
-        track.note(b(start_bar + bar - 1, beat), dur, pitch + transpose, vel)
+    for i, (bar, beat, dur, pitch, syl) in enumerate(data):
+        track.note(b(start_bar + bar - 1, beat), dur, pitch + transpose, vel,
+                   lyric=(words[i] if words else syl))
 
 
 def put_motif(track, start_bar, vel=88, transpose=0, octave=0):
@@ -465,7 +469,7 @@ def make_tracks(with_melody=True, with_rhythm=True):
         put_mel(voc, VERSE_MEL, 5)
         put_mel(voc, PRE_MEL, 13)
         put_mel(voc, CHORUS_MEL, 17)
-        put_mel(voc, VERSE_MEL, 29)
+        put_mel(voc, VERSE_MEL, 29, words=VERSE2_WORDS)      # 2절은 가사가 다르다
         put_mel(voc, PRE_MEL, 37)
         put_mel(voc, CHORUS_MEL, 41)
         put_mel(voc, BRIDGE_MEL, 53)
@@ -473,27 +477,33 @@ def make_tracks(with_melody=True, with_rhythm=True):
         # 포스트코러스: 휘슬 + 보컬. 4마디째는 보칼리즈에서 가사 태그로 갈라진다.
         post_voc = [(b(25) + bt, d, p) for bt, d, p in MOTIF if bt < 12.0] \
                    + [(b(25) + bt, d, p) for bt, d, p, _s in POST_TAG]
+        post_syl = {round(b(25) + bt, 3): sl for bt, _d, _p, sl in POST_TAG}
         for sb, evs in ((25, post_voc), (49, move(post_voc, 24))):
             put_motif(whi, sb, 92)
             for bt, d, p in evs:
-                voc.note(bt, d, p, 84)
+                voc.note(bt, d, p, 84, lyric=post_syl.get(round(bt - (sb - 25) * 4, 3), 'oh'))
         # 2회차 포스트코러스만 3도 아래로 갈라 두께를 준다 (1회차는 유니즌으로 남긴다)
         for bt, d, p in move(harmonize(post_voc, below=True), 24):
-            hlo.note(bt, d, p, 68)
+            hlo.note(bt, d, p, 68, lyric=post_syl.get(round(bt - 96, 3), 'oh'))
 
         # 코러스 하모니 — 17~24마디 기준으로 계산해 두 번 옮겨 쓴다
         ch = mel_events(CHORUS_MEL, 17)
         lo, hi = harmonize(ch, below=True), harmonize(ch, below=False)
+        ch_syl = {round(b(17 + bar - 1, beat), 3): sl
+                  for bar, beat, _d, _p, sl in CHORUS_MEL}
+
+        def syl_of(bt, shift_bars):
+            return ch_syl.get(round(bt - shift_bars * 4, 3), 'ah')
         for bt, d, p in between(lo, 21, 24):                  # 코러스 1: 후반 4마디만
-            hlo.note(bt, d, p, 66)
+            hlo.note(bt, d, p, 66, lyric=syl_of(bt, 0))
         for bt, d, p in move(lo, 24):                         # 코러스 2: 전체
-            hlo.note(bt, d, p, 72)
+            hlo.note(bt, d, p, 72, lyric=syl_of(bt, 24))
         for bt, d, p in move(between(hi, 21, 24), 24):        # 코러스 2: 후반만 위로도
-            hhi.note(bt, d, p, 64)
+            hhi.note(bt, d, p, 64, lyric=syl_of(bt, 24))
         for bt, d, p in move(between(lo, 21, 24), 44, 2):     # 마지막 코러스: 65~68마디만
-            hlo.note(bt, d, p, 76)                            # (61~64 낙사비는 리드 단독)
+            hlo.note(bt, d, p, 76, lyric=syl_of(bt, 44))      # (61~64 낙사비는 리드 단독)
         for bt, d, p in move(between(hi, 21, 24), 44, 2):
-            hhi.note(bt, d, p, 70)
+            hhi.note(bt, d, p, 70, lyric=syl_of(bt, 44))
         # 브릿지 56마디: 모티프의 하행 한숨을 Gm6 위 단조로 (하프)
         for o, p in ((0.0, 74), (1.0, 70), (2.0, 69), (3.0, 67)):
             hrp.note(b(56, o), 1.0, p, 70)

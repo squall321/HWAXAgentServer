@@ -59,13 +59,15 @@ def parse(path):
     for _ in range(ntrk):
         assert d[i:i + 4] == b'MTrk', 'MTrk 없음'
         ln = struct.unpack('>I', d[i + 4:i + 8])[0]; i += 8; end = i + ln
-        t, name, run, ev = 0, '', None, []
+        t, name, run, ev, lyr = 0, '', None, [], []
         while i < end:
             dt, i = vlq(i); t += dt; s = d[i]
             if s == 0xFF:
                 mt = d[i + 1]; l, j = vlq(i + 2)
                 if mt == 0x03:
                     name = d[j:j + l].decode('utf8', 'replace')
+                if mt == 0x05:
+                    lyr.append(d[j:j + l].decode('utf8', 'replace'))
                 i = j + l; continue
             if s < 0x80:
                 s = run
@@ -77,7 +79,7 @@ def parse(path):
             elif k in (0xC0, 0xD0):
                 i += 1
         assert i == end, '트랙 길이 불일치'
-        out.append((name, ev, t))
+        out.append((name, ev, t, lyr))
     return div, out
 
 
@@ -130,7 +132,7 @@ if len(sys.argv) > 1 and sys.argv[1] == '--fit':
 print('\n[1] MIDI 구조 · 미결 노트')
 div, tracks = parse(os.path.join(HERE, '03_full.mid'))
 played = {}
-for name, ev, _ in tracks:
+for name, ev, _, _l in tracks:
     hung = collections.Counter(); orphan = 0; ps = []
     for t, k, ch, a, b2 in ev:
         if k == 0x90 and b2 > 0:
@@ -143,6 +145,14 @@ for name, ev, _ in tracks:
     if ps:
         played[name] = ps
         check(sum(hung.values()) == 0 and orphan == 0, f'{name}: 노트 온/오프 정합')
+
+print('\n[8] 가사 이벤트 커버리지 — Synthesizer V 임포트용')
+for name, ev, _t, lyr in tracks:
+    if 'Vocal' not in name:
+        continue
+    notes = sum(1 for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0)
+    check(notes == len(lyr) and notes > 0,
+          f'{name}: 노트 {notes}개 / 가사 {len(lyr)}개 — 전 노트에 음절이 붙어 있음')
 
 print('\n[2] 음역 — 편곡 스펙 및 실제 악기 물리 음역')
 for name, ps in played.items():
