@@ -13,6 +13,7 @@
 실행: python3 render.py [입력.mid] [출력.mp3]
 기본값: 05_instruments.mid -> 05_instruments.mp3
 """
+# 의존성: numpy(필수), lameenc(선택 — 없으면 WAV로 대체)
 import struct
 import sys
 import numpy as np
@@ -384,16 +385,25 @@ def main():
     print(f'\n0.999 이상 샘플: {clipped}개 / {mix.size}개')
 
     pcm = (mix * 32767.0).astype('<i2').tobytes()
-    import lameenc
-    enc = lameenc.Encoder()
-    enc.set_bit_rate(192)
-    enc.set_in_sample_rate(SR)
-    enc.set_channels(2)
-    enc.set_quality(2)
-    data = enc.encode(pcm) + enc.flush()
-    with open(dst, 'wb') as f:
-        f.write(data)
-    print(f'-> {dst}  ({len(data)/1024:.0f} KB)')
+    try:
+        import lameenc                        # requirements: pip install numpy lameenc
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(192)
+        enc.set_in_sample_rate(SR)
+        enc.set_channels(2)
+        enc.set_quality(2)
+        data = enc.encode(pcm) + enc.flush()
+        with open(dst, 'wb') as f:
+            f.write(data)
+        print(f'-> {dst}  ({len(data)/1024:.0f} KB)')
+    except ImportError:
+        import wave
+        wav_dst = dst.rsplit('.', 1)[0] + '.wav'
+        with wave.open(wav_dst, 'wb') as w:
+            w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR)
+            w.writeframes(pcm)
+        print(f'lameenc 없음 (pip install lameenc) — 대신 WAV 저장: {wav_dst} '
+              f'({len(pcm)/1024:.0f} KB)')
 
 
 if __name__ == '__main__':

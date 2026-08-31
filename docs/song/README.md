@@ -112,7 +112,7 @@ Every ending is a door / I've walked before (ooh)
 count the feathers on the floor —
 one, two, and we begin
 
-[Chorus]
+[Chorus]  (1·2절 — 아래로 물러선 채 청함)
 Open the moongate, let the evening in,
 I have fallen a thousand times just to land here again.
 Give me one white feather and a reason to stay,
@@ -133,10 +133,17 @@ I'll spend it slower, I'll spend it loud.
 No more waiting for the sky to fall —
 you were the reason I came back at all.
 
-[Final Chorus — E major, 앞 4마디는 로즈+보컬만]
-Open the moongate, let the evening in…
-…and I'll find you in the mor—ning of a new day.
+[Final Chorus — E major, 앞 4마디는 로즈+보컬만; 3행이 도착한다]
+Open the moongate, let the evening in,
+I have fallen a thousand times just to land here again.
+This is my last white feather, and I'm here to stay,
+and I'll find you in the mor—ning of a new day.
 ```
+
+**3행이 이 곡에서 유일하게 바뀌는 가사.** 1·2절의 "Give me one white feather and a reason
+to stay"(청함)가 마지막에만 "This is my last white feather, and I'm here to stay"(선언)로
+바뀐다. 같은 12음절, 같은 멜로디·리듬 — 가사만 다르다. 브릿지의 "If this is the last life,
+tell me now"가 던진 질문에 대한 답이다. 하모니 3트랙도 같은 가사로 맞춰져 있다.
 
 ---
 
@@ -225,6 +232,52 @@ Open the moongate, let the evening in…
 
 결과: 선율 공백 **59% → 5%**. 남은 4마디는 61~64 낙사비로, 로즈가 혼자 가는 게 의도다.
 린터 [11]이 이 조건을 검사한다.
+
+### STEP 13 — 다른 프로젝트의 방법론에서 가져온 것
+
+같은 사용자의 다른 노래("보고있었니", 5막 18분)에서 나온 작곡 방법론 문서를 참고해
+Moongate 에 적용했다. **단, 그 문서의 절대 수치는 가져오지 않았다** — 템포·언어·장르가
+다른 곡에서 나온 값이고, 문서 자신도 "방법이 이식되지 값이 이식되는 게 아니다"라고
+못박고 있다. 방법(측정 축)만 가져와 Moongate 자신의 값으로 다시 쟀다.
+
+**여섯 축 실측** — 음절 길이·같은음 반복·순차진행·도약·밀도폭
+
+| 섹션 | 노트 | 중앙길이 | 같은음 | 순차(2도) | 도약(4도+) | 밀도폭 |
+|---|---|---|---|---|---|---|
+| Verse | 53 | 0.27s | 13% | 63% | 0% | 1.6x |
+| Pre | 26 | 0.27s | 16% | 68% | 0% | 1.2x |
+| Chorus | 48 | 0.27s | 15%→**17%** | 53% | 9% | 2.2x |
+| Bridge | 37 | 0.27s | 8%→**11%** | 64% | 3% | 4.0x |
+
+참조 프로젝트 자신의 싱글은 같은음 23% · 순차 48% · 도약 6% · 밀도폭 4.4배였다. Moongate는
+전 섹션에서 같은음 반복이 낮고 순차진행이 높다 — "III막이 87% 순차진행으로 걷기만 한다"고
+지적받은 것과 같은 방향이다. 다만 그 곡은 느린 발라드, Moongate 는 112BPM 네오디스코라
+**같은 목표 수치를 그대로 쫓지 않았다** — 장르가 다르면 리듬의 그루브가 "생동감"을 대신 맡을
+수 있다. 그래서 극단으로 밀지 않고(Ch13 "극단에서 극단으로" 경고), 반복이 가장 낮았던
+**코러스·브릿지에만 최소한으로 심었다**:
+
+- 코러스 2마디 "eve-**ning**": F#4(A7의 경과음) → A4('eve'와 같은음, A7의 근음) — 화성도 개선
+- 브릿지 5마디 "for **the**": F#4 → E4('for'와 같은음, Em9의 근음)
+
+**후크를 심고·도착시킨다** (뒤집는 대신 — 이 곡 분량에선 그걸로 충분했다)
+
+마지막 코러스 3행만 가사를 바꿨다. 같은 12음절, 같은 멜로디·리듬:
+
+```
+1·2절   Give me one white feather and a reason to stay     ← 청함
+마지막  This is my last white feather, and I'm here to stay ← 선언
+```
+
+브릿지의 "If this is the last life, tell me now"가 던진 질문에 이 한 줄이 답한다. 하모니
+3트랙도 같은 텍스트로 맞췄다(`FINAL_LINE3_OVERRIDE`, 절대 박자 기준 사전 조회).
+
+**Mai2 발음 가이드를 정량화했다** — `VOCAL-MAI2.md` 의 "손봐야 할 자리" 목록이 정성적
+나열이었던 것을, 전체 164음절 중 16분 이하 13%·위험 어형 108개 중 11%로 **분모와 함께**
+다시 적고, IPA + 수동 편집 지침표로 확장했다.
+
+**재현성 검증** — 빌드를 두 번 돌려 `03/04/05.mid` 가 바이트 단위로 동일한지 확인했다
+(SEED 고정 덕분에 통과). `render.py` 에 `lameenc` 없을 때 WAV 로 대체하는 폴백을 추가했다
+— 이 환경에서 `pip install` 한 인코더는 다른 기기엔 없다.
 
 ### STEP 12 — 렌더 (`render.py`) — 사운드폰트 없이 numpy 오실레이터로
 

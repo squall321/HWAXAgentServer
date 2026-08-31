@@ -319,6 +319,14 @@ MOTIF = [
 
 # 포스트코러스: 1~3마디는 휘슬과 유니즌 보칼리즈, 4마디는 가사가 붙은 태그로 갈라진다.
 # (휘슬은 B4 롱톤을 유지하고 보컬이 그 밑으로 내려간다 -> 다음 섹션 첫 음 E 로 연결)
+# (마디, 박) -> 새 음절. CHORUS_MEL 의 "Give me one white fea-ther and a rea-son to stay"
+# 열두 음절 자리에 정확히 겹쳐 "This is my last white fea-ther and I'm here to stay" 를 얹는다.
+FINAL_LINE3_OVERRIDE = {
+    (4, 3.5): 'This', (5, 0.0): 'is', (5, 0.5): 'my', (5, 1.0): 'last',
+    (5, 2.0): 'white', (5, 2.5): 'fea', (6, 0.0): 'ther', (6, 0.5): 'and',
+    (6, 0.75): "I'm", (6, 1.5): 'here', (6, 2.0): 'to', (6, 2.5): 'stay',
+}
+
 POST_TAG = [(12.0, 0.5, 69, 'moon'), (12.5, 0.5, 71, 'gate'), (13.0, 0.5, 69, 'take'),
             (13.5, 0.5, 66, 'me'), (14.0, 2.0, 64, 'home')]
 
@@ -330,7 +338,7 @@ CHORUS_MEL = [
     (1, 1.0, 1.5, 74, 'moon'), (1, 2.5, 0.5, 71, 'gate'),
     (1, 3.5, 0.5, 69, 'let'),                                     # 당김
     (2, 0.0, 0.5, 71, 'the'), (2, 0.5, 1.0, 69, 'eve'),
-    (2, 1.5, 0.5, 66, 'ning'), (2, 2.0, 1.5, 64, 'in'),           # -> 숨
+    (2, 1.5, 0.5, 69, 'ning'), (2, 2.0, 1.5, 64, 'in'),           # -> 숨. 'eve'와 같은음(A7 근음)
     (3, 0.0, 0.5, 66, 'I'), (3, 0.5, 0.5, 66, 'have'),            # 제자리에서 새 줄
     (3, 1.0, 0.25, 69, 'fal'), (3, 1.25, 0.25, 69, 'len'), (3, 1.5, 0.5, 69, 'a'),
     (3, 2.0, 0.5, 71, 'thou'), (3, 2.5, 0.5, 69, 'sand'), (3, 3.0, 0.5, 66, 'times'),
@@ -409,7 +417,7 @@ BRIDGE_MEL = [
     (4, 0.0, 0.5, 67, "I'll"), (4, 0.5, 0.5, 70, 'spend'),          # ★Bb4 = Gm6 의 눈물
     (4, 1.0, 0.5, 69, 'it'), (4, 1.5, 2.0, 67, 'loud'),
     (5, 0.0, 1.0, 64, 'No'), (5, 1.0, 0.5, 66, 'more'), (5, 1.5, 0.5, 67, 'wait'),
-    (5, 2.0, 0.5, 66, 'ing'), (5, 2.5, 0.5, 64, 'for'), (5, 3.0, 0.5, 66, 'the'),
+    (5, 2.0, 0.5, 66, 'ing'), (5, 2.5, 0.5, 64, 'for'), (5, 3.0, 0.5, 64, 'the'),  # 'for'와 같은음
     (5, 3.5, 0.5, 67, 'sky'),
     (6, 0.0, 0.5, 69, 'to'), (6, 0.5, 1.5, 71, 'fall'),
     (7, 0.0, 0.5, 69, 'you'), (7, 0.5, 0.5, 71, 'were'), (7, 1.0, 0.5, 69, 'the'),
@@ -600,7 +608,9 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         put_mel(voc, PRE_MEL, 37)
         put_mel(voc, CHORUS_MEL, 41)
         put_mel(voc, BRIDGE_MEL, 53)
-        put_mel(voc, CHORUS_MEL, 61, transpose=2)          # ★전조 +2도
+        final_words = [FINAL_LINE3_OVERRIDE.get((bar, beat), syl)
+                       for bar, beat, _d, _p, syl in CHORUS_MEL]
+        put_mel(voc, CHORUS_MEL, 61, transpose=2, words=final_words)   # ★전조 +2도 + 가사 반전
         # 포스트코러스: 휘슬 + 보컬. 4마디째는 보칼리즈에서 가사 태그로 갈라진다.
         post_voc = [(b(25) + bt, d, p) for bt, d, p in MOTIF if bt < 12.0] \
                    + [(b(25) + bt, d, p) for bt, d, p, _s in POST_TAG]
@@ -619,8 +629,13 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         ch_syl = {round(b(17 + bar - 1, beat), 3): sl
                   for bar, beat, _d, _p, sl in CHORUS_MEL}
 
+        ch_syl_final = dict(ch_syl)
+        for (bar, beat), new_syl in FINAL_LINE3_OVERRIDE.items():
+            ch_syl_final[round(b(17 + bar - 1, beat), 3)] = new_syl
+
         def syl_of(bt, shift_bars):
-            return ch_syl.get(round(bt - shift_bars * 4, 3), 'ah')
+            table = ch_syl_final if shift_bars == 44 else ch_syl
+            return table.get(round(bt - shift_bars * 4, 3), 'ah')
         for bt, d, p in between(lo, 21, 24):                  # 코러스 1: 후반 4마디만
             hlo.note(bt, d, p, 66, lyric=syl_of(bt, 0))
         for bt, d, p in move(lo, 24):                         # 코러스 2: 전체
