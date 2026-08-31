@@ -75,6 +75,9 @@ def test_agent_for_caches_by_group_set(monkeypatch):
         llm=ChatOpenAI(base_url="http://127.0.0.1:1/v1", api_key="EMPTY", model="x"),
         connections={"gateway": {"url": "http://gw/mcp", "headers": {"Authorization": "Bearer x"}}},
         agent_cache={},
+        # 실제 app.state 가 기동 시(app.py:257·261) 항상 갖는 칸 — 가짜 state 에도 그대로 둔다.
+        tool_degraded={},
+        tool_load_error={},
     )
     fake = pytypes.SimpleNamespace(state=state)
 
@@ -84,5 +87,7 @@ def test_agent_for_caches_by_group_set(monkeypatch):
 
     assert a1 is a2
     assert a1 is not a3
-    assert set(state.agent_cache.keys()) == {frozenset({"admin"}), frozenset({"user"})}
+    # 캐시 키는 (groups, pins, query, sources, user, cred) 튜플이다(app.py:1325). 이 테스트가 보는
+    # 것은 그룹셋 축 하나뿐이므로 첫 칸만 비교한다 — 나머지 축은 여기서 전부 기본값이다.
+    assert {k[0] for k in state.agent_cache} == {frozenset({"admin"}), frozenset({"user"})}
     assert seen_headers == ["admin", "user"]                 # 게이트웨이로 그룹셋당 1회, 정렬된 헤더 전달
