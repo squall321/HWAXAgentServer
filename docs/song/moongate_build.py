@@ -464,6 +464,13 @@ def put_motif(track, start_bar, vel=88, transpose=0, octave=0, expressive=False)
             track.cc(bt + dur, 1, 0)
 
 
+# 69~72 는 전조 직후 풀밴드로 선언하고, 73마디부터 실제로 줄어든다.
+# 이전엔 문서(README STEP 2)에만 "73마디부터 페이드"라고 적혀 있고 코드엔 구현이 없어서,
+# 드럼·베이스·로즈가 76마디까지 풀파워로 가는 바람에 outro 가 곡에서 가장 시끄러운
+# 섹션이 되는 사고가 났다(render.py 섹션별 RMS 리포트로 발견).
+OUTRO_FADE = {73: 0.78, 74: 0.58, 75: 0.40, 76: 0.22}
+
+
 def build_chords(rhodes, gtr, bass):
     for beat, dur, name in PROG:
         voic, root = CH[name]
@@ -472,9 +479,10 @@ def build_chords(rhodes, gtr, bass):
         # 로즈: 섹션 첫 박에 지속 + 8분 백비트 반복
         rhodes.cc(beat, 64, 127)                             # 코드마다 페달 밟고
         rhodes.cc(beat + dur - 0.08, 64, 0)                  # 다음 코드 직전에 뗀다
-        rhodes.chord(beat, dur, voic, 58 if quiet else 68)
+        fade = OUTRO_FADE.get(bar, 1.0)
+        rhodes.chord(beat, dur, voic, int((58 if quiet else 68) * fade))
         if not quiet and dur >= 4.0:
-            rhodes.chord(beat + 2.5, 1.0, voic, 52)
+            rhodes.chord(beat + 2.5, 1.0, voic, int(52 * fade))
         # 기타 16비트 커팅 (벌스·코러스·포스트·마지막 후반)
         if in_(beat, 'verse1', 'verse2', 'chorus1', 'chorus2', 'post1', 'post2') or 65 <= bar <= 68:
             top = voic[1:]
@@ -488,29 +496,39 @@ def build_chords(rhodes, gtr, bass):
         if 53 <= bar <= 56:
             bass.note(beat, dur, root, 74)
             continue
+        if bar == 76:              # 마지막 마디는 베이스를 빼고 로즈·휘슬·스트링스만 남긴다
+            continue
         if in_(beat, 'verse1', 'verse2'):
             pat = [(0.0, 0.75), (1.5, 0.5), (2.5, 0.5), (3.0, 0.5)]
             for j, (o, d) in enumerate(pat):
                 if o < dur:
-                    bass.note(beat + o, d, root + (0 if j != 3 else 7), 82)
+                    bass.note(beat + o, d, root + (0 if j != 3 else 7), int(82 * fade))
         else:
             steps = [(0.0, 0.75), (1.0, 0.5), (1.75, 0.5), (2.5, 0.5), (3.0, 0.5), (3.5, 0.5)]
             for j, (o, d) in enumerate(steps):
                 if o < dur:
                     p = root + (12 if j == 4 else (7 if j == 2 else 0))
-                    bass.note(beat + o, d, p, 86 if j == 0 else 76)
+                    bass.note(beat + o, d, p, int((86 if j == 0 else 76) * fade))
 
 
 def build_drums(dr):
     K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 70, 49, 47, 45
     for bar in range(1, 77):
         beat = b(bar)
-        style = ('none' if bar <= 4 or 53 <= bar <= 56 or 61 <= bar <= 64 else
+        fade = OUTRO_FADE.get(bar, 1.0)
+        style = ('none' if bar <= 4 or 53 <= bar <= 56 or 61 <= bar <= 64 or bar >= 75 else
                  'verse' if in_(beat, 'verse1', 'verse2', 'pre1', 'pre2') else
-                 'build' if 57 <= bar <= 60 else 'four')
+                 'build' if 57 <= bar <= 60 else
+                 'outro-thin' if bar in (73, 74) else 'four')
         if style == 'none':
             for k in range(8):
-                dr.note(beat + k * 0.5, 0.2, SHK, 40 if k % 2 else 52)
+                dr.note(beat + k * 0.5, 0.2, SHK, int((40 if k % 2 else 52) * fade))
+            continue
+        if style == 'outro-thin':                      # 73~74마디: 풀킷 -> 킥+셰이커만
+            for o in (0.0, 2.0):
+                dr.note(beat + o, 0.3, K, int(100 * fade))
+            for k in range(8):
+                dr.note(beat + k * 0.5, 0.2, SHK, int((42 if k % 2 else 56) * fade))
             continue
         if style == 'verse':
             for o in (0.0, 1.5, 2.5):

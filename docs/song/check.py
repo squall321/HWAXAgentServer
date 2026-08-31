@@ -206,6 +206,19 @@ for name, ev, _t, _l, _i in tracks:
         check(off > 0 or len(vels) > 3,
               f'{name}: 격자 이탈 {off * 100:.0f}% · 벨로시티 {len(vels)}종')
 
+print('\n[12] 아웃트로 페이드 — 73마디부터 실제로 줄어드는가')
+def vel_sum(track_name, bar_lo, bar_hi):
+    for name, ev, _t, _l, _i in tracks:
+        if name != track_name:
+            continue
+        return sum(b2 for t, k, ch, a, b2 in ev
+                   if k == 0x90 and b2 > 0 and bar_lo <= t / div / 4 + 1 < bar_hi)
+    return 0
+for name in ('Rhodes', 'Bass', 'Drums'):
+    a = vel_sum(name, 69, 73)      # 마디당 평균 벨로시티 총합 (69~72)
+    b2 = vel_sum(name, 73, 77)     # (73~76)
+    check(b2 < a, f'{name}: 69~72 합계 {a} -> 73~76 합계 {b2} (감소해야 한다)')
+
 print('\n[3] 섹션 타임코드 · 전체 길이')
 sec_per_bar = 4 * 60 / mg.BPM
 for label, rng in mg.SECTIONS.items():
