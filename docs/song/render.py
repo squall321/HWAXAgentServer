@@ -19,6 +19,7 @@ import sys
 import numpy as np
 
 SR = 44100
+REV = 2   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
 RNG = np.random.default_rng(20260830)   # moongate_build.py 와 같은 시드 계열
 
 
@@ -317,7 +318,7 @@ def reverb(mix, sr, seconds=1.3, wet=0.16):
 
 
 def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else '05_instruments.mid'
+    src = sys.argv[1] if len(sys.argv) > 1 else f'05_instruments_rev{REV:02d}.mid'
     dst = sys.argv[2] if len(sys.argv) > 2 else src.replace('.mid', '.mp3')
 
     div, bpm, tracks = parse_midi(src)

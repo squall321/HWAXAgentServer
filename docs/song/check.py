@@ -132,7 +132,8 @@ if len(sys.argv) > 1 and sys.argv[1] == '--fit':
     sys.exit(0)
 
 print('\n[1] MIDI 구조 · 미결 노트')
-div, tracks = parse(os.path.join(HERE, '03_full.mid'))
+R = f'_rev{mg.REV:02d}'
+div, tracks = parse(os.path.join(HERE, f'03_full{R}.mid'))
 played = {}
 for name, ev, _, _l, _i in tracks:
     hung = collections.Counter(); orphan = 0; ps = []
@@ -167,7 +168,7 @@ for name, ps in played.items():
     check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)
 
 print('\n[11] 인스트루멘털 — 보컬이 빠진 자리를 악기가 이어받는가')
-_, itr = parse(os.path.join(HERE, '06_instrumental.mid'))
+_, itr = parse(os.path.join(HERE, f'06_instrumental{R}.mid'))
 lead = set()
 for nme, ev, _t, _l, _i in itr:
     if nme in ('Signature Whistle', 'Celtic Harp'):       # 선율을 쥘 수 있는 파트만

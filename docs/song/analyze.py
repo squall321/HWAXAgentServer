@@ -83,7 +83,7 @@ def parse(path):
             elif k in (0xC0,0xD0): i+=1
         i=end; out[name]=sorted(ons)
     return out
-ins=parse(os.path.join(HERE,'05_instruments.mid'))
+ins=parse(os.path.join(HERE, f'05_instruments_rev{mg.REV:02d}.mid'))
 for label,sb,data in (('Verse 1',5,SEC['Verse'][0]),('Verse 2',29,SEC['Verse'][0]),('Chorus',17,SEC['Chorus'][0])):
     evs=sorted((mg.b(sb+bar-1,beat),dur) for bar,beat,dur,_p,_s in data)
     gaps=[]; last=evs[0][0]

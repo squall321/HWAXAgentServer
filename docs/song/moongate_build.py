@@ -19,6 +19,9 @@ BPM = 112
 # 어떤 값이 그 가수에게 맞는지는 `python3 check.py --fit <최저음> <최고음>` 이 알려준다.
 TRANSPOSE = 0
 
+# 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
+REV = 2
+
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
 # 트랙 이름(FF 03)과 별개로 **악기 이름(FF 04)** 이 있어서, 어떤 음색을 의도했는지
@@ -483,62 +486,79 @@ def put_motif(track, start_bar, vel=88, transpose=0, octave=0, expressive=False)
 OUTRO_FADE = {73: 0.78, 74: 0.58, 75: 0.40, 76: 0.22}
 
 
-# 베이스 리듬 셀 4종 — 마디마다 하나를 순환시켜 "같은 패턴의 무한반복"을 피한다.
-# (offset, dur, semitone-from-root) 목록. 12=옥타브 위, -12=옥타브 아래(서브 성부).
-BASS_CELLS_VERSE = [
-    [(0.0, 0.75, 0), (1.5, 0.5, 0), (2.5, 0.5, 0), (3.0, 0.5, 7)],
-    [(0.0, 0.85, 0), (1.0, 0.15, 0), (1.5, 0.5, 0), (2.5, 0.75, 0), (3.5, 0.5, 5)],
-    [(0.0, 0.75, 0), (1.5, 0.25, 0), (1.75, 0.25, 2), (2.5, 0.5, 0), (3.0, 0.5, 7)],
-]
-BASS_CELLS_MAIN = [
-    [(0.0, 0.75, 0), (1.0, 0.5, 0), (1.75, 0.5, 7), (2.5, 0.5, 0), (3.0, 0.5, 0), (3.5, 0.5, 12)],
-    [(0.0, 0.85, 0), (1.0, 0.15, 0), (1.25, 0.5, 0), (1.75, 0.5, 7), (2.5, 0.75, 0), (3.5, 0.5, 9)],
-    [(0.0, 0.75, 0), (1.0, 0.5, 0), (1.75, 0.25, 0), (2.0, 0.25, 2), (2.5, 0.5, 7), (3.0, 0.5, 0), (3.5, 0.5, 12)],
-]
+# ── 베이스: 셀을 무작위로 순환시키지 않고 "역할"로 고정 배정한다 ─────────────
+# POCKET = 벌스. 킥과 정확히 맞물려 자리를 지킨다(보컬이 앞에 있으니 그루브는 뒤에서).
+# LIFT   = 프리코러스. 계단식 상행으로 코러스로 밀어 올린다.
+# DRIVE  = 코러스·포스트·마지막 후반. 당김+옥타브 도약으로 에너지를 낸다.
+# 각 역할 안에서도 4마디 프레이즈의 홀수/짝수 마디를 다르게 써서(앵커/변주) 완전 반복을 피한다.
+BASS_ROLE = {
+    'POCKET': [
+        [(0.0, 0.75, 0), (1.5, 0.5, 0), (2.5, 0.5, 0), (3.0, 0.5, 7)],          # 앵커: 근음 중심
+        [(0.0, 0.75, 0), (1.5, 0.25, 0), (1.75, 0.25, 2), (2.5, 0.5, 0), (3.0, 0.5, 7)],  # 변주: 경과음 하나
+    ],
+    'LIFT': [
+        [(0.0, 0.75, 0), (1.0, 0.5, 2), (1.75, 0.5, 4), (2.5, 0.5, 5), (3.0, 0.5, 7)],    # 1-2-3-4-5 상행
+        [(0.0, 0.75, 0), (1.0, 0.5, 4), (1.75, 0.5, 7), (2.5, 0.75, 0), (3.5, 0.5, 9)],   # 도약 상행
+    ],
+    'DRIVE': [
+        [(0.0, 0.5, 0), (0.75, 0.25, 0), (1.0, 0.5, 7), (1.75, 0.5, 0), (2.5, 0.5, 0), (3.0, 0.25, 0), (3.5, 0.5, 12)],  # 당김+옥타브
+        [(0.0, 0.75, 0), (1.0, 0.5, 0), (1.75, 0.25, 7), (2.0, 0.25, 9), (2.5, 0.5, 12), (3.0, 0.5, 7), (3.5, 0.5, 0)],  # 옥타브 경유 하행
+    ],
+}
 
-# 기타 코밍 리듬 셀 3종 — 위 음(코드톤 커팅) + 아래 음(뮤트 척, funk 계열의 저음 펑크)
-GTR_CELLS = [
-    [1, 2],                    # 업비트만 (원래 패턴)
-    [1, 2, 5, 6],               # 업비트 + 3박 안쪽에 한 겹 더
-    [0, 2, 3, 6],               # 다운비트 첫 16분 + 당김 섞기
-]
+
+def bass_role(beat):
+    if in_(beat, 'verse1', 'verse2'):
+        return 'POCKET'
+    if in_(beat, 'pre1', 'pre2'):
+        return 'LIFT'
+    return 'DRIVE'
 
 
 def build_chords(rhodes, gtr, bass):
-    chord_idx = 0
     for beat, dur, name in PROG:
         voic, root = CH[name]
         bar = bar_of(beat)
         quiet = in_(beat, 'intro') or (61 <= bar <= 64) or (53 <= bar <= 56)
         fade = OUTRO_FADE.get(bar, 1.0)
+        dense = in_(beat, 'chorus1', 'chorus2') or 65 <= bar <= 68
 
-        # 로즈: 정박 지속 + 섹션 밀도에 맞춘 콤핑 리듬(마디마다 같은 두 타격이 아니다)
+        # 로즈: 코드 보이싱은 항상 유지. 코러스에서는 배음 복제 대신 옥타브 아래 페달을 더해
+        # "두껍다"가 아니라 "낮은 대역에 화성이 실려 있다"가 되게 한다.
         rhodes.cc(beat, 64, 127)                             # 코드마다 페달 밟고
         rhodes.cc(beat + dur - 0.08, 64, 0)                  # 다음 코드 직전에 뗀다
         rhodes.chord(beat, dur, voic, int((58 if quiet else 68) * fade))
         if not quiet and dur >= 4.0:
-            dense = in_(beat, 'chorus1', 'chorus2') or 65 <= bar <= 68
             comp = [(2.5, 1.0)] if not dense else [(1.5, 0.5), (2.5, 1.0), (3.5, 0.5)]
             for o, d in comp:
-                rhodes.chord(beat + o, d, voic, int((58 if o == 1.5 or o == 3.5 else 52) * fade))
-            if dense:                                        # 코러스만 위 배음을 더한다 (E6 상한 클램프)
-                rhodes.chord(beat, dur, [min(voic[-1] + 12, 85)], int(30 * fade))
+                rhodes.chord(beat + o, d, voic, int((58 if o != 2.5 else 52) * fade))
+            if dense:                                            # 페달: root 는 베이스 저음역(28~49)이라 옥타브 올려야 로즈 하한(E2=40) 안이다
+                rhodes.note(beat, dur, root + 12, int(38 * fade))
 
-        # 기타 — 마디마다 셀을 순환시키고, 척(뮤트 저음)을 한 겹 더 깐다
+        # 기타 — Rhodes 와 다른 음(shell 보이싱, 한 옥타브 위)으로 대역을 겹치지 않는다.
+        # 코드톤 커팅은 킥과 같은 자리를 치지 않고, 척은 업비트(킥이 없는 자리)에서 맞물린다.
         if in_(beat, 'verse1', 'verse2', 'chorus1', 'chorus2', 'post1', 'post2') or 65 <= bar <= 68:
-            top = voic[1:]
-            cell = GTR_CELLS[chord_idx % len(GTR_CELLS)]
+            # +12 클램프는 로즈의 상단(최대 F#5=78)과 정확히 겹치는 자리로 되돌아가는 문제가 있었다
+            # (검증하다 발견 — 65~68마디에서 다섯 음이 그대로 겹쳤다). 대신 각 음을 목표 음역
+            # 근처의 옥타브로 재배치해, 로즈가 어디에 있든 기타는 항상 그 위에 뜨게 한다.
+            # voic[-1]은 정의상 그 코드의 최고음이라, "로즈보다 위"를 요구하면 옥타브를
+            # 통째로 넘어야 했고 그러면 기타 상한(C6)을 넘었다(검증하다 발견). 위 확장음 대신
+            # 코드의 낮은 두 음(근음+3도)을 옥타브 올린다 — 재즈/펑크 기타의 실제 "셸 보이싱"과
+            # 같은 선택이고, 로즈의 최고음역과 구조적으로 겹칠 이유가 없어진다.
+            shell = [voic[0] + 12, voic[1] + 12]
+            if max(shell) > 83:                                   # 그래도 넘으면 페어 전체를 내린다
+                shell = [p - 12 for p in shell]
+            # k%4 는 0~3 만 나오므로 이전 버전의 (1,2,5,6) 은 5·6이 죽은 코드였다 —
+            # 코러스 밀집 패턴이 실제로는 sparse 와 똑같이 나가고 있었다.
+            # 절대 k 로 박2·박4 직전 16분에 당김을 얹는다 — 킥(박1~4)·하이햇(8분) 과
+            # 겹치지 않는 자리(3, 11)라 새 리듬 정보가 실제로 추가된다.
             for k in range(int(dur * 4)):
-                p = beat + k * 0.25
-                if k % 4 in cell:
-                    gtr.chord(p, 0.2, top, 46 if k % 2 else 54)
-            chuck_on = in_(beat, 'chorus1', 'chorus2') or 65 <= bar <= 68
-            if chuck_on:                                     # 저음 뮤트 척 — 킥과 겹쳐 대역을 두껍게
-                chuck_p = max(voic[0] - 12, 52)                 # 기타 음역 하한(E3=52) 아래로 안 내려간다
-                for o in (0.0, 1.0, 2.0, 3.0):
-                    gtr.note(beat + o, 0.08, chuck_p, 38)
-
-        chord_idx += 1
+                if k % 4 in (1, 2) or (dense and k in (3, 11)):
+                    gtr.chord(beat + k * 0.25, 0.2, shell, 44 if k % 2 else 52)
+            if dense:                                            # 척 = 8분 업비트(0.5·1.5·2.5·3.5) — 킥과 안 겹친다
+                chuck_p = max(voic[0] - 12, 52)
+                for o in (0.5, 1.5, 2.5, 3.5):
+                    gtr.note(beat + o, 0.1, chuck_p, 34)
 
         # 베이스
         if quiet and not (53 <= bar <= 56):
@@ -548,11 +568,12 @@ def build_chords(rhodes, gtr, bass):
             continue
         if bar == 76:              # 마지막 마디는 베이스를 빼고 로즈·휘슬·스트링스만 남긴다
             continue
-        cells = BASS_CELLS_VERSE if in_(beat, 'verse1', 'verse2') else BASS_CELLS_MAIN
-        cell = cells[chord_idx % len(cells)]
+        role = bass_role(beat)
+        variant = (bar - 1) % 2                                # 홀수 마디=앵커, 짝수 마디=변주
+        cell = BASS_ROLE[role][variant % len(BASS_ROLE[role])]
         for j, (o, d, semi) in enumerate(cell):
             if o < dur:
-                vel = 88 if o == 0.0 else (78 if semi == 0 else 82)
+                vel = 88 if o == 0.0 else (78 if semi == 0 else 84)
                 bass.note(beat + o, d, root + semi, int(vel * fade))
         # 다음 코드로의 접근음 — 이 코드 마지막 8분을 다음 근음의 반음/온음 아래에서 접근시킨다
         nxt_root = None
@@ -711,13 +732,24 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         put_motif(whi, 69, 94, transpose=2, expressive=True)
         put_motif(whi, 73, 84, transpose=2, expressive=True)
         # 스트링스: 코러스(옅게, 고음역 화성 보강) · 브릿지 후반 · 마지막 코러스 · 아웃트로
+        # 정적인 2음 화음 대신 두 성부로 나눈다 — 위는 지속, 아래는 코드 중간에 온음계
+        # 이웃음으로 한 번 움직인다(작은 서스펜션). 매 코드가 똑같은 딱딱한 화음으로 안 들리게.
         for beat, dur, name in PROG:
             bar = bar_of(beat)
             in_chorus = in_(beat, 'chorus1', 'chorus2')
             if in_chorus or 57 <= bar <= 60 or 65 <= bar <= 76:
                 voic = CH[name][0]
                 vel = 40 if in_chorus else (54 if bar >= 73 else 66)  # 코러스는 리드 아래로 옅게
-                strs.chord(beat, dur, [voic[0] + 12, voic[2] + 12], vel)
+                top = voic[2] + 12
+                strs.note(beat, dur, top, vel)                        # 지속 성부
+                low0 = voic[0] + 12
+                if dur >= 2.0:
+                    half = dur / 2
+                    low1 = low0 + 2                      # 온음 위 — 전조 구간(E장조)도 있어 스케일 의존 안 함
+                    strs.note(beat, half, low0, max(1, vel - 6))
+                    strs.note(beat + half, dur - half, low1, max(1, vel - 6))
+                else:
+                    strs.note(beat, dur, low0, max(1, vel - 6))
 
     if topline:
         put_topline(whi, hrp, rho)
@@ -732,25 +764,26 @@ if __name__ == '__main__':
         put_motif(m, 1 + rep * 4, 92)
         for i, name in enumerate(POST):
             mr.chord(b(1 + rep * 4 + i), 4.0, CH[name][0], 64)
-    write_midi(os.path.join(OUT, '01_motif.mid'), [m, mr])
+    R = f'_rev{REV:02d}'
+    write_midi(os.path.join(OUT, f'01_motif{R}.mid'), [m, mr])
 
     # STEP 2 — 구조 골격
-    write_midi(os.path.join(OUT, '02_structure.mid'),
+    write_midi(os.path.join(OUT, f'02_structure{R}.mid'),
                [t for t in make_tracks(with_melody=False) if t.ev])
 
     # STEP 3~6 — 전곡, 그리고 작업 흐름에 맞춘 분리본
     tracks = [t for t in make_tracks() if t.ev]
-    write_midi(os.path.join(OUT, '03_full.mid'), tracks)
-    write_midi(os.path.join(OUT, '04_vocals.mid'),          # -> Synthesizer V (Mai 2)
+    write_midi(os.path.join(OUT, f'03_full{R}.mid'), tracks)
+    write_midi(os.path.join(OUT, f'04_vocals{R}.mid'),          # -> Synthesizer V (Mai 2)
                [t for t in tracks if 'Vocal' in t.name])
-    write_midi(os.path.join(OUT, '05_instruments.mid'),     # -> DAW (보컬판의 반주)
+    write_midi(os.path.join(OUT, f'05_instruments{R}.mid'),     # -> DAW (보컬판의 반주)
                [t for t in tracks if 'Vocal' not in t.name])
-    write_midi(os.path.join(OUT, '06_instrumental.mid'),    # -> 인스트 (선율을 악기가 이어받는다)
+    write_midi(os.path.join(OUT, f'06_instrumental{R}.mid'),    # -> 인스트 (선율을 악기가 이어받는다)
                [t for t in make_tracks(topline=True) if t.ev and 'Vocal' not in t.name])
 
     total = 76 * 4 * 60 / BPM
     KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
     key = KEYS[(2 + TRANSPOSE) % 12]
-    print(f'wrote 01~05.mid  —  76 bars, '
+    print(f'wrote 01~06{R}.mid  —  76 bars, '
           f'{int(total // 60)}:{int(total % 60):02d} @ {BPM}BPM, '
-          f'key {key} major (TRANSPOSE={TRANSPOSE:+d})')
+          f'key {key} major (TRANSPOSE={TRANSPOSE:+d}, rev{REV:02d})')
