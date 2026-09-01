@@ -375,9 +375,15 @@ def test_리스크_지정석은_기준선_옹호다():
 
 def test_좌석_계약은_공통_1_도메인_15_해서_16키다():
     assert set(d._RISK_SEAT_CONTRACT) == {"_common", *_RISK_DOMAINS}
-    assert "[리스크 심사 좌석 계약]" in d._RISK_SEAT_CONTRACT["_common"]
-    assert "evidence_only" in d._RISK_SEAT_CONTRACT["_common"]      # MCP 경로도 같은 계약을 받는다
-    assert "«…»" in d._RISK_SEAT_CONTRACT["_common"]                # 인젝션 방어 문장
+    common = d._RISK_SEAT_CONTRACT["_common"]
+    assert "[리스크 심사 좌석 계약]" in common
+    assert "evidence_only" in common                                # MCP 경로도 같은 계약을 받는다
+    assert "«…»" in common                                          # 인젝션 방어 문장
+    # 계획 §6.5.3 개정 2문장 — 판정 기준은 요구(req:)이고, 요구가 없으면 그 사실을 판정 옆에 적는다.
+    assert "요구(req:)의 한계와 여유를 기준으로" in common
+    assert "요구 미등록 — 이 판정은 내 경험 기준" in common
+    # 스코프가 다른 앱 버전·부분 캡처면 인용에 병기한다(소스 드리프트를 판정에 노출).
+    assert "부분 캡처인 스코프" in common and "인용에 병기" in common
     for dom in _RISK_DOMAINS:
         line = d._RISK_SEAT_CONTRACT[dom]
         assert line.startswith(f"[{dom}] 필수: "), dom
@@ -418,6 +424,22 @@ def test_읽기_도구는_앱_조건부이고_쓰기_도구가_없다():
     assert not d._free_tool_ok("pcb_warpage_surrogate")
 
 
+def test_유지_도구는_15종이고_계약표_rel_std_행과_맞는다():
+    """계획 §6.5.2 keep 15종 — RA·laminate·열충격 8 + rel 필드 이력·std 문헌 7.
+    이 7종이 빠지면 계약표 rel·std 행이 시키는 조회가 앱 제한에서 사라진다."""
+    assert set(d._RISK_KEEP_TOOLS) == {
+        "search_objects", "get_object", "get_subgraph", "search_reports", "predict_sed",
+        "check_design_rules", "pcb_warpage_surrogate", "get_reference_cases",
+        "get_top_issues", "query_voc", "search_voc", "get_voc_summary",
+        "get_kg_relations", "search_scholar", "search_web",
+    }
+    assert len(d._RISK_KEEP_TOOLS) == len(set(d._RISK_KEEP_TOOLS)) == 15
+    for n in ("get_top_issues", "query_voc"):
+        assert n in d._RISK_SEAT_CONTRACT["rel"], n
+    for n in ("search_scholar", "search_web"):
+        assert n in d._RISK_SEAT_CONTRACT["std"], n
+
+
 def test_자유조회_조립식_게이트가_chair_와_앱_조건부다():
     """소스에서 뽑은 _g 조건식을 실제로 돌린다 — 기존 심의(chair≠risk-review)는 종전 그대로."""
     gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
@@ -450,6 +472,14 @@ def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():
     assert _eval_gate(gate, "interface_graph", chair="default", apps=apps, amap=amap)
     assert not _eval_gate(gate, "search_objects", chair="default", apps=apps, amap=amap)
     assert _eval_gate(gate, "search_objects", chair="risk-review", apps=apps, amap=amap)
+    # 신규 keep 7종도 같은 규칙이다 — 접두사(query_·get_·search_)로 _g 는 통과하지만,
+    # 소속 앱이 apps 3칸 밖이라 _narrow 에서 chair 조건부 or 가 없으면 통째로 사라진다.
+    amap.update({"query_voc": "heax-signalforge", "get_top_issues": "heax-signalforge",
+                 "search_scholar": "heax-paperhub"})
+    for n in ("query_voc", "get_top_issues", "search_scholar"):
+        assert d._free_tool_ok(n), n
+        assert not _eval_gate(gate, n, chair="default", apps=apps, amap=amap), n
+        assert _eval_gate(gate, n, chair="risk-review", apps=apps, amap=amap), n
 
 
 def _contract_suffix_stmt():
