@@ -1457,6 +1457,13 @@ def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
     return kept
 
 
+# 핸드오프(챗→심의)용 도구 결과 길이. 화면 미리보기(220)와 **일부러 분리한다** —
+# 활동 패널은 짧아야 읽히고, 심의는 날것이 많이 필요하다(심의의 챗근거 예산은 11KB인데
+# 220자×12건 ≈ 2.6KB 만 도착해 8.4KB 가 비어 있었다). 표시용을 늘리면 패널도 브라우저
+# localStorage 도 같이 무거워지므로 필드를 나눈다. 12건×1200자 ≈ 14KB → 예산을 채운다.
+HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "1200"))
+
+
 def _tool_preview(v, n: int = 220) -> str:
     """활동 패널 드릴다운용 도구 입출력 요약 — 안전 문자열화 + 공백 압축 + 절단."""
     try:
@@ -1872,8 +1879,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     if _PHANTOM_ID_MARK in _txt:
                         _budget["blocked"] += 1
                 out = _tool_preview(_raw)
+                # 심의 핸드오프용 날것 — 표시용보다 길 때만 싣는다(짧은 결과에 중복 페이로드 금지).
+                full = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
-                                      **({"result_preview": out} if out else {})})
+                                      **({"result_preview": out} if out else {}),
+                                      **({"result_full": full} if len(full) > len(out) else {})})
     except Exception as exc:
         # 상세는 서버 로그에만(내부 유출 방지). 단 AGENT_DEBUG_ERRORS=1 이면 예외 타입·메시지를
         # 브라우저 응답에도 실어 운영자가 바로 원인을 본다(기본 꺼짐 — 켜면 재시작 필요).
@@ -2201,15 +2211,15 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts,
-                                      req.user_email, req.user_pat)
+                                      req.user_email, req.user_pat, req.history)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
         stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts,
-                               req.user_email, req.user_pat)
+                               req.user_email, req.user_pat, req.history)
     elif is_deliberation(req.message):
         stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts,
-                                  req.user_email, req.user_pat)
+                                  req.user_email, req.user_pat, req.history)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,

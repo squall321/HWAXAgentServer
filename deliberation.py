@@ -354,6 +354,63 @@ _MODIFIER_BLOCKS = {
 _ALLOWED_MODIFIERS = set(_MODIFIER_BLOCKS)
 
 
+# 챗 대화 맥락 예산(문자). 라운드마다 좌석 수만큼 곱해지므로 크게 못 잡는다.
+# 도구 결과는 별도 채널(opts.evidence, 11KB)이라 여기는 사람이 한 말만 담는다.
+CHAT_CONTEXT_BUDGET = _env_int("DELIB_CHAT_CONTEXT_BUDGET", 6000)
+
+
+def _chat_context_note(history) -> str:
+    """챗 대화를 심의에 넘길 한 덩이로 — **지위를 명시해서** 넣는다.
+
+    금지해야 할 것은 '결론이 들어오는 것'이 아니라 '결론이 **전제로 둔갑**하는 것'이다.
+    전에는 어시스턴트 발화를 통째로 빼서 오염을 막았는데, 그러면 사람이 챗에서 말한
+    조건·제약·의도까지 같이 버려져 첫 발화 한 줄만 심의에 닿았다. 라벨을 붙여 넣는다 —
+    이 프레이밍은 챗 근거(chat_ev_inject)가 이미 쓰던 방식과 같다.
+
+    예산이 밀리면 **어시스턴트 발화부터 버린다.** 사람의 전제가 더 값나가고, 어시스턴트의
+    잠정 해석은 없어도 심의가 스스로 다시 만든다.
+    """
+    users, bots = [], []
+    # ⚠ 심의 경로의 history 는 **검증을 안 거친다** — _history_messages(챗 전용)가 아니라
+    #   요청 본문이 그대로 온다. 예산이 길이는 막지만 항목 수는 안 막으므로 여기서 자른다.
+    for m in (history or [])[:60]:
+        if not isinstance(m, dict):
+            continue
+        text = str(m.get("content") or "").strip()
+        if not text:
+            continue
+        # 트리거 발화(/심의 …)는 question 으로 이미 들어가 있다 — 두 번 넣지 않는다.
+        text = re.sub(r"^/(심의|시뮬심의|시험계획|deliberate|토의)\s*", "", text)
+        (users if m.get("role") == "user" else bots).append(text)
+    if not users and not bots:
+        return ""
+
+    budget = CHAT_CONTEXT_BUDGET
+    out = ["\n\n[챗에서 이어진 맥락 — 아래는 모두 **검증 대상**이다. 전제로 받아들이지 마라]"]
+    if users:
+        out.append("[인간의 전제·의중] 사람이 챗에서 한 말이다. 무엇을 원하고 무엇을 제약으로 "
+                   "두는지가 여기 있다. 심의는 이 전제 자체가 옳은지도 함께 따져라 — "
+                   "틀렸다고 판단하면 근거를 대고 그렇게 말하라.")
+        for t in users:
+            line = f"· {t[:1200]}"
+            if budget - len(line) < 0:
+                out.append("· (이하 생략 — 예산)")
+                break
+            out.append(line)
+            budget -= len(line)
+    if bots and budget > 400:
+        out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
+                   "근거가 없거나 틀렸으면 반박하라.")
+        for t in bots:
+            line = f"· {t[:900]}"
+            if budget - len(line) < 0:
+                out.append("· (이하 생략 — 예산)")
+                break
+            out.append(line)
+            budget -= len(line)
+    return "\n".join(out)
+
+
 def _modifier_note(mods):
     """켠 Modifier 들의 지시 블록을 심의 BASE 에 붙일 한 덩이로. 없으면 빈 문자열."""
     blocks = [_MODIFIER_BLOCKS[m] for m in (mods or []) if m in _MODIFIER_BLOCKS]
@@ -1782,7 +1839,7 @@ async def _evidence_prepass(tools: dict, llm, question: str):
 
 
 async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                               user_pat: str = ""):
+                               user_pat: str = "", history: list | None = None):
     """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
 
     라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
@@ -1833,7 +1890,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
         opts_a = _resolve_opts(req_opts)
         opts_a.chair_template = "mechanism"
-        async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat):
+        async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat, history):
             _capture(chunk)
             yield chunk
         if not decision_a:
@@ -1885,7 +1942,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
             print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
-        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat):
+        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat, history):
             _capture_b(chunk)
             yield chunk
 
@@ -1904,7 +1961,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                                  "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
             build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                        f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
-            async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat):
+            async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
                 yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[sim-deliberation] fatal: {exc!r}")
@@ -1914,13 +1971,13 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
 
 
 async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                           user_pat: str = ""):
+                           user_pat: str = "", history: list | None = None):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     opts = _resolve_opts(req_opts)
     try:
-        async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat):
+        async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat, history):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[deliberation] fatal: {exc!r}")
@@ -1929,7 +1986,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
 
 
 async def run_test_plan(app, question: str, groups: list, req_opts=None, user: str = "",
-                        user_pat: str = ""):
+                        user_pat: str = "", history: list | None = None):
     """시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정해 시험 계획서를 낸다.
 
     해석은 물성이 없으면 시작할 수 없고, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는
@@ -1958,7 +2015,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
             print(f"[test-plan] snapshot failed: {exc!r}")
         q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
              f"목적: {question}")
-        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat):
+        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[test-plan] fatal: {exc!r}")
@@ -1968,7 +2025,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
 
 
 async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS, user: str = "",
-                               user_pat: str = ""):
+                               user_pat: str = "", history: list | None = None):
     """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
     # 근거 계수(F2) — 결정문 헤더에 실을 프로파일. 형식의 권위가 근거의 강도를 넘지 않게,
@@ -2319,9 +2376,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                               "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라]\n" + "\n".join(_items))
     # 얹을 층(2층 Modifier) — 켠 것들의 지시 블록. _tail 에 실어 base·base_blind(좌석·의장) 전체에 적용.
     mod_inject = _modifier_note(opts.modifiers)
+    # 챗에서 이어진 대화 — 사람의 전제와 챗의 잠정 해석을 지위를 붙여 넣는다(둘 다 검증 대상).
+    chat_ctx_inject = _chat_context_note(history)
+    if chat_ctx_inject:
+        yield _delib("evidence", source="챗 대화 맥락 (검증 대상)",
+                     text=chat_ctx_inject[:1500], included=True)
     _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
              + (f"\n{tool_inject}" if tool_inject else "")
-             + (f"\n{chat_ev_inject}" if chat_ev_inject else "") + mod_inject)
+             + (f"\n{chat_ev_inject}" if chat_ev_inject else "") + chat_ctx_inject + mod_inject)
     base = f"[심의 주제]\n{question}\n" + cont + _tail
     # 신규 좌석 앵커링 차단(F12) — 재심사로 새로 합류한 좌석에게 이전 결론을 먼저 읽히면
     # 동조 압력을 받아 '새 관점을 얻으려고 불렀다'는 목적이 사라진다. 1라운드에 한해 이전 요약을
