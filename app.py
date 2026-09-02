@@ -28,6 +28,7 @@ Env:
 """
 
 import hashlib
+import itertools
 import asyncio
 import contextvars
 import json
@@ -2239,6 +2240,9 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 class ExpertsRequest(BaseModel):
     message: str
     groups: list[str] = []
+    # 대화 전체 — 좌석 추천을 화두 한 줄이 아니라 오간 맥락 위에서 하기 위한 것.
+    # ⚠ 통째로 임베딩 질의에 넣지 않는다(아래 _seat_axes 주석 참조). 축을 뽑는 데만 쓴다.
+    history: list[dict] = []
 
 
 def _parse_json_multi(text) -> list:
@@ -2271,6 +2275,99 @@ def _parse_json_multi(text) -> list:
     return out
 
 
+# 대화에서 뽑을 도메인 축 개수. 축마다 recommend_agents 를 한 번씩 더 부르므로 지연과 맞바꾼다.
+EXPERT_AXES = int(os.environ.get("EXPERT_AXES", "4"))
+# 축 추출에 넣을 대화 분량(문자). 축만 뽑으면 되므로 크게 필요 없다.
+_AXIS_CTX_BUDGET = 5000
+
+
+async def _domain_roster(tools: dict) -> list[dict]:
+    """전문가 풀의 **도메인 분류 정본**(list_agent_domains). 실패하면 빈 목록."""
+    try:
+        rows = _parse_json_multi(await _call(tools, "list_agent_domains", {}))
+    except Exception as exc:  # noqa: BLE001 — 분류 조회 실패는 비치명적
+        print(f"[experts] list_agent_domains failed: {exc!r}")
+        return []
+    out = []
+    for r in rows:
+        r = _first_dict(r)
+        d = str(r.get("domain") or "").strip()
+        if d:
+            out.append({"domain": d, "agents": int(r.get("agent_count") or 0)})
+    return sorted(out, key=lambda x: -x["agents"])
+
+
+async def _seat_axes(llm, tools: dict, message: str, history: list) -> list[dict]:
+    """대화에서 **좌석 검색 축**을 뽑는다 — 자유 생성이 아니라 도메인 분류에서의 **선택**이다.
+
+    두 가지를 동시에 푼다.
+
+    ① 긴 질의 문제 — 대화를 통째로 임베딩 질의에 던지면 추천이 **나빠진다.** 긴 텍스트는
+       한 벡터로 평균이 되어 변별이 죽는다. 실측(2026-08-07) — 원 질문에 말을 덧붙인
+       역질의는 상위 5 중 4가 기존 좌석과 동일했고, 반대로 '봉지 수분 산소 침투 신뢰성'
+       같은 **짧은 도메인 질의는 정확히 다른 좌석**(rel-chemical-corrosion)을 돌려줬다.
+       그래서 축마다 짧은 질의로 나눠 던진다(deliberation._counter_seats 와 같은 방식).
+
+    ② 체계성 문제 — 축을 LLM 이 자유 연상으로 만들면 커버리지 보장이 없다. 무엇을 빠뜨렸는지
+       셀 수조차 없다. 그래서 풀의 **도메인 분류(list_agent_domains, 실시간)** 를 프레임으로
+       주고 '해당하는 도메인을 고르라'는 **선택** 문제로 바꾼다. 프레임이 풀 전체를 덮으므로
+       빠진 도메인을 셀 수 있고, 없는 도메인을 지어내면 아래 검증에서 버려진다.
+
+    반환: [{domain, phrase}] — phrase 가 실제 검색 질의다. 실패하면 빈 목록(호출부가 종전대로).
+    """
+    if not history:
+        return []
+    roster = await _domain_roster(tools)
+    if not roster:
+        return []
+    lines, budget = [], _AXIS_CTX_BUDGET
+    for m in history[:60]:
+        if not isinstance(m, dict):
+            continue
+        t = str(m.get("content") or "").strip()
+        if not t:
+            continue
+        who = "사람" if m.get("role") == "user" else "AI"
+        line = f"[{who}] {t[:800]}"
+        if budget - len(line) < 0:
+            break
+        lines.append(line)
+        budget -= len(line)
+    if not lines:
+        return []
+    roster_txt = ", ".join(f"{r['domain']}({r['agents']}명)" for r in roster)
+    try:
+        raw = await _llm_text(
+            llm,
+            "당신은 심의 좌석 편성자입니다. 지시한 형식의 줄만 출력하세요.",
+            f"[전문가 풀의 도메인 분류 — 여기 있는 것만 쓸 수 있다]\n{roster_txt}\n\n"
+            f"[화두]\n{message[:1000]}\n\n[오간 대화]\n" + "\n".join(lines) +
+            f"\n\n위 대화 전체를 읽고, 이 문제를 판단하려면 어느 도메인이 필요한지 위 목록에서 "
+            f"고르라. 화두에 직접 쓰인 말만이 아니라 대화에서 드러난 조건·제약·의심까지 반영하라. "
+            f"중요한 순서로 최대 {EXPERT_AXES}줄, 각 줄은 다음 형식뿐이다.\n"
+            f"도메인코드 | 그 도메인에서 무엇을 볼지 짧은 명사구(8단어 이내)\n"
+            f"목록에 없는 코드는 쓰지 마라. 설명·번호·머리말 없이 줄만 출력하라.")
+    except Exception as exc:  # noqa: BLE001 — 축 추출 실패는 비치명적. 종전 단일 질의로 간다.
+        print(f"[experts] axis extraction failed: {exc!r}")
+        return []
+    known = {r["domain"] for r in roster}
+    axes, seen = [], set()
+    for ln in str(raw or "").splitlines():
+        ln = re.sub(r"^[\s\-\*\d\.\)·]+", "", ln).strip()
+        if "|" not in ln:
+            continue
+        dom, _, phrase = ln.partition("|")
+        dom, phrase = dom.strip().lower(), phrase.strip()[:60]
+        # 분류에 없는 도메인은 버린다 — 지어낸 축으로 검색하면 체계성이 도로 무너진다.
+        if dom not in known or len(phrase) < 2 or dom in seen:
+            continue
+        seen.add(dom)
+        axes.append({"domain": dom, "phrase": phrase})
+        if len(axes) >= EXPERT_AXES:
+            break
+    return axes
+
+
 @app.post("/deliberate/experts")
 async def deliberate_experts(req: ExpertsRequest) -> dict:
     """심의 전 전문가 선정 미리보기 — 자동 추천(recommend_agents) + 전체 풀(list_agents compact).
@@ -2289,12 +2386,18 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     # 질문 연관 순위 — recommend_agents 를 넉넉히(top_k=CAND) 받아 관련도순 후보로 쓴다.
     # recommended = 상위 N(기본 선택), candidates = 관련 전문가 목록(수동 추가 기본 노출·검색 우선).
     cand_k = int(os.environ.get("EXPERT_CANDIDATE_TOP_K", "40"))
-    candidates: list[dict] = []
-    try:
-        recd = _parse_json(await _call(tools, "recommend_agents", {"q": req.message, "top_k": cand_k}))
+
+    async def _rank(q: str, top_k: int) -> list[dict]:
+        """한 질의의 추천 결과를 정규화해 돌려준다. 실패는 빈 목록(호출부가 계속 진행)."""
+        try:
+            recd = _parse_json(await _call(tools, "recommend_agents", {"q": q, "top_k": top_k}))
+        except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
+            print(f"[experts] recommend failed (q={q[:40]!r}): {exc!r}")
+            return []
         items = recd if isinstance(recd, list) else (
             (recd or {}).get("recommendations") or (recd or {}).get("agents") or (recd or {}).get("data") or [])
-        for it in (items or [])[:cand_k]:
+        out = []
+        for it in (items or [])[:top_k]:
             it = _first_dict(it)
             n = _norm(it)
             if not n["key"]:
@@ -2303,9 +2406,64 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
             n["why"] = it.get("why") or ""
             n["low_confidence"] = bool(it.get("low_confidence"))
             n["desc_match"] = it.get("desc_match")
+            out.append(n)
+        return out
+
+    # 축 분해 — 대화가 있으면 축마다 짧은 질의를 따로 던진다(긴 질의는 이웃이 그대로 돌아온다).
+    # 축 추출이 실패하거나 대화가 없으면 axes 는 빈 목록이고, 아래는 종전 단일 질의와 같아진다.
+    axes = await _seat_axes(app.state.llm, tools, req.message, req.history)
+    base_task = _rank(req.message, cand_k)
+    axis_tasks = [_rank(a["phrase"], 8) for a in axes]
+    base_out, *axis_out = await asyncio.gather(base_task, *axis_tasks)
+
+    # 병합 — 화두 질의 결과를 바탕에 깔고, 축별 상위를 **축을 한 명씩 돌아가며** 얹는다.
+    # 라운드로빈이라 한 축이 앞자리를 독식하지 않는다(축 다양성이 인원수보다 중요하다).
+    candidates: list[dict] = []
+    by_key: dict[str, dict] = {}
+    for n in base_out:
+        if n["key"] not in by_key:
+            by_key[n["key"]] = n
             candidates.append(n)
-    except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
-        print(f"[experts] recommend failed: {exc!r}")
+    # 축당 신규 좌석 상한. 라운드로빈만으로는 안 된다 — 화두 질의가 이미 40명을 물어오므로
+    # 대부분의 축 추천은 거기 이미 있고(라벨만 붙는다), '정말 못 닿던' 좌석을 내는 축 하나가
+    # 깊이를 계속 파며 앞자리를 독식한다(실측: pwr 축이 상위 5 중 3을 먹었다).
+    # 축 다양성이 인원수보다 중요하다.
+    _AXIS_QUOTA = 2
+    picked: list[dict] = []
+    quota: dict[str, int] = {}
+    for depth in range(8):
+        for axis, lst in zip(axes, axis_out):
+            if depth >= len(lst):
+                continue
+            n = lst[depth]
+            label = f"{axis['domain']} · {axis['phrase']}"
+            prev = by_key.get(n["key"])
+            if prev is not None:
+                prev.setdefault("axes", []).append(label)  # 이미 있으면 축 출처만 보탠다
+                continue
+            if quota.get(axis["domain"], 0) >= _AXIS_QUOTA:
+                continue
+            quota[axis["domain"]] = quota.get(axis["domain"], 0) + 1
+            n["axes"] = [label]
+            by_key[n["key"]] = n
+            picked.append(n)
+    # 커버리지 회계 — 고른 도메인 중 실제로 좌석을 얻은 것과 못 얻은 것. 자유 생성 축이었으면
+    # 셀 수조차 없던 값이다. 의장 (0) 커버리지 항목이 짐작 대신 이 숫자를 쓸 수 있다.
+    for axis, lst in zip(axes, axis_out):
+        axis["seats"] = [n["key"] for n in lst[:3]]
+    # 축 좌석과 화두 좌석을 **번갈아** 세운다. 축을 앞에 몰아 세웠더니 화두 자체의 좌석이
+    # 통째로 밀려났다 — '염수 부식 후 낙하 크랙' 에서 rel-drop-impact 가 상위 5에서 빠졌다
+    # (실측: 축 적용 전후 상위 5가 하나도 겹치지 않았다). 축은 화두가 못 닿는 도메인을 보태는
+    # 것이지 화두를 대체하는 게 아니다. 축부터 시작해 교차시킨다 — 축이 이번 수정의 값이므로
+    # 첫 자리는 주되, 화두 좌석이 함께 남는다.
+    merged: list[dict] = []
+    seen_m: set[str] = set()
+    for a, b in itertools.zip_longest(picked, candidates):
+        for n in (a, b):
+            if n is not None and n["key"] not in seen_m:
+                seen_m.add(n["key"])
+                merged.append(n)
+    candidates = merged
     recommended = candidates[:N_PERSONAS]
 
     # 풀에 맞는 전문가가 없을 때 화면이 그렇게 말할 수 있게 올려 보낸다. AIDataHub 가
@@ -2351,8 +2509,10 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         "all": _tool_catalog(tools),
         "apps": _app_catalog(tools),
     }
+    # axes — 대화에서 뽑은 도메인 축. 화면이 "왜 이 좌석인지"를 보여주는 근거다.
+    # 빈 배열이면 화두 한 줄로만 추천했다는 뜻이고, 화면도 그렇게 말해야 한다.
     return {"recommended": recommended, "candidates": candidates, "pool": pool,
-            "tools": tools_info, "low_confidence": low_conf}
+            "tools": tools_info, "low_confidence": low_conf, "axes": axes}
 
 
 class AgentDetailRequest(BaseModel):
