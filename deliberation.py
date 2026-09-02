@@ -669,7 +669,7 @@ def _resolve_opts(req_opts):
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:120],
                     "tool": str(it.get("tool") or "")[:80],
                     "args": str(it.get("args") or "")[:400],
-                    "result": res[:2000],
+                    "result": res[:2000] + (f" …[{len(res):,}자 중 2,000자]" if len(res) > 2000 else ""),
                 })
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
@@ -1113,10 +1113,12 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
                               f"다른 설명 없이, 요구된 키를 실제 내용으로 채운 JSON 객체 하나만 출력하세요.)")
         d = _parse_json(txt)
     if not isinstance(d, dict):
-        d = {"say": str(txt)[:800]}
+        # 파싱 재시도 소진 — 발언을 통째로 버리지 않되 **강등 사실을 표식으로 남긴다**(감사 C28:
+        # 5~7천자 논증이 800자로 무표식 붕괴해 회의록·다음 라운드가 완결 발언으로 읽었다).
+        d = {"say": "(구조화 실패 — 원문 강등, 일부만 보존) " + str(txt)[:2000]}
     elif required and not any(d.get(k) not in (None, "", []) for k in required):
         # 요구 키 없는 dict({"response":…} 등) — 원문을 say 로 보존해 다음 라운드에 전달
-        d = {**d, "say": str(d.get("say") or txt)[:800]}
+        d = {**d, "say": "(요구 키 누락 — 원문 보존) " + str(d.get("say") or txt)[:2000]}
     d["persona"] = persona["key"]
     return d
 
@@ -1150,9 +1152,18 @@ def _ser(o: dict, keys: tuple, primary: str = "") -> str:
 
 def _cap_ctx(s: str) -> str:
     """의장 프롬프트에 싣는 라운드 텍스트의 라운드당 상한(DELIB_DECISION_CTX, 0=무제한) —
-    3개 라운드 합산이 좁은 컨텍스트(dev 16K)에서 의장 호출을 밀어내는 꼬리위험 방지."""
+    3개 라운드 합산이 좁은 컨텍스트(dev 16K)에서 의장 호출을 밀어내는 꼬리위험 방지.
+
+    ⚠ 머리만 남기면 **완료순 앞쪽 3~4석만 의장에게 닿는다**(감사 C22 — 21석 라운드 직렬화
+    ~44K 에서 6K 만 남았고, 잘린 게 뒤쪽 = 나중에 끝난 좌석 전부였다). 예산을 머리·꼬리로
+    갈라 양끝 좌석이 살게 하고, 몇 자가 빠졌는지 의장에게 말한다."""
     if _DECISION_CTX > 0 and len(s) > _DECISION_CTX:
-        return s[:_DECISION_CTX].rstrip() + "\n…(이하 생략)"
+        head = int(_DECISION_CTX * 0.6)
+        tail = _DECISION_CTX - head
+        return (s[:head].rstrip()
+                + f"\n…[라운드 전사 {len(s):,}자 중 앞 {head:,}·뒤 {tail:,}자만 — 중간 좌석 발언 생략됨. "
+                  "생략 좌석의 입장을 아는 척하지 마라]…\n"
+                + s[-tail:].lstrip())
     return s
 
 
@@ -2244,7 +2255,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     break
                 _err_note = (_out or "(빈 응답)")[:500]
             if _good:
-                _chunks.append(f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n{_good[:2000]}")
+                _cut = f" …[{len(_good):,}자 중 2,000자]" if len(_good) > 2000 else ""
+                _chunks.append(f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n{_good[:2000]}{_cut}")
                 _used.append(_tn)
                 ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
@@ -2451,6 +2463,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   "JSON {concede:[],rebut:[],deepen} 로.")
 
     rounds_data = []          # [(turns_list, transcript_str), ...] 라운드별
+    seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
 
     for rnd in range(1, N + 1):
@@ -2525,7 +2538,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
         _gathered = {}
         if g_agent is not None and kind != "converge":
-            _gctx = (prev_t[-1800:] if (rnd > 1 and prev_t) else base[:1800])
+            _gctx = (prev_t[-4000:] if (rnd > 1 and prev_t) else base[:4000])
             _gt = [asyncio.ensure_future(
                 _free_gather_one(g_agent, p, question, _gctx, opts.tool_budget)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
@@ -2587,6 +2600,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
         rounds_data.append((cur, ct))
+        # 좌석 유실 판정 — _round_live 는 한 명의 실패를 continue 로 삼킨다(라운드는 살리되).
+        # 그 좌석은 회의록·다음 라운드·의장 어디에도 없는데 아무도 몰랐다(감사 C23 — MCP 경로의
+        # 같은 결함이 실측 좌석 하나를 무음으로 지웠다). 라운드마다 세어 스트림·의장에 알린다.
+        _spoke = {o.get("persona") for o in cur}
+        _lost_now = [pp["key"] for pp in personas if pp["key"] not in _spoke]
+        if _lost_now:
+            seat_loss.append({"round": rnd, "lost": _lost_now})
+            print(f"[deliberation] ⚠ r{rnd} 좌석 {len(_lost_now)}석 유실 — {', '.join(_lost_now)}")
+            yield _sse("status", {"step": f"⚠ {rnd}라운드 좌석 유실: {', '.join(_lost_now)} (오류·시간초과)",
+                                  "tool": None})
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
         if opts.stop_after_round == 1 and rnd == 1:
@@ -2620,9 +2643,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
     rounds_block = "\n\n".join(
         f"[{i + 1}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
+    _loss_note = ""
+    if seat_loss:
+        _loss_note = ("[좌석 유실 — 아래 좌석은 그 라운드에서 오류로 발언하지 못했다. "
+                      "(0) 커버리지에 이 사실을 그대로 적고, 그 도메인 판단이 빠진 채 수렴했음을 밝혀라]\n"
+                      + "\n".join(f"· {x['round']}라운드: {', '.join(x['lost'])}" for x in seat_loss) + "\n")
     chair_human = (
         base + f"\n{rounds_block}\n\n"
-        f"[{seat_note}]\n[{ev_note}]\n"
+        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
@@ -2721,15 +2749,25 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else [])
                           + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
             "results": [results_t[:1500]],
-            # 맨 앞 '핵심 요약' 문단 + 의사결정문. 요약이 한 슬롯 먹어도 본문이 안 잘리게 +1.
-            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:20],
+            # ⚠ 여기는 코드가 직접 도구를 부르는 경로다(에이전트 에코 아님) — 에코 출력 상한이
+            #   없으므로 상한을 넉넉히 둔다. 종전 [:20]/[:40] 은 실측 6만자급에서 소수의견·
+            #   뒤집힘 조건(뒤쪽 항목)과 수렴 라운드 회의록을 통째로 버렸다(감사 C24/C25).
+            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:200],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
-                        f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:40],
+                        f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:400],
         }
-        made = _parse_json(await _call(tools, "create_report_draft", {
+        _paras = [p.strip() for p in decision.split("\n\n") if p.strip()]
+        if len(_paras) > 200 or len(transcript) > 400:
+            print(f"[deliberation] RA 블록 절단 — 문단 {len(_paras)}/200 · 회의록 {len(transcript)}/400")
+        _raw_made = await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
             "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
-            "tags": ["심의", "chat-deliberation"]}))
+            "tags": ["심의", "chat-deliberation"]})
+        # _call 은 도구 예외를 "(tool … error: …)" 문자열로 삼킨다 — 그러면 아래 파싱이 None 이
+        # 되어 실패 원인이 어디에도 안 남았다(감사 C29). 오류 문자열이면 원인을 찍는다.
+        if isinstance(_raw_made, str) and _raw_made.lstrip().startswith("(tool"):
+            print(f"[deliberation] create_report_draft 도구 오류: {_raw_made[:300]}")
+        made = _parse_json(_raw_made)
         rid = ((made or {}).get("report") or {}).get("id")
         if rid:
             report_note = f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨."
@@ -2799,7 +2837,10 @@ async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
         if c:
             who = "질문" if m.get("role") == "user" else "응답"
             lines.append(f"[{who}] {c}")
-    body = "\n\n".join(lines)[:60000]
+    _joined = "\n\n".join(lines)
+    # 이력은 오래된 것→최신 순 — 머리만 남기면 잘리는 쪽이 최신 = 심의 결정문이다(감사 C30).
+    body = _joined if len(_joined) <= 60000 else (
+        _joined[:15000] + f"\n\n…[이력 {len(_joined):,}자 중 중간 생략]…\n\n" + _joined[-45000:])
     if note:
         body += f"\n\n[사용자가 직접 끌어낸 결론] {note}"
     try:

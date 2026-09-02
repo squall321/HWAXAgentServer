@@ -1881,10 +1881,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                         _budget["blocked"] += 1
                 out = _tool_preview(_raw)
                 # 심의 핸드오프용 날것 — 표시용보다 길 때만 싣는다(짧은 결과에 중복 페이로드 금지).
-                full = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
+                # ⚠ 변수명 주의 — `full` 은 1701행의 **토큰 누적 리스트**다. 처음에 `full =` 로
+                #   덮어썼다가 다음 토큰의 full.append 가 AttributeError 로 챗을 죽였다(감사 C35).
+                _hand = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
                                       **({"result_preview": out} if out else {}),
-                                      **({"result_full": full} if len(full) > len(out) else {})})
+                                      **({"result_full": _hand} if len(_hand) > len(out) else {})})
     except Exception as exc:
         # 상세는 서버 로그에만(내부 유출 방지). 단 AGENT_DEBUG_ERRORS=1 이면 예외 타입·메시지를
         # 브라우저 응답에도 실어 운영자가 바로 원인을 본다(기본 꺼짐 — 켜면 재시작 필요).
