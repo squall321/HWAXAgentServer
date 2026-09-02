@@ -1442,7 +1442,16 @@ _FREE_ALLOW = ("list_", "get_", "search_", "find_", "query_", "compute_", "analy
                "stress_", "top_", "catalog_", "agent_search", "daily_", "alert_",
                # 물성 DB 의 읽기 전용 조회인데 접두어 규칙에 안 걸리는 것들 —
                # 이름이 동사로 시작해 새는 자리다. 셋 다 조회만 한다.
-               "how_to_measure", "test_plan_for_material", "measurement_gaps")
+               "how_to_measure", "test_plan_for_material", "measurement_gaps",
+               # 2026-09-02 솔더볼 심의 실주행에서 좌석이 실제로 부른 읽기 전용 도구 중
+               # 위 접두사에 안 걸리던 것들. MCP 워크플로 경로(게이트웨이 직결)에서는 쓰였는데
+               # agent-server 자유 조회에서는 빠져 **두 경로의 좌석 능력이 달라진다**.
+               "recommend_agents", "instrument_summary", "section_contact_usage",
+               # ⚠ slurm 은 접두사로 열면 안 된다 — slurm_submit_job·slurm_job_control·
+               #   slurm_node_set_state 가 함께 열린다(전부 쓰기). 조회 셋만 이름으로 연다.
+               "slurm_cluster_health", "slurm_list_nodes", "slurm_list_partitions")
+# export_dyna_cards 는 일부러 뺐다 — 같은 실주행에서 쓰였지만 'export' 가 파일을 쓰는지
+# 확인 못 했다. deny-by-default 목록에서는 확인 안 된 것을 넣지 않는 쪽이 맞다.
 _FREE_DENY = ("get_agent_session",)   # 페르소나 시스템프롬프트 원문은 조회 근거가 아니다
 
 # 물성 DB(MaterialTwin) 조회 도구 — 앱 제한과 무관하게 **항상** 바인딩한다.
