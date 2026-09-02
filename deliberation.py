@@ -1076,7 +1076,19 @@ def _parse_json(text: str):
 
 async def _llm_text(llm, system: str, human: str) -> str:
     r = await llm.ainvoke([("system", system), ("human", human)])
-    return r.content if hasattr(r, "content") else str(r)
+    text = r.content if hasattr(r, "content") else str(r)
+    # ⚠ max_tokens 절단 검출 — finish_reason 을 아무도 안 읽어서, 의장 결정문이 출력 상한에서
+    #   문장 중간에 잘려도 정상 반환으로 흘렀다(감사 비판자 1-D). 잘렸으면 표식을 붙인다 —
+    #   하류의 파싱 실패·절단 감지가 이 표식으로 원인을 구분할 수 있다.
+    try:
+        meta = getattr(r, "response_metadata", None) or {}
+        fin = meta.get("finish_reason") or (getattr(r, "additional_kwargs", None) or {}).get("finish_reason")
+        if fin == "length":
+            print(f"[deliberation] ⚠ LLM 출력이 max_tokens 에서 절단됨 (len={len(str(text))})")
+            text = str(text) + "\n…[출력 상한(max_tokens) 절단 — 이 응답은 불완전하다]"
+    except Exception:  # noqa: BLE001 — 검출 실패가 본 호출을 죽이면 안 된다
+        pass
+    return text
 
 
 async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
