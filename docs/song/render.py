@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 SR = 44100
-REV = 2   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
+REV = 3   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
 RNG = np.random.default_rng(20260830)   # moongate_build.py 와 같은 시드 계열
 
 
@@ -189,15 +189,18 @@ def voice_drum(pitch, dur, vel, n_extra=0.0):
     n = int(SR * max(dur, 0.03))
     t = np.arange(n) / SR
     g = 0.35 + 0.55 * vel / 127
-    if pitch == 36:                                          # Kick
+    if pitch == 36:                                          # Kick — 클릭/바디/서브 3층
         f = 150 * np.exp(-t / 0.045) + 45
-        sig = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-t / 0.16)
+        body = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-t / 0.16)
+        sub = np.sin(2 * np.pi * 47 * t) * np.exp(-t / 0.22) * 0.5      # 저역 무게
         click = highpass_diff(RNG.standard_normal(n), 2) * np.exp(-t / 0.004) * 0.6
-        return (sig + click) * g * 1.3
-    if pitch == 38:                                          # Snare
+        return (body + sub + click) * g * 1.3
+    if pitch == 38:                                          # Snare — 몸통 두 음 + 스네어 와이어
         noise = smooth(RNG.standard_normal(n), 3) * np.exp(-t / 0.13)
-        tone = np.sin(2 * np.pi * 190 * t) * np.exp(-t / 0.07) * 0.5
-        return (noise * 0.9 + tone) * g
+        wire = highpass_diff(RNG.standard_normal(n), 1) * np.exp(-t / 0.09) * 0.45
+        tone = (np.sin(2 * np.pi * 185 * t) + 0.6 * np.sin(2 * np.pi * 278 * t)) \
+               * np.exp(-t / 0.07) * 0.4
+        return (noise * 0.7 + wire + tone) * g
     if pitch == 37:                                          # Rim
         noise = highpass_diff(RNG.standard_normal(n), 2) * np.exp(-t / 0.03)
         tone = np.sin(2 * np.pi * 900 * t) * np.exp(-t / 0.02)
@@ -345,6 +348,17 @@ def main():
         print(f'  {name:24s} 노트 {n_notes:5d}  RMS {rms:.4f} -> gain {gain:.2f}')
 
     mix = reverb(mix, SR)
+
+    # 버스 글루 압축 — 파트가 따로 놀지 않고 한 밴드로 들리게. 포락선을 부드럽게 따라간다.
+    env = smooth(np.abs(mix).max(axis=1), int(SR * 0.02))
+    thr = np.percentile(env, 70)
+    gain = np.where(env > thr, (thr / np.maximum(env, 1e-9)) ** 0.35, 1.0)
+    mix *= smooth(gain, int(SR * 0.06))[:, None]
+
+    # 스테레오 폭 — 사이드 성분만 아주 살짝 넓힌다(모노 호환 유지: 카페 천장 스피커 전제)
+    mid = (mix[:, 0] + mix[:, 1]) * 0.5
+    side = (mix[:, 0] - mix[:, 1]) * 0.5 * 1.18
+    mix = np.stack([mid + side, mid - side], axis=1)
 
     # 아웃트로 자연 페이드 위에 마지막 1.5초 추가 페이드로 클릭 방지
     fade = min(int(SR * 1.5), total_samples)

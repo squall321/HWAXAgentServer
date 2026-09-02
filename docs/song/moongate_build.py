@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 2
+REV = 3
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -534,6 +534,16 @@ def build_chords(rhodes, gtr, bass):
                 rhodes.chord(beat + o, d, voic, int((58 if o != 2.5 else 52) * fade))
             if dense:                                            # 페달: root 는 베이스 저음역(28~49)이라 옥타브 올려야 로즈 하한(E2=40) 안이다
                 rhodes.note(beat, dur, root + 12, int(38 * fade))
+        # 로즈 왼손 — 오른손 보이싱만 치던 것을 실제 연주처럼 두 손으로 나눈다.
+        # 중역(D3~D4)이 전 섹션에서 0~13% 로 비어 있었다(quality.py [C]).
+        if not quiet:
+            lh_root = root + 12                                  # 베이스 위, 오른손 아래
+            lh_fifth = lh_root + 7
+            while lh_fifth > 62:                                 # 중역(D4=62) 위로는 안 올라간다
+                lh_root -= 12; lh_fifth -= 12
+            if lh_root >= 45:                                    # 너무 낮으면(베이스와 겹침) 생략
+                lh = [lh_root, lh_fifth]                          # 코러스만이 아니라 전 구간 2음
+                rhodes.chord(beat, dur * 0.9, lh, int((44 if dense else 38) * fade))
 
         # 기타 — Rhodes 와 다른 음(shell 보이싱, 한 옥타브 위)으로 대역을 겹치지 않는다.
         # 코드톤 커팅은 킥과 같은 자리를 치지 않고, 척은 업비트(킥이 없는 자리)에서 맞물린다.
@@ -548,6 +558,8 @@ def build_chords(rhodes, gtr, bass):
             shell = [voic[0] + 12, voic[1] + 12]
             if max(shell) > 83:                                   # 그래도 넘으면 페어 전체를 내린다
                 shell = [p - 12 for p in shell]
+            # (기타를 벌스에서 한 옥타브 내려 중역을 채우려 했으나, rev02 에서 해결한
+            #  로즈와의 겹침이 100% 로 되살아났다 — 중역은 로즈 왼손이 맡는다)
             # k%4 는 0~3 만 나오므로 이전 버전의 (1,2,5,6) 은 5·6이 죽은 코드였다 —
             # 코러스 밀집 패턴이 실제로는 sparse 와 똑같이 나가고 있었다.
             # 절대 k 로 박2·박4 직전 16분에 당김을 얹는다 — 킥(박1~4)·하이햇(8분) 과
@@ -574,7 +586,12 @@ def build_chords(rhodes, gtr, bass):
         for j, (o, d, semi) in enumerate(cell):
             if o < dur:
                 vel = 88 if o == 0.0 else (78 if semi == 0 else 84)
-                bass.note(beat + o, d, root + semi, int(vel * fade))
+                p_ = root + semi
+                # 코러스 계열의 마디 첫 박만 옥타브 아래로 — 저역(<D2)이 전 구간 0% 였다.
+                # E1(28)=41.2Hz 를 하한으로 고정: 기획서의 "40Hz 이하 없다"를 지킨다.
+                if role == 'DRIVE' and o == 0.0 and p_ - 12 >= 28:
+                    p_ -= 12
+                bass.note(beat + o, d, p_, int(vel * fade))
         # 다음 코드로의 접근음 — 이 코드 마지막 8분을 다음 근음의 반음/온음 아래에서 접근시킨다
         nxt_root = None
         ni = PROG.index((beat, dur, name)) + 1
@@ -587,6 +604,30 @@ def build_chords(rhodes, gtr, bass):
             bass.note(beat + dur - 0.5, 0.5, appr, int(72 * fade))
 
 
+# 고스트 스네어 위치 — 마디 짝/홀로 갈아 끼워 두 마디가 같아지지 않게 한다
+GHOST_VERSE = {0: (0.75, 2.25), 1: (1.75, 3.25)}
+GHOST_FOUR = {0: (1.75, 3.75), 1: (0.75, 2.25)}
+
+# 필 — 자리마다 성격이 다르다. (offset, dur, GM노트, velocity)
+# 36=킥 37=림 38=스네어 42=클로즈햇 45=로우탐 46=오픈햇 47=미드탐 49=크래시 70=셰이커
+FILLS = {
+    12: [(3.0, 0.25, 38, 84), (3.25, 0.25, 38, 70), (3.5, 0.5, 47, 96)],       # 프리 진입: 스네어 굴림
+    16: [(2.5, 0.25, 47, 88), (2.75, 0.25, 47, 92), (3.0, 0.25, 45, 100),
+         (3.5, 0.5, 38, 112)],                                                  # 코러스 진입: 탐->스네어
+    24: [(3.5, 0.5, 38, 104)],                                                  # 포스트 진입: 한 방만
+    28: [(3.0, 0.5, 46, 88), (3.5, 0.5, 38, 100)],                              # 2절 진입: 오픈햇+스네어
+    36: [(3.25, 0.25, 38, 76), (3.5, 0.25, 38, 90), (3.75, 0.25, 38, 104)],     # 프리2: 16분 밀어넣기
+    40: [(2.5, 0.25, 47, 90), (2.75, 0.25, 45, 96), (3.0, 0.5, 38, 106),
+         (3.5, 0.5, 45, 110)],                                                  # 코러스2: 가장 큰 필
+    48: [(3.5, 0.5, 38, 104)],
+    4:  [(3.0, 0.25, 38, 44), (3.5, 0.25, 38, 58), (3.75, 0.25, 38, 70)],       # ★첫 보컬 진입: 여린 스네어 픽업 (rev02 까지 아무 준비도 없었다)
+    52: [(3.0, 1.0, 46, 84)],                                                   # 브릿지 진입: 오픈햇을 길게 — 비우며 들어간다
+    60: [],                                                                     # G.P. 는 아래에서 따로
+    68: [(2.5, 0.25, 47, 92), (2.75, 0.25, 47, 98), (3.0, 0.25, 45, 104),
+         (3.25, 0.25, 45, 108), (3.5, 0.5, 38, 116)],                           # 아웃트로 진입: 최대 필
+}
+
+
 def build_drums(dr):
     K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 70, 49, 47, 45
     for bar in range(1, 77):
@@ -596,9 +637,21 @@ def build_drums(dr):
                  'verse' if in_(beat, 'verse1', 'verse2', 'pre1', 'pre2') else
                  'build' if 57 <= bar <= 60 else
                  'outro-thin' if bar in (73, 74) else 'four')
+        ph = (bar - 1) % 4                       # 프레이즈 안 위치 (0~3)
         if style == 'none':
-            for k in range(8):
-                dr.note(beat + k * 0.5, 0.2, SHK, int((40 if k % 2 else 52) * fade))
+            # 조용한 구간도 마디마다 같으면 안 된다(인트로가 100% 복붙이었다).
+            # 셰이커 격자를 8분/16분으로 번갈아 쓰고, 2마디마다 림을 하나 얹는다.
+            if ph % 2 == 0:
+                for k in range(8):
+                    dr.note(beat + k * 0.5, 0.2, SHK, int((40 if k % 2 else 54) * fade))
+            else:
+                for k in range(16):
+                    if k % 4 != 2:                       # 16분에서 한 칸씩 빼 숨을 만든다
+                        dr.note(beat + k * 0.25, 0.12, SHK, int((34 if k % 2 else 48) * fade))
+            if ph == 3:
+                dr.note(beat + 3.5, 0.2, RIM, int(52 * fade))
+            for o, d, note_, v in FILLS.get(bar, []):        # 조용한 구간도 진입 준비는 한다
+                dr.note(beat + o, d, note_, int(v * fade))
             continue
         if style == 'outro-thin':                      # 73~74마디: 풀킷 -> 킥+셰이커만
             for o in (0.0, 2.0):
@@ -606,13 +659,19 @@ def build_drums(dr):
             for k in range(8):
                 dr.note(beat + k * 0.5, 0.2, SHK, int((42 if k % 2 else 56) * fade))
             continue
+        # (ph = 프레이즈 안 위치. 실제 드러머는 4마디 단위로 호흡한다 —
+        #  rev02 까지 이 개념이 없어서 드럼 자기유사도가 92% 였다)
         if style == 'verse':
-            for o in (0.0, 1.5, 2.5):
+            kicks = [0.0, 1.5, 2.5] if ph != 3 else [0.0, 1.5, 2.75, 3.5]
+            for o in kicks:
                 dr.note(beat + o, 0.3, K, 100)
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, RIM, 92)
-            for k in range(8):
-                dr.note(beat + k * 0.5, 0.2, HH, 44 if k % 2 else 62)
+            for k in range(8):                    # 하이햇: 2마디 단위로 악센트 자리를 옮긴다
+                acc = (k == 0 or k == 4) if ph % 2 == 0 else (k == 2 or k == 6)
+                dr.note(beat + k * 0.5, 0.2, HH, 66 if acc else (44 if k % 2 else 56))
+            for o in GHOST_VERSE[ph % 2]:         # 고스트 스네어 — 포켓은 여기서 나온다
+                dr.note(beat + o, 0.1, S, 26)
         elif style == 'build':
             for o in (0.0, 1.0, 2.0, 3.0):
                 dr.note(beat + o, 0.3, K, 104)
@@ -620,21 +679,33 @@ def build_drums(dr):
                 dr.note(beat + o, 0.3, S, 98)
             for k in range(16):
                 dr.note(beat + k * 0.25, 0.15, HH, 42 + (18 if k % 4 == 0 else 0))
+            for o in (0.75, 2.75):
+                dr.note(beat + o, 0.1, S, 30)
         else:
-            for o in (0.0, 1.0, 2.0, 3.0):
+            kicks = [0.0, 1.0, 2.0, 3.0] if ph != 3 else [0.0, 1.0, 1.75, 2.0, 3.0]
+            for o in kicks:
                 dr.note(beat + o, 0.3, K, 106)
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, S, 100)
+            # 오픈 하이햇은 매 업비트가 아니라 2마디 구절 끝에만 — rev02 는 마디당 4번이라 씻겨나갔다
             for k in range(8):
-                dr.note(beat + k * 0.5, 0.25, OH if k % 2 else HH, 58 if k % 2 else 70)
+                is_open = (k == 7 and ph % 2 == 1)
+                dr.note(beat + k * 0.5, 0.25, OH if is_open else HH,
+                        62 if is_open else (48 if k % 2 else 72))
             for k in range(4):
                 dr.note(beat + 0.25 + k, 0.15, SHK, 46)
-        # 섹션 진입 크래시 / 마디 끝 필
+            for o in GHOST_FOUR[ph % 2]:
+                dr.note(beat + o, 0.1, S, 28)
+        # 섹션 진입 크래시
         if bar in (17, 25, 41, 49, 61, 65, 69):
             dr.note(beat, 0.5, CR, 108)
-        if bar in (12, 16, 24, 28, 36, 40, 48, 52, 60, 68):
-            dr.note(beat + 3.0, 0.25, T1, 96)
-            dr.note(beat + 3.5, 0.25, T2, 100)
+        # 필 — 자리마다 다른 걸 친다 (rev02 까지는 전부 톰 2방으로 같았다)
+        if bar in FILLS:
+            for o, d, note_, v in FILLS[bar]:
+                dr.note(beat + o, d, note_, v)
+        if bar in (16, 40):                             # 코러스 직전: 필 앞 반 박을 비워 낙차를 만든다
+            lo_, hi_ = b(bar, 2.0) * PPQ, b(bar, 2.5) * PPQ
+            dr.ev = [e for e in dr.ev if not (lo_ <= e[0] < hi_)]
         if bar == 60:                                   # 브릿지 끝 G.P.
             dr.ev = [e for e in dr.ev if not (b(60, 2.0) * PPQ <= e[0] < b(61) * PPQ)]
             dr.note(b(60, 2.0), 0.25, T1, 100)
