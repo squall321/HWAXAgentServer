@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 5
+REV = 6
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -755,7 +755,7 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     gtr = Track('Guitar (16th chops)', 27, 3)
     bas = Track('Bass', 33, 4)
     hrp = Track('Celtic Harp', 46, 5)
-    strs = Track('Strings', 48, 6)
+    strs = Track('Strings', 49, 6)      # 48(String Ensemble 1)보다 어택이 느리고 따뜻하다
     dr = Track('Drums', None, 9)
 
     if with_rhythm:
@@ -865,6 +865,14 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         for beat, dur, name in PROG:
             bar = bar_of(beat)
             in_chorus = in_(beat, 'chorus1', 'chorus2')
+            if bar <= 4:
+                # 인트로에 아주 옅은 스트링 베드. 휘슬·하프·로즈 셋 다 감쇠가 빠른 악기라
+                # 지속음이 하나도 없었고, 그래서 세 소리가 서로 붙지 않고 따로 놀았다.
+                # 전면에 나오면 안 되므로 코러스(vel 40)보다도 훨씬 아래에 둔다.
+                voic = CH[name][0]
+                strs.note(beat, dur, voic[2], 30)
+                strs.note(beat, dur, voic[0], 26)
+                continue
             if in_chorus or 57 <= bar <= 60 or 65 <= bar <= 76:
                 voic = CH[name][0]
                 vel = 40 if in_chorus else (54 if bar >= 73 else 66)  # 코러스는 리드 아래로 옅게

@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 SR = 44100
-REV = 5   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
+REV = 6   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
 RNG = np.random.default_rng(20260830)   # moongate_build.py 와 같은 시드 계열
 
 
