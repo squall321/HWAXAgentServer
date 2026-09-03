@@ -122,6 +122,10 @@ for label, rng in mg.SECTIONS.items():
         c = sum(d for _n, evs in pitched for t, a, d in evs if lo <= t < hi and blo <= a < bhi)
         counts.append(c)
     total = max(sum(counts), 1)
-    bars = ' '.join(f'{bn.split()[0]}:{c*100//total:>2}%' for (bn, _l, _h), c in zip(BANDS, counts))
+    # 정수 내림으로 찍으면 '있지만 1% 미만'과 '아예 없음'이 똑같이 0% 로 보인다.
+    # 벌스 저역을 채우고도 표에는 0% 로 남아 고친 줄 알 수 없었다 — 둘을 구분해 찍는다.
+    def _pct(c):
+        return ' 0%' if c == 0 else ('<1%' if c * 100 // total == 0 else f'{c*100//total:>2}%')
+    bars = ' '.join(f'{bn.split()[0]}:{_pct(c)}' for (bn, _l, _h), c in zip(BANDS, counts))
     empty = [bn for (bn, _l, _h), c in zip(BANDS, counts) if c == 0]
     print(f'  {label:9s} {bars}' + (f'   ★빈 대역: {", ".join(empty)}' if empty else ''))
