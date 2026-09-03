@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 7
+REV = 8
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -537,8 +537,31 @@ def bass_role(beat):
 RH_DROP = 12
 
 
+def _bass_octaves():
+    """베이스 근음의 옥타브를 성부 진행으로 고른다.
+
+    CH 표의 근음은 전부 E2~C#3(40~49)인데, 그 위에 셀이 +7·+12 를 얹으니 선율이
+    C3~B3(131~247Hz)에서 33% 를 보냈다 — 베이스가 아니라 중역 악기 소리가 난다.
+    옥타브를 통째로 내리면 코드마다 10반음씩 튀어 선율이 어지러워지므로,
+    코드마다 root/root±12 중 **직전 음에서 가장 가까운 것**을 고른다.
+    화음 보이싱에 쓴 것과 같은 원리다(거기선 평균 3.8반음).
+
+    하한 E1(28)=41.2Hz — 기획서의 "40Hz 이하 없다".
+    상한 A2(45)=110Hz — 셀이 +12 까지 얹으므로 여기가 근음의 천장이다.
+    """
+    LO, HI = 28, 45
+    out, prev = {}, None
+    for i, (_beat, _dur, name) in enumerate(PROG):
+        r = CH[name][1]
+        cands = [p for p in (r - 24, r - 12, r, r + 12) if LO <= p <= HI] or [r]
+        out[i] = min(cands) if prev is None else min(cands, key=lambda p: (abs(p - prev), p))
+        prev = out[i]
+    return out
+
+
 def build_chords(rhodes, gtr, bass):
-    for beat, dur, name in PROG:
+    bass_root = _bass_octaves()
+    for i, (beat, dur, name) in enumerate(PROG):
         voic_hi, root = CH[name]
         voic = [p - RH_DROP for p in voic_hi]
         bar = bar_of(beat)
@@ -604,10 +627,11 @@ def build_chords(rhodes, gtr, bass):
         if quiet and not (53 <= bar <= 56):
             continue
         if 53 <= bar <= 56:
-            bass.note(beat, dur, root, 74)
+            bass.note(beat, dur, bass_root[i], 74)
             continue
         if bar == 76:              # 마지막 마디는 베이스를 빼고 로즈·휘슬·스트링스만 남긴다
             continue
+        root = bass_root[i]              # 여기서부터는 옥타브가 정리된 근음
         role = bass_role(beat)
         variant = (bar - 1) % 2                                # 홀수 마디=앵커, 짝수 마디=변주
         cell = BASS_ROLE[role][variant % len(BASS_ROLE[role])]
@@ -626,11 +650,11 @@ def build_chords(rhodes, gtr, bass):
                 bass.note(beat + o, d, p_, int(vel * fade))
         # 다음 코드로의 접근음 — 이 코드 마지막 8분을 다음 근음의 반음/온음 아래에서 접근시킨다
         nxt_root = None
-        ni = PROG.index((beat, dur, name)) + 1
+        ni = i + 1
         if ni < len(PROG):
             nb, _nd, nname = PROG[ni]
             if bar_of(nb) == bar_of(beat + dur - 0.5) and not (nb - (beat + dur) > 0.01):
-                nxt_root = CH[nname][1]
+                nxt_root = bass_root[ni]
         if nxt_root is not None and dur >= 2.0:
             appr = nxt_root - 1 if nxt_root - 1 not in (root,) else nxt_root - 2
             bass.note(beat + dur - 0.5, 0.5, appr, int(72 * fade))
