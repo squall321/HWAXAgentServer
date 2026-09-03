@@ -1550,6 +1550,10 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
               f"search_by_property 로 대상을 찾고 get_material_properties·get_mat_card 로 값을 "
               f"받는다. 기억이나 일반 상식으로 수치를 말하지 마라 — 조회 기록이 없는 수치는 "
               f"근거로 인정되지 않는다. DB 에 없으면 '없음'을 확인한 사실로 보고하라. "
+              # RA(70개 저작용 API)는 입구에서 헤맨다 — 지도 도구와 조회 입구를 고정해 준다.
+              f"과거 보고서를 찾을 땐 search_reports 또는 get_reports_digest 로 시작하라 — "
+              f"Report Archive 도구가 낯설면 get_guide 로 사용법을 먼저 확인하라"
+              f"(list_reports 의 수십 개 인자를 추측으로 채우지 마라). "
               f"끝나면 '조회 요약:' 뒤에 핵심 수치만 "
               f"3줄 이내로 요약하라. 조회할 것이 없으면 '조회 불필요' 한 줄만 출력하라.")
     human = (f"[심의 주제]\n{question}\n\n[지금까지의 논의·근거(발췌)]\n{ctx}\n\n"
