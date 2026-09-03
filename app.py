@@ -316,6 +316,46 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
+# ── SSE 절단 내성(감사 원장 1-C) ────────────────────────────────────────────────
+# 심의류 스트림은 저장(RA·대화·결정문)이 전부 제너레이터 꼬리에 있다 — 종전 구조에선
+# 탭 닫힘·사내 프록시 idle 절단·nginx read timeout 하나가 수 시간 심의를 무저장으로
+# 죽였다(취소 스택만 남고 GPU 시간 전소). 심의 본체를 백그라운드 태스크로 옮기고
+# SSE 는 큐 구독만 한다 — 구독이 끊겨도 태스크는 계속 돌아 저장까지 완주한다.
+_DETACHED_TASKS: set = set()   # 태스크 GC 방지 — 참조가 사라지면 asyncio 가 조용히 버린다
+
+
+def _detach_stream(gen, label: str):
+    q: asyncio.Queue = asyncio.Queue()   # 무제한 — 소비자가 없어도 생산이 막히지 않는다
+
+    async def _drive():
+        try:
+            async for chunk in gen:
+                q.put_nowait(chunk)
+        except Exception as exc:  # noqa: BLE001 — 태스크 안 예외는 아무도 await 안 하면 무음이다
+            logging.getLogger("agent").exception("[detach:%s] 심의 태스크 오류", label)
+            q.put_nowait(_sse("error", {"message": f"심의 오류: {exc}"}))
+        finally:
+            q.put_nowait(None)
+
+    task = asyncio.create_task(_drive(), name=f"delib-{label}")
+    _DETACHED_TASKS.add(task)
+    task.add_done_callback(_DETACHED_TASKS.discard)
+
+    async def _subscribe():
+        try:
+            while True:
+                chunk = await q.get()
+                if chunk is None:
+                    break
+                yield chunk
+        except asyncio.CancelledError:
+            logging.getLogger("agent").warning(
+                "[detach:%s] SSE 구독 절단 — 심의는 백그라운드에서 계속 완주한다(저장 포함)", label)
+            raise
+
+    return _subscribe()
+
+
 # 도구 결과 절단(문자) — 컨텍스트 보호용 안전밸브. 무제한이면 대량 조회(VOC 수천 건)가
 # 프롬프트를 넘겨 'maximum context length' 로 챗 전체가 죽는다(dev 16K 실측).
 # 다만 6000 은 dev(16K) 기준값이라 대형 컨텍스트 모델(prod GLM)에 그대로 쓰면 목록이
@@ -2232,16 +2272,19 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
-        stream = run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups, req.delib_opts,
-                                      req.user_email, req.user_pat, req.history)
+        stream = _detach_stream(run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups,
+                                                     req.delib_opts, req.user_email, req.user_pat,
+                                                     req.history), "sim")
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
-        stream = run_test_plan(app, strip_test_plan_trigger(req.message), req.groups, req.delib_opts,
-                               req.user_email, req.user_pat, req.history)
+        stream = _detach_stream(run_test_plan(app, strip_test_plan_trigger(req.message), req.groups,
+                                              req.delib_opts, req.user_email, req.user_pat,
+                                              req.history), "test-plan")
     elif is_deliberation(req.message):
-        stream = run_deliberation(app, strip_trigger(req.message), req.groups, req.delib_opts,
-                                  req.user_email, req.user_pat, req.history)
+        stream = _detach_stream(run_deliberation(app, strip_trigger(req.message), req.groups,
+                                                 req.delib_opts, req.user_email, req.user_pat,
+                                                 req.history), "delib")
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,

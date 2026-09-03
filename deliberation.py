@@ -2420,10 +2420,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     chat_ev_inject = ""
     if opts.evidence:
         _items, _budget = [], 0
-        for _e in opts.evidence:
+        for _ei, _e in enumerate(opts.evidence, start=1):
             _src, _res = _e.get("source") or "챗", _e.get("result", "")
             _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
-            _line = f"· [{_src}{_meta}] {_res}"
+            # [e:N] 안정 id — 좌석·의장이 근거 항목을 지목해 인용할 참조 체계(JS 파이프라인 파리티).
+            _line = f"· [e:{_ei}] [{_src}{_meta}] {_res}"
             if _budget + len(_line) > 11000 and _items:
                 break
             _items.append(_line)
@@ -2432,7 +2433,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             ev_count["tool"] += 1
         if _items:
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
-                              "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라]\n" + "\n".join(_items))
+                              "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라. 이 항목의 "
+                              "수치·주장을 발언·결정문에 쓸 때는 해당 [e:N] 표지를 함께 적어라]\n" + "\n".join(_items))
     # 얹을 층(2층 Modifier) — 켠 것들의 지시 블록. _tail 에 실어 base·base_blind(좌석·의장) 전체에 적용.
     mod_inject = _modifier_note(opts.modifiers)
     # 챗에서 이어진 대화 — 사람의 전제와 챗의 잠정 해석을 지위를 붙여 넣는다(둘 다 검증 대상).
@@ -2676,7 +2678,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 종전엔 "라운드별 심화·수렴을 드러내라"를 무조건 요구했다. 그러면 과정 서술이 분량을
         # 먹고 종합을 밀어낸다 — 읽는 사람이 먼저 알아야 할 건 결론의 그림이다. 투명성은
         # 유지하되(여전히 드러내야 한다) 자리를 한 항목으로 묶는다.
-        "라운드별 심화·수렴은 위 항목 중 해당하는 자리에서 다루고, 본문 전체에 흩뿌리지 마라.")
+        "라운드별 심화·수렴은 위 항목 중 해당하는 자리에서 다루고, 본문 전체에 흩뿌리지 마라. "
+        "근거 인용 — [원천 데이터] 항목의 수치·주장을 쓸 때는 그 [e:N] 표지를 함께 적어라. "
+        "결정문의 모든 수치는 결정적 후검증으로 근거·발언 원문과 대조된다.")
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
     n_cand = max(1, opts.chair_bestof)
@@ -2704,6 +2708,29 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 decision = cands[b - 1] if 1 <= b <= len(cands) else cands[0]
             except (ValueError, TypeError):
                 decision = cands[0]
+
+    # 4a-2) 인용 후검증(결정적, LLM 아님) — JS 파이프라인 citationAudit 파리티(감사 원장 (3)).
+    #        결정문의 유의미 수치를 근거·발언 원문과 대조한다. unmatched 는 의장 신규 산술일 수도
+    #        환각일 수도 있는 '사람이 훑을 목록'이다 — 차단이 아니라 감사 채널.
+    _num_re = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{3,}")
+    _nrm = lambda s: str(s).replace(",", "")  # noqa: E731
+    _cit_corpus = _nrm("\n".join(
+        [f"{e.get('source', '')} {e.get('tool', '')} {e.get('args', '')} {e.get('result', '')}"
+         for e in (opts.evidence or [])]
+        + [question, opts.human_note or ""]
+        + [json.dumps(lst, ensure_ascii=False, default=str) + "\n" + str(t)
+           for lst, t in rounds_data]))
+    _dec_nums = [n for n in dict.fromkeys(_nrm(m.group(0)) for m in _num_re.finditer(decision))
+                 if not re.fullmatch(r"(19|20)\d{2}", n)]
+    _unmatched_nums = [n for n in _dec_nums if n not in _cit_corpus]
+    if _unmatched_nums:
+        yield _sse("status", {"step": f"근거 대조 — 결정문 수치 {len(_dec_nums)}건 중 "
+                   f"{len(_unmatched_nums)}건 미대조: {', '.join(_unmatched_nums[:6])}"
+                   f"{' …' if len(_unmatched_nums) > 6 else ''} (신규 산술 또는 환각 — 검토 대상)",
+                   "tool": None})
+    elif _dec_nums:
+        yield _sse("status", {"step": f"근거 대조 — 결정문 수치 {len(_dec_nums)}건 전부 "
+                   "근거·발언 원문에서 확인", "tool": None})
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
