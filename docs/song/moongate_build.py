@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 6
+REV = 7
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -38,6 +38,7 @@ INSTRUMENTS = {
     'Celtic Harp':               'Celtic lever harp',
     'Strings':                   'Small chamber string section (or synth strings)',
     'Drums':                     'Dry acoustic kit, minimal room (GM drum map)',
+    'Percussion':                'Hi-hats, shaker, tambourine, ride - mixed separately from the kit',
 }
 
 # ── 휴머나이즈 ────────────────────────────────────────────────
@@ -569,7 +570,12 @@ def build_chords(rhodes, gtr, bass):
 
         # 기타 — Rhodes 와 다른 음(shell 보이싱, 한 옥타브 위)으로 대역을 겹치지 않는다.
         # 코드톤 커팅은 킥과 같은 자리를 치지 않고, 척은 업비트(킥이 없는 자리)에서 맞물린다.
-        if in_(beat, 'verse1', 'verse2', 'chorus1', 'chorus2', 'post1', 'post2') or 65 <= bar <= 68:
+        # ★프리코러스에 기타가 아예 없었다. 실제 렌더 스펙트럼에서 프리의 프레즌스(2~4kHz)가
+        # 벌스보다 7dB 어두웠다 — 코러스로 밀어 올리는 구간이 오히려 어두워지고 있었다.
+        # 프레즌스의 55%를 기타가 담당하는데 그게 통째로 빠져 있었던 게 원인이다.
+        # 벌스와 같은 패턴이면 밋밋하니 16분 한 칸을 더 얹어 벌스보다 촘촘하게 — 그게 빌드다.
+        pre = in_(beat, 'pre1', 'pre2')
+        if pre or in_(beat, 'verse1', 'verse2', 'chorus1', 'chorus2', 'post1', 'post2') or 65 <= bar <= 68:
             # +12 클램프는 로즈의 상단(최대 F#5=78)과 정확히 겹치는 자리로 되돌아가는 문제가 있었다
             # (검증하다 발견 — 65~68마디에서 다섯 음이 그대로 겹쳤다). 대신 각 음을 목표 음역
             # 근처의 옥타브로 재배치해, 로즈가 어디에 있든 기타는 항상 그 위에 뜨게 한다.
@@ -587,7 +593,7 @@ def build_chords(rhodes, gtr, bass):
             # 절대 k 로 박2·박4 직전 16분에 당김을 얹는다 — 킥(박1~4)·하이햇(8분) 과
             # 겹치지 않는 자리(3, 11)라 새 리듬 정보가 실제로 추가된다.
             for k in range(int(dur * 4)):
-                if k % 4 in (1, 2) or (dense and k in (3, 11)):
+                if k % 4 in (1, 2) or (pre and k % 4 == 3) or (dense and k in (3, 11)):
                     gtr.chord(beat + k * 0.25, 0.2, shell, 44 if k % 2 else 52)
             if dense:                                            # 척 = 8분 업비트(0.5·1.5·2.5·3.5) — 킥과 안 겹친다
                 chuck_p = max(voic[0] - 12, 52)
@@ -658,8 +664,11 @@ FILLS = {
 }
 
 
-def build_drums(dr):
-    K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 70, 49, 47, 45
+def build_drums(dr, pc):
+    # ★SHK 는 rev06 까지 70 이었는데 GM 70 은 셰이커가 아니라 마라카스다(82가 셰이커).
+    #  이름만 SHK 였지 실제로는 마라카스를 치고 있었고, 마라카스가 더 어둡다.
+    K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 82, 49, 47, 45
+    TAMB, RIDE = 54, 51                    # 탬버린·라이드 — 비어 있던 고역을 맡는다
     for bar in range(1, 77):
         beat = b(bar)
         fade = OUTRO_FADE.get(bar, 1.0)
@@ -673,11 +682,11 @@ def build_drums(dr):
             # 셰이커 격자를 8분/16분으로 번갈아 쓰고, 2마디마다 림을 하나 얹는다.
             if ph % 2 == 0:
                 for k in range(8):
-                    dr.note(beat + k * 0.5, 0.2, SHK, int((40 if k % 2 else 54) * fade))
+                    pc.note(beat + k * 0.5, 0.2, SHK, int((40 if k % 2 else 54) * fade))
             else:
                 for k in range(16):
                     if k % 4 != 2:                       # 16분에서 한 칸씩 빼 숨을 만든다
-                        dr.note(beat + k * 0.25, 0.12, SHK, int((34 if k % 2 else 48) * fade))
+                        pc.note(beat + k * 0.25, 0.12, SHK, int((34 if k % 2 else 48) * fade))
             if ph == 3:
                 dr.note(beat + 3.5, 0.2, RIM, int(52 * fade))
             for o, d, note_, v in FILLS.get(bar, []):        # 조용한 구간도 진입 준비는 한다
@@ -687,7 +696,7 @@ def build_drums(dr):
             for o in (0.0, 2.0):
                 dr.note(beat + o, 0.3, K, int(100 * fade))
             for k in range(8):
-                dr.note(beat + k * 0.5, 0.2, SHK, int((42 if k % 2 else 56) * fade))
+                pc.note(beat + k * 0.5, 0.2, SHK, int((42 if k % 2 else 56) * fade))
             continue
         # (ph = 프레이즈 안 위치. 실제 드러머는 4마디 단위로 호흡한다 —
         #  rev02 까지 이 개념이 없어서 드럼 자기유사도가 92% 였다)
@@ -699,7 +708,7 @@ def build_drums(dr):
                 dr.note(beat + o, 0.3, RIM, 92)
             for k in range(8):                    # 하이햇: 2마디 단위로 악센트 자리를 옮긴다
                 acc = (k == 0 or k == 4) if ph % 2 == 0 else (k == 2 or k == 6)
-                dr.note(beat + k * 0.5, 0.2, HH, 66 if acc else (44 if k % 2 else 56))
+                pc.note(beat + k * 0.5, 0.2, HH, 66 if acc else (44 if k % 2 else 56))
             for o in GHOST_VERSE[ph % 2]:         # 고스트 스네어 — 포켓은 여기서 나온다
                 dr.note(beat + o, 0.1, S, 26)
         elif style == 'build':
@@ -708,7 +717,7 @@ def build_drums(dr):
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, S, 98)
             for k in range(16):
-                dr.note(beat + k * 0.25, 0.15, HH, 42 + (18 if k % 4 == 0 else 0))
+                pc.note(beat + k * 0.25, 0.15, HH, 42 + (18 if k % 4 == 0 else 0))
             for o in (0.75, 2.75):
                 dr.note(beat + o, 0.1, S, 30)
         else:
@@ -720,10 +729,10 @@ def build_drums(dr):
             # 오픈 하이햇은 매 업비트가 아니라 2마디 구절 끝에만 — rev02 는 마디당 4번이라 씻겨나갔다
             for k in range(8):
                 is_open = (k == 7 and ph % 2 == 1)
-                dr.note(beat + k * 0.5, 0.25, OH if is_open else HH,
+                pc.note(beat + k * 0.5, 0.25, OH if is_open else HH,
                         62 if is_open else (48 if k % 2 else 72))
             for k in range(4):
-                dr.note(beat + 0.25 + k, 0.15, SHK, 46)
+                pc.note(beat + 0.25 + k, 0.15, SHK, 46)
             for o in GHOST_FOUR[ph % 2]:
                 dr.note(beat + o, 0.1, S, 28)
         # 섹션 진입 크래시
@@ -737,6 +746,16 @@ def build_drums(dr):
             # 필이 2.25 로 당겨졌으니 비우는 창도 그만큼 앞으로 옮긴다(안 옮기면 필 첫 타가 지워진다)
             lo_, hi_ = b(bar, 1.5) * PPQ, b(bar, 2.25) * PPQ
             dr.ev = [e for e in dr.ev if not (lo_ <= e[0] < hi_)]
+        # 고역 퍼커션 — 실제 렌더 스펙트럼에서 8~16kHz 가 전 구간 비어 있었다(어느 악기도
+        # 0~1.4%). 탬버린과 라이드가 그 대역을 맡는다. 편성이 두꺼운 자리에만 넣어
+        # 벌스의 성김은 그대로 둔다.
+        if style == 'four':
+            for o in (0.5, 1.5, 2.5, 3.5):              # 8분 업비트 — 킥·스네어 사이를 메운다
+                pc.note(beat + o, 0.2, TAMB, int((54 if o in (1.5, 3.5) else 46) * fade))
+        if 65 <= bar <= 72:                             # 마지막 코러스 후반~아웃트로: 라이드로 광채
+            for k in range(8):
+                pc.note(beat + k * 0.5, 0.3, RIDE, int((58 if k % 2 == 0 else 44) * fade))
+
         if bar == 60:                                   # 브릿지 끝 G.P.
             dr.ev = [e for e in dr.ev if not (b(60, 2.0) * PPQ <= e[0] < b(61) * PPQ)]
             dr.note(b(60, 2.0), 0.25, T1, 100)
@@ -757,10 +776,14 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     hrp = Track('Celtic Harp', 46, 5)
     strs = Track('Strings', 49, 6)      # 48(String Ensemble 1)보다 어택이 느리고 따뜻하다
     dr = Track('Drums', None, 9)
+    # 퍼커션을 킷에서 분리한다. 한 트랙이면 믹스에서 킥과 하이햇의 비율을 못 만진다 —
+    # 실제 렌더 스펙트럼을 재 보니 드럼 에너지의 78%가 250Hz 아래였고(킥이 다 먹었다)
+    # 에어 대역(8~16kHz)은 0.6% 였다. 갈라 놔야 위쪽만 따로 올릴 수 있다.
+    pc = Track('Percussion', None, 9)
 
     if with_rhythm:
         build_chords(rho, gtr, bas)
-        build_drums(dr)
+        build_drums(dr, pc)
 
     if with_melody:
         # 인트로: 휘슬 모티프 + 하프 아르페지오
@@ -889,7 +912,7 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
 
     if topline:
         put_topline(whi, hrp, rho)
-    return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr]
+    return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr, pc]
 
 
 if __name__ == '__main__':

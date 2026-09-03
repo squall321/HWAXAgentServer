@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 SR = 44100
-REV = 6   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
+REV = 7   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
 RNG = np.random.default_rng(20260830)   # moongate_build.py 와 같은 시드 계열
 
 
@@ -233,9 +233,10 @@ MELODIC_VOICE = {
 PAN = {
     'Rhodes': -0.15, 'Guitar (16th chops)': 0.30, 'Bass': 0.0,
     'Celtic Harp': 0.35, 'Strings': 0.15, 'Signature Whistle': -0.05, 'Drums': 0.0,
+    'Percussion': 0.12,        # 킷에서 분리된 하이햇·셰이커·탬버린·라이드
 }
 TARGET_RMS = {                                # 상대 밸런스 (드럼·베이스가 뼈대, 나머지는 그 위에)
-    'Drums': 0.22, 'Bass': 0.20, 'Rhodes': 0.11, 'Guitar (16th chops)': 0.085,
+    'Drums': 0.20, 'Percussion': 0.115, 'Bass': 0.20, 'Rhodes': 0.11, 'Guitar (16th chops)': 0.085,
     'Celtic Harp': 0.075, 'Strings': 0.095, 'Signature Whistle': 0.13,
 }
 
@@ -267,7 +268,7 @@ def render_track(track, tick_to_sec, total_samples):
         t = np.arange(n) / SR
         start_sample = int(round(t0 * SR))
 
-        if name == 'Drums':
+        if name in ('Drums', 'Percussion'):     # 둘 다 GM 드럼맵이라 같은 보이스를 쓴다
             sig = voice_drum(pitch, dur, vel)
             n = len(sig)
         elif name == 'Signature Whistle':
