@@ -5,3 +5,6 @@ __pycache__/
 .env
 mcp_servers.json
 artifacts/
+
+# 스템 배포용 zip 은 stems_revNN/ 에서 다시 만들 수 있다
+docs/song/*.zip

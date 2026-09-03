@@ -917,6 +917,16 @@ if __name__ == '__main__':
     write_midi(os.path.join(OUT, f'06_instrumental{R}.mid'),    # -> 인스트 (선율을 악기가 이어받는다)
                [t for t in make_tracks(topline=True) if t.ev and 'Vocal' not in t.name])
 
+    # STEP 7 — DAW 용 트랙별 스템. Logic/GarageBand 에 파일 하나씩 끌어다 놓으면
+    # 그 트랙에만 그 악기가 들어간다. 합본(03)을 통째로 임포트하면 DAW 가 채널을
+    # 제 방식대로 배치해 버려 악기 배정을 다시 해야 하는 경우가 많다.
+    stem_dir = os.path.join(OUT, f'stems{R}')
+    os.makedirs(stem_dir, exist_ok=True)
+    for i, t in enumerate(tracks, 1):
+        safe = t.name.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '-')
+        write_midi(os.path.join(stem_dir, f'{i:02d}_{safe}.mid'), [t])
+    print(f'  스템 {len(tracks)}개 -> {os.path.basename(stem_dir)}/')
+
     total = 76 * 4 * 60 / BPM
     KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
     key = KEYS[(2 + TRANSPOSE) % 12]
