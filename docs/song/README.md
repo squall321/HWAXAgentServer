@@ -356,3 +356,8 @@ D 조의 V 가 E 조의 IV 로 반음 하나에 갈아타는 피벗이다.
 
 `DAW-MAC.md` — Logic Pro / GarageBand 로 가져가는 방법. 트랙당 MIDI 스템(`stems_revNN/`),
 악기 배정표, GM 드럼맵 주의사항, 믹스 출발값. **GM 사운드폰트보다 이쪽이 낫다.**
+
+## 표절 위험 점검
+
+`ORIGINALITY.md` — 화성(왕도진행은 의도한 관습), 선율 음형, 가사 문구 정확 일치 검색 결과.
+주의할 줄 하나(브릿지 "waiting for the sky to fall")와 **확인하지 못한 것**을 함께 적었다.

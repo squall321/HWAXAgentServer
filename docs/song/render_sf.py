@@ -22,7 +22,11 @@ rspec = importlib.util.spec_from_file_location('rn', os.path.join(HERE, 'render.
 rn = importlib.util.module_from_spec(rspec); rspec.loader.exec_module(rn)   # main() 은 __main__ 가드로 보호됨
 
 SR = 44100
-SF2_CANDIDATES = ['/usr/share/sounds/sf2/FluidR3_GM.sf2',
+# 사운드폰트는 귀로 고른다. 배음 성분 개수 같은 스펙트럼 지표로는 우열이 안 갈린다 —
+# 노이즈가 많아도 올라가는 값이라 '샘플이냐 가산합성이냐' 같은 범주 차이만 잡힌다.
+# 그래서 후보를 골라 쓸 수 있게 --sf2 를 둔다.
+SF2_CANDIDATES = ['/usr/share/sounds/sf2/MuseScore_General_Full.sf2',   # 489MB, 최신·용량 큼
+                  '/usr/share/sounds/sf2/FluidR3_GM.sf2',              # 148MB, 2008년 고전
                   '/usr/share/sounds/sf2/default-GM.sf2',
                   '/usr/share/soundfonts/FluidR3_GM.sf2']
 
@@ -40,7 +44,12 @@ MIX = {
 }
 
 
-def find_sf2():
+def find_sf2(argv):
+    for i, a in enumerate(argv):
+        if a == '--sf2' and i + 1 < len(argv):
+            if not os.path.exists(argv[i + 1]):
+                raise SystemExit(f'사운드폰트 없음: {argv[i + 1]}')
+            return argv[i + 1]
     for p in SF2_CANDIDATES:
         if os.path.exists(p):
             return p
@@ -61,11 +70,19 @@ def render_stem(mid_path, sf2, wav_path):
 def main():
     rev = mg.REV
     # --inst : 보컬 선율까지 악기가 이어받는 인스트루멘털판(06)을 굽는다
-    inst = '--inst' in sys.argv[1:]
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    argv = sys.argv[1:]
+    inst = '--inst' in argv
+    args, skip = [], False
+    for a in argv:                          # --sf2 <경로> 의 경로를 출력 파일명으로 오해하지 않게
+        if skip:
+            skip = False; continue
+        if a == '--sf2':
+            skip = True; continue
+        if not a.startswith('--'):
+            args.append(a)
     default = f'0{"6_instrumental" if inst else "5_instruments"}_rev{rev:02d}.mp3'
     dst = args[0] if args else os.path.join(HERE, default)
-    sf2 = find_sf2()
+    sf2 = find_sf2(argv)
     print(f'사운드폰트: {sf2}   ({"인스트루멘털" if inst else "반주"})')
 
     tracks = [t for t in mg.make_tracks(topline=inst) if t.ev and 'Vocal' not in t.name]
