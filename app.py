@@ -106,8 +106,9 @@ SYSTEM_PROMPT = (
     # 도구는 질의 관련도로 일부만 바인딩된다(TOOL_MAX) — 랭킹이 빗나가면 모델이 '기능이
     # 없다'고 단정하는 게 최악의 실패다. 안내대(search_tools)가 그 폴백이다.
     "필요한 기능의 도구가 목록에 안 보이면 '없다'고 단정하기 전에 search_tools 로 찾아보세요 "
-    "— 이 대화에 실리지 않은 도구까지 전부 검색됩니다. 찾은 도구가 목록에 없으면 그 이름을 "
-    "알려주고, 도구 선택(핀)이나 재질문을 안내하세요. "
+    "— 이 대화에 실리지 않은 도구까지 전부 검색됩니다. 찾은 도구가 목록에 없으면 "
+    "invoke_tool(name, arguments) 로 그 자리에서 바로 호출하세요 — search_tools 결과의 "
+    "args(required 포함)를 그대로 채우고, 인자를 모르면 추측하지 말고 다시 검색하세요. "
     # 종전엔 '차트를 요청받으면 HTML 로 출력하라'가 조건→문법→보상(챗이 렌더링합니다)까지 갖춘
     # 구체적 절차였고, 도구 우선은 추상적 원칙이었다. LLM 은 구체적 지시를 따르므로 자작이 이겼다
     # (실측: 도구 0회로 물성표 + Plotly CDN 차트 생성 — 그 문장 자신의 '외부 리소스 없이'까지 위반).
@@ -840,8 +841,9 @@ TOOL_REPEAT_WARN = int(os.environ.get("TOOL_REPEAT_WARN", "3"))
 TOOL_SCHEMA_BUDGET = int(os.environ.get("TOOL_SCHEMA_BUDGET", "12000"))
 _TOOL_PRIORITY = (
     # 안내대 — 관련도 랭킹이 빗나갔을 때의 폴백 입구. 반드시 상시 바인딩한다(2026-09-03,
-    # 도구 진입 구조: search_tools 는 게이트웨이 전 도구를 검색해 이름을 알려준다).
-    "search_tools", "list_tool_apps",
+    # 도구 진입 구조). search_tools 가 이름·인자를 찾아 주고, invoke_tool 이 바인딩에 없는
+    # 도구를 **그 턴에 즉시** 호출한다(파괴·제어성 도구는 게이트웨이가 차단).
+    "search_tools", "invoke_tool", "list_tool_apps",
     "recommend_agents", "get_agent_session", "agent_search", "semantic_search", "list_records",
     "data_aggregate", "alert_check", "daily_briefing", "query_voc", "search_voc", "get_top_issues",
     "create_report_draft", "update_report_draft", "search_reports", "list_templates",
