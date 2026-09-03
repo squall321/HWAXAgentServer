@@ -34,6 +34,7 @@ import contextvars
 import json
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -271,6 +272,10 @@ async def lifespan(app: FastAPI):
     # 다른 사용자 턴까지 '도구 없음'으로 오염시키고, 캐시 적중 경로에선 해제조차 안 돼
     # 영구 고착된다(실측: 실패한 적 없는 그룹이 계속 "도구 연결 복구되면 다시" 응답).
     app.state.tool_load_error = {}  # frozenset(groups) -> 마지막 실패 사유
+    # 마지막 성공 도구 스냅샷 — 게이트웨이가 죽어 로드가 실패해도 직전 도구로 응답한다
+    # (강건성 최상단). 키에 사용자 신원을 넣어 남의 자격증명 도구가 새지 않게 한다.
+    # 값: (raw_tools, ts). 게이트웨이 도구는 자주 안 바뀌므로 짧은 불통은 이걸로 흡수된다.
+    app.state.tool_snapshot = {}  # (frozenset(groups), user_lower) -> (raw_tools, ts)
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
     yield
 
@@ -1363,6 +1368,33 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 
+async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
+    """게이트웨이에서 도구 목록을 받되, **일시적** 실패는 지수 백오프로 재시도한다(간헐 도구
+    0개 해소). 게이트웨이 재기동·재연결은 보통 1~2초 내에 끝나므로, 그 창에 걸린 요청이
+    도구 없이 응답하던 것을 흡수한다(cae00 '될 때도 안 될 때도' 실증). 401/403 인증 실패는
+    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다."""
+    import asyncio as _aio
+    last = None
+    for i in range(max(1, tries)):
+        try:
+            got = await MultiServerMCPClient(scoped).get_tools()
+            # 빈 목록도 실패로 본다 — 게이트웨이가 부팅 직후 tools=0 인 과도 상태를 완결로
+            # 받으면 도구 없는 에이전트가 만들어진다. 마지막 시도가 아니면 재시도.
+            if not got and i < tries - 1:
+                raise RuntimeError("empty tool list")
+            return got
+        except Exception as e:  # noqa: BLE001
+            last = e
+            s = repr(e) + " " + str(e)
+            if re.search(r"\b(401|403)\b", s):
+                raise
+            if i < tries - 1:
+                d = base_delay * (2 ** i)   # 0.5 → 1.0 → 2.0
+                print(f"[agent] get_tools 일시 실패({i + 1}/{tries}) — {d:.1f}s 후 재시도: {type(e).__name__}")
+                await _aio.sleep(d)
+    raise last
+
+
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
                      query: str = "", sources: list[str] | None = None, user: str = "",
                      user_pat: str = ""):
@@ -1402,7 +1434,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 scoped = _with_groups(connections, sorted(groups), user, user_pat)
                 import asyncio as _aio
                 try:
-                    _got = await MultiServerMCPClient(scoped).get_tools()
+                    _got = await _get_tools_retry(scoped)
                 except Exception as _pe:
                     # ⚠ 사용자 PAT 로 붙는 데 실패하면 서비스 계정으로 한 번 되돌아간다.
                     # 챗의 도구 연결은 게이트웨이 하나뿐이라(mcp_servers.json), 이 한 번의
@@ -1419,8 +1451,13 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     degraded = repr(_pe)[:200]
                     print(f"[agent] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({degraded})")
                     scoped = _with_groups(connections, sorted(groups), user, "")
-                    _got = await MultiServerMCPClient(scoped).get_tools()
+                    _got = await _get_tools_retry(scoped)
                 _raw = [_prep_tool(t) for t in _got]
+                # 성공분을 스냅샷에 보관(source 게이트·select 전 순수 목록) — 다음 불통 때
+                # 폴백 재료다. 사용자 신원 키라 남에게 재사용되지 않는다.
+                if _raw:
+                    app.state.tool_snapshot[(frozenset(groups), (user or "").strip().lower())] = (
+                        _raw, time.time())
                 _raw = gate_sources(_raw, sources)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
                 tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
@@ -1451,7 +1488,19 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 else:
                     detail = f"{type(_root).__name__}: {str(_root)[:120]}"
                 app.state.tool_load_error[frozenset(groups)] = detail
-                print(f"[agent] tool load FAILED groups={sorted(groups)} {detail} ({exc!r}); no tools")
+                print(f"[agent] tool load FAILED groups={sorted(groups)} {detail} ({exc!r})")
+                # ── 스냅샷 폴백 — 게이트웨이가 죽어도 직전 성공 도구로 응답한다(강건성 최상단).
+                #    401(인증) 실패면 스냅샷 도구도 같은 토큰을 물어 무의미하니 폴백하지 않는다.
+                snap = app.state.tool_snapshot.get((frozenset(groups), (user or "").strip().lower()))
+                if snap and _st != 401:
+                    _snap_raw, _snap_ts = snap
+                    _age = int(time.time() - _snap_ts)
+                    _sr = gate_sources(list(_snap_raw), sources)
+                    tools = await _aio.to_thread(_select_tools, _sr, query, pinned)
+                    load_failed = False   # 도구가 살아 있으니 실패 아님 — 단 신선하지 않다
+                    degraded = f"stale-snapshot({_age}s): {detail}"
+                    app.state.tool_load_error.pop(frozenset(groups), None)
+                    print(f"[agent] 스냅샷 폴백 — 도구 {len(tools)}개(나이 {_age}s) 로 응답. 게이트웨이 복구 시 자동 갱신")
         if not load_failed:
             # 성공했으면 이 그룹셋의 과거 오류를 지운다(다른 그룹셋 상태는 건드리지 않는다).
             app.state.tool_load_error.pop(frozenset(groups), None)
@@ -2657,4 +2706,8 @@ def health() -> dict:
         "tool_desc_max": TOOL_DESC_MAX,
         "tool_max": TOOL_MAX,   # 0=무제한. >0 이고 게이트웨이 도구수보다 작으면 챗에 일부 도구 미바인딩
         "hist_budget": HIST_BUDGET,
+        # 최근 도구 로드 실패 사유(그룹셋별) — '도구가 없다'는 증상의 원인을 원격에서 본다.
+        # 비어 있으면 최근 로드가 전부 성공. 값이 있으면 401/타임아웃 등 실사유가 찍힌다.
+        "tool_load_errors": {" ".join(sorted(g)) or "(none)": v
+                             for g, v in (getattr(app.state, "tool_load_error", None) or {}).items()},
     }
