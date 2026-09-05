@@ -8,3 +8,6 @@ artifacts/
 
 # /data 이관 브리지(심링크) 이름 — dir/ 패턴은 심링크를 무시하지 않아 git stash -u 가 치운다(data-migration D0)
 /artifacts
+
+# data-migrate 가 남기는 옛 경로 원본(유예 뒤 사람이 지운다). 미추적이면 deploy-all 의 git stash -u 가 치운다
+*.pre-move-*
