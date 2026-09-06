@@ -73,7 +73,7 @@ MIX = {
     'Bass':                (0.150, +0.00, 0.02),
     'Bass Character':      (0.030, +0.00, 0.03),   # 배음만 — 저역은 Bass 가 맡는다   # 저역은 모노·드라이로 둬야 카페 스피커에서 뭉치지 않는다
     'Rhodes':              (0.080, -0.16, 0.17),
-    'Guitar (16th chops)': (0.052, +0.26, 0.11),   # 로즈 반대편에 앉힌다
+    'Guitar (16th chops)': (0.043, +0.26, 0.11),   # 로즈 반대편에 앉힌다
     'Signature Whistle':   (0.072, +0.08, 0.26),
     'Celtic Harp':         (0.050, -0.28, 0.26),
     'Strings':             (0.044, +0.00, 0.30),
@@ -168,6 +168,51 @@ def compressor(x, sr, thresh_db=-17.0, ratio=2.4, attack_ms=15.0, release_ms=160
     slow = rn.smooth(gr, max(1, int(sr * release_ms / 1000)))
     gr = np.minimum(fast, slow)
     return x * (10 ** (gr / 20.0))[:, None]
+
+
+# 보컬이 부를 때 물러날 악기와 그 깊이(dB). `05_instruments` 에만 적용한다.
+# 정적 EQ(VOCAL_POCKET)는 보컬이 쉬는 동안에도 계속 파여 있어 반주가 밋밋해진다.
+# 실제 믹스는 **보컬이 소리를 내는 동안에만** 반주를 눌러 준다(사이드체인).
+DUCK_DB = {
+    'Guitar (16th chops)': 4.0,     # 16분 커팅이 가사 위에서 가장 시끄럽다
+    'Strings':             2.2,
+    'Celtic Harp':         1.8,
+    'Rhodes':              1.2,
+    'Percussion':          1.0,
+    'Percussion Hi':       1.0,
+}
+
+
+def vocal_envelope(sr, n, pre_ms=45.0, rel_ms=140.0):
+    """리드 보컬이 소리내는 구간을 1로 두는 포락선.
+
+    보컬 오디오가 없어도 만들 수 있다 — 우리는 보컬 MIDI 를 갖고 있고,
+    거기엔 음 하나하나의 시작과 끝이 정확히 들어 있다. 실제 사이드체인보다 오히려 정밀하다.
+
+    `pre_ms` 만큼 **먼저** 비켜 준다. 자음은 음 시작 직전에 나므로, 온셋에 맞춰 내리면
+    첫 자음이 이미 묻힌 뒤다. 릴리즈는 길게 둬 반주가 튀어 오르지 않게 한다.
+    """
+    voc = next((t for t in mg.make_tracks() if t.name == 'Lead Vocal (guide)'), None)
+    if voc is None:
+        return np.zeros(n)
+    spb = 60.0 / mg.BPM / mg.PPQ            # 틱 -> 초
+    pend, spans = {}, []
+    for tick, _o, d in sorted(voc.ev):
+        if len(d) != 3:
+            continue
+        k, p = d[0] & 0xF0, d[1]
+        if k == 0x90 and d[2] > 0:
+            pend.setdefault(p, []).append(tick)
+        elif pend.get(p):
+            spans.append((pend[p].pop(0), tick))
+    env = np.zeros(n)
+    pre = int(sr * pre_ms / 1000)
+    for st, en in spans:
+        a = max(0, int(st * spb * sr) - pre)
+        b = min(n, int(en * spb * sr))
+        if b > a:
+            env[a:b] = 1.0
+    return np.minimum(1.0, rn.smooth(env, max(1, int(sr * rel_ms / 1000))) * 1.6)
 
 
 def widen(mix, sr, bands=((0, 150, 1.00), (150, 800, 1.35),
@@ -334,6 +379,7 @@ def _mix_from_stems(inst, sf2, quiet):
     n = max(len(a) for a in stems.values())
     mix = np.zeros((n, 2))
     wet_bus = np.zeros((n, 2))
+    _venv = None
     if not quiet:
         print('\n악기별 스템')
     for name, a in stems.items():
@@ -350,6 +396,10 @@ def _mix_from_stems(inst, sf2, quiet):
         #  실제로 기타의 2~4kHz 점유가 69.5% 에서 68.4% 로만 움직였다.
         if not inst and name in VOCAL_POCKET:
             a = eq(a, SR, cut=VOCAL_POCKET[name])
+        if not inst and name in DUCK_DB:               # 보컬이 부를 때만 물러난다
+            if _venv is None:
+                _venv = vocal_envelope(SR, n)
+            a = a * (10 ** (-DUCK_DB[name] * _venv[:len(a)] / 20.0))[:, None]
         lg, rg = rn.pan_gains(pan)
         a = a * np.array([lg, rg])
         mix += a
