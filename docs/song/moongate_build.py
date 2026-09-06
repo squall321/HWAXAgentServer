@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 8
+REV = 9
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -788,6 +788,55 @@ def build_drums(dr, pc):
             dr.note(b(60, 3.5), 0.5, S, 118)
 
 
+def legato_pass(track, same_pitch_gap=15, adjacent=24):
+    """보컬 트랙의 음을 프레이즈 안에서 딱 붙인다 — Synthesizer V 임포트용.
+
+    rev08 까지는 단어 안 음절(`~`)만 붙이고 나머지는 전부 8틱을 벌려 놨다.
+    8틱(9ms)은 사람 귀에 안 들리지만 **SynthV 에게는 "여기서 끊어라"는 지시**다.
+    음마다 성문 폐쇄가 하나씩 들어가 프레이즈가 계단처럼 들린다.
+    진짜 숨자리는 선율에 쉼표로 이미 들어 있으므로, 그 외의 인접음은 붙이는 게 맞다.
+
+    반대 문제도 하나 있었다. **같은 음이 이어지는 자리 22쌍**(`fid~`->`dle`,
+    `pen`->`the`, `eve~`->`ning` …)은 레가토 규칙 때문에 간격이 정확히 0 이었다.
+    노트 오프와 온이 같은 틱에 겹치면 임포터가 **두 음을 한 음으로 합쳐** 음절이
+    통째로 사라질 수 있다. 여기만 최소 간격을 남긴다.
+
+    쉼표(adjacent 틱을 넘는 간격)는 건드리지 않는다 — 숨자리를 지운다는 뜻이 되니까.
+    """
+    ev = track.ev
+    idx = sorted(range(len(ev)), key=lambda i: (ev[i][0], ev[i][1]))
+    pend, notes = {}, []
+    for i in idx:
+        _t, _o, d = ev[i]
+        if len(d) != 3:
+            continue
+        k, p = d[0] & 0xF0, d[1]
+        if k == 0x90 and d[2] > 0:
+            rec = [ev[i][0], p, None]
+            pend.setdefault(p, []).append(rec)
+            notes.append(rec)
+        elif k == 0x80 or (k == 0x90 and d[2] == 0):
+            q = pend.get(p)
+            if q:
+                q.pop(0)[2] = i
+    notes.sort(key=lambda n: n[0])
+    closed = spaced = 0
+    for a, b in zip(notes, notes[1:]):
+        if a[2] is None:
+            continue
+        off = ev[a[2]][0]
+        if b[0] - off > adjacent:              # 진짜 쉼표 = 숨자리. 그대로 둔다
+            continue
+        want = b[0] - (same_pitch_gap if a[1] == b[1] else 0)
+        want = max(a[0] + 1, want)
+        if want == off:
+            continue
+        closed += want > off
+        spaced += want < off
+        ev[a[2]] = (want, ev[a[2]][1], ev[a[2]][2])
+    return closed, spaced
+
+
 def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     RNG.seed(SEED)                                           # 호출마다 같은 흔들림
     voc = Track('Lead Vocal (guide)', 54, 0)
@@ -936,6 +985,8 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
 
     if topline:
         put_topline(whi, hrp, rho)
+    for _v in (voc, hlo, hhi):        # 보컬 3트랙만 — 악기는 그루브가 살아 있어야 한다
+        legato_pass(_v)
     return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr, pc]
 
 

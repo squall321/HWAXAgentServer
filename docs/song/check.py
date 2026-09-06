@@ -287,6 +287,37 @@ print('\n[7] 보컬 최고음 — 전조를 반영한 실제 상한')
 peak = max(p for _b, _d, p in ch)
 check(peak + 2 <= 76, f'코러스 최고음 {nm(peak)} → 전조 후 {nm(peak + 2)} (상한 E5)')
 
+print('\n[13] 보컬 레가토 — 프레이즈 안에서 음이 붙어 있는가 (SynthV 임포트용)')
+# rev09 에서 잡은 것 둘을 못박는다.
+#  · 인접음마다 8틱을 벌려 놨다. 사람 귀엔 안 들리지만 SynthV 에겐 "끊어라"는 지시라
+#    음마다 성문 폐쇄가 들어가 프레이즈가 계단처럼 들렸다.
+#  · 반대로 같은 음이 이어지는 자리는 간격이 정확히 0 이었다. 노트 오프와 온이 같은 틱에
+#    겹치면 임포터가 두 음을 한 음으로 합쳐 음절이 통째로 사라질 수 있다.
+for _tname in ('Lead Vocal (guide)', 'Vocal Harmony (3rd below)', 'Vocal Harmony (3rd above)'):
+    _tr = next((t for t in tracks if t[0] == _tname), None)
+    if _tr is None:
+        continue
+    _pend, _notes = {}, []
+    for _t, _k, _c, _a, _b in sorted(_tr[1], key=lambda e: (e[0], 0 if e[1] == 0x80 else 1)):
+        if _k == 0x90 and _b > 0:
+            _rec = [_t, _a, None]; _pend.setdefault(_a, []).append(_rec); _notes.append(_rec)
+        elif _pend.get(_a):
+            _pend[_a].pop(0)[2] = _t
+    _notes.sort()
+    _merge = _step = 0
+    for _x, _y in zip(_notes, _notes[1:]):
+        if _x[2] is None:
+            continue
+        _gap = _y[0] - _x[2]
+        if _gap > 24:                      # 진짜 쉼표(숨자리)는 검사 대상이 아니다
+            continue
+        if _x[1] == _y[1] and _gap <= 0:
+            _merge += 1                    # 같은 음인데 붙어 있다 -> 합쳐질 수 있다
+        elif _x[1] != _y[1] and _gap > 0:
+            _step += 1                     # 다른 음인데 벌어져 있다 -> 계단처럼 들린다
+    check(_merge == 0 and _step == 0,
+          f'{_tname}: 같은음 겹침 {_merge}곳 · 다른음 사이 틈 {_step}곳 (둘 다 0이어야 한다)')
+
 print('\n' + ('✘ 실패 %d건' % len(FAIL) if FAIL else '✔ 전 항목 통과')
       + (f' / ▲ 경고 {len(WARN)}건' if WARN else ''))
 sys.exit(1 if FAIL else 0)
