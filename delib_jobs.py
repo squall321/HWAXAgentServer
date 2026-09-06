@@ -366,6 +366,12 @@ def summary(job: dict, *, full: bool = False) -> dict:
     return out
 
 
+def rounds_end(job: dict) -> int:
+    """그 잡이 끝난 시점의 누적 라운드 번호 — 이어하기가 여기서부터 이어 센다."""
+    prev_off = int((job.get("opts") or {}).get("rounds_so_far") or 0)
+    return prev_off + int(job.get("total_rounds") or job.get("round") or 0)
+
+
 def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
                offset: int = 0, limit: int = 40) -> dict:
     """좌석 발언 전사를 페이지로 돌려준다. 전량은 클라이언트 컨텍스트를 터뜨린다."""

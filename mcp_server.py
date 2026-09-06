@@ -94,8 +94,10 @@ def _caller(ctx: Context | None) -> tuple[str, list[str]]:
 
 def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None,
                 tools=None, apps=None, human_note: str = "", search_sources=None,
-                continue_summary: str = "", non_negotiables=None,
-                stop_after_round: int = 0, advanced=None) -> dict:
+                continue_summary: str = "", non_negotiables=None, options=None,
+                stop_after_round: int = 0, rounds_so_far: int = 0,
+                save_report: bool = True, append_to_report_id: int = 0,
+                advanced=None) -> dict:
     """도구 인자 → deliberation._resolve_opts 화이트리스트 dict.
 
     값 검증·클램프는 엔진이 한다(신뢰 안 되는 입력을 전제로 짜여 있다). 여기서는 모양만 맞춘다."""
@@ -122,6 +124,14 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
         o["non_negotiables"] = [str(x) for x in non_negotiables if str(x).strip()]
     if stop_after_round:
         o["stop_after_round"] = int(stop_after_round)
+    if options:
+        o["options"] = options if isinstance(options, str) else [str(x) for x in options if str(x).strip()]
+    if rounds_so_far:
+        o["rounds_so_far"] = int(rounds_so_far)
+    if not save_report:
+        o["save_report"] = 0
+    if append_to_report_id:
+        o["append_to_report_id"] = int(append_to_report_id)
     if isinstance(advanced, dict):
         o.update({k: v for k, v in advanced.items() if v is not None})
     return o
@@ -151,7 +161,9 @@ async def deliberate_start(
     apps: list[str] | None = None,
     human_note: str = "",
     search_sources: list[str] | None = None,
+    options: list[str] | None = None,
     stop_after_round: int = 0,
+    save_report: bool = True,
     advanced: dict | None = None,
     ctx: Context | None = None,
 ) -> dict:
@@ -173,15 +185,20 @@ async def deliberate_start(
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다(최대 3).
         human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다(최대 2000자).
         search_sources: 웹 리서치 소스 토글. 지정하면 인용 계약이 강제된다.
+        options: 후보안 목록(안 선택용, 최대 8). 2개 이상이면 최종 라운드가 이 중에서 고르는 표결을
+                 요구한다. 없으면 표결을 강제하지 않는다 — 후보 없이 표를 받으면 좌석이 방금 자기가
+                 함께 만든 결론에 찬성표를 던져 정보량이 0 이 된다.
         stop_after_round: 1 이면 초기 라운드까지만 돌고 사람 검토를 기다린다(체크포인트).
+        save_report: False 면 Report Archive 저장을 건너뛴다. 탐색적 심의로 아카이브를 어지럽히지
+                     않으려 할 때. 기본 True.
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
                   parse_retries · timeout_s. 보통 비운다.
     """
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
-                       tools=tools, apps=apps, human_note=human_note,
+                       tools=tools, apps=apps, human_note=human_note, options=options,
                        search_sources=search_sources, stop_after_round=stop_after_round,
-                       advanced=advanced)
+                       save_report=save_report, advanced=advanced)
     user, groups = _caller(ctx)
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
                            groups=groups, user_email=user)
@@ -206,6 +223,7 @@ async def deliberate_continue(
     rounds: int = 0,
     non_negotiables: list[str] | None = None,
     keep_seats: bool = True,
+    append_report: bool = True,
     modifiers: list[str] | None = None,
     ctx: Context | None = None,
 ) -> dict:
@@ -219,7 +237,12 @@ async def deliberate_continue(
         rounds: 라운드 수. 0 이면 기본값.
         non_negotiables: 이전 결정의 양보 불가 조항. 요약에 섞으면 소실되므로 따로 넘긴다.
         keep_seats: True 면 이전 좌석을 그대로 앉힌다(발굴 생략). False 면 다시 발굴한다.
+        append_report: True 면 이전 회차의 Report Archive 보고서에 페이지로 이어붙인다 — 한 사안이
+                       보고서 여러 건으로 흩어지지 않는다. 이전 보고서가 없으면 새로 만든다.
         modifiers: 이번 회차에 얹을 층.
+
+    라운드 번호는 이전 회차에 이어서 센다 — 3회차 회의록이 매번 '1R' 로 돌아가면
+    어느 회차의 발언인지 구분이 안 된다.
     """
     prev = delib_jobs.get(previous_job_id)
     if not prev:
@@ -232,6 +255,8 @@ async def deliberate_continue(
         continue_summary=summary_text[:8000],
         non_negotiables=non_negotiables,
         personas=(prev.get("seats") or []) if keep_seats else None,
+        rounds_so_far=delib_jobs.rounds_end(prev),
+        append_to_report_id=(int(prev.get("report_id") or 0) if append_report else 0),
     )
     user, groups = _caller(ctx)
     rec = delib_jobs.start(_need_app(), job or prev.get("job") or "default",
@@ -239,6 +264,8 @@ async def deliberate_continue(
                            groups=groups, user_email=user)
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
+    out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
+    out["appending_to_report"] = (prev.get("report_id") if append_report else None)
     return out
 
 
@@ -321,7 +348,9 @@ async def deliberate_jobs() -> dict:
             "personas": "좌석 직접 지정(≤12). 비우면 서버가 발굴한다",
             "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달",
+            "options": "후보안 목록(≤8). 2개 이상이면 최종 라운드가 그 중에서 고르는 표결을 요구한다",
             "stop_after_round": "1 이면 초기 라운드에서 멈추고 사람 검토를 기다린다",
+            "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
             "advanced": "free_tools·tool_budget·chair_bestof·chair_cite·rebut_quote·cross_exam·"
                         "anchor·evidence_prepass·prose_first·parse_retries·timeout_s",
         },

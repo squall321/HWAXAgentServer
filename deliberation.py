@@ -582,12 +582,24 @@ def _resolve_opts(req_opts):
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
+        # 이어하기 회차의 라운드 번호 시작점 — 이전까지 이미 진행된 라운드 수(hwax-deliberate.js ROUND_OFFSET).
+        # 없으면 3회차 이어하기 회의록이 매번 '1R 초기입장' 으로 되돌아가 RA 보고서에서 회차 구분이 안 된다.
+        # ⚠ 표시 번호만 민다 — 루프 제어(N·kind 판정)는 회차 안 번호를 그대로 쓴다.
+        rounds_so_far=0,
         # 의장 산출 항목 템플릿 — default|mechanism|sim-plan|test-plan|build-plan|diagnosis|option-select|credibility.
         chair_template="default",
         # 얹을 층(2층 Modifier) — 심의 굴리는 방식 오버레이. chairTemplate 무관하게 합성한다(0~5개).
         modifiers=[],
         # 시뮬 심의(/시뮬심의)에서 1=2단(해석 계획) 뒤 3단 구축 계획까지 이어 만든다(기본 꺼짐).
         build_plan=0,
+        # RA 보고서 저장 제어. 기본은 켜짐 — 웹 심의는 보고서가 산출물이라 종전 동작을 지킨다.
+        # 0 이면 저장을 건너뛴다(탐색적 심의가 RA 를 어지럽히지 않게). append_to_report_id 를 주면
+        # 새 보고서를 만들지 않고 그 보고서에 페이지로 이어붙인다 — 이어하기 회차를 한 건으로 묶는다.
+        save_report=1, append_to_report_id=0,
+        # 안 선택(option-select) 후보안 목록. 2개 이상일 때만 최종 라운드가 표결을 요구한다.
+        # 없으면 표결 강제를 끈다 — 후보 없이 vote 를 요구하면 좌석이 자기가 방금 함께 만든
+        # 결론에 찬성표를 던져 정보량 0 인 표결이 된다(hwax-deliberate.js HAS_CHOICES 와 같은 규율).
+        options=[],
         # 사용자 지정 도구 — 심의 시작 전 실제 호출해 정량 근거로 주입(자동 파이프라인 도구에 추가).
         delib_tools=[],
         # 사용자 지정 앱 — 전문가 자유 조회 범위를 이 앱들로 좁힌다. delib_tools 처럼 전량 호출하지
@@ -604,7 +616,8 @@ def _resolve_opts(req_opts):
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
-                  "free_tools", "tool_budget", "stop_after_round", "build_plan"):
+                  "free_tools", "tool_budget", "stop_after_round", "build_plan",
+                  "rounds_so_far", "save_report", "append_to_report_id"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -638,6 +651,12 @@ def _resolve_opts(req_opts):
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
                                                else "carry")}
                                    for p in cp[:12] if isinstance(p, dict) and p.get("key")]
+        # 후보안 — 배열 또는 '1안 X | 2안 Y' 구분자 문자열 둘 다 받는다(JS 계약과 동일).
+        op = req_opts.get("options")
+        if isinstance(op, str):
+            op = [x.strip() for x in re.split(r"\s*\|\s*|\n+", op) if x.strip()]
+        if isinstance(op, list):
+            o.options = [str(x).strip()[:400] for x in op[:8] if str(x).strip()]
         tl = req_opts.get("tools")
         if isinstance(tl, list):
             o.delib_tools = [str(n).strip()[:80] for n in tl[:6] if isinstance(n, str) and str(n).strip()]
@@ -686,6 +705,8 @@ def _resolve_opts(req_opts):
     o.parse_retries = max(0, min(10, o.parse_retries))   # 방어심층 — 직접 호출 시 재시도 폭주 상한
     o.chair_bestof = max(1, min(5, o.chair_bestof))
     o.rounds = max(2, min(8, o.rounds))                  # 라운드 수 2~8(기본 3=초기+심화1+수렴)
+    o.rounds_so_far = max(0, min(64, o.rounds_so_far))   # 이어하기 표시 오프셋(폭주 방어)
+    o.append_to_report_id = max(0, o.append_to_report_id)
     o.tool_budget = max(1, min(6, o.tool_budget))        # 자유 조회 1인당 호출 상한
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
@@ -2442,9 +2463,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if chat_ctx_inject:
         yield _delib("evidence", source="챗 대화 맥락 (검증 대상)",
                      text=chat_ctx_inject[:1500], included=True)
+    # 후보안(안 선택) — 상호 배타 후보를 목록으로 못박는다. 질문 문장에만 있으면 좌석마다
+    # 다르게 읽고, 최종 라운드 표결이 무엇에 대한 표인지 흐려진다(hwax-deliberate.js OPT_LIST 와 같은 규율).
+    _opt_inject = ""
+    if len(opts.options) >= 2:
+        _opt_inject = ("\n[후보안 — 이 중에서 고른다. 새 안을 지어내지 말고, 필요하면 둘 이상을 "
+                       "결합한 하이브리드안을 제안하되 어느 후보의 조합인지 밝혀라]\n"
+                       + "\n".join(f"· ({i + 1}) {o}" for i, o in enumerate(opts.options)))
+    elif opts.options:
+        _opt_inject = f"\n[참고 — 검토 대상으로 제시된 안]\n· {opts.options[0]}"
     _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
              + (f"\n{tool_inject}" if tool_inject else "")
-             + (f"\n{chat_ev_inject}" if chat_ev_inject else "") + chat_ctx_inject + mod_inject)
+             + (f"\n{chat_ev_inject}" if chat_ev_inject else "") + chat_ctx_inject
+             + _opt_inject + mod_inject)
     base = f"[심의 주제]\n{question}\n" + cont + _tail
     # 신규 좌석 앵커링 차단(F12) — 재심사로 새로 합류한 좌석에게 이전 결론을 먼저 읽히면
     # 동조 압력을 받아 '새 관점을 얻으려고 불렀다'는 목적이 사라진다. 1라운드에 한해 이전 요약을
@@ -2480,6 +2511,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   if opts.rebut_quote else
                   "JSON {concede:[],rebut:[],deepen} 로.")
 
+    # 표시용 라운드 번호 — 이어하기 회차에서 이전까지 진행분을 이어 센다. 루프 제어(N·_kind)는
+    # 회차 안 번호를 그대로 쓰고, 사람이 읽는 라벨·프롬프트 참조·회의록만 민다.
+    _RO = int(getattr(opts, "rounds_so_far", 0) or 0)
+    _dr = lambda r: r + _RO   # noqa: E731 — display round
+    _has_choices = len(opts.options) >= 2
+
     rounds_data = []          # [(turns_list, transcript_str), ...] 라운드별
     seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
@@ -2491,7 +2528,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
         yield _delib("stage", stage=f"r{rnd}", n=len(personas))
-        yield _sse("status", {"step": f"{rnd}라운드 — {rlabel}", "tool": None})
+        yield _sse("status", {"step": f"{_dr(rnd)}라운드 — {rlabel}", "tool": None})
 
         if kind == "initial":
             prompt_fn = lambda p: ((base_blind if (_has_blind and (_anon1r or p.get("origin") == "new")) else base) +
@@ -2513,12 +2550,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     anchor = (f"\n[당신의 1라운드 입장(앵커)]\n{aser}\n다수 의견에 동조해 당신 도메인의 "
                               "제약을 희석하지 마세요 — 입장을 바꾼다면 어떤 새 근거 때문인지 "
                               "final_position 에 명시하세요.\n")
-                return (base + f"\n[{_pno}라운드 전원]\n{_pt}\n" + anchor +
+                # 표결은 고를 후보가 실제로 둘 이상일 때만 요구한다. 후보 없이 vote 를 강제하면
+                # 좌석이 방금 자기들이 함께 만든 결론에 찬성표를 던져 정보량 0 인 표결이 된다.
+                _vote_ask = (("최종 권장(vote — 위 [후보안] 중 하나를 번호와 이름으로 명시. "
+                              "하이브리드면 어느 후보의 조합인지 밝혀라)으로 수렴하고, ")
+                             if _has_choices else
+                             "최종 권장(vote — 무엇을 하자는 것인지 한 문장)으로 수렴하고, ")
+                return (base + f"\n[{_dr(_pno)}라운드 전원]\n{_pt}\n" + anchor +
                         "\n직전 라운드를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
-                        "제약(non_negotiable)·최종 권장(vote)으로 수렴하고, "
+                        "제약(non_negotiable)·" + _vote_ask +
                         "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
                         "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
-            required, validator_fn, render = ("final_position", "vote"), None, 3
+            required = ("final_position", "vote") if _has_choices else ("final_position",)
+            validator_fn, render = None, 3
 
         else:  # deepen — 직전 라운드에 반박·심화. 교차심문(cross_exam)·인용계약(rebut_quote)은 직전 라운드 대상.
             prev_keys = [o["persona"] for o in prev_list]
@@ -2528,13 +2572,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      _pno=prev_no, _pkind=prev_kind):
                 # (컨텍스트, 인용 실재 검증 대상 문자열)
                 if not (opts.cross_exam and len(_pl) >= 2):
-                    return f"[{_pno}라운드 전원]\n{_pt}", _pt
+                    return f"[{_dr(_pno)}라운드 전원]\n{_pt}", _pt
                 tkey = (_pk[(_pk.index(p["key"]) + 1) % len(_pk)] if p["key"] in _pk else _pk[0])
                 tser = _ser_kind(_pbk[tkey], _pkind)
                 others = "\n".join(
                     f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('deepen') or o.get('lens'), 160)}"
                     for o in _pl if o["persona"] != tkey)
-                ctx = (f"[당신의 지정 반박 표적: {tkey} — {_pno}라운드 발언 전체]\n{tser}\n\n"
+                ctx = (f"[당신의 지정 반박 표적: {tkey} — {_dr(_pno)}라운드 발언 전체]\n{tser}\n\n"
                        f"[다른 전문가 한 줄 입장]\n{others}\n\n"
                        f"표적({tkey})의 논증에서 특정 주장을 골라 반박하세요. 다른 전문가 언급은 자유.")
                 return ctx, tser
@@ -2546,7 +2590,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         f"두루뭉술 금지). {rebut_spec}")
 
             _where = (f"당신의 지정 반박 표적의 {prev_no}라운드 발언 전체"
-                      if opts.cross_exam and len(prev_list) >= 2 else f"위 [{prev_no}라운드 전원] 텍스트")
+                      if opts.cross_exam and len(prev_list) >= 2 else f"위 [{_dr(prev_no)}라운드 전원] 텍스트")
             validator_fn = ((lambda p, _c=_ctx, _w=_where: _quote_validator(_c(p)[1], _w))
                             if opts.rebut_quote else None)
             required, render = ("deepen", "rebut", "concede"), 2
@@ -2613,7 +2657,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
                          "stance": _norm_stance(o.get("stance")),
                          "non_negotiable": str(o.get("non_negotiable") or "")[:1200]}
-            yield _delib("turn", round=rnd, persona=o["persona"], say=_say_of(render, o), **extra)
+            yield _delib("turn", round=rnd, display_round=_dr(rnd), persona=o["persona"],
+                         say=_say_of(render, o), **extra)
         if rnd == 1:
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
@@ -2626,12 +2671,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _lost_now:
             seat_loss.append({"round": rnd, "lost": _lost_now})
             print(f"[deliberation] ⚠ r{rnd} 좌석 {len(_lost_now)}석 유실 — {', '.join(_lost_now)}")
-            yield _sse("status", {"step": f"⚠ {rnd}라운드 좌석 유실: {', '.join(_lost_now)} (오류·시간초과)",
+            yield _sse("status", {"step": f"⚠ {_dr(rnd)}라운드 좌석 유실: {', '.join(_lost_now)} (오류·시간초과)",
                                   "tool": None})
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
         if opts.stop_after_round == 1 and rnd == 1:
-            _cp = (f"[체크포인트 — {rnd}라운드(초기입장)에서 멈춤]\n{seat_note}\n\n"
+            _cp = (f"[체크포인트 — {_dr(rnd)}라운드(초기입장)에서 멈춤]\n{seat_note}\n\n"
                    f"{ct}\n\n빠진 관점이나 추가 관측이 있으면 의견으로 넣어 이어가라. "
                    "좌석 재심사가 그 방향에 맞는 도메인을 불러온다.")
             yield _delib("decision", text=_cp)
@@ -2659,13 +2704,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      opts.chair_template, "의사결정문")
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
+    # 태그는 회차 안 위치로 판정하고(초기/최종), 번호만 이어 센다.
     rounds_block = "\n\n".join(
-        f"[{i + 1}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
+        f"[{_dr(i + 1)}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
     _loss_note = ""
     if seat_loss:
         _loss_note = ("[좌석 유실 — 아래 좌석은 그 라운드에서 오류로 발언하지 못했다. "
                       "(0) 커버리지에 이 사실을 그대로 적고, 그 도메인 판단이 빠진 채 수렴했음을 밝혀라]\n"
-                      + "\n".join(f"· {x['round']}라운드: {', '.join(x['lost'])}" for x in seat_loss) + "\n")
+                      + "\n".join(f"· {_dr(x['round'])}라운드: {', '.join(x['lost'])}" for x in seat_loss) + "\n")
     chair_human = (
         base + f"\n{rounds_block}\n\n"
         f"[{seat_note}]\n[{ev_note}]\n{_loss_note}"
@@ -2770,18 +2816,26 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("plain", text=_plain)
 
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
-    yield _delib("stage", stage="report")
-    yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
-                          "detail": f"심의 — {question[:50]}"})
+    # save_report=0 이면 도구 호출을 건너뛴다(블록 조립은 순수 문자열이라 비용이 없다).
+    # 탐색적 심의까지 RA 를 어지럽히지 않게 하는 스위치이고 비용 문제이기도 하다 — 실측에서
+    # 3시간 심의의 저장에만 1시간 반이 들었다. 웹 심의는 보고서가 산출물이라 기본은 켜짐이다.
+    _do_save = bool(getattr(opts, "save_report", 1))
+    _append_to = int(getattr(opts, "append_to_report_id", 0) or 0)
     report_note = ""
     rid = None
+    yield _delib("stage", stage="report")
+    yield _sse("status", {"step": ("Report Archive 보고서 저장 중" if _do_save and not _append_to
+                                   else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
+                                   else "보고서 저장 건너뜀(save_report=0)"),
+                          "tool": "create_report_draft" if _do_save else None,
+                          "detail": f"심의 — {question[:50]}"})
     try:
         # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
         transcript = []
         for i, (arr, _t) in enumerate(rounds_data):
             r = i + 1
             lbl = ("도메인별 초기 입장" if r == 1 else "수렴·최종 입장" if r == N else "상호 반박·심화")
-            transcript.append(f"— {r}라운드 — {lbl} —")
+            transcript.append(f"— {_dr(r)}라운드 — {lbl} —")
             render = 1 if r == 1 else 3 if r == N else 2
             # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다.
             # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 2000자)일 뿐.
@@ -2797,23 +2851,36 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             #   뒤집힘 조건(뒤쪽 항목)과 수렴 라운드 회의록을 통째로 버렸다(감사 C24/C25).
             "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:200],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
-                        f"{N}라운드 심의(1R 초기→…→{N}R 수렴)."] + transcript[:400],
+                        f"{N}라운드 심의({_dr(1)}R 초기→…→{_dr(N)}R 수렴)."] + transcript[:400],
         }
         _paras = [p.strip() for p in decision.split("\n\n") if p.strip()]
         if len(_paras) > 200 or len(transcript) > 400:
             print(f"[deliberation] RA 블록 절단 — 문단 {len(_paras)}/200 · 회의록 {len(transcript)}/400")
-        _raw_made = await _call(tools, "create_report_draft", {
-            "template_id": "deliberation", "template_version": 1,
-            "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
-            "tags": ["심의", "chat-deliberation"]})
+        if not _do_save:
+            _raw_made = None
+        elif _append_to:
+            # 이어하기 회차를 한 보고서로 묶는다 — 현재 페이지 수를 읽어 그 다음 장에 붙인다.
+            _cur = _parse_json(await _call(tools, "get_report", {"report_id": _append_to}))
+            _pg = ((_cur or {}).get("report") or _cur or {}).get("pages")
+            _raw_made = await _call(tools, "update_report_draft", {
+                "report_id": _append_to,
+                "page": (len(_pg) if isinstance(_pg, list) else 1) + 1,
+                "blocks": _ra_blocks(blocks)})
+        else:
+            _raw_made = await _call(tools, "create_report_draft", {
+                "template_id": "deliberation", "template_version": 1,
+                "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
+                "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 문자열로 삼킨다 — 그러면 아래 파싱이 None 이
         # 되어 실패 원인이 어디에도 안 남았다(감사 C29). 오류 문자열이면 원인을 찍는다.
-        if isinstance(_raw_made, str) and _raw_made.lstrip().startswith("(tool"):
+        if _raw_made is not None and isinstance(_raw_made, str) and _raw_made.lstrip().startswith("(tool"):
             print(f"[deliberation] create_report_draft 도구 오류: {_raw_made[:300]}")
-        made = _parse_json(_raw_made)
-        rid = ((made or {}).get("report") or {}).get("id")
+        made = _parse_json(_raw_made) if _raw_made is not None else None
+        rid = ((made or {}).get("report") or {}).get("id") or (_append_to if (_do_save and _append_to) else None)
         if rid:
-            report_note = f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨."
+            report_note = (f"\n\n📄 Report Archive 보고서 #{rid} 에 페이지로 이어붙임."
+                           if _append_to else
+                           f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨.")
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
 
