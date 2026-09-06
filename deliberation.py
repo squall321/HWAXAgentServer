@@ -2876,7 +2876,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _raw_made is not None and isinstance(_raw_made, str) and _raw_made.lstrip().startswith("(tool"):
             print(f"[deliberation] create_report_draft 도구 오류: {_raw_made[:300]}")
         made = _parse_json(_raw_made) if _raw_made is not None else None
-        rid = ((made or {}).get("report") or {}).get("id") or (_append_to if (_do_save and _append_to) else None)
+        # ⚠ 응답 키가 두 모양이다. RA 배포본은 최상위 report_id 를 주는데(실측 2026-09-06:
+        # {"report_id":58,"title":…,"page_count":1,"url":…}) 종전 파서는 report.id 만 봤다.
+        # 그래서 저장은 실제로 되는데 id 를 못 읽어 "저장됨" 안내가 한 번도 붙지 않았고,
+        # 이어붙이기·잡 원장도 대상 보고서를 알 수 없었다. 세 모양을 다 받는다.
+        _m = made or {}
+        rid = (((_m.get("report") or {}).get("id") if isinstance(_m.get("report"), dict) else None)
+               or _m.get("report_id") or _m.get("id")
+               or (_append_to if (_do_save and _append_to) else None))
         if rid:
             report_note = (f"\n\n📄 Report Archive 보고서 #{rid} 에 페이지로 이어붙임."
                            if _append_to else
