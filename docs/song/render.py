@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 SR = 44100
-REV = 9   # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
+REV = 10  # moongate_build.py 의 REV 와 맞춰 둔다 — 산출물 파일명에 그대로 박힌다.
 RNG = np.random.default_rng(20260830)   # moongate_build.py 와 같은 시드 계열
 
 
@@ -370,7 +370,9 @@ def main():
     if not np.isfinite(peak) or peak < 1e-9:
         raise SystemExit(f'렌더 실패 — peak={peak}')
     mix = mix / peak * 0.89                         # 피크 정규화 (-1dBFS 근처)
-    mix = np.tanh(mix * 1.05) / np.tanh(1.05)        # 안전용 소프트 리미터
+    # ★tanh 새추레이션은 THD 7.25% 를 만든다(사인파로 측정). 안전장치가 아니라 왜곡기였다.
+    #  render_sf.py 의 limiter() 와 같은 이유로 걷어낸다 — 여기선 확인용이라 하드 클립만 둔다.
+    mix = np.clip(mix, -0.999, 0.999)
     nan = int(np.sum(~np.isfinite(mix)))
     if nan:
         raise SystemExit(f'NaN/Inf {nan}개 발생 — 렌더 중단')
