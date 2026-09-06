@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 10
+REV = 11
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -35,10 +35,12 @@ INSTRUMENTS = {
     'Rhodes':                    'Rhodes MK1 electric piano, tremolo; DX7 EP layer for attack',
     'Guitar (16th chops)':       'Clean Strat + compressor, 16th-note chops, 9th/11th voicings',
     'Bass':                      'Fingered P-bass, or round analog synth bass',
+    'Bass Character':            'Picked bass doubling the low layer - only its upper harmonics are kept',
     'Celtic Harp':               'Celtic lever harp',
     'Strings':                   'Small chamber string section (or synth strings)',
     'Drums':                     'Dry acoustic kit, minimal room (GM drum map)',
-    'Percussion':                'Hi-hats, shaker, tambourine, ride - mixed separately from the kit',
+    'Percussion':                'Hi-hats and shaker - mixed separately from the kit',
+    'Percussion Hi':             'Tambourine and ride - opposite side from the hats (overhead image)',
 }
 
 # ── 휴머나이즈 ────────────────────────────────────────────────
@@ -559,7 +561,7 @@ def _bass_octaves():
     return out
 
 
-def build_chords(rhodes, gtr, bass):
+def build_chords(rhodes, gtr, bass, bass2=None):
     bass_root = _bass_octaves()
     for i, (beat, dur, name) in enumerate(PROG):
         voic_hi, root = CH[name]
@@ -628,6 +630,8 @@ def build_chords(rhodes, gtr, bass):
             continue
         if 53 <= bar <= 56:
             bass.note(beat, dur, bass_root[i], 74)
+            if bass2 is not None:
+                bass2.note(beat, dur, bass_root[i], 74)
             continue
         if bar == 76:              # 마지막 마디는 베이스를 빼고 로즈·휘슬·스트링스만 남긴다
             continue
@@ -648,6 +652,8 @@ def build_chords(rhodes, gtr, bass):
                 if drop and o == 0.0 and p_ - 12 >= 28:
                     p_ -= 12
                 bass.note(beat + o, d, p_, int(vel * fade))
+                if bass2 is not None:
+                    bass2.note(beat + o, d, p_, int(vel * fade))
         # 다음 코드로의 접근음 — 이 코드 마지막 8분을 다음 근음의 반음/온음 아래에서 접근시킨다
         nxt_root = None
         ni = i + 1
@@ -658,6 +664,8 @@ def build_chords(rhodes, gtr, bass):
         if nxt_root is not None and dur >= 2.0:
             appr = nxt_root - 1 if nxt_root - 1 not in (root,) else nxt_root - 2
             bass.note(beat + dur - 0.5, 0.5, appr, int(72 * fade))
+            if bass2 is not None:
+                bass2.note(beat + dur - 0.5, 0.5, appr, int(72 * fade))
 
 
 # 고스트 스네어 위치 — 마디 짝/홀로 갈아 끼워 두 마디가 같아지지 않게 한다
@@ -688,7 +696,7 @@ FILLS = {
 }
 
 
-def build_drums(dr, pc):
+def build_drums(dr, pc, pc2):
     # ★SHK 는 rev06 까지 70 이었는데 GM 70 은 셰이커가 아니라 마라카스다(82가 셰이커).
     #  이름만 SHK 였지 실제로는 마라카스를 치고 있었고, 마라카스가 더 어둡다.
     K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 82, 49, 47, 45
@@ -775,10 +783,10 @@ def build_drums(dr, pc):
         # 벌스의 성김은 그대로 둔다.
         if style == 'four':
             for o in (0.5, 1.5, 2.5, 3.5):              # 8분 업비트 — 킥·스네어 사이를 메운다
-                pc.note(beat + o, 0.2, TAMB, int((54 if o in (1.5, 3.5) else 46) * fade))
+                pc2.note(beat + o, 0.2, TAMB, int((54 if o in (1.5, 3.5) else 46) * fade))
         if 65 <= bar <= 72:                             # 마지막 코러스 후반~아웃트로: 라이드로 광채
             for k in range(8):
-                pc.note(beat + k * 0.5, 0.3, RIDE, int((58 if k % 2 == 0 else 44) * fade))
+                pc2.note(beat + k * 0.5, 0.3, RIDE, int((58 if k % 2 == 0 else 44) * fade))
 
         if bar == 60:                                   # 브릿지 끝 G.P.
             dr.ev = [e for e in dr.ev if not (b(60, 2.0) * PPQ <= e[0] < b(61) * PPQ)]
@@ -846,6 +854,11 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     rho = Track('Rhodes', 4, 2)
     gtr = Track('Guitar (16th chops)', 27, 3)
     bas = Track('Bass', 33, 4)
+    # 베이스 캐릭터 레이어. 프로 팝은 베이스를 한 겹으로 두지 않는다 — 저역을 담당하는
+    # 층과, 폰·노트북 스피커에서 **음정이 들리게 하는** 상위 배음 층을 따로 쌓는다.
+    # 여기선 같은 음을 픽 베이스로 겹치고 믹스에서 250Hz 아래를 잘라 배음만 남긴다.
+    # 저역이 안 나오는 스피커에서도 베이스 라인이 사라지지 않는다.
+    bas2 = Track('Bass Character', 34, 10)
     hrp = Track('Celtic Harp', 46, 5)
     strs = Track('Strings', 49, 6)      # 48(String Ensemble 1)보다 어택이 느리고 따뜻하다
     dr = Track('Drums', None, 9)
@@ -853,10 +866,14 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     # 실제 렌더 스펙트럼을 재 보니 드럼 에너지의 78%가 250Hz 아래였고(킥이 다 먹었다)
     # 에어 대역(8~16kHz)은 0.6% 였다. 갈라 놔야 위쪽만 따로 올릴 수 있다.
     pc = Track('Percussion', None, 9)
+    # 고역을 한 트랙에 몰아 두니 4~16kHz 좌우상관이 0.85 였다(프로는 0.0~0.7).
+    # 소스가 모노라 스테레오 폭 처리를 아무리 걸어도 넓어지지 않는다.
+    # 실제 드러머의 이미지처럼 햇·셰이커와 탬버린·라이드를 갈라 반대편에 앉힌다.
+    pc2 = Track('Percussion Hi', None, 9)
 
     if with_rhythm:
-        build_chords(rho, gtr, bas)
-        build_drums(dr, pc)
+        build_chords(rho, gtr, bas, bas2)
+        build_drums(dr, pc, pc2)
 
     if with_melody:
         # 인트로: 휘슬 모티프 + 하프 아르페지오
@@ -987,7 +1004,7 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         put_topline(whi, hrp, rho)
     for _v in (voc, hlo, hhi):        # 보컬 3트랙만 — 악기는 그루브가 살아 있어야 한다
         legato_pass(_v)
-    return [voc, hlo, hhi, whi, rho, gtr, bas, hrp, strs, dr, pc]
+    return [voc, hlo, hhi, whi, rho, gtr, bas, bas2, hrp, strs, dr, pc, pc2]
 
 
 if __name__ == '__main__':
