@@ -11,3 +11,6 @@ artifacts/
 
 # data-migrate 가 남기는 옛 경로 원본(유예 뒤 사람이 지운다). 미추적이면 deploy-all 의 git stash -u 가 치운다
 *.pre-move-*
+
+# 심의 잡 원장(MCP 경로) — ARTIFACT_DIR 미설정 시 리포 안에 생긴다. /data 로 가면 여기 안 생긴다
+/delib-jobs

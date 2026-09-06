@@ -32,6 +32,7 @@ import itertools
 import asyncio
 import contextvars
 import json
+import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 없었다 — 심의가 터지면 오류 처리 자체가 NameError 로 죽었다
 import os
 import re
 import time
@@ -277,10 +278,35 @@ async def lifespan(app: FastAPI):
     # 값: (raw_tools, ts). 게이트웨이 도구는 자주 안 바뀌므로 짧은 불통은 이걸로 흡수된다.
     app.state.tool_snapshot = {}  # (frozenset(groups), user_lower) -> (raw_tools, ts)
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
+    # 심의 MCP(/mcp) — streamable_http_app 은 자체 lifespan(task group)이 있어야 동작하는데
+    # FastAPI 의 mount() 는 하위 앱 lifespan 을 전파하지 않는다. 여기서 명시적으로 연다.
+    # 실패해도 서버는 뜬다 — 심의 MCP 는 부가 진입점이고, 웹(/chat) 경로는 이것과 무관하다.
+    if _DELIB_MCP is not None:
+        _delib_mcp_module.bind(app)
+        try:
+            async with _DELIB_MCP.router.lifespan_context(_DELIB_MCP):
+                print("[agent] deliberation MCP mounted at /mcp")
+                yield
+            return
+        except Exception:  # noqa: BLE001
+            logging.getLogger("agent").exception("[agent] 심의 MCP lifespan 실패 — /mcp 없이 계속")
     yield
 
 
+# 심의를 MCP 도구로 노출한다(게이트웨이 백엔드). import 실패는 치명적이지 않다 —
+# 웹 심의(/chat 슬래시 트리거)는 이 모듈과 무관하게 돈다.
+try:
+    import mcp_server as _delib_mcp_module
+    _DELIB_MCP = _delib_mcp_module.app
+except Exception as _exc:  # noqa: BLE001
+    logging.getLogger("agent").warning("[agent] 심의 MCP 비활성 — %r", _exc)
+    _delib_mcp_module = None
+    _DELIB_MCP = None
+
+
 app = FastAPI(title="HWAX Agent Server", version="0.3.0", lifespan=lifespan)
+if _DELIB_MCP is not None:
+    app.mount("/mcp", _DELIB_MCP, name="delib-mcp")
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
