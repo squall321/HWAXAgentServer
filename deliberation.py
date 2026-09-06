@@ -1496,7 +1496,12 @@ _FREE_ALLOW = ("list_", "get_", "search_", "find_", "query_", "compute_", "analy
                "slurm_cluster_health", "slurm_list_nodes", "slurm_list_partitions")
 # export_dyna_cards 는 일부러 뺐다 — 같은 실주행에서 쓰였지만 'export' 가 파일을 쓰는지
 # 확인 못 했다. deny-by-default 목록에서는 확인 안 된 것을 넣지 않는 쪽이 맞다.
-_FREE_DENY = ("get_agent_session",)   # 페르소나 시스템프롬프트 원문은 조회 근거가 아니다
+# ⚠ catalog_ 접두사로 열리는 것 중 쓰기·실행이 섞여 있다. SmartTwinMCP 의 catalog_run 은
+#   카탈로그에 등록된 시나리오를 **실제로 실행**하는 만능 실행기이고 catalog_reload 는 서버
+#   상태를 바꾼다 — 이름만 catalog_ 라 접두사 화이트리스트를 그냥 통과한다. slurm_ 을 접두사로
+#   열지 않은 것과 같은 이유로 이름으로 막는다(심의는 데이터를 만들지 않는다).
+_FREE_DENY = ("get_agent_session",   # 페르소나 시스템프롬프트 원문은 조회 근거가 아니다
+              "catalog_run", "catalog_reload")
 
 # 물성 DB(MaterialTwin) 조회 도구 — 앱 제한과 무관하게 **항상** 바인딩한다.
 #
