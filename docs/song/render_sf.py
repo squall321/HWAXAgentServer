@@ -341,6 +341,17 @@ def _mix_from_stems(inst, sf2, quiet):
     # 리버브는 센드 버스에 한 번만 건다 — 악기마다 따로 걸면 FFT 를 7번 돌리게 된다
     mix += reverb(wet_bus, SR, seconds=2.4) * 0.55
 
+    # ★꼬리 무음 제거. fluidsynth 는 릴리즈용으로 스템을 넉넉히 패딩해 내보내고,
+    # 그중 가장 긴 스템 길이가 곡 전체 길이가 된다. 그 결과 소리가 끝난 뒤로 **6.7초의
+    # 완전 무음**이 붙어 있었고, 마지막 1.5초 페이드도 이미 무음인 자리에서 걸리고 있었다.
+    # 리버브 꼬리까지 다 울린 지점(-60dB)에서 잘라 1.2초만 남긴다.
+    _env = np.max(np.abs(mix), axis=1)
+    _thr = float(_env.max()) * 1e-3                       # -60dB
+    _nz = np.nonzero(_env > _thr)[0]
+    if len(_nz):
+        n = min(n, int(_nz[-1]) + int(SR * 1.2))
+        mix = mix[:n]
+
     # 섹션 매크로 오토메이션 — 리미터 **앞에서** 낙차를 미리 벌려 둔다.
     # 컴프레서와 리미터는 큰 곳을 더 누르므로, 아무것도 안 하면 편곡의 낙차가 깎여 나간다
     # (실제로 3.95dB -> 2.71dB 로 무너졌다). 마스터링 엔지니어가 리미터 앞에서 볼륨을
@@ -367,7 +378,7 @@ def _mix_from_stems(inst, sf2, quiet):
     mix = widen(mix, SR)
     # 마스터 틸트 — GM 샘플을 쌓으면 전체가 어두워진다(측정 -5.0dB/oct, 프로는 -5.0~-2.5).
     # 악기별 EQ 로는 모자라서 마스터에서 한 번 더 들어 올린다.
-    mix = eq(mix, SR, air=2.2)
+    mix = eq(mix, SR, air=3.1)
 
     fade = min(int(SR * 1.5), n)
     mix[-fade:] *= np.linspace(1.0, 0.0, fade)[:, None]

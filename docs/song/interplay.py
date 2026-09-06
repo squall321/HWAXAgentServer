@@ -22,7 +22,7 @@ parse = _ns['parse']
 REV = f'_rev{mg.REV:02d}'
 div, tracks = parse(os.path.join(HERE, f'03_full{REV}.mid'))
 G = div // 4                                  # 16분 격자
-NBARS = 76
+NBARS = mg.BARS
 NG = NBARS * 16                               # 전체 16분 칸 수
 
 

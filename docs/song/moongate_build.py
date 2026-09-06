@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 11
+REV = 12
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -223,12 +223,21 @@ sec(61, ['Amaj9', 'B7', 'G#m9', 'C#m9',
          'Amaj9', 'B7', 'E69', 'B7sus4'])                # 61-68  Final Chorus (E)
 sec(69, ['Amaj9', 'A#dim7', 'E/B', 'B7sus4',
          'Amaj9', 'A#dim7', 'E69', 'E69'])                 # 69-76  Outro (E)
+# 77-84 코다. rev12 까지는 76마디에서 페이드아웃으로 끝났다 — 곡이 끝난 게 아니라
+# 소리만 작아지다 절벽처럼 끊겼다(162초 -13dB -> 164초 -46dB). 종지를 써서 마무리한다.
+# IV - V - vi(위종지로 한 번 미룸) - IV/V - I 를 4마디 늘여 놓고, 마지막 E69 를 네 마디 울린다.
+sec(77, ['Amaj9', (('B7sus4', 2.0), ('B7', 2.0)), 'C#m9', (('Amaj9', 2.0), ('B7', 2.0)),
+         'E69', 'E69', 'E69', 'E69'])                      # 77-84  Coda (E) — 마지막 화음을 늘여 맺는다
+
+BARS = 84                      # 곡 전체 마디 수. 하드코딩된 76 이 여기저기 흩어져 있어
+                               # 구조를 늘릴 때마다 어긋났다 — 한 곳에서만 정한다.
 
 SECTIONS = {
     'intro': range(1, 5), 'verse1': range(5, 13), 'pre1': range(13, 17),
     'chorus1': range(17, 25), 'post1': range(25, 29), 'verse2': range(29, 37),
     'pre2': range(37, 41), 'chorus2': range(41, 49), 'post2': range(49, 53),
     'bridge': range(53, 61), 'final': range(61, 69), 'outro': range(69, 77),
+    'coda': range(77, 85),
 }
 
 
@@ -501,7 +510,9 @@ def put_motif(track, start_bar, vel=88, transpose=0, octave=0, expressive=False)
 # 이전엔 문서(README STEP 2)에만 "73마디부터 페이드"라고 적혀 있고 코드엔 구현이 없어서,
 # 드럼·베이스·로즈가 76마디까지 풀파워로 가는 바람에 outro 가 곡에서 가장 시끄러운
 # 섹션이 되는 사고가 났다(render.py 섹션별 RMS 리포트로 발견).
-OUTRO_FADE = {73: 0.78, 74: 0.58, 75: 0.40, 76: 0.22}
+# 코다가 생기면서 페이드아웃은 필요 없어졌다 — 소리를 줄여 끊는 게 아니라 종지로 맺는다.
+# 아웃트로 뒷부분만 살짝 눌러 코다 진입에 낙차를 만든다(0 까지 내리지 않는다).
+OUTRO_FADE = {73: 0.92, 74: 0.86, 75: 0.80, 76: 0.74}
 
 
 # ── 베이스: 셀을 무작위로 순환시키지 않고 "역할"로 고정 배정한다 ─────────────
@@ -567,7 +578,9 @@ def build_chords(rhodes, gtr, bass, bass2=None):
         voic_hi, root = CH[name]
         voic = [p - RH_DROP for p in voic_hi]
         bar = bar_of(beat)
-        quiet = in_(beat, 'intro') or (61 <= bar <= 64) or (53 <= bar <= 56)
+        # 81마디부터는 마지막 화음이 울리는 자리 — 컴핑을 멈추고 눌러 둔다.
+        # 종지 위에서 리듬을 계속 치면 '끝났다'가 아니라 '계속된다'로 들린다.
+        quiet = in_(beat, 'intro') or (61 <= bar <= 64) or (53 <= bar <= 56) or bar >= 81
         fade = OUTRO_FADE.get(bar, 1.0)
         dense = in_(beat, 'chorus1', 'chorus2') or 65 <= bar <= 68
 
@@ -608,7 +621,13 @@ def build_chords(rhodes, gtr, bass, bass2=None):
             # 통째로 넘어야 했고 그러면 기타 상한(C6)을 넘었다(검증하다 발견). 위 확장음 대신
             # 코드의 낮은 두 음(근음+3도)을 옥타브 올린다 — 재즈/펑크 기타의 실제 "셸 보이싱"과
             # 같은 선택이고, 로즈의 최고음역과 구조적으로 겹칠 이유가 없어진다.
-            shell = [voic[0] + 12 + RH_DROP, voic[1] + 12 + RH_DROP]
+            # ★rev12 에서 잡은 버그. rev04 에서 로즈를 한 옥타브 내리면서(RH_DROP) 기타에
+            # `+ 12 + RH_DROP` 보정을 넣어 **원래 자리에 못 박아** 뒀다. 그런데 기타가 높았던
+            # 이유는 로즈를 피하려던 것뿐이다 — 로즈가 내려갔으면 기타도 같이 내려와야 했다.
+            # 그대로 둔 결과 기타가 F#5/A5 에서 16분음표로 초당 6번씩 울렸다(1056음 중 966음이
+            # C5 이상). 사용자가 "띠리릭띠리릭 거슬린다"고 한 소리가 이것이다.
+            # 보정을 걷어내면 로즈(F#3 A3 B3 D4) 바로 위 F#4/A4 — 실제 펑크 기타의 커팅 음역이다.
+            shell = [voic[0] + 12, voic[1] + 12]
             if max(shell) > 83:                                   # 그래도 넘으면 페어 전체를 내린다
                 shell = [p - 12 for p in shell]
             # (기타를 벌스에서 한 옥타브 내려 중역을 채우려 했으나, rev02 에서 해결한
@@ -633,7 +652,11 @@ def build_chords(rhodes, gtr, bass, bass2=None):
             if bass2 is not None:
                 bass2.note(beat, dur, bass_root[i], 74)
             continue
-        if bar == 76:              # 마지막 마디는 베이스를 빼고 로즈·휘슬·스트링스만 남긴다
+        if bar >= 81:              # 마지막 화음 — 베이스는 근음을 길게 눌러 받친다
+            if bar in (81, 83):    # 두 마디마다 한 번씩만 다시 짚어 여운을 남긴다
+                bass.note(beat, 7.6, bass_root[i], 72 if bar == 81 else 58)
+                if bass2 is not None:
+                    bass2.note(beat, 7.6, bass_root[i], 60 if bar == 81 else 46)
             continue
         root = bass_root[i]              # 여기서부터는 옥타브가 정리된 근음
         role = bass_role(beat)
@@ -693,6 +716,8 @@ FILLS = {
     60: [],                                                                     # G.P. 는 아래에서 따로
     68: [(2.5, 0.25, 47, 92), (2.75, 0.25, 47, 98), (3.0, 0.25, 45, 104),
          (3.25, 0.25, 45, 108), (3.5, 0.5, 38, 116)],                           # 아웃트로 진입: 최대 필
+    80: [(2.0, 0.5, 47, 78), (2.5, 0.5, 45, 86), (3.0, 0.5, 38, 94),
+         (3.5, 0.5, 38, 102)],                                                  # 코다의 마지막 화음으로 미는 탐 굴림
 }
 
 
@@ -701,14 +726,21 @@ def build_drums(dr, pc, pc2):
     #  이름만 SHK 였지 실제로는 마라카스를 치고 있었고, 마라카스가 더 어둡다.
     K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 82, 49, 47, 45
     TAMB, RIDE = 54, 51                    # 탬버린·라이드 — 비어 있던 고역을 맡는다
-    for bar in range(1, 77):
+    for bar in range(1, BARS + 1):
         beat = b(bar)
         fade = OUTRO_FADE.get(bar, 1.0)
-        style = ('none' if bar <= 4 or 53 <= bar <= 56 or 61 <= bar <= 64 or bar >= 75 else
+        # 81마디부터는 마지막 화음이 울리는 자리 — 드럼을 완전히 뺀다(크래시만 따로 얹는다).
+        # 77~80 은 종지를 미는 구간이라 얇게라도 움직임이 있어야 한다.
+        style = ('silent' if bar >= 81 else
+                 'none' if bar <= 4 or 53 <= bar <= 56 or 61 <= bar <= 64 else
                  'verse' if in_(beat, 'verse1', 'verse2', 'pre1', 'pre2') else
                  'build' if 57 <= bar <= 60 else
-                 'outro-thin' if bar in (73, 74) else 'four')
+                 'outro-thin' if 73 <= bar <= 80 else 'four')
         ph = (bar - 1) % 4                       # 프레이즈 안 위치 (0~3)
+        if style == 'silent':
+            if bar == 81:                              # 마지막 화음 도착 — 크래시 하나
+                dr.note(beat, 2.0, CR, 104)
+            continue
         if style == 'none':
             # 조용한 구간도 마디마다 같으면 안 된다(인트로가 100% 복붙이었다).
             # 셰이커 격자를 8분/16분으로 번갈아 쓰고, 2마디마다 림을 하나 얹는다.
@@ -768,7 +800,7 @@ def build_drums(dr, pc, pc2):
             for o in GHOST_FOUR[ph % 2]:
                 dr.note(beat + o, 0.1, S, 28)
         # 섹션 진입 크래시
-        if bar in (17, 25, 41, 49, 61, 65, 69):
+        if bar in (17, 25, 41, 49, 61, 65, 69, 77):
             dr.note(beat, 0.5, CR, 108)
         # 필 — 자리마다 다른 걸 친다 (rev02 까지는 전부 톰 2방으로 같았다)
         if bar in FILLS:
@@ -879,10 +911,19 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         # 인트로: 휘슬 모티프 + 하프 아르페지오
         put_motif(whi, 1, 84, expressive=True)
         for beat, dur, name in PROG:
-            if in_(beat, 'intro', 'bridge') or 69 <= bar_of(beat) <= 76:
+            if in_(beat, 'intro', 'bridge') or 69 <= bar_of(beat) <= BARS:
                 voic = CH[name][0]
-                for k in range(8):
-                    hrp.note(beat + k * 0.5, 0.5, voic[k % 4] + (12 if k >= 4 else 0), 52)
+                if bar_of(beat) >= 81:
+                    # 마지막 화음 — 상행으로 굴리면 계속 밀어붙이는 소리가 난다.
+                    # 하행으로, 마디마다 음을 줄이고 여리게 해서 잦아들게 한다.
+                    bi = bar_of(beat) - 81                       # 0,1,2,3
+                    steps = (6, 5, 4, 3)[bi]
+                    for k in range(steps):
+                        pit = voic[(3 - k) % 4] + (12 if k < 2 else 0)
+                        hrp.note(beat + k * 0.75, 1.2, pit, int((54 - bi * 9) - k * 2))
+                else:
+                    for k in range(8):
+                        hrp.note(beat + k * 0.5, 0.5, voic[k % 4] + (12 if k >= 4 else 0), 52)
 
         # 프리코러스 하프 — 이 구간은 D5 위가 통째로 비어 있었다(대역 점유 고역 0%).
         # 프리는 코러스로 밀어 올리는 자리인데 공기감이 없으면 코러스가 열리는 느낌이 안 난다.
@@ -972,6 +1013,10 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         # 아웃트로: 모티프 2회 (E major)
         put_motif(whi, 69, 94, transpose=2, expressive=True)
         put_motif(whi, 73, 84, transpose=2, expressive=True)
+        # 코다 — 마지막 화음 위에서 모티프의 머리만 한 번 더. 곡을 연 소리로 닫는다.
+        # 전곡을 다시 부르면 코다가 아니라 한 절이 더 붙는 셈이 되므로 앞 세 음만 쓴다.
+        for o, d, p in ((0.0, 1.0, 69), (1.0, 1.0, 71), (2.0, 4.0, 74)):
+            whi.note(b(81, o), d, p + 2, 86 if o < 2.0 else 92)
         # 스트링스: 코러스(옅게, 고음역 화성 보강) · 브릿지 후반 · 마지막 코러스 · 아웃트로
         # 정적인 2음 화음 대신 두 성부로 나눈다 — 위는 지속, 아래는 코드 중간에 온음계
         # 이웃음으로 한 번 움직인다(작은 서스펜션). 매 코드가 똑같은 딱딱한 화음으로 안 들리게.
@@ -986,7 +1031,7 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
                 strs.note(beat, dur, voic[2], 30)
                 strs.note(beat, dur, voic[0], 26)
                 continue
-            if in_chorus or 57 <= bar <= 60 or 65 <= bar <= 76:
+            if in_chorus or 57 <= bar <= 60 or 65 <= bar <= BARS:
                 voic = CH[name][0]
                 vel = 40 if in_chorus else (54 if bar >= 73 else 66)  # 코러스는 리드 아래로 옅게
                 top = voic[2] + 12
@@ -1042,9 +1087,9 @@ if __name__ == '__main__':
         write_midi(os.path.join(stem_dir, f'{i:02d}_{safe}.mid'), [t])
     print(f'  스템 {len(tracks)}개 -> {os.path.basename(stem_dir)}/')
 
-    total = 76 * 4 * 60 / BPM
+    total = BARS * 4 * 60 / BPM
     KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
     key = KEYS[(2 + TRANSPOSE) % 12]
-    print(f'wrote 01~06{R}.mid  —  76 bars, '
+    print(f'wrote 01~06{R}.mid  —  {BARS} bars, '
           f'{int(total // 60)}:{int(total % 60):02d} @ {BPM}BPM, '
           f'key {key} major (TRANSPOSE={TRANSPOSE:+d}, rev{REV:02d})')

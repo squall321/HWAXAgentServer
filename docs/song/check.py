@@ -182,7 +182,7 @@ for nme, ev, _t, _l, _i in itr:
     if nme in ('Signature Whistle', 'Celtic Harp'):       # 선율을 쥘 수 있는 파트만
         lead.update(int(t / div / 4) + 1 for t, k, _c, _a, b2 in ev if k == 0x90 and b2 > 0)
 gaps, cur = [], None
-for bar in range(1, 77):
+for bar in range(1, mg.BARS + 1):
     if bar not in lead:
         cur = (cur[0], bar) if cur else (bar, bar)
     elif cur:
@@ -191,7 +191,7 @@ if cur:
     gaps.append(cur)
 big = [(a, b2) for a, b2 in gaps if b2 - a + 1 >= 4]
 tot = sum(b2 - a + 1 for a, b2 in gaps)
-check(tot <= 8, f'선율 공백 {tot}마디 ({tot / 76 * 100:.0f}%)')
+check(tot <= 8, f'선율 공백 {tot}마디 ({tot / mg.BARS * 100:.0f}%)')
 check(big == [(61, 64)], f'4마디 이상 구멍은 61~64(낙사비, 로즈 단독)뿐: {big}')
 
 print('\n[10] 의도한 악기 이름(FF 04) 이 파일에 남아 있는가')
@@ -233,7 +233,7 @@ sec_per_bar = 4 * 60 / mg.BPM
 for label, rng in mg.SECTIONS.items():
     st = (rng[0] - 1) * sec_per_bar
     print(f'  · {label:9s} {rng[0]:>2}–{rng[-1]:<2}마디  {int(st // 60)}:{int(st % 60):02d}')
-total = 76 * sec_per_bar
+total = mg.BARS * sec_per_bar
 check(150 <= total <= 210, f'전체 {int(total // 60)}:{int(total % 60):02d} — 현대 팝 길이(2:30~3:30) 안')
 
 print('\n[4] 보컬 하모니 — 음정 · 성부 교차')
@@ -291,6 +291,28 @@ check(ok and not v2, f'2절이 1절 음절 그리드에 정확히 맞음 (남은
 print('\n[7] 보컬 최고음 — 전조를 반영한 실제 상한')
 peak = max(p for _b, _d, p in ch)
 check(peak + 2 <= 76, f'코러스 최고음 {nm(peak)} → 전조 후 {nm(peak + 2)} (상한 E5)')
+
+print('\n[14] 기타-로즈 음역 관계 — 기타가 로즈 위에 뜨되 너무 멀지 않은가')
+# ★rev12 에서 잡은 버그를 못박는다. 기타를 로즈 위로 올린 건 겹침을 피하려던 것인데,
+# rev04 에서 로즈를 한 옥타브 내리면서 기타에는 보정을 넣어 **원래 자리에 못 박아** 뒀다.
+# 로즈가 내려갔으면 기타도 내려와야 했다. 그대로 둔 결과 기타가 F#5/A5 에서 16분음표로
+# 초당 6번씩 울렸고(1056음 중 966음이 C5 이상), 곡 내내 "띠리릭"거리는 소리가 났다.
+# 두 트랙의 중앙값 간격으로 검사한다 — 겹치지도(3반음 미만), 멀지도(15반음 초과) 않아야 한다.
+def _median_pitch(tname):
+    ps = sorted(a for t in tracks if t[0] == tname
+                for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0)
+    return ps[len(ps) // 2] if ps else None
+_rh, _gt = _median_pitch('Rhodes'), _median_pitch('Guitar (16th chops)')
+if _rh is not None and _gt is not None:
+    _d = _gt - _rh
+    check(3 <= _d <= 15,
+          f'로즈 중앙값 {nm(_rh)} → 기타 중앙값 {nm(_gt)} = {_d:+d}반음 (3~15 이어야 한다)')
+    _hi = sum(1 for t in tracks if t[0] == 'Guitar (16th chops)'
+              for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0 and a >= 72)
+    _all = sum(1 for t in tracks if t[0] == 'Guitar (16th chops)'
+               for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0)
+    check(_hi * 100 // max(_all, 1) <= 20,
+          f'기타 C5 이상 비율 {_hi}/{_all} ({_hi*100//max(_all,1)}%) — 20% 이하여야 한다')
 
 print('\n[13] 보컬 레가토 — 프레이즈 안에서 음이 붙어 있는가 (SynthV 임포트용)')
 # rev09 에서 잡은 것 둘을 못박는다.
