@@ -47,6 +47,17 @@ EQ = {
     'Strings':             (200, (400, -2.0), +1.0),
 }
 
+# 보컬 포켓 — `05_instruments`(보컬을 얹을 반주)에만 적용한다.
+# 코러스에서 보컬의 명료도 대역을 반주가 이만큼 차지하고 있었다:
+#   1~2kHz 기타 47.7% · 스트링스 25.2%   /   2~4kHz 기타 69.5% · 스트링스 15.6%
+# 보컬이 그 위에 올라가려면 자리를 비워 줘야 한다. 마스터에 걸면 전체가 둔해지므로
+# **경쟁하는 악기에만** 넓은 딥을 판다. (`06_instrumental` 은 선율을 악기가 맡으므로 걸지 않는다)
+VOCAL_POCKET = {
+    'Guitar (16th chops)': [(2200, -3.8, 0.95)],
+    'Strings':             [(1800, -2.6, 0.90)],
+    'Celtic Harp':         [(2000, -1.6, 0.90)],
+}
+
 MIX = {
     # 킥이 저역을 독점하고 있었다 — 20~60Hz 를 드럼 88.8% 대 베이스 11.2% 로 나눠 갖고 있어서
     # "베이스가 없다"고 들렸다. 킥은 최저역의 타격감만 유지하고, 음정이 들리는 60~250Hz 는
@@ -81,9 +92,10 @@ def eq(x, sr, hp=0.0, cut=None, air=0.0):
     g = np.ones(len(f))
     if hp > 0:
         g *= 1.0 / np.sqrt(1.0 + (hp / np.maximum(f, 1e-6)) ** 4)
-    if cut:
-        fc, db = cut
-        g *= 10 ** ((db / 20) * np.exp(-((np.log2(np.maximum(f, 1e-6) / fc)) ** 2) / (2 * 0.55 ** 2)))
+    for fc, db, w in ([(cut[0], cut[1], 0.55)] if cut and not isinstance(cut[0], tuple)
+                      else [(a, b, (c[2] if len(c) > 2 else 0.55)) for c in (cut or ())
+                            for a, b in ((c[0], c[1]),)]):
+        g *= 10 ** ((db / 20) * np.exp(-((np.log2(np.maximum(f, 1e-6) / fc)) ** 2) / (2 * w ** 2)))
     if air:
         g *= 10 ** ((air / 20) / (1.0 + (8000.0 / np.maximum(f, 1e-6)) ** 2))
     out = np.empty_like(x)
@@ -324,10 +336,16 @@ def _mix_from_stems(inst, sf2, quiet):
         a = np.pad(a, ((0, n - len(a)), (0, 0)))
         target, pan, send = MIX.get(name, (0.05, 0.0, 0.15))
         _hp, _cut, _air = EQ.get(name, (0, None, 0.0))
-        a = eq(a, SR, hp=_hp, cut=_cut, air=_air)      # 레벨을 맞추기 전에 EQ 를 건다
+        # 보정 EQ 는 레벨을 맞추기 **전에** 건다 — 쓰레기를 걷어낸 뒤의 소리를 목표 레벨에 맞춘다.
+        a = eq(a, SR, hp=_hp, cut=_cut, air=_air)
         rms = float(np.sqrt(np.mean(a ** 2)))
         g = target / max(rms, 1e-9)
         a = a * g
+        # ★보컬 포켓은 레벨을 맞춘 **뒤에** 건다. 앞에 걸면 깎은 만큼 RMS 가 줄고
+        #  정규화(target/rms)가 그걸 도로 올려버려 상대 비중이 그대로다 —
+        #  실제로 기타의 2~4kHz 점유가 69.5% 에서 68.4% 로만 움직였다.
+        if not inst and name in VOCAL_POCKET:
+            a = eq(a, SR, cut=VOCAL_POCKET[name])
         lg, rg = rn.pan_gains(pan)
         a = a * np.array([lg, rg])
         mix += a
@@ -390,8 +408,13 @@ def _mix_from_stems(inst, sf2, quiet):
     # 실제 샘플은 크레스트 팩터가 커서 같은 피크에서 RMS 가 낮게 나온다. 예전에는
     # tanh 새추레이션으로 밀어 넣었는데 THD 16.4% 를 만들고 있었다(limiter 주석 참고).
     # 대신 게인을 먼저 올려 놓고 리미터가 피크만 눌러내리게 한다 — 왜곡이 없다.
-    mix = mix / peak * 5.4
-    mix = limiter(mix, SR, ceiling=0.94)
+    # ★반주판(05)과 인스트루멘털판(06)의 마스터 목표가 다르다.
+    # 06 은 선율을 악기가 맡는 **완성곡**이라 상업 팝 라우드니스(-11 LUFS)로 맞춘다.
+    # 05 는 그 위에 보컬을 얹을 **반주**다. 완성곡 레벨로 만들어 놓으면 보컬을 올릴 자리가
+    # 없어 사용자가 결국 반주를 다시 내려야 한다 — 그럴 거면 처음부터 내려서 줘야 한다.
+    # 약 4dB 를 비워 두면 보컬을 얹은 합이 -11 LUFS 근처가 된다.
+    mix = mix / peak * (5.4 if inst else 3.4)
+    mix = limiter(mix, SR, ceiling=0.94 if inst else 0.72)
     if int(np.sum(~np.isfinite(mix))):
         raise SystemExit('NaN/Inf 발생 — 렌더 중단')
 

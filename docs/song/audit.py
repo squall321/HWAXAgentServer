@@ -66,12 +66,16 @@ def main():
     print('[A] 라우드니스 · 다이내믹 — 스트리밍 팝 규범과 대조')
     print()
     L = lufs(mix, SR)
-    judge('통합 라우드니스 (근사 LUFS)', L, -14.0, -8.0, 'LU',
-          '' if -14 <= L <= -8 else '★너무 조용하다 — 프로 마스터 옆에 두면 초라하게 들린다')
+    # 반주판(05)과 완성곡판(06)의 목표가 다르다. 05 는 그 위에 보컬이 올라가므로
+    # 일부러 4dB 쯤 비워 둔다 — 완성곡 레벨로 주면 사용자가 결국 다시 내려야 한다.
+    lo, hi = (-14.0, -8.0) if inst else (-16.0, -12.5)
+    judge('통합 라우드니스 (근사 LUFS)', L, lo, hi, 'LU',
+          '완성곡 기준' if inst else '반주 기준 — 보컬 얹을 헤드룸을 남긴다')
     peak_db = 20 * np.log10(np.max(np.abs(mix)) + 1e-12)
     rms_db = 20 * np.log10(np.sqrt(np.mean(mix ** 2)) + 1e-12)
     judge('크레스트 팩터 (피크-RMS)', peak_db - rms_db, 8.0, 14.0, 'dB')
-    judge('트루피크 여유', -peak_db, 0.3, None, 'dB')
+    judge('트루피크 여유', -peak_db, 0.3 if inst else 2.0, None, 'dB',
+          '' if inst else '보컬이 올라갈 자리')
     spb = 4 * 60.0 / mg.BPM
     secs = {}
     for label, rng in mg.SECTIONS.items():
@@ -95,8 +99,12 @@ def main():
         if mm.sum():
             bx.append(np.log2(np.sqrt(lo * hi))); by.append(10 * np.log10(S[mm].mean() + 1e-18))
     slope = np.polyfit(bx, by, 1)[0]
-    judge('스펙트럼 틸트', slope, -5.0, -2.5, 'dB/oct',
-          '' if -5 <= slope <= -2.5 else ('★너무 어둡다' if slope < -5 else '★너무 밝다/납작하다'))
+    # 틸트 규범은 **완성 마스터** 기준이다. 반주판(05)은 보컬 포켓으로 1~4kHz 를 일부러
+    # 비워 두므로 그만큼 어둡게 측정된다 — 그 자리는 보컬이 채운다. 완성곡 기준을 그대로
+    # 들이대면 "너무 어둡다"는 가짜 신호가 나온다(실제로 -5.46 로 잡혔다).
+    tlo, thi = (-5.0, -2.5) if inst else (-6.2, -3.0)
+    judge('스펙트럼 틸트', slope, tlo, thi, 'dB/oct',
+          '완성곡 기준' if inst else '반주 기준 — 보컬 대역을 비워 둔 만큼 어둡게 나온다')
 
     print('\n' + '=' * 72)
     print('[C] 스테레오 이미지 — 대역마다 넓이가 달라야 한다')
