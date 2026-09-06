@@ -20,7 +20,7 @@ BPM = 112
 TRANSPOSE = 0
 
 # 리비전 번호 — 산출물 파일명에 그대로 박힌다. REVISIONS.md 에 rev 를 추가할 때마다 올린다.
-REV = 13
+REV = 14
 
 # ── 의도한 악기 (MIDI 메타이벤트 FF 04 'Instrument Name') ────────
 # GM 프로그램 번호는 "플루트 비슷한 것"까지밖에 전달하지 못한다. MIDI 규격에는
@@ -41,6 +41,7 @@ INSTRUMENTS = {
     'Drums':                     'Dry acoustic kit, minimal room (GM drum map)',
     'Percussion':                'Hi-hats and shaker - mixed separately from the kit',
     'Percussion Hi':             'Tambourine and ride - opposite side from the hats (overhead image)',
+    'Kick':                      'Kick drum only - split from the kit so its low end can be shaped',
 }
 
 # ── 휴머나이즈 ────────────────────────────────────────────────
@@ -721,7 +722,7 @@ FILLS = {
 }
 
 
-def build_drums(dr, pc, pc2):
+def build_drums(dr, pc, pc2, kck):
     # ★SHK 는 rev06 까지 70 이었는데 GM 70 은 셰이커가 아니라 마라카스다(82가 셰이커).
     #  이름만 SHK 였지 실제로는 마라카스를 치고 있었고, 마라카스가 더 어둡다.
     K, S, RIM, HH, OH, SHK, CR, T1, T2 = 36, 38, 37, 42, 46, 82, 49, 47, 45
@@ -758,7 +759,8 @@ def build_drums(dr, pc, pc2):
             continue
         if style == 'outro-thin':                      # 73~74마디: 풀킷 -> 킥+셰이커만
             for o in (0.0, 2.0):
-                dr.note(beat + o, 0.3, K, int(100 * fade))
+                # 아웃트로·코다는 반주가 얇아 킥이 유독 앞으로 나온다 — 벨로시티를 내린다
+                kck.note(beat + o, 0.3, K, int(84 * fade))
             for k in range(8):
                 pc.note(beat + k * 0.5, 0.2, SHK, int((42 if k % 2 else 56) * fade))
             continue
@@ -767,7 +769,9 @@ def build_drums(dr, pc, pc2):
         if style == 'verse':
             kicks = [0.0, 1.5, 2.5] if ph != 3 else [0.0, 1.5, 2.75, 3.5]
             for o in kicks:
-                dr.note(beat + o, 0.3, K, 100)
+                # ★벌스·프리는 편성이 얇아 같은 벨로시티라도 킥이 훨씬 크게 들린다.
+                # 코러스(106)와 6밖에 차이가 없어 10~30초·60~80초에서 킥이 튀었다.
+                kck.note(beat + o, 0.3, K, 86)
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, RIM, 92)
             for k in range(8):                    # 하이햇: 2마디 단위로 악센트 자리를 옮긴다
@@ -777,7 +781,7 @@ def build_drums(dr, pc, pc2):
                 dr.note(beat + o, 0.1, S, 26)
         elif style == 'build':
             for o in (0.0, 1.0, 2.0, 3.0):
-                dr.note(beat + o, 0.3, K, 104)
+                kck.note(beat + o, 0.3, K, 104)
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, S, 98)
             for k in range(16):
@@ -787,7 +791,7 @@ def build_drums(dr, pc, pc2):
         else:
             kicks = [0.0, 1.0, 2.0, 3.0] if ph != 3 else [0.0, 1.0, 1.75, 2.0, 3.0]
             for o in kicks:
-                dr.note(beat + o, 0.3, K, 106)
+                kck.note(beat + o, 0.3, K, 106)
             for o in (1.0, 3.0):
                 dr.note(beat + o, 0.3, S, 100)
             # 오픈 하이햇은 매 업비트가 아니라 2마디 구절 끝에만 — rev02 는 마디당 4번이라 씻겨나갔다
@@ -902,10 +906,14 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
     # 소스가 모노라 스테레오 폭 처리를 아무리 걸어도 넓어지지 않는다.
     # 실제 드러머의 이미지처럼 햇·셰이커와 탬버린·라이드를 갈라 반대편에 앉힌다.
     pc2 = Track('Percussion Hi', None, 9)
+    # 킥을 킷에서 뗀다. 스펙트럼을 재보니 킥의 최대 에너지가 90~120Hz(35.3%)이고
+    # 서브(20~40Hz)는 3% 뿐이었다 — 깊게 깔리는 게 아니라 앞에서 때리는 킥이다.
+    # 킥 외의 드럼은 120Hz 아래에 에너지가 0% 라, 갈라 놓으면 저역을 수술적으로 만질 수 있다.
+    kck = Track('Kick', None, 9)
 
     if with_rhythm:
         build_chords(rho, gtr, bas, bas2)
-        build_drums(dr, pc, pc2)
+        build_drums(dr, pc, pc2, kck)
 
     if with_melody:
         # 인트로: 휘슬 모티프 + 하프 아르페지오
@@ -1049,7 +1057,7 @@ def make_tracks(with_melody=True, with_rhythm=True, topline=False):
         put_topline(whi, hrp, rho)
     for _v in (voc, hlo, hhi):        # 보컬 3트랙만 — 악기는 그루브가 살아 있어야 한다
         legato_pass(_v)
-    return [voc, hlo, hhi, whi, rho, gtr, bas, bas2, hrp, strs, dr, pc, pc2]
+    return [voc, hlo, hhi, whi, rho, gtr, bas, bas2, hrp, strs, dr, pc, pc2, kck]
 
 
 if __name__ == '__main__':
