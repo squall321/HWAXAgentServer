@@ -69,6 +69,7 @@ from deliberation import (
     strip_sim_trigger,
     strip_test_plan_trigger,
 )
+from thinking import is_thinking, run_thinking, strip_thinking_trigger
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
@@ -341,6 +342,10 @@ class ChatRequest(BaseModel):
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
     # 클램프하므로 raw dict 로 받아도 안전. 미지정 키는 env 기본값. 심의(/심의) 경로에서만 쓰인다.
     delib_opts: dict | None = None
+    # 띵킹 모드 — 질문을 전문가 풀에 돌려 답할 수 있는 좌석만 각자 답하게 한다(회의 없음).
+    # delib_opts 가 아니라 top-level 인 이유: 이건 매 턴 켜져 있어야 하는 모드인데, 프론트의
+    # 슬래시 접두사는 첫 발화에만 붙어(ChatContext.applyPrefix) 둘째 턴부터 조용히 꺼진다.
+    thinking: bool = False
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -2371,6 +2376,12 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # "/도구 <질의>" 또는 '도구 뭐 있어' 류 → 도구 카탈로그+추천을 SSE tools 이벤트로(결정적).
         # 프론트가 선택 UI 를 그리고, 고른 도구는 다음 발화부터 pinned_tools 로 우선 사용된다.
         stream = run_tool_search(app, strip_tool_trigger(req.message), req.groups)
+    elif is_thinking(req.message) or req.thinking:
+        # 띵킹 모드 — 답할 수 있는 전문가만 각자 답하고, 못 하는 좌석은 넘길 곳을 지목한다.
+        # 명시 슬래시 트리거(/심의·/도구 등)보다 **뒤**에 둔다: 모드가 켜져 있어도 그 턴에
+        # 사용자가 대놓고 /심의 를 치면 그 의도가 이긴다.
+        stream = run_thinking(app, strip_thinking_trigger(req.message), req.groups,
+                              req.user_email, req.user_pat, req.history)
     else:
         stream = _agent_stream(app, req)
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)
