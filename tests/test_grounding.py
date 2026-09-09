@@ -7,6 +7,7 @@
 # 모델이 찍었던 값: test_id=1(→ SUS201_annealed 카드), material_id=12345(→ not found).
 #
 #   실행:  .venv/bin/python -m pytest tests/test_grounding.py -q
+import ast
 import re
 import sys
 from pathlib import Path
@@ -211,13 +212,31 @@ def test_일반_한국어_영단어를_도구로_오인하지_않는다():
 
 # ── 자유 조회 화이트리스트 ────────────────────────────────────────────────────
 def _free_ok():
+    r"""deliberation.py 에서 화이트리스트 3블록을 떼어 와 실행한다(무거운 import 회피).
+
+    ⚠ 정규식(`\([^)]*\)`)으로 긁으면 안 된다. 그 패턴은 **첫 번째 닫는 괄호**에서 멈추는데,
+    _FREE_ALLOW 의 주석에 괄호가 있어(예: "…가 함께 열린다(전부 쓰기)") 튜플이 중간에서
+    잘리고 `SyntaxError: '(' was never closed` 가 난다. 그러면 이 파일이 import 되지 못해
+    **tests/ 디렉터리 전체가 수집 실패**한다 — 실제로 925953e 이후 그 상태였다.
+    구문 트리로 뽑으면 주석 내용과 무관하게 정확하다.
+    """
     src = (APP.parent / "deliberation.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    wanted = {"_FREE_ALLOW", "_FREE_DENY", "_free_tool_ok"}
     ns: dict = {}
-    for pat in (r"_FREE_ALLOW = \([^)]*\)", r"_FREE_DENY = \([^)]*\)",
-                r"def _free_tool_ok.*?startswith\(_FREE_ALLOW\)"):
-        m = re.search(pat, src, re.S)
-        assert m, f"deliberation.py 에서 블록을 찾지 못했다: {pat[:30]}"
-        exec(m.group(0), ns)  # noqa: S102
+    found: set = set()
+    for node in tree.body:
+        name = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+        elif isinstance(node, ast.FunctionDef):
+            name = node.name
+        if name in wanted:
+            exec(ast.get_source_segment(src, node), ns)  # noqa: S102
+            found.add(name)
+    missing = wanted - found
+    assert not missing, f"deliberation.py 에서 블록을 찾지 못했다: {sorted(missing)}"
     return ns["_free_tool_ok"]
 
 

@@ -418,10 +418,21 @@ def test_읽기_도구는_앱_조건부이고_쓰기_도구가_없다():
     everything = [n for v in d._RISK_READ_TOOLS.values() for n in v] + list(d._RISK_KEEP_TOOLS)
     for n in everything:
         assert n not in write and not n.startswith("upload_"), n
-    # 이 통로가 필요한 이유 — 접두사 화이트리스트에 하나도 안 걸린다(§6.5.2).
+    # 이 통로가 필요한 이유 — **대부분이** 접두사 화이트리스트에 안 걸린다(§6.5.2).
+    # ⚠ 예외 하나: section_contact_usage 는 925953e 가 _FREE_ALLOW 에 이름으로 넣었다.
+    #   MCP 워크플로 경로에서는 좌석이 실제로 쓰는데 agent-server 자유 조회에서만 빠져
+    #   두 경로의 좌석 능력이 달랐기 때문이다. 읽기 전용이 맞으므로(게이트웨이 설명 실측:
+    #   "요소 정식·접촉 카드 사용 분포 — 해석 설계 관행의 근거") 그 결정을 유지하고
+    #   불변식을 좁힌다. 이 테스트는 tests/ 수집 실패에 가려 그동안 돌지 않았다.
+    _also_free = {"section_contact_usage"}
     for n in d._RISK_READ_TOOLS["heax-step_forge"] + d._RISK_READ_TOOLS["heax-kooremapper_mcp"]:
+        if n in _also_free:
+            continue
         assert not d._free_tool_ok(n), n
     assert not d._free_tool_ok("pcb_warpage_surrogate")
+    # 예외로 둔 것은 반드시 읽기 전용이어야 한다 — 자유 조회는 deny-by-default 다.
+    for n in _also_free:
+        assert n not in write and not n.startswith("upload_"), n
 
 
 def test_유지_도구는_15종이고_계약표_rel_std_행과_맞는다():
