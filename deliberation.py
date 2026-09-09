@@ -1933,50 +1933,25 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
     opts = _resolve_opts(req_opts)
-    decision_a, personas_a, nn_a = "", [], []
-    decision_b = ""  # 2단(해석 계획) 결정문 — 3단 구축 계획(build_plan) 승계용
-
-    def _capture_b(chunk: bytes):
-        """2단 스트림에서 해석 계획 결정문을 가로챈다(3단 구축 계획 입력)."""
-        nonlocal decision_b
-        try:
-            if not chunk.startswith(b"data:"):
-                return
-            ev = json.loads(chunk[5:].decode("utf-8").strip())
-        except Exception:  # noqa: BLE001
-            return
-        if ev.get("kind") == "decision":
-            decision_b = ev.get("text") or decision_b
-
-    def _capture(chunk: bytes):
-        """1단 스트림에서 결정문·좌석·양보 불가 조항을 가로챈다(2단 입력)."""
-        nonlocal decision_a
-        try:
-            if not chunk.startswith(b"data:"):
-                return
-            ev = json.loads(chunk[5:].decode("utf-8").strip())
-        except Exception:  # noqa: BLE001 — 파싱 실패는 무시(캡처 실패가 심의를 죽이지 않게)
-            return
-        kind = ev.get("kind")
-        if kind == "decision":
-            decision_a = ev.get("text") or decision_a
-        elif kind == "personas":
-            for pp in ev.get("personas") or []:
-                if pp.get("key") and not any(x["key"] == pp["key"] for x in personas_a):
-                    personas_a.append({"key": pp["key"], "role": pp.get("role") or ""})
-        elif kind == "turn" and ev.get("non_negotiable"):
-            nn = str(ev["non_negotiable"]).strip()
-            if nn and nn not in nn_a:
-                nn_a.append(nn)
+    # 단 사이 승계는 **코어가 직접 채우는 dict** 로 받는다. 예전에는 SSE 청크를 문자열로
+    # 파싱해 가로챘는데, 가드가 chunk.startswith(b"data:") 였고 _sse 는 "event: …\ndata: …"
+    # 를 내므로 **항상 거짓**이었다. decision_a 가 영영 비어 /시뮬심의 웹 경로는 도입
+    # 시점부터 1단에서 sim_no_mechanism 으로 죽었다(2026-09-08 확인). 스트림을 다시
+    # 파싱하는 방식 자체를 없앤다 — 같은 실패가 조용히 재발할 자리를 남기지 않는다.
+    out_a: dict = {}   # 1단 산출 — 결정문·좌석·양보 불가 조항(2단 입력)
+    out_b: dict = {}   # 2단 산출 — 해석 계획 결정문(3단 build_plan 입력)
 
     try:
         # ── 1단 — 메커니즘 심의 ──────────────────────────────────────────────
         yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
         opts_a = _resolve_opts(req_opts)
         opts_a.chair_template = "mechanism"
-        async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat, history):
-            _capture(chunk)
+        async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
+                                                history, out=out_a):
             yield chunk
+        decision_a = out_a.get("decision") or ""
+        personas_a = out_a.get("personas") or []
+        nn_a = out_a.get("non_negotiables") or []
         if not decision_a:
             yield _sse("error", {"code": "sim_no_mechanism",
                                  "message": "1단 메커니즘 심의가 결정문을 내지 못해 해석 설계로 넘어갈 수 없습니다."})
@@ -2026,9 +2001,10 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
             print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
-        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat, history):
-            _capture_b(chunk)
+        async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat,
+                                                history, out=out_b):
             yield chunk
+        decision_b = out_b.get("decision") or ""
 
         # ── 3단 — 구축 계획 심의 (opt-in: build_plan) ─────────────────────────────
         # 2단 해석 계획을 그 문제에 특화된 반복 파라메트릭 모듈로 "구축"하는 계획까지. 2단 결정문
@@ -2109,8 +2085,18 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
 
 
 async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS, user: str = "",
-                               user_pat: str = "", history: list | None = None):
+                               user_pat: str = "", history: list | None = None,
+                               out: dict | None = None):
     """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
+    # out — 다단 심의(시뮬)가 다음 단으로 넘길 산출물을 **직접** 받는 통로다. 예전엔 래퍼가
+    # SSE 청크를 문자열로 파싱해 가로챘는데, _sse 가 "event: …\ndata: …" 를 내는데도 가드가
+    # chunk.startswith(b"data:") 였다. 항상 거짓이라 decision 이 영영 비었고 /시뮬심의 웹 경로가
+    # 도입 시점부터 1단에서 sim_no_mechanism 으로 죽었다(2026-09-08 확인, 테스트 0건).
+    # 값을 코드로 넘기면 그런 조용한 실패가 구조적으로 불가능해진다.
+    if out is not None:
+        out.setdefault("personas", [])
+        out.setdefault("non_negotiables", [])
+        out.setdefault("decision", "")
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
     # 근거 계수(F2) — 결정문 헤더에 실을 프로파일. 형식의 권위가 근거의 강도를 넘지 않게,
     # 조회 0건 심의가 확정 결론과 같은 모습으로 유통되는 것을 막는다.
@@ -2377,6 +2363,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _delib("personas", totalRounds=opts.rounds,
                  personas=[{"key": p["key"], "role": (p.get("role") or "")[:280],
                             "origin": p.get("origin", "primary")} for p in personas])
+    if out is not None:
+        # 다음 단이 좌석을 승계할 수 있게 **절단하지 않은** role 을 넘긴다(SSE 는 280자 표시용).
+        out["personas"] = [{"key": p["key"], "role": p.get("role") or ""} for p in personas]
     seat_note = _seat_note(personas)
 
     # 페르소나별 주제 지식 주입(결정적 RAG) — 지식카드를 많이 가진 전문가일수록 "지금 주제와
@@ -2664,6 +2653,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                          "non_negotiable": str(o.get("non_negotiable") or "")[:1200]}
             yield _delib("turn", round=rnd, display_round=_dr(rnd), persona=o["persona"],
                          say=_say_of(render, o), **extra)
+            if out is not None and extra.get("non_negotiable"):
+                _nn = str(extra["non_negotiable"]).strip()
+                if _nn and _nn not in out["non_negotiables"]:
+                    out["non_negotiables"].append(_nn)
         if rnd == 1:
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
@@ -2684,6 +2677,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _cp = (f"[체크포인트 — {_dr(rnd)}라운드(초기입장)에서 멈춤]\n{seat_note}\n\n"
                    f"{ct}\n\n빠진 관점이나 추가 관측이 있으면 의견으로 넣어 이어가라. "
                    "좌석 재심사가 그 방향에 맞는 도메인을 불러온다.")
+            if out is not None:
+                out["decision"] = _cp
             yield _delib("decision", text=_cp)
             yield _sse("status", {"step": "체크포인트 — 사람 검토 대기(의견을 넣어 이어가기)", "tool": None})
             yield _sse("result", {"type": "text", "content": _cp})
@@ -2917,6 +2912,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
                              "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
                              "별도 판단입니다.")
+    if out is not None:
+        out["decision"] = decision
     yield _delib("decision", text=decision + report_note)
     yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
                  tally=tally, unanimous=(tally["agree"] == tally["total"] and tally["total"] > 0))
