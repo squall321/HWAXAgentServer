@@ -1475,6 +1475,23 @@ async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
     return hits2, f"{note} → {fb} 로 되물음"
 
 
+def _ra_report_id(made) -> int | None:
+    """RA 저장 응답에서 보고서 id — 응답 모양이 셋이라 전부 받는다.
+
+    ⚠ RA 배포본은 최상위 `report_id` 를 준다(실측 2026-09-06:
+    {"report_id":58,"title":…,"page_count":1,"url":…}). 종전 파서는 `report.id` 만 봐서
+    저장은 되는데 id 를 못 읽었고, 호출부는 그걸 '저장 실패'로 읽어 사용자에게 반대 사실을
+    말했다. 같은 실수가 두 자리에서 따로 났으므로(심의·`/보고서`) 파서를 한 곳에 둔다.
+    """
+    m = made if isinstance(made, dict) else {}
+    inner = m.get("report")
+    rid = (inner.get("id") if isinstance(inner, dict) else None) or m.get("report_id") or m.get("id")
+    try:
+        return int(rid) if rid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -2941,10 +2958,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # {"report_id":58,"title":…,"page_count":1,"url":…}) 종전 파서는 report.id 만 봤다.
         # 그래서 저장은 실제로 되는데 id 를 못 읽어 "저장됨" 안내가 한 번도 붙지 않았고,
         # 이어붙이기·잡 원장도 대상 보고서를 알 수 없었다. 세 모양을 다 받는다.
-        _m = made or {}
-        rid = (((_m.get("report") or {}).get("id") if isinstance(_m.get("report"), dict) else None)
-               or _m.get("report_id") or _m.get("id")
-               or (_append_to if (_do_save and _append_to) else None))
+        rid = _ra_report_id(made) or (_append_to if (_do_save and _append_to) else None)
         if rid:
             report_note = (f"\n\n📄 Report Archive 보고서 #{rid} 에 페이지로 이어붙임."
                            if _append_to else
@@ -3125,7 +3139,11 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
             "template_id": "deliberation", "template_version": 1,
             "title": title, "blocks": _ra_blocks(blocks),
             "tags": ["심의", "conversation-report"]}))
-        rid = ((made or {}).get("report") or {}).get("id")
+        # _call 은 도구 예외를 "(tool … error: …)" **문자열**로 삼켜 반환하므로 아래 except 가
+        # 안 걸린다. 진짜 도구 오류와 파싱 결손이 사용자에게 똑같이 보이지 않게 여기서 가른다.
+        if isinstance(made, str) and not _tool_text_ok(made):
+            print(f"[report] RA 저장 도구 오류: {made.strip()[:200]}")
+        rid = _ra_report_id(made)
     except Exception as exc:  # noqa: BLE001 — RA 미가용(cae00 등)은 비치명적 폴백
         print(f"[report-save] create_report_draft failed: {exc!r}")
     text = (f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
