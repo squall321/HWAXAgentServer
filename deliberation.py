@@ -1129,10 +1129,17 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
               f"{fmt}")
 
     def problem_of(x):
+        """재시도 지적 — 요구 키는 **전부** 채워져야 한다(AND)."""
+        # ⚠ 예전엔 any 였다. 그러면 심화 라운드의 ("deepen","rebut") 중 하나만 채워도 통과해
+        # '반박 최소 1개' 계약이 코드에서 검사되지 않았다(프롬프트만 요구하고 코드는 안 봤다).
+        # rebut_quote 가 켜져 인용 검증기가 붙었을 때만 우연히 막히던 구멍이고, JS 정본
+        # hwax-deliberate.js 는 네 키를 전부 강제한다 — 두 엔진이 동형이어야 한다는 계약과도 어긋났다.
         if not isinstance(x, dict):
             return "직전 출력이 유효한 JSON 객체가 아니었습니다."
-        if required and not any(x.get(k) not in (None, "", []) for k in required):
-            return f"직전 JSON 에 요구 키({', '.join(required)})의 내용이 비어 있었습니다."
+        if required:
+            missing = [k for k in required if x.get(k) in (None, "", [])]
+            if missing:
+                return f"직전 JSON 에 요구 키({', '.join(missing)})의 내용이 비어 있었습니다."
         return validator(x) if validator else None
 
     txt = await _llm_text(llm, sysmsg, prompt)
@@ -1150,6 +1157,8 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
         # 5~7천자 논증이 800자로 무표식 붕괴해 회의록·다음 라운드가 완결 발언으로 읽었다).
         d = {"say": "(구조화 실패 — 원문 강등, 일부만 보존) " + str(txt)[:2000]}
     elif required and not any(d.get(k) not in (None, "", []) for k in required):
+        # ⚠ 이쪽은 any 가 맞다. 여기는 '구조화가 통째로 실패했다' 를 구제하는 자리이고,
+        # all 로 올리면 부분 성공한 dict 의 say 에까지 표식이 붙어 정상 발언을 오염시킨다.
         # 요구 키 없는 dict({"response":…} 등) — 원문을 say 로 보존해 다음 라운드에 전달
         d = {**d, "say": "(요구 키 누락 — 원문 보존) " + str(d.get("say") or txt)[:2000]}
     d["persona"] = persona["key"]
@@ -2665,7 +2674,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                       if opts.cross_exam and len(prev_list) >= 2 else f"위 [{_dr(prev_no)}라운드 전원] 텍스트")
             validator_fn = ((lambda p, _c=_ctx, _w=_where: _quote_validator(_c(p)[1], _w))
                             if opts.rebut_quote else None)
-            required, render = ("deepen", "rebut", "concede"), 2
+            # concede 를 요구에서 뺀다 — 이제 AND 판정이라, 넣어 두면 양보할 게 없는 좌석이
+            # 수용을 **지어내야** 한다. 계약이 강제하는 것은 "반박 최소 1개" 이지 "수용 최소 1개"가
+            # 아니다(프롬프트 문구도 그렇다). concede 는 낼 게 있으면 내는 선택 항으로 남는다.
+            required, render = ("deepen", "rebut"), 2
 
         # 자유 조회 — 발언 전에 각 전문가가 직접 데이터를 조회한다. 수렴 라운드는 새 조회 없이
         # 기존 논의를 정리하는 단계라 건너뛴다. 병렬 실행하되 완료 순서대로 조회 이력을 흘린다 —
