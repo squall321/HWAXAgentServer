@@ -78,6 +78,10 @@ def test_agent_for_caches_by_group_set(monkeypatch):
         # 실제 app.state 가 기동 시(app.py:257·261) 항상 갖는 칸 — 가짜 state 에도 그대로 둔다.
         tool_degraded={},
         tool_load_error={},
+        # 게이트웨이 불통 때 직전 성공 도구로 답하는 폴백 재료(app.py 가 1491 에서 쓰고 1526 에서 읽는다).
+        # 이 칸이 빠져 있어 2026-09-03 부터 이 테스트가 상시 빨간색이었고, 그동안 캐시 키 격리
+        # 불변식이 검증되지 않았다 — 그 불변식은 '키에서 신원을 빼면 조용히 남의 데이터가 보인다' 다.
+        tool_snapshot={},
     )
     fake = pytypes.SimpleNamespace(state=state)
 
