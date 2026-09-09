@@ -1346,8 +1346,17 @@ def _item_text(x) -> str:
 
 def _norm_stance(s) -> str:
     """스탠스를 canonical 라벨로 — 부정 표현('동의하지 않습니다' 등)이 동의로 집계되지 않게
-    부정 패턴을 먼저 매칭하고, 판별 불가면 조건부로(거짓 만장일치 방지)."""
-    s = str(s or "")
+    부정 패턴을 먼저 매칭한다.
+
+    ⚠ **비어 있는 입력은 '미표명' 이다.** 예전엔 이것도 '조건부 동의' 로 떨어뜨렸는데,
+    stance 는 요구 키가 아니라 안 내도 재시도 없이 통과하고, 구조화 실패로 강등된 발언에는
+    stance 자체가 없다. 그래서 **한 마디도 못 한 좌석이 '조건부 동의' 로 집계되고 회의록에
+    그 칩이 붙었다.** 의장 프롬프트는 "명시하지 않은 좌석은 '미표명'으로 기록" 하라고 하는데
+    집계에는 그 칸이 없어 본문과 배지가 어긋났다.
+    내용은 있는데 판별이 안 되는 문자열은 종전대로 '조건부 동의' 다(그쪽은 의도된 보수 폴백)."""
+    s = str(s or "").strip()
+    if not s or re.search(r"^(미표명|기권|유보|해당\s*없음|없음|n/?a|abstain|none)$", s, re.IGNORECASE):
+        return "미표명"
     if re.search(r"반대|않|부동의|disagre|oppos|반론", s, re.IGNORECASE):
         return "반대"
     if re.search(r"조건|condition|partial|단서", s, re.IGNORECASE):
@@ -2979,10 +2988,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         print(f"[deliberation] create_report_draft failed: {exc!r}")
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
-    _KEY = {"동의": "agree", "조건부 동의": "conditional", "반대": "oppose"}
-    tally = {"agree": 0, "conditional": 0, "oppose": 0, "total": len(last_list)}
+    # ⚠ 분모는 **착석 수**다. 예전엔 len(last_list) — 즉 마지막 라운드 **응답자 수** 였고,
+    # _round_live 가 실패 좌석을 except…continue 로 삼키므로 5석 중 3석만 답해도
+    # "만장일치 3/3" 이 나갔다. 두 좌석의 도메인 판단이 통째로 빠진 채로 그렇게 보였다.
+    _KEY = {"동의": "agree", "조건부 동의": "conditional", "반대": "oppose", "미표명": "abstain"}
+    _seated = len(personas)
+    tally = {"agree": 0, "conditional": 0, "oppose": 0, "abstain": 0,
+             "responded": len(last_list), "total": _seated}
     for o in last_list:
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
+    # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
+    tally["abstain"] += max(0, _seated - len(last_list))
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
     if opts.search_sources:
@@ -3003,7 +3019,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         out["decision"] = decision
     yield _delib("decision", text=decision + report_note)
     yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
-                 tally=tally, unanimous=(tally["agree"] == tally["total"] and tally["total"] > 0))
+                 # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
+                 # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
+                 # 그대로 좌석 유실까지 막는다(응답 못 한 좌석은 abstain 으로 들어간다).
+                 tally=tally, unanimous=(tally["total"] > 0
+                                         and tally["agree"] == tally["total"]
+                                         and tally["abstain"] == 0))
 
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
