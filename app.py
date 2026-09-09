@@ -2559,6 +2559,12 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     # recommended = 상위 N(기본 선택), candidates = 관련 전문가 목록(수동 추가 기본 노출·검색 우선).
     cand_k = int(os.environ.get("EXPERT_CANDIDATE_TOP_K", "40"))
 
+    # 원 응답 보관 — relevant_tools 는 좌석 정규화(_norm)에서 버려지는 필드라 여기 담아 둔다.
+    # ⚠ 예전엔 아래에서 `recd` 를 그냥 참조했는데, 그건 _rank 의 **지역변수**라 바깥에서는
+    # 이름이 없다. 매 호출 NameError 가 나고 try/except 가 삼켜 expert_tools 가 **항상 비었다**
+    # (실측 재현 2026-09-09 — 전문가 선정 화면의 '전문가가 쓰는 도구' 칸이 늘 0개였다).
+    raw_by_q: dict[str, dict] = {}
+
     async def _rank(q: str, top_k: int) -> list[dict]:
         """한 질의의 추천 결과를 정규화해 돌려준다. 실패는 빈 목록(호출부가 계속 진행)."""
         try:
@@ -2566,6 +2572,8 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
             print(f"[experts] recommend failed (q={q[:40]!r}): {exc!r}")
             return []
+        if isinstance(recd, dict):
+            raw_by_q[q] = recd
         items = recd if isinstance(recd, list) else (
             (recd or {}).get("recommendations") or (recd or {}).get("agents") or (recd or {}).get("data") or [])
         out = []
@@ -2662,7 +2670,9 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     # 전문가가 쓰는 도구 — AIDH recommend_agents 가 주는 relevant_tools(compatible_agents).
     expert_tools = []
     try:
-        for rt in ((recd or {}).get("relevant_tools") or []) if isinstance(recd, dict) else []:
+        # 화두 질의의 응답을 쓴다 — 축 질의는 좁은 명사구라 도구 연관도가 화두보다 낮다.
+        _base_recd = raw_by_q.get(req.message) or {}
+        for rt in (_base_recd.get("relevant_tools") or []):
             rt = _first_dict(rt)
             nm = rt.get("name")
             if nm:
