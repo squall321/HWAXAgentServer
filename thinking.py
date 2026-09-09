@@ -21,6 +21,7 @@ import json
 import os
 
 from deliberation import (
+    _agent_search_hits,
     _call,
     _first_dict,
     _llm_text,
@@ -50,11 +51,14 @@ SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "180"))
 # 위임 명사구 상한(좌석당).
 REFER_MAX = 3
 
-# ⚠ mode 는 semantic 고정이다. 게이트웨이 실측(2026-09-08) — semantic 0.1초 · tag 1.0초 ·
-# hybrid 102.5초 · fts 221.4초. hybrid 가 느린 것은 fts 를 포함하기 때문이고, fts 는
-# record_sections.content_text 의 to_tsvector 식에 GIN 인덱스가 없어 862,910행 순차
-# 스캔이 나기 때문이다. 좌석마다 부르는 신호라 이 차이가 기능의 생사를 가른다.
-_SEARCH_MODE = "semantic"
+# 검색 모드. 2026-09-09 에 AIDataHub 를 고치기 전에는 hybrid 가 102초라 semantic 을 박아
+# 두었다(fts 는 221초). 원인 둘을 고친 뒤 hybrid 0.5초 · fts 0.3초가 됐고, 결과도 좋아졌다
+# — 범위를 파이썬이 아니라 SQL 로 걸게 되면서 hybrid 히트가 3건에서 6건으로 늘었다
+# (전에는 전역 상위를 뽑고 나서 좌석으로 걸러 FTS 절반이 아무것도 기여하지 못했다).
+# 그래도 느릴 수 있다고 가정한다 — _agent_search_hits 가 타임아웃·semantic 폴백을 맡는다.
+_SEARCH_MODE = os.environ.get("THINK_SEARCH_MODE", "hybrid")
+# 예심은 좌석 수만큼 병렬로 도는 단계라 개별 상한을 짧게 잡는다(심의 기본값보다 짧다).
+SCREEN_TIMEOUT_S = float(os.environ.get("THINK_SCREEN_TIMEOUT_S", "12"))
 
 _TRIGGERS = ("/띵킹", "/생각", "/thinking", "/think")
 
@@ -140,18 +144,12 @@ async def _summon(tools: dict, q: str, top_k: int, exclude: set) -> list[dict]:
 # ── (1) 예심 ──────────────────────────────────────────────────────────────────
 async def _screen_one(tools: dict, seat: dict, q: str) -> dict:
     """그 좌석의 **실제 바인딩 문서** 위에서 검색해 근거를 확보하고 예심 통과 여부를 정한다."""
-    hits, top, refused = [], None, False
-    try:
-        d = _as_dict(await _call(tools, "agent_search",
-                                 {"agent_type": seat["key"], "q": q, "mode": _SEARCH_MODE}))
-        refused = bool(d.get("refused"))
-        raw_hits = d.get("hits") or []
-        if isinstance(raw_hits, list):
-            hits = raw_hits
-        scores = [h.get("score") for h in hits if isinstance(h, dict) and h.get("score") is not None]
-        top = max(scores) if scores else None
-    except Exception as exc:  # noqa: BLE001 — 검색 실패한 좌석은 근거 없이 본심으로 보낸다
-        print(f"[thinking] agent_search 실패({seat['key']}): {exc!r}")
+    hits, note = await _agent_search_hits(tools, seat["key"], q, mode=_SEARCH_MODE,
+                                          timeout_s=SCREEN_TIMEOUT_S)
+    if note:
+        print(f"[thinking] 예심 검색 강등({seat['key']}): {note}")
+    scores = [h.get("score") for h in hits if isinstance(h, dict) and h.get("score") is not None]
+    top = max(scores) if scores else None
 
     # 탈락은 AND 다. 한쪽만으로 자르지 않는다 —
     #  · hits>0 이고 desc_match≈0  : 어휘는 안 겹치는데 내용이 걸린 좌석(현장 용어 vs 표준 용어)
@@ -159,10 +157,12 @@ async def _screen_one(tools: dict, seat: dict, q: str) -> dict:
     # 둘 다 값이 있는 판정이라 살린다. 자르는 것은 근거도 어휘도 없을 때뿐이다.
     n = len(hits)
     passed = bool(n) or seat["desc_match"] >= DESC_FLOOR
-    if passed and refused and not n and seat["desc_match"] < DESC_FLOOR:
-        passed = False
+    if note and not n:
+        # 검색이 실패한 좌석을 '근거 없음' 으로 자르지 않는다 — 못 물어본 것과 없는 것은 다르다.
+        passed = True
     reason = ("근거 %d건" % n) if n else (
         f"보유 근거 0건 · 어휘 일치 {seat['desc_match']:.2f}"
+        + (f" · 검색 강등({note})" if note else "")
         + ("" if passed else " — 근거도 어휘도 없음"))
 
     lines, total, seen = [], 0, set()
@@ -175,7 +175,7 @@ async def _screen_one(tools: dict, seat: dict, q: str) -> dict:
         seen.add(ln)
         lines.append(ln)
         total += len(ln)
-    return {**seat, "hits": n, "top": top, "refused": refused,
+    return {**seat, "hits": n, "top": top, "search_note": note,
             "passed": passed, "reason": reason, "knowledge": "\n".join(lines)}
 
 

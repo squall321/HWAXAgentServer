@@ -48,6 +48,7 @@ from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
     _call,
+    _agent_search_hits,
     _tool_schema_brief,
     _env_float,
     _env_int,
@@ -1688,11 +1689,15 @@ async def _persona_knowledge(app: FastAPI, groups: list[str], agent_type: str, q
         tools = await _knowledge_tools(app, groups)
         if "agent_search" not in tools:
             return ""
-        raw = await _call(tools, "agent_search",
-                          {"agent_type": agent_type, "q": query, "mode": "hybrid"})
-        d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
-        hits = d.get("hits") if isinstance(d, dict) else None
-        if not hits or (isinstance(d, dict) and d.get("refused")):
+        # 타임아웃·강등 판정은 공용 헬퍼에 맡긴다 — _call 은 예외를 문자열로 삼켜서
+        # '지식이 없다' 와 '못 물어봤다' 가 같은 빈 결과로 보인다(그 둘은 다른 사실이다).
+        hits, note = await _agent_search_hits(tools, agent_type, query)
+        if note:
+            print(f"[agent] 지식카드 강등({agent_type}): {note}")
+            _persona_knowledge.last_note = note   # 호출부가 사용자에게 사유를 보이게
+        else:
+            _persona_knowledge.last_note = ""
+        if not hits:
             return ""
         lines, total, seen = [], 0, set()
         for h in hits:
@@ -1707,7 +1712,12 @@ async def _persona_knowledge(app: FastAPI, groups: list[str], agent_type: str, q
         return "\n".join(lines)
     except Exception as exc:  # noqa: BLE001 — 지식 검색 실패는 비치명(페르소나만으로 계속)
         print(f"[agent] 지식카드 검색 실패({agent_type}): {exc!r}")
+        _persona_knowledge.last_note = f"조회 실패({type(exc).__name__})"
         return ""
+
+
+# 직전 호출의 강등 사유. 챗 스트림이 읽어 사용자에게 보인다 — 무음 강등을 만들지 않는다.
+_persona_knowledge.last_note = ""
 
 
 # 모델마다 호출 JSON 모양이 다르다. qwen/hermes 는 {"name":…,"arguments":…}, Anthropic 계열은
@@ -1958,10 +1968,22 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                f"더 필요하면 agent_search(\"{agent_key}\", 구체적 질의) 로 추가 조회하라.")
                 yield _sse("status", {"step": f"지식카드 {len(know):,}자 주입", "tool": None})
             else:
-                # 0히트를 침묵하면 모델이 일반 지식으로 메우고 사용자는 그것을 사내 지식으로 읽는다.
-                sys_prompt += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
-                               f"일반 지식으로 답하되 '사내 지식카드에는 관련 내용이 없다'고 먼저 밝혀라.")
-                yield _sse("status", {"step": "연관 지식카드 없음 — 일반 지식으로 답변", "tool": None})
+                # '없다' 와 '못 물어봤다' 를 구분해 말한다. 검색이 늦거나 죽어서 못 받은 것을
+                # '보유 지식 없음' 으로 말하면, 그 전문가가 아는 게 없다는 거짓이 사용자에게 간다.
+                _note = getattr(_persona_knowledge, "last_note", "")
+                if _note:
+                    sys_prompt += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
+                                   f"이번 답변에는 사내 발췌가 없다. 일반 지식으로 답하되 "
+                                   f"'사내 지식카드를 조회하지 못했다(없다는 뜻이 아니다)'고 먼저 밝혀라.")
+                    yield _sse("warning", {"code": "knowledge_degraded",
+                                           "message": f"{agent_key} 지식카드를 조회하지 못했습니다 — {_note}. "
+                                                      "보유 지식이 없다는 뜻이 아닙니다."})
+                    yield _sse("status", {"step": f"지식카드 조회 실패 — {_note}", "tool": None})
+                else:
+                    # 0히트를 침묵하면 모델이 일반 지식으로 메우고 사용자는 그것을 사내 지식으로 읽는다.
+                    sys_prompt += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
+                                   f"일반 지식으로 답하되 '사내 지식카드에는 관련 내용이 없다'고 먼저 밝혀라.")
+                    yield _sse("status", {"step": "연관 지식카드 없음 — 일반 지식으로 답변", "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에

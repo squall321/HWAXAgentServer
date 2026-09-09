@@ -1422,6 +1422,59 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
 _PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 
 
+# ── 지식카드 조회 — 느린 것을 상정한다 ──────────────────────────────────────────
+# 이 조회는 좌석마다 부르는 네트워크 너머 도구 호출이다. 세 가지를 가정하고 쓴다.
+#  ① 느릴 수 있다 — hybrid 가 102초였다(2026-09-08 실측). GIN 인덱스와 범위 SQL 화로
+#    고쳤지만, 코퍼스가 커지거나 인덱스가 빠진 박스에서 다시 느려질 수 있다.
+#  ② 실패가 성공처럼 생겼다 — _call 은 예외를 "(tool X error: …)" **문자열**로 삼키므로
+#    타임아웃과 정상 응답이 같은 타입으로 돌아온다. 문자열을 봐야 구분된다.
+#  ③ 비었다는 것과 못 물어봤다는 것은 다르다 — 섞으면 "이 전문가는 아는 게 없다"로
+#    오독된다. 그래서 사유를 함께 돌려주고 호출부가 그것을 사용자에게 보인다.
+KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 20.0)
+# hybrid 가 늦으면 semantic 으로 한 번 되묻는다. hybrid 가 느린 것이지 semantic 은 0.1초다.
+KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
+
+
+async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
+                             mode: str = "hybrid",
+                             timeout_s: float | None = None) -> tuple[list, str]:
+    """(hits, note) — note 는 강등·실패 사유이고 빈 문자열이면 정상이다.
+
+    타임아웃이면 `KNOWLEDGE_FALLBACK_MODE` 로 한 번 되묻는다. 그것도 실패하면 빈 목록과
+    사유를 돌려준다 — **조용히 0건으로 만들지 않는다.** 이 함수는 심의·챗·띵킹이 함께 쓴다.
+    """
+    limit = KNOWLEDGE_TIMEOUT_S if timeout_s is None else timeout_s
+
+    async def _once(m: str) -> tuple[list | None, str]:
+        try:
+            raw = await asyncio.wait_for(
+                _call(tools, "agent_search", {"agent_type": agent_type, "q": q, "mode": m}), limit)
+        except asyncio.TimeoutError:
+            return None, f"{m} 검색 {limit:.0f}초 초과"
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{m} 검색 실패({type(exc).__name__})"
+        if isinstance(raw, str) and not _tool_text_ok(raw):
+            return None, f"{m} 검색 오류({raw.strip()[:80]})"
+        d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
+        if not isinstance(d, dict):
+            return None, f"{m} 응답을 해석하지 못함"
+        if d.get("refused"):
+            return [], ""          # 거절은 정상 판정이다 — 강등이 아니다.
+        hits = d.get("hits")
+        return (hits if isinstance(hits, list) else []), ""
+
+    hits, note = await _once(mode)
+    if hits is not None:
+        return hits, note
+    fb = KNOWLEDGE_FALLBACK_MODE
+    if not fb or fb == mode:
+        return [], note
+    hits2, note2 = await _once(fb)
+    if hits2 is None:
+        return [], f"{note}; 폴백도 실패({note2})"
+    return hits2, f"{note} → {fb} 로 되물음"
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -2391,34 +2444,42 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             return f"• [{head}] {str(x).strip()}"[:700]
 
         async def _kn_one(p):
-            try:
-                raw = await _call(tools, "agent_search",
-                                  {"agent_type": p["key"], "q": question, "mode": "hybrid"})
-                d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
-                hits = (d or {}).get("hits") if isinstance(d, dict) else None
-                if not hits or (isinstance(d, dict) and d.get("refused")):
-                    return p["key"], ""
-                lines, total, seen = [], 0, set()
-                for h in hits:
-                    ln = _hit_line(h)
-                    if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
-                        continue
-                    if total + len(ln) > _kb_budget:
-                        break
-                    seen.add(ln); lines.append(ln); total += len(ln)
-                return p["key"], "\n".join(lines)
-            except Exception as exc:  # noqa: BLE001 — 지식 검색 실패는 비치명(그 전문가만 미주입)
-                print(f"[deliberation] 지식카드 검색 실패({p.get('key')}): {exc!r}")
-                return p["key"], ""
+            # 타임아웃·강등은 _agent_search_hits 가 판정한다. 여기서 조용히 0건으로 만들면
+            # '지식이 없는 전문가' 와 '못 물어본 전문가' 가 구분되지 않는다.
+            hits, note = await _agent_search_hits(tools, p["key"], question)
+            if not hits:
+                return p["key"], "", note
+            lines, total, seen = [], 0, set()
+            for h in hits:
+                ln = _hit_line(h)
+                if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
+                    continue
+                if total + len(ln) > _kb_budget:
+                    break
+                seen.add(ln); lines.append(ln); total += len(ln)
+            return p["key"], "\n".join(lines), note
 
         yield _sse("status", {"step": "페르소나별 지식카드 검색(주제 연관 발췌)", "tool": "agent_search"})
-        for _k, _blk in await asyncio.gather(*[_kn_one(p) for p in personas]):
+        _kn_notes: list[str] = []
+        for _k, _blk, _note in await asyncio.gather(*[_kn_one(p) for p in personas]):
             if _blk:
                 knowledge_by_key[_k] = _blk
                 ev_count["knowledge"] += 1
                 yield _delib("evidence", source=f"{_k} · 지식카드", text=_blk[:400], included=True)
+            if _note:
+                _kn_notes.append(f"{_k}: {_note}")
+                print(f"[deliberation] 지식카드 강등({_k}): {_note}")
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(personas)}명 "
                                       f"관련 지식 확보", "tool": None})
+        if _kn_notes:
+            # 무음 강등 금지 — 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
+            yield _sse("warning", {"code": "knowledge_degraded",
+                                   "message": ("일부 전문가의 지식카드를 시간 안에 받지 못했습니다 — "
+                                               f"{len(_kn_notes)}/{len(personas)}명. "
+                                               "그 좌석은 지식 발췌 없이 발언합니다. "
+                                               + "; ".join(_kn_notes[:4]))})
+            yield _delib("evidence", source="지식카드 조회 강등",
+                         text="\n".join(f"- {x}" for x in _kn_notes[:12]), included=False)
 
     # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
     # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
