@@ -1,4 +1,4 @@
-# 띵킹 모드 — 질문 하나를 전문가 풀에 돌려 답할 수 있는 좌석만 각자 답하게 하고, 못 하는 좌석은 넘길 곳을 지목하게 한다(회의 없음, 심의 엔진 미사용)
+# Thinking 모드 — 질문 하나를 전문가 풀에 돌려 답할 수 있는 좌석만 각자 답하게 하고, 못 하는 좌석은 넘길 곳을 지목하게 한다(회의 없음, 심의 엔진 미사용)
 """회의가 아니라 **분진(分診)** 이다.
 
 심의(`deliberation.py`)는 좌석들을 한자리에 앉혀 라운드로 수렴시킨다. 이 모듈은 그러지
@@ -60,6 +60,8 @@ _SEARCH_MODE = os.environ.get("THINK_SEARCH_MODE", "hybrid")
 # 예심은 좌석 수만큼 병렬로 도는 단계라 개별 상한을 짧게 잡는다(심의 기본값보다 짧다).
 SCREEN_TIMEOUT_S = float(os.environ.get("THINK_SCREEN_TIMEOUT_S", "12"))
 
+# 화면·산출물의 이름은 **영문 "Thinking"** 이다(한글 음차 "띵킹" 은 쓰지 않는다).
+# 다만 슬래시 트리거는 이미 쓰던 사람이 있으므로 "/띵킹" 을 계속 받는다.
 _TRIGGERS = ("/띵킹", "/생각", "/thinking", "/think")
 
 
@@ -258,7 +260,7 @@ async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore) -> 
 # ── (4) 종합 — 코드가 조립한다. LLM 을 부르지 않는다 ──────────────────────────
 def _summary_text(question: str, answered: list, passed: list, screened: list,
                   errored: list, capped: list, hops: int) -> str:
-    out = [f"## 띵킹 — {len(answered)}명 답변 · {len(passed)}명 기권"]
+    out = [f"## Thinking — {len(answered)}명 답변 · {len(passed)}명 기권"]
     if not answered:
         out.append("")
         # 기권과 오류를 섞어 말하지 않는다. '아무도 답할 수 없다' 는 판정 결과이고
@@ -382,8 +384,13 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
         try:
             for fut in asyncio.as_completed(tasks):
                 r = await fut
+                # ⚠ error 사유를 함께 싣는다. 예전엔 verdict 만 보내서 화면이
+                #   "응답 실패(기권 아님)" 만 띄우고 **왜인지 말하지 못했다** — 사용자에겐
+                #   그 좌석이 이유 없이 끊긴 것으로 보인다(타임초과인지 형식 실패인지가
+                #   다음 행동을 가른다: 전자는 재시도, 후자는 질문을 바꿔야 한다).
                 yield _think("verdict", key=r["key"], verdict=r["verdict"],
-                             scope=r.get("scope") or "", refer=r.get("refer") or [])
+                             scope=r.get("scope") or "", refer=r.get("refer") or [],
+                             error=r.get("error") or "")
                 if r["verdict"] == "answer":
                     answered.append(r)
                     yield _think("answer", key=r["key"], name=r["name"], domain=r["domain"],
