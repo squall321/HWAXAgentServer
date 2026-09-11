@@ -351,6 +351,45 @@ class ChatRequest(BaseModel):
     # delib_opts 가 아니라 top-level 인 이유: 이건 매 턴 켜져 있어야 하는 모드인데, 프론트의
     # 슬래시 접두사는 첫 발화에만 붙어(ChatContext.applyPrefix) 둘째 턴부터 조용히 꺼진다.
     thinking: bool = False
+    # 요청 시점 권한(feat:·plat:) — 포털이 원장으로 계산해 준다(HWAXPortal docs/access-control).
+    # 심의·Thinking 트리거 판정은 여기 있으므로 포털이 아니라 이쪽이 막는다. None 은 권한을 모르는
+    # 옛 호출이라 막지 않는다(포털은 늘 보낸다) — '안 보냄'과 '권한 없음'을 구분해야 해서다.
+    entitlements: list[str] | None = None
+
+
+# 기능 권한 이름(사람용) — 포털 access.yaml 의 label 과 같다.
+_FEATURE_LABEL = {"feat:deliberation": "전문가 심의", "feat:thinking": "Thinking",
+                  "feat:expert-chat": "전문가와 대화"}
+
+
+def _denied_feature(req: "ChatRequest") -> str | None:
+    """이 요청이 쓰려는 기능 중 권한이 없는 것. 트리거 순서는 chat() 과 같다."""
+    if req.entitlements is None:
+        return None
+    have = set(req.entitlements)
+    m = req.message
+    if is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
+        need = "feat:deliberation"
+    elif is_agent_search(m):
+        need = "feat:expert-chat"
+    elif is_thinking(m) or req.thinking:
+        need = "feat:thinking"
+    else:
+        need = None
+    if need and need not in have:
+        return need
+    if req.pinned_agent and "feat:expert-chat" not in have:
+        return "feat:expert-chat"
+    return None
+
+
+async def _deny_stream(key: str) -> AsyncIterator[bytes]:
+    """권한이 없을 때의 답 — 오류 배너가 아니라 대화에 남는 한 줄로 알린다(무엇이 없고 어디서 청하나)."""
+    msg = (f"'{_FEATURE_LABEL.get(key, key)}' 을(를) 쓸 권한이 없습니다. "
+           "상단 메뉴의 내 권한에서 요청하면 관리자가 승인합니다.")
+    yield _sse("token", {"delta": msg})
+    yield _sse("result", {"type": "text", "content": msg})
+    yield _sse("done", {})
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -2479,6 +2518,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
 async def chat(req: ChatRequest) -> StreamingResponse:
     # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
     # 정본은 역량 있는 Claude(개인 Claude via MCP); 이건 GLM 연결 시 포털 챗으로도 되게 하는 진입점.
+    denied = _denied_feature(req)
+    if denied:
+        # 메뉴를 숨겨도 슬래시 명령은 손으로 칠 수 있다 — 트리거를 아는 이쪽이 마지막으로 막는다.
+        return StreamingResponse(_deny_stream(denied), media_type="text/event-stream", headers=SSE_HEADERS)
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
