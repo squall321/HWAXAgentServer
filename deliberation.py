@@ -1079,6 +1079,40 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
             "위에 없는 항목은 미보유로 보되, 조회되지 않은 것과 실제로 없는 것을 구분해 쓰십시오.")
 
 
+def _parse_json_multi(text) -> list:
+    """AIDH list 반환 툴은 원소별 content 로 직렬화돼 _call 이 이어붙인다 — 연결된 JSON
+    객체들을 모두 추출해 리스트로. (단일 배열/객체도 지원.)
+
+    ⚠ 목록 도구 결과에 _parse_json 을 쓰지 마라. 그건 LLM 출력용이라 **마지막** 객체 하나만
+    취한다 — SignalForge query_voc 5건이 `{…}{…}` 로 이어져 와서 VOC 환기가 0건을 봤다
+    (2026-09-11 실측, _defect_briefing). app.py 에만 있던 것을 여기로 옮겨 양쪽이 같이 쓴다."""
+    if isinstance(text, list):
+        return text
+    s = str(text or "").strip()
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, list) else [v]
+    except Exception:
+        pass
+    dec = json.JSONDecoder()
+    out: list = []
+    i = 0
+    while i < len(s):
+        while i < len(s) and s[i] not in "{[":
+            i += 1
+        if i >= len(s):
+            break
+        try:
+            o, end = dec.raw_decode(s, i)
+            out.append(o)
+            i = end
+        except Exception:
+            i += 1
+    return out
+
+
 def _first_dict(x):
     """AIDataHub 는 list 반환 툴을 원소별 content 로 직렬화한다 — list면 첫 dict, dict면 자신, 아니면 {}."""
     if isinstance(x, dict):
@@ -2060,11 +2094,13 @@ async def _defect_briefing(tools: dict, llm, question: str):
     if products:  # 경보 제품별 이슈 카테고리
         used.append("get_top_issues")
         for p in products:
-            top = _first_dict(_parse_json(await _call(
-                tools, "get_top_issues", {"product_code": p, "period_days": 7, "top_n": 5})))
-            issues = top.get("issues") or top.get("top_issues") or top.get("data") or []
-            if not isinstance(issues, list):
-                issues = []
+            # 목록 도구 — 이슈마다 블록이 따로 온다. _parse_json 은 마지막 하나만 읽어 0건이었다.
+            issues = [x for x in _parse_json_multi(await _call(
+                tools, "get_top_issues", {"product_code": p, "period_days": 7, "top_n": 5})) if isinstance(x, dict)]
+            if len(issues) == 1:   # 래핑 응답({issues:[…]}) 형태도 받는다
+                _w = issues[0].get("issues") or issues[0].get("top_issues") or issues[0].get("data")
+                if isinstance(_w, list):
+                    issues = _w
             names = [str((_first_dict(i)).get("category") or (_first_dict(i)).get("issue") or i)[:40]
                      for i in issues[:5] if i]
             if names:
@@ -2085,10 +2121,10 @@ async def _defect_briefing(tools: dict, llm, question: str):
     if isinstance(raw_voc, str) and not _tool_text_ok(raw_voc):
         degraded = True
         raw_voc = None
-    voc = _parse_json(raw_voc)
-    voc_items = voc if isinstance(voc, list) else (_first_dict(voc).get("results") or _first_dict(voc).get("data") or [])
-    if not isinstance(voc_items, list):
-        voc_items = []
+    # 목록 도구라 원소별 블록이 이어져 온다 — _parse_json(마지막 객체 하나)으로 읽으면 0건이다.
+    voc_items = [x for x in _parse_json_multi(raw_voc) if isinstance(x, dict)]
+    if len(voc_items) == 1 and isinstance(voc_items[0].get("results") or voc_items[0].get("data"), list):
+        voc_items = voc_items[0].get("results") or voc_items[0].get("data")   # 래핑 응답 형태도 받는다
     for i, v in enumerate(voc_items[:5], 1):
         v = _first_dict(v)
         txt = (v.get("content_translated") or v.get("content") or "")[:200]

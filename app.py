@@ -54,6 +54,7 @@ from deliberation import (
     _env_int,
     _first_dict,
     _parse_json,
+    _parse_json_multi,
     _call,
     _llm_text,
     _tools_by_name,
@@ -2448,36 +2449,6 @@ class ExpertsRequest(BaseModel):
     # 대화 전체 — 좌석 추천을 화두 한 줄이 아니라 오간 맥락 위에서 하기 위한 것.
     # ⚠ 통째로 임베딩 질의에 넣지 않는다(아래 _seat_axes 주석 참조). 축을 뽑는 데만 쓴다.
     history: list[dict] = []
-
-
-def _parse_json_multi(text) -> list:
-    """AIDH list 반환 툴은 원소별 content 로 직렬화돼 _call 이 이어붙인다 — 연결된 JSON
-    객체들을 모두 추출해 리스트로. (단일 배열/객체도 지원.)"""
-    if isinstance(text, list):
-        return text
-    s = str(text or "").strip()
-    if not s:
-        return []
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, list) else [v]
-    except Exception:
-        pass
-    dec = json.JSONDecoder()
-    out: list = []
-    i = 0
-    while i < len(s):
-        while i < len(s) and s[i] not in "{[":
-            i += 1
-        if i >= len(s):
-            break
-        try:
-            o, end = dec.raw_decode(s, i)
-            out.append(o)
-            i = end
-        except Exception:
-            i += 1
-    return out
 
 
 # 대화에서 뽑을 도메인 축 개수. 축마다 recommend_agents 를 한 번씩 더 부르므로 지연과 맞바꾼다.
