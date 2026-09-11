@@ -3,6 +3,7 @@
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
 import json
+import math
 import os
 import re
 import asyncio
@@ -86,7 +87,15 @@ _EVIDENCE_PREPASS = _env_int("DELIB_EVIDENCE_PREPASS", 0)  # T1 정량 근거 �
 # 운영에서 한 번도 돌지 않았다. 끄려면 DELIB_REBUT_QUOTE=0.
 _REBUT_QUOTE = _env_int("DELIB_REBUT_QUOTE", 1)
 _PROSE_FIRST = _env_int("DELIB_PROSE_FIRST", 0)      # T3 산문 논증 후 JSON(형식 강제 완화)
-_CROSS_EXAM = _env_int("DELIB_CROSS_EXAM", 0)        # 2R 교차심문 — 지목 표적의 원본 전체에 반박
+# 2R 교차심문 — 지목 표적의 원본 전체에 반박. **기본 켜짐**.
+# 종전 기본값은 0 이었다. 끄면 좌석마다 직전 라운드 회의록 **전체**가 들어가서 라운드당
+# 프롬프트가 N² 로 자란다 — 실측 15석 라운드에서 회의록 143,205자 × 15석 = 2.1M자다.
+# (의장 프롬프트엔 _cap_ctx 클립이 있는데 좌석 프롬프트엔 없다.) 켜면 표적 원본 + 나머지
+# 한 줄이라 O(N) 이 되고, 표적이 지정돼 반박도 구체적이 된다. 끄려면 DELIB_CROSS_EXAM=0.
+_CROSS_EXAM = _env_int("DELIB_CROSS_EXAM", 1)
+# 좌석당 반박 표적 수 — 1명이면 반박 한 갈래로 끝나 교착이 안 드러난다. 늘릴수록 프롬프트가
+# 표적 수에 비례해 커진다(표적만 원본 전체이므로 O(N)은 유지).
+_CROSS_TARGETS = _env_int("DELIB_CROSS_TARGETS", 2)
 _ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주입(동조 붕괴 방어)
 _CHAIR_BESTOF = _env_int("DELIB_CHAIR_BESTOF", 1)    # 의장 후보 n개→심판 선택(1=끔, temp>0 필요)
 _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라운드·페르소나] 출처 태깅
@@ -1266,6 +1275,88 @@ def _quotable_corpus(ctx: str) -> list[str]:
             continue
     if not ok:
         return [str(ctx or "")]
+    return out
+
+
+_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+.\-]+|\d+(?:\.\d+)?[A-Za-z%°µΩ]*|[가-힣]{2,}")
+# 조사 꼬리 — 한국어는 교착어라 어절에 조사가 붙어 온다. 떼지 않으면 '크랙이'와 '크랙은'이
+# 서로 다른 용어가 되어, 같은 것을 논하는 두 좌석의 겹침이 0 으로 나온다(실측으로 잡았다).
+# 긴 것부터 매칭해야 '에서'가 '에'로 먼저 잘리지 않는다.
+_JOSA_RE = re.compile(
+    r"(?:으로서|으로써|에게서|이라고|으로는|에서는|에게는|라고|으로|에서|에게|한테|까지|부터|보다|"
+    r"처럼|마다|조차|밖에|이나|나마|들의|들이|들을|들은|들도|"
+    r"의|이|가|은|는|을|를|에|와|과|도|만|로|랑)+$")
+
+
+def _terms(s) -> set:
+    """발언에서 비교 가능한 용어만 뽑는다 — 영문 기술어·수치(+단위)·2자 이상 한글(조사 제거).
+
+    ⚠ 형태소 분석이 아니다. '신뢰도'가 '신뢰'로 깎이는 과대 제거가 일어나지만, 양쪽 발언에
+    **똑같이** 적용되므로 겹침 점수에는 해가 없다(오히려 '신뢰도'와 '신뢰성'이 붙어 준다).
+    여기서 필요한 건 언어학적 정확성이 아니라 좌우 대칭이다."""
+    out = set()
+    for t in _TERM_RE.findall(str(s or "")):
+        if "가" <= t[0] <= "힣":
+            stem = _JOSA_RE.sub("", t)
+            t = stem if len(stem) >= 2 else t
+        out.add(t.lower())
+    return out
+
+
+def _cross_targets(texts: dict, k: int) -> dict:
+    """좌석 → 교차심문 반박 표적 목록(관련도 상위 k).
+
+    종전에는 링 배정(`prev_keys[(i+1) % n]`)이라 **옆자리**가 표적이었다. 공평하지만
+    무관한 상대가 걸리면 반박이 "관점이 다르네요" 수준으로 떠 버린다. 직전 라운드 발언의
+    **용어 겹침**으로 고른다 — 라운드 내 IDF 로 가중해서, 전원이 쓰는 말('설계'·'해석')은
+    0점이 되고 두 좌석만 공유하는 말이 점수를 만든다.
+
+    ⚠ 임베딩은 쓰지 않는다. e5 는 무관한 문장끼리도 코사인 0.87~0.90 이라 한 라운드 안의
+      순위를 못 가른다(docs/gotchas.md). 그리고 라운드마다 네트워크 왕복이 늘어난다.
+
+    ⚠ 관련도만으로 고르면 **아무도 안 겨냥한 좌석**이 생긴다(인기 표적 쏠림). 그 좌석은
+      이번 라운드에 반박을 한 번도 안 받는데, 하필 반대도메인 좌석(F1)처럼 홀로 튀는 자리가
+      거기 걸리기 쉽다 — 가장 검증이 필요한 발언이 무사통과한다. 그래서 끝에 보정한다.
+      구멍을 메우다 새 구멍을 내지 않도록, **두 번 이상 겨냥된 표적의 칸만** 내준다.
+    """
+    keys = list(texts)
+    if len(keys) < 2:
+        return {kk: [] for kk in keys}
+    tset = {kk: _terms(texts[kk]) for kk in keys}
+    df: dict = {}
+    for s in tset.values():
+        for t in s:
+            df[t] = df.get(t, 0) + 1
+    n = len(keys)
+    ix = {kk: i for i, kk in enumerate(keys)}
+
+    def score(a, b):  # 공유 용어의 IDF 합 — 흔한 말은 0 에 수렴한다
+        return sum(math.log(n / df[t]) for t in (tset[a] & tset[b]))
+
+    out, cnt = {}, {kk: 0 for kk in keys}
+    for a in keys:
+        ranked = sorted((b for b in keys if b != a), key=lambda b: (-score(a, b), ix[b]))
+        out[a] = ranked[: max(1, k)]
+        for b in out[a]:
+            cnt[b] += 1
+    for b in keys:
+        if cnt[b]:
+            continue
+        cands = sorted((x for x in keys if x != b), key=lambda x: (-score(x, b), ix[x]))
+        # (1) 관련도 높은 순으로 훑어, **중복 지목된 표적**을 쥔 첫 좌석의 그 칸을 b 로 바꾼다.
+        #     중복분만 건드리므로 메우면서 다른 구멍을 내지 않고, 표적 수도 안 늘어난다.
+        for a in cands:
+            slot = next((i for i in range(len(out[a]) - 1, -1, -1) if cnt[out[a][i]] > 1), None)
+            if slot is not None:
+                cnt[out[a][slot]] -= 1
+                out[a][slot] = b
+                break
+        else:
+            # (2) 내줄 칸이 어디에도 없으면 한 명 더 맡긴다. 이때는 **가장 적게 맡은 좌석**부터 —
+            #     관련도만 보면 인기 좌석 한 명이 표적 4~5명을 떠안는다(15석 실측에서 실제로 그랬다).
+            a = min(cands, key=lambda x: (len(out[x]), -score(x, b), ix[x]))
+            out[a].append(b)
+        cnt[b] += 1
     return out
 
 
@@ -2687,30 +2778,49 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         else:  # deepen — 직전 라운드에 반박·심화. 교차심문(cross_exam)·인용계약(rebut_quote)은 직전 라운드 대상.
             prev_keys = [o["persona"] for o in prev_list]
             prev_by_key = {o["persona"]: o for o in prev_list}
+            # 표적 배정은 **라운드당 1회**다 — 좌석마다 다시 부르면 O(N²) 채점을 N 번 돈다.
+            _xexam = opts.cross_exam and len(prev_list) >= 2
+            cross_tg = (_cross_targets({k: _ser_kind(prev_by_key[k], prev_kind) for k in prev_keys},
+                                       _CROSS_TARGETS) if _xexam else {})
+            if _xexam:
+                yield _sse("status", {"step": "교차심문 표적 배정 — " + " / ".join(
+                    f"{k}→{'·'.join(v)}" for k, v in list(cross_tg.items())[:6])
+                    + (" …" if len(cross_tg) > 6 else ""), "tool": None})
 
             def _ctx(p, _pl=prev_list, _pk=prev_keys, _pbk=prev_by_key, _pt=prev_t,
-                     _pno=prev_no, _pkind=prev_kind):
+                     _pno=prev_no, _pkind=prev_kind, _tg=cross_tg, _on=_xexam):
                 # (컨텍스트, 인용 실재 검증 대상 문자열)
-                if not (opts.cross_exam and len(_pl) >= 2):
+                if not _on:
                     return f"[{_dr(_pno)}라운드 전원]\n{_pt}", _pt
-                tkey = (_pk[(_pk.index(p["key"]) + 1) % len(_pk)] if p["key"] in _pk else _pk[0])
-                tser = _ser_kind(_pbk[tkey], _pkind)
+                # 배정이 없는 좌석(신규 착석 등)은 자기 아닌 첫 좌석으로 폴백한다.
+                tkeys = _tg.get(p["key"]) or [k for k in _pk if k != p["key"]][:1]
+                blocks = "\n\n".join(f"— {tk} —\n{_ser_kind(_pbk[tk], _pkind)}" for tk in tkeys)
                 others = "\n".join(
                     f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('deepen') or o.get('lens'), 160)}"
-                    for o in _pl if o["persona"] != tkey)
-                ctx = (f"[당신의 지정 반박 표적: {tkey} — {_dr(_pno)}라운드 발언 전체]\n{tser}\n\n"
+                    for o in _pl if o["persona"] not in tkeys)
+                # 인용 실재 검증 대상 = **화면에 보여 준 전부**. 표적 둘 중 아무나 인용해도 통과해야
+                # 하고(하나만 넣으면 2번 표적 반박이 통째로 반려된다), 한 줄 입장도 상대가 실제로 한
+                # 말이라 인용 대상이다 — 빼면 "언급은 자유"라 해 놓고 그 인용만 반려하게 된다.
+                tser = "\n".join([_ser_kind(_pbk[tk], _pkind) for tk in tkeys] + [others])
+                ctx = (f"[당신의 지정 반박 표적 {len(tkeys)}명 — {_dr(_pno)}라운드 발언 전체]\n{blocks}\n\n"
                        f"[다른 전문가 한 줄 입장]\n{others}\n\n"
-                       f"표적({tkey})의 논증에서 특정 주장을 골라 반박하세요. 다른 전문가 언급은 자유.")
+                       f"표적({' , '.join(tkeys)}) **각각**의 논증에서 특정 주장을 골라 반박하세요"
+                       f"(표적당 최소 1개). 다른 전문가 언급은 자유.")
                 return ctx, tser
 
-            def prompt_fn(p, _ctx=_ctx):
+            def prompt_fn(p, _ctx=_ctx, _tg=cross_tg, _on=_xexam):
                 ctx, _ = _ctx(p)
-                return (base + f"\n{ctx}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 1개, "
-                        f"근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, "
+                # 표적이 둘이면 반박도 둘을 요구한다. ⚠ 검증기(_quote_validator)는 종전대로
+                # '적어도 하나' 로 둔다 — 전량 요구는 parse_retries 가 작아 라운드를 통째로
+                # 날린다(그 함수 독스트링의 완화 근거). 프롬프트로 요구하고 코드로는 안 막는다.
+                _nmin = max(1, len(_tg.get(p["key"]) or [])) if _on else 1
+                return (base + f"\n{ctx}\n\n다른 전문가 입장에 수용(concede)·반박(rebut — 최소 {_nmin}개"
+                        + (", 표적마다 하나씩" if _nmin > 1 else "") +
+                        f", 근거: 수치·표준·실패모드)하고 당신 핵심 주장을 한 단계 더 깊게(deepen — 3문장 이상, "
                         f"두루뭉술 금지). {rebut_spec}")
 
-            _where = (f"당신의 지정 반박 표적의 {prev_no}라운드 발언 전체"
-                      if opts.cross_exam and len(prev_list) >= 2 else f"위 [{_dr(prev_no)}라운드 전원] 텍스트")
+            _where = (f"당신의 지정 반박 표적들의 {prev_no}라운드 발언 전체"
+                      if _xexam else f"위 [{_dr(prev_no)}라운드 전원] 텍스트")
             validator_fn = ((lambda p, _c=_ctx, _w=_where: _quote_validator(_c(p)[1], _w))
                             if opts.rebut_quote else None)
             # concede 를 요구에서 뺀다 — 이제 AND 판정이라, 넣어 두면 양보할 게 없는 좌석이

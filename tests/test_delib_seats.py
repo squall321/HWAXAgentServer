@@ -199,10 +199,18 @@ def test_좌석_손잡이는_기본_켜짐이고_탈출구가_있다():
 
 def test_깊이_회복_손잡이는_기본_꺼짐을_유지한다():
     """단일 변수 A/B 원칙(GLM-DELIB-TUNING-REVIEW §T-서열) — 임의 활성화 금지.
-    _REBUT_QUOTE 는 인용 반박 계약이 운영 표준으로 승격돼 기본 ON(deliberation.py:86-87)이라 제외한다."""
-    for name in ("_EVIDENCE_PREPASS", "_PROSE_FIRST", "_CROSS_EXAM", "_ANCHOR", "_CHAIR_CITE"):
+
+    승격된 둘은 제외한다. 승격은 '임의 활성화'가 아니라 근거를 남긴 결정이다.
+      · _REBUT_QUOTE  — 인용 반박 계약이 운영 표준으로(deliberation.py 주석)
+      · _CROSS_EXAM   — 끄면 좌석 프롬프트가 N² 로 자란다(실측 15석 라운드 2.1M자 →
+                        켜면 0.34M자, 16%). 표적도 링 배정에서 관련도 상위 2명으로 바뀌어
+                        A/B 대상이던 종전 동작과 다르다.
+    둘 다 환경변수 0 으로 되돌릴 수 있어야 한다(코드 롤백 없이)."""
+    for name in ("_EVIDENCE_PREPASS", "_PROSE_FIRST", "_ANCHOR", "_CHAIR_CITE"):
         assert getattr(d, name) == 0, f"{name} 이 켜져 있다 — A/B 판정이 오염된다"
     assert d._REBUT_QUOTE == 1  # 의도된 기본 ON(운영 표준) — 끄려면 DELIB_REBUT_QUOTE=0
+    assert d._CROSS_EXAM == 1   # 의도된 기본 ON — 끄려면 DELIB_CROSS_EXAM=0
+    assert d._CROSS_TARGETS >= 2  # 표적 1명이면 반박이 한 갈래로 끝난다
     assert d._CHAIR_BESTOF == 1
 
 
