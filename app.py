@@ -3064,7 +3064,9 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
         sd = _first_dict(sess.get("data", sess))
         out["name"] = sd.get("name") or key
         out["role"] = str(sd.get("description") or "")[:2000]
-        out["tags"] = list(sd.get("common_tags") or [])[:30]
+        # get_agent_session 은 태그를 scope.common_tags 에 둔다(AIDataHub mcp_runtime). 최상위만 보면
+        # 늘 빈 목록이었고, 화면은 빈 태그 줄을 숨기므로 아무도 몰랐다.
+        out["tags"] = list(sd.get("common_tags") or (sd.get("scope") or {}).get("common_tags") or [])[:30]
         out["samples"] = [str(s)[:200] for s in (sd.get("sample_queries") or [])][:5]
         # HE팀 운영자 — 보유 지식이 0건인 게 정상이라, 무엇으로 답하는지(앱·도구 수)를 함께 준다.
         rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}

@@ -234,3 +234,22 @@ def test_좌석_추천_화면은_운영자를_추천하지_않지만_풀에는_�
     assert "he-calc-laminate" not in [r["key"] for r in out["recommended"]]
     assert "he-calc-laminate" not in [r["key"] for r in out["candidates"]]
     assert "he-calc-laminate" in [p["key"] for p in out["pool"]], "조직도에서 사람이 고를 수는 있어야 한다"
+
+
+def test_전문가_상세는_scope_아래_태그를_읽고_운영_앱을_준다(monkeypatch):
+    sess = dict(OP_SESSION, scope={"common_tags": ["HE팀", "MCP 운영자"]})
+
+    async def fake_tools(*_a, **_k):
+        return {"get_agent_session": object(), "list_records": object()}
+
+    async def fake_call(tools, name, args):
+        return json.dumps(sess, ensure_ascii=False) if name == "get_agent_session" else json.dumps({"records": []})
+
+    monkeypatch.setattr(a, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(a, "_call", fake_call)
+    _prime_tools_map(monkeypatch, TS_MAP)
+    out = asyncio.run(a.catalog_agent(a.AgentDetailRequest(key="he-calc-thermalshock")))
+    assert out["tags"] == ["HE팀", "MCP 운영자"], "get_agent_session 은 태그를 scope 아래에 둔다"
+    assert out["operator"] is True
+    assert out["apps"] == [{"key": "heax-thermal_shock_mcp", "label": a._app_label("heax-thermal_shock_mcp"),
+                            "tool_count": 3, "connected": True}]
