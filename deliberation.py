@@ -1911,6 +1911,16 @@ def _dom_of(key: str) -> str:
     return k.split("-", 1)[0] if "-" in k else k
 
 
+# 도구 운영자 도메인 — HE팀(he-<묶음>-<앱>)은 MCP 앱 하나를 모는 역할이지 도메인 전문가가 아니다.
+# 자동 발굴(좌석·반대 도메인·재심사·띵킹 소집·좌석 추천)에 섞이면 도구 이름이 겹치는 화두에서
+# 도메인 좌석을 밀어낸다. 사람이 조직도에서 직접 고르는 것은 막지 않는다.
+OPERATOR_DOMAINS = frozenset({"he"})
+
+
+def is_operator(key: str) -> bool:
+    return _dom_of(key) in OPERATOR_DOMAINS
+
+
 async def _restore_role(tools: dict, key: str, fallback: str = "") -> str:
     """페르소나 역할 원본을 get_agent_session 으로 복원한다(실패 시 fallback)."""
     try:
@@ -1947,7 +1957,7 @@ async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
             break
         it = _first_dict(it)
         key = it.get("agent_type") or it.get("id")
-        if not key or key in exclude or any(p["key"] == key for p in out):
+        if not key or key in exclude or is_operator(key) or any(p["key"] == key for p in out):
             continue
         out.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
     return out

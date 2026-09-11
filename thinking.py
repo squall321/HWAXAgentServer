@@ -29,6 +29,7 @@ from deliberation import (
     _restore_role,
     _sse,
     _tools_by_name,
+    is_operator,
 )
 
 # ── 손잡이 ────────────────────────────────────────────────────────────────────
@@ -126,7 +127,8 @@ async def _summon(tools: dict, q: str, top_k: int, exclude: set) -> list[dict]:
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)
         key = str(it.get("agent_type") or it.get("id") or "").strip()
-        if not key or key in exclude or any(s["key"] == key for s in out):
+        # 도구 운영자(HE팀)는 자기 앱으로 답하는 역할이라 '답할 수 있는 전문가' 소집 대상이 아니다.
+        if not key or key in exclude or is_operator(key) or any(s["key"] == key for s in out):
             continue
         out.append({
             "key": key,

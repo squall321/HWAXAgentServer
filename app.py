@@ -61,6 +61,7 @@ from deliberation import (
     _llm_text,
     _tools_by_name,
     is_deliberation,
+    is_operator,
     is_sim_deliberation,
     is_test_plan,
     is_report_save,
@@ -934,6 +935,11 @@ _TOOL_PRIORITY = (
     "get_curve", "get_context_bundle", "get_fits", "get_mat_card", "get_reports_digest",
     "get_guide",
 )
+# HE팀 운영자의 상시 예약 — 안내대만 남긴다. 운영자는 자기 앱 도구가 핀으로 이미 앞자리를 차지하는데,
+# 위 핵심 38개(VOC·적층·보고서…)까지 예산 밖에서 덧붙이면 그 앱과 무관한 도구가 절반이 되고 작은
+# 컨텍스트에서는 초과 400 으로 턴이 죽는다(실측 dev 16K: StepForge 운영자 77개 → 16,385토큰).
+# 다른 앱이 필요하면 recommend_agents·list_tool_apps 로 안내하고, 바인딩 밖 도구는 invoke_tool 로 부른다.
+_GUIDE_TOOLS = ("search_tools", "invoke_tool", "list_tool_apps", "recommend_agents")
 
 
 # ── 도구 시맨틱 검색 — AIDH 다국어 e5 임베더 재사용(모델 중복 로딩 없음) ─────────────
@@ -1038,14 +1044,23 @@ def gate_sources(tools: list, sources: list[str] | None) -> list:
             or getattr(t, "name", "") in allow]
 
 
-def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None) -> list:
+def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
+                  first: list[str] | None = None, core_names: tuple | None = None) -> list:
     """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
-    '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 사용자 지정(핀) ② 질의 어휘 관련도
-    ③ 상시 핵심(라우팅·검색) ④ 나머지. 캡 미설정(0)이면 전부 바인딩(회귀 0)."""
+    '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 콕 집은 도구(first) ② 사용자 지정(핀)
+    ③ 질의 어휘 관련도 ④ 상시 핵심(라우팅·검색) ⑤ 나머지. 캡 미설정(0)이면 전부 바인딩(회귀 0).
+
+    first 는 핀 중에서도 먼저 사는 것이다 — 앱 하나를 통째로 핀하면 도구가 캡(dev 40)을 넘는데
+    (StepForge 81·ReportArchive 70), 핀끼리는 관련도로만 갈려 사용자가 콕 집은 도구나 HE팀
+    운영자의 입구 도구(get_guide·list_projects 등)가 캡 밖으로 밀려났다.
+
+    core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
         return tools
-    pin = set(pinned or [])
-    core = {n: i for i, n in enumerate(_TOOL_PRIORITY)}
+    pin = set(pinned or []) | set(first or [])
+    top = set(first or [])
+    core_list = _TOOL_PRIORITY if core_names is None else core_names
+    core = {n: i for i, n in enumerate(core_list)}
     # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
     qtok = _tok_query(query)
     def rel(t) -> float:
@@ -1063,7 +1078,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
     fused = _rrf(lex_order, sem_order) if sem_order else {}
     scored = [(t, rel(t)) for t in tools]
     ordered = sorted(scored, key=lambda x: (
-        0 if getattr(x[0], "name", "") in pin else 1,            # 핀 최우선
+        0 if getattr(x[0], "name", "") in top else 1 if getattr(x[0], "name", "") in pin else 2,  # 콕 집은 것 → 핀
         -round(fused.get(getattr(x[0], "name", ""), 0.0), 6),    # 어휘+시맨틱 융합 순위
         -round(x[1], 3),                                          # 어휘 관련도(융합 미가용 시)
         core.get(getattr(x[0], "name", ""), len(core)),           # 상시 핵심
@@ -1098,7 +1113,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None)
     if TOOL_MAX > 0:
         kept_names = {getattr(t, "name", "") for t in kept}
         by_name = {getattr(t, "name", ""): t for t in tools}
-        missing_core = [by_name[n] for n in _TOOL_PRIORITY
+        missing_core = [by_name[n] for n in core_list
                         if n in by_name and n not in kept_names]
         if missing_core:
             # 뒤에서부터(=관련도 낮은 것부터) 비핀 도구를 밀어내고 core 를 넣는다.
@@ -1465,12 +1480,14 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
                      query: str = "", sources: list[str] | None = None, user: str = "",
-                     user_pat: str = ""):
+                     user_pat: str = "", first: list[str] | None = None,
+                     core_names: tuple | None = None):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
-    pinned 은 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에 포함한다
-    (무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 우선순위 반영)."""
-    pin_key = tuple(sorted(pinned)) if (pinned and TOOL_MAX > 0) else ()
+    pinned·first·core_names 는 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에
+    포함한다(무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 우선순위 반영)."""
+    pin_key = ((tuple(sorted(pinned or [])), tuple(sorted(first or [])), core_names)
+               if ((pinned or first or core_names is not None) and TOOL_MAX > 0) else ())
     # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
     # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
@@ -1528,7 +1545,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                         _raw, time.time())
                 _raw = gate_sources(_raw, sources)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
-                tools = await _aio.to_thread(_select_tools, _raw, query, pinned)
+                tools = await _aio.to_thread(_select_tools, _raw, query, pinned, first, core_names)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 # 상태코드를 뽑아 둔다 — prod 에서 '툴콜이 되었다 안 되었다' 할 때 401(토큰)
@@ -1564,7 +1581,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     _snap_raw, _snap_ts = snap
                     _age = int(time.time() - _snap_ts)
                     _sr = gate_sources(list(_snap_raw), sources)
-                    tools = await _aio.to_thread(_select_tools, _sr, query, pinned)
+                    tools = await _aio.to_thread(_select_tools, _sr, query, pinned, first, core_names)
                     load_failed = False   # 도구가 살아 있으니 실패 아님 — 단 신선하지 않다
                     degraded = f"stale-snapshot({_age}s): {detail}"
                     app.state.tool_load_error.pop(frozenset(groups), None)
@@ -1656,24 +1673,41 @@ def _tool_preview(v, n: int = 220) -> str:
         return ""
 
 
-async def _persona_role(app: FastAPI, groups: list[str], agent_type: str) -> str:
-    """선택 전문가의 역할 원문 로드(get_agent_session) — 프로세스 캐시(불변 가정, 재시작 시 갱신)."""
+# 페르소나 역할 원문 상한(문자). HE팀 정본 동기화(HWAXPortal infra/scripts/sync-he-personas.py
+# PROMPT_MAX)가 같은 값으로 막는다 — 여기서 잘리면 역할 뒤쪽('답하는 법')이 조용히 빠진다.
+PERSONA_ROLE_MAX = 4000
+# 페르소나 캐시 수명(초). 예전엔 재시작 전까지 영구였다 — 정본을 고쳐 동기화해도 에이전트서버를
+# 다시 띄우기 전까지 옛 역할·옛 앱으로 답했다.
+PERSONA_TTL_S = _env_int("PERSONA_TTL_S", 300)
+
+
+async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dict:
+    """선택 전문가의 역할 원문과 운영 설정(get_agent_session) — {role, operator, apps, key_tools}.
+
+    operator 는 HE팀 MCP 운영자(response_config.persona_kind == 'mcp_operator')다. 지식카드가 아니라
+    자기 앱 도구로 답하므로, 호출부가 도구 선별 **전에** 이 값을 읽어 그 앱 도구를 묶는다."""
     cache = getattr(app.state, "persona_cache", None)
     if cache is None:
         cache = app.state.persona_cache = {}
-    if agent_type in cache:
-        return cache[agent_type]
-    role = ""
+    hit = cache.get(agent_type)
+    if hit and time.time() - hit[0] < PERSONA_TTL_S:
+        return hit[1]
+    meta: dict = {"role": "", "operator": False, "apps": [], "key_tools": []}
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 역할 원문을 JSON 으로 읽는다
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
         sd = _first_dict(sess.get("data", sess))
-        role = str(sd.get("system_prompt") or sd.get("description") or "")[:4000]
+        meta["role"] = str(sd.get("system_prompt") or sd.get("description") or "")[:PERSONA_ROLE_MAX]
+        rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}
+        if rc.get("persona_kind") == "mcp_operator":
+            meta["operator"] = True
+            meta["apps"] = [a.strip()[:80] for a in (rc.get("mcp_apps") or []) if isinstance(a, str) and a.strip()][:3]
+            meta["key_tools"] = [n.strip()[:80] for n in (rc.get("key_tools") or []) if isinstance(n, str) and n.strip()][:12]
     except Exception as exc:  # noqa: BLE001 — 실패 시 페르소나 없이 일반 챗
         print(f"[agent] persona load failed for {agent_type}: {exc!r}")
-    if role:
-        cache[agent_type] = role
-    return role
+    if meta["role"]:
+        cache[agent_type] = (time.time(), meta)
+    return meta
 
 
 # 지정 전문가의 지식카드 주입 예산(문자). 심의 경로(DELIB_KNOWLEDGE_BUDGET)와 같은 기본값이다 —
@@ -1922,19 +1956,38 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             print(f"[agent] nudge→resume: {_orig[:60]!r}")
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
+        # 지정 전문가 — 역할·운영 설정을 도구 선별보다 먼저 읽는다. HE팀 운영자는 자기 앱 도구를
+        # 묶어야 해서 _agent_for 전에 알아야 한다(예전엔 역할 문구만 붙고 그 앱 도구는 따라오지 않아,
+        # 운영자를 골라도 도구는 질의 관련도로만 뽑혔다).
+        agent_key = (req.pinned_agent or "").strip()[:120]
+        persona = await _persona_meta(app, req.groups, agent_key) if agent_key else {}
+        operator = bool(persona.get("operator"))
+        op_apps = list(persona.get("apps") or []) if operator else []
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
+        # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools). 앱을 통째로 핀하면
+        # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
+        first = list(dict.fromkeys([*pinned, *(persona.get("key_tools") or [] if operator else [])]))
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
-        apps = [str(a)[:80] for a in (req.pinned_apps or []) if isinstance(a, str) and a.strip()][:3]
+        # 운영자가 모는 앱이 사용자 지정 앱보다 앞선다(합쳐 3개).
+        user_apps = [str(a)[:80] for a in (req.pinned_apps or []) if isinstance(a, str) and a.strip()][:3]
+        apps = list(dict.fromkeys([*op_apps, *user_apps]))[:3]
+        _op_missing: list[str] = []
         if apps:
             _tm = _tools_map()
             _from_apps = [n for n, gk in _tm.items() if gk in apps and n not in pinned]
-            pinned = pinned + sorted(_from_apps)
+            pinned = list(dict.fromkeys([*pinned, *first, *sorted(_from_apps)]))
             yield _sse("status", {"step": f"지정 앱 {len(apps)}개 → 도구 {len(_from_apps)}개 우선",
                                   "tool": None, "tools_used": apps})
+            # 운영자의 앱이 이 게이트웨이에 없다 — cae00 전용 앱(arp·odb-hub)을 다른 박스에서 고른 경우.
+            # 말없이 두면 모델은 역할에 적힌 도구를 부르겠다고 약속만 하고 아무것도 못 부른다.
+            # 매핑 자체를 못 받았으면(_tm 빈 값) 없다고 단정하지 않는다.
+            if _tm:
+                _have = set(_tm.values())
+                _op_missing = [a for a in op_apps if a not in _have]
         # 도구 선별 질의에는 최근 히스토리를 함께 넣는다. 현재 메시지만 보면 '다시 제출해줘',
         # '그럼 그래프로 그려줘' 같은 후속 발화는 토큰이 거의 없어 관련도가 0이 되고, 직전 턴에
         # 쓰던 도구가 캡 밖으로 사라진다(감사 실측: slurm 14개 → 0개, 모델이 이미 받은 잡 ID를
@@ -1946,7 +1999,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
-                                 req.user_email, req.user_pat)
+                                 req.user_email, req.user_pat, first,
+                                 _GUIDE_TOOLS if operator else None)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
@@ -1971,8 +2025,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 실제 강제는 바인딩 우선순위(pin)가 담당한다.
         if apps:
             _labels = ", ".join(_app_label(a) for a in apps)
-            sys_prompt += (f"\n\n[사용자 지정 우선 앱]\n{_labels}\n"
-                           f"사용자가 이 앱(들)의 기능을 쓰라고 직접 골랐다. 이 질문 처리에 적합한 도구가 "
+            _hdr, _why = (("[운영 앱 — 선택한 HE팀 운영자]", "이 운영자가 모는 앱이다")
+                          if set(apps) <= set(op_apps) else
+                          ("[사용자 지정 우선 앱]", "사용자가 이 앱(들)의 기능을 쓰라고 직접 골랐다"))
+            sys_prompt += (f"\n\n{_hdr}\n{_labels}\n"
+                           f"{_why}. 이 질문 처리에 적합한 도구가 "
                            f"그 앱 안에 있으면 반드시 우선 호출하고 결과를 답변에 인용하라"
                            f"(다른 도구 사용 금지는 아니다). 어떤 도구를 쓸지는 네가 고른다.")
             if req.pinned_tools:
@@ -1983,10 +2040,25 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
                              "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
+        if _op_missing:
+            _ml = ", ".join(_app_label(a) for a in _op_missing)
+            yield _sse("warning", {"code": "operator_app_missing",
+                                   "message": f"{agent_key} 가 모는 앱({_ml})이 이 게이트웨이에 연결돼 있지 않습니다 — "
+                                              "그 앱 도구 없이 답합니다."})
+            sys_prompt += (f"\n\n[중요] 이 운영자가 모는 앱({_ml})의 도구가 지금 연결돼 있지 않다. 그 도구를 "
+                           "호출하겠다고 말하지 말고, 연결되지 않았다는 사실을 먼저 밝힌 뒤 도구 없이 답할 수 "
+                           "있는 범위만 답하라.")
         # 지정 전문가 페르소나 — 선택 패널에서 고른 전문가의 역할로 답하는 '전문가와 대화' 모드.
-        agent_key = (req.pinned_agent or "").strip()[:120]
-        if agent_key:
-            role = await _persona_role(app, req.groups, agent_key)
+        if agent_key and operator:
+            # HE팀 MCP 운영자 — 역할(사전 지식·작업 순서·함정)만 싣고 지식카드 선조회는 하지 않는다.
+            # 이 역할의 근거는 앱 도구 결과다. 지식카드 0건이라고 "사내 지식카드에 없다"를 먼저
+            # 밝히게 하면, 도구로 답할 질문에 엉뚱한 단서가 붙는다.
+            _opl = ", ".join(_app_label(a) for a in op_apps) or "지정 앱"
+            sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 아래 사전 지식과 "
+                           f"작업 순서를 따라 {_opl} 의 도구를 직접 호출해 답하라.\n{persona.get('role') or ''}")
+            yield _sse("status", {"step": f"{agent_key} — {_opl} 도구로 답합니다", "tool": None})
+        elif agent_key:
+            role = persona.get("role") or ""
             if role:
                 sys_prompt += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
                                f"아래 역할과 범위를 지켜 그 전문가로서 답하라.\n{role}\n"
@@ -2586,7 +2658,8 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         for it in (items or [])[:top_k]:
             it = _first_dict(it)
             n = _norm(it)
-            if not n["key"]:
+            # 도구 운영자(HE팀)는 추천·후보에 안 올린다 — 풀(조직도)에는 남아 사람이 직접 고를 수 있다.
+            if not n["key"] or is_operator(n["key"]):
                 continue
             n["score"] = it.get("score")
             n["why"] = it.get("why") or ""
@@ -2984,7 +3057,8 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
     if not tools:
         return {"error": "gateway_unavailable"}
     key = req.key.strip()[:120]
-    out: dict = {"key": key, "name": key, "role": "", "tags": [], "samples": [], "records": []}
+    out: dict = {"key": key, "name": key, "role": "", "tags": [], "samples": [], "records": [],
+                 "operator": False, "apps": []}
     try:
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
         sd = _first_dict(sess.get("data", sess))
@@ -2992,6 +3066,14 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
         out["role"] = str(sd.get("description") or "")[:2000]
         out["tags"] = list(sd.get("common_tags") or [])[:30]
         out["samples"] = [str(s)[:200] for s in (sd.get("sample_queries") or [])][:5]
+        # HE팀 운영자 — 보유 지식이 0건인 게 정상이라, 무엇으로 답하는지(앱·도구 수)를 함께 준다.
+        rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}
+        if rc.get("persona_kind") == "mcp_operator":
+            _tm = _tools_map()
+            out["operator"] = True
+            out["apps"] = [{"key": a, "label": _app_label(a), "tool_count": sum(1 for g in _tm.values() if g == a),
+                            "connected": (a in set(_tm.values())) if _tm else None}
+                           for a in (rc.get("mcp_apps") or []) if isinstance(a, str) and a.strip()][:3]
     except Exception as exc:  # noqa: BLE001 — 상세 실패해도 지식 목록은 시도
         print(f"[catalog] agent session failed: {exc!r}")
     try:
