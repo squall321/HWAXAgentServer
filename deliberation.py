@@ -1328,6 +1328,36 @@ def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
 
     return check
 
+def _rebut_items(o: dict) -> list:
+    """발언의 반박을 **구조 그대로** 꺼낸다 — {target, quote, counter, basis}.
+
+    ⚠ 이 관계는 예전부터 LLM 이 만들고 있었는데 `_item_text` 가 산문으로 평탄화해 버려서
+    서버 메모리 밖으로는 나가지 못했다(프론트·저장·회의록 어디에도 구조가 없었다).
+    '누가 누구의 어떤 말을 반박했나' 는 심의의 핵심 산출인데 화면이 그릴 수가 없었다.
+
+    산문(say)은 그대로 둔다 — 사람이 읽는 것은 그쪽이다. 이건 **그래프용 부본**이다.
+    프론트로 나가고 저장되므로 짧게 자른다.
+    """
+    raw = o.get("rebut")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for x in raw[:4]:
+        if not isinstance(x, dict):
+            continue
+        tgt = str(x.get("target") or "").strip()[:60]
+        counter = str(x.get("counter") or "").strip()[:400]
+        if not (tgt or counter):
+            continue
+        out.append({"target": tgt,
+                    "quote": _norm_ws(x.get("quote"))[:200],
+                    "counter": counter,
+                    "basis": str(x.get("basis") or "").strip()[:200]})
+    return out
+
+
 def _item_text(x) -> str:
     """배열 항목 → 대화체 문구. 인용 반박 계약의 dict({target,quote,counter,basis})는
     '누구의 어떤 발언에 대한 반박인지'가 읽히게 합성하고, 그 외 dict 는 key: value 나열."""
@@ -2750,6 +2780,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
                          "stance": _norm_stance(o.get("stance")),
                          "non_negotiable": str(o.get("non_negotiable") or "")[:1200]}
+            # 반박 관계는 라운드 성격과 무관하게 **있으면** 싣는다. 심화 라운드가 주 무대지만
+            # 수렴 라운드에서도 나온다 — 여기서 render 로 가르면 그만큼 그래프가 비게 된다.
+            _reb = _rebut_items(o)
+            if _reb:
+                extra["rebut"] = _reb
             yield _delib("turn", round=rnd, display_round=_dr(rnd), persona=o["persona"],
                          say=_say_of(render, o), **extra)
             if out is not None and extra.get("non_negotiable"):

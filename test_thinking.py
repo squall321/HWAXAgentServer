@@ -131,3 +131,35 @@ def test_summary_reports_capped_seats_instead_of_hiding_them():
     out = _sum(answered=[{"key": "a", "name": "A", "scope": "", "answer": "본문", "basis": []}],
                capped=[{"key": "z"}])
     assert "안 물어봄" in out and "`z`" in out
+
+
+# ── 반박 구조 추출(_rebut_items) — 지식 그래프의 재료 ──────────────────────────
+# 이 관계는 예전부터 LLM 이 만들었는데 산문으로 평탄화돼 서버 밖으로 못 나갔다.
+def test_rebut_items_keeps_the_relation_structured():
+    import deliberation as d
+    o = {"rebut": [{"target": "mech-cover-glass", "quote": "갭 0.3mm 면 충분하다",
+                    "counter": "코너 낙하에서는 소진된다", "basis": "SDI-F-004"}]}
+    got = d._rebut_items(o)
+    assert len(got) == 1
+    assert got[0]["target"] == "mech-cover-glass"
+    assert got[0]["counter"].startswith("코너 낙하")
+
+
+def test_rebut_items_accepts_a_bare_dict_and_drops_empty_ones():
+    import deliberation as d
+    assert len(d._rebut_items({"rebut": {"target": "a", "counter": "b"}})) == 1
+    # target 도 counter 도 없으면 그래프에 그릴 게 없다 — 버린다.
+    assert d._rebut_items({"rebut": [{"quote": "인용만"}, {}]}) == []
+    assert d._rebut_items({}) == []
+    assert d._rebut_items({"rebut": "문자열"}) == []
+
+
+def test_rebut_items_clamps_size():
+    """프론트로 나가고 저장되므로 짧아야 한다 — 회의록 전문을 두 번 나르면 안 된다."""
+    import deliberation as d
+    o = {"rebut": [{"target": "t" * 200, "counter": "c" * 900,
+                    "quote": "q" * 900, "basis": "b" * 900}] * 9}
+    got = d._rebut_items(o)
+    assert len(got) == 4                      # 항목 상한
+    assert len(got[0]["target"]) == 60 and len(got[0]["counter"]) == 400
+    assert len(got[0]["quote"]) == 200 and len(got[0]["basis"]) == 200
