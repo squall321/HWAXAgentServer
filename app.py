@@ -55,6 +55,7 @@ from deliberation import (
     _first_dict,
     _parse_json,
     _parse_json_multi,
+    _tool_text_ok,
     _call,
     _llm_text,
     _tools_by_name,
@@ -2702,6 +2703,100 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     # 빈 배열이면 화두 한 줄로만 추천했다는 뜻이고, 화면도 그렇게 말해야 한다.
     return {"recommended": recommended, "candidates": candidates, "pool": pool,
             "tools": tools_info, "low_confidence": low_conf, "axes": axes}
+
+
+# ── 심의 전 'VOC 먼저 보기' ────────────────────────────────────────────────────────
+# 심의 엔진의 불량 환기(_defect_briefing)는 (1) 질문에 불량 단어가 있을 때만 켜지고 (2) 화두로
+# 검색하지 않고 경보 제품의 최신 부정 VOC 를 가져오며 (3) 넣을지를 LLM 이 통째로 정한다 — 사람이
+# 보고 고를 틈이 없다. 여기서는 화두로 **검색**해 목록을 주고 고르는 것은 사람이 한다. 고른 것은
+# delib_opts.evidence(원천 근거 — 결론 아님)로, 보강 문장은 human_note 로 간다(포털 프론트).
+class VocPreviewRequest(BaseModel):
+    message: str
+    groups: list[str] = []
+    # 사람이 고친 검색어 — 주면 추출을 건너뛴다. 보강의 첫 단계는 검색어를 바로잡는 일이다.
+    keywords: list[str] = []
+
+
+_VOC_PREVIEW_MAX = int(os.environ.get("VOC_PREVIEW_MAX", "24"))
+
+
+async def _voc_keywords(llm, message: str) -> list[str]:
+    """search_voc 는 FTS 이고 '영어 권장'이다 — VOC 본문이 대부분 영어(번역본 포함)라 한국어
+    화두를 그대로 넣으면 안 걸린다(실측 — '솔더 크랙' 은 빈 응답). 화두에서 소비자가 쓸 법한
+    영어 증상·부품 낱말을 뽑는다. LLM 이 실패하면 화두 속 영문 토큰으로 대신한다."""
+    try:
+        raw = await _llm_text(
+            llm, "당신은 검색어 추출기입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+            f"[화두]\n{message[:1500]}\n\n위 화두와 관련된 **고객 불만**을 글로벌 사용자 커뮤니티(VOC)에서 찾을 "
+            "영어 검색어를 2~4개 뽑아라. 엔지니어 용어가 아니라 **소비자가 쓰는 말**로, 부품·증상 위주로 "
+            "짧게(1~3 단어). 예: hinge crack, battery swelling, overheating, screen flicker. "
+            'JSON {"keywords": ["...", "..."]} 로만.')
+        kws = (_parse_json(raw) or {}).get("keywords") or []
+        out = [str(k).strip()[:40] for k in kws if isinstance(k, str) and str(k).strip()]
+        if out:
+            return out[:4]
+    except Exception as exc:  # noqa: BLE001 — 추출 실패는 폴백으로
+        print(f"[voc] keyword extraction failed: {exc!r}")
+    return [w for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", message)][:4]
+
+
+def _voc_row(v: dict, kw: str) -> dict:
+    """SignalForge VOC 한 건 → 화면·근거용 정규형(필드명은 SF 실측 스키마)."""
+    text = str(v.get("content_translated") or v.get("content_original") or "").strip()
+    return {
+        "id": v.get("id"), "keyword": kw,
+        "product": str(v.get("product_name") or v.get("product_code") or "")[:60],
+        "platform": str(v.get("platform_name") or "")[:40],
+        "country": str(v.get("country_code") or "")[:8],
+        "date": str(v.get("published_at") or "")[:10],
+        "sentiment": str(v.get("sentiment_label") or "")[:16],
+        "score": v.get("sentiment_score"),
+        "text": text[:600],
+        "url": str(v.get("source_url") or "")[:300],
+    }
+
+
+@app.post("/deliberate/voc-preview")
+async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
+    """심의 전 VOC 미리보기 — 화두로 SignalForge 를 검색해 사람이 고를 목록을 준다.
+
+    ⚠ 세 가지를 뭉개지 않는다(무음 결함의 공통 패턴 — '빈 결과'와 '못 물어봄'이 같아 보인다).
+      · unavailable — 이 사용자에게 search_voc 가 없다(권한·미연결)
+      · degraded    — 물어봤는데 도구가 실패했다
+      · items=[]    — 물어봤고 정말 없다"""
+    tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
+    if "search_voc" not in tools:
+        return {"items": [], "keywords": [], "unavailable": True,
+                "note": "SignalForge VOC 도구를 쓸 수 없습니다(권한 또는 연결)."}
+    kws = [k.strip()[:40] for k in req.keywords if k and k.strip()][:6] or \
+        await _voc_keywords(app.state.llm, req.message)
+    if not kws:
+        return {"items": [], "keywords": [], "note": "검색어를 뽑지 못했습니다 — 영어 검색어를 직접 넣어 주세요."}
+    per_kw: list[list[dict]] = []
+    failed = 0
+    for kw in kws:
+        raw = await _call(tools, "search_voc", {"keyword": kw, "limit": 10})
+        if isinstance(raw, str) and raw.strip() and not _tool_text_ok(raw):
+            failed += 1
+            per_kw.append([])
+            continue
+        # 목록 도구 — 원소별 블록이 이어져 온다(_parse_json 은 마지막 하나만 읽는다).
+        per_kw.append([_voc_row(v, kw) for v in _parse_json_multi(raw) if isinstance(v, dict)])
+    # 검색어마다 번갈아 뽑는다 — 한 검색어가 목록을 독점하면 나머지 증상이 안 보인다.
+    items, seen = [], set()
+    for i in range(max((len(x) for x in per_kw), default=0)):
+        for rows in per_kw:
+            if i < len(rows) and rows[i]["id"] not in seen and rows[i]["text"]:
+                seen.add(rows[i]["id"])
+                items.append(rows[i])
+    total = len(items)
+    items = items[:_VOC_PREVIEW_MAX]
+    return {"keywords": kws, "items": items, "total": total,
+            "degraded": failed == len(kws),
+            "partial": 0 < failed < len(kws),
+            "tools_used": ["search_voc"],
+            **({"note": f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."}
+               if total > len(items) else {})}
 
 
 class AgentDetailRequest(BaseModel):

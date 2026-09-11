@@ -595,6 +595,10 @@ def _resolve_opts(req_opts):
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
+        # 불량 환기(SignalForge) — auto(질문에 불량 단어가 있을 때만, 종전) | off | always.
+        # 포털 'VOC 먼저 보기' 에서 사람이 이미 골랐으면 off 로 온다 — 자동 환기를 또 돌리면
+        # 사람이 뺀 VOC 가 다시 들어간다.
+        voc="auto",
         # 이전 심의의 양보 불가 조항 — 요약에 넣지 않으면 소실되므로 별도 필드로 승계한다(F11).
         continue_non_negotiables=[],
         # 챗 워크스페이스가 정리해 넘긴 원천 근거(도구결과+출처) — 심의가 '검증 대상·결론 아님'으로
@@ -651,6 +655,9 @@ def _resolve_opts(req_opts):
                 o.timeout_s = float(ts)
             except (ValueError, TypeError):
                 pass
+        vm = str(req_opts.get("voc") or "").strip().lower()
+        if vm in ("auto", "off", "always"):
+            o.voc = vm
         hn = req_opts.get("human_note")
         if isinstance(hn, str):
             o.human_note = hn[:2000]
@@ -2478,7 +2485,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
     sf_inject = ""
-    if _has_defect_topic(question):
+    if opts.voc == "always" or (opts.voc == "auto" and _has_defect_topic(question)):
         yield _delib("stage", stage="recall")
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
