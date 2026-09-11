@@ -253,3 +253,4 @@ def test_전문가_상세는_scope_아래_태그를_읽고_운영_앱을_준다(
     assert out["operator"] is True
     assert out["apps"] == [{"key": "heax-thermal_shock_mcp", "label": a._app_label("heax-thermal_shock_mcp"),
                             "tool_count": 3, "connected": True}]
+

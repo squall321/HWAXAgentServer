@@ -3049,21 +3049,38 @@ class AgentDetailRequest(BaseModel):
     groups: list[str] = []
 
 
+# AIDataHub 가 역할 원문 뒤에 붙이는 공용 도구 안내(build_system_prompt 의 '## How to access this hub'
+# 블록) — 모든 전문가에게 같은 영문 안내라 사람이 읽을 역할이 아니다. 역할 원문이 없는 에이전트는
+# 'You are an assistant for "…"' 자동 틀을 받는데, 그것도 역할 문서가 아니다.
+_HUB_GUIDE_SEP = "\n\n---\n\n## How to access this hub"
+
+
+def _role_doc(system_prompt: str) -> str:
+    sp = system_prompt or ""
+    if sp.startswith('You are an assistant for "'):
+        return ""
+    i = sp.find(_HUB_GUIDE_SEP)
+    return (sp[:i] if i >= 0 else sp).strip()
+
+
 @app.post("/catalog/agent")
 async def catalog_agent(req: AgentDetailRequest) -> dict:
     """전문가 상세 + 보유 지식(레코드 목록) — 브라우즈 UI 용(결정적·LLM 미경유).
-    LLM 텍스트 나열은 결과 절단 캡에 걸려 잘리므로, 탐색은 이 데이터로 UI 가 그린다."""
+    LLM 텍스트 나열은 결과 절단 캡에 걸려 잘리므로, 탐색은 이 데이터로 UI 가 그린다.
+    records 는 미리보기 20건이고 records_total 이 전체 수다 — 전체는 /catalog/agent/records 로 넘긴다."""
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 상세·레코드를 JSON 으로 읽는다
     if not tools:
         return {"error": "gateway_unavailable"}
     key = req.key.strip()[:120]
-    out: dict = {"key": key, "name": key, "role": "", "tags": [], "samples": [], "records": [],
-                 "operator": False, "apps": []}
+    out: dict = {"key": key, "name": key, "role": "", "prompt": "", "tags": [], "samples": [], "records": [],
+                 "records_total": None, "operator": False, "apps": []}
     try:
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
         sd = _first_dict(sess.get("data", sess))
         out["name"] = sd.get("name") or key
         out["role"] = str(sd.get("description") or "")[:2000]
+        # 역할 문서 전문 — 심층 보기가 '이 전문가가 어떻게 생각하고 답하는가'를 그대로 보여 준다.
+        out["prompt"] = _role_doc(str(sd.get("system_prompt") or ""))[:PERSONA_ROLE_MAX * 2]
         # get_agent_session 은 태그를 scope.common_tags 에 둔다(AIDataHub mcp_runtime). 최상위만 보면
         # 늘 빈 목록이었고, 화면은 빈 태그 줄을 숨기므로 아무도 몰랐다.
         out["tags"] = list(sd.get("common_tags") or (sd.get("scope") or {}).get("common_tags") or [])[:30]
@@ -3089,9 +3106,129 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
             if rid or title:
                 out["records"].append({"id": str(rid)[:80], "title": str(title)[:160],
                                        "data_type": str(r.get("data_type") or "")[:20]})
+        # 상세칸의 '보유 지식 20건'은 목록 상한이었다 — 실제로는 2,729건인 사람도 20건으로 보였다.
+        if isinstance(raw, dict) and isinstance(raw.get("total"), int):
+            out["records_total"] = raw["total"]
     except Exception as exc:  # noqa: BLE001
         print(f"[catalog] records failed: {exc!r}")
     return out
+
+
+class AgentRecordsRequest(BaseModel):
+    key: str
+    q: str = ""
+    offset: int = 0
+    limit: int = 50
+    groups: list[str] = []
+
+
+# 심층 보기 지식카드 한 쪽 상한 — 한 번에 수천 건(material-twin-analyst 2,729)을 받으면 화면도
+# 무겁고 게이트웨이 응답도 크다. 쪽으로 넘긴다.
+CATALOG_PAGE_MAX = 100
+
+
+def _record_row(r) -> dict:
+    r = _first_dict(r)
+    return {"id": str(r.get("id") or r.get("record_id") or "")[:80],
+            "title": str(r.get("title") or "")[:300],
+            "data_type": str(r.get("data_type") or "")[:20],
+            "doc_type": str(r.get("doc_type") or "")[:60],
+            "year": r.get("year") if isinstance(r.get("year"), int) else None,
+            "tags": [str(t)[:60] for t in (r.get("tags") or [])][:12],
+            "summary": str(r.get("summary") or "")[:400]}
+
+
+@app.post("/catalog/agent/records")
+async def catalog_agent_records(req: AgentRecordsRequest) -> dict:
+    """전문가 한 명의 지식카드 목록 — 제목·요약 검색(q)·쪽(offset·limit)·총수. 심층 보기 용(LLM 미경유)."""
+    tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
+    offset = max(0, int(req.offset or 0))
+    if not tools or "list_records" not in tools:
+        return {"error": "gateway_unavailable", "total": 0, "offset": offset, "items": []}
+    limit = max(1, min(int(req.limit or 50), CATALOG_PAGE_MAX))
+    args: dict = {"agents": [req.key.strip()[:120]], "limit": limit, "offset": offset}
+    if req.q.strip():
+        args["q"] = req.q.strip()[:200]
+    raw = _parse_json(await _call(tools, "list_records", args))
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+        # '0건'과 '못 물어봤다'를 뭉개지 않는다 — 실패를 빈 목록으로 주면 '지식이 없는 전문가'로 읽힌다.
+        return {"error": "records_failed", "total": 0, "offset": offset, "items": []}
+    items = [row for row in (_record_row(r) for r in raw["items"]) if row["id"] or row["title"]]
+    total = raw.get("total") if isinstance(raw.get("total"), int) else offset + len(items)
+    return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+
+class RecordRequest(BaseModel):
+    id: str
+    groups: list[str] = []
+
+
+# 카드 한 장 본문 상한(문자)·표 행 상한. 표 레코드는 행이 수천 개일 수 있어 앞쪽만 싣고
+# truncated 로 잘렸다고 알린다 — 잘린 걸 전부인 척 보이면 없는 결론을 읽게 된다.
+RECORD_TEXT_MAX = 60000
+RECORD_ROWS_MAX = 200
+
+
+def _cell(v):
+    """표 칸 — 숫자·불리언·빈 값은 그대로, 나머지는 200자 문자열로."""
+    if v is None or isinstance(v, (bool, int, float)):
+        return v
+    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:200]
+
+
+def _record_view(rec: dict) -> dict:
+    """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
+    그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다)."""
+    content = rec.get("content") if isinstance(rec.get("content"), dict) else {}
+    out = {**_record_row(rec), "agents": [str(a)[:120] for a in (rec.get("agents") or [])][:20],
+           "sections": [], "table": None, "sources": [], "truncated": False}
+    out["summary"] = str(rec.get("summary") or "")[:2000]
+    budget = RECORD_TEXT_MAX
+    for s in content.get("sections") or []:
+        s = _first_dict(s)
+        text = str(s.get("content_text") or s.get("text") or "")
+        if budget <= 0:
+            out["truncated"] = True
+            break
+        if len(text) > budget:
+            text, out["truncated"] = text[:budget], True
+        budget -= len(text)
+        out["sections"].append({"id": str(s.get("section_id") or "")[:40], "title": str(s.get("title") or "")[:200],
+                                "level": s.get("level") if isinstance(s.get("level"), int) else 1, "text": text})
+    headers, rows = content.get("headers"), content.get("rows")
+    if isinstance(headers, list) and isinstance(rows, list):
+        out["table"] = {"caption": str(content.get("caption") or "")[:200],
+                        "headers": [str(h)[:80] for h in headers][:40],
+                        "rows": [[_cell(c) for c in row[:40]] for row in rows[:RECORD_ROWS_MAX] if isinstance(row, list)],
+                        "total_rows": len(rows),
+                        "notes": str(content.get("notes") or "")[:2000]}
+        if len(rows) > RECORD_ROWS_MAX:
+            out["truncated"] = True
+    for src in content.get("sources") or []:
+        src = _first_dict(src)
+        if src.get("title") or src.get("doi") or src.get("url"):
+            out["sources"].append({k: str(src.get(k) or "")[:300] for k in ("title", "doi", "url", "kind", "authors")}
+                                  | {"year": src.get("year") if isinstance(src.get("year"), int) else None})
+    if not out["sections"] and out["table"] is None:
+        rest = {k: v for k, v in content.items() if k != "sources"}
+        if rest:
+            text = json.dumps(rest, ensure_ascii=False, indent=1, default=str)
+            out["truncated"] = out["truncated"] or len(text) > RECORD_TEXT_MAX
+            out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1, "text": text[:RECORD_TEXT_MAX]})
+    return out
+
+
+@app.post("/catalog/record")
+async def catalog_record(req: RecordRequest) -> dict:
+    """지식카드 한 장 — 제목·요약·태그·본문 섹션·표·출처. 심층 보기의 읽기 칸 용(LLM 미경유)."""
+    tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
+    rid = req.id.strip()[:120]
+    if not tools or "get_record" not in tools:
+        return {"error": "gateway_unavailable", "id": rid}
+    rec = _first_dict(_parse_json(await _call(tools, "get_record", {"record_id": rid})))
+    if not rec.get("id"):
+        return {"error": "record_failed", "id": rid}
+    return _record_view(rec)
 
 
 @app.get("/artifacts/{name}")
