@@ -637,12 +637,15 @@ def _resolve_opts(req_opts):
         # 없으면 심의는 시작 시점 근거 스냅샷에 갇힌다(사전 조회의 상상력이 검증 범위의 상한).
         free_tools=_env_int("DELIB_FREE_TOOLS", 1),
         tool_budget=_env_int("DELIB_TOOL_BUDGET", 3),
+        # 이어하기 좌석 재심사 — 요청 단위로 끌 수 있어야 한다. 사람이 이어하기 명단을 **직접 고르면**
+        # 포털이 0 을 보낸다: 고른 명단 위에 재심사가 좌석을 몰래 더 얹으면 '고르게 했다'가 거짓이 된다.
+        rescreen=_RESCREEN,
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
                   "free_tools", "tool_budget", "stop_after_round", "build_plan",
-                  "rounds_so_far", "save_report", "append_to_report_id"):
+                  "rounds_so_far", "save_report", "append_to_report_id", "rescreen"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -739,6 +742,7 @@ def _resolve_opts(req_opts):
     o.rounds = max(2, min(8, o.rounds))                  # 라운드 수 2~8(기본 3=초기+심화1+수렴)
     o.rounds_so_far = max(0, min(64, o.rounds_so_far))   # 이어하기 표시 오프셋(폭주 방어)
     o.append_to_report_id = max(0, o.append_to_report_id)
+    o.rescreen = 1 if o.rescreen else 0
     o.tool_budget = max(1, min(6, o.tool_budget))        # 자유 조회 1인당 호출 상한
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
@@ -2609,7 +2613,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # '원 질문 + 이전 결론 + 사람 의견'이다. 좌석을 그 위에서 다시 뽑아 새 도메인을 연다.
         # 유임은 전원 유지하고 신규만 더한다(정원 확대) — 좌석을 빼면 그 도메인의 이전 발언에
         # 대한 책임 주체가 사라지기 때문. DELIB_RESCREEN=0 으로 종전 동작(재심사 없음) 복귀.
-        if _RESCREEN and (opts.continue_summary or opts.human_note):
+        if opts.rescreen and (opts.continue_summary or opts.human_note):
             eff_q = (f"{question}\n\n[이전 결론]\n{(opts.continue_summary or '')[:2000]}"
                      f"\n\n[사람 의견]\n{(opts.human_note or '')[:1000]}")
             _seated_dom = {_dom_of(p["key"]) for p in personas}
