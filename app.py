@@ -56,6 +56,7 @@ from deliberation import (
     _parse_json,
     _parse_json_multi,
     _tool_text_ok,
+    _has_defect_topic,
     _call,
     _llm_text,
     _tools_by_name,
@@ -2797,6 +2798,177 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
             "tools_used": ["search_voc"],
             **({"note": f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."}
                if total > len(items) else {})}
+
+
+# ── 심의 전 되묻기 — 메커니즘 분석에 필요한 최소 정보가 비었으면 몇 가지를 묻는다 ──────────
+# 화두 한 줄로 심의를 돌리면 좌석이 조건·범위를 **지어내며** 논의한다(낙하 높이도 온도 범위도
+# 모르는 채 파손 원인을 좁힌다). 빈 칸을 한 번에 모아 묻고(AIDataHub _scan_missing 선례 —
+# 여러 번 왕복하지 않는다), 답은 포털이 화두에 '[보강 정보]' 로 붙인다. 그러면 좌석 추천도
+# 그 정보를 보고 다시 뽑는다. 칸의 키는 여기서 고정한다 — LLM 이 칸을 지어내지 못하게.
+# (키, 이름, 설명 — 빈 칸이면 이것이 질문이 된다, 흔한 답 후보 — LLM 이 후보를 안 줬을 때)
+_CLARIFY_SLOTS: dict[str, list[tuple[str, str, str, list[str]]]] = {
+    "mechanism": [
+        ("target", "대상", "무엇에서 일어났나요 — 제품·부품·계면", []),
+        ("symptom", "현상", "어떻게 됐나요 — 관측된 그대로", ["크랙·파단", "변형·휨", "박리", "특성 저하"]),
+        ("condition", "조건", "어떤 하중·환경에서 났나요", ["낙하·충격", "온도 사이클", "고온고습", "반복 굽힘"]),
+        ("scope", "범위", "얼마나·언제부터·어디서만 났나요 — 발생률, 특정 로트·모델만인지",
+         ["특정 로트만", "특정 모델만", "전 모델", "장기 사용 후"]),
+        ("known", "이미 확인한 것", "해 본 시험·분석이나 의심하는 원인이 있나요",
+         ["파단면·단면 분석", "재현 시험", "해석", "아직 없음"]),
+    ],
+    "option-select": [
+        ("decision", "결정할 것", "무엇을 고르는 결정인가요", []),
+        ("options", "후보안", "비교할 안이 무엇인가요(2개 이상)", []),
+        ("criteria", "판단 기준", "무엇으로 우열을 가리나요", ["비용", "신뢰성", "일정", "양산성"]),
+        ("constraints", "제약", "넘으면 안 되는 선이 있나요 — 규격·일정·양산성", []),
+    ],
+    "credibility": [
+        ("subject", "판정 대상", "믿을지 따질 해석·모델·데이터가 무엇인가요", []),
+        ("use", "결정 용도", "그 결과로 무엇을 결정하려 하나요", ["설계 확정", "시험 대체", "원인 판정"]),
+        ("reference", "비교할 실측", "대조할 시험·현장 데이터가 있나요", ["시험 데이터 있음", "현장 데이터 있음", "없음"]),
+    ],
+    "test-plan": [
+        ("target", "대상 재료·부품", "무엇의 물성·성능을 확보하나요", []),
+        ("purpose", "용도", "그 값을 어떤 해석·판단에 쓰나요", ["낙하 해석", "열 해석", "피로 수명", "휨 예측"]),
+        ("range", "조건 범위", "온도·변형률 속도·습도 등 필요한 범위가 있나요", []),
+        ("have", "이미 있는 데이터", "보유 시험값·문헌값이 있나요", ["사내 시험값", "문헌값", "없음"]),
+    ],
+}
+_JOB_SLOTSET = {"diagnosis": "mechanism", "sim-plan": "mechanism", "build-plan": "mechanism",
+                "default": "mechanism", "option-select": "option-select",
+                "credibility": "credibility", "test-plan": "test-plan"}
+_CLARIFY_MAX_ASK = 4
+# 자유 심의는 사람이 방법을 고르지 않았으니, 물리 현상·불량 화두일 때만 칸을 묻는다. 이 판정을 LLM 에
+# 맡겼더니 dev 7B 가 '사내 교육 제도 개선' 에도 applicable=true 를 내고 낙하·온도 칸을 물었다(실측).
+_PHENOMENON_RE = re.compile(
+    r"휨|변형|발열|과열|누설|박리|부식|열화|피로|균열|마모|진동|소음|깨짐|들뜸|수명|강도"
+    r"|warpage|delamination|corrosion|fatigue|overheat|leak|vibration", re.IGNORECASE)
+
+
+def _clarify_applicable(job: str, text: str) -> bool:
+    if job != "default":                  # 사람이 방법을 골랐다 — 그 방법의 최소 정보는 늘 필요하다
+        return True
+    return bool(_has_defect_topic(text) or _PHENOMENON_RE.search(text))
+
+
+def _bigrams(t: str) -> set:
+    t = re.sub(r"[^0-9A-Za-z가-힣%°.+-]", "", str(t or "").lower())
+    return {t[i:i + 2] for i in range(len(t) - 1)} or ({t} if t else set())
+
+
+def _grounded(value: str, source: str, need: float = 0.6) -> bool:
+    """칸 값이 화두·대화에 **실제로 적혀 있나** — 글자 쌍 겹침으로 본다(조사·띄어쓰기에 안 흔들림).
+
+    ⚠ 왜 필요한가. 'present' 를 LLM 이 판정하게 두면 빈약한 화두에서도 전부 '있음'이라 하고 값을
+    **칸 설명에서 베껴 온다.** 실측(2026-09-11, dev qwen2.5-7b) — '폴드 힌지 파손 원인' 에
+    '조건: 낙하 높이 · 범위: 특정 로트 · 이미 확인한 것: 해 본 시험' 을 채웠다. 셋 다 화두에 없는
+    말이고 전부 설명문 예시였다. 되묻기가 가장 필요한 화두에서 아무것도 안 묻게 되는 결함이다."""
+    vb = _bigrams(value)
+    if not vb:
+        return False
+    sb = _bigrams(source)
+    return len(vb & sb) / len(vb) >= need
+
+
+_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _ko_text(t) -> str:
+    """한국어 화면에 쓸 문구만 — 한자가 섞이면 버린다. dev qwen2.5-7b 가 질문·후보를 중국어로
+    쓰는 일이 실측됐다('应力', '这种故障是普遍发生的…'). 그러면 칸 설명·기본 후보로 대신한다."""
+    t = str(t or "").strip()
+    return "" if _HAN_RE.search(t) else t
+
+
+def _slot_objects(raw: str, keys: list[str]) -> dict:
+    """칸 키별로 객체를 따로 뽑는다 — 출력 전체가 JSON 으로 안 읽혀도 읽히는 칸은 살린다.
+
+    실측(2026-09-11, dev qwen2.5-7b): JSON 을 쓰다가 한 칸의 문자열 **안에서** 날것 줄바꿈과
+    중국어 반복 잡문으로 무너졌다(2,078자). 바깥 객체가 안 읽히니 _parse_json 은 마지막으로
+    완결된 안쪽 칸 하나를 돌려주고, 되묻기가 통째로 'unparsed' 가 됐다. 칸 키는 우리가 정한
+    것이라 키 위치에서 따로 읽을 수 있다. strict=False 는 문자열 안 날것 제어문자를 허용한다."""
+    s = str(raw or "")
+    dec = json.JSONDecoder(strict=False)
+    out: dict = {}
+    for k in keys:
+        m = re.search(r'"%s"\s*:\s*\{' % re.escape(k), s)
+        if not m:
+            continue
+        try:
+            obj, _ = dec.raw_decode(s, m.end() - 1)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            out[k] = obj
+    return out
+
+
+class ClarifyRequest(BaseModel):
+    message: str
+    job: str = "default"
+    history: list[dict] = []
+
+
+@app.post("/deliberate/clarify")
+async def deliberate_clarify(req: ClarifyRequest) -> dict:
+    """빈 칸 스캔 — {applicable, slots:[{key,label,present,value,question,options}], ask:[key]}.
+
+    ⚠ 되묻기는 **절대 심의를 막지 않는다.** LLM 이 실패하거나 응답이 이상하면 ask=[] 로 돌려
+    묻지 않고 진행한다(묻지 못한 것을 '다 있다'로 꾸미지는 않는다 — error 로 알린다).
+    칸이 응답에서 빠지면 그 칸은 묻지 않는다(괴롭히지 않는 쪽으로 틀린다)."""
+    slots = _CLARIFY_SLOTS[_JOB_SLOTSET.get(req.job, "mechanism")]
+    hist: list[str] = []
+    budget = 3000
+    for m in req.history[-20:]:
+        t = str((m or {}).get("content") or "").strip()
+        if t and budget > 0:
+            hist.append(f"{m.get('role', 'user')}: {t[:budget]}")
+            budget -= len(t)
+    if not _clarify_applicable(req.job, req.message + "\n" + "\n".join(hist)):
+        return {"applicable": False, "slots": [], "ask": []}   # LLM 을 부르지도 않는다
+    spec = "\n".join(f"- {k}: {label} — {hint}" for k, label, hint, _o in slots)
+    try:
+        raw = await _llm_text(
+            app.state.llm, "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+            f"[화두]\n{req.message[:3000]}\n"
+            + (f"\n[앞선 대화]\n" + "\n".join(hist) + "\n" if hist else "")
+            + f"\n아래는 이 심의에 필요한 최소 정보 칸이다.\n{spec}\n\n"
+            "화두·대화에 **이미 적힌 것만** present=true 로 하고 value 에 짧게 옮겨라. 추측으로 채우지 마라. "
+            "비어 있으면 present=false, question 에 질문자에게 물을 한 문장(존댓말), 흔한 답 후보가 있으면 "
+            "options 에 짧은 낱말 2~4개(없으면 []). "
+            'JSON {"slots": {"<칸키>": {"present": bool, "value": "", "question": "", "options": []}}} 로만.')
+        v = _parse_json(raw) or {}
+    except Exception as exc:  # noqa: BLE001 — 되묻기 실패가 심의를 막으면 안 된다
+        print(f"[clarify] failed: {exc!r}")
+        return {"applicable": False, "slots": [], "ask": [], "error": "clarify_failed"}
+    got = v.get("slots") if isinstance(v.get("slots"), dict) else {}
+    if not got:
+        got = _slot_objects(raw, [k for k, *_ in slots])
+    if not got:                            # 알아듣지 못했다 — 묻지 않되 '다 있다'로 꾸미지 않는다
+        _r = str(raw)
+        print(f"[clarify] unparsed LLM output (len={len(_r)}): {_r[:160]!r} … {_r[-240:]!r}")
+        return {"applicable": False, "slots": [], "ask": [], "error": "clarify_unparsed"}
+    source = req.message + "\n" + "\n".join(hist)
+    out, ask = [], []
+    for key, label, hint, dflt in slots:
+        g = got.get(key)
+        if not isinstance(g, dict):
+            # 응답에서 빠진 칸 — 모델이 무너졌거나 빼먹었다. '있음'으로 칠 근거가 없으니 묻는다.
+            # (종전엔 묻지 않았는데, 그러면 모델이 무너진 칸이 바로 가장 필요한 질문이었다 — 실측.)
+            g = {}
+        # '있음' 은 값이 원문에 실재할 때만 — LLM 이 설명문을 베껴 채운 칸을 걸러낸다(_grounded).
+        present = bool(g.get("present")) and _grounded(str(g.get("value") or ""), source)
+        opts = [_ko_text(o)[:30] for o in (g.get("options") or []) if isinstance(o, str) and _ko_text(o)][:4] \
+            or list(dflt)
+        row = {"key": key, "label": label, "hint": hint, "present": present,
+               "value": str(g.get("value") or "").strip()[:200] if present else "",
+               # 근거 검사로 되돌린 칸은 LLM 이 질문을 안 달았다(있다고 여겼으니) — 칸 설명을 질문으로.
+               "question": (_ko_text(g.get("question"))[:200] if not g.get("present") else "") or hint,
+               "options": opts}
+        out.append(row)
+        if not present and len(ask) < _CLARIFY_MAX_ASK:
+            ask.append(key)
+    return {"applicable": True, "slots": out, "ask": ask}
 
 
 class AgentDetailRequest(BaseModel):
