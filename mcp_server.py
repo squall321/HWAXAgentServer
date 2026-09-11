@@ -180,7 +180,8 @@ async def deliberate_start(
                    eliminative(완결 기준) · anon1r(익명 1R). 최대 5개.
         evidence: 원천 근거 주입(최대 12). [{source, tool, args, result}] — 이미 도구로 뽑아 둔
                   결과를 좌석에 '검증 대상'으로 깐다. 결론이 아니라 원천만 넣어라.
-        personas: 좌석 지정(최대 12). [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다.
+        personas: 좌석 지정(최대 20 — deliberation.MAX_REQ_SEATS). [{key, role}] — 비우면 서버가
+                  recommend_agents 로 발굴한다.
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름(최대 6).
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다(최대 3).
         human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다(최대 2000자).
@@ -345,7 +346,7 @@ async def deliberate_jobs() -> dict:
         },
         "options": {
             "evidence": "이미 뽑아 둔 도구 결과를 원천 근거로 주입(≤12) — 결론 말고 원천만",
-            "personas": "좌석 직접 지정(≤12). 비우면 서버가 발굴한다",
+            "personas": "좌석 직접 지정(≤20). 비우면 서버가 발굴한다",
             "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달",
             "options": "후보안 목록(≤8). 2개 이상이면 최종 라운드가 그 중에서 고르는 표결을 요구한다",
