@@ -65,6 +65,12 @@ def _env_float(name: str, default: float) -> float:
 #   기록(RA 회의록) — 온전한 발언을 남긴다. DELIB_TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한.
 #   화면(회의 버블) — 가독성용 절단 유지, DELIB_CLIP_SCALE 로 배율 조절.
 N_PERSONAS = _env_int("DELIB_PERSONAS", 5)          # 참여 페르소나 수
+# 호출자가 지정할 수 있는 좌석 상한. ⚠ 포털 DelibOpts.personas(max_length)·ExpertPicker·
+# HandoffBrief 가 **같은 값**이어야 한다(tests/test_seat_cap_contract 가 대조한다).
+# 종전 12 는 능력 한계가 아니었다 — 저장 심의 실측에서 한 라운드 15석이 98% 완주했고,
+# 엔진이 얹는 좌석까지 21석 라운드도 있었다(감사 C22). 교차심문이 켜져 좌석 프롬프트가
+# O(N) 이 된 뒤로 20 으로 올렸다. 폭주 방지선으로는 여전히 필요하다(좌석 = 동시 LLM 호출).
+MAX_REQ_SEATS = 20
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
@@ -78,6 +84,12 @@ _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
 _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
 _DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라운드당 상한(자), 0=무제한
+# 좌석 프롬프트에 싣는 직전 라운드 텍스트 상한(자), 0=무제한. 의장엔 위 클립이 있는데 좌석엔
+# 없었다 — 그리고 **수렴 라운드는 교차심문과 무관하게** 직전 라운드 전문을 전원에게 준다
+# (실측 15석 수렴 직전 라운드 164,854자 × 15석). 넘치면 400 이지 절단이 아니라서 좌석이 유실된다
+# (docs/GLM-DELIB-TUNING-REVIEW.md §7). 48K 는 평범한 라운드를 건드리지 않는 선이다 —
+# 발언 중앙값 2,000자 × 20석 = 40K. 줄일 때는 좌석마다 같은 몫이다(_fit_rows).
+_SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
 # 동시 적용 시 지시 추종이 분산돼 효과가 상쇄되므로(§5 실행 순서) 한 번에 하나씩 A/B 할 것.
@@ -656,10 +668,14 @@ def _resolve_opts(req_opts):
         if isinstance(cp, list):
             # origin 승계 — 호출자(리스크 심사 러너 등)가 좌석 성격을 구분해 보내면 그대로 쓴다.
             # 화이트리스트는 _origin_label 이 아는 5종이다. 밖·미지정은 종전대로 carry 다(setdefault 와 같은 값).
+            _cp_ok = [p for p in cp if isinstance(p, dict) and p.get("key")]
             o.continue_personas = [{"key": str(p.get("key"))[:120], "role": str(p.get("role") or "")[:2000],
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
                                                else "carry")}
-                                   for p in cp[:12] if isinstance(p, dict) and p.get("key")]
+                                   for p in _cp_ok[:MAX_REQ_SEATS]]
+            # 잘린 좌석은 알린다 — 포털은 422 로 막지만 MCP 호출자는 여기까지 온다. 종전엔
+            # 13번째부터 소리 없이 사라졌다(발굴 단계에서 status 로 흘린다).
+            o.seats_clamped = [str(p.get("key")) for p in _cp_ok[MAX_REQ_SEATS:]]
         # 후보안 — 배열 또는 '1안 X | 2안 Y' 구분자 문자열 둘 다 받는다(JS 계약과 동일).
         op = req_opts.get("options")
         if isinstance(op, str):
@@ -1199,6 +1215,23 @@ def _ser(o: dict, keys: tuple, primary: str = "") -> str:
     if not picked and o.get("say"):
         picked = {"say": str(o.get("say"))[:800]}
     return json.dumps(picked, ensure_ascii=False)
+
+
+def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
+    """[(좌석키, 발언 직렬화)] 의 합이 budget 을 넘으면 **좌석마다 같은 몫**으로 줄인다.
+
+    반환 (rows, share) — share 는 줄였을 때의 좌석당 몫, 안 줄였으면 0.
+
+    의장용 `_cap_ctx` 는 머리·꼬리를 남긴다. 좌석에게 그러면 중간 좌석이 **통째로** 안 보인다
+    (감사 C22 — 머리만 남겼더니 완료순 앞쪽 3~4석만 닿았다). 수렴 라운드는 '형성된 다수 의견'을
+    읽고 스탠스를 정하는 자리라, 모두가 조금씩 보이는 쪽이 누군가가 전부 보이는 쪽보다 낫다.
+    floor 는 몫이 너무 작아 발언이 한 문장도 안 남는 것을 막는다(좌석이 아주 많을 때)."""
+    total = sum(len(t) for _, t in rows)
+    if budget <= 0 or not rows or total <= budget:
+        return rows, 0
+    share = max(budget // len(rows), floor)
+    return [(k, t if len(t) <= share else t[:share].rstrip() + f" …[{len(t):,}자 중 앞 {share:,}자]")
+            for k, t in rows], share
 
 
 def _cap_ctx(s: str) -> str:
@@ -2526,6 +2559,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     p["role"] = ((p["role"] or "") + "\n" + _RISK_SEAT_CONTRACT["_common"]
                                  + "\n" + _RISK_SEAT_CONTRACT[_dom])
         yield _sse("status", {"step": "지정 전문가 소집", "tool": "get_agent_session"})
+        if getattr(opts, "seats_clamped", None):
+            yield _sse("status", {"step": f"⚠ 좌석 상한 {MAX_REQ_SEATS}석 초과 — 제외: "
+                                          + ", ".join(opts.seats_clamped), "tool": None})
         # 이어하기 좌석 재심사(F10) — 이어하기의 실효 질문은 원 질문이 아니라
         # '원 질문 + 이전 결론 + 사람 의견'이다. 좌석을 그 위에서 다시 뽑아 새 도메인을 연다.
         # 유임은 전원 유지하고 신규만 더한다(정원 확대) — 좌석을 빼면 그 도메인의 이전 발언에
@@ -2736,6 +2772,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         kind = _kind(rnd)
         prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
         prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")
+        # 좌석에게 보여 줄 직전 라운드 — prev_t 와 같은 모양이되 _SEAT_CTX 를 넘으면 좌석마다
+        # 같은 몫으로 줄인다. prev_t(원본)는 인용 검증·자유조회·의장용으로 그대로 둔다.
+        _srows, _sshare = _fit_rows([(o["persona"], _ser_kind(o, prev_kind)) for o in prev_list], _SEAT_CTX)
+        prev_seat_t = ((f"[직전 라운드 {len(prev_t):,}자 — 좌석당 {_sshare:,}자로 줄임. 잘린 부분을 "
+                        "아는 척하지 마라]\n") if _sshare else "") + "\n".join(f"• {k}: {t}" for k, t in _srows)
+        if _sshare:
+            yield _sse("status", {"step": f"직전 라운드 {len(prev_t):,}자 — 좌석 프롬프트 상한 "
+                                          f"{_SEAT_CTX:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
         yield _delib("stage", stage=f"r{rnd}", n=len(personas))
@@ -2752,7 +2796,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             required, validator_fn, render = ("lens", "recommendation"), None, 1
 
         elif kind == "converge":
-            def prompt_fn(p, _pt=prev_t, _pno=prev_no):
+            def prompt_fn(p, _pt=prev_seat_t, _pno=prev_no):
                 # 입장 앵커 재주입(DELIB_ANCHOR) — 약한 모델의 수렴 라운드 동조 붕괴(전원이 평균 입장으로
                 # 뭉개짐) 방어. 자기 1R 핵심을 되돌려주고, 입장 변경엔 새 근거 명시를 요구(GLM 리뷰 §5).
                 anchor = ""
@@ -2788,13 +2832,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     + (" …" if len(cross_tg) > 6 else ""), "tool": None})
 
             def _ctx(p, _pl=prev_list, _pk=prev_keys, _pbk=prev_by_key, _pt=prev_t,
-                     _pno=prev_no, _pkind=prev_kind, _tg=cross_tg, _on=_xexam):
+                     _pno=prev_no, _pkind=prev_kind, _tg=cross_tg, _on=_xexam, _pst=prev_seat_t):
                 # (컨텍스트, 인용 실재 검증 대상 문자열)
                 if not _on:
-                    return f"[{_dr(_pno)}라운드 전원]\n{_pt}", _pt
+                    # 보여 주는 건 줄인 판, 인용 검증은 원본 — 보지 못한 부분을 인용할 수는 없으니
+                    # 원본으로 검증해도 허위 통과가 생기지 않는다.
+                    return f"[{_dr(_pno)}라운드 전원]\n{_pst}", _pt
                 # 배정이 없는 좌석(신규 착석 등)은 자기 아닌 첫 좌석으로 폴백한다.
                 tkeys = _tg.get(p["key"]) or [k for k in _pk if k != p["key"]][:1]
-                blocks = "\n\n".join(f"— {tk} —\n{_ser_kind(_pbk[tk], _pkind)}" for tk in tkeys)
+                # 표적 원본도 상한 안에서 — DELIB_CROSS_TARGETS 를 올리면 표적 합이 커진다.
+                _trows, _ = _fit_rows([(tk, _ser_kind(_pbk[tk], _pkind)) for tk in tkeys], _SEAT_CTX)
+                blocks = "\n\n".join(f"— {tk} —\n{t}" for tk, t in _trows)
                 others = "\n".join(
                     f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('deepen') or o.get('lens'), 160)}"
                     for o in _pl if o["persona"] not in tkeys)
