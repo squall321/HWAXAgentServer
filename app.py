@@ -1140,7 +1140,7 @@ def _tok_query(text: str) -> set[str]:
 # 도구 → 소유 MCP 앱(백엔드) 매핑 — 166개가 평평하게 쏟아지면 고르기 어려워, 게이트웨이의
 # /tools-map 으로 '어느 앱의 기능인지'를 붙여 계층 선택이 되게 한다(짧은 TTL 캐시).
 _GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
-_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}}
+_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
@@ -1191,9 +1191,14 @@ def _tools_map() -> dict:
         return _TOOLS_MAP_CACHE["map"]
     try:
         with urllib.request.urlopen(f"{_GW_HTTP}/tools-map", timeout=5) as r:
-            m = (json.loads(r.read()) or {}).get("map") or {}
+            data = json.loads(r.read()) or {}
+        m = data.get("map") or {}
         if m:
-            _TOOLS_MAP_CACHE.update({"at": now, "map": m})
+            # 영역(tool_areas.json)도 같은 응답에 온다 — 따로 받지 않는다. 구 게이트웨이면 빈 채로
+            # 두어 도구가 '미분류' 로 보인다(분류를 지어내지 않는다).
+            _TOOLS_MAP_CACHE.update({"at": now, "map": m, "areas": data.get("areas") or {},
+                                     "area_meta": {a["area"]: a for a in (data.get("area_meta") or [])
+                                                   if isinstance(a, dict) and a.get("area")}})
     except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
         print(f"[tools] map fetch failed: {exc!r}")
     return _TOOLS_MAP_CACHE["map"]
@@ -1213,6 +1218,13 @@ def _pretty_group(key: str) -> str:
 def _group_of(name: str) -> tuple:
     key = _tools_map().get(name, "")
     return key, (_app_label(key) if key else "")
+
+
+def _area_of(name: str) -> tuple:
+    """도구 → (영역 키, 영역 라벨) — 게이트웨이 tool_areas.json 판정 그대로. 미분류는 ('', '')."""
+    _tools_map()  # 캐시 갱신(영역은 같은 응답에 실려 온다)
+    key = _TOOLS_MAP_CACHE["areas"].get(name, "")
+    return key, ((_TOOLS_MAP_CACHE["area_meta"].get(key) or {}).get("label") or "" if key else "")
 
 
 def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
@@ -1241,7 +1253,9 @@ def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
     out = []
     for sc, n, d in scored[:top_k]:
         gk, gl = _group_of(n)
-        out.append({"name": n, "desc": d, "score": round(sc, 3), "group": gk, "group_label": gl})
+        ak, al = _area_of(n)
+        out.append({"name": n, "desc": d, "score": round(sc, 3), "group": gk, "group_label": gl,
+                    "area": ak, "area_label": al})
     return out
 
 
@@ -1249,8 +1263,9 @@ def _tool_catalog(tools: dict) -> list[dict]:
     out = []
     for n, t in sorted(tools.items()):
         gk, gl = _group_of(n)
+        ak, al = _area_of(n)
         out.append({"name": n, "desc": (getattr(t, "description", "") or "")[:160],
-                    "group": gk, "group_label": gl})
+                    "group": gk, "group_label": gl, "area": ak, "area_label": al})
     return out
 
 
@@ -1267,6 +1282,24 @@ def _app_catalog(tools: dict) -> list[dict]:
             n_by[gk] = n_by.get(gk, 0) + 1
     return [{"app": k, "label": _app_label(k), "desc": _app_desc(k)[:200], "tool_count": v}
             for k, v in sorted(n_by.items(), key=lambda kv: -kv[1])]
+
+
+def _area_catalog(tools: dict) -> list[dict]:
+    """도구 영역 목록 — 도구 선택 UI 의 1단(하는 일로 고르기). _app_catalog 와 같은 규칙으로
+    **이 사용자에게 보이는 도구**만 센다. 순서는 분류표(tool_areas.json)에 적힌 순서다 — 사람이
+    읽는 순서(CAD → 메시 → 실행 → 계산 → 결과 …)라 인원순으로 섞지 않는다.
+    미분류가 있으면 끝에 area='' 로 붙인다 — 숨기면 새 앱의 도구가 영역 보기에서 사라진다."""
+    _tools_map()
+    meta = _TOOLS_MAP_CACHE["area_meta"]
+    n_by: dict[str, int] = {}
+    for n in tools:
+        ak, _ = _area_of(n)
+        n_by[ak] = n_by.get(ak, 0) + 1
+    out = [{"area": k, "label": m.get("label") or k, "desc": (m.get("description") or "")[:200],
+            "tool_count": n_by[k]} for k, m in meta.items() if n_by.get(k)]
+    if n_by.get(""):
+        out.append({"area": "", "label": "미분류", "desc": "영역 분류표에 없는 도구", "tool_count": n_by[""]})
+    return out
 
 
 # 에이전트(전문가) 검색 — 도구와 같은 구조적 문제. LLM 에 659명을 나열시키면 결과 절단 캡에
@@ -1386,7 +1419,7 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
     recommended = _rank_tools(tools, query)
     catalog = _tool_catalog(tools)
     yield _sse("tools", {"query": query, "recommended": recommended, "all": catalog,
-                         "apps": _app_catalog(tools)})
+                         "apps": _app_catalog(tools), "areas": _area_catalog(tools)})
     if recommended:
         head = ", ".join(r["name"] for r in recommended[:5])
         text = (f"질의와 관련된 도구 {len(recommended)}개를 추천합니다(상위: {head}). "
@@ -2677,9 +2710,11 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
             nm = rt.get("name")
             if nm:
                 gk, gl = _group_of(nm)
+                ak, al = _area_of(nm)
                 expert_tools.append({
                     "name": nm, "desc": (rt.get("description") or "")[:160],
                     "score": rt.get("score"), "group": gk, "group_label": gl,
+                    "area": ak, "area_label": al,
                     "agents": list(rt.get("compatible_agents") or [])[:8],
                 })
     except Exception as exc:  # noqa: BLE001 — 연결 정보 없으면 생략
@@ -2690,6 +2725,7 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         "pipeline": [n for n in _PIPELINE_TOOLS if n in tools],
         "all": _tool_catalog(tools),
         "apps": _app_catalog(tools),
+        "areas": _area_catalog(tools),
     }
     # axes — 대화에서 뽑은 도메인 축. 화면이 "왜 이 좌석인지"를 보여주는 근거다.
     # 빈 배열이면 화두 한 줄로만 추천했다는 뜻이고, 화면도 그렇게 말해야 한다.
