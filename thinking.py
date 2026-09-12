@@ -193,7 +193,7 @@ _JUDGE_SYS = (
 )
 
 
-def _judge_prompt(seat: dict, question: str) -> str:
+def _judge_prompt(seat: dict, question: str, docs: str = "") -> str:
     kn = seat.get("knowledge") or ""
     ev = (f"[당신의 지식카드 — 이 질문 관련 발췌]\n{kn}\n"
           if kn else
@@ -201,7 +201,9 @@ def _judge_prompt(seat: dict, question: str) -> str:
     return (
         f"[당신]\n{seat['key']} — {seat.get('role') or seat.get('name') or ''}\n\n"
         f"{ev}\n"
-        f"[질문]\n{question}\n\n"
+        f"[질문]\n{question}\n"
+        + (f"{docs}\n" if docs else "")
+        + "\n"
         "먼저 스스로 판정하세요. **이 질문이 당신 도메인의 질문이고, 위 발췌나 당신의 전문 지식으로 "
         "실질적인 답을 줄 수 있습니까?** 어휘가 익숙하다는 것과 답할 수 있다는 것은 다릅니다. "
         "인접 도메인이라 겉핥기만 가능하다면 그것은 답할 수 없는 것입니다.\n\n"
@@ -221,12 +223,13 @@ def _judge_prompt(seat: dict, question: str) -> str:
     )
 
 
-async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore) -> dict:
+async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
+                     docs: str = "") -> dict:
     """좌석 1명의 자기판정 + (가능하면) 답변. 실패·시간초과는 pass 가 아니라 error 로 남긴다."""
     async with sem:
         try:
             raw = await asyncio.wait_for(
-                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question)), SEAT_TIMEOUT_S)
+                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs)), SEAT_TIMEOUT_S)
         except asyncio.TimeoutError:
             return {**seat, "verdict": "error", "scope": "", "answer": "",
                     "basis": [], "refer": [], "error": f"{SEAT_TIMEOUT_S:.0f}초 초과"}
@@ -316,8 +319,13 @@ def _summary_text(question: str, answered: list, passed: list, screened: list,
 
 
 # ── 스트림 본체 ───────────────────────────────────────────────────────────────
+# 띵킹은 좌석이 **동시에** 여러 명 돌아 문서가 좌석 수만큼 배로 든다(자기판정 단계는 선별된
+# 좌석 전원이 돈다). 챗 한 번에 주는 몫을 그대로 주면 한 발화에 수백만 토큰이 나간다.
+THINK_DOC_SHARE = float(os.environ.get("THINK_DOC_SHARE", "0.5"))
+
+
 async def run_thinking(app, question: str, groups: list, user: str = "", user_pat: str = "",
-                       history: list | None = None):
+                       history: list | None = None, documents: list | None = None):
     """띵킹 모드 SSE 제너레이터. 어떤 경로로 끝나든 result → done 으로 닫는다."""
     q = str(question or "").strip()
     if not q:
@@ -329,6 +337,13 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
     # 코드가 JSON 을 파싱하는 경로다 — LLM 보호용 절단을 걸면 응답이 중간에서 끊겨
     # '추천 0명' 이 조용히 나온다(run_agent_search 와 같은 규약).
     from app import CATALOG_RESULT_MAX  # noqa: PLC0415 — 순환 import 회피(늦은 로드)
+    # 붙인 문서 — 좌석 프롬프트에만 싣는다. q(질문)에 붙이면 recommend_agents 검색어가
+    # 수십만 자가 되어 전문가 발굴이 통째로 망가진다.
+    _docs = ""
+    if documents:
+        from app import _doc_block, _doc_budget_tokens  # noqa: PLC0415
+        _docs = _doc_block(documents,
+                           budget_tokens=max(2000, int(_doc_budget_tokens(0) * THINK_DOC_SHARE)))
     yield _sse("status", {"step": "전문가 소집", "tool": "recommend_agents"})
     tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, user=user, user_pat=user_pat)
     if not tools or "recommend_agents" not in tools:
@@ -382,7 +397,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
             s["role"] = r
 
         yield _sse("status", {"step": f"본심 — 좌석별 자기판정·답변({len(live)}명)", "tool": None})
-        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem)) for s in live]
+        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem, _docs)) for s in live]
         try:
             for fut in asyncio.as_completed(tasks):
                 r = await fut

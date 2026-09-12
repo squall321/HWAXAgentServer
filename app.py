@@ -1864,7 +1864,7 @@ def _doc_total_chars(documents=None, history_tokens: int = 0) -> int:
 
 
 
-def _doc_block(documents, history_tokens: int = 0) -> str:
+def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> str:
     """붙인 문서를 시스템 프롬프트에 실을 블록으로.
 
     세 갈래(첫 호출·재시도·강제 도구호출)가 모두 sys_prompt 를 공유하므로 여기 실으면
@@ -1878,7 +1878,10 @@ def _doc_block(documents, history_tokens: int = 0) -> str:
     if not docs:
         return ""
     docs = docs[:DOC_MAX_FILES]
-    share = max(2000, _doc_total_chars(docs, max(0, history_tokens)) // len(docs))
+    total = (_chars_for_tokens("".join(str((d or {}).get("text") or "")[:20000] for d in docs)
+                               or "가나다", budget_tokens)
+             if budget_tokens > 0 else _doc_total_chars(docs, max(0, history_tokens)))
+    share = max(2000, total // len(docs))
     parts = []
     for i, d in enumerate(docs, start=1):
         name = str(d.get("name") or f"문서{i}")[:260]
@@ -2886,7 +2889,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 명시 슬래시 트리거(/심의·/도구 등)보다 **뒤**에 둔다: 모드가 켜져 있어도 그 턴에
         # 사용자가 대놓고 /심의 를 치면 그 의도가 이긴다.
         stream = run_thinking(app, strip_thinking_trigger(req.message), req.groups,
-                              req.user_email, req.user_pat, req.history)
+                              req.user_email, req.user_pat, req.history, req.documents)
     else:
         stream = _agent_stream(app, req)
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)

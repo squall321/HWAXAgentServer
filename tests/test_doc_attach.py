@@ -372,3 +372,36 @@ def test_이력_예산이_컨텍스트를_넘지_않는다(monkeypatch):
             chars = app._hist_budget_chars(has_docs=has_docs)
             tok = app._est_tokens("가" * chars)       # 한국어 최악
             assert tok < ctx, f"컨텍스트 {ctx:,}인데 이력 예산만 {tok:,}토큰(docs={has_docs})"
+
+
+# ── 띵킹 모드 — 좌석 프롬프트에 문서가 들어가되 질문에는 안 섞인다 ──────────────────
+def test_띵킹_좌석_프롬프트에_문서가_실린다():
+    import thinking
+
+    seat = {"key": "pcb-expert", "role": "PCB 설계", "knowledge": "카드 발췌"}
+    docs = app._doc_block([_doc("설계.hwax.md", 500)])
+    p = thinking._judge_prompt(seat, "굽힘 수명이 왜 부족한가", docs)
+    assert "사용자가 붙인 문서" in p
+    assert "굽힘 수명이 왜 부족한가" in p
+    # 문서가 없으면 빈 자리가 생기지 않는다(프롬프트가 지저분해지면 형식 준수율이 떨어진다).
+    assert "사용자가 붙인 문서" not in thinking._judge_prompt(seat, "질문")
+
+
+def test_띵킹_문서_몫은_챗보다_작다():
+    """좌석이 동시에 여러 명 돌아 문서가 좌석 수만큼 배로 든다 — 챗과 같은 몫을 주면
+    한 발화에 수백만 토큰이 나간다."""
+    import thinking
+
+    assert 0 < thinking.THINK_DOC_SHARE < 1
+
+
+def test_문서는_전문가_발굴_검색어에_안_섞인다():
+    """q 에 문서를 붙이면 recommend_agents 검색어가 수십만 자가 되어 발굴이 통째로 망가진다.
+    좌석 프롬프트에만 실어야 한다."""
+    import inspect
+
+    import thinking
+
+    src = inspect.getsource(thinking.run_thinking)
+    assert "_docs = _doc_block" in src
+    assert "q += _docs" not in src and "q = q +" not in src
