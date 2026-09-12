@@ -92,6 +92,15 @@ _DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라�
 # (docs/GLM-DELIB-TUNING-REVIEW.md §7). 48K 는 평범한 라운드를 건드리지 않는 선이다 —
 # 발언 중앙값 2,000자 × 20석 = 40K. 줄일 때는 좌석마다 같은 몫이다(_fit_rows).
 _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
+# 사전 컨텍스트(챗 핸드오프 원천 근거·업로드 문서) 예산 — 좌석 프롬프트에 통째로 실린다.
+# 종전 값(항목 2,000자 · 합계 11,000자)은 챗 도구결과 몇 건을 나르려고 잡은 것이라, 발표자료나
+# 보고서 한 건(추출하면 보통 30,000~80,000자)을 실으면 **첫 항목에서 잘려** 심의가 표지만 보고
+# 논의했다. 좌석 컨텍스트 상한(_SEAT_CTX 48K)과 같은 자릿수로 맞춘다.
+_EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
+_EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 12000)   # 항목당 상한(자)
+_EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
+_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 60000)       # 주입 합계 상한(자)
+_EVID_SHOW = _env_int("DELIB_EVID_SHOW", 4000)            # 화면 근거 카드 표시 상한(자)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
 # 동시 적용 시 지시 추종이 분산돼 효과가 상쇄되므로(§5 실행 순서) 한 번에 하나씩 A/B 할 것.
@@ -710,22 +719,23 @@ def _resolve_opts(req_opts):
                     seen.add(m)
                     picked.append(m)
             o.modifiers = picked[:5]
-        # 챗 핸드오프 원천 근거 — 항목당 {source, tool, args, result} 로 정규화·클램프(≤12항목).
-        # 결과 없는 항목은 근거가 아니므로 버린다.
+        # 챗 핸드오프 원천 근거 — 항목당 {source, tool, args, result} 로 정규화·클램프.
+        # 결과 없는 항목은 근거가 아니므로 버린다. 상한은 _EVID_* 손잡이다(문서 한 건이 들어간다).
         ev = req_opts.get("evidence")
         if isinstance(ev, list):
             o.evidence = []
-            for it in ev[:12]:
+            for it in ev[:_EVID_ITEMS]:
                 if not isinstance(it, dict):
                     continue
                 res = str(it.get("result") or "").strip()
                 if not res:
                     continue
                 o.evidence.append({
-                    "source": str(it.get("source") or it.get("source_app") or "챗")[:120],
+                    "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
                     "tool": str(it.get("tool") or "")[:80],
-                    "args": str(it.get("args") or "")[:400],
-                    "result": res[:2000] + (f" …[{len(res):,}자 중 2,000자]" if len(res) > 2000 else ""),
+                    "args": str(it.get("args") or "")[:_EVID_ARGS_MAX],
+                    "result": res[:_EVID_ITEM_MAX] + (
+                        f" …[{len(res):,}자 중 {_EVID_ITEM_MAX:,}자]" if len(res) > _EVID_ITEM_MAX else ""),
                 })
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
@@ -2731,24 +2741,30 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="이전 심의 양보 불가 조항",
                      text="\n".join(f"- {x}" for x in opts.continue_non_negotiables)[:1500], included=True)
     if opts.human_note:
-        yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:1500], included=True)
+        yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:_EVID_SHOW], included=True)
     # 챗 워크스페이스 핸드오프 원천 근거(P1) — 요약이 아니라 날것 도구결과+출처를 좌석에 준다.
     # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
-    # 예산(≈11KB) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).
+    # 예산(_EVID_BUDGET) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).
     chat_ev_inject = ""
     if opts.evidence:
-        _items, _budget = [], 0
+        _items, _budget, _dropped = [], 0, 0
         for _ei, _e in enumerate(opts.evidence, start=1):
             _src, _res = _e.get("source") or "챗", _e.get("result", "")
             _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
             # [e:N] 안정 id — 좌석·의장이 근거 항목을 지목해 인용할 참조 체계(JS 파이프라인 파리티).
             _line = f"· [e:{_ei}] [{_src}{_meta}] {_res}"
-            if _budget + len(_line) > 11000 and _items:
+            if _budget + len(_line) > _EVID_BUDGET and _items:
+                _dropped = len(opts.evidence) - len(_items)
                 break
             _items.append(_line)
             _budget += len(_line)
-            yield _delib("evidence", source=f"챗 정리 · {_src}", text=_res[:1500], included=True)
+            yield _delib("evidence", source=f"챗 정리 · {_src}", text=_res[:_EVID_SHOW], included=True)
             ev_count["tool"] += 1
+        # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
+        if _dropped:
+            yield _delib("evidence", source="사전 근거 예산 초과",
+                         text=f"근거 {len(opts.evidence)}건 중 뒤쪽 {_dropped}건은 예산"
+                              f"({_EVID_BUDGET:,}자)을 넘겨 좌석에 주지 않았다.", included=False)
         if _items:
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
                               "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라. 이 항목의 "
