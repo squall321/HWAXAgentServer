@@ -16,6 +16,7 @@ Job 7종은 `frontend/src/components/chat/delibTaxonomy.ts`, 손잡이는 `delib
 from __future__ import annotations
 
 import logging
+from urllib.parse import unquote
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -85,6 +86,9 @@ def _caller(ctx: Context | None) -> tuple[str, list[str]]:
             return "", []
         user = (hdr.get("x-hwax-user") or "").strip()
         raw = (hdr.get("x-hwax-groups") or "").strip()
+        # 퍼센트 인코딩을 되돌린다 — 게이트웨이는 한글 그룹명 때문에 인코딩해 보내고, 권한 키의
+        # `:` 까지 인코딩되면(feat%3Achat) 그대로 쓰는 순간 전 키가 무효가 된다(실측: 심의 좌석 0명).
+        raw = unquote(raw)
         groups = [g.strip() for g in raw.replace(";", ",").split(",") if g.strip()]
         return user, groups
     except Exception:  # noqa: BLE001 — 신원 확보 실패가 심의를 막으면 안 된다
