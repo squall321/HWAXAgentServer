@@ -111,8 +111,6 @@ _evid_cache: dict = {}
 
 def _evid_budget() -> int:
     """이번 심의에서 사전 근거에 줄 글자 예산 — 천장과 컨텍스트 중 작은 쪽."""
-    if os.environ.get("DELIB_EVID_BUDGET"):
-        return _EVID_BUDGET                       # 사람이 못박았으면 그 값이 이긴다
     if "n" in _evid_cache:
         return _evid_cache["n"]
     try:
@@ -121,6 +119,8 @@ def _evid_budget() -> int:
     except Exception:
         ctx = 128000
     avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
+    # env 값(_EVID_BUDGET)은 **낮추기만** 한다 — 올리는 쪽으로 두면 낡은 설정 한 줄이
+    # 좌석 프롬프트를 컨텍스트 밖으로 밀어내고, 심의는 좌석이 동시에 죽는다.
     n = min(_EVID_BUDGET, max(2000, int(avail * _EVID_KO_CPT)))
     _evid_cache["n"] = n
     return n

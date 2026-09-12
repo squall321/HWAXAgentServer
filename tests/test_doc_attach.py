@@ -38,7 +38,7 @@ def test_문서_예산은_모델_컨텍스트에서_나온다():
     틀리고, 틀리면 400 이라 사용자에게는 '응답 생성 실패' 로만 보인다 — 실측으로 터졌다."""
     ko = [{"text": "한글 본문입니다. " * 100}]
     en = [{"text": "English body text here. " * 100}]
-    assert app._doc_budget_tokens(0) == 128000 - app.DOC_RESERVE_TOKENS
+    assert app._doc_budget_tokens(0) == int((128000 - app.DOC_RESERVE_TOKENS) * app.DOC_SAFETY)
     # 같은 토큰 예산이라도 글자 수는 글 구성에 따라 다르다 — 한 값으로 뭉뚱그리면
     # 한국어에서 400 이 나거나 영문에서 창의 3분의 1만 쓴다.
     assert _budget(en) > _budget(ko) * 2, "영문/한국어 토큰 밀도 차이가 반영 안 됐다"
@@ -60,7 +60,7 @@ def test_긴_대화_중이면_문서_예산이_줄어든다():
     중에 문서를 붙이는 순간 400 이 난다."""
     none_ = app._doc_budget_tokens(0)
     some = app._doc_budget_tokens(40000)
-    assert some == none_ - 40000
+    assert some == pytest.approx(none_ - 40000 * app.DOC_SAFETY, abs=2)
     # 이력이 창을 다 먹었으면 **없는 자리를 있다고 하지 않는다**(바닥값이 그 버그였다).
     assert app._doc_budget_tokens(500000) <= 1500
 
@@ -227,14 +227,99 @@ def test_심의_예산도_큰_컨텍스트에서_더_준다():
     d._evid_cache.clear()
 
 
-def test_사람이_못박으면_그_값이_이긴다(monkeypatch):
-    """운영에서 컨텍스트 조회가 틀리거나 더 줄이고 싶을 때 손잡이가 있어야 한다."""
+def test_env_는_낮추기만_한다(monkeypatch):
+    """낡은 .env 한 줄이 컨텍스트를 조용히 넘겨 400 을 만들면 안 된다 — 실측으로 그렇게
+    터졌다(dev .env 의 HIST_BUDGET=16000 이 16,384 창을 넘겼다).
+    탐지가 틀려 창을 **크게** 잡아야 하면 그건 LLM_CONTEXT_TOKENS 로 고칠 일이다."""
     import importlib
 
+    app._ctx_cache["n"] = 128000
+    # 낮추는 쪽 — 그대로 먹힌다.
     monkeypatch.setenv("DELIB_EVID_BUDGET", "5000")
     import deliberation as d
 
     importlib.reload(d)
+    d._evid_cache.clear()
     assert d._evid_budget() == 5000
+
+    # 올리는 쪽 — 컨텍스트가 이긴다.
+    monkeypatch.setenv("DELIB_EVID_BUDGET", "9999999")
+    importlib.reload(d)
+    d._evid_cache.clear()
+    assert d._evid_budget() < 9999999
+
     monkeypatch.delenv("DELIB_EVID_BUDGET")
     importlib.reload(d)
+    d._evid_cache.clear()
+
+
+def test_이력_env_도_낮추기만_한다(monkeypatch):
+    app._ctx_cache["n"] = 16384
+    monkeypatch.setenv("HIST_BUDGET", "200000")     # 창보다 훨씬 큰 낡은 설정
+    big = app._hist_budget_chars()
+    monkeypatch.delenv("HIST_BUDGET")
+    assert big == app._hist_budget_chars(), "env 가 컨텍스트를 넘겨 올렸다"
+
+
+# ── 이력 압축 — 오래된 턴을 버리지 않는다 ──────────────────────────────────────────
+def _hist(n: int, each: int = 3000):
+    out = [{"role": "user", "content": "이번 과제는 폴더블 힌지 FPCB 굽힘 수명 20만회다."}]
+    for i in range(2, n + 1):
+        out.append({"role": "user" if i % 2 else "assistant",
+                    "content": f"턴 {i}. " + ("설명 문장이 이어집니다. " * (each // 12))})
+    return out
+
+
+def test_예산_안이면_전부_원문이다():
+    st = {}
+    msgs = app._history_messages(_hist(4, 500), st)
+    assert st["compacted"] == 0 and len(msgs) == 4
+
+
+def test_넘치면_버리지_않고_압축해_넣는다():
+    """종전에는 오래된 턴을 통째로 버렸다 — 모델은 그런 대화가 있었다는 것조차 몰랐고,
+    사용자는 '아까 말했잖아' 가 왜 안 통하는지 알 수 없었다."""
+    hist = _hist(40)
+    st = {}
+    msgs = app._history_messages(hist, st)
+
+    assert st["compacted"] > 0, "이 시험용 이력이 예산을 안 넘는다 — 시험이 무의미하다"
+    assert st["kept"] > 0, "최근 턴까지 압축되면 대화가 끊긴다"
+    digest = msgs[0][1]
+    assert "이전 대화" in digest and "압축" in digest
+    assert "폴더블 힌지 FPCB" in digest, "첫 턴(과제 규정)이 사라졌다"
+    assert "지어내지 말고" in digest, "압축본이라는 걸 모델에게 안 알렸다"
+    # 최근 턴은 원문 그대로다.
+    assert f"턴 {len(hist)}" in msgs[-1][1]
+
+
+def test_압축본도_예산_안에_들어간다():
+    """압축이 예산을 넘기면 압축하는 의미가 없다 — 400 은 똑같이 난다."""
+    st = {}
+    msgs = app._history_messages(_hist(60), st)
+    total = sum(len(c) for _, c in msgs)
+    assert total <= st["budget"] * 1.05, f"{total:,}자가 예산 {st['budget']:,}자를 넘겼다"
+
+
+def test_사용자_턴을_어시스턴트_턴보다_많이_남긴다():
+    """요구·결정은 사용자 턴에 있다. 같은 글자를 쓸 거면 그쪽을 남기는 게 복원력이 높다."""
+    dropped = [("user", "사" * 4000), ("assistant", "어" * 4000)]
+    out = app._compact_turns(dropped, 2000)
+    assert out.count("사") > out.count("어")
+
+
+def test_이력과_문서_예산이_동시에_컨텍스트에_들어간다(monkeypatch):
+    """둘은 같은 창을 다툰다. 각각은 맞는데 **합치면 넘는** 경우가 실제로 있었다
+    (실측 128,000 창에서 142토큰 초과 — 토큰↔글자 왕복 변환 오차)."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    for ctx in (128000, 200000, 1000000):
+        app._ctx_cache["n"] = ctx
+        hist_chars = app._hist_budget_chars()
+        hist_tokens = app._est_tokens("가" * hist_chars)        # 한국어 최악
+        doc_chars = app._doc_total_chars([{"text": "가" * 100}], hist_tokens)
+        doc_tokens = app._est_tokens("가" * doc_chars)
+        total = hist_tokens + doc_tokens + app.DOC_RESERVE_TOKENS
+        assert total <= ctx, (
+            f"컨텍스트 {ctx:,}토큰인데 이력({hist_tokens:,}) + 문서({doc_tokens:,}) + "
+            f"예비분({app.DOC_RESERVE_TOKENS:,}) = {total:,}토큰이다"
+        )

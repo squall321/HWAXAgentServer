@@ -485,8 +485,12 @@ CATALOG_DESC_MAX = int(os.environ.get("CATALOG_DESC_MAX", "4000"))
 # 소형 모델 박스(dev qwen 16K)만 .env 로 낮춘다 — 반대로 잡으면 prod 가 dev 사이즈에 묶인다.
 TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "2400"))  # 도구 description 절단(문자)
 HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "24000"))  # history 항목별 절단(문자)
-HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "200000"))  # history 전체 예산(문자) — 최신 우선
 HIST_MAX_ITEMS = int(os.environ.get("HIST_MAX_ITEMS", "80"))  # history 최대 항목 수
+# 이력 예산은 **컨텍스트에서 유도**한다. 종전 고정 200,000자는 한국어로 약 190,000토큰이라
+# GLM 128K 를 이력만으로 넘긴다 — 문서까지 붙이면 그대로 400 이다. env 로 못박으면 그 값이 이긴다.
+HIST_CTX_SHARE = float(os.environ.get("HIST_CTX_SHARE", "0.40"))   # 이력이 가져갈 수 있는 최대 몫
+# 예산을 넘긴 오래된 턴을 **버리지 않고** 압축해 넣는다. 이 몫이 그 압축본에 쓰인다.
+HIST_COMPACT_SHARE = float(os.environ.get("HIST_COMPACT_SHARE", "0.20"))
 
 
 def _cap(text, limit=None):
@@ -1662,10 +1666,58 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     return cache[key]
 
 
-def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
+def _hist_budget_chars(sample: str = "") -> int:
+    """이력에 줄 글자 예산.
+
+    env HIST_BUDGET 은 **낮추기만** 한다. 올리는 쪽으로 두면 낡은 .env 한 줄이 컨텍스트를
+    조용히 넘겨 400 을 만든다(실측: dev .env 의 HIST_BUDGET=16000 이 16,384 창을 넘겼다).
+    탐지가 틀려 창을 크게 잡아야 하면 그건 LLM_CONTEXT_TOKENS 로 고칠 일이다.
+    """
+    tokens = int((_model_context_tokens() - DOC_RESERVE_TOKENS) * HIST_CTX_SHARE)
+    derived = max(1500, _chars_for_tokens(sample or "가나다라", max(1200, tokens)))
+    forced = os.environ.get("HIST_BUDGET")
+    return min(derived, max(1500, int(forced))) if forced else derived
+
+
+def _compact_turns(dropped: list, budget: int) -> str:
+    """예산 밖으로 밀려난 오래된 턴을 **버리지 않고** 한 덩어리로 압축한다.
+
+    종전에는 그냥 버렸다. 그러면 모델은 그런 대화가 있었다는 것조차 모르고, 사용자는
+    "아까 말했잖아" 가 왜 안 통하는지 모른다 — 화면에도 아무 흔적이 없다.
+
+    LLM 요약을 쓰지 않는 이유는 지연과 비용이다. 이력은 **매 턴** 다시 들어오므로 요약도
+    매 턴 다시 해야 한다. 대신 발췌로 압축한다 — 첫 턴(대개 과제를 규정한다)에 몫을 더
+    주고 나머지는 머리를 남긴다. 무엇이 압축됐는지 모델이 알면 사용자에게 되물을 수 있다.
+    """
+    if not dropped or budget < 200:
+        return ""
+    lines, n = [], len(dropped)
+    # 몫을 균등하게 주지 않는다. **사용자 턴이 요구·결정을 담고** 어시스턴트 턴은 그것을 풀어
+    # 쓴 것이라, 같은 글자를 쓸 거면 사용자 쪽을 남기는 편이 복원력이 높다. 첫 턴은 대개
+    # 과제 자체를 규정하므로 한 몫 더 준다.
+    weights = [(3 if i == 0 else 0) + (2 if role == "user" else 1)
+               for i, (role, _) in enumerate(dropped)]
+    unit = budget / max(1, sum(weights))
+    for i, (role, content) in enumerate(dropped):
+        cap = max(60, int(unit * weights[i]))
+        who = "사용자" if role == "user" else "어시스턴트"
+        body = " ".join(content.split())
+        if len(body) > cap:
+            body = body[:cap] + "…"
+        lines.append(f"- {who}: {body}")
+    return (f"[이전 대화 {n}턴 압축 — 길이 때문에 원문 대신 발췌만 있다. 여기 근거가 모자라면 "
+            "지어내지 말고 사용자에게 그 대목을 다시 말해 달라고 하라]\n" + "\n".join(lines))
+
+
+def _history_messages(history: list[dict], stats: dict | None = None) -> list[tuple[str, str]]:
     """멀티턴 history 를 검증·절단해 LangChain 메시지 tuple 로 만든다.
+
     방어: role 이 user/assistant 외면 무시, 항목별 HIST_ITEM_MAX 절단, 항목 수 최대
-    HIST_MAX_ITEMS, 전체는 최신 것 우선으로 HIST_BUDGET 안에서 오래된 것부터 버림."""
+    HIST_MAX_ITEMS. 전체는 최신 것 우선으로 예산 안에 담고, **밀려난 오래된 턴은 버리지 않고
+    압축본 한 덩어리로** 맨 앞에 넣는다(_compact_turns).
+
+    stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다.
+    """
     items: list[tuple[str, str]] = []
     for entry in history:
         if not isinstance(entry, dict):
@@ -1677,14 +1729,26 @@ def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
             content = content[:HIST_ITEM_MAX] + "…"
         items.append((role, content))
     items = items[-HIST_MAX_ITEMS:]
+
+    budget = _hist_budget_chars("".join(c for _, c in items[-6:]))
+    verbatim_budget = int(budget * (1.0 - HIST_COMPACT_SHARE))
     kept: list[tuple[str, str]] = []
     used = 0
-    for role, content in reversed(items):  # 최신부터 예산을 채우고, 넘치는 오래된 것은 버림
-        if used + len(content) > HIST_BUDGET:
+    cut = len(items)                        # 이 앞의 것들이 압축 대상
+    for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
+        role, content = items[idx]
+        if used + len(content) > verbatim_budget and kept:
             break
         kept.append((role, content))
         used += len(content)
+        cut = idx
     kept.reverse()
+
+    digest = _compact_turns(items[:cut], int(budget * HIST_COMPACT_SHARE))
+    if digest:
+        kept.insert(0, ("user", digest))
+    if stats is not None:
+        stats.update(kept=len(items) - cut, compacted=cut, budget=budget)
     return kept
 
 
@@ -1708,6 +1772,7 @@ DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 �
 # 스키마·출력)는 창 크기에 비례하지 않기 때문이다 — 1M 창에서 45%만 쓰면 50만 토큰을 놀린다.
 # 그래서 '컨텍스트 − 예비분 − 이력' 으로 잡는다. 운영 타깃은 GLM(128K)·Claude Opus(200K~1M)다.
 DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", "12000"))  # 시스템+도구+출력
+DOC_SAFETY = float(os.environ.get("DOC_SAFETY", "0.97"))                 # 변환 오차 안전 계수
 _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
 _ctx_cache: dict = {}
 
@@ -1765,13 +1830,15 @@ def _model_context_tokens() -> int:
 def _doc_budget_tokens(history_tokens: int = 0) -> int:
     """붙인 문서 전부에 줄 **토큰** 예산 — 컨텍스트에서 예비분과 이력을 뺀 나머지.
 
-    이력은 최대 200,000자(HIST_BUDGET)까지 실릴 수 있어 문서와 같은 창을 다툰다. 고정값으로
-    빼면 긴 대화 중에 문서를 붙이는 순간 400 이 난다 — 그래서 그 턴의 실제 이력을 뺀다.
+    이력도 같은 창을 다툰다(_hist_budget_chars 로 컨텍스트에서 유도한다). 고정값으로 빼면
+    긴 대화 중에 문서를 붙이는 순간 400 이 난다 — 그래서 그 턴의 실제 이력을 뺀다.
     """
     ctx = _model_context_tokens()
     # 바닥을 '컨텍스트의 N%' 로 두면 안 된다 — 이력이 창을 이미 먹었을 때 **없는 자리를
     # 있다고** 계산해 그대로 400 이 난다. 남은 만큼만 주고, 최소치는 상징적으로만 둔다.
-    return max(1500, ctx - DOC_RESERVE_TOKENS - max(0, history_tokens))
+    # 안전 계수는 토큰↔글자 왕복 변환의 오차 몫이다(실측 128,000 창에서 142토큰 초과).
+    # 넘치면 400 이고 400 은 '응답 생성 실패' 로만 보이므로, 조금 손해 보는 쪽으로 둔다.
+    return max(1500, int((ctx - DOC_RESERVE_TOKENS - max(0, history_tokens)) * DOC_SAFETY))
 
 
 def _doc_total_chars(documents=None, history_tokens: int = 0) -> int:
@@ -1780,12 +1847,11 @@ def _doc_total_chars(documents=None, history_tokens: int = 0) -> int:
     글자↔토큰 환산은 **그 문서의 글자 구성**으로 한다 — 한국어 발표자료와 영문 논문은
     같은 글자 수라도 토큰이 3배 넘게 차이 난다.
     """
-    forced = os.environ.get("DOC_TOTAL_CHARS")
-    if forced:
-        return max(2000, int(forced))
     tokens = _doc_budget_tokens(history_tokens)
     joined = "".join(str((d or {}).get("text") or "")[:20000] for d in (documents or [])) or "가나다"
-    return max(2000, _chars_for_tokens(joined, tokens))
+    derived = max(1500, _chars_for_tokens(joined, tokens))
+    forced = os.environ.get("DOC_TOTAL_CHARS")   # 낮추기만 한다(위 HIST_BUDGET 과 같은 이유)
+    return min(derived, max(1500, int(forced))) if forced else derived
 
 
 
@@ -2363,11 +2429,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 앞의 경우엔 '새 대화에서 붙이면 더 읽는다' 가 답이라 조치가 다르다.
                 _ht = _est_tokens("".join(str((h or {}).get("content") or "")
                                           for h in (req.history or []) if isinstance(h, dict)))
-                _step += ("— 대화가 길어 문서에 줄 자리가 적습니다(새 대화에서 붙이면 더 읽습니다)"
+                _step += (" — 대화가 길어 문서에 줄 자리가 적습니다(새 대화에서 붙이면 더 읽습니다)"
                           if _ht > _model_context_tokens() * 0.4
                           else " — 길어서 가운데 일부는 건너뜁니다")
             yield _sse("status", {"step": _step, "tool": None})
-        messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
+        _hstat: dict = {}
+        _hist_msgs = _history_messages(req.history, _hstat)
+        if _hstat.get("compacted"):
+            yield _sse("status", {"step": f"이전 대화 {_hstat['compacted']}턴은 길이 때문에 "
+                                          f"발췌로 압축해 넣었습니다(최근 {_hstat['kept']}턴은 원문)",
+                                  "tool": None})
+        messages = [("system", sys_prompt), *_hist_msgs, ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
@@ -3584,7 +3656,10 @@ def health() -> dict:
         "tool_scoping": "gateway (X-HWAX-Groups)",
         "tool_desc_max": TOOL_DESC_MAX,
         "tool_max": TOOL_MAX,   # 0=무제한. >0 이고 게이트웨이 도구수보다 작으면 챗에 일부 도구 미바인딩
-        "hist_budget": HIST_BUDGET,
+        # 예산은 이제 모델 컨텍스트에서 유도한다 — 원격 진단에서 실제 값이 보여야 한다.
+        "context_tokens": _model_context_tokens(),
+        "hist_budget": _hist_budget_chars(),
+        "doc_budget": _doc_total_chars(),
         # 최근 도구 로드 실패 사유(그룹셋별) — '도구가 없다'는 증상의 원인을 원격에서 본다.
         # 비어 있으면 최근 로드가 전부 성공. 값이 있으면 401/타임아웃 등 실사유가 찍힌다.
         "tool_load_errors": {" ".join(sorted(g)) or "(none)": v
