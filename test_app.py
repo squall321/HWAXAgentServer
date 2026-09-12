@@ -10,10 +10,13 @@ def test_with_groups_injects_comma_joined_header():
     assert out["gateway"]["headers"]["Authorization"] == "Bearer x"   # 기존 헤더 보존
 
 
-def test_with_groups_empty_groups_empty_header():
+def test_with_groups_empty_groups_no_header():
+    """계약 변경(2026-09-12) — 예전에는 빈 헤더를 보내 '공개 도구만' 을 노렸다. 권한 모델이
+    생기면서 게이트웨이가 빈 헤더를 **권한 0인 사람**으로 읽게 되어(fail-closed) 그 값이
+    '도구 8개'를 뜻하게 됐다. 신원이 없는 호출은 헤더를 아예 안 보내야 내부 서비스로 취급된다."""
     conns = {"gateway": {"url": "http://gw/mcp"}}
     out = _with_groups(conns, [])
-    assert out["gateway"]["headers"][GROUPS_HEADER] == ""              # 빈 헤더 = 그룹 없음(게이트웨이가 공개만 노출)
+    assert GROUPS_HEADER not in out["gateway"]["headers"]
 
 
 def test_with_groups_adds_headers_when_absent():
@@ -170,3 +173,23 @@ def test_한글_단위가_붙은_수치도_대조한다():
     # 실제 판정까지 — 근거에 없는 한글단위 수치를 잡아야 한다.
     assert unsourced_numbers("응력 51200.5MPa", "결과 48039.32") == ["51200.5"]
     assert unsourced_numbers("응력 48039.32MPa", "결과 48039.32") == []
+
+
+def test_그룹이_없으면_헤더를_아예_안_보낸다():
+    """게이트웨이는 '빈 그룹 헤더'를 권한 0인 사람으로 읽고(fail-closed) '헤더 없음'만 내부
+    서비스로 본다. 신원이 없는 호출에 빈 문자열을 보내면 도구가 465→8개로 줄어 MCP 심의의
+    좌석 발굴이 통째로 실패한다(실측)."""
+    conns = {"gateway": {"url": "http://gw/mcp", "transport": "streamable_http", "headers": {"Authorization": "Bearer x"}}}
+    out = _with_groups(conns, [])
+    assert GROUPS_HEADER not in out["gateway"]["headers"], "빈 그룹은 '권한 없음'이 아니라 '신원 없음'이다"
+    assert out["gateway"]["headers"]["Authorization"] == "Bearer x"
+    out2 = _with_groups(conns, ["a"])
+    assert out2["gateway"]["headers"][GROUPS_HEADER] == "a"
+
+
+def test_심의도_챗과_같은_그룹헤더_구현을_쓴다():
+    """사본을 두면 한쪽만 고쳐진다 — 실제로 빈 헤더 문제를 app 만 고쳐 MCP 심의가 계속 죽었다."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent / "deliberation.py").read_text(encoding="utf-8")
+    assert "from app import _with_groups as _impl" in src, "심의는 챗 구현에 위임해야 한다"
+    assert src.count("cfg[\"headers\"] = {") == 0, "심의에 헤더 조립 사본이 남아 있다"

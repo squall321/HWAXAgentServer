@@ -860,23 +860,14 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _with_groups(connections: dict, groups: list, user: str = "",
-                 user_pat: str = "") -> dict:
-    # user 는 호출자 이메일. 게이트웨이가 이 값으로 사용자별 백엔드 자격증명을 쓴다 —
-    # 없으면 DynaForge 같은 사용자 스코프 앱은 서비스 계정 시야(=아무 모델도 없음)로 답한다.
-    hdr = ",".join(groups)
-    extra = {USER_HEADER: quote(user.strip().lower(), safe="@.")} if (user or "").strip() else {}
-    out = {}
-    for name, cfg in connections.items():
-        cfg = dict(cfg)
-        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr, **extra}
-        # 포털이 이 요청용으로 발급한 사용자 PAT 가 있으면 서비스 계정 대신 그것으로 붙는다.
-        # 헤더로 누구인지 알리는 것과 그 사람의 자격증명으로 붙는 것은 다르다 — 포털에
-        # 되물어야 하는 도구(대화 저장·검색)는 후자가 없으면 401 이다(감사 기록에 5회).
-        if user_pat:
-            cfg["headers"]["Authorization"] = f"Bearer {user_pat}"
-        out[name] = cfg
-    return out
+def _with_groups(connections: dict, groups: list, user: str = "", user_pat: str = "") -> dict:
+    """챗과 **같은 구현**을 쓴다(app._with_groups). 여기 사본을 두었더니 한쪽만 고쳐졌다 —
+    ① 빈 그룹 헤더를 게이트웨이가 '권한 0인 사람'으로 읽어 도구가 465→8개가 되는 문제를
+       app 만 고쳐서 MCP 심의는 계속 좌석 0명으로 죽었다(실측 2026-09-12).
+    ② 한글 그룹명 퍼센트 인코딩도 이 사본에는 없었다(UnicodeEncodeError → 그 사용자 도구 0개).
+    순환 임포트를 피하려고 호출 시점에 가져온다(이 파일의 다른 app 참조와 같은 방식)."""
+    from app import _with_groups as _impl  # noqa: PLC0415 — 순환 방지용 늦은 import
+    return _impl(connections, list(groups), user, user_pat)
 
 
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",

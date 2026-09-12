@@ -212,10 +212,16 @@ def _with_groups(connections: dict, groups: list[str], user: str = "",
     # 보내고 게이트웨이가 디코드한다 — ASCII 그룹명은 인코딩해도 그대로라 하위호환된다.
     hdr = quote(",".join(groups), safe=",")
     extra = {USER_HEADER: quote(user.strip().lower(), safe="@.")} if (user or "").strip() else {}
+    # ⚠ 그룹이 없으면 헤더를 **아예 안 보낸다.** 게이트웨이는 '빈 헤더' 를 권한 0인 **사람**으로
+    # 읽고(fail-closed), '헤더 없음' 만 내부 서비스로 본다. 신원이 없는 호출(MCP 심의처럼 게이트웨이가
+    # 신원 헤더를 안 실어 준 경우)에 빈 문자열을 보내면 도구가 465개 → 8개로 줄어 좌석 발굴이
+    # 통째로 실패한다(실측: MCP 심의가 '관련 전문 페르소나를 충분히 찾지 못했습니다' 로 즉사).
+    # 빈 값은 '권한이 없다' 가 아니라 '누구인지 모른다' 라는 뜻이므로 헤더를 비워 보내면 안 된다.
+    _g = {GROUPS_HEADER: hdr} if groups else {}
     out = {}
     for name, cfg in connections.items():
         cfg = dict(cfg)
-        cfg["headers"] = {**cfg.get("headers", {}), GROUPS_HEADER: hdr, **extra}
+        cfg["headers"] = {**cfg.get("headers", {}), **_g, **extra}
         # 포털이 이 챗용으로 발급한 사용자 PAT 가 있으면 서비스 계정(GW_TOKEN) 대신 그것으로
         # 붙는다. 헤더로 "누구"라고 알리는 것과 실제로 그 사람의 자격증명으로 붙는 것은 다르다
         # — 게이트웨이가 포털에 되물어야 하는 도구(대화 검색·저장)는 후자가 없으면 401 이다.
