@@ -11,7 +11,7 @@ import contextvars
 from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 
-from evidence import unsourced_numbers   # 수치 대조는 챗과 같은 판정을 쓴다(공용 모듈)
+from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -97,9 +97,9 @@ _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 # 보고서 한 건(추출하면 보통 30,000~80,000자)을 실으면 **첫 항목에서 잘려** 심의가 표지만 보고
 # 논의했다. 좌석 컨텍스트 상한(_SEAT_CTX 48K)과 같은 자릿수로 맞춘다.
 _EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
-_EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 12000)   # 항목당 상한(자)
+_EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 40000)   # 항목당 상한(자) — 긴 발표자료 한 건
 _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
-_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 60000)       # 주입 합계 상한(자)
+_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 160000)      # 주입 합계 상한(자)
 _EVID_SHOW = _env_int("DELIB_EVID_SHOW", 4000)            # 화면 근거 카드 표시 상한(자)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
@@ -734,8 +734,9 @@ def _resolve_opts(req_opts):
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
                     "tool": str(it.get("tool") or "")[:80],
                     "args": str(it.get("args") or "")[:_EVID_ARGS_MAX],
-                    "result": res[:_EVID_ITEM_MAX] + (
-                        f" …[{len(res):,}자 중 {_EVID_ITEM_MAX:,}자]" if len(res) > _EVID_ITEM_MAX else ""),
+                    # 앞에서 자르지 않는다 — 발표자료·보고서는 결론이 뒤에 있다.
+                    # 낱장 표지가 있으면 경계에서 가운데를 덜어내고 무엇이 빠졌는지 밝힌다.
+                    "result": _fit_ev(res),
                 })
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
@@ -759,6 +760,12 @@ def _resolve_opts(req_opts):
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
     return o
+
+
+def _fit_ev(res: str) -> str:
+    """근거 항목 하나를 항목 예산에 맞춘다 — 잘랐으면 원문 길이와 함께 밝힌다."""
+    body, note = fit_document(res, _EVID_ITEM_MAX)
+    return body if not note else f"{body}\n…[원문 {len(res):,}자 · {note}]"
 
 
 _DEFAULT_OPTS = _resolve_opts(None)   # env 기본값 스냅샷 — 요청 미지정 시 사용

@@ -13,6 +13,18 @@ def _doc(name, chars):
     return {"name": name, "text": "가" * chars}
 
 
+def test_문서_예산은_모델_컨텍스트에서_나온다():
+    """고정 숫자로 두면 박스마다(dev 16K · 운영 GLM) 한쪽이 반드시 틀리고, 틀리면 400 이라
+    사용자에게는 '응답 생성 실패' 로만 보인다 — 실측으로 그렇게 터졌다."""
+    ctx = app._model_context_tokens()
+    assert ctx > 0
+    budget = app._doc_total_chars()
+    # 예산이 컨텍스트를 통째로 먹으면 시스템 프롬프트·도구·이력이 들어갈 자리가 없다.
+    assert budget <= ctx * app.DOC_CHARS_PER_TOKEN * 0.8, (
+        f"예산 {budget:,}자가 컨텍스트 {ctx:,}토큰에 비해 너무 크다"
+    )
+
+
 def test_붙인_문서가_없으면_빈_문자열():
     assert app._doc_block(None) == ""
     assert app._doc_block([]) == ""
@@ -37,19 +49,19 @@ def test_예산은_건수로_균등_분배된다():
     """앞 문서가 예산을 다 먹으면 사용자는 두 건을 붙였는데 답은 한 건만 본 채로 나온다.
 
     그 실패는 화면에 아무 흔적도 안 남는다 — 그래서 코드가 몫을 나눈다."""
-    big = app.DOC_TOTAL_CHARS * 2
+    big = app._doc_total_chars() * 2
     out = app._doc_block([_doc("앞.md", big), _doc("뒤.md", big)])
     assert "앞.md" in out and "뒤.md" in out, "뒤 문서가 통째로 사라졌다"
-    share = app.DOC_TOTAL_CHARS // 2
+    share = app._doc_total_chars() // 2
     # 두 문서 모두 같은 몫만큼 실린다(합계가 예산 근처, 한쪽으로 쏠리지 않는다).
     assert out.count("가" * share) == 2
 
 
 def test_잘랐으면_잘랐다고_적는다():
     """모델이 '뒷부분을 못 봤다'는 걸 알아야 지어내지 않고 되물을 수 있다."""
-    out = app._doc_block([_doc("긴문서.md", app.DOC_TOTAL_CHARS + 1000)])
+    out = app._doc_block([_doc("긴문서.md", app._doc_total_chars() + 1000)])
     assert "만 실림" in out
-    assert f"{app.DOC_TOTAL_CHARS + 1000:,}자" in out   # 원문 길이를 밝힌다
+    assert f"{app._doc_total_chars() + 1000:,}자" in out   # 원문 길이를 밝힌다
 
 
 def test_건수_상한을_넘으면_자른다():
@@ -75,3 +87,69 @@ def test_핸드오프_발췌가_심의_예산에_맞다():
         f"발췌 {app.HANDOFF_RESULT_CHARS}자 × {d._EVID_ITEMS}건 = "
         f"{app.HANDOFF_RESULT_CHARS * d._EVID_ITEMS:,}자로 예산 {d._EVID_BUDGET:,}자를 못 채운다"
     )
+
+
+# ── 긴 문서 맞추기(fit_document) — 앞에서 자르면 결론이 날아간다 ────────────────────
+def _deck(n_slides: int, per: int = 1200) -> str:
+    """n장짜리 발표자료. **결론은 맨 뒤 슬라이드에 있다**(현실이 그렇다)."""
+    out = ["---\nschema: hwax-doc/1\nkind: ppt\n---\n\n# 대형_발표자료\n"]
+    for i in range(1, n_slides + 1):
+        body = "결론: 구리 두께를 12um 로 낮춘다." if i == n_slides else ("본문 " * (per // 3))
+        out.append(f"## [s.{i}] 제목{i}\n\n{body}")
+    return "\n\n".join(out)
+
+
+def test_예산_안이면_한_글자도_안_바뀐다():
+    import evidence
+
+    deck = _deck(5)
+    body, note = evidence.fit_document(deck, 10**7)
+    assert body == deck and note == ""
+
+
+def test_넘치면_앞뒤를_남기고_가운데를_덜어낸다():
+    """이 테스트가 이 기능의 존재 이유다 — 앞에서 잘랐다면 결론이 사라진다."""
+    import evidence
+
+    deck = _deck(120)
+    budget = len(deck) // 3
+    body, note = evidence.fit_document(deck, budget)
+
+    assert len(body) <= budget + 500          # 안내 문구 몫만 여유
+    assert "## [s.1]" in body, "첫 낱장이 사라졌다"
+    assert "결론: 구리 두께" in body, "마지막 낱장(결론)이 사라졌다 — 앞에서 자른 것과 같다"
+    assert "실리지 않았다" in body, "빠진 구간을 모델에게 알리지 않았다"
+    assert "~" in note, f"어느 낱장이 빠졌는지 안 밝혔다: {note!r}"
+    # 종전 방식(앞에서 절단)과 대조 — 같은 예산에서 결론이 없다.
+    assert "결론: 구리 두께" not in deck[:budget]
+
+
+def test_낱장_경계에서만_자른다():
+    """슬라이드가 반토막 나면 문장이 끊긴 채로 근거가 된다."""
+    import evidence
+
+    deck = _deck(60)
+    body, _ = evidence.fit_document(deck, len(deck) // 4)
+    head, tail = body.split("[⋯ 가운데", 1)
+    # 앞부분은 완결된 낱장으로 끝난다(다음 낱장 표지 직전에서 끊겼다).
+    assert head.rstrip().endswith("본문") or head.rstrip().endswith("본문 "), head[-40:]
+
+
+def test_낱장_표지가_없으면_글자수로_자르고_그렇다고_말한다():
+    import evidence
+
+    body, note = evidence.fit_document("가" * 5000, 1000)
+    assert len(body) == 1000
+    assert "낱장 표지가 없어" in note
+
+
+def test_심의_근거도_같은_방식으로_맞춘다():
+    """챗과 심의가 같은 함수를 쓴다 — 한쪽만 고치면 같은 문서가 화면마다 다르게 잘린다."""
+    import deliberation as d
+
+    deck = _deck(200)
+    assert len(deck) > d._EVID_ITEM_MAX, "시험용 문서가 상한보다 작아 의미가 없다"
+    opts = d._resolve_opts({"evidence": [{"source": "업로드 문서", "result": deck}]})
+    kept = opts.evidence[0]["result"]
+    assert "결론: 구리 두께" in kept, "심의 근거에서 결론이 날아갔다"
+    assert "원문" in kept and "낱장이 빠짐" in kept, "심의 쪽에 빠진 구간 표시가 없다"

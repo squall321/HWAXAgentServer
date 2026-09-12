@@ -56,3 +56,50 @@ def unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
             break
     return bad
 
+
+# ── 긴 문서를 예산에 맞추기 ──────────────────────────────────────────────────
+# 추출기가 낱장마다 붙이는 표지 — '## [s.12]'(슬라이드) / '## [p.34]'(쪽).
+_DOC_UNIT_RE = re.compile(r"^## \[([sp])\.(\d+)\]", re.M)
+
+
+def fit_document(text: str, budget: int, head_ratio: float = 0.6) -> tuple:
+    """긴 문서를 예산에 맞춘다 — **앞에서 자르지 않고 가운데를 덜어낸다.**
+
+    발표자료·보고서는 결론이 뒤에 있다. 앞에서 budget 만큼 잘라 넣으면 배경만 읽고
+    결론을 못 본 채로 답하게 되는데, 그 답은 겉보기에 멀쩡하다(실측 120슬라이드에서
+    앞 60,000자만 남기면 결론 슬라이드가 통째로 사라진다). 그래서 앞뒤를 남기고
+    가운데를 뺀다. 자르는 자리는 **낱장 경계**라 슬라이드가 반토막 나지 않고, 무엇이
+    빠졌는지 낱장 번호로 말해 줄 수 있다 — 모델이 되물을 수 있어야 지어내지 않는다.
+
+    챗(app._doc_block)과 심의(deliberation 근거 정규화)가 같이 쓴다. 한쪽만 고치면
+    같은 문서가 화면마다 다르게 잘린다.
+
+    반환: (실을 본문, 사람에게 보일 한 줄 설명 — 온전하면 빈 문자열)
+    """
+    if budget <= 0 or len(text) <= budget:
+        return text, ""
+    marks = list(_DOC_UNIT_RE.finditer(text))
+    if len(marks) < 4:
+        # 표지가 없는 평문(사람이 직접 만든 메모, 도구 결과 등)은 낱장 경계를 모른다.
+        return text[:budget], f"앞 {budget:,}자만 실림(낱장 표지가 없어 글자 수로 잘랐다)"
+
+    starts = [m.start() for m in marks] + [len(text)]
+    labels = [f"{m.group(1)}.{m.group(2)}" for m in marks]
+
+    head_cap = int(budget * head_ratio)
+    hi = 0                                   # 앞에서 담을 낱장 수
+    while hi < len(marks) and starts[hi + 1] <= head_cap:
+        hi += 1
+    lo = len(marks)                          # 뒤에서 담기 시작할 낱장 index
+    tail_cap = budget - starts[hi]
+    while lo > hi and len(text) - starts[lo - 1] <= tail_cap:
+        lo -= 1
+
+    if lo <= hi:                             # 낱장 하나가 예산보다 큰 경우
+        return text[:budget], f"앞 {budget:,}자만 실림"
+
+    dropped = f"{labels[hi]}~{labels[lo - 1]}" if lo - hi > 1 else labels[hi]
+    note = (f"\n\n[⋯ 가운데 {lo - hi}낱장({dropped})은 길이 때문에 여기 실리지 않았다. "
+            "이 구간의 내용을 묻거든 '못 봤다' 고 말하고 그 부분만 따로 붙여 달라고 하라 — "
+            "추측으로 메우지 마라]\n\n")
+    return text[:starts[hi]] + note + text[starts[lo]:], f"{dropped} {lo - hi}낱장이 빠짐"

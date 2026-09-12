@@ -44,7 +44,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
-from evidence import sig_numbers as _sig_numbers, unsourced_numbers as _unsourced_numbers
+from evidence import (fit_document, sig_numbers as _sig_numbers,
+                      unsourced_numbers as _unsourced_numbers)
 from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
@@ -1696,8 +1697,55 @@ HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "4000"))
 
 # 붙인 문서(추출문) 주입 예산. 원본 파일은 오지 않는다 — DRM 문서는 그 PC 에서만 복호화되므로
 # 추출은 사용자 PC 의 Office COM 에서 끝난다(HWAXPortal docs/doc-deliberate).
-DOC_TOTAL_CHARS = int(os.environ.get("DOC_TOTAL_CHARS", "120000"))   # 합계 상한
+# ⚠ 진짜 천장은 이 값이 아니라 **모델 컨텍스트**다. 넉넉히 잡되, 넘치면 잘리는 게 아니라
+# 낱장 경계에서 가운데를 덜어낸다(_fit_doc) — 뒤를 버리면 발표자료는 결론이 날아간다.
+# 진짜 천장은 고정 숫자가 아니라 **모델 컨텍스트**다. 고정값을 크게 잡으면 긴 발표자료에서
+# 400(context length exceeded)이 나고, 사용자에게는 '응답 생성 실패' 로만 보인다(실측:
+# 326,875자 180슬라이드 → dev 16,384 토큰 모델에서 그대로 터졌다). 그래서 서버에 물어본다.
 DOC_MAX_FILES = int(os.environ.get("DOC_MAX_FILES", "5"))            # 건수 상한
+DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 때 앞쪽에 줄 몫
+# 한국어는 토큰당 대략 1.2~1.6자다. 보수적으로 1.2 를 쓴다(과대평가하면 또 400 이 난다).
+DOC_CHARS_PER_TOKEN = float(os.environ.get("DOC_CHARS_PER_TOKEN", "1.2"))
+# 컨텍스트 중 문서에 줄 몫. 나머지는 시스템 프롬프트·도구 스키마·이력·출력이 쓴다.
+DOC_CTX_SHARE = float(os.environ.get("DOC_CTX_SHARE", "0.45"))
+_CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
+_ctx_cache: dict = {}
+
+
+def _model_context_tokens() -> int:
+    """이 모델이 받는 최대 토큰. OpenAI 호환 /v1/models 의 max_model_len 을 한 번만 읽는다.
+
+    박스마다 모델이 다르다(dev 16K · 운영 GLM). env 로 박아 두면 한쪽에서 반드시 틀리고,
+    틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다."""
+    if "n" in _ctx_cache:
+        return _ctx_cache["n"]
+    n = _CTX_FALLBACK
+    try:
+        import httpx
+
+        r = httpx.get(f"{VLLM_BASE_URL.rstrip('/')}/models",
+                      headers={"Authorization": f"Bearer {VLLM_API_KEY}"}, timeout=5.0)
+        data = [m for m in ((r.json() or {}).get("data") or []) if isinstance(m, dict)]
+        # 이름이 맞는 것 우선, 서빙 모델이 하나뿐이면 그것. 여러 개인데 이름이 안 맞으면
+        # 아무거나 집지 않는다 — 틀린 컨텍스트로 예산을 잡느니 보수적 기본값이 낫다.
+        pick = next((m for m in data if m.get("id") == VLLM_MODEL), data[0] if len(data) == 1 else None)
+        v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
+        if isinstance(v, int) and v > 0:
+            n = v
+    except Exception as e:      # 못 물어보면 기본값으로 간다 — 기능을 막지는 않는다
+        print(f"[agent] 모델 컨텍스트 조회 실패({e}) — {n:,} 토큰으로 가정한다")
+    _ctx_cache["n"] = n
+    print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰")
+    return n
+
+
+def _doc_total_chars() -> int:
+    """붙인 문서 전부에 줄 글자 예산. env 로 못박으면 그 값을 쓴다."""
+    forced = os.environ.get("DOC_TOTAL_CHARS")
+    if forced:
+        return max(2000, int(forced))
+    return max(2000, int(_model_context_tokens() * DOC_CHARS_PER_TOKEN * DOC_CTX_SHARE))
+
 
 
 def _doc_block(documents) -> str:
@@ -1714,15 +1762,14 @@ def _doc_block(documents) -> str:
     if not docs:
         return ""
     docs = docs[:DOC_MAX_FILES]
-    share = max(2000, DOC_TOTAL_CHARS // len(docs))
+    share = max(2000, _doc_total_chars() // len(docs))
     parts = []
     for i, d in enumerate(docs, start=1):
         name = str(d.get("name") or f"문서{i}")[:260]
         text = str(d.get("text") or "")
-        cut = len(text) > share
-        body = text[:share] if cut else text
+        body, note = fit_document(text, share, DOC_HEAD_RATIO)
         head = f"[문서 {i}/{len(docs)} · {name} · {len(text):,}자"
-        head += f", 이 중 앞 {share:,}자만 실림]" if cut else "]"
+        head += f" — {note}]" if note else "]"
         parts.append(head + "\n" + body)
     return ("\n\n[사용자가 붙인 문서 — 사용자 PC 의 Office 로 추출한 원문이다. 아래 규율을 지켜라]\n"
             "· 이 문서에 대해 답할 때는 **여기 적힌 것만** 근거로 삼아라. 기억으로 채우지 마라.\n"
@@ -2265,7 +2312,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _docs = _doc_block(req.documents)
         if _docs:
             sys_prompt += _docs
-            yield _sse("status", {"step": f"붙인 문서 {min(len(req.documents), DOC_MAX_FILES)}건을 읽습니다",
+            _n = min(len(req.documents), DOC_MAX_FILES)
+            _cut = "⋯ 가운데" in _docs
+            yield _sse("status", {"step": f"붙인 문서 {_n}건을 읽습니다"
+                                          + (" — 길어서 가운데 일부는 건너뜁니다" if _cut else ""),
                                   "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
