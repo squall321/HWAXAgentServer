@@ -2566,6 +2566,10 @@ class ExpertsRequest(BaseModel):
     # 대화 전체 — 좌석 추천을 화두 한 줄이 아니라 오간 맥락 위에서 하기 위한 것.
     # ⚠ 통째로 임베딩 질의에 넣지 않는다(아래 _seat_axes 주석 참조). 축을 뽑는 데만 쓴다.
     history: list[dict] = []
+    # 조직도 트리만 그리면 되는 호출 — 명부(키·이름)만 즉시 주고 추천·도구 카탈로그·태그는
+    # 건너뛴다. 태그는 응답의 69%(796명에 301KB)인데 쓰이는 곳은 검색뿐이라, 트리를 그 무게
+    # 뒤에 세울 이유가 없다. 화면은 이걸로 먼저 그리고 전체를 뒤에서 받아 얹는다.
+    light: bool = False
 
 
 # 대화에서 뽑을 도메인 축 개수. 축마다 recommend_agents 를 한 번씩 더 부르므로 지연과 맞바꾼다.
@@ -2675,6 +2679,22 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
         return {"key": key, "name": d.get("name") or key,
                 "role": (d.get("description") or "")[:280],
                 "tags": list(d.get("common_tags") or [])}
+
+    if req.light:
+        # 조직도 1단계 — 명부만. recommend_agents(축 질의 포함 최대 5회)·도구 카탈로그·태그를
+        # 전부 건너뛴다. 화면이 트리를 그리는 데 필요한 건 키와 이름뿐이다.
+        pool_light: list[dict] = []
+        try:
+            for a in _parse_json_multi(await _call(tools, "list_agents", {"compact": True})):
+                n = _norm(a)
+                if n["key"]:
+                    pool_light.append({"key": n["key"], "name": n["name"], "tags": []})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[experts] list_agents failed (light): {exc!r}")
+        return {"recommended": [], "candidates": [], "pool": pool_light, "light": True,
+                "tools": {"recommended": [], "expert_tools": [], "pipeline": [],
+                          "all": [], "apps": [], "areas": []},
+                "low_confidence": False, "axes": []}
 
     # 질문 연관 순위 — recommend_agents 를 넉넉히(top_k=CAND) 받아 관련도순 후보로 쓴다.
     # recommended = 상위 N(기본 선택), candidates = 관련 전문가 목록(수동 추가 기본 노출·검색 우선).
