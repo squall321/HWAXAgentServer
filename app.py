@@ -2873,9 +2873,11 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                                               req.delib_opts, req.user_email, req.user_pat,
                                               req.history), "test-plan")
     elif is_deliberation(req.message):
-        stream = _detach_stream(run_deliberation(app, strip_trigger(req.message), req.groups,
-                                                 req.delib_opts, req.user_email, req.user_pat,
-                                                 req.history), "delib")
+        # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
+        # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
+        # (종전엔 빈 문자열로 그대로 심의가 돌았다 — 가드가 없었다).
+        # 그때만 대화에서 뽑고, **무엇을 화두로 삼았는지 화면에 밝힌다.**
+        stream = _detach_stream(_delib_with_topic(req), "delib")
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
@@ -3381,6 +3383,104 @@ class ClarifyRequest(BaseModel):
     message: str
     job: str = "default"
     history: list[dict] = []
+
+
+class TopicRequest(BaseModel):
+    """챗 대화에서 심의 화두를 뽑는다 — 첫 발화가 아니라 **오간 내용 전체**에서."""
+
+    history: list[dict] = []
+    fallback: str = ""          # 실패하면 돌려줄 것(대개 첫 발화) — 브리프가 못 열리면 안 된다
+    job: str = "default"
+
+
+# 이보다 짧으면 화두로 못 쓴다고 본다. "왜?"·"이거" 같은 것은 좌석에 줄 게 없다.
+DELIB_TOPIC_MIN = int(os.environ.get("DELIB_TOPIC_MIN", "12"))
+
+
+async def _delib_with_topic(req):
+    """`/심의` 경로 — 화두가 비었거나 너무 짧으면 대화에서 뽑아 쓴다."""
+    q = strip_trigger(req.message)
+    if len(q.strip()) < DELIB_TOPIC_MIN and req.history:
+        r = await _derive_topic(req.history, q)
+        got = (r.get("topic") or "").strip()
+        if got and got != q.strip():
+            yield _sse("status", {"step": f"대화에서 화두를 뽑았습니다 — “{got[:120]}”",
+                                  "tool": None})
+            q = got
+        elif not q.strip():
+            # 뽑지도 못했고 적힌 것도 없다 — 빈 심의를 돌리느니 되묻는다.
+            msg = ("무엇을 판단해 드릴지 한 줄로 적어 주세요. 예: `/심의 구리 두께를 12um 로 "
+                   "낮출 것인가` — 대화가 이어지는 중이면 '심의로 넘기기' 버튼이 화두를 "
+                   "대신 뽑아 줍니다.")
+            yield _sse("token", {"delta": msg})
+            yield _sse("result", {"type": "text", "content": msg})
+            yield _sse("done", {})
+            return
+    async for chunk in run_deliberation(app, q, req.groups, req.delib_opts,
+                                        req.user_email, req.user_pat, req.history):
+        yield chunk
+
+
+async def _derive_topic(history: list, fallback: str = "") -> dict:
+    """대화에서 심의 화두 한 문장을 뽑는다. 엔드포인트와 `/심의` 경로가 **같은 것**을 쓴다.
+
+    두 곳이 다른 프롬프트를 쓰면 같은 대화에서 다른 화두가 나오고, 사용자는 어느 쪽이
+    진짜인지 알 수 없다."""
+    fb = (fallback or "").strip()
+    hist, budget = [], 12000
+    for m in (history or [])[-40:]:
+        t = str((m or {}).get("content") or "").strip()
+        if not t or budget <= 0:
+            continue
+        who = "사용자" if (m or {}).get("role") == "user" else "어시스턴트"
+        hist.append(f"{who}: {t[:2000]}")
+        budget -= len(t)
+    if not hist:
+        return {"topic": fb, "why": "", "options": [], "error": "no_history"}
+
+    try:
+        raw = await _llm_text(
+            app.state.llm,
+            "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+            "아래는 사람과 어시스턴트가 나눈 대화다. 이 대화가 **결국 무엇을 판단해 달라는 것인지**"
+            " 한 문장으로 뽑아라.\n\n"
+            + "\n".join(hist)
+            + "\n\n규칙\n"
+            "· **답이 아니라 물음**을 써라. '…을 12um 로 낮춘다' 가 아니라 '…을 12um 로 낮출 것인가' 다. "
+            "결론을 화두에 넣으면 심의가 그것을 전제로 깔고 시작한다.\n"
+            "· 대화 **뒷부분의 쟁점**을 우선해라. 첫 발화는 대개 배경이고, 진짜 물음은 오가면서 옮겨 간다.\n"
+            "· 대화에 나온 수치·조건·제약을 물음 안에 넣어라(예: 굽힘 반경 3.0mm, 목표 20만회).\n"
+            "· 대화에 없는 것을 지어내지 마라. 애매하면 좁히지 말고 그대로 둬라.\n"
+            "· why 에는 왜 이 물음인지 한 줄(어느 대목에서 왔는지).\n"
+            "· options 에는 다르게 잡을 수 있는 화두 1~2개(없으면 []).\n\n"
+            'JSON {"topic": "한 문장 물음", "why": "한 줄", "options": ["대안 화두", ...]} 로만.')
+        v = _parse_json(raw) or {}
+    except Exception as exc:  # noqa: BLE001 — 화두 제안 실패가 심의를 막으면 안 된다
+        print(f"[topic] failed: {exc!r}")
+        return {"topic": fb, "why": "", "options": [], "error": "llm_failed"}
+
+    topic = str(v.get("topic") or "").strip()[:600]
+    if not topic:
+        return {"topic": fb, "why": "", "options": [], "error": "empty"}
+    opts = [str(x).strip()[:600] for x in (v.get("options") or []) if str(x).strip()][:2]
+    return {"topic": topic, "why": str(v.get("why") or "").strip()[:300], "options": opts}
+
+
+@app.post("/deliberate/topic")
+async def deliberate_topic(req: TopicRequest) -> dict:
+    """대화를 읽고 **심의에 부칠 한 문장**을 쓴다.
+
+    왜 첫 발화를 그냥 쓰면 안 되나 — 대화는 움직인다. 처음엔 "굽힘 수명이 왜 부족하냐" 로
+    시작해도, 오가는 사이 쟁점은 "구리 두께를 12um 로 낮출 것인가" 로 옮겨 간다. 첫 발화를
+    화두로 넣으면 심의가 **이미 지나온 자리**를 다시 판다.
+
+    ⚠ 되묻기(/deliberate/clarify)와 같은 규율이다 — **실패가 브리프를 막지 않는다.** LLM 이
+    죽거나 이상하면 fallback 을 그대로 돌려주고 error 로 알린다. 사람이 고쳐 쓰는 칸이므로
+    틀린 제안보다 위험한 것은 화면이 안 열리는 것이다.
+
+    P1(브리프에 결론 금지)도 지킨다 — 답이 아니라 **판단을 요구하는 물음**을 쓰게 한다.
+    """
+    return await _derive_topic(req.history, req.fallback)
 
 
 @app.post("/deliberate/clarify")
