@@ -154,3 +154,19 @@ def test_수치_대조는_챗과_심의가_같은_판정을_쓴다():
     assert "unsourced_numbers(decision," in delib, "결정문에 대조가 걸려 있어야 한다"
     app_src = (root / "app.py").read_text(encoding="utf-8")
     assert "from evidence import" in app_src, "챗도 같은 모듈을 써야 한다"
+
+
+def test_한글_단위가_붙은_수치도_대조한다():
+    """`(?!\\w)` 경계가 한글 단위를 단어로 봐서 '408명'은 검사조차 안 됐고 '1250.5원'은 '1250'
+    으로 잘려 엉뚱한 값을 대조했다(실측). 한국어 답변은 대부분 이렇게 쓴다 — 안전장치가 조용히
+    헛돌던 자리다."""
+    from evidence import sig_numbers, unsourced_numbers
+
+    assert [r for r, _ in sig_numbers("전문가 408명")] == ["408"]
+    assert [r for r, _ in sig_numbers("응력 48039.32MPa")] == ["48039.32"]
+    assert [r for r, _ in sig_numbers("비용 1250.5원")] == ["1250.5"]
+    assert sig_numbers("v1.2.3") == [], "버전 문자열을 수치로 보면 안 된다"
+    assert sig_numbers("ABC123") == [], "식별자 속 숫자는 수치가 아니다"
+    # 실제 판정까지 — 근거에 없는 한글단위 수치를 잡아야 한다.
+    assert unsourced_numbers("응력 51200.5MPa", "결과 48039.32") == ["51200.5"]
+    assert unsourced_numbers("응력 48039.32MPa", "결과 48039.32") == []
