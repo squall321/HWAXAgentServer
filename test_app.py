@@ -121,3 +121,15 @@ def test_지정_전문가_목록_정규화():
     assert _persona_keys([str(i) for i in range(20)], None) == [str(i) for i in range(PERSONA_MAX)]
     assert _persona_keys(None, None) == []
     assert _persona_keys([1, None, "ok"], None) == ["ok"], "문자열 아닌 값은 버린다"
+
+
+def test_예고_미호출_감지는_언어가_새도_잡는다():
+    """모델이 중국어로 흘러 답해도 '부르겠다고만 하고 안 부른 턴'은 잡아야 한다 — 한국어 패턴만
+    보면 그대로 통과해 예고 한 줄만 남는다(실측: dev 7B 가 중국어로 analyze_laminate 예고)."""
+    from app import _announced_without_calling
+    assert _announced_without_calling("我们将调用 analyze_laminate 函数来计算") is True
+    assert _announced_without_calling("接下来，我们将使用 Laminate Analyzer 进行计算") is True
+    assert _announced_without_calling("먼저 확인하겠습니다") is True
+    assert _announced_without_calling("Let me check the guide") is True
+    # 도구 이름을 설명만 하는 문장은 걸리지 않는다(오탐이 더 나쁘다)
+    assert _announced_without_calling("analyze_laminate 는 적층 해석 도구입니다") is False

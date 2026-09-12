@@ -1931,6 +1931,9 @@ _ANNOUNCE_RE = re.compile(
     r"(확인하겠습니다|조회하겠습니다|호출하겠습니다|가져오겠습니다|검색하겠습니다|알아보겠습니다|"
     r"조회해\s?보겠습니다|바로\s?(조회|호출|확인)|let me (check|call|search|look|get|fetch)|"
     r"i(?:'| wi)ll (call|check|search|use|fetch)|i(?:'m| am) going to (call|check|use)|"
+    # 중국어 — 모델이 언어를 흘리면(실측: dev 7B 가 중국어로 답하며 "我们将调用 analyze_laminate")
+    # 한국어 패턴이 통째로 빗나가 예고-미호출을 못 잡는다. 운영 타깃 GLM 도 같은 계열이다.
+    r"(?:我们)?将(?:使用|调用|查询|获取)|让我(?:们)?(?:来)?(?:调用|使用|查询|检查)|接下来[，,]?\s*(?:我们)?(?:将|会)(?:调用|使用)|"
     # 산문 속 파이썬식 호출문 + 호출 의사 — "list_materials(query=\"Al6061-T6\")를 호출하여 …"
     # 로 끝나고 실제 호출은 없던 실측 턴을 잡는다. 도구명(…_…)+괄호+인자 형태에 '호출/사용/
     # 실행' 이 붙은 경우만 본다 — 도구 이름만 언급하는 설명문은 걸리지 않는다.
@@ -2052,12 +2055,18 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         op_apps = list(persona.get("apps") or []) if operator else []
         # 보조 전문가 — 운영자는 앱·입구도구를, 도메인 전문가는 역할(판단 기준)을 빌려준다.
         helpers: list[tuple[str, dict]] = []
+        helper_apps: list[str] = []
         for _k in _keys[1:]:
             _m = await _persona_meta(app, req.groups, _k)
             helpers.append((_k, _m))
             if _m.get("operator"):
-                op_apps.extend(_m.get("apps") or [])
-        op_apps = list(dict.fromkeys(op_apps))
+                helper_apps.extend(_m.get("apps") or [])
+        # ⚠ 보조 운영자의 앱은 **통째로 핀하지 않는다**. 앱 하나가 도구 38~81개인데 주 전문가의
+        # 역할·지식카드까지 같이 실리면 스키마만으로 컨텍스트를 먹는다(실측: PCB 전문가 + 라미네이트
+        # 운영자 조합이 dev 16K 에서 16,385 토큰 초과). 보조는 **입구 도구(key_tools)** 만 빌려주고
+        # 나머지는 search_tools·invoke_tool 로 닿는다 — 운영자 상시 예약을 안내대로 줄인 것과 같은 이유다
+        # (이 시스템 실측: 상위 40개가 호출의 79%, 도구를 늘릴수록 선택 정확도가 떨어진다).
+        helper_apps = [a for a in dict.fromkeys(helper_apps) if a not in op_apps]
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
@@ -2097,7 +2106,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
-                                 _GUIDE_TOOLS if operator else None)
+                                 # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.
+                                 # ⚠ 조건이 '주 전문가가 운영자일 때'면 안 된다 — 이 기능의 핵심
+                                 # 조합인 '도메인 전문가(주) + 도구 운영자(보조)'가 그 밖으로
+                                 # 빠져 핵심 38개가 예산 밖에서 덧붙고, dev 16K 에서 16,385
+                                 # 토큰으로 400 이 났다(실측: PCB 전문가 + 라미네이트 운영자).
+                                 _GUIDE_TOOLS if (operator or op_apps) else None)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
@@ -2199,7 +2213,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 _tag = "MCP 운영자" if _m.get("operator") else "도메인 전문가"
                 _apps_note = ""
                 if _m.get("operator") and _m.get("apps"):
-                    _apps_note = f" (도구: {', '.join(_app_label(a) for a in _m['apps'])})"
+                    # 입구 도구만 묶여 있다 — 나머지는 안내대(search_tools·invoke_tool)로 닿는다고
+                    # 명시한다. 안 그러면 '도구가 없다'고 판단해 일반 지식으로 답한다.
+                    _apps_note = (f" (도구: {', '.join(_app_label(a) for a in _m['apps'])}"
+                                  " — 입구 도구만 묶여 있다. 더 필요하면 search_tools 로 찾아 "
+                                  "invoke_tool 로 호출하라)")
                 _blocks.append(f"- {_k} · {_tag}{_apps_note}\n{_r}" if _r else f"- {_k} · {_tag}{_apps_note}")
             sys_prompt += (
                 "\n\n[함께 선택된 보조 전문가 — 렌즈와 도구만 빌려준다]\n"
