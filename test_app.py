@@ -109,3 +109,15 @@ def test_도구_뒤_말이_없으면_예고만_남아도_구제한다():
     assert _needs_final_rescue(calls, "가이드는 3장 구성입니다…", 120) is False
     # ④ 도구를 안 쓴 턴은 이 구제의 대상이 아니다(다른 보강기가 본다)
     assert _needs_final_rescue([], "", 0) is False
+
+
+def test_지정_전문가_목록_정규화():
+    """여러 명 지정 — 첫 명이 주 전문가. 공백·중복·상한을 코드가 정리한다(구 계약도 같이 받는다)."""
+    from app import PERSONA_MAX, _persona_keys
+    assert _persona_keys(["a", "b"], None) == ["a", "b"]
+    assert _persona_keys(None, "solo") == ["solo"], "한 명만 지정한 종전 계약"
+    assert _persona_keys([], "solo") == ["solo"], "빈 목록이면 구 필드를 쓴다"
+    assert _persona_keys([" a ", "a", "b", ""], None) == ["a", "b"], "중복·공백 제거"
+    assert _persona_keys([str(i) for i in range(20)], None) == [str(i) for i in range(PERSONA_MAX)]
+    assert _persona_keys(None, None) == []
+    assert _persona_keys([1, None, "ok"], None) == ["ok"], "문자열 아닌 값은 버린다"

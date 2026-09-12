@@ -326,6 +326,11 @@ class ChatRequest(BaseModel):
     # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
     # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
     pinned_agent: str | None = None
+    # 여러 전문가를 한 목소리로 — 첫 명이 **주 전문가**(목소리·지식카드·판단 기준)이고 나머지는
+    # 보조다. 보조가 HE팀 운영자면 그 앱 도구를 얹고, 도메인 전문가면 판단 기준(역할)만 빌려준다.
+    # 같은 층 전문가를 여럿 겹치면 답이 평균으로 무너지고 의견 충돌이 한 목소리에 묻히므로,
+    # 상한은 5명이되 실효 제약은 앱 3개·도구 캡이다(docs/multi-persona).
+    pinned_agents: list[str] | None = None
     # 웹 리서치 소스 토글 — None 이면 종전 동작(전부), 리스트면 그 소스만 바인딩한다.
     # 빈 리스트는 '전부 끔'이라 나가는 도구가 하나도 실리지 않는다.
     search_sources: list[str] | None = None
@@ -1720,6 +1725,28 @@ PERSONA_ROLE_MAX = 4000
 PERSONA_TTL_S = _env_int("PERSONA_TTL_S", 300)
 
 
+# 한 대화에 세울 수 있는 전문가 수. 상한을 5로 두되 값이 나는 조합은 '주 전문가 1 + 보조'이고,
+# 같은 층 전문가를 여럿 겹치면 답이 평균으로 무너진다(docs/multi-persona/PLAN.md).
+PERSONA_MAX = _env_int("PERSONA_MAX", 5)
+# 보조 전문가의 역할 문구 길이. 주 전문가(PERSONA_ROLE_MAX)보다 짧게 싣는다 — 보조는 판단 기준만
+# 빌려주는 자리라 전문을 실으면 도구 스키마 예산을 그만큼 밀어낸다.
+PERSONA_HELPER_ROLE_MAX = _env_int("PERSONA_HELPER_ROLE_MAX", 1200)
+
+
+def _persona_keys(many: list[str] | None, one: str | None) -> list[str]:
+    """지정 전문가 목록 정규화 — 중복·공백을 걷고 상한을 씌운다. 첫 명이 주 전문가다.
+    구 계약(pinned_agent 하나)도 같은 함수로 받는다(목록이 비면 그 한 명을 쓴다)."""
+    src = list(many or []) or ([one] if one else [])
+    out: list[str] = []
+    for k in src:
+        if not isinstance(k, str):
+            continue
+        k = k.strip()[:120]
+        if k and k not in out:
+            out.append(k)
+    return out[:PERSONA_MAX]
+
+
 async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dict:
     """선택 전문가의 역할 원문과 운영 설정(get_agent_session) — {role, operator, apps, key_tools}.
 
@@ -2015,16 +2042,30 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 지정 전문가 — 역할·운영 설정을 도구 선별보다 먼저 읽는다. HE팀 운영자는 자기 앱 도구를
         # 묶어야 해서 _agent_for 전에 알아야 한다(예전엔 역할 문구만 붙고 그 앱 도구는 따라오지 않아,
         # 운영자를 골라도 도구는 질의 관련도로만 뽑혔다).
-        agent_key = (req.pinned_agent or "").strip()[:120]
+        # 여러 명을 골랐으면 첫 명이 주 전문가다 — 목소리·지식카드·판단 기준은 이 사람 것이고,
+        # 나머지는 도구(운영자)와 판단 기준(도메인 전문가)만 보탠다. 한 명만 고른 종전 경로는
+        # _keys 가 한 원소가 되어 그대로다.
+        _keys = _persona_keys(req.pinned_agents, req.pinned_agent)
+        agent_key = _keys[0] if _keys else ""
         persona = await _persona_meta(app, req.groups, agent_key) if agent_key else {}
         operator = bool(persona.get("operator"))
         op_apps = list(persona.get("apps") or []) if operator else []
+        # 보조 전문가 — 운영자는 앱·입구도구를, 도메인 전문가는 역할(판단 기준)을 빌려준다.
+        helpers: list[tuple[str, dict]] = []
+        for _k in _keys[1:]:
+            _m = await _persona_meta(app, req.groups, _k)
+            helpers.append((_k, _m))
+            if _m.get("operator"):
+                op_apps.extend(_m.get("apps") or [])
+        op_apps = list(dict.fromkeys(op_apps))
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
         # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools). 앱을 통째로 핀하면
         # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
-        first = list(dict.fromkeys([*pinned, *(persona.get("key_tools") or [] if operator else [])]))
+        first = list(dict.fromkeys([*pinned, *(persona.get("key_tools") or [] if operator else []),
+                                    *[t for _k, _m in helpers if _m.get("operator")
+                                      for t in (_m.get("key_tools") or [])]]))
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
@@ -2148,6 +2189,28 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     sys_prompt += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
                                    f"일반 지식으로 답하되 '사내 지식카드에는 관련 내용이 없다'고 먼저 밝혀라.")
                     yield _sse("status", {"step": "연관 지식카드 없음 — 일반 지식으로 답변", "tool": None})
+        # 보조 전문가 — 목소리는 주 전문가 하나다. 보조는 판단 기준(역할)과 도구를 빌려줄 뿐이고,
+        # 각자 따로 답하지 않는다(그건 Thinking 이고, 갈린 의견을 세우는 자리는 심의다).
+        # ⚠ 갈리는 것을 한 목소리가 숨기면 '거짓 합의'가 된다 — 갈리면 한 줄로 밝히게 한다.
+        if helpers:
+            _blocks = []
+            for _k, _m in helpers:
+                _r = (_m.get("role") or "")[:PERSONA_HELPER_ROLE_MAX]
+                _tag = "MCP 운영자" if _m.get("operator") else "도메인 전문가"
+                _apps_note = ""
+                if _m.get("operator") and _m.get("apps"):
+                    _apps_note = f" (도구: {', '.join(_app_label(a) for a in _m['apps'])})"
+                _blocks.append(f"- {_k} · {_tag}{_apps_note}\n{_r}" if _r else f"- {_k} · {_tag}{_apps_note}")
+            sys_prompt += (
+                "\n\n[함께 선택된 보조 전문가 — 렌즈와 도구만 빌려준다]\n"
+                + "\n".join(_blocks)
+                + f"\n\n답은 '{agent_key}' 한 사람의 목소리로 쓴다. 보조 전문가의 이름으로 따로 말하지 말고, "
+                  "그들의 판단 기준과 도구를 네 판단에 녹여라. 보조 전문가의 사내 지식이 필요하면 "
+                  "agent_search(\"<그 전문가 키>\", 질의) 로 직접 조회하라.\n"
+                  "⚠ 관점이 실제로 갈리면 숨기지 마라 — 답 끝에 '이견: <무엇이 갈리는지>' 한 줄을 붙이고, "
+                  "판단이 갈려 결론을 못 내면 '/심의 <질문>' 으로 정식 심의를 권하라.")
+            yield _sse("status", {"step": f"주 전문가 {agent_key} + 보조 {len(helpers)}명으로 답합니다",
+                                  "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
