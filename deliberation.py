@@ -105,7 +105,9 @@ _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천�
 #   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.
 #   실측: 천장 160,000자(≈152,000토큰) + _SEAT_CTX 48,000자(≈45,700토큰) = 198,000토큰.
 _EVID_KO_CPT = 1.05          # 한국어 최악 기준 자/토큰 — 과대평가하면 400 이 난다
-_EVID_RESERVE = _env_int("DELIB_EVID_RESERVE", 16000)     # 시스템·페르소나·도구 스키마 몫(토큰)
+# 시스템·페르소나·**도구 스키마**·출력 몫(토큰). 좌석은 자유 조회가 기본 켜짐이라
+# (DELIB_FREE_TOOLS=1) 도구가 바인딩된다 — 스키마 예산(기본 40,000)을 안 빼면 넘친다.
+_EVID_RESERVE = _env_int("DELIB_EVID_RESERVE", _env_int("TOOL_SCHEMA_BUDGET", 40000) + 16000)
 _evid_cache: dict = {}
 
 
@@ -123,8 +125,10 @@ def _pre_budget() -> int:
         ctx = _model_context_tokens()
     except Exception:
         ctx = 128000
+    # 안전 계수 — 이 계산은 구조상 **정확히 컨텍스트에 딱 맞게** 떨어진다(실측 128,000/128,000).
+    # 여유 0 이면 토큰 추정 오차 한 번에 넘치고, 심의는 좌석이 동시에 죽는다. 조금 손해 본다.
     avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
-    n = max(2000, int(avail * _EVID_KO_CPT))
+    n = max(2000, int(avail * _EVID_KO_CPT * _PRE_SAFETY))
     _evid_cache["pre"] = n
     return n
 
@@ -455,6 +459,7 @@ CHAT_CONTEXT_BUDGET = _env_int("DELIB_CHAT_CONTEXT_BUDGET", 150000)
 _CHAT_TURN_MAX = _env_int("DELIB_CHAT_TURN_MAX", 4000)     # 사람 발화 하나당 상한(종전 1,200)
 _CHAT_BOT_MAX = _env_int("DELIB_CHAT_BOT_MAX", 2500)       # 챗 답변 하나당 상한(종전 900)
 _CHAT_CTX_SHARE = _env_float("DELIB_CHAT_CTX_SHARE", 0.3)  # 사전 컨텍스트 중 챗 맥락 몫
+_PRE_SAFETY = _env_float("DELIB_PRE_SAFETY", 0.93)         # 토큰 추정 오차 여유
 
 
 def _chat_context_note(history) -> str:

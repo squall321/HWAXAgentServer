@@ -1776,7 +1776,10 @@ DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 �
 # 컨텍스트에서 문서 몫을 **비율로** 떼면 큰 창을 버린다. 고정 오버헤드(시스템 프롬프트·도구
 # 스키마·출력)는 창 크기에 비례하지 않기 때문이다 — 1M 창에서 45%만 쓰면 50만 토큰을 놀린다.
 # 그래서 '컨텍스트 − 예비분 − 이력' 으로 잡는다. 운영 타깃은 GLM(128K)·Claude Opus(200K~1M)다.
-DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", "12000"))  # 시스템+도구+출력
+# 시스템 프롬프트 + **도구 스키마** + 출력 몫. 도구 스키마가 압도적으로 크다 —
+# TOOL_SCHEMA_BUDGET 기본이 40,000 토큰인데 여기를 12,000 으로 박아 뒀었다(실측 3배 초과).
+# 고정값으로 두면 도구 예산을 올릴 때마다 조용히 어긋나므로 거기서 유도한다.
+DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", str(TOOL_SCHEMA_BUDGET + 16000)))
 DOC_SAFETY = float(os.environ.get("DOC_SAFETY", "0.97"))                 # 변환 오차 안전 계수
 _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
 _ctx_cache: dict = {}

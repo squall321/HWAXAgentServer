@@ -51,8 +51,9 @@ def test_큰_컨텍스트일수록_문서에_더_준다():
         app._ctx_cache["n"] = ctx
         got[ctx] = app._doc_budget_tokens(0)
     assert got[16384] < got[128000] < got[200000] < got[1000000]
-    # 큰 창에서는 예비분만 떼고 거의 다 준다(비율 배분이면 여기서 절반이 날아간다).
-    assert got[1000000] >= 1000000 * 0.95
+    # 큰 창에서는 예비분(도구 스키마 40,000 + 시스템·출력)만 떼고 나머지를 거의 다 준다.
+    # 비율 배분이면 여기서 절반이 날아간다 — 그것과 구분되는 선이면 된다.
+    assert got[1000000] >= (1000000 - app.DOC_RESERVE_TOKENS) * 0.9
 
 
 def test_긴_대화_중이면_문서_예산이_줄어든다():
@@ -442,3 +443,36 @@ def test_사람_발화를_챗_답변보다_길게_남긴다():
     import deliberation as d
 
     assert d._CHAT_TURN_MAX > d._CHAT_BOT_MAX
+
+
+def test_좌석_프롬프트가_구조적으로_딱_맞지_않는다():
+    """`<= ctx` 만 보면 **정확히 딱 맞는** 것도 통과한다 — 실측 128,000/128,000 이 그랬다.
+    안전 계수를 넣기 전 이 계산은 구조상 정확히 컨텍스트에 떨어졌고, 토큰 추정 오차 한 번이면
+    넘쳤다. 심의는 좌석이 동시에 돌아 그러면 라운드가 통째로 죽는다.
+
+    여유가 작은 창(128K)에서 얇은 것은 **정상**이다 — 거기서는 고정비(직전 라운드 48,000자 +
+    도구 스키마 40,000토큰)만으로 이미 80% 를 쓴다. 여기서 보는 것은 '0 이 아니다' 이지
+    '넉넉하다' 가 아니다.
+    """
+    import deliberation as d
+
+    for ctx in (128000, 200000, 1000000):
+        app._ctx_cache["n"] = ctx
+        d._evid_cache.clear()
+        worst = app._est_tokens("가" * (d._evid_budget() + d._chat_ctx_budget() + d._SEAT_CTX))
+        worst += d._EVID_RESERVE
+        assert worst < ctx, f"컨텍스트 {ctx:,} 에서 좌석 최악 {worst:,}토큰 — 넘는다"
+        assert worst <= ctx * 0.99, (
+            f"컨텍스트 {ctx:,} 여유 {ctx - worst:,}토큰({(1 - worst / ctx) * 100:.1f}%) — "
+            "구조상 딱 맞게 떨어지고 있다(안전 계수가 죽었다)"
+        )
+    d._evid_cache.clear()
+
+
+def test_예비분이_도구_스키마_예산을_덮는다():
+    """도구 스키마가 예비분에서 가장 큰 몫이다. 고정값으로 두면 도구 예산을 올릴 때마다
+    조용히 어긋난다 — 실제로 12,000 으로 박아 둬서 40,000 짜리 스키마를 못 덮었다."""
+    import deliberation as d
+
+    assert app.DOC_RESERVE_TOKENS > app.TOOL_SCHEMA_BUDGET
+    assert d._EVID_RESERVE > app.TOOL_SCHEMA_BUDGET
