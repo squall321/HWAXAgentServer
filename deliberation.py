@@ -99,7 +99,31 @@ _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 _EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
 _EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 40000)   # 항목당 상한(자) — 긴 발표자료 한 건
 _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
-_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 160000)      # 주입 합계 상한(자)
+_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 160000)      # 주입 합계 **천장**(자)
+# ⚠ 위 값은 천장이고 실제 예산은 모델 컨텍스트에서 유도한다. 좌석 프롬프트 하나는
+#   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
+#   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.
+#   실측: 천장 160,000자(≈152,000토큰) + _SEAT_CTX 48,000자(≈45,700토큰) = 198,000토큰.
+_EVID_KO_CPT = 1.05          # 한국어 최악 기준 자/토큰 — 과대평가하면 400 이 난다
+_EVID_RESERVE = _env_int("DELIB_EVID_RESERVE", 16000)     # 시스템·페르소나·도구 스키마 몫(토큰)
+_evid_cache: dict = {}
+
+
+def _evid_budget() -> int:
+    """이번 심의에서 사전 근거에 줄 글자 예산 — 천장과 컨텍스트 중 작은 쪽."""
+    if os.environ.get("DELIB_EVID_BUDGET"):
+        return _EVID_BUDGET                       # 사람이 못박았으면 그 값이 이긴다
+    if "n" in _evid_cache:
+        return _evid_cache["n"]
+    try:
+        from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
+        ctx = _model_context_tokens()
+    except Exception:
+        ctx = 128000
+    avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
+    n = min(_EVID_BUDGET, max(2000, int(avail * _EVID_KO_CPT)))
+    _evid_cache["n"] = n
+    return n
 _EVID_SHOW = _env_int("DELIB_EVID_SHOW", 4000)            # 화면 근거 카드 표시 상한(자)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
@@ -763,8 +787,11 @@ def _resolve_opts(req_opts):
 
 
 def _fit_ev(res: str) -> str:
-    """근거 항목 하나를 항목 예산에 맞춘다 — 잘랐으면 원문 길이와 함께 밝힌다."""
-    body, note = fit_document(res, _EVID_ITEM_MAX)
+    """근거 항목 하나를 항목 예산에 맞춘다 — 잘랐으면 원문 길이와 함께 밝힌다.
+
+    항목 상한이 합계 예산보다 클 수 없다 — 작은 컨텍스트에서 항목 하나가 예산을 통째로
+    먹으면 나머지 근거가 전부 드롭된다."""
+    body, note = fit_document(res, min(_EVID_ITEM_MAX, _evid_budget()))
     return body if not note else f"{body}\n…[원문 {len(res):,}자 · {note}]"
 
 
@@ -2760,7 +2787,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
             # [e:N] 안정 id — 좌석·의장이 근거 항목을 지목해 인용할 참조 체계(JS 파이프라인 파리티).
             _line = f"· [e:{_ei}] [{_src}{_meta}] {_res}"
-            if _budget + len(_line) > _EVID_BUDGET and _items:
+            if _budget + len(_line) > _evid_budget() and _items:
                 _dropped = len(opts.evidence) - len(_items)
                 break
             _items.append(_line)
@@ -2771,7 +2798,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _dropped:
             yield _delib("evidence", source="사전 근거 예산 초과",
                          text=f"근거 {len(opts.evidence)}건 중 뒤쪽 {_dropped}건은 예산"
-                              f"({_EVID_BUDGET:,}자)을 넘겨 좌석에 주지 않았다.", included=False)
+                              f"({_evid_budget():,}자)을 넘겨 좌석에 주지 않았다.", included=False)
         if _items:
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
                               "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라. 이 항목의 "

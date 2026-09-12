@@ -1704,12 +1704,35 @@ HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "4000"))
 # 326,875자 180슬라이드 → dev 16,384 토큰 모델에서 그대로 터졌다). 그래서 서버에 물어본다.
 DOC_MAX_FILES = int(os.environ.get("DOC_MAX_FILES", "5"))            # 건수 상한
 DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 때 앞쪽에 줄 몫
-# 한국어는 토큰당 대략 1.2~1.6자다. 보수적으로 1.2 를 쓴다(과대평가하면 또 400 이 난다).
-DOC_CHARS_PER_TOKEN = float(os.environ.get("DOC_CHARS_PER_TOKEN", "1.2"))
-# 컨텍스트 중 문서에 줄 몫. 나머지는 시스템 프롬프트·도구 스키마·이력·출력이 쓴다.
-DOC_CTX_SHARE = float(os.environ.get("DOC_CTX_SHARE", "0.45"))
+# 컨텍스트에서 문서 몫을 **비율로** 떼면 큰 창을 버린다. 고정 오버헤드(시스템 프롬프트·도구
+# 스키마·출력)는 창 크기에 비례하지 않기 때문이다 — 1M 창에서 45%만 쓰면 50만 토큰을 놀린다.
+# 그래서 '컨텍스트 − 예비분 − 이력' 으로 잡는다. 운영 타깃은 GLM(128K)·Claude Opus(200K~1M)다.
+DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", "12000"))  # 시스템+도구+출력
 _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
 _ctx_cache: dict = {}
+
+# 토큰 환산 — 한글은 토큰당 1자 남짓, 라틴 문자는 3~4자다. 한 값으로 뭉뚱그리면 한국어 문서에서
+# 400 이 나거나(과대평가) 영문 문서에서 창의 3분의 1만 쓴다(과소평가). 글자 구성으로 가른다.
+_CJK_RANGES = ((0xAC00, 0xD7AF), (0x4E00, 0x9FFF), (0x3040, 0x30FF), (0x3130, 0x318F))
+
+
+def _est_tokens(text: str) -> int:
+    """대략의 토큰 수. 앞부분만 표본으로 보고 전체에 비례 적용한다(2백만 자를 다 세면 느리다)."""
+    if not text:
+        return 0
+    sample = text[:20000]
+    cjk = sum(1 for ch in sample
+              if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES))
+    ratio = (cjk / 1.05 + (len(sample) - cjk) / 3.6) / len(sample)
+    return max(1, int(len(text) * ratio))
+
+
+def _chars_for_tokens(text: str, tokens: int) -> int:
+    """이 글의 구성 그대로 `tokens` 토큰에 해당하는 글자 수."""
+    est = _est_tokens(text)
+    if est <= 0:
+        return tokens
+    return max(500, int(len(text) * tokens / est))
 
 
 def _model_context_tokens() -> int:
@@ -1739,16 +1762,34 @@ def _model_context_tokens() -> int:
     return n
 
 
-def _doc_total_chars() -> int:
-    """붙인 문서 전부에 줄 글자 예산. env 로 못박으면 그 값을 쓴다."""
+def _doc_budget_tokens(history_tokens: int = 0) -> int:
+    """붙인 문서 전부에 줄 **토큰** 예산 — 컨텍스트에서 예비분과 이력을 뺀 나머지.
+
+    이력은 최대 200,000자(HIST_BUDGET)까지 실릴 수 있어 문서와 같은 창을 다툰다. 고정값으로
+    빼면 긴 대화 중에 문서를 붙이는 순간 400 이 난다 — 그래서 그 턴의 실제 이력을 뺀다.
+    """
+    ctx = _model_context_tokens()
+    # 바닥을 '컨텍스트의 N%' 로 두면 안 된다 — 이력이 창을 이미 먹었을 때 **없는 자리를
+    # 있다고** 계산해 그대로 400 이 난다. 남은 만큼만 주고, 최소치는 상징적으로만 둔다.
+    return max(1500, ctx - DOC_RESERVE_TOKENS - max(0, history_tokens))
+
+
+def _doc_total_chars(documents=None, history_tokens: int = 0) -> int:
+    """문서 예산을 글자 수로. env DOC_TOTAL_CHARS 로 못박으면 그 값이 이긴다.
+
+    글자↔토큰 환산은 **그 문서의 글자 구성**으로 한다 — 한국어 발표자료와 영문 논문은
+    같은 글자 수라도 토큰이 3배 넘게 차이 난다.
+    """
     forced = os.environ.get("DOC_TOTAL_CHARS")
     if forced:
         return max(2000, int(forced))
-    return max(2000, int(_model_context_tokens() * DOC_CHARS_PER_TOKEN * DOC_CTX_SHARE))
+    tokens = _doc_budget_tokens(history_tokens)
+    joined = "".join(str((d or {}).get("text") or "")[:20000] for d in (documents or [])) or "가나다"
+    return max(2000, _chars_for_tokens(joined, tokens))
 
 
 
-def _doc_block(documents) -> str:
+def _doc_block(documents, history=None) -> str:
     """붙인 문서를 시스템 프롬프트에 실을 블록으로.
 
     세 갈래(첫 호출·재시도·강제 도구호출)가 모두 sys_prompt 를 공유하므로 여기 실으면
@@ -1762,7 +1803,9 @@ def _doc_block(documents) -> str:
     if not docs:
         return ""
     docs = docs[:DOC_MAX_FILES]
-    share = max(2000, _doc_total_chars() // len(docs))
+    hist_tokens = _est_tokens("".join(
+        str((h or {}).get("content") or "") for h in (history or []) if isinstance(h, dict)))
+    share = max(2000, _doc_total_chars(docs, hist_tokens) // len(docs))
     parts = []
     for i, d in enumerate(docs, start=1):
         name = str(d.get("name") or f"문서{i}")[:260]
@@ -2309,14 +2352,21 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                   "tool": None})
         # 붙인 문서는 **sys_prompt 에** 싣는다 — 아래 세 갈래(첫 호출·오류 재시도·강제 도구호출)가
         # 모두 sys_prompt 를 공유하므로, user 메시지에 붙이면 재시도 경로에서 조용히 빠진다.
-        _docs = _doc_block(req.documents)
+        _docs = _doc_block(req.documents, req.history)
         if _docs:
             sys_prompt += _docs
             _n = min(len(req.documents), DOC_MAX_FILES)
             _cut = "⋯ 가운데" in _docs
-            yield _sse("status", {"step": f"붙인 문서 {_n}건을 읽습니다"
-                                          + (" — 길어서 가운데 일부는 건너뜁니다" if _cut else ""),
-                                  "tool": None})
+            _step = f"붙인 문서 {_n}건을 읽습니다"
+            if _cut:
+                # 대화가 길어 자리가 없는 것인지, 문서 자체가 긴 것인지 구분해 준다 —
+                # 앞의 경우엔 '새 대화에서 붙이면 더 읽는다' 가 답이라 조치가 다르다.
+                _ht = _est_tokens("".join(str((h or {}).get("content") or "")
+                                          for h in (req.history or []) if isinstance(h, dict)))
+                _step += ("— 대화가 길어 문서에 줄 자리가 적습니다(새 대화에서 붙이면 더 읽습니다)"
+                          if _ht > _model_context_tokens() * 0.4
+                          else " — 길어서 가운데 일부는 건너뜁니다")
+            yield _sse("status", {"step": _step, "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에

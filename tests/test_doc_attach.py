@@ -6,23 +6,63 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest  # noqa: E402
+
 import app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pin_context():
+    """모델 컨텍스트를 고정한다.
+
+    안 고정하면 이 파일의 결과가 **그 박스에 떠 있는 모델**에 따라 달라진다(dev 16K ·
+    운영 GLM 128K). 예산 로직을 시험하는 것이지 그 박스의 모델을 시험하는 게 아니다.
+    """
+    saved = dict(app._ctx_cache)
+    app._ctx_cache["n"] = 128000
+    yield
+    app._ctx_cache.clear()
+    app._ctx_cache.update(saved)
 
 
 def _doc(name, chars):
     return {"name": name, "text": "가" * chars}
 
 
+def _budget(docs):
+    return app._doc_total_chars(docs)
+
+
 def test_문서_예산은_모델_컨텍스트에서_나온다():
-    """고정 숫자로 두면 박스마다(dev 16K · 운영 GLM) 한쪽이 반드시 틀리고, 틀리면 400 이라
-    사용자에게는 '응답 생성 실패' 로만 보인다 — 실측으로 그렇게 터졌다."""
-    ctx = app._model_context_tokens()
-    assert ctx > 0
-    budget = app._doc_total_chars()
-    # 예산이 컨텍스트를 통째로 먹으면 시스템 프롬프트·도구·이력이 들어갈 자리가 없다.
-    assert budget <= ctx * app.DOC_CHARS_PER_TOKEN * 0.8, (
-        f"예산 {budget:,}자가 컨텍스트 {ctx:,}토큰에 비해 너무 크다"
-    )
+    """고정 숫자로 두면 박스마다(dev 16K · 운영 GLM 128K · Opus 200K~1M) 한쪽이 반드시
+    틀리고, 틀리면 400 이라 사용자에게는 '응답 생성 실패' 로만 보인다 — 실측으로 터졌다."""
+    ko = [{"text": "한글 본문입니다. " * 100}]
+    en = [{"text": "English body text here. " * 100}]
+    assert app._doc_budget_tokens(0) == 128000 - app.DOC_RESERVE_TOKENS
+    # 같은 토큰 예산이라도 글자 수는 글 구성에 따라 다르다 — 한 값으로 뭉뚱그리면
+    # 한국어에서 400 이 나거나 영문에서 창의 3분의 1만 쓴다.
+    assert _budget(en) > _budget(ko) * 2, "영문/한국어 토큰 밀도 차이가 반영 안 됐다"
+
+
+def test_큰_컨텍스트일수록_문서에_더_준다():
+    """비율 배분이면 1M 창에서 절반을 놀린다. 고정 오버헤드는 창에 비례하지 않는다."""
+    got = {}
+    for ctx in (16384, 128000, 200000, 1000000):
+        app._ctx_cache["n"] = ctx
+        got[ctx] = app._doc_budget_tokens(0)
+    assert got[16384] < got[128000] < got[200000] < got[1000000]
+    # 큰 창에서는 예비분만 떼고 거의 다 준다(비율 배분이면 여기서 절반이 날아간다).
+    assert got[1000000] >= 1000000 * 0.95
+
+
+def test_긴_대화_중이면_문서_예산이_줄어든다():
+    """이력은 최대 200,000자까지 실려 문서와 같은 창을 다툰다. 고정값으로 빼면 긴 대화
+    중에 문서를 붙이는 순간 400 이 난다."""
+    none_ = app._doc_budget_tokens(0)
+    some = app._doc_budget_tokens(40000)
+    assert some == none_ - 40000
+    # 이력이 창을 다 먹었으면 **없는 자리를 있다고 하지 않는다**(바닥값이 그 버그였다).
+    assert app._doc_budget_tokens(500000) <= 1500
 
 
 def test_붙인_문서가_없으면_빈_문자열():
@@ -37,8 +77,9 @@ def test_글자_없는_항목은_버린다():
 
 
 def test_상한_안이면_본문이_그대로_실린다():
-    out = app._doc_block([_doc("설계검토.hwax.md", 5000)])
-    assert "가" * 5000 in out
+    n = min(5000, _budget([_doc("x", 5000)]) - 100)
+    out = app._doc_block([_doc("설계검토.hwax.md", n)])
+    assert "가" * n in out
     assert "설계검토.hwax.md" in out
     # 자름 표시는 **문서 머리말**에만 나와야 한다. 규율 문구에도 같은 말이 나오므로
     # 전체 문자열로 보면 안 된다(이 테스트가 처음에 거기서 틀렸다).
@@ -49,19 +90,20 @@ def test_예산은_건수로_균등_분배된다():
     """앞 문서가 예산을 다 먹으면 사용자는 두 건을 붙였는데 답은 한 건만 본 채로 나온다.
 
     그 실패는 화면에 아무 흔적도 안 남는다 — 그래서 코드가 몫을 나눈다."""
-    big = app._doc_total_chars() * 2
-    out = app._doc_block([_doc("앞.md", big), _doc("뒤.md", big)])
+    docs = [_doc("앞.md", 200000), _doc("뒤.md", 200000)]
+    out = app._doc_block(docs)
     assert "앞.md" in out and "뒤.md" in out, "뒤 문서가 통째로 사라졌다"
-    share = app._doc_total_chars() // 2
-    # 두 문서 모두 같은 몫만큼 실린다(합계가 예산 근처, 한쪽으로 쏠리지 않는다).
-    assert out.count("가" * share) == 2
+    share = _budget(docs) // 2
+    # 두 문서 모두 같은 몫만큼 실린다(한쪽이 예산을 다 먹지 않는다).
+    assert out.count("가" * share) == 2, f"몫({share:,}자)이 균등 분배되지 않았다"
 
 
 def test_잘랐으면_잘랐다고_적는다():
     """모델이 '뒷부분을 못 봤다'는 걸 알아야 지어내지 않고 되물을 수 있다."""
-    out = app._doc_block([_doc("긴문서.md", app._doc_total_chars() + 1000)])
+    n = _budget([_doc("x", 1)]) + 1000
+    out = app._doc_block([_doc("긴문서.md", n)])
     assert "만 실림" in out
-    assert f"{app._doc_total_chars() + 1000:,}자" in out   # 원문 길이를 밝힌다
+    assert f"{n:,}자" in out   # 원문 길이를 밝힌다
 
 
 def test_건수_상한을_넘으면_자른다():
@@ -153,3 +195,46 @@ def test_심의_근거도_같은_방식으로_맞춘다():
     kept = opts.evidence[0]["result"]
     assert "결론: 구리 두께" in kept, "심의 근거에서 결론이 날아갔다"
     assert "원문" in kept and "낱장이 빠짐" in kept, "심의 쪽에 빠진 구간 표시가 없다"
+
+
+# ── 심의 근거 예산도 컨텍스트를 넘으면 안 된다 ──────────────────────────────────────
+# 챗은 400 이 나면 그 발화 하나가 죽지만, 심의는 좌석이 동시에 돌아 **전원이 같이 죽는다**.
+def test_좌석_프롬프트가_컨텍스트를_넘지_않는다():
+    """근거 천장(160,000자)만 보면 좌석 프롬프트가 GLM 128K 를 넘는다 — 실측 198,000토큰."""
+    import deliberation as d
+
+    for ctx in (128000, 200000, 1000000):
+        app._ctx_cache["n"] = ctx
+        d._evid_cache.clear()
+        worst = d._evid_budget() + d._SEAT_CTX       # 근거 + 직전 라운드(한국어 최악)
+        assert app._est_tokens("가" * worst) < ctx, (
+            f"컨텍스트 {ctx:,}토큰인데 좌석 프롬프트만 "
+            f"{app._est_tokens('가' * worst):,}토큰이다 — 라운드가 통째로 400 이 난다"
+        )
+    d._evid_cache.clear()
+
+
+def test_심의_예산도_큰_컨텍스트에서_더_준다():
+    import deliberation as d
+
+    got = {}
+    for ctx in (128000, 200000):
+        app._ctx_cache["n"] = ctx
+        d._evid_cache.clear()
+        got[ctx] = d._evid_budget()
+    assert got[200000] > got[128000]
+    assert got[200000] <= d._EVID_BUDGET, "천장을 넘었다"
+    d._evid_cache.clear()
+
+
+def test_사람이_못박으면_그_값이_이긴다(monkeypatch):
+    """운영에서 컨텍스트 조회가 틀리거나 더 줄이고 싶을 때 손잡이가 있어야 한다."""
+    import importlib
+
+    monkeypatch.setenv("DELIB_EVID_BUDGET", "5000")
+    import deliberation as d
+
+    importlib.reload(d)
+    assert d._evid_budget() == 5000
+    monkeypatch.delenv("DELIB_EVID_BUDGET")
+    importlib.reload(d)
