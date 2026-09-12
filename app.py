@@ -448,7 +448,7 @@ def _detach_stream(gen, label: str):
 # 0 이면 무제한(권장 안 함 — 안전밸브 해제).
 # 32000 도 부족했다: recommend_agents(top_k=40) 한 번이 53KB 다(실측). prod 는 GLM(대형 컨텍스트)
 # 이므로 기본을 120000(≈35K 토큰)까지 올린다 — 소형 모델 박스만 .env 로 낮춘다.
-TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "120000"))
+TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "200000"))
 # 결정적 카탈로그 조회(recommend_agents·list_agents·get_agent_session·list_records)는 LLM 프롬프트가
 # 아니라 **코드가 JSON 으로 파싱**한다. 여기에 프롬프트 보호용 절단을 걸면 JSON 이 중간에서 끊겨
 # 파싱이 조용히 실패하고 "추천 0명"·"풀 9명" 같은 빈 결과가 나온다(실측 원인). 사실상 무제한으로 둔다.
@@ -458,7 +458,7 @@ CATALOG_RESULT_MAX = int(os.environ.get("CATALOG_RESULT_MAX", "2000000"))
 CATALOG_DESC_MAX = int(os.environ.get("CATALOG_DESC_MAX", "4000"))
 # 아래 기본값은 모두 대형 컨텍스트(prod B300 8기·GLM) 기준으로 넉넉하게 잡는다.
 # 소형 모델 박스(dev qwen 16K)만 .env 로 낮춘다 — 반대로 잡으면 prod 가 dev 사이즈에 묶인다.
-TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "1200"))  # 도구 description 절단(문자)
+TOOL_DESC_MAX = int(os.environ.get("TOOL_DESC_MAX", "2400"))  # 도구 description 절단(문자)
 HIST_ITEM_MAX = int(os.environ.get("HIST_ITEM_MAX", "24000"))  # history 항목별 절단(문자)
 HIST_BUDGET = int(os.environ.get("HIST_BUDGET", "200000"))  # history 전체 예산(문자) — 최신 우선
 HIST_MAX_ITEMS = int(os.environ.get("HIST_MAX_ITEMS", "80"))  # history 최대 항목 수
@@ -952,18 +952,25 @@ def _prep_tool(tool, result_max=None, desc_max=None):
     return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max)
 
 
+# ── 컨텍스트 예산 (운영 타깃 = GLM on B300, 128K 창 기준) ────────────────────────────
+# 기본값은 **대형 컨텍스트 기준으로 넉넉하게** 잡는다. 작은 박스(dev qwen 16K)만 .env 로 낮춘다 —
+# 반대로 잡으면 운영이 dev 크기에 묶인다. 128K 를 대략 이렇게 나눈 값이다.
+#   도구 스키마 40K · 대화 이력 200K자(≈57K토큰, 최신 우선으로 잘림) · 도구 결과 1건 200K자 상한
+#   · 역할 8K자 · 지식카드 12K자 · 나머지는 추론·출력
+# ⚠ 각 상한은 **따로** 적용된다 — 합이 창을 넘을 수 있다. 넘으면 상류가 400 을 주고 그 턴은
+#   중단 문구로 끝난다(무음 아님). 로그의 `[agent] tool budget:` 줄이 잘린 개수를 알려 준다.
 # 소형 컨텍스트(dev 16K) 보호 — 도구 스키마 총량이 프롬프트를 넘치면 LLM 400으로 챗 전체가 죽는다.
 # TOOL_MAX(0=무제한, prod 기본)로 바인딩 개수를 캡하고, 자주 쓰는 핵심 도구를 우선 남긴다.
 # 기본 80 — 0(무제한)이면 랭킹이 아예 안 돌아 도구가 수백 개가 될 때 평평하게 쏟아진다.
 # 명시적으로 TOOL_MAX=0 을 주면 종전처럼 전체 바인딩(탈출구 유지).
-TOOL_MAX = int(os.environ.get("TOOL_MAX", "80"))
+TOOL_MAX = int(os.environ.get("TOOL_MAX", "200"))
 # 그래프 재귀 한도 — 미설정 시 LangGraph 기본(25)에 걸려 턴 전체가 폐기된다. 넉넉히 두되
 # 무한은 아니게. 도구 왕복 1회가 노드 2~3개를 쓴다.
-AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "60"))
+AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "80"))
 # 같은 도구·같은 인자 반복 호출 경고 임계 — 작은 모델의 루프를 사용자에게 드러낸다.
 TOOL_REPEAT_WARN = int(os.environ.get("TOOL_REPEAT_WARN", "3"))
 # 바인딩 도구 스키마의 추정 토큰 상한(0=무제한). 개수 캡만으로는 컨텍스트 초과를 못 막는다.
-TOOL_SCHEMA_BUDGET = int(os.environ.get("TOOL_SCHEMA_BUDGET", "12000"))
+TOOL_SCHEMA_BUDGET = int(os.environ.get("TOOL_SCHEMA_BUDGET", "40000"))
 _TOOL_PRIORITY = (
     # 안내대 — 관련도 랭킹이 빗나갔을 때의 폴백 입구. 반드시 상시 바인딩한다(2026-09-03,
     # 도구 진입 구조). search_tools 가 이름·인자를 찾아 주고, invoke_tool 이 바인딩에 없는
@@ -1719,7 +1726,7 @@ def _tool_preview(v, n: int = 220) -> str:
 
 # 페르소나 역할 원문 상한(문자). HE팀 정본 동기화(HWAXPortal infra/scripts/sync-he-personas.py
 # PROMPT_MAX)가 같은 값으로 막는다 — 여기서 잘리면 역할 뒤쪽('답하는 법')이 조용히 빠진다.
-PERSONA_ROLE_MAX = 4000
+PERSONA_ROLE_MAX = 8000
 # 페르소나 캐시 수명(초). 예전엔 재시작 전까지 영구였다 — 정본을 고쳐 동기화해도 에이전트서버를
 # 다시 띄우기 전까지 옛 역할·옛 앱으로 답했다.
 PERSONA_TTL_S = _env_int("PERSONA_TTL_S", 300)
@@ -1730,7 +1737,7 @@ PERSONA_TTL_S = _env_int("PERSONA_TTL_S", 300)
 PERSONA_MAX = _env_int("PERSONA_MAX", 5)
 # 보조 전문가의 역할 문구 길이. 주 전문가(PERSONA_ROLE_MAX)보다 짧게 싣는다 — 보조는 판단 기준만
 # 빌려주는 자리라 전문을 실으면 도구 스키마 예산을 그만큼 밀어낸다.
-PERSONA_HELPER_ROLE_MAX = _env_int("PERSONA_HELPER_ROLE_MAX", 1200)
+PERSONA_HELPER_ROLE_MAX = _env_int("PERSONA_HELPER_ROLE_MAX", 3000)
 
 
 def _persona_keys(many: list[str] | None, one: str | None) -> list[str]:
@@ -1778,7 +1785,7 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
 
 # 지정 전문가의 지식카드 주입 예산(문자). 심의 경로(DELIB_KNOWLEDGE_BUDGET)와 같은 기본값이다 —
 # 챗은 인원 1명·라운드 1회라 심의처럼 곱해지지 않으므로 더 조일 이유가 없다.
-CHAT_KNOWLEDGE_BUDGET = _env_int("CHAT_KNOWLEDGE_BUDGET", 3500)
+CHAT_KNOWLEDGE_BUDGET = _env_int("CHAT_KNOWLEDGE_BUDGET", 12000)
 
 # 지식 조회용 도구 핸들 캐시(그룹셋별, 300초) — _tools_by_name 은 매번 백엔드 5곳의 도구 목록을
 # 다시 받아 온다. 페르소나 대화는 매 발화마다 이 경로를 타므로 캐시가 없으면 발화마다 그 왕복이
