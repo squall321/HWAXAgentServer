@@ -1,5 +1,5 @@
 # Agent Server: 게이트웨이로 groups를 실어보내는 헤더 주입/설정 로직 단위 테스트 (네트워크 불필요).
-from app import GROUPS_HEADER, _parse_servers, _with_groups
+from app import GROUPS_HEADER, _needs_final_rescue, _parse_servers, _with_groups
 
 
 def test_with_groups_injects_comma_joined_header():
@@ -95,3 +95,17 @@ def test_agent_for_caches_by_group_set(monkeypatch):
     # 것은 그룹셋 축 하나뿐이므로 첫 칸만 비교한다 — 나머지 축은 여기서 전부 기본값이다.
     assert {k[0] for k in state.agent_cache} == {frozenset({"admin"}), frozenset({"user"})}
     assert seen_headers == ["admin", "user"]                 # 게이트웨이로 그룹셋당 1회, 정렬된 헤더 전달
+
+
+def test_도구_뒤_말이_없으면_예고만_남아도_구제한다():
+    """'먼저 가이드와 템플릿을 확인하겠습니다' 하고 도구만 부른 뒤 끝나는 턴 — 예전에는
+    text 가 비어 있지 않아 빈응답 구제를 그대로 통과했고 화면에는 그 한 줄만 남았다."""
+    calls = [("get_guide", "")]
+    # ① 예고만 하고 도구 결과 뒤로 한 글자도 없다 → 구제
+    assert _needs_final_rescue(calls, "먼저 가이드와 템플릿을 확인하겠습니다.", 0) is True
+    # ② 아무 글자도 없는 턴 → 종전대로 구제
+    assert _needs_final_rescue(calls, "", 0) is True
+    # ③ 도구 결과 뒤에 답을 썼다 → 구제 안 함(정상 턴)
+    assert _needs_final_rescue(calls, "가이드는 3장 구성입니다…", 120) is False
+    # ④ 도구를 안 쓴 턴은 이 구제의 대상이 아니다(다른 보강기가 본다)
+    assert _needs_final_rescue([], "", 0) is False

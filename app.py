@@ -1837,6 +1837,19 @@ _LEAK_RE = re.compile(
     r'"name"\s*:\s*"[A-Za-z_][A-Za-z0-9_]*"[^{}]{0,80}?"(?:arguments|input|parameters)"\s*:')
 
 
+def _needs_final_rescue(turn_calls: list, text: str, post_tool_chars: int) -> bool:
+    """도구를 부른 턴인데 마무리 답이 없으면 True — 구제(도구 결과로 답 만들기) 대상이다.
+
+    두 모양이 있다. ① 글자가 아예 없는 턴. ② **예고만 하고 끊긴 턴** — "먼저 가이드와
+    템플릿을 확인하겠습니다" 하고 도구를 부른 뒤, 결과를 받고도 한 글자도 더 내지 않는다.
+    ②는 text 가 비어 있지 않아 '빈 응답' 조건을 그대로 통과했고, 사용자에겐 중간에 끊긴
+    응답으로 보였다(실측 신고: 보고서 작성이 늘 그 문장에서 멈췄다).
+    post_tool_chars = 마지막 도구 결과 뒤에 모델이 낸 글자 수."""
+    if not turn_calls:
+        return False
+    return (not text.strip()) or post_tool_chars <= 0
+
+
 def _looks_like_leaked_tool_call(text: str, no_tool_ran: bool = False) -> bool:
     """모델이 도구 호출을 실행하지 못하고 호출문을 본문에 그대로 출력했는지 판정.
 
@@ -1964,6 +1977,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 넘지 못해 스트림 쪽에서 직접 회수해야 한다(실측 빈 값).
     turn_calls: list = []          # [(도구명, 인자요약)]
     turn_out: list = []            # 도구 출력 원문 조각(수치 대조용)
+    # 마지막 도구 결과 **뒤에** 모델이 뱉은 글자 수. 0 이면 "확인하겠습니다" 하고 도구만 부른 뒤
+    # 말없이 끝난 턴이다 — 화면에는 예고 한 줄만 남아 '중간에 끊긴' 것으로 보인다(실측 신고).
+    # 빈 응답 구제는 text 가 통째로 빌 때만 돌아서 이 모양을 그대로 통과시켰다.
+    _post_tool_chars = 0
     # 유령 ID 게이트의 출처집합 — 발화와 **전체 history** 의 정수로 시작한다(최근 몇 턴만 보면
     # "아까 그 재료" 처럼 오래된 ID 를 다시 쓰는 정상 호출이 막힌다). 도구 결과의 정수는
     # _learn_ids 가 호출 성공 시마다 더한다.
@@ -2145,6 +2162,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 token = event["data"]["chunk"].content
                 if token:  # empty on tool-call delta chunks — guard
                     full.append(token)
+                    _post_tool_chars += len(token if isinstance(token, str) else str(token))
                     yield _sse("token", {"delta": token})
             elif kind == "on_chat_model_end" and getattr(app.state, "llm_nostream", False):
                 # 비스트리밍 모드 — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
@@ -2156,6 +2174,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                         p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
                 if content:
                     full.append(content)
+                    _post_tool_chars += len(content)
                     yield _sse("token", {"delta": content})
             elif kind == "on_tool_start":
                 _budget["calls"] += 1
@@ -2192,6 +2211,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # ⚠ 변수명 주의 — `full` 은 1701행의 **토큰 누적 리스트**다. 처음에 `full =` 로
                 #   덮어썼다가 다음 토큰의 full.append 가 AttributeError 로 챗을 죽였다(감사 C35).
                 _hand = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
+                _post_tool_chars = 0   # 이 결과 뒤에 모델이 말을 했는지만 본다
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
                                       **({"result_preview": out} if out else {}),
                                       **({"result_full": _hand} if len(_hand) > len(out) else {})})
@@ -2460,11 +2480,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 사용자에겐 초록불이 꺼지고 아무것도 안 나온 것으로 보인다 — 조회는 이미 다 해 놓고서다.
     # 도구 결과가 손에 있으므로 그것으로 최소 응답을 만든다. 없는 말을 지어내지 않고,
     # 조회한 사실과 결과 발췌만 싣는다.
-    if not text.strip() and turn_calls:
+    # ⚠ 여기서 '빈 응답'은 두 모양이다. ① 아무 글자도 없는 턴 ② **예고만 하고 끊긴 턴** —
+    # "먼저 가이드와 템플릿을 확인하겠습니다" 하고 도구를 부른 뒤 결과를 받고도 아무 말 없이
+    # 끝난다(실측 신고: 보고서 작성이 늘 그 문장에서 멈췄다). ②는 text 가 비어 있지 않아
+    # 예전 조건을 그대로 통과했고, 사용자에겐 '중간에 끊긴 응답'으로 보였다.
+    if _needs_final_rescue(turn_calls, text, _post_tool_chars):
         _names = ", ".join(dict.fromkeys(n for n, _ in turn_calls))
         _excerpt = "\n".join(turn_out)[:12000].strip()
-        print(f"[agent] empty final after tools({_names}) — 자동 재시도")
-        yield _sse("status", {"step": "응답이 비어 자동 재시도", "tool": None})
+        _before = text   # 구제로 뭐라도 보탰는지 판정용(예고만 남은 턴은 text 가 비지 않는다)
+        print(f"[agent] {'stalled' if text.strip() else 'empty'} final after tools({_names}) — 자동 재시도")
+        yield _sse("status", {"step": "도구 결과 뒤 응답이 없어 자동 재시도", "tool": None})
         # 재시도는 '요약만' 시킨다 — 도구를 다시 부르면 같은 조회를 반복하고 같은 자리에서
         # 또 빌 수 있다. 이미 받은 결과를 컨텍스트로 주고 답만 쓰게 하는 것이 확실하다.
         try:
@@ -2484,18 +2509,26 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             if isinstance(_c3, list):
                 _c3 = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c3)
             if isinstance(_c3, str) and _c3.strip():
-                text = _c3.strip()
-                yield _sse("token", {"delta": text})
+                # 예고 문장은 지우지 않고 이어 붙인다 — 이미 사용자 화면에 흘러간 글자다.
+                # 지우면 스트리밍으로 본 것과 저장본이 달라진다.
+                _add = _c3.strip()
+                if text.strip():
+                    _add = "\n\n" + _add
+                text = (text + _add) if text.strip() else _add
+                yield _sse("token", {"delta": _add})
                 print("[agent] empty-final retry 성공")
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] empty-final retry failed: {exc!r}")
         # 재시도까지 실패하면 조회 결과라도 내보낸다. 조회는 이미 끝났으므로 이것을 버리면
         # 사용자는 아무것도 못 받는다(초록불만 꺼지는 그 상태다).
-        if not text.strip():
+        if text == _before:
             _short = _excerpt[:1200]
-            text = (f"조회는 완료했으나 요약 생성에 실패했습니다. 조회한 도구는 `{_names}` 입니다.\n\n"
-                    + (f"조회 결과 발췌\n\n```\n{_short}\n```\n" if _short else ""))
-            yield _sse("token", {"delta": text})
+            _fallback = (f"조회는 완료했으나 요약 생성에 실패했습니다. 조회한 도구는 `{_names}` 입니다.\n\n"
+                         + (f"조회 결과 발췌\n\n```\n{_short}\n```\n" if _short else ""))
+            if text.strip():
+                _fallback = "\n\n" + _fallback
+            text = (text + _fallback) if text.strip() else _fallback
+            yield _sse("token", {"delta": _fallback})
             print("[agent] empty-final retry 실패 — 원문 발췌로 대체")
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
