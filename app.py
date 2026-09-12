@@ -377,6 +377,9 @@ class ChatRequest(BaseModel):
     # delib_opts 가 아니라 top-level 인 이유: 이건 매 턴 켜져 있어야 하는 모드인데, 프론트의
     # 슬래시 접두사는 첫 발화에만 붙어(ChatContext.applyPrefix) 둘째 턴부터 조용히 꺼진다.
     thinking: bool = False
+    # 붙인 문서의 추출문 [{name, kind, text}, …]. 원본 파일은 오지 않는다 — 포털이 브라우저에서
+    # 읽어 글만 싣는다(DRM 전제). 검증·절단은 _doc_block 이 한다.
+    documents: list[dict] = []
     # 요청 시점 권한(feat:·plat:) — 포털이 원장으로 계산해 준다(HWAXPortal docs/access-control).
     # 심의·Thinking 트리거 판정은 여기 있으므로 포털이 아니라 이쪽이 막는다. None 은 권한을 모르는
     # 옛 호출이라 막지 않는다(포털은 늘 보낸다) — '안 보냄'과 '권한 없음'을 구분해야 해서다.
@@ -1685,10 +1688,49 @@ def _history_messages(history: list[dict]) -> list[tuple[str, str]]:
 
 
 # 핸드오프(챗→심의)용 도구 결과 길이. 화면 미리보기(220)와 **일부러 분리한다** —
-# 활동 패널은 짧아야 읽히고, 심의는 날것이 많이 필요하다(심의의 챗근거 예산은 11KB인데
-# 220자×12건 ≈ 2.6KB 만 도착해 8.4KB 가 비어 있었다). 표시용을 늘리면 패널도 브라우저
-# localStorage 도 같이 무거워지므로 필드를 나눈다. 12건×1200자 ≈ 14KB → 예산을 채운다.
-HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "1200"))
+# 활동 패널은 짧아야 읽히고, 심의는 날것이 많이 필요하다(220자×12건 ≈ 2.6KB 만 도착해
+# 예산이 비어 있었다). 표시용을 늘리면 패널도 브라우저 localStorage 도 같이 무거워지므로
+# 필드를 나눈다. 심의 예산이 60KB 로 올라갔으므로(deliberation._EVID_BUDGET) 여기도 같이
+# 올린다 — 4000자×40건이면 예산을 채운다. 안 올리면 예산만 크고 실제로 실리는 건 그대로다.
+HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "4000"))
+
+# 붙인 문서(추출문) 주입 예산. 원본 파일은 오지 않는다 — DRM 문서는 그 PC 에서만 복호화되므로
+# 추출은 사용자 PC 의 Office COM 에서 끝난다(HWAXPortal docs/doc-deliberate).
+DOC_TOTAL_CHARS = int(os.environ.get("DOC_TOTAL_CHARS", "120000"))   # 합계 상한
+DOC_MAX_FILES = int(os.environ.get("DOC_MAX_FILES", "5"))            # 건수 상한
+
+
+def _doc_block(documents) -> str:
+    """붙인 문서를 시스템 프롬프트에 실을 블록으로.
+
+    세 갈래(첫 호출·재시도·강제 도구호출)가 모두 sys_prompt 를 공유하므로 여기 실으면
+    한 군데만 고쳐도 전부 덮인다 — user 메시지에 붙이면 재시도 경로에서 조용히 빠진다.
+
+    예산은 **건수로 균등 분배**한다. 앞 문서가 다 먹고 뒤 문서가 통째로 사라지면, 사용자는
+    두 건을 붙였는데 답이 한 건만 본 채로 나온다. 자른 건 잘랐다고 문서마다 적는다."""
+    if not documents:
+        return ""
+    docs = [d for d in documents if isinstance(d, dict) and str(d.get("text") or "").strip()]
+    if not docs:
+        return ""
+    docs = docs[:DOC_MAX_FILES]
+    share = max(2000, DOC_TOTAL_CHARS // len(docs))
+    parts = []
+    for i, d in enumerate(docs, start=1):
+        name = str(d.get("name") or f"문서{i}")[:260]
+        text = str(d.get("text") or "")
+        cut = len(text) > share
+        body = text[:share] if cut else text
+        head = f"[문서 {i}/{len(docs)} · {name} · {len(text):,}자"
+        head += f", 이 중 앞 {share:,}자만 실림]" if cut else "]"
+        parts.append(head + "\n" + body)
+    return ("\n\n[사용자가 붙인 문서 — 사용자 PC 의 Office 로 추출한 원문이다. 아래 규율을 지켜라]\n"
+            "· 이 문서에 대해 답할 때는 **여기 적힌 것만** 근거로 삼아라. 기억으로 채우지 마라.\n"
+            "· 수치·날짜·이름을 인용할 때 어디서 왔는지 함께 적어라(예: [s.7], [p.12], 문서 이름).\n"
+            "· '앞 N자만 실림' 이라고 적힌 문서는 뒷부분을 못 봤다. 뒷부분이 필요하면 "
+            "그렇다고 말하고 사용자에게 해당 구간을 따로 붙여 달라고 하라 — 지어내지 마라.\n"
+            "· 문서 내용과 네 사전 지식이 어긋나면 어긋난다고 말하라. 조용히 덮어쓰지 마라.\n\n"
+            + "\n\n".join(parts))
 
 
 def _tool_preview(v, n: int = 220) -> str:
@@ -2217,6 +2259,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                   "⚠ 관점이 실제로 갈리면 숨기지 마라 — 답 끝에 '이견: <무엇이 갈리는지>' 한 줄을 붙이고, "
                   "판단이 갈려 결론을 못 내면 '/심의 <질문>' 으로 정식 심의를 권하라.")
             yield _sse("status", {"step": f"주 전문가 {agent_key} + 보조 {len(helpers)}명으로 답합니다",
+                                  "tool": None})
+        # 붙인 문서는 **sys_prompt 에** 싣는다 — 아래 세 갈래(첫 호출·오류 재시도·강제 도구호출)가
+        # 모두 sys_prompt 를 공유하므로, user 메시지에 붙이면 재시도 경로에서 조용히 빠진다.
+        _docs = _doc_block(req.documents)
+        if _docs:
+            sys_prompt += _docs
+            yield _sse("status", {"step": f"붙인 문서 {min(len(req.documents), DOC_MAX_FILES)}건을 읽습니다",
                                   "tool": None})
         messages = [("system", sys_prompt), *_history_messages(req.history), ("user", req.message)]
         inputs = {"messages": messages}
