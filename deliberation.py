@@ -97,9 +97,9 @@ _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 # 보고서 한 건(추출하면 보통 30,000~80,000자)을 실으면 **첫 항목에서 잘려** 심의가 표지만 보고
 # 논의했다. 좌석 컨텍스트 상한(_SEAT_CTX 48K)과 같은 자릿수로 맞춘다.
 _EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
-_EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 40000)   # 항목당 상한(자) — 긴 발표자료 한 건
+_EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 150000)  # 항목당 **천장**(자) — 큰 발표자료 한 건
 _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
-_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 160000)      # 주입 합계 **천장**(자)
+_EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천장**(자) — 1M 창 기준
 # ⚠ 위 값은 천장이고 실제 예산은 모델 컨텍스트에서 유도한다. 좌석 프롬프트 하나는
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
 #   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.

@@ -120,15 +120,42 @@ def test_근거_규율이_함께_실린다():
     assert "어긋난다고 말하라" in out       # 사전 지식과 충돌하면 조용히 덮지 마라
 
 
-def test_핸드오프_발췌가_심의_예산에_맞다():
-    """심의 예산(_EVID_BUDGET)만 올리고 발췌 길이를 안 올리면, 예산은 크고 실제로 실리는
-    건 그대로다 — 종전에 정확히 그 상태였다(11KB 예산에 2.6KB 만 도착)."""
-    import deliberation as d
+def test_핸드오프_발췌가_너무_짧지_않다():
+    """예산만 올리고 발췌 길이를 안 올리면 예산은 크고 실제로 실리는 건 그대로다 —
+    종전이 그 상태였다(11KB 예산에 220자×12건 ≈ 2.6KB 만 도착).
 
-    assert app.HANDOFF_RESULT_CHARS * d._EVID_ITEMS >= d._EVID_BUDGET, (
-        f"발췌 {app.HANDOFF_RESULT_CHARS}자 × {d._EVID_ITEMS}건 = "
-        f"{app.HANDOFF_RESULT_CHARS * d._EVID_ITEMS:,}자로 예산 {d._EVID_BUDGET:,}자를 못 채운다"
+    예산과의 '곱셈 일치' 는 더 이상 걸지 않는다. 근거 예산은 이제 **붙인 문서**도 채우므로
+    도구 발췌만으로 예산을 메워야 할 이유가 없다. 회귀 방어선만 남긴다."""
+    assert app.HANDOFF_RESULT_CHARS >= 4000, (
+        f"발췌가 {app.HANDOFF_RESULT_CHARS}자로 줄었다 — 표의 첫 줄만 심의에 간다"
     )
+
+
+def test_문서_건수_상한이_세_곳에서_같다():
+    """프론트가 더 많이 붙이게 하면 포털이 422 를 낸다(문서 글자 상한과 같은 함정)."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "HWAXPortal"
+    front = re.search(r"^export const DOC_MAX\s*=\s*(\d+)",
+                      (root / "frontend/src/components/chat/docAttach.ts").read_text(encoding="utf-8"),
+                      re.M)
+    portal = re.search(r"documents: list\[ChatDocument\] \| None = Field\(default=None, max_length=(\d+)\)",
+                       (root / "backend/app/agent/routes.py").read_text(encoding="utf-8"))
+    assert front and portal, "상한 선언을 못 찾았다 — 이름이 바뀌었으면 이 테스트도 고쳐라"
+    assert int(front.group(1)) == int(portal.group(1)) == app.DOC_MAX_FILES, (
+        f"문서 건수 불일치 — 프론트 {front.group(1)} · 포털 {portal.group(1)} · "
+        f"엔진 {app.DOC_MAX_FILES}"
+    )
+
+
+def test_문서가_없으면_이력이_창을_더_쓴다(monkeypatch):
+    """문서를 안 붙인 턴에 창을 놀릴 이유가 없다 — 종전엔 문서 유무와 무관하게 40% 만 썼다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    app._ctx_cache["n"] = 1000000
+    solo = app._hist_budget_chars(has_docs=False)
+    with_docs = app._hist_budget_chars(has_docs=True)
+    assert solo > with_docs * 1.8, f"문서 없을 때 {solo:,}자 / 있을 때 {with_docs:,}자"
 
 
 # ── 긴 문서 맞추기(fit_document) — 앞에서 자르면 결론이 날아간다 ────────────────────
@@ -314,7 +341,7 @@ def test_이력과_문서_예산이_동시에_컨텍스트에_들어간다(monke
     monkeypatch.delenv("HIST_BUDGET", raising=False)
     for ctx in (128000, 200000, 1000000):
         app._ctx_cache["n"] = ctx
-        hist_chars = app._hist_budget_chars()
+        hist_chars = app._hist_budget_chars(has_docs=True)   # 문서를 붙인 턴의 이력 몫
         hist_tokens = app._est_tokens("가" * hist_chars)        # 한국어 최악
         doc_chars = app._doc_total_chars([{"text": "가" * 100}], hist_tokens)
         doc_tokens = app._est_tokens("가" * doc_chars)
@@ -323,3 +350,25 @@ def test_이력과_문서_예산이_동시에_컨텍스트에_들어간다(monke
             f"컨텍스트 {ctx:,}토큰인데 이력({hist_tokens:,}) + 문서({doc_tokens:,}) + "
             f"예비분({app.DOC_RESERVE_TOKENS:,}) = {total:,}토큰이다"
         )
+
+
+def test_짧은_표본에서도_예산이_부풀지_않는다():
+    """토큰 수를 정수로 거쳐 나누면 짧은 표본의 절사 오차가 증폭된다 — 실측으로 1M 창에서
+    1,066,412토큰짜리 이력 예산이 나왔다(즉 컨텍스트를 넘는 예산)."""
+    for sample in ("가", "가나다라", "ab", "한글 섞인 mixed text"):
+        for tokens in (1000, 100000, 839800):
+            chars = app._chars_for_tokens(sample, tokens)
+            # 되돌릴 때 **같은 구성**으로 만들어야 한다 — 첫 글자만 반복하면 혼합 표본이
+            # 순한글이 되어 시험 자체가 틀린다(이 테스트가 처음에 거기서 틀렸다).
+            back = app._est_tokens((sample * (chars // len(sample) + 1))[:chars])
+            assert back <= tokens * 1.05, f"{sample!r}/{tokens}: {chars:,}자 → {back:,}토큰"
+
+
+def test_이력_예산이_컨텍스트를_넘지_않는다(monkeypatch):
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    for ctx in (128000, 200000, 1000000):
+        app._ctx_cache["n"] = ctx
+        for has_docs in (False, True):
+            chars = app._hist_budget_chars(has_docs=has_docs)
+            tok = app._est_tokens("가" * chars)       # 한국어 최악
+            assert tok < ctx, f"컨텍스트 {ctx:,}인데 이력 예산만 {tok:,}토큰(docs={has_docs})"
