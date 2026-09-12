@@ -26,9 +26,6 @@ def _load() -> dict:
         r"def _int_tokens.*?\n    return \{int\(m\) for m in _INT_TOK_RE\.findall\(s\)\}",
         r"def _phantom_id_arg.*?\n    return None",
         r"_CHART_SURFACE_RE = .*?bool\(_ENTITY_RE\.search\(message or \"\"\)\)",
-        r"_NUM_TOK_RE = re\.compile\(r\"[^\n]*\"\)",
-        r"def _sig_numbers.*?\n    return out",
-        r"def _unsourced_numbers.*?\n    return bad",
         r"def _evidence_block.*?\n    return \"\\n\"\.join\(lines\)",
         r"_EVIDENCE_MARK = .*?\n",
         r"_NUDGE_RE = re\.compile\(.*?\)\n",
@@ -41,6 +38,17 @@ def _load() -> dict:
         m = re.search(pat, src, re.S)
         assert m, f"app.py 에서 블록을 찾지 못했다: {pat[:40]}"
         exec(m.group(0), ns)  # noqa: S102 — 자기 레포 소스만 대상
+    # 수치 대조는 챗·심의 공용 모듈로 옮겼다(evidence.py) — 거기서 읽어 옛 이름으로 붙인다.
+    ev = APP.parent / "evidence.py"
+    ev_src = ev.read_text(encoding="utf-8")
+    for pat in (r"_NUM_TOK_RE = re\.compile\(r\"[^\n]*\"\)",
+                r"def sig_numbers.*?\n    return out",
+                r"def unsourced_numbers.*?\n    return bad"):
+        m = re.search(pat, ev_src, re.S)
+        assert m, f"evidence.py 에서 블록을 찾지 못했다: {pat[:40]}"
+        exec(m.group(0), ns)  # noqa: S102
+    ns["_sig_numbers"] = ns["sig_numbers"]
+    ns["_unsourced_numbers"] = ns["unsourced_numbers"]
     return ns
 
 

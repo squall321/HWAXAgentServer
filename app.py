@@ -44,6 +44,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
+from evidence import sig_numbers as _sig_numbers, unsourced_numbers as _unsourced_numbers
 from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
@@ -639,49 +640,10 @@ def _resume_target(history: list) -> tuple:
 # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 표시한다.
 
 # 답변에서 뽑을 수치 토큰 — 천단위 콤마와 소수점을 포함해 원문 표기 그대로 잡는다.
-_NUM_TOK_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])")
 
 
-def _sig_numbers(text: str) -> list:
-    """대조할 가치가 있는 수치만. 오탐을 줄이려고 범위를 좁게 잡는다.
-
-    작은 정수(0~99)는 개수·순번·백분율로 정상 생성되는 값이라 제외한다 — 여기까지 잡으면
-    경고가 남발돼 표시 자체를 아무도 안 보게 된다. 소수점이 있거나 100 이상인 값만 본다.
-    """
-    out = []
-    for m in _NUM_TOK_RE.finditer(text or ""):
-        raw = m.group(0)
-        norm = raw.replace(",", "")
-        try:
-            val = float(norm)
-        except ValueError:
-            continue
-        if "." not in norm and val < 100:
-            continue
-        out.append((raw, norm))
-    return out
 
 
-def _unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
-    """답변의 수치 중 도구 출력·사용자 발화 어디에도 없는 것.
-
-    부분문자열로 대조한다 — '48039.32' 가 원문에 그대로 있으면 근거 있는 값으로 본다.
-    부분 일치라 '232' 가 '1232' 에 걸려 통과하는 느슨함이 있는데, 이 방향의 오차는
-    '근거 있다고 잘못 보는' 쪽이라 경고 남발보다 낫다(과다 경고는 기능을 죽인다).
-    """
-    if not sources:
-        return []
-    src_norm = sources.replace(",", "")
-    seen, bad = set(), []
-    for raw, norm in _sig_numbers(answer):
-        if norm in seen:
-            continue
-        seen.add(norm)
-        if norm not in src_norm:
-            bad.append(raw)
-        if len(bad) >= limit:
-            break
-    return bad
 
 
 # 근거 블록의 고정 표지 — 생성부와 '다음 턴 출처 판정'이 이 문자열로 맞물린다.

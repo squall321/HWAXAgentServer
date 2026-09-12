@@ -10,6 +10,8 @@ import asyncio
 import contextvars
 from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
+
+from evidence import unsourced_numbers   # 수치 대조는 챗과 같은 판정을 쓴다(공용 모듈)
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -3265,6 +3267,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
                              "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
                              "별도 판단입니다.")
+    # 의사결정문 수치 대조 — **의장이 본 것**(좌석 발언·근거·화두)에 없는 수치는 의장이 지어낸
+    # 값이다. 챗에는 이 판정이 근거 블록으로 있었는데, 정작 가장 중요한 산출물인 결정문에는
+    # 없었다(실측 점검). 판정은 챗과 같은 공용 모듈이 한다 — 화면마다 기준이 달라지면 안 된다.
+    _bad_num = unsourced_numbers(decision, chair_human + " " + (question or ""))
+    if _bad_num:
+        decision += ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다 — 의장이 "
+                     "추론·계산한 값일 수 있으니 그대로 인용하지 마십시오: "
+                     + ", ".join(f"`{v}`" for v in _bad_num))
+        yield _sse("status", {"step": f"결정문 수치 대조 — 출처 미확인 {len(_bad_num)}건", "tool": None})
     if out is not None:
         out["decision"] = decision
     yield _delib("decision", text=decision + report_note)

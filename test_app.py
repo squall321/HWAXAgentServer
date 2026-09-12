@@ -133,3 +133,24 @@ def test_예고_미호출_감지는_언어가_새도_잡는다():
     assert _announced_without_calling("Let me check the guide") is True
     # 도구 이름을 설명만 하는 문장은 걸리지 않는다(오탐이 더 나쁘다)
     assert _announced_without_calling("analyze_laminate 는 적층 해석 도구입니다") is False
+
+
+def test_수치_대조는_챗과_심의가_같은_판정을_쓴다():
+    """대조를 두 곳에 따로 구현하면 화면마다 경고 기준이 달라진다. 공용 모듈 하나를 쓰는지와,
+    심의 결정문에 실제로 걸려 있는지를 코드로 확인한다(결정문은 가장 중요한 산출물인데
+    챗에만 대조가 있었다)."""
+    from pathlib import Path
+
+    from evidence import unsourced_numbers
+
+    # 근거에 없는 큰 수치만 잡는다 — 작은 정수(순번·개수)는 오탐이 더 나쁘다.
+    assert unsourced_numbers("응력은 48039.32 MPa 다", "결과 48039.32") == []
+    assert unsourced_numbers("응력은 51200.5 MPa 다", "결과 48039.32") == ["51200.5"]
+    assert unsourced_numbers("항목 3개", "무관") == []
+
+    root = Path(__file__).resolve().parent
+    delib = (root / "deliberation.py").read_text(encoding="utf-8")
+    assert "from evidence import unsourced_numbers" in delib, "심의가 공용 판정을 임포트해야 한다"
+    assert "unsourced_numbers(decision," in delib, "결정문에 대조가 걸려 있어야 한다"
+    app_src = (root / "app.py").read_text(encoding="utf-8")
+    assert "from evidence import" in app_src, "챗도 같은 모듈을 써야 한다"
