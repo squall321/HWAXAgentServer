@@ -109,21 +109,35 @@ _EVID_RESERVE = _env_int("DELIB_EVID_RESERVE", 16000)     # 시스템·페르소
 _evid_cache: dict = {}
 
 
-def _evid_budget() -> int:
-    """이번 심의에서 사전 근거에 줄 글자 예산 — 천장과 컨텍스트 중 작은 쪽."""
-    if "n" in _evid_cache:
-        return _evid_cache["n"]
+def _pre_budget() -> int:
+    """사전 컨텍스트 **전체** 예산(자) — 원천 근거 + 챗 맥락이 나눠 쓴다.
+
+    둘을 따로 잡으면 각각은 맞는데 **합치면 컨텍스트를 넘는다.** 좌석 프롬프트 하나는
+    시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + **여기** + 도구 스키마이고, 심의는 좌석이
+    동시에 돌아 넘치면 라운드가 통째로 죽는다.
+    """
+    if "pre" in _evid_cache:
+        return _evid_cache["pre"]
     try:
         from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
         ctx = _model_context_tokens()
     except Exception:
         ctx = 128000
     avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
-    # env 값(_EVID_BUDGET)은 **낮추기만** 한다 — 올리는 쪽으로 두면 낡은 설정 한 줄이
-    # 좌석 프롬프트를 컨텍스트 밖으로 밀어내고, 심의는 좌석이 동시에 죽는다.
-    n = min(_EVID_BUDGET, max(2000, int(avail * _EVID_KO_CPT)))
-    _evid_cache["n"] = n
+    n = max(2000, int(avail * _EVID_KO_CPT))
+    _evid_cache["pre"] = n
     return n
+
+
+def _evid_budget() -> int:
+    """원천 근거 몫. env 천장(_EVID_BUDGET)은 **낮추기만** 한다 — 올리는 쪽으로 두면 낡은
+    설정 한 줄이 좌석 프롬프트를 컨텍스트 밖으로 밀어낸다."""
+    return min(_EVID_BUDGET, max(2000, int(_pre_budget() * (1.0 - _CHAT_CTX_SHARE))))
+
+
+def _chat_ctx_budget() -> int:
+    """챗 맥락 몫. 같은 통에서 나눠 쓰므로 근거와 합쳐도 컨텍스트를 안 넘는다."""
+    return min(CHAT_CONTEXT_BUDGET, max(1000, int(_pre_budget() * _CHAT_CTX_SHARE)))
 _EVID_SHOW = _env_int("DELIB_EVID_SHOW", 4000)            # 화면 근거 카드 표시 상한(자)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
@@ -434,7 +448,13 @@ _ALLOWED_MODIFIERS = set(_MODIFIER_BLOCKS)
 
 # 챗 대화 맥락 예산(문자). 라운드마다 좌석 수만큼 곱해지므로 크게 못 잡는다.
 # 도구 결과는 별도 채널(opts.evidence, 11KB)이라 여기는 사람이 한 말만 담는다.
-CHAT_CONTEXT_BUDGET = _env_int("DELIB_CHAT_CONTEXT_BUDGET", 6000)
+# 챗 맥락 예산 — 이것도 **천장**이고 실제 값은 컨텍스트에서 나온다(_chat_ctx_budget).
+# 종전 6,000자는 1M 창의 0.6% 라, 긴 대화를 넘겨도 좌석에는 몇 턴만 닿았다. 사용자가
+# "문장 하나만 넘기는 것처럼 보인다" 고 한 게 이것이다.
+CHAT_CONTEXT_BUDGET = _env_int("DELIB_CHAT_CONTEXT_BUDGET", 150000)
+_CHAT_TURN_MAX = _env_int("DELIB_CHAT_TURN_MAX", 4000)     # 사람 발화 하나당 상한(종전 1,200)
+_CHAT_BOT_MAX = _env_int("DELIB_CHAT_BOT_MAX", 2500)       # 챗 답변 하나당 상한(종전 900)
+_CHAT_CTX_SHARE = _env_float("DELIB_CHAT_CTX_SHARE", 0.3)  # 사전 컨텍스트 중 챗 맥락 몫
 
 
 def _chat_context_note(history) -> str:
@@ -463,14 +483,14 @@ def _chat_context_note(history) -> str:
     if not users and not bots:
         return ""
 
-    budget = CHAT_CONTEXT_BUDGET
+    budget = _chat_ctx_budget()
     out = ["\n\n[챗에서 이어진 맥락 — 아래는 모두 **검증 대상**이다. 전제로 받아들이지 마라]"]
     if users:
         out.append("[인간의 전제·의중] 사람이 챗에서 한 말이다. 무엇을 원하고 무엇을 제약으로 "
                    "두는지가 여기 있다. 심의는 이 전제 자체가 옳은지도 함께 따져라 — "
                    "틀렸다고 판단하면 근거를 대고 그렇게 말하라.")
         for t in users:
-            line = f"· {t[:1200]}"
+            line = f"· {t[:_CHAT_TURN_MAX]}"
             if budget - len(line) < 0:
                 out.append("· (이하 생략 — 예산)")
                 break
@@ -480,7 +500,7 @@ def _chat_context_note(history) -> str:
         out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
                    "근거가 없거나 틀렸으면 반박하라.")
         for t in bots:
-            line = f"· {t[:900]}"
+            line = f"· {t[:_CHAT_BOT_MAX]}"
             if budget - len(line) < 0:
                 out.append("· (이하 생략 — 예산)")
                 break

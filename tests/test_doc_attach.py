@@ -227,13 +227,14 @@ def test_심의_근거도_같은_방식으로_맞춘다():
 # ── 심의 근거 예산도 컨텍스트를 넘으면 안 된다 ──────────────────────────────────────
 # 챗은 400 이 나면 그 발화 하나가 죽지만, 심의는 좌석이 동시에 돌아 **전원이 같이 죽는다**.
 def test_좌석_프롬프트가_컨텍스트를_넘지_않는다():
-    """근거 천장(160,000자)만 보면 좌석 프롬프트가 GLM 128K 를 넘는다 — 실측 198,000토큰."""
+    """근거 천장만 보면 좌석 프롬프트가 GLM 128K 를 넘는다(실측 198,000토큰).
+    **챗 맥락까지 더해서** 본다 — 둘은 같은 좌석 프롬프트에 함께 실린다."""
     import deliberation as d
 
     for ctx in (128000, 200000, 1000000):
         app._ctx_cache["n"] = ctx
         d._evid_cache.clear()
-        worst = d._evid_budget() + d._SEAT_CTX       # 근거 + 직전 라운드(한국어 최악)
+        worst = d._evid_budget() + d._chat_ctx_budget() + d._SEAT_CTX
         assert app._est_tokens("가" * worst) < ctx, (
             f"컨텍스트 {ctx:,}토큰인데 좌석 프롬프트만 "
             f"{app._est_tokens('가' * worst):,}토큰이다 — 라운드가 통째로 400 이 난다"
@@ -405,3 +406,39 @@ def test_문서는_전문가_발굴_검색어에_안_섞인다():
     src = inspect.getsource(thinking.run_thinking)
     assert "_docs = _doc_block" in src
     assert "q += _docs" not in src and "q = q +" not in src
+
+
+# ── 챗→심의 핸드오프가 대화를 얼마나 넘기나 ────────────────────────────────────────
+def test_챗_맥락이_한_통에서_근거와_나뉜다():
+    """둘을 따로 잡으면 각각은 맞는데 **합치면 컨텍스트를 넘는다.**"""
+    import deliberation as d
+
+    app._ctx_cache["n"] = 1000000
+    d._evid_cache.clear()
+    assert d._evid_budget() + d._chat_ctx_budget() <= d._pre_budget()
+    assert d._chat_ctx_budget() > 0 and d._evid_budget() > d._chat_ctx_budget()
+    d._evid_cache.clear()
+
+
+def test_긴_대화가_몇_턴에서_안_잘린다():
+    """종전 6,000자는 1M 창의 0.6% 였다 — 긴 대화를 넘겨도 좌석엔 몇 턴만 닿았다."""
+    import deliberation as d
+
+    app._ctx_cache["n"] = 1000000
+    d._evid_cache.clear()
+    hist = [{"role": "user" if i % 2 == 0 else "assistant",
+             "content": f"{i}번째 발화. " + ("설계 검토 논의 문장. " * 60)} for i in range(40)]
+    note = d._chat_context_note(hist)
+
+    assert "0번째 발화" in note, "첫 발화가 안 들어갔다"
+    assert "38번째 발화" in note, "뒤쪽 발화가 예산에서 잘렸다 — 종전 6,000자면 여기서 끊긴다"
+    assert "인간의 전제·의중" in note and "잠정 해석" in note
+    assert len(note) <= d._chat_ctx_budget() + 3000   # 라벨·안내문 몫
+    d._evid_cache.clear()
+
+
+def test_사람_발화를_챗_답변보다_길게_남긴다():
+    """요구·제약은 사람 발화에 있다. 예산이 밀리면 어시스턴트부터 버린다."""
+    import deliberation as d
+
+    assert d._CHAT_TURN_MAX > d._CHAT_BOT_MAX
