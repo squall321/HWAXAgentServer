@@ -3551,8 +3551,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 잃고 (경험칙) 으로 강등해 결정문에 싣는다.
         # ⚠ 예산은 좌석 하나가 받는 **총량**이다. share 와 mine 에 각각 통째로 주면 실제
         #   주입량이 표기의 두 배가 된다(실측: 표기 1,500자 / 실제 2,670자). 나눠 쓴다.
-        _sb, _mbudget = _share_budget(), 0
-        _mbudget = max(400, _sb // 3)           # 자기 조회는 보통 적다 — 1/3 이면 넉넉하다
+        _sb = _share_budget()
+        # 자기 조회 몫은 1/3 을 노리되 **절반을 넘지 않는다.** 바닥값만 두면 작은 창에서
+        # 비율이 뒤집힌다(실측: dev 600자에서 공용 200 / 자기 400 이 됐다).
+        _mbudget = min(_sb // 2, max(200, _sb // 3))
         _sb -= _mbudget
         _share, _mine, _drop, _shown = {}, {}, {}, 0
         for p in personas if gather_pool else ():

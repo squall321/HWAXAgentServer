@@ -894,3 +894,10 @@ def test_역할어가_도구_이름_속_짧은_낱말에_안_걸린다():
     assert not d._name_hit("interface", "search_in_page")
     assert not d._name_hit("getting", "get_material")
     assert d._name_hit("material", "list_materials"), "material↔materials 는 살아야 한다"
+
+
+def test_자기_조회_몫이_공용_몫을_넘지_않는다():
+    """바닥값만 두면 작은 창에서 비율이 뒤집힌다 — dev 600자에서 공용 200 / 자기 400 이 됐다."""
+    for sb in (600, 1200, 1500, 8000):
+        m = min(sb // 2, max(200, sb // 3))
+        assert m <= sb - m, f"예산 {sb}: 자기 {m} > 공용 {sb - m}"
