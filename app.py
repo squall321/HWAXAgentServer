@@ -1661,6 +1661,11 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
             # 성공했으면 이 그룹셋의 과거 오류를 지운다(다른 그룹셋 상태는 건드리지 않는다).
             app.state.tool_load_error.pop(frozenset(groups), None)
         agent = create_react_agent(app.state.llm, tools)
+        # 실제로 묶인 도구 이름을 달아 둔다. 호출부가 "N종 우선 바인딩" 같은 말을 하려면
+        # **묶인 것**을 알아야 하는데, prefer 는 그룹 필터 없는 /tools-map(465종)에서 뽑은
+        # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
+        # 캐시 값 모양을 바꾸지 않으려고 객체에 붙인다 — 캐시를 타도 함께 따라온다.
+        agent._hwax_tools = tuple(getattr(t, "name", "") for t in tools)
         if load_failed:
             # 실패 결과는 캐시하지 않는다 — 캐시하면 게이트웨이가 복구돼도 이 그룹은
             # 재시작 전까지 영구 no-tool 이 된다(조용한 최악의 실패 모드). 이번 요청만
@@ -2362,10 +2367,6 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             _names = list(await asyncio.to_thread(_tools_map))
             if _names:
                 prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
-        if prefer:
-            yield _sse("status", {"step": f"{persona.get('name') or agent_key} 분야 도구 "
-                                          f"{len(prefer)}종 우선 바인딩",
-                                  "tool": None, "tools_used": prefer[:8]})
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
                                  # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.
@@ -2375,6 +2376,20 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                  # 토큰으로 400 이 났다(실측: PCB 전문가 + 라미네이트 운영자).
                                  _GUIDE_TOOLS if (operator or op_apps) else None,
                                  prefer)
+        # ⚠ 상태줄은 **바인딩된 뒤에** 낸다. 앞에 내면 (a) 조기 반환·예산 절단으로 실제로는
+        #   안 붙었을 수 있고 (b) prefer 는 그룹 필터 전 목록이라 그 사용자에게 없는 도구
+        #   이름을 "우선 바인딩" 칩으로 그려 준다. 실제로 묶인 것만 말한다.
+        if prefer:
+            _bound = set(getattr(agent, "_hwax_tools", ()) or ())
+            _hit = [n for n in prefer if n in _bound] if _bound else prefer
+            if _hit:
+                yield _sse("status", {"step": f"{persona.get('name') or agent_key} 분야 도구 "
+                                              f"{len(_hit)}종 우선 바인딩",
+                                      "tool": None, "tools_used": _hit[:8]})
+            else:
+                # 하나도 안 붙었으면 그렇게 말한다 — 조용히 넘기면 '전문가 도구로 답했다'로 읽힌다.
+                yield _sse("status", {"step": f"{persona.get('name') or agent_key} 분야 도구는 "
+                                              f"이번 턴에 안 붙었습니다(권한·예산)", "tool": None})
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
@@ -3634,7 +3649,11 @@ class AgentDetailRequest(BaseModel):
 # AIDataHub 가 역할 원문 뒤에 붙이는 공용 도구 안내(build_system_prompt 의 '## How to access this hub'
 # 블록) — 모든 전문가에게 같은 영문 안내라 사람이 읽을 역할이 아니다. 역할 원문이 없는 에이전트는
 # 'You are an assistant for "…"' 자동 틀을 받는데, 그것도 역할 문서가 아니다.
-_HUB_GUIDE_RE = re.compile(r"\n#{1,4}\s*How to access this hub", re.I)
+# 허브 사용 안내의 시작. **문구 하나에 기대지 않는다** — 상류가 "How to access" 를
+# "How to use" 로만 바꿔도 조용히 안 잘리고 안내문 2,840자가 통째로 들어간다(감사 실측).
+# 머리말에 "this hub" 가 들어간 마크다운 헤딩이면 잡는다. 한국어 역할 문서에 영문
+# 헤딩으로 그 표현이 정당하게 들어갈 일은 없다.
+_HUB_GUIDE_RE = re.compile(r"\n#{1,6}[^\n]*\bthis hub\b", re.I)
 
 
 def _role_doc(system_prompt: str) -> str:

@@ -439,3 +439,65 @@ def test_세글자_역할어가_엉뚱한_도구에_안_걸린다(monkeypatch):
     assert not d._name_hit("str", "chart_country_distribution")
     assert d._name_hit("pcb", "pcb_warpage_surrogate"), "낱말로 맞으면 3자라도 붙는다"
     assert d._name_hit("material", "list_materials"), "4자 이상은 접두 일치를 살린다"
+
+
+# ── 상태줄은 실제로 묶인 것만 말한다 ────────────────────────────────────────
+def test_안_묶인_도구를_우선_바인딩이라_말하지_않는다(monkeypatch):
+    """prefer 는 그룹 필터 **전** 목록(/tools-map 465종)에서 뽑는다. 실제 바인딩은 그 사용자의
+    그룹 헤더 뒤라 8종일 수도 있다 — 그대로 칩으로 그리면 못 쓰는 도구를 '우선 바인딩' 으로
+    보여 준다. 조기 반환·예산 절단으로 안 붙는 경우도 같다."""
+    sink: dict = {}
+    _prime_tools_map(monkeypatch, TS_MAP)
+    sess = {"agent_type": "he-calc-thermalshock", "name": "열충격 전문가",
+            "description": "열충격", "system_prompt": "열충격 SED 담당", "response_config": {}}
+    _stub_session(monkeypatch, {sess["agent_type"]: sess})
+
+    async def fake_agent_for(app, groups, pinned=None, query="", sources=None, user="", user_pat="",
+                             first=None, core_names=None, prefer=None):
+        ag = _FakeAgent(sink)
+        ag._hwax_tools = ("predict_sed",)      # 하나만 실제로 묶였다
+        return ag
+
+    async def fake_knowledge(*_a, **_k):
+        return ""
+
+    monkeypatch.setattr(a, "_agent_for", fake_agent_for)
+    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
+    a._persona_knowledge.last_note = ""
+    fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
+    req = a.ChatRequest(message="SED 예측", groups=[], pinned_agent=sess["agent_type"])
+
+    async def consume():
+        return [c async for c in a._agent_stream(fake_app, req)]
+
+    out = b"".join(asyncio.run(consume())).decode("utf-8")
+    assert "1종 우선 바인딩" in out, out[:400]
+    assert "get_dataset_summary" not in out, "안 묶인 도구를 칩으로 그렸다"
+
+
+def test_하나도_안_묶이면_그렇다고_말한다(monkeypatch):
+    sink: dict = {}
+    _prime_tools_map(monkeypatch, TS_MAP)
+    sess = {"agent_type": "he-calc-thermalshock", "name": "열충격 전문가",
+            "description": "열충격", "system_prompt": "열충격 SED 담당", "response_config": {}}
+    _stub_session(monkeypatch, {sess["agent_type"]: sess})
+
+    async def fake_agent_for(*_a, **_k):
+        ag = _FakeAgent(sink)
+        ag._hwax_tools = ("무관도구",)
+        return ag
+
+    async def fake_knowledge(*_a, **_k):
+        return ""
+
+    monkeypatch.setattr(a, "_agent_for", fake_agent_for)
+    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
+    a._persona_knowledge.last_note = ""
+    fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
+    req = a.ChatRequest(message="SED 예측", groups=[], pinned_agent=sess["agent_type"])
+
+    async def consume():
+        return [c async for c in a._agent_stream(fake_app, req)]
+
+    out = b"".join(asyncio.run(consume())).decode("utf-8")
+    assert "안 붙었습니다" in out, "조용히 넘기면 '전문가 도구로 답했다' 로 읽힌다"

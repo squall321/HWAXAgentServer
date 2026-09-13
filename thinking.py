@@ -30,6 +30,7 @@ from deliberation import (
     _sse,
     _tools_by_name,
     is_operator,
+    knowledge_line,
 )
 
 # ── 손잡이 ────────────────────────────────────────────────────────────────────
@@ -89,17 +90,10 @@ def _dom(key: str) -> str:
     return k.split("-", 1)[0] if "-" in k else k
 
 
-def _hit_line(h) -> str:
-    """agent_search hit → `• [제목 › 섹션] 발췌` 한 줄(deliberation._hit_line 과 같은 규격)."""
-    if not isinstance(h, dict):
-        return str(h)[:300]
-    title = h.get("title") or ""
-    sec = h.get("section_title") or ""
-    body = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
-    head = f"{title}" + (f" › {sec}" if sec else "")
-    if not (head or body):
-        return json.dumps(h, ensure_ascii=False, default=str)[:300]
-    return f"• [{head}] {str(body).strip()}"[:700]
+# 지식카드 한 줄 포맷 — 챗·심의와 **같은 함수**를 쓴다. 세 곳이 각자 만들다 셋 다
+# record_id 를 빠뜨렸고, 여기만 마지막까지 남아 있었다(docstring 은 "같은 규격" 이라
+# 적어 놓고 실제로는 갈라져 있었다 — 선언이 틀린 자리가 가장 늦게 발견된다).
+_hit_line = knowledge_line
 
 
 def _as_dict(raw) -> dict:

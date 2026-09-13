@@ -223,3 +223,31 @@ def test_구분선은_잘랐을_때만_떼어_낸다():
     """무조건 돌리면 역할 본문이 정당하게 '…판정 기준은 A---' 로 끝나는 경우까지 깎는다."""
     assert a._role_doc("판정 기준은 A---") == "판정 기준은 A---"
     assert a._role_doc("역할\n\n-----\n\n## How to access this hub\nx") == "역할"
+
+
+# ── 세 곳이 같은 포맷을 쓴다(챗·심의·띵킹) ──────────────────────────────────
+def test_띵킹도_같은_포맷을_쓴다():
+    """세 곳이 각자 만들다 셋 다 record_id 를 빠뜨렸다. 띵킹이 마지막까지 남아 있었고,
+    docstring 은 '같은 규격' 이라 적혀 있었다 — 선언이 틀린 자리가 가장 늦게 발견된다."""
+    import deliberation as d
+    import thinking as th
+
+    h = {"record_id": "R-1", "section_id": "2", "title": "t", "snippet": "b",
+         "tags": ["confidence:heuristic"]}
+    assert th._hit_line(h) == d.knowledge_line(h) == a._knowledge_line(h)
+    assert "R-1" in th._hit_line(h) and "경험칙" in th._hit_line(h)
+
+
+# ── 허브 안내 구분자는 문구 하나에 기대지 않는다 ─────────────────────────────
+def test_머리말_문구가_바뀌어도_잘린다():
+    """상류가 'How to access' 를 'How to use' 로만 바꿔도 조용히 안 잘리면
+    안내문 2,840자가 통째로 프롬프트에 들어간다."""
+    for head in ("## How to access this hub", "## How to use this hub — MCP tools",
+                 "### Accessing this hub", "##### How to access this hub"):
+        got = a._role_doc(f"역할 본문\n\n---\n\n{head}\n안내문 본문")
+        assert got == "역할 본문", f"{head!r} → {got!r}"
+
+
+def test_평문_속_같은_표현은_안_자른다():
+    txt = "평문 안의 (how to access this hub) 는 역할 본문이다"
+    assert a._role_doc(txt) == txt
