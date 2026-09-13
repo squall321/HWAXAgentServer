@@ -496,3 +496,33 @@ def test_챗_맥락에_인용_표지가_붙는다():
     # 표지만 붙이고 안 알리면 모델이 안 쓴다.
     assert "[c:N]" in note and "표지를 함께 적어라" in note
     d._evid_cache.clear()
+
+
+# ── VOC 환기가 '다듬은 화두' 에서 조용히 꺼지던 문제 ──────────────────────────────
+def test_VOC_발동이_대화까지_본다():
+    """화두는 다듬을수록 '판단을 요구하는 한 문장' 이 되어 불량 낱말이 빠진다.
+    실측: 'FPCB 굽힘 수명 **불량**이 왜 나나' → '구리를 12um 로 낮출 것인가'.
+    화두만 보면 정작 VOC 를 봐야 할 대화에서 환기가 **조용히** 건너뛰어진다."""
+    import deliberation as d
+
+    polished = "굽힘 반경 3.0mm·목표 20만회 조건에서 구리를 12um 로 낮출 것인가"
+    assert not d._has_defect_topic(polished), "시험 전제가 깨졌다 — 이 화두엔 불량 낱말이 없어야 한다"
+    hist = [{"role": "user", "content": "FPCB 굽힘 수명 불량이 왜 나는지 봐줘"}]
+    assert d._has_defect_topic(polished, hist), "대화에 불량이 있는데 환기가 안 걸린다"
+
+
+def test_현장_표현도_불량으로_본다():
+    """사람은 '불량' 이라고 안 하고 '부풀었다'·'먹통' 이라고 한다."""
+    import deliberation as d
+
+    for q in ("셀이 부풀어 올랐는데 원인이 뭔가", "기기가 먹통이 되는 건이 늘었다",
+              "코팅이 벗겨진다", "화면에 얼룩이 보인다", "케이블이 단선됐다"):
+        assert d._has_defect_topic(q), f"현장 표현을 못 잡는다: {q}"
+
+
+def test_무관한_화두는_여전히_안_걸린다():
+    """넓히다 아무 데나 걸리면 매 심의가 VOC 조회로 느려진다."""
+    import deliberation as d
+
+    for q in ("내년 예산 배분을 어떻게 할 것인가", "조직 개편안을 고른다"):
+        assert not d._has_defect_topic(q, [{"role": "user", "content": "예산 얘기"}]), q

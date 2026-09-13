@@ -870,11 +870,30 @@ def _ra_blocks(blocks: dict) -> dict:
 # 화두에 불량/품질 얘기가 있으면 SignalForge(VOC)에서 최근 불량 이슈를 먼저 환기한다.
 _DEFECT_RE = re.compile(
     r"불량|결함|불만|품질|크랙|파손|파단|리콜|클레임|고장|하자|이슈|스웰링|swelling"
-    r"|defect|failure|crack|fault|recall|complaint|quality", re.IGNORECASE)
+    r"|defect|failure|crack|fault|recall|complaint|quality"
+    # 현장에서 쓰는 말 — 사람은 "불량" 이라고 안 하고 "부풀었다"·"터졌다" 라고 한다.
+    # 이게 없으면 정작 VOC 를 봐야 할 대화에서 환기가 조용히 건너뛰어진다.
+    r"|부풀|불룩|팽창|들뜸|들뜬|벗겨|박리|깨짐|깨진|갈라|금이|터짐|터진|찢어|뜯어"
+    r"|단선|끊어|녹아|타버|눌어|변색|얼룩|긁힘|찍힘|휨|휘어|뒤틀|말림|소음|잡음"
+    r"|발열|과열|누액|샌다|새는|누수|이물|먹통|멈춤|재부팅|먹히지|안 켜|안 되",
+    re.IGNORECASE)
 
 
-def _has_defect_topic(question: str) -> bool:
-    return bool(_DEFECT_RE.search(question or ""))
+def _has_defect_topic(question: str, history=None) -> bool:
+    """불량 환기를 걸 화두인가 — **대화까지 본다.**
+
+    화두만 보면 안 되는 이유: 화두는 LLM 이 다듬을수록 '판단을 요구하는 한 문장' 이 되어
+    불량 낱말이 빠진다(실측: "FPCB 굽힘 수명 **불량**이 왜 나나" → "굽힘 반경 3.0mm 조건에서
+    구리를 12um 로 낮출 것인가"). 정작 VOC 를 봐야 할 대화에서 환기가 **조용히** 건너뛰어진다.
+    """
+    if _DEFECT_RE.search(question or ""):
+        return True
+    for m in (history or [])[-20:]:
+        if not isinstance(m, dict):
+            continue
+        if _DEFECT_RE.search(str(m.get("content") or "")[:4000]):
+            return True
+    return False
 
 
 def is_deliberation(message: str) -> bool:
@@ -1713,7 +1732,11 @@ _PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 #    타임아웃과 정상 응답이 같은 타입으로 돌아온다. 문자열을 봐야 구분된다.
 #  ③ 비었다는 것과 못 물어봤다는 것은 다르다 — 섞으면 "이 전문가는 아는 게 없다"로
 #    오독된다. 그래서 사유를 함께 돌려주고 호출부가 그것을 사용자에게 보인다.
-KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 20.0)
+# 좌석 지식카드 검색 타임아웃. 좌석은 **병렬**(asyncio.gather)이라 이 값을 올려도 전체
+# 시간은 '가장 느린 하나' 로 끝난다 — 20초는 너무 빡빡했다(agent_search 하이브리드가
+# 102초 걸린 전례가 있다. docs/gotchas 지식카드 검색 지연). 넉넉히 두고, 대신 강등되면
+# 화면에 남긴다. 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
+KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 120.0)
 # hybrid 가 늦으면 semantic 으로 한 번 되묻는다. hybrid 가 느린 것이지 semantic 은 0.1초다.
 KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 
@@ -2162,9 +2185,15 @@ def _sf_products(alerts: dict) -> list:
     return out
 
 
-async def _defect_briefing(tools: dict, llm, question: str):
+async def _defect_briefing(tools: dict, llm, question: str, history=None):
     """SignalForge 3-콜 환기: alert_check → get_top_issues/daily_briefing 폴백 → query_voc 증거.
-    반환 (환기 표시문, 심의 주입 블록 또는 "", 실제 호출한 도구명 리스트) — best-effort, 연관성은 LLM 판정."""
+    반환 (환기 표시문, 심의 주입 블록 또는 "", 실제 호출한 도구명 리스트) — best-effort, 연관성은 LLM 판정.
+
+    ⚠ 연관성 판정에 **대화까지** 준다. 화두만 보면 안 되는 이유는 발동 조건(_has_defect_topic)과
+    같다 — 화두는 다듬을수록 '판단을 요구하는 한 문장' 이 되어 증상·불량 얘기가 빠진다.
+    실측: 불량으로 시작한 대화인데 화두가 "구리를 12um 로 낮출 것인가" 라서 VOC 를 조회해
+    놓고도 '연관 없음' 으로 판정해 **좌석에 안 실렸다**(화면엔 떴다 — 더 헷갈린다).
+    """
     parts = []
     used = ["alert_check"]   # 활동 패널용 — 이 환기에서 실제 호출한 SF 도구들
     degraded = False   # 도구가 죽어 내용을 못 받은 흔적 — 전부 죽었으면 '조회 불가' 한 줄로 진행
@@ -2228,11 +2257,19 @@ async def _defect_briefing(tools: dict, llm, question: str):
     briefing = "\n".join(f"- {p}" for p in parts)
 
     # 연관성 판정 — 연관된 문제가 있으면 심의에 포함, 없으면 환기만 하고 질문 기반으로 진행.
+    _hist_txt = ""
+    for _m in (history or [])[-12:]:
+        if isinstance(_m, dict) and str(_m.get("content") or "").strip():
+            _who = "사용자" if _m.get("role") == "user" else "어시스턴트"
+            _hist_txt += f"{_who}: {str(_m['content'])[:600]}\n"
     verdict = _parse_json(await _llm_text(
         llm,
         "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-        f"[화두]\n{question}\n\n[최근 고객 불만 신호(SignalForge VOC)]\n{briefing}\n\n"
-        "위 불만 신호 중 화두와 실질적으로 연관된 것이 있습니까? "
+        f"[화두]\n{question}\n\n"
+        + (f"[이 화두가 나온 대화]\n{_hist_txt}\n" if _hist_txt else "")
+        + f"[최근 고객 불만 신호(SignalForge VOC)]\n{briefing}\n\n"
+        "위 불만 신호 중 **화두 또는 그 대화에서 다룬 증상·부품·제품**과 실질적으로 연관된 것이 "
+        "있습니까? 화두 문장에 그 낱말이 없더라도 대화에서 다룬 것이면 연관으로 봅니다. "
         'JSON {"relevant": true|false, "reason": "한 문장"} 로만 답하세요.')) or {}
     relevant = bool(verdict.get("relevant"))
     reason = str(verdict.get("reason") or "")[:200]
@@ -2565,11 +2602,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
     sf_inject = ""
-    if opts.voc == "always" or (opts.voc == "auto" and _has_defect_topic(question)):
+    if opts.voc == "always" or (opts.voc == "auto" and _has_defect_topic(question, history)):
         yield _delib("stage", stage="recall")
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
-            sf_display, sf_inject, sf_used = await _defect_briefing(tools, llm, question)
+            sf_display, sf_inject, sf_used = await _defect_briefing(tools, llm, question, history)
         except Exception:  # noqa: BLE001 — 환기 실패가 심의를 죽이지 않게
             sf_display, sf_inject, sf_used = "", "", []
         if sf_used:  # 활동 패널용 — 환기에서 실제 호출된 SF 도구들
@@ -2774,9 +2811,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 seen.add(ln); lines.append(ln); total += len(ln)
             return p["key"], "\n".join(lines), note
 
-        yield _sse("status", {"step": "페르소나별 지식카드 검색(주제 연관 발췌)", "tool": "agent_search"})
+        yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(personas)}명 "
+                                      f"(최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)", "tool": "agent_search"})
         _kn_notes: list[str] = []
-        for _k, _blk, _note in await asyncio.gather(*[_kn_one(p) for p in personas]):
+        # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
+        # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
+        _kn_done = 0
+        for _fut in asyncio.as_completed([_kn_one(p) for p in personas]):
+            _k, _blk, _note = await _fut
+            _kn_done += 1
             if _blk:
                 knowledge_by_key[_k] = _blk
                 ev_count["knowledge"] += 1
@@ -2784,6 +2827,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if _note:
                 _kn_notes.append(f"{_k}: {_note}")
                 print(f"[deliberation] 지식카드 강등({_k}): {_note}")
+            yield _sse("status", {
+                "step": f"지식카드 {_kn_done}/{len(personas)} — {_k}"
+                        + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
+                "tool": None})
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(personas)}명 "
                                       f"관련 지식 확보", "tool": None})
         if _kn_notes:
