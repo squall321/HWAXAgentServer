@@ -501,3 +501,31 @@ def test_하나도_안_묶이면_그렇다고_말한다(monkeypatch):
 
     out = b"".join(asyncio.run(consume())).decode("utf-8")
     assert "안 붙었습니다" in out, "조용히 넘기면 '전문가 도구로 답했다' 로 읽힌다"
+
+
+# ── 캡이 없어도 스키마 총량은 본다 ──────────────────────────────────────────
+def test_캡이_없어도_스키마_총량_상한이_있다(monkeypatch):
+    """TOOL_MAX=0(운영 cae00)에서 465종이 예산 검사 없이 전부 붙고 있었다. 1M 창이라
+    지금은 넉넉하지만 창 작은 모델로 바꾸면 조용히 400 이 된다."""
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 16384)   # 천장 7,372토큰
+    big = [_tool(f"t{i:03d}", "설" * 900) for i in range(200)]       # 도구당 약 300토큰
+    kept = a._select_tools(big, "무관")
+    assert len(kept) < len(big), "무캡 경로가 예산을 통째로 건너뛰었다"
+    assert sum(a._tool_schema_cost(t) for t in kept) <= max(4000, int(16384 * 0.45)) + 400
+
+
+def test_큰_창에서는_전량_바인딩이_유지된다(monkeypatch):
+    """cae00 의 전량 바인딩은 의도된 선택이다 — env 상한을 쓰면 그게 깨진다."""
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 1048576)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 40000)              # env 는 훨씬 작다
+    tools = [_tool(f"t{i:03d}", "설" * 300) for i in range(465)]
+    assert len(a._select_tools(tools, "무관")) == 465
+
+
+def test_두_경로가_같은_비용_계산을_쓴다():
+    """캡 경로와 무캡 경로가 갈리면 한쪽만 예산을 안 보게 된다 — 실제로 그랬다."""
+    import inspect
+    src = inspect.getsource(a._select_tools)
+    assert src.count("_fit_schema(") == 2

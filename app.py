@@ -1093,6 +1093,34 @@ def gate_sources(tools: list, sources: list[str] | None) -> list:
             or getattr(t, "name", "") in allow]
 
 
+def _tool_schema_cost(t) -> int:
+    """도구 하나의 추정 스키마 토큰 — 한글·JSON 혼합에서 대략 3자 ≈ 1토큰(보수적 과대평가)."""
+    try:
+        sch = json.dumps(getattr(t, "args_schema", None) or {}, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        sch = ""
+    return (len(getattr(t, "name", "")) + len(getattr(t, "description", "") or "") + len(sch)) // 3 + 8
+
+
+def _fit_schema(tools: list, budget: int) -> list:
+    """추정 토큰 합계가 budget 을 넘지 않도록 **뒤에서부터** 떨어뜨린다(앞이 더 관련).
+
+    캡 경로와 무캡 경로가 **같은 계산**을 쓰게 하려고 떼어 냈다. 둘이 갈리면 한쪽만
+    예산을 안 보게 되고, 실제로 무캡 경로가 검사를 통째로 건너뛰고 있었다.
+    떨어뜨린 것은 로그로 남긴다 — 조용히 자르면 '도구가 있는데 안 부른다' 로 보인다.
+    """
+    total, kept = 0, []
+    for t in tools:
+        c = _tool_schema_cost(t)
+        if kept and total + c > budget:
+            continue
+        kept.append(t)
+        total += c
+    if len(kept) < len(tools):
+        print(f"[agent] tool budget: {len(tools)}개 → {len(kept)}개 (추정 {total}토큰 / 상한 {budget})")
+    return kept
+
+
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
                   first: list[str] | None = None, core_names: tuple | None = None,
                   prefer: list[str] | None = None) -> list:
@@ -1116,8 +1144,12 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
         # 박으므로, 여기를 안 고치면 이 기능은 **운영에서 100% 무효**다(실측).
         if prefer:
             _r = {n: i for i, n in enumerate(prefer)}
-            return sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
-        return tools
+            tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
+        # 캡이 없어도 **스키마 총량**은 본다. 종전엔 이 경로가 예산 검사를 통째로 건너뛰어
+        # TOOL_MAX=0(운영 cae00)에서 465종이 무제한으로 붙었다 — 1M 창이라 지금은 넉넉하지만
+        # 창 작은 모델로 바꾸면 조용히 400 이 된다. 상한은 env(TOOL_SCHEMA_BUDGET)가 아니라
+        # **컨텍스트에서** 유도한다 — env 40,000 을 쓰면 cae00 의 의도된 전량 바인딩이 깨진다.
+        return _fit_schema(tools, max(4000, int(_model_context_tokens() * 0.45)))
     pin = set(pinned or []) | set(first or [])
     top = set(first or [])
     pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
@@ -1155,22 +1187,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     # '에이전트 처리 중 오류'만 본다(감사: dev 로그에 동일 400 3건). 개수와 별개로 추정
     # 토큰 합계에도 상한을 걸어, 넘치면 관련도 낮은 것부터 떨어뜨린다.
     if TOOL_SCHEMA_BUDGET > 0:
-        def _cost(t) -> int:
-            try:
-                sch = json.dumps(getattr(t, "args_schema", None) or {}, ensure_ascii=False, default=str)
-            except Exception:  # noqa: BLE001
-                sch = ""
-            # 한글·JSON 혼합에서 대략 3자 ≈ 1토큰(보수적으로 과대평가해 안전측).
-            return (len(getattr(t, "name", "")) + len(getattr(t, "description", "") or "") + len(sch)) // 3 + 8
-        total, budgeted = 0, []
-        for t in kept:
-            c = _cost(t)
-            if budgeted and total + c > TOOL_SCHEMA_BUDGET:
-                continue
-            budgeted.append(t); total += c
-        if len(budgeted) < len(kept):
-            print(f"[agent] tool budget: {len(kept)}개 → {len(budgeted)}개 (추정 {total}토큰 / 상한 {TOOL_SCHEMA_BUDGET})")
-        kept = budgeted
+        kept = _fit_schema(kept, TOOL_SCHEMA_BUDGET)
     # 핵심 도구 예약 슬롯 — 정렬키의 core 타이브레이크는 fused 값이 사실상 유일해 발동하지
     # 않는다(감사: fused 고유값 167/168 → docstring 의 '③ 상시 핵심'은 죽은 코드였다).
     # 그래서 순위와 별개로 존재하는 core 전량을 확보한다. 상위 N개만 예약하면 임베딩이
