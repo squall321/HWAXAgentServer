@@ -105,6 +105,42 @@ def test_운영자는_안내대만_상시_예약한다(monkeypatch):
     assert "query_voc" in full and "invoke_tool" in full, "일반 경로의 핵심 예약은 그대로다"
 
 
+# ── _select_tools: 전문가 분야 도구는 핀보다 뒤, 질문 어휘보다 앞 ─────────────
+def test_전문가_분야_도구가_질문_어휘보다_먼저_산다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 3)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 0)
+    monkeypatch.setattr(a, "_TOOL_PRIORITY", ())
+    monkeypatch.setattr(a, "_semantic_order", lambda q, tools: [])
+    tools = [_tool("list_materials", "물성 목록"), _tool("get_material_properties", "물성 값"),
+             _tool("noise_a", "구리 구리 구리"), _tool("noise_b", "구리 구리 구리")]
+    # 질문 어휘("구리")만 보면 noise 둘이 이긴다. 전문가를 앉혔으면 그 사람 도구가 먼저다.
+    kept = [t.name for t in a._select_tools(tools, "구리", prefer=["list_materials",
+                                                                  "get_material_properties"])]
+    assert kept[:2] == ["list_materials", "get_material_properties"], \
+        "전문가를 골라도 질문 어휘로만 고르면, 그 사람이 늘 쓰는 도구가 캡 밖으로 밀린다"
+
+
+def test_사용자가_콕_집은_도구가_전문가_분야보다_먼저다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 2)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 0)
+    monkeypatch.setattr(a, "_TOOL_PRIORITY", ())
+    monkeypatch.setattr(a, "_semantic_order", lambda q, tools: [])
+    tools = [_tool("list_materials", "물성"), _tool("submit_job", "잡 제출"), _tool("x", "x")]
+    kept = [t.name for t in a._select_tools(tools, "물성", pinned=["submit_job"],
+                                            prefer=["list_materials"])]
+    assert kept[0] == "submit_job", "일부러 고른 것은 언제나 전문가 짐작보다 먼저다"
+    assert "list_materials" in kept
+
+
+def test_분야_도구_없이는_종전_순서_그대로다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 2)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 0)
+    monkeypatch.setattr(a, "_TOOL_PRIORITY", ())
+    monkeypatch.setattr(a, "_semantic_order", lambda q, tools: [])
+    tools = [_tool("hit", "구리 물성"), _tool("miss", "무관")]
+    assert [t.name for t in a._select_tools(tools, "구리 물성")][0] == "hit"
+
+
 # ── 챗 스트림: 운영자를 고르면 그 앱이 묶인다 ─────────────────────────────────
 class _FakeAgent:
     def __init__(self, sink):
@@ -121,8 +157,9 @@ def _run_stream(monkeypatch, session, mapping):
     _prime_tools_map(monkeypatch, mapping)
 
     async def fake_agent_for(app, groups, pinned=None, query="", sources=None, user="", user_pat="",
-                             first=None, core_names=None):
+                             first=None, core_names=None, prefer=None):
         sink["pinned"], sink["first"], sink["core"] = list(pinned or []), list(first or []), core_names
+        sink["prefer"] = list(prefer or [])
         return _FakeAgent(sink)
 
     knowledge_calls: list = []
@@ -176,6 +213,17 @@ def test_일반_전문가는_종전대로_지식카드를_조회한다(monkeypat
     assert "agent_search" in sink["messages"][0][1]
     assert sink["pinned"] == [] and sink["first"] == []
     assert sink["core"] is None, "일반 전문가는 종전 핵심 예약 그대로"
+    # 낙하 전문가의 역할은 이 맵(열충격 도구)과 안 걸린다 → 짐작이 안 되므로 순위를 안 바꾼다.
+    assert sink["prefer"] == [], "짐작이 안 되는데 순위를 바꾸면 질문 어휘로 고른 도구를 밀어낸다"
+
+
+def test_전문가_역할이_도구와_걸리면_분야_도구가_붙는다(monkeypatch):
+    """전문가를 앉혔는데 도구가 질문 어휘로만 정해지면 그 사람을 고른 효과가 말투까지만 간다."""
+    sess = {"agent_type": "he-calc-thermalshock", "name": "열충격 전문가",
+            "description": "열충격", "system_prompt": "열충격 SED 담당", "response_config": {}}
+    sink, _out, _ = _run_stream(monkeypatch, sess, TS_MAP)
+    assert sink["prefer"], "역할이 도구 영역과 걸리는데도 분야 도구가 안 붙었다"
+    assert len(sink["prefer"]) <= a._PERSONA_PREFER_N
 
 
 # ── 자동 발굴에서 운영자 제외 ────────────────────────────────────────────────
@@ -254,3 +302,20 @@ def test_전문가_상세는_scope_아래_태그를_읽고_운영_앱을_준다(
     assert out["apps"] == [{"key": "heax-thermal_shock_mcp", "label": a._app_label("heax-thermal_shock_mcp"),
                             "tool_count": 3, "connected": True}]
 
+
+
+# ── 전문가 분야 도구는 '짐작이 될 때만' 준다 ──────────────────────────────────
+def test_역할이_비면_분야_도구를_주지_않는다(monkeypatch):
+    """짐작이 안 되는데 순위를 바꾸면 질문 어휘로 고른 진짜 관련 도구를 밀어낸다.
+    실측(2026-09-13): 역할 없는 키를 주니 get_guide·describe_* 입구 도구만 12종 올라왔다."""
+    names = ["get_guide", "describe_template", "list_materials", "search_reports"]
+    assert d._seat_tool_prefer(names, {}, "구리", 12) == []
+
+
+def test_물성_전문가는_물성_도구를_받는다(monkeypatch):
+    monkeypatch.setattr(a, "_area_of", lambda n: ("material", "물성·재료")
+                        if "material" in n else ("report", "보고서"))
+    monkeypatch.setattr(d, "_AREA_HINT", {"material": "물성 재료 구리", "report": "보고서"})
+    names = ["get_guide", "describe_template", "list_materials", "get_material_properties"]
+    got = d._seat_tool_prefer(names, {"key": "mat-cu", "role": "구리 물성 담당"}, "구리", 12)
+    assert got and all("material" in g for g in got), f"물성 전문가가 받은 것: {got}"

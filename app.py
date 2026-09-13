@@ -52,6 +52,7 @@ from deliberation import (
     _call,
     _agent_search_hits,
     _tool_schema_brief,
+    _seat_tool_prefer,
     _env_float,
     _env_int,
     _first_dict,
@@ -984,6 +985,9 @@ _TOOL_PRIORITY = (
 # 컨텍스트에서는 초과 400 으로 턴이 죽는다(실측 dev 16K: StepForge 운영자 77개 → 16,385토큰).
 # 다른 앱이 필요하면 recommend_agents·list_tool_apps 로 안내하고, 바인딩 밖 도구는 invoke_tool 로 부른다.
 _GUIDE_TOOLS = ("search_tools", "invoke_tool", "list_tool_apps", "recommend_agents")
+# 지목한 전문가의 분야 도구를 몇 개까지 먼저 앉힐지. 캡(dev 40)의 3할 남짓이라 질문 어휘로
+# 고르는 자리를 다 먹지 않는다 — 전문가 짐작이 빗나가도 관련 도구가 들어올 여지를 남긴다.
+_PERSONA_PREFER_N = _env_int("CHAT_PERSONA_PREFER_N", 12)
 
 
 # ── 도구 시맨틱 검색 — AIDH 다국어 e5 임베더 재사용(모델 중복 로딩 없음) ─────────────
@@ -1089,10 +1093,15 @@ def gate_sources(tools: list, sources: list[str] | None) -> list:
 
 
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
-                  first: list[str] | None = None, core_names: tuple | None = None) -> list:
+                  first: list[str] | None = None, core_names: tuple | None = None,
+                  prefer: list[str] | None = None) -> list:
     """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
     '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 콕 집은 도구(first) ② 사용자 지정(핀)
-    ③ 질의 어휘 관련도 ④ 상시 핵심(라우팅·검색) ⑤ 나머지. 캡 미설정(0)이면 전부 바인딩(회귀 0).
+    ③ **지목한 전문가의 분야 도구(prefer)** ④ 질의 어휘 관련도 ⑤ 상시 핵심 ⑥ 나머지.
+    캡 미설정(0)이면 전부 바인딩(회귀 0).
+
+    prefer 가 핀보다 **뒤**인 것이 핵심이다 — 사람이 일부러 고른 것은 언제나 먼저고,
+    전문가의 분야 도구는 '아무도 안 골랐을 때 그 사람이 늘 쓰는 것'을 채우는 자리다.
 
     first 는 핀 중에서도 먼저 사는 것이다 — 앱 하나를 통째로 핀하면 도구가 캡(dev 40)을 넘는데
     (StepForge 81·ReportArchive 70), 핀끼리는 관련도로만 갈려 사용자가 콕 집은 도구나 HE팀
@@ -1103,6 +1112,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
         return tools
     pin = set(pinned or []) | set(first or [])
     top = set(first or [])
+    pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
     core_list = _TOOL_PRIORITY if core_names is None else core_names
     core = {n: i for i, n in enumerate(core_list)}
     # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
@@ -1122,7 +1132,10 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     fused = _rrf(lex_order, sem_order) if sem_order else {}
     scored = [(t, rel(t)) for t in tools]
     ordered = sorted(scored, key=lambda x: (
-        0 if getattr(x[0], "name", "") in top else 1 if getattr(x[0], "name", "") in pin else 2,  # 콕 집은 것 → 핀
+        # 콕 집은 것 → 핀 → 전문가 분야 도구 → 나머지
+        0 if getattr(x[0], "name", "") in top else 1 if getattr(x[0], "name", "") in pin
+        else 2 if getattr(x[0], "name", "") in pref else 3,
+        pref.get(getattr(x[0], "name", ""), 0),                   # 분야 도구끼리는 전문가 점수 순
         -round(fused.get(getattr(x[0], "name", ""), 0.0), 6),    # 어휘+시맨틱 융합 순위
         -round(x[1], 3),                                          # 어휘 관련도(융합 미가용 시)
         core.get(getattr(x[0], "name", ""), len(core)),           # 상시 핵심
@@ -1525,13 +1538,16 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
                      query: str = "", sources: list[str] | None = None, user: str = "",
                      user_pat: str = "", first: list[str] | None = None,
-                     core_names: tuple | None = None):
+                     core_names: tuple | None = None, prefer: list[str] | None = None):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
-    pinned·first·core_names 는 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만 캐시 키에
-    포함한다(무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 우선순위 반영)."""
-    pin_key = ((tuple(sorted(pinned or [])), tuple(sorted(first or [])), core_names)
-               if ((pinned or first or core_names is not None) and TOOL_MAX > 0) else ())
+    pinned·first·core_names·prefer 는 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만
+    캐시 키에 포함한다(무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 반영).
+    ⚠ prefer 를 키에서 빼면 전문가를 바꿔도 앞 전문가로 만든 에이전트가 재사용돼 **조용히**
+    무시된다 — 소스 토글에서 이미 같은 사고가 났다(아래 주석)."""
+    pin_key = ((tuple(sorted(pinned or [])), tuple(sorted(first or [])), core_names,
+                tuple(prefer or []))
+               if ((pinned or first or prefer or core_names is not None) and TOOL_MAX > 0) else ())
     # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
     # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
@@ -1589,7 +1605,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                         _raw, time.time())
                 _raw = gate_sources(_raw, sources)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
-                tools = await _aio.to_thread(_select_tools, _raw, query, pinned, first, core_names)
+                tools = await _aio.to_thread(_select_tools, _raw, query, pinned, first, core_names, prefer)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
                 load_failed = True
                 # 상태코드를 뽑아 둔다 — prod 에서 '툴콜이 되었다 안 되었다' 할 때 401(토큰)
@@ -1625,7 +1641,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     _snap_raw, _snap_ts = snap
                     _age = int(time.time() - _snap_ts)
                     _sr = gate_sources(list(_snap_raw), sources)
-                    tools = await _aio.to_thread(_select_tools, _sr, query, pinned, first, core_names)
+                    tools = await _aio.to_thread(_select_tools, _sr, query, pinned, first, core_names, prefer)
                     load_failed = False   # 도구가 살아 있으니 실패 아님 — 단 신선하지 않다
                     degraded = f"stale-snapshot({_age}s): {detail}"
                     app.state.tool_load_error.pop(frozenset(groups), None)
@@ -2304,6 +2320,20 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             if isinstance(h, dict)
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
+        # 전문가를 앉혔으면 **그 사람이 쓸 줄 아는 도구**가 먼저 붙어야 한다. 종전에는 운영자
+        # 페르소나만 도구가 바뀌고(op_apps·key_tools) 도메인 전문가는 질문 어휘로만 골라서,
+        # 물성 전문가를 골라도 물성 DB 가 캡 밖으로 밀리는 일이 있었다 — 전문가를 고른 효과가
+        # 말투·판단 기준까지만 갔다. 심의 좌석과 같은 기준(_seat_tool_rank)을 쓴다.
+        # 사용자가 콕 집은 것(pinned)·앱 핀보다는 **뒤**다(_select_tools 의 3순위).
+        prefer: list[str] = []
+        if persona and not (req.pinned_tools or req.pinned_apps):
+            _names = list(_tools_map())
+            if _names:
+                prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
+        if prefer:
+            yield _sse("status", {"step": f"{persona.get('name') or agent_key} 분야 도구 "
+                                          f"{len(prefer)}종 우선 바인딩",
+                                  "tool": None, "tools_used": prefer[:8]})
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
                                  # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.
@@ -2311,7 +2341,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                  # 조합인 '도메인 전문가(주) + 도구 운영자(보조)'가 그 밖으로
                                  # 빠져 핵심 38개가 예산 밖에서 덧붙고, dev 16K 에서 16,385
                                  # 토큰으로 400 이 났다(실측: PCB 전문가 + 라미네이트 운영자).
-                                 _GUIDE_TOOLS if (operator or op_apps) else None)
+                                 _GUIDE_TOOLS if (operator or op_apps) else None,
+                                 prefer)
         # 게이트웨이에서 도구를 못 받아 오면 도구 0개 에이전트가 되고, 모델은 도구가 있다고
         # 착각한 채 "지금 바로 호출하겠습니다"만 하고 아무것도 호출하지 않는다(조용한 실패).
         # 사용자에게 상태를 알리고, 모델에게도 도구가 없음을 명시해 헛약속을 막는다.
