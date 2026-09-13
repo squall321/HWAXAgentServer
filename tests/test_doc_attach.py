@@ -476,3 +476,23 @@ def test_예비분이_도구_스키마_예산을_덮는다():
 
     assert app.DOC_RESERVE_TOKENS > app.TOOL_SCHEMA_BUDGET
     assert d._EVID_RESERVE > app.TOOL_SCHEMA_BUDGET
+
+
+def test_챗_맥락에_인용_표지가_붙는다():
+    """도구 근거는 [e:N] 으로 지목되는데 대화 맥락엔 표지가 없었다 — 그러면 좌석이
+    '사람이 말한 전제' 를 정확히 가리킬 수 없고 '대화에서 언급된 바와 같이' 로 흐른다.
+    나중에 누구 말인지 되짚을 수 없다."""
+    import deliberation as d
+
+    app._ctx_cache["n"] = 1000000
+    d._evid_cache.clear()
+    note = d._chat_context_note([
+        {"role": "user", "content": "굽힘 반경은 3.0mm 고정이다"},
+        {"role": "assistant", "content": "저온에서 모듈러스가 올라갑니다"},
+        {"role": "user", "content": "12um 로 확정해도 되나"},
+    ])
+    assert "[c:1]" in note and "[c:2]" in note, "사람 발화 표지가 없다"
+    assert "[a:1]" in note, "챗 발화 표지가 없다"
+    # 표지만 붙이고 안 알리면 모델이 안 쓴다.
+    assert "[c:N]" in note and "표지를 함께 적어라" in note
+    d._evid_cache.clear()

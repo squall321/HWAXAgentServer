@@ -489,13 +489,17 @@ def _chat_context_note(history) -> str:
         return ""
 
     budget = _chat_ctx_budget()
-    out = ["\n\n[챗에서 이어진 맥락 — 아래는 모두 **검증 대상**이다. 전제로 받아들이지 마라]"]
+    out = ["\n\n[챗에서 이어진 맥락 — 아래는 모두 **검증 대상**이다. 전제로 받아들이지 마라. "
+           "이 중 무엇을 근거로 쓰거든 [c:N](사람)·[a:N](챗) 표지를 함께 적어라 — "
+           "'대화에서 언급된 바와 같이' 로 뭉뚱그리면 나중에 누구 말인지 되짚을 수 없다]"]
     if users:
         out.append("[인간의 전제·의중] 사람이 챗에서 한 말이다. 무엇을 원하고 무엇을 제약으로 "
                    "두는지가 여기 있다. 심의는 이 전제 자체가 옳은지도 함께 따져라 — "
                    "틀렸다고 판단하면 근거를 대고 그렇게 말하라.")
-        for t in users:
-            line = f"· {t[:_CHAT_TURN_MAX]}"
+        for i, t in enumerate(users, start=1):
+            # [c:N] — 도구 근거의 [e:N] 과 같은 역할. 없으면 좌석이 "사람이 말한 전제" 를
+            # 가리킬 수가 없어 "대화에서 언급된 바와 같이" 같은 뭉뚱그린 말로 흐른다.
+            line = f"· [c:{i}] {t[:_CHAT_TURN_MAX]}"
             if budget - len(line) < 0:
                 out.append("· (이하 생략 — 예산)")
                 break
@@ -504,8 +508,8 @@ def _chat_context_note(history) -> str:
     if bots and budget > 400:
         out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
                    "근거가 없거나 틀렸으면 반박하라.")
-        for t in bots:
-            line = f"· {t[:_CHAT_BOT_MAX]}"
+        for i, t in enumerate(bots, start=1):
+            line = f"· [a:{i}] {t[:_CHAT_BOT_MAX]}"
             if budget - len(line) < 0:
                 out.append("· (이하 생략 — 예산)")
                 break
@@ -2834,7 +2838,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     chat_ctx_inject = _chat_context_note(history)
     if chat_ctx_inject:
         yield _delib("evidence", source="챗 대화 맥락 (검증 대상)",
-                     text=chat_ctx_inject[:1500], included=True)
+                     text=chat_ctx_inject[:_EVID_SHOW], included=True)
     # 후보안(안 선택) — 상호 배타 후보를 목록으로 못박는다. 질문 문장에만 있으면 좌석마다
     # 다르게 읽고, 최종 라운드 표결이 무엇에 대한 표인지 흐려진다(hwax-deliberate.js OPT_LIST 와 같은 규율).
     _opt_inject = ""
