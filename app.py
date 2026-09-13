@@ -1995,7 +1995,19 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
                   "operator": False, "apps": [], "key_tools": [], "note": ""}
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 역할 원문을 JSON 으로 읽는다
-        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
+        # ⚠ 예외만으로는 '못 물어봤다' 를 못 잡는다. 게이트웨이 미연결이면 _tools_by_name 이
+        #   예외가 아니라 **빈 dict** 를 주고, 도구 실패는 _call 이 "(tool … error: …)" 문자열로
+        #   삼킨다. 그래서 세 갈래 중 둘이 '역할 문서가 비어 있다' 로 나가고 있었다 — 갈랐다고
+        #   선언해 놓고 실제로는 합쳐진 채였다.
+        if "get_agent_session" not in tools:
+            meta["note"] = "게이트웨이에 연결하지 못했습니다"
+            return meta
+        raw = await _call(tools, "get_agent_session", {"agent_type": agent_type})
+        if isinstance(raw, str) and raw.lstrip().startswith("(tool "):
+            meta["note"] = raw.strip()[:160]
+            print(f"[agent] persona load failed for {agent_type}: {meta['note']}")
+            return meta
+        sess = _first_dict(_parse_json(raw))
         sd = _first_dict(sess.get("data", sess))
         # ⚠ _role_doc 으로 허브 사용 안내를 떼고 싣는다. 원문을 그대로 주면 실측 69%가
         #   다른 클라이언트용 안내문이고, 그 안내가 포털 챗에서는 틀린 지시다.
@@ -2010,7 +2022,10 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
     except Exception as exc:  # noqa: BLE001 — 실패 시 페르소나 없이 일반 챗(단, 조용히는 아니다)
         meta["note"] = f"{type(exc).__name__}: {str(exc)[:120]}"
         print(f"[agent] persona load failed for {agent_type}: {exc!r}")
-    if meta["role"]:
+    # 조회가 **성공했으면** 캐시한다(역할이 비어 있어도). 종전 조건은 role 이라, 역할 문서가
+    # 원래 빈 페르소나는 발화마다 게이트웨이를 다시 쳤다 — _tools_by_name 은 MCP get_tools +
+    # 465종 _prep_tool 이라 싼 호출이 아니다. 실패(note)는 여전히 캐시하지 않는다(다음 턴 재시도).
+    if not meta["note"]:
         cache[agent_type] = (time.time(), meta)
     return meta
 
@@ -3638,9 +3653,11 @@ def _role_doc(system_prompt: str) -> str:
     if sp.startswith('You are an assistant for "'):
         return ""          # 자동 생성 플레이스홀더 — 역할이 아니다
     m = _HUB_GUIDE_RE.search(sp)
-    if m:
-        sp = sp[:m.start()]
-    return sp.rstrip().removesuffix("---").strip()
+    if not m:
+        return sp.strip()
+    # 구분선 찌꺼기는 **잘랐을 때만** 떼어 낸다. 무조건 돌리면 역할 본문이 정당하게
+    # "…판정 기준은 A---" 로 끝나는 경우까지 깎는다(실측).
+    return re.sub(r"\n*-{3,}\s*$", "", sp[:m.start()].rstrip()).strip()
 
 
 @app.post("/catalog/agent")

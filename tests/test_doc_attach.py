@@ -842,3 +842,55 @@ def test_사람이_좌석보다_덜_보지_않는다():
     import deliberation as d
 
     assert d._FREE_EVID_SHOW >= d._SHARE_ITEM_MAX
+
+
+# ── 공용 근거 2차 — 좌석 공평·예산 분할·좌석별 누락 ──────────────────────────
+def test_좁은_예산에서_한_좌석이_독식하지_않는다():
+    """풀은 좌석 단위로 쌓인다. 최신부터 그냥 훑으면 가장 늦게 끝난 좌석이 전부 먹는다
+    (실측: 공용 근거 4건이 전부 한 좌석 것). 관점이 갈리는 것이 심의의 값어치다."""
+    import deliberation as d
+
+    pool = ([(1, "A", f"a{i}", "{}", "x" * 200) for i in range(5)]
+            + [(1, "B", f"b{i}", "{}", "x" * 200) for i in range(5)]
+            + [(1, "C", f"c{i}", "{}", "x" * 200) for i in range(5)])
+    blk, n, _ = d._share_block(pool, "none", 900)
+    seats = {ln.split()[2] for ln in blk.split("\n") if ln}
+    assert len(seats) >= 2, f"한 좌석이 독식했다: {seats}"
+
+
+def test_출력은_시간순이다():
+    import deliberation as d
+
+    pool = [(1, "A", "t1", "{}", "old"), (3, "B", "t3", "{}", "new"), (2, "C", "t2", "{}", "mid")]
+    blk, _, _ = d._share_block(pool, "none", 4000)
+    assert [x.split()[1] for x in blk.split("\n")] == ["[R1", "[R2", "[R3"]
+
+
+def test_근거_등급이_태그에서_나온다():
+    """causal_status 는 이 코퍼스에서 전부 validated 로 온다(태그가 없어 상류가 채운다).
+    실제 등급 신호는 tags 의 confidence:* 인데 종전에는 통째로 버렸다."""
+    import deliberation as d
+
+    h = {"title": "t", "snippet": "b", "causal_status": "validated",
+         "tags": ["type:design-rule", "confidence:heuristic", "tier:checklist"]}
+    assert "경험칙" in d.knowledge_line(h)
+    assert "사실" in d.knowledge_line({**h, "tags": ["confidence:fact"]})
+
+
+def test_모르는_등급도_감추지_않는다():
+    """닫힌 집합으로 get 하면 상류가 새 값을 내보낼 때 조용히 validated 와 같은 줄이 된다."""
+    import deliberation as d
+
+    ln = d.knowledge_line({"title": "t", "snippet": "b", "tags": ["confidence:brand-new"],
+                           "causal_status": "correlational"})
+    assert "brand-new" in ln and "correlational" in ln
+
+
+def test_역할어가_도구_이름_속_짧은_낱말에_안_걸린다():
+    """내가 만든 회귀 — word.startswith(x) 때문에 'integration' 이 ..._in_... 에 붙었다."""
+    import deliberation as d
+
+    assert not d._name_hit("integration", "find_materials_in_property_range")
+    assert not d._name_hit("interface", "search_in_page")
+    assert not d._name_hit("getting", "get_material")
+    assert d._name_hit("material", "list_materials"), "material↔materials 는 살아야 한다"

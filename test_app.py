@@ -153,7 +153,11 @@ def test_수치_대조는_챗과_심의가_같은_판정을_쓴다():
 
     root = Path(__file__).resolve().parent
     delib = (root / "deliberation.py").read_text(encoding="utf-8")
-    assert "from evidence import unsourced_numbers" in delib, "심의가 공용 판정을 임포트해야 한다"
+    # ⚠ 문자열 일치가 아니라 **임포트되었는지**를 본다. 종전에는 소스에 정확히
+    #   "from evidence import unsourced_numbers" 가 있는지 봤는데, 임포트가
+    #   "from evidence import fit_document, unsourced_numbers" 로 합쳐지자 조용히 썩었다.
+    import deliberation as _d
+    assert getattr(_d, "unsourced_numbers", None) is not None, "심의가 공용 판정을 임포트해야 한다"
     assert "unsourced_numbers(decision," in delib, "결정문에 대조가 걸려 있어야 한다"
     app_src = (root / "app.py").read_text(encoding="utf-8")
     assert "from evidence import" in app_src, "챗도 같은 모듈을 써야 한다"

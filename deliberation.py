@@ -1743,10 +1743,37 @@ KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 
 
 # 카드의 인과 검증 상태 → 모델에게 보일 꼬리표. validated 는 안 붙인다(기본이라 소음이 된다).
+# ⚠ 닫힌 집합으로 .get 하면 상류가 새 값을 내보낼 때 **조용히 validated 와 같은 줄**이 된다.
+#   모르는 값은 그대로 보여 준다 — 상류(AIDataHub)는 태그에서 뽑는 열린 집합이다.
 _CAUSAL_NOTE = {
     "unknown": "⚠미검증 관측(인과 불명) — 단독 근거 금지",
     "hypothesized": "가설",
 }
+# 근거 등급 — **실제로 코퍼스에 실려 오는 신호는 이쪽이다.** causal_status 는 태그가 없으면
+# 상류가 'validated' 로 채우는데 causal_status:* 태그는 이 코퍼스에 0건이라 전부 validated 로
+# 온다(실측). 반면 confidence:* 는 heuristic 15,877 · fact 6,767 · expert-judgement 734 건이다.
+# 심의 프롬프트가 "출처 없는 수치는 (경험칙) 표기" 를 요구하므로 이 등급이 곧 그 판단 재료다.
+_CONF_NOTE = {
+    "fact": "사실",
+    "heuristic": "경험칙",
+    "expert-judgement": "전문가 판단",
+    "expert_judgement": "전문가 판단",
+}
+
+
+def _grade_notes(h: dict) -> list[str]:
+    """카드의 근거 등급 꼬리표 — tags 의 confidence:* 와 causal_status 를 함께 본다."""
+    out = []
+    for t in (h.get("tags") or []):
+        s = str(t)
+        if s.startswith("confidence:"):
+            v = s.split(":", 1)[1].strip().lower()
+            out.append(_CONF_NOTE.get(v) or v)      # 모르는 등급도 감추지 않는다
+            break
+    cz = str(h.get("causal_status") or "").strip().lower()
+    if cz and cz != "validated":
+        out.append(_CAUSAL_NOTE.get(cz) or f"인과:{cz}")
+    return out
 
 
 def knowledge_line(h) -> str:
@@ -1772,8 +1799,9 @@ def knowledge_line(h) -> str:
     rid = str(h.get("record_id") or h.get("id") or "")[:60]
     sid = str(h.get("section_id") or "")[:40]
     src = f" (출처: {rid}{f' §{sid}' if sid else ''})" if rid else ""
-    cz = _CAUSAL_NOTE.get(str(h.get("causal_status") or "").strip().lower(), "")
-    return f"• [{head}]{src}{f' [{cz}]' if cz else ''} {str(body).strip()}"[:700]
+    gr = _grade_notes(h)
+    tag = f" [{' · '.join(gr)}]" if gr else ""
+    return f"• [{head}]{src}{tag} {str(body).strip()}"[:700]
 
 
 async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
@@ -2071,8 +2099,23 @@ def _share_block(pool: list, key: str, budget: int, *,
     else:
         cand = [e for e in pool if e[1] != key and (e[2], e[3]) not in own_sigs]
 
+    # 좌석을 **돌아가며** 담는다. 최신부터 그냥 훑으면 풀이 좌석 단위로 쌓여 있어서, 예산이
+    # 좁을 때 가장 늦게 끝난 좌석 하나가 전부 먹는다(실측: 공용 근거 4건이 전부 한 좌석 것).
+    # 관점이 갈리는 것이 심의의 값어치인데, 그러면 한 사람 조회만 공용이 된다.
+    order: list = []
+    if mine:
+        order = list(reversed(cand))
+    else:
+        _by_seat: dict = {}
+        for e in reversed(cand):                           # 좌석마다 최신 → 과거
+            _by_seat.setdefault(e[1], []).append(e)
+        while any(_by_seat.values()):
+            for _s in list(_by_seat):
+                if _by_seat[_s]:
+                    order.append(_by_seat[_s].pop(0))
+
     seen, picked, used, dropped = set(), [], 0, 0
-    for rnd, seat, tool, args, out in reversed(cand):      # 최신 → 과거
+    for rnd, seat, tool, args, out in order:
         sig = (tool, args)
         if sig in seen:
             continue
@@ -2085,9 +2128,11 @@ def _share_block(pool: list, key: str, budget: int, *,
         if picked and used + len(line) + 1 > budget:
             dropped += 1
             continue
-        picked.append(line)
+        picked.append((rnd, seat, line))
         used += len(line) + 1
-    return "\n".join(reversed(picked)), len(picked), dropped
+    # 고르는 순서(최신·좌석 라운드로빈)와 **보여 주는 순서**는 다르다 — 읽기는 시간순이 낫다.
+    picked.sort(key=lambda x: (x[0], x[1]))
+    return "\n".join(x[2] for x in picked), len(picked), dropped
 
 
 def _tool_cost(t) -> int:
@@ -2157,8 +2202,12 @@ def _name_hit(word: str, tool_name: str) -> bool:
     di**str**ibution·**str**ess 에 6점씩 붙어, 영역 분류가 없을 때 점수가 통째로 쓰레기가
     된다(실측). 4자 이상일 때만 접두 일치를 허용해 material↔materials 는 살린다.
     """
+    # ⚠ 한 방향만 본다. `word.startswith(x)` 를 같이 허용하면 도구 이름 안의 짧은 낱말이
+    #   전부 미끼가 된다 — 465종에 get 56·job 24·set 8·run 8·in 2… 가 있어서 역할어
+    #   'integration' 이 find_materials_**in**_property_range 에 6점, 'interface' 가
+    #   search_**in**_page 에 붙었다(실측). 명분이던 material↔materials 는 이 방향만으로 된다.
     for x in tool_name.replace("-", "_").split("_"):
-        if word == x or (len(word) >= 4 and (x.startswith(word) or word.startswith(x))):
+        if word == x or (len(word) >= 4 and x.startswith(word)):
             return True
     return False
 
@@ -3300,7 +3349,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     rounds_data = []          # [(turns_list, transcript_str), ...] 라운드별
     seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
-    gather_pool: list = []    # [(좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
+    gather_pool: list = []    # [(라운드, 좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
 
     for rnd in range(1, N + 1):
         kind = _kind(rnd)
@@ -3500,22 +3549,29 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 수렴 라운드에도 준다(정리하려면 수치가 있어야 한다). 수렴 라운드는 _gathered 가
         # 구조적으로 비므로, 앞 라운드 자기 조회를 안 주면 전 좌석이 자기가 DB 로 뽑은 값을
         # 잃고 (경험칙) 으로 강등해 결정문에 싣는다.
-        _share, _mine, _drop, _shown = {}, {}, 0, 0
+        # ⚠ 예산은 좌석 하나가 받는 **총량**이다. share 와 mine 에 각각 통째로 주면 실제
+        #   주입량이 표기의 두 배가 된다(실측: 표기 1,500자 / 실제 2,670자). 나눠 쓴다.
+        _sb, _mbudget = _share_budget(), 0
+        _mbudget = max(400, _sb // 3)           # 자기 조회는 보통 적다 — 1/3 이면 넉넉하다
+        _sb -= _mbudget
+        _share, _mine, _drop, _shown = {}, {}, {}, 0
         for p in personas if gather_pool else ():
-            _b, _n, _d = _share_block(gather_pool, p["key"], _share_budget())
-            _share[p["key"]] = _b
-            _drop = max(_drop, _d)
-            _shown = max(_shown, _n)
-            _mb, _mn, _md = _share_block(gather_pool, p["key"], _share_budget(),
-                                         mine=True, cur_round=rnd)
-            _mine[p["key"]] = _mb
+            _k2 = p["key"]
+            _b, _n, _d = _share_block(gather_pool, _k2, _sb)
+            _mb, _mn, _md = _share_block(gather_pool, _k2, _mbudget, mine=True, cur_round=rnd)
+            _share[_k2], _mine[_k2] = _b, _mb
+            # 좌석마다 실제로 빠진 수를 따로 센다. 전 좌석 최대값을 모두에게 말하면, 하나도
+            # 안 빠진 좌석이 "2건 못 실었다" 를 듣고 없는 근거를 상상한다(실측).
+            _drop[_k2] = _d + _md
+            _shown = max(_shown, _n + _mn)
         if any(_share.values()) or any(_mine.values()):
             # ⚠ 풀 크기도, 블록의 줄 수도 아니고 **_share_block 이 센 항목 수**를 말한다.
             #   풀을 세면 300건 조회에 "300건 전달" 이 되고, 줄을 세면 예쁘게 찍힌 JSON
             #   한 건이 23건으로 세어진다(실측으로 둘 다 겪었다).
+            _dmax = max(_drop.values(), default=0)
             yield _sse("status", {"step": f"공용 근거 — 좌석당 최대 {_shown}건 전달"
-                                          + (f" · 예산 밖 {_drop}건 생략" if _drop else "")
-                                          + f" (1인당 {_share_budget():,}자)", "tool": None})
+                                          + (f" · 예산 밖 최대 {_dmax}건 생략" if _dmax else "")
+                                          + f" (1인당 {_sb + _mbudget:,}자)", "tool": None})
         if any(_kn.values()) or any(_gathered.values()) or any(_share.values()) or any(_mine.values()):
             _base_fn = prompt_fn
 
@@ -3537,9 +3593,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if shb:
                     out += ("\n\n[다른 전문가가 조회한 결과 — 공용 근거다. 당신 주장에 그대로 "
                             "인용해도 되고, 값이 당신 판단과 어긋나면 그 점을 반박에 쓰세요. "
-                            "누가 조회했는지는 [R라운드 좌석키]로 표시돼 있습니다]\n" + shb
-                            + (f"\n(예산상 {_dr}건은 여기 싣지 못했습니다 — 없다는 뜻이 아닙니다)"
-                               if _dr else ""))
+                            "누가 조회했는지는 [R라운드 좌석키]로 표시돼 있습니다]\n" + shb)
+                # 이 좌석이 실제로 못 받은 수만 말한다. 자기 것(mine)의 탈락도 함께 세므로
+                # "앞 라운드에 내가 뽑은 값이 원래 없었다" 로 읽히는 일이 없다.
+                _d = _dr.get(p["key"], 0)
+                if _d and (shb or (_mn.get(p["key"]) or "")):
+                    out += (f"\n(예산상 {_d}건은 여기 싣지 못했습니다 — 없다는 뜻이 아닙니다. "
+                            f"필요하면 그 수치를 직접 조회하세요)")
                 return out
 
         cur = []

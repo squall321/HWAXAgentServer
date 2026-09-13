@@ -132,9 +132,11 @@ def test_검증된_카드는_꼬리표가_없다():
     assert "미검증" not in ln and "가설" not in ln
 
 
-def test_모르는_값은_꼬리표를_만들지_않는다():
-    ln = a._knowledge_line({"title": "t", "snippet": "b", "causal_status": "weird-new-value"})
-    assert "미검증" not in ln and "가설" not in ln
+def test_모르는_값은_그대로_보여_준다():
+    """닫힌 집합으로 get 하면 상류가 새 값을 내보낼 때 **조용히 validated 와 같은 줄**이 된다.
+    상류(AIDataHub)는 태그에서 뽑는 열린 집합이라 새 값이 언제든 온다."""
+    ln = a._knowledge_line({"title": "t", "snippet": "b", "causal_status": "correlational"})
+    assert "correlational" in ln
 
 
 def test_챗과_심의가_같은_포맷을_쓴다():
@@ -147,3 +149,77 @@ def test_챗과_심의가_같은_포맷을_쓴다():
     h = {"record_id": "R-9", "section_id": "4", "title": "제목", "section_title": "절",
          "snippet": "본문", "causal_status": "unknown"}
     assert a._knowledge_line(h) == d.knowledge_line(h)
+
+
+# ── '못 물어봤다' 의 세 갈래 ─────────────────────────────────────────────────
+def _meta_with(monkeypatch, tools, call_result=None, raises=False):
+    async def fake_tools(*_a, **_k):
+        return tools
+
+    async def fake_call(_t, _n, _a):
+        if raises:
+            raise RuntimeError("boom")
+        return call_result
+
+    monkeypatch.setattr(a, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(a, "_call", fake_call)
+    return asyncio.run(a._persona_meta(NS(state=NS()), [], "x"))
+
+
+def test_게이트웨이_미연결은_예외가_아니라_빈_dict_다(monkeypatch):
+    """_tools_by_name 이 예외가 아니라 {} 를 준다 — 예외만 잡으면 '역할이 비었다' 로 나간다."""
+    m = _meta_with(monkeypatch, {})
+    assert m["note"] and "연결" in m["note"]
+
+
+def test_도구_실패는_문자열로_삼켜져_온다(monkeypatch):
+    """_call 은 실패를 '(tool … error: …)' 문자열로 돌려준다. 파싱하면 빈 dict 가 되고
+    역할이 비므로, 문자열을 안 보면 '역할 문서가 비어 있다' 가 된다."""
+    m = _meta_with(monkeypatch, {"get_agent_session": object()},
+                   call_result="(tool get_agent_session error: agent not found)")
+    assert m["note"] and "agent not found" in m["note"]
+
+
+def test_진짜로_역할이_없으면_사유가_비어_있다(monkeypatch):
+    m = _meta_with(monkeypatch, {"get_agent_session": object()},
+                   call_result=json.dumps({"agent_type": "x", "system_prompt": ""}))
+    assert m["role"] == "" and m["note"] == ""
+
+
+def test_조회에_성공하면_역할이_비어도_캐시한다(monkeypatch):
+    """종전 조건이 role 이라, 역할 문서가 원래 빈 페르소나는 발화마다 게이트웨이를 다시 쳤다."""
+    calls = []
+
+    async def fake_tools(*_a, **_k):
+        calls.append(1)
+        return {"get_agent_session": object()}
+
+    async def fake_call(_t, _n, _a):
+        return json.dumps({"agent_type": "x", "system_prompt": ""})
+
+    monkeypatch.setattr(a, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(a, "_call", fake_call)
+    fake = NS(state=NS())
+    asyncio.run(a._persona_meta(fake, [], "x"))
+    asyncio.run(a._persona_meta(fake, [], "x"))
+    assert len(calls) == 1
+
+
+def test_실패는_캐시하지_않는다(monkeypatch):
+    calls = []
+
+    async def fake_tools(*_a, **_k):
+        calls.append(1)
+        return {}
+
+    monkeypatch.setattr(a, "_tools_by_name", fake_tools)
+    fake = NS(state=NS())
+    asyncio.run(a._persona_meta(fake, [], "x"))
+    asyncio.run(a._persona_meta(fake, [], "x"))
+    assert len(calls) == 2, "실패를 캐시하면 게이트웨이가 돌아와도 TTL 동안 계속 실패한다"
+
+
+def test_구분선은_잘랐을_때만_떼어_낸다():
+    """무조건 돌리면 역할 본문이 정당하게 '…판정 기준은 A---' 로 끝나는 경우까지 깎는다."""
+    assert a._role_doc("판정 기준은 A---") == "판정 기준은 A---"
+    assert a._role_doc("역할\n\n-----\n\n## How to access this hub\nx") == "역할"
