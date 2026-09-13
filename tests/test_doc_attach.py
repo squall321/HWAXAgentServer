@@ -834,3 +834,11 @@ def test_한_항목은_한_줄이다():
     assert n == 1
     assert blk.count("\n") == 0, blk
     assert '"id": 1, "name": "Cu"' in blk
+
+
+def test_사람이_좌석보다_덜_보지_않는다():
+    """근거 패널이 좌석이 받은 것보다 짧으면 '좌석은 봤는데 사람은 못 본 수치' 가 생긴다.
+    종전에는 자유 조회 카드만 500 을 박아 다른 근거(_EVID_SHOW 4,000)와도 어긋났다."""
+    import deliberation as d
+
+    assert d._FREE_EVID_SHOW >= d._SHARE_ITEM_MAX

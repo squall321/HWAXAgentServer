@@ -2035,6 +2035,11 @@ def _free_result_chars(tool_budget: int) -> int:
 _SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
 _SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
 _PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자)
+# 자유 조회 근거 카드의 화면 표시 상한. 종전에는 여기만 500 을 박아 다른 근거(_EVID_SHOW
+# 4,000)와 어긋나 있었다. **좌석이 받는 양보다 작아질 수 없다** — 사람이 좌석보다 덜 보면
+# "좌석은 봤는데 사람은 못 본 수치" 가 생기고, 그게 이 폴더에서 계속 잡아 온 결함 모양이다.
+# 건수가 좌석 × 호출 × 라운드로 곱해지므로 전체 상한보다는 낮춰 잡는다.
+_FREE_EVID_SHOW = max(_env_int("DELIB_FREE_EVID_SHOW", 2000), _SHARE_ITEM_MAX)
 
 
 def _share_budget() -> int:
@@ -3469,7 +3474,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
                         if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
                             ev_count["tool"] += 1
-                            yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
+                            yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:_FREE_EVID_SHOW],
                                          included=True)
                             # 공용 풀 — 이 값을 다른 좌석도 본다. 안 넣으면 A 가 조회한 수치를
                             # B 는 못 보고 기억으로 말한다(근거 패널에는 떠 있는데 좌석엔 없다).
