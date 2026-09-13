@@ -1937,8 +1937,52 @@ def _wrap_cached(tool, cache: dict):
     return tool
 
 
+# 자유 조회에 바인딩할 도구 스키마의 추정 토큰 상한. 0=무제한(종전 동작).
+# 챗의 TOOL_SCHEMA_BUDGET(40,000)보다 작게 잡는다 — 좌석 수 × 라운드만큼 곱해지기 때문이다.
+_FREE_TOOL_TOKENS = _env_int("DELIB_FREE_TOOL_TOKENS", 12000)
+
+
+def _tool_cost(t) -> int:
+    """도구 하나의 스키마 추정 토큰(한글·JSON 혼합에서 대략 3자 ≈ 1토큰, 보수적 과대평가)."""
+    try:
+        sch = json.dumps(getattr(t, "args_schema", None) or {}, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        sch = ""
+    return (len(getattr(t, "name", "")) + len(getattr(t, "description", "") or "") + len(sch)) // 3 + 8
+
+
+def _trim_free_tools(g: dict, question: str, budget: int) -> dict:
+    """예산 안에서 **관련도 높은 것부터** 남긴다.
+
+    잘라야 한다면 아무거나 버리면 안 된다 — 좌석이 쓸 법한 것을 남긴다. 화두의 낱말과 도구
+    이름·설명의 겹침으로 고르고, 입구 도구(검색·목록·안내)는 먼저 확보한다.
+    입구가 없으면 모델이 식별자를 지어내 호출하다 차단된다(그게 종전 실패 양상이었다).
+    """
+    import re as _re
+
+    words = {w for w in _re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", question or "")}
+    entry = ("search", "list", "find", "guide", "describe", "get_guide", "discover")
+
+    def _score(name: str, tool) -> int:
+        n = name.lower()
+        s = 40 if any(n.startswith(e) or e in n for e in entry) else 0   # 입구 먼저
+        blob = (n + " " + (getattr(tool, "description", "") or "")[:400]).lower()
+        s += sum(3 for w in words if w.lower() in blob)
+        return s
+
+    ranked = sorted(g.items(), key=lambda kv: -_score(kv[0], kv[1]))
+    kept, used = {}, 0
+    for name, tool in ranked:
+        c = _tool_cost(tool)
+        if kept and used + c > budget:
+            continue
+        kept[name] = tool
+        used += c
+    return kept
+
+
 async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budget: int):
-    """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록) 반환. 실패 비치명.
+    """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록, 실패사유) 반환.
     발언(JSON 계약)과 분리된 이유: 도구 호출 모델은 왕복 후 스키마 계약을 곧잘 어긴다(실측) —
     조회는 여기서, 발언은 종전대로 도구 없는 텍스트 턴에서."""
     sysmsg = (f"당신은 '{persona['key']}' 전문가({str(persona.get('role', ''))[:280]}). "
@@ -1981,6 +2025,9 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
                 summary = body.strip()
     except Exception as exc:  # noqa: BLE001 — 조회 실패가 발언을 막지 않는다
         print(f"[deliberation] free-gather 실패({persona.get('key')}): {exc!r}")
+        # 호출부가 화면에 올릴 수 있게 사유를 돌려준다 — print 만 하면 사용자는 '좌석이
+        # 조회할 게 없다고 판단했다' 와 '조회가 통째로 실패했다' 를 구별할 수 없다.
+        return persona["key"], [], "", f"{type(exc).__name__}: {str(exc)[:120]}"
     calls = calls[:budget]
     # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
     # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
@@ -1988,11 +2035,11 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         return _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")
     good = [(n, ap, b) for n, ap, b in calls if _has_content(b)]
     if not good:
-        return persona["key"], calls, ""
+        return persona["key"], calls, "", ""
     block = "\n".join(f"- {n}({ap}): {b[:900]}" for n, ap, b in good)[:3500]
     if summary and not summary.startswith("조회 불필요"):
         block += f"\n(전문가 자체 요약) {summary[:400]}"
-    return persona["key"], calls, block
+    return persona["key"], calls, block, ""
 
 def _dom_of(key: str) -> str:
     """페르소나 키의 도메인 접두사 — disp-burnin → disp. 커버리지 판정의 단위다."""
@@ -2592,12 +2639,40 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 else:
                     yield _sse("status", {"step": "지정 앱의 조회 도구를 찾지 못해 전체 범위로 진행",
                                           "tool": None})
+            # ⚠ 스키마 예산 — 챗 경로엔 TOOL_SCHEMA_BUDGET 이 있는데 **여기엔 없었다.**
+            # 174종을 통째로 바인딩하면 좌석 프롬프트가 16K 모델에서 그대로 400 이 나고,
+            # 실패는 print 한 줄로만 남아 심의는 정상처럼 끝난다(실측: 7명 전원 400).
+            # 큰 창에서도 좌석×라운드만큼 곱해지므로 그냥 낭비다.
+            if _g and _FREE_TOOL_TOKENS > 0:
+                # ⚠ 좌석(personas)은 **아직 발굴 전**이다 — 이 준비는 discover 단계보다 앞선다.
+                #   여기서 personas 를 쓰면 UnboundLocalError 다(실제로 냈다). 화두로만 고른다.
+                _before = len(_g)
+                _g = _trim_free_tools(_g, question, _FREE_TOOL_TOKENS)
+                if len(_g) < _before:
+                    yield _sse("status", {"step": f"자유 조회 도구 예산 — {_before}종 → {len(_g)}종"
+                                                  f"(스키마 {_FREE_TOOL_TOKENS:,}토큰 상한)",
+                                          "tool": None})
             if _g:
                 g_agent = create_react_agent(llm, list(_g.values()))
                 yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종, "
                                               f"1인당 최대 {opts.tool_budget}회", "tool": None})
+            else:
+                # ⚠ 조용히 넘어가면 안 된다. 자유 조회를 켜 놓고 도구가 하나도 안 붙으면 심의는
+                # **자유 조회가 원래 없던 것처럼** 끝나고, 화면은 정상 심의와 구별되지 않는다.
+                # 좌석이 '도구로 확인했다' 고 믿게 만드는 자리라 특히 위험하다.
+                yield _sse("warning", {"code": "free_tools_unavailable",
+                                       "message": "전문가 자유 조회를 켰지만 **쓸 수 있는 조회 도구가 "
+                                                  "하나도 없습니다** — 좌석이 도구로 확인하지 않고 "
+                                                  "지식카드와 대화만으로 논의합니다. 권한(플랫폼 허가)이나 "
+                                                  "게이트웨이 연결을 확인하세요."})
+                yield _delib("evidence", source="자유 조회 불가", included=False,
+                             text="읽기 전용 도구가 바인딩되지 않아 좌석이 직접 조회하지 못했습니다.")
         except Exception as exc:  # noqa: BLE001 — 자유 조회 불가여도 심의는 종전대로 진행
             print(f"[deliberation] free-tool 준비 실패: {exc!r}")
+            # print 만 하면 사용자는 왜 조회가 없었는지 영원히 모른다.
+            yield _sse("warning", {"code": "free_tools_failed",
+                                   "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
+                                              "좌석이 도구 없이 논의합니다."})
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
@@ -3068,9 +3143,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             try:
                 for _fut in asyncio.as_completed(_gt):
                     try:
-                        _k, _calls, _blk = await _fut
+                        _k, _calls, _blk, _err = await _fut
                     except Exception:  # noqa: BLE001
                         continue
+                    if _err:
+                        # 조용히 넘기면 '좌석이 조회할 게 없다고 판단' 과 구별되지 않는다.
+                        yield _sse("warning", {"code": "free_gather_failed",
+                                               "message": f"{_k} 자유 조회 실패 — {_err}"})
+                        yield _delib("evidence", source=f"{_k} · 자유 조회 실패",
+                                     text=_err, included=False)
                     for _tn, _ap, _out in _calls:
                         yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
                         if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):

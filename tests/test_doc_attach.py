@@ -526,3 +526,43 @@ def test_무관한_화두는_여전히_안_걸린다():
 
     for q in ("내년 예산 배분을 어떻게 할 것인가", "조직 개편안을 고른다"):
         assert not d._has_defect_topic(q, [{"role": "user", "content": "예산 얘기"}]), q
+
+
+# ── 자유 조회 — "돈다고 되어 있는 것" 과 "실제로 도는 것" ────────────────────────────
+def test_자유_조회_도구에_스키마_예산이_있다():
+    """챗 경로엔 TOOL_SCHEMA_BUDGET 이 있는데 자유 조회엔 **없었다.** 174종을 통째로
+    바인딩해 좌석 프롬프트가 16K 모델에서 그대로 400 이 났고, 실패는 print 한 줄로만 남아
+    심의는 정상처럼 끝났다(실측: 좌석 7명 전원 400, 조회 0회)."""
+    import deliberation as d
+
+    assert d._FREE_TOOL_TOKENS > 0, "예산이 꺼져 있다 — 종전의 조용한 실패로 되돌아간다"
+    # 좌석 수 × 라운드만큼 곱해지므로 챗보다 작아야 한다.
+    assert d._FREE_TOOL_TOKENS < app.TOOL_SCHEMA_BUDGET
+
+
+def test_도구를_자를_때_입구부터_남긴다():
+    """아무거나 버리면 모델이 식별자를 지어내 호출하다 차단된다 — 검색·목록 같은 입구를
+    먼저 확보해야 한다."""
+    import deliberation as d
+
+    class _T:
+        def __init__(self, n, desc=""):
+            self.name, self.description, self.args_schema = n, desc, {"x": "y" * 300}
+
+    g = {n: _T(n) for n in ("search_reports", "list_materials", "get_curve",
+                            "compute_abd_matrix", "render_3d", "submit_job")}
+    kept = d._trim_free_tools(g, "굽힘 수명", budget=200)
+    assert kept, "전부 잘라 버렸다"
+    assert any(k.startswith(("search", "list")) for k in kept), f"입구 도구가 없다: {list(kept)}"
+
+
+def test_예산이_커도_한_종은_남긴다():
+    """예산이 아무리 작아도 도구 0종이면 자유 조회가 통째로 꺼진다 — 그건 별도 경고 경로다."""
+    import deliberation as d
+
+    class _T:
+        def __init__(self, n):
+            self.name, self.description, self.args_schema = n, "d" * 5000, {"a": "b" * 5000}
+
+    kept = d._trim_free_tools({"search_x": _T("search_x"), "y": _T("y")}, "q", budget=1)
+    assert len(kept) == 1
