@@ -693,3 +693,44 @@ def test_실패는_캐시에_굳지_않는다():
 
     assert asyncio.run(main()) == "두 번째는 성공"
     assert calls["n"] == 2, "실패가 캐시에 굳어 재시도가 막혔다"
+
+
+# ── 좌석 조회 턴 예산 — 스키마·프롬프트·결과를 **한 예산**으로 본다 ────────────────
+def test_조회_턴_전체가_컨텍스트에_들어간다():
+    """결과 몫을 안 떼면 결과 하나가 창을 터뜨린다 — 실측: dev 의 TOOL_RESULT_MAX=6,000자
+    × 3회 ≈ 17,000토큰으로 16K 창을 **결과만으로** 넘겼다. 좌석은 조회를 다 해 놓고
+    요약 턴에서 죽고, 근거 패널은 비어 사용자는 '조회를 안 했다' 고 읽는다."""
+    import deliberation as d
+
+    for ctx in (16384, 128000, 1000000):
+        app._ctx_cache["n"] = ctx
+        d._free_tok_cache.clear()
+        for budget in (1, 3, 6):
+            sch = d._free_tool_tokens()
+            res_tok = int(d._free_result_chars(budget) / 1.2) * budget
+            total = sch + d._FREE_PROMPT_RESERVE + res_tok
+            assert total <= ctx, (
+                f"컨텍스트 {ctx:,} · 호출 {budget}회 — 스키마 {sch:,} + 프롬프트 "
+                f"{d._FREE_PROMPT_RESERVE:,} + 결과 {res_tok:,} = {total:,}토큰"
+            )
+    d._free_tok_cache.clear()
+
+
+def test_결과_상한이_전역_상한을_넘지_않는다():
+    """큰 창이라고 전역 TOOL_RESULT_MAX 를 넘겨 잡으면 다른 경로의 전제가 깨진다."""
+    import deliberation as d
+
+    app._ctx_cache["n"] = 1000000
+    d._free_tok_cache.clear()
+    assert d._free_result_chars(3) <= app.TOOL_RESULT_MAX
+    d._free_tok_cache.clear()
+
+
+def test_호출_수가_늘면_건당_상한이_준다():
+    """1인당 6회를 허용하면 건당 몫은 그만큼 작아져야 한다 — 안 그러면 합계가 넘는다."""
+    import deliberation as d
+
+    app._ctx_cache["n"] = 128000
+    d._free_tok_cache.clear()
+    assert d._free_result_chars(6) < d._free_result_chars(2)
+    d._free_tok_cache.clear()

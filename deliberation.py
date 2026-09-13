@@ -1963,20 +1963,36 @@ _FREE_PROMPT_RESERVE = _env_int("DELIB_FREE_PROMPT_RESERVE", 4000)   # 그 나�
 _free_tok_cache: dict = {}
 
 
-def _free_tool_tokens() -> int:
-    """이번 심의에서 좌석 하나에 실을 도구 스키마 예산(토큰)."""
-    if "n" in _free_tok_cache:
-        return _free_tok_cache["n"]
+def _free_ctx_tokens() -> int:
+    """자유 조회 턴이 쓸 수 있는 컨텍스트(토큰). 출력·재시도 여유로 80% 만 쓴다."""
     try:
         from app import _model_context_tokens  # noqa: PLC0415 — 순환 방지용 늦은 import
         ctx = _model_context_tokens()
     except Exception:  # noqa: BLE001
         ctx = 128000
-    # 조회 단계는 발언 단계와 별개 호출이라 컨텍스트를 통째로 쓸 수 있지만, 응답·재시도
-    # 여유를 두고 절반만 쓴다. 프롬프트 나머지(페르소나·발췌)는 _FREE_PROMPT_RESERVE.
-    n = min(_FREE_TOOL_TOKENS, max(1200, int(ctx * 0.5) - _FREE_PROMPT_RESERVE))
+    return max(4000, int(ctx * 0.8))
+
+
+def _free_tool_tokens() -> int:
+    """좌석 하나에 실을 **도구 스키마** 예산(토큰)."""
+    if "n" in _free_tok_cache:
+        return _free_tok_cache["n"]
+    # 조회 턴 = 스키마 + 프롬프트 + **도구 결과**. 결과 몫을 안 떼면 결과 하나가 창을 터뜨린다
+    # (실측: dev 의 TOOL_RESULT_MAX=6,000자 × 3회 ≈ 17,000토큰 — 16K 창을 결과 혼자 넘긴다).
+    n = min(_FREE_TOOL_TOKENS, max(1200, int(_free_ctx_tokens() * 0.45) - _FREE_PROMPT_RESERVE))
     _free_tok_cache["n"] = n
     return n
+
+
+def _free_result_chars(tool_budget: int) -> int:
+    """도구 결과 **1건당** 글자 상한 — 스키마·프롬프트를 뺀 나머지를 호출 수로 나눈다.
+
+    결과는 ReAct 메시지에 그대로 쌓인다. 상한이 없으면 좌석이 조회를 마치고도 요약 턴에서
+    컨텍스트 초과로 죽는다(부분 결과는 살리지만, 애초에 안 죽는 게 낫다)."""
+    left = _free_ctx_tokens() - _free_tool_tokens() - _FREE_PROMPT_RESERVE
+    per = max(400, left // max(1, tool_budget))
+    from app import TOOL_RESULT_MAX  # noqa: PLC0415 — 전역 상한을 넘지는 않는다
+    return min(TOOL_RESULT_MAX, int(per * 1.2))   # 토큰 → 글자(보수적 1.2자/토큰)
 
 
 def _tool_cost(t) -> int:
@@ -2723,8 +2739,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _risk_chair = opts.chair_template == "risk-review"
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
+            _rmax = _free_result_chars(opts.tool_budget)
             _g = {n: _wrap_cached(t, _fcache, _fstats)
-                  for n, t in (await _tools_by_name(app, groups, user=user, user_pat=user_pat)).items()
+                  for n, t in (await _tools_by_name(app, groups, _rmax,
+                                                    user=user, user_pat=user_pat)).items()
                   if n.lower() not in _FREE_DENY and (
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
@@ -2768,7 +2786,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 free_pool = _g
                 g_agent = create_react_agent(llm, list(_g.values()))   # 좌석 매칭 실패 시 폴백
                 yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종 후보"
-                                              f"(좌석마다 분야에 맞춰 추림), 1인당 최대 {opts.tool_budget}회",
+                                              f"(좌석마다 분야에 맞춰 추림), 1인당 최대 "
+                                              f"{opts.tool_budget}회 · 결과 {_rmax:,}자까지",
                                       "tool": None})
             else:
                 # ⚠ 조용히 넘어가면 안 된다. 자유 조회를 켜 놓고 도구가 하나도 안 붙으면 심의는
