@@ -1995,6 +1995,40 @@ def _free_result_chars(tool_budget: int) -> int:
     return min(TOOL_RESULT_MAX, int(per * 1.2))   # 토큰 → 글자(보수적 1.2자/토큰)
 
 
+# 다른 좌석이 조회한 결과를 공용으로 돌릴 때의 **천장**(자). 좌석 수와 무관하게 상한이
+# 고정이라 20석이 되어도 프롬프트가 선형으로 커지지 않는다.
+_SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
+_SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
+
+
+def _share_budget() -> int:
+    """공용 조회 결과 몫(자). 발언 턴은 도구를 안 묶으므로(_round_live 는 도구 없는 텍스트 턴)
+    _EVID_RESERVE 가 잡아 둔 스키마 몫이 실제로는 비어 있다 — 그 여유에서 쓴다."""
+    return min(_SHARE_BUDGET, max(600, int(_pre_budget() * 0.15)))
+
+
+def _share_block(pool: list, exclude_key: str, budget: int) -> str:
+    """다른 좌석이 조회해 온 것 — 같은 (도구·인자)는 한 번만 싣는다.
+
+    이걸 안 주면 A 가 찾은 구리 CTE 를 B 는 못 보고 기억으로 말한다. 좌석마다 따로 조회해
+    놓고 서로 못 보면, 심의가 아니라 독립된 1인 답변 여러 개다.
+    """
+    seen, lines, used = set(), [], 0
+    for seat, tool, args, out in pool:
+        if seat == exclude_key:
+            continue                      # 자기 것은 '당신이 직접 조회한 결과'에 이미 있다
+        sig = (tool, args)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        line = f"- [{seat}] {tool}({args}): {out[:_SHARE_ITEM_MAX]}"
+        if lines and used + len(line) > budget:
+            continue
+        lines.append(line)
+        used += len(line)
+    return "\n".join(lines)
+
+
 def _tool_cost(t) -> int:
     """도구 하나의 스키마 추정 토큰(한글·JSON 혼합에서 대략 3자 ≈ 1토큰, 보수적 과대평가)."""
     try:
@@ -2055,11 +2089,12 @@ _AREA_HINT: dict = {
 _AREA_ALWAYS = ("knowledge", "report", "system")
 
 
-def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
-    """이 좌석이 쓸 도구 — **자기 분야를 앞에** 두고 예산 안에서 남긴다.
+def _seat_tool_rank(names, persona: dict, question: str) -> list[str]:
+    """이 전문가가 쓸 법한 순서로 도구 **이름**을 정렬한다(개수·예산 제한은 호출부 몫).
 
-    좌석 전원에게 같은 목록을 주면 물성 전문가도 적층 전문가도 똑같은 77종을 받는다.
-    역할 문장과 영역 힌트의 낱말이 겹치는 영역을 그 좌석의 분야로 보고 그쪽을 먼저 채운다.
+    점수만 떼어 낸 이유 — 심의 좌석과 챗에서 지목한 전문가가 **같은 기준**을 써야 한다.
+    전문가를 앉혀 놓고 도구는 질문 어휘로만 고르면, 그 사람이 늘 쓰는 도구가 빠진다
+    (사용자 2026-09-13: "일부러 설정하는 게 아닌 한 자기가 쓸 줄 아는 도구를 쓰게끔").
     """
     import re as _re
     from app import _area_of  # noqa: PLC0415 — 순환 방지용 늦은 import
@@ -2075,23 +2110,58 @@ def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
         # 좌석 역할이 더 중요하다 — 화두는 모든 좌석에 같지만 역할은 그 사람 것이다.
         return 3 * len(rtok & hint) + len(qtok & hint)
 
-    scored = []
-    for name, tool in g.items():
+    def _score(name: str) -> tuple[int, int]:
+        """(총점, 역할이 기여한 몫). 역할 몫이 0 이면 그 도구는 '이 전문가 것' 이 아니다."""
         area = _area_of(name)[0] or ""
-        s = _area_score(area) if area else 0
-        if area in _AREA_ALWAYS:
-            s += 2
         n = name.lower()
+        hint = {w.lower() for w in (_AREA_HINT.get(area) or "").split()}
         # 영역이 같아도(예: calc 안의 적층 vs 열충격) 이름이 겹치면 그 좌석 것이다.
         # 영역만 보면 적층 전문가와 열충격 전문가가 **똑같은 29종**을 받는다(실측).
-        s += 6 * sum(1 for w in rtok if len(w) > 2 and w in n.replace("_", " "))
+        role = 3 * len(rtok & hint) + 6 * sum(1 for w in rtok
+                                              if len(w) > 2 and w in n.replace("_", " "))
+        s = role + (len(qtok & hint) if area else 0)
+        if area in _AREA_ALWAYS:
+            s += 2
         if any(n.startswith(e) or e in n for e in ("search", "list", "find", "guide", "describe")):
             s += 4                      # 입구 도구
-        scored.append((s, name, tool))
-    scored.sort(key=lambda x: -x[0])
+        return s, role
 
+    # 안정 정렬 — 점수가 같으면 원래 순서를 지킨다(종전 동작).
+    return sorted(names, key=lambda n: -_score(n)[0])
+
+
+def _seat_tool_prefer(names, persona: dict, question: str, n: int) -> list[str]:
+    """챗에서 지목한 전문가의 도구 — **짐작이 될 때만** 준다.
+
+    역할 문장이 어느 영역·도구 이름과도 안 걸리면 빈 목록이다. 짐작이 안 되는데 순위를
+    바꾸면 질문 어휘로 고른 진짜 관련 도구를 밀어낸다 — 실측으로 잡았다. 역할이 비어 있는
+    키를 주니 점수가 '입구 도구 가산점' 만 남아 get_guide·describe_* 12종이 올라왔다.
+    """
+    import re as _re
+    from app import _area_of  # noqa: PLC0415 — 순환 방지용 늦은 import
+
+    role = f"{persona.get('key', '')} {persona.get('role', '') or ''} {persona.get('name', '') or ''}"
+    rtok = {w.lower() for w in _re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", role)}
+    if not rtok:
+        return []
+
+    def _role_part(name: str) -> int:
+        hint = {w.lower() for w in (_AREA_HINT.get(_area_of(name)[0] or "") or "").split()}
+        return 3 * len(rtok & hint) + 6 * sum(1 for w in rtok
+                                              if len(w) > 2 and w in name.lower().replace("_", " "))
+
+    ranked = [x for x in _seat_tool_rank(names, persona, question) if _role_part(x) > 0]
+    return ranked[:n]
+
+
+def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
+    """이 좌석이 쓸 도구 — **자기 분야를 앞에** 두고 예산 안에서 남긴다.
+
+    좌석 전원에게 같은 목록을 주면 물성 전문가도 적층 전문가도 똑같은 77종을 받는다.
+    """
     kept, used = {}, 0
-    for _s, name, tool in scored:
+    for name in _seat_tool_rank(list(g), persona, question):
+        tool = g[name]
         c = _tool_cost(tool)
         if kept and used + c > budget:
             continue
@@ -2100,7 +2170,8 @@ def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
     return kept
 
 
-async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budget: int):
+async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budget: int,
+                           prior: str = ""):
     """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록, 실패사유) 반환.
     발언(JSON 계약)과 분리된 이유: 도구 호출 모델은 왕복 후 스키마 계약을 곧잘 어긴다(실측) —
     조회는 여기서, 발언은 종전대로 도구 없는 텍스트 턴에서."""
@@ -2122,7 +2193,11 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
               f"끝나면 '조회 요약:' 뒤에 핵심 수치만 "
               f"3줄 이내로 요약하라. 조회할 것이 없으면 '조회 불필요' 한 줄만 출력하라.")
     human = (f"[심의 주제]\n{question}\n\n[지금까지의 논의·근거(발췌)]\n{ctx}\n\n"
-             f"당신 발언에 필요한 조회를 지금 수행하라.")
+             # 앞 라운드에 누가 무엇을 불렀는지 알려 준다 — 모르면 같은 목록 조회를 라운드마다
+             # 되풀이하고, 정작 아무도 안 본 각도는 끝까지 비어 있다.
+             + (f"[이미 조회된 것 — 결과는 공용 근거로 받게 된다. 같은 호출을 되풀이하지 말고 "
+                f"보완할 각도를 조회하라]\n{prior}\n\n" if prior else "")
+             + f"당신 발언에 필요한 조회를 지금 수행하라.")
     calls, summary = [], ""
     msgs: list = []
     try:
@@ -3151,6 +3226,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     rounds_data = []          # [(turns_list, transcript_str), ...] 라운드별
     seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
+    gather_pool: list = []    # [(좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
 
     for rnd in range(1, N + 1):
         kind = _kind(rnd)
@@ -3279,9 +3355,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                               + " · ".join(f"{k} {n}종" for k, n in
                                                            list(_seat_n.items())[:6]),
                                       "tool": None})
+            # 앞 라운드에 이미 불린 호출을 알려 준다(결과가 아니라 **호출 서명**만 — 싸다).
+            _prior = "\n".join(dict.fromkeys(f"- {t}({a})" for _s, t, a, _o in gather_pool))[:1200]
             _gt = [asyncio.ensure_future(
                 _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
-                                 _gctx, opts.tool_budget)) for p in personas]
+                                 _gctx, opts.tool_budget, _prior)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
             # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
             # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,
@@ -3305,6 +3383,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             ev_count["tool"] += 1
                             yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:500],
                                          included=True)
+                            # 공용 풀 — 이 값을 다른 좌석도 본다. 안 넣으면 A 가 조회한 수치를
+                            # B 는 못 보고 기억으로 말한다(근거 패널에는 떠 있는데 좌석엔 없다).
+                            gather_pool.append((_k, _tn, _ap, _out))
                     _gathered[_k] = _blk
             finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
                 for _t in _gt:
@@ -3318,10 +3399,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
         # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
         _kn = knowledge_by_key if kind != "converge" else {}
-        if any(_kn.values()) or any(_gathered.values()):
+        # 공용 조회 결과 — 다른 좌석이 찾아 온 값. 수렴 라운드에도 준다(정리하려면 수치가 있어야
+        # 한다). 좌석마다 자기 것을 뺀 목록이라 같은 내용이 두 번 실리지 않는다.
+        _share = ({p["key"]: _share_block(gather_pool, p["key"], _share_budget()) for p in personas}
+                  if gather_pool else {})
+        if _share and any(_share.values()):
+            _n_share = len({(t, a) for _s, t, a, _o in gather_pool})
+            yield _sse("status", {"step": f"공용 근거 {_n_share}건을 좌석 전원이 함께 본다 "
+                                          f"(1인당 최대 {_share_budget():,}자)", "tool": None})
+        if any(_kn.values()) or any(_gathered.values()) or any(_share.values()):
             _base_fn = prompt_fn
 
-            def prompt_fn(p, _f=_base_fn, _kn=_kn, _g=_gathered):
+            def prompt_fn(p, _f=_base_fn, _kn=_kn, _g=_gathered, _sh=_share):
                 out = _f(p)
                 kb = _kn.get(p["key"]) or ""
                 if kb:
@@ -3331,6 +3420,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if blk:
                     out += ("\n\n[당신이 직접 조회한 결과 — 발언에 인용하세요. 여기·공용 근거에 "
                             "없는 수치는 (경험칙) 표기]\n" + blk)
+                shb = _sh.get(p["key"]) or ""
+                if shb:
+                    out += ("\n\n[다른 전문가가 조회한 결과 — 공용 근거다. 당신 주장에 그대로 "
+                            "인용해도 되고, 값이 당신 판단과 어긋나면 그 점을 반박에 쓰세요. "
+                            "누가 조회했는지는 [좌석키]로 표시돼 있습니다]\n" + shb)
                 return out
 
         cur = []

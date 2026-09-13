@@ -734,3 +734,44 @@ def test_호출_수가_늘면_건당_상한이_준다():
     d._free_tok_cache.clear()
     assert d._free_result_chars(6) < d._free_result_chars(2)
     d._free_tok_cache.clear()
+
+
+# ── 조회 결과 공유 — A 가 찾은 값을 B 도 본다 ─────────────────────────────────
+def test_다른_좌석_조회_결과가_공용으로_돈다():
+    """좌석마다 따로 조회해 놓고 서로 못 보면 심의가 아니라 1인 답변 여러 개다."""
+    import deliberation as d
+
+    pool = [("seat-a", "list_materials", '{"q":"cu"}', "구리 CTE 17ppm/K"),
+            ("seat-b", "search_by_property", '{"p":"E"}', "Cu E=117GPa")]
+    blk = d._share_block(pool, "seat-b", 4000)
+    assert "구리 CTE 17ppm/K" in blk, "다른 좌석이 조회한 값이 안 보이면 기억으로 말하게 된다"
+    assert "Cu E=117GPa" not in blk, "자기 조회는 '직접 조회한 결과'에 이미 있다 — 두 번 싣지 않는다"
+    assert "[seat-a]" in blk, "누가 조회했는지 없으면 반박할 때 지목을 못 한다"
+
+
+def test_같은_호출은_공용_목록에_한_번만_실린다():
+    import deliberation as d
+
+    pool = [("seat-a", "list_materials", "{}", "A"), ("seat-b", "list_materials", "{}", "A")]
+    assert d._share_block(pool, "seat-c", 4000).count("list_materials") == 1
+
+
+def test_공용_근거는_예산_안에서_잘린다():
+    """좌석이 20명이 되어도 프롬프트가 선형으로 커지면 안 된다."""
+    import deliberation as d
+
+    pool = [(f"seat-{i}", f"tool_{i}", "{}", "x" * 2000) for i in range(30)]
+    blk = d._share_block(pool, "none", 3000)
+    assert len(blk) <= 3000 + d._SHARE_ITEM_MAX + 60, f"예산을 넘겼다({len(blk):,}자)"
+    assert blk, "예산이 작다고 통째로 비면 공유가 없는 것과 같다"
+
+
+def test_공용_예산이_사전_예산_안에_있다():
+    """공용 근거가 사전 컨텍스트 예산을 통째로 먹으면 원천 근거가 밀려난다."""
+    import deliberation as d
+
+    for ctx in (16384, 128000, 1000000):
+        app._ctx_cache["n"] = ctx
+        d._evid_cache.clear()
+        assert d._share_budget() <= max(600, d._pre_budget())
+    d._evid_cache.clear()
