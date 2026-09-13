@@ -251,3 +251,27 @@ def test_머리말_문구가_바뀌어도_잘린다():
 def test_평문_속_같은_표현은_안_자른다():
     txt = "평문 안의 (how to access this hub) 는 역할 본문이다"
     assert a._role_doc(txt) == txt
+
+
+# ── 실제 코퍼스에서 확인한 머리말(전수 796명, 2026-09-13) ────────────────────
+#    잘리는 구간에 한국어 역할 문장이 남은 전문가는 **0건**이었다. 그래서 "안내문 뒤 본문을
+#    버린다" 는 오늘 이 코퍼스에서는 결함이 아니다 — 고치면 안내문이 되살아날 위험만 진다.
+#    상류가 배치를 바꾸면 이 전제가 깨지므로, 그때 알아채라고 머리말 실물을 박아 둔다.
+_REAL_HEADS = [
+    "## How to access this hub — use the MCP tools (NOT web fetch)",
+    "## CRITICAL — do NOT use WebFetch / browser fetch on this hub",
+]
+
+
+def test_실제_머리말을_전부_잡는다():
+    for h in _REAL_HEADS:
+        got = a._role_doc(f"당신은 휨 해석 전문가다.\n판단 기준은 상대 휨이다.\n\n---\n\n{h}\n안내문")
+        assert got == "당신은 휨 해석 전문가다.\n판단 기준은 상대 휨이다.", f"{h!r} → {got!r}"
+
+
+def test_안내문이_없는_역할은_통째로_남는다():
+    """HE팀 MCP 운영자 15명은 허브 안내 블록이 애초에 안 붙는 별도 계보다(전수 확인).
+    역할 본문이 agent_search·recommend_agents 를 정당하게 언급해도 잘리면 안 된다."""
+    txt = ("당신은 AIDataHub 운영자다. agent_search 로 찾고 recommend_agents 로 넘긴다.\n"
+           "지식 등록은 사람 확인 뒤에 한다.")
+    assert a._role_doc(txt) == txt
