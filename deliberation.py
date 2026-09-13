@@ -1914,9 +1914,18 @@ def _app_of_tools() -> dict:
         return {}
 
 
-def _wrap_cached(tool, cache: dict):
+def _wrap_cached(tool, cache: dict, stats: dict | None = None):
     """같은 심의 안에서 같은 도구·같은 인자 재호출을 1회로 접는다 — 전문가 여럿이 같은 재료를
-    조회하는 것이 정상 패턴이라 캐시가 곧 예산 절약이다(도구 객체는 이 심의 전용 로드라 안전)."""
+    조회하는 것이 정상 패턴이라 캐시가 곧 예산 절약이다(도구 객체는 이 심의 전용 로드라 안전).
+
+    ⚠ **결과가 아니라 Future 를 캐시한다.** 좌석은 병렬로 돌기 때문에, 결과만 저장하면 같은
+    호출이 나란히 출발한 경우 전부 캐시를 놓치고 전부 실제로 부른다 — 그리고 그게 드문
+    경우가 아니라 **기본**이다(7석이 동시에 시작한다). Future 를 넣어 두면 뒤따라온 좌석이
+    같은 호출을 **기다려서** 결과를 나눠 쓴다.
+
+    예외는 캐시하지 않는다 — 일시적 실패가 그 심의 내내 굳으면 안 된다(재호출은 한 번 더
+    시도할 기회를 준다). 정상 응답 안의 에러 문자열까지는 구분하지 않는다.
+    """
     orig = tool.coroutine
     if orig is None:
         return tool
@@ -1927,11 +1936,20 @@ def _wrap_cached(tool, cache: dict):
                                          sort_keys=True, ensure_ascii=False, default=str))
         except Exception:  # noqa: BLE001 — 키 직렬화 불가면 캐시 없이 그냥 호출
             return await orig(*a, **kw)
-        if key in cache:
-            return cache[key]
-        out = await orig(*a, **kw)
-        cache[key] = out
-        return out
+        fut = cache.get(key)
+        if fut is not None:
+            if stats is not None:
+                stats["hit"] = stats.get("hit", 0) + 1
+            return await asyncio.shield(fut)      # 호출자가 취소돼도 공유 결과는 살린다
+        fut = asyncio.ensure_future(orig(*a, **kw))
+        cache[key] = fut
+        if stats is not None:
+            stats["miss"] = stats.get("miss", 0) + 1
+        try:
+            return await asyncio.shield(fut)
+        except Exception:
+            cache.pop(key, None)   # 실패는 굳히지 않는다 — 다음 좌석이 다시 시도할 수 있게
+            raise
 
     tool.coroutine = cached
     return tool
@@ -2090,11 +2108,27 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     human = (f"[심의 주제]\n{question}\n\n[지금까지의 논의·근거(발췌)]\n{ctx}\n\n"
              f"당신 발언에 필요한 조회를 지금 수행하라.")
     calls, summary = [], ""
+    msgs: list = []
     try:
-        res = await g_agent.ainvoke({"messages": [("system", sysmsg), ("user", human)]},
-                                    config={"recursion_limit": budget * 2 + 5})
+        # ⚠ ainvoke 로 받으면 **중간에 터질 때 앞서 받은 도구 결과까지 통째로 사라진다.**
+        #   실측: 좌석이 조회를 다 해 놓고 요약 턴에서 컨텍스트 초과(400) → 조회 0건으로 기록.
+        #   캐시 통계에는 실제 호출이 찍히는데 근거 패널은 비어 있는, 앞뒤가 안 맞는 상태였다.
+        #   스트리밍으로 받아 도중에 죽어도 **거기까지 받은 것은 살린다.**
+        async for _st in g_agent.astream({"messages": [("system", sysmsg), ("user", human)]},
+                                         config={"recursion_limit": budget * 2 + 5},
+                                         stream_mode="values"):
+            got = (_st or {}).get("messages") or []
+            if len(got) > len(msgs):
+                msgs = got
+    except Exception as exc:  # noqa: BLE001 — 조회 실패가 발언을 막지 않는다
+        print(f"[deliberation] free-gather 중단({persona.get('key')}): {exc!r}")
+        if not msgs:
+            return persona["key"], [], "", f"{type(exc).__name__}: {str(exc)[:120]}"
+        # 여기까지 받은 것은 쓴다 — 사유는 남겨 화면에 '일부만' 임을 알린다.
+        summary = f"(조회 도중 중단: {type(exc).__name__})"
+    try:
         args_by_id = {}
-        for m in (res or {}).get("messages") or []:
+        for m in msgs:
             for tc in (getattr(m, "tool_calls", None) or []):
                 args_by_id[tc.get("id")] = tc.get("args")
             mtype = getattr(m, "type", "")
@@ -2108,23 +2142,21 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
                               str(body)))
             elif mtype == "ai" and isinstance(body, str) and body.strip():
                 summary = body.strip()
-    except Exception as exc:  # noqa: BLE001 — 조회 실패가 발언을 막지 않는다
-        print(f"[deliberation] free-gather 실패({persona.get('key')}): {exc!r}")
-        # 호출부가 화면에 올릴 수 있게 사유를 돌려준다 — print 만 하면 사용자는 '좌석이
-        # 조회할 게 없다고 판단했다' 와 '조회가 통째로 실패했다' 를 구별할 수 없다.
-        return persona["key"], [], "", f"{type(exc).__name__}: {str(exc)[:120]}"
+    except Exception as exc:  # noqa: BLE001 — 메시지 해석 실패가 발언을 막지 않는다
+        print(f"[deliberation] free-gather 해석 실패({persona.get('key')}): {exc!r}")
     calls = calls[:budget]
     # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
     # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
     def _has_content(b: str) -> bool:
         return _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")
     good = [(n, ap, b) for n, ap, b in calls if _has_content(b)]
+    _err = summary if summary.startswith("(조회 도중 중단") else ""
     if not good:
-        return persona["key"], calls, "", ""
+        return persona["key"], calls, "", _err
     block = "\n".join(f"- {n}({ap}): {b[:900]}" for n, ap, b in good)[:3500]
     if summary and not summary.startswith("조회 불필요"):
         block += f"\n(전문가 자체 요약) {summary[:400]}"
-    return persona["key"], calls, block, ""
+    return persona["key"], calls, block, _err
 
 def _dom_of(key: str) -> str:
     """페르소나 키의 도메인 접두사 — disp-burnin → disp. 커버리지 판정의 단위다."""
@@ -2682,6 +2714,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         try:
             from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
             _fcache: dict = {}
+            _fstats: dict = {}      # 캐시 적중/실호출 — 끝에 한 줄로 알린다
             # 리스크 심사 도구 통로 — _FREE_ALLOW 접두사에 안 걸리는 읽기 전용 도구를 앱
             # 조건부(_RISK_READ_TOOLS)·의장 조건부(_RISK_KEEP_TOOLS)로만 더 연다. 검문은 여기
             # 조립식이어야 한다 — 아래 _narrow 에만 넣으면 그 도구는 _g 에 애초에 없어 무효다.
@@ -2690,7 +2723,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _risk_chair = opts.chair_template == "risk-review"
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
-            _g = {n: _wrap_cached(t, _fcache)
+            _g = {n: _wrap_cached(t, _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, user=user, user_pat=user_pat)).items()
                   if n.lower() not in _FREE_DENY and (
                       _free_tool_ok(n)
@@ -3258,6 +3291,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 for _t in _gt:
                     if not _t.done():
                         _t.cancel()
+            # 캐시가 실제로 먹었는지 보이게 — 안 보이면 좌석이 같은 걸 몇 번 부르는지 모른다.
+            if _fstats.get("hit"):
+                yield _sse("status", {"step": f"조회 캐시 — 실제 호출 {_fstats.get('miss', 0)}회 · "
+                                              f"공유 {_fstats['hit']}회(같은 도구·같은 인자)",
+                                      "tool": None})
         # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
         # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
         _kn = knowledge_by_key if kind != "converge" else {}

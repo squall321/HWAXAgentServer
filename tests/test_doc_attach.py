@@ -627,3 +627,69 @@ def test_같은_영역이라도_좌석이_다르면_도구가_다르다(monkeypa
     assert lam[:3] != ts[:3], "적층과 열충격이 같은 도구를 받는다"
     assert any("laminate" in t or "abd" in t for t in lam[:3]), lam[:3]
     assert any("sed" in t for t in ts[:3]), ts[:3]
+
+
+# ── 조회 캐시 — 좌석이 병렬이라 '결과 캐시' 만으로는 새 나간다 ──────────────────────
+def test_동시_호출도_한_번만_실제로_부른다():
+    """좌석은 asyncio 로 **동시에** 돈다. 결과만 캐시하면 같은 호출이 나란히 출발한 경우
+    전부 캐시를 놓치고 전부 실제로 부른다 — 그리고 그게 기본이다(7석 동시 시작)."""
+    import asyncio
+
+    import deliberation as d
+
+    hits = {"n": 0}
+
+    class _Tool:
+        name = "list_materials"
+
+        async def _call(self, args):
+            hits["n"] += 1
+            await asyncio.sleep(0.05)       # 실제 호출은 느리다 — 그 사이 다른 좌석이 온다
+            return "결과"
+
+        def __init__(self):
+            self.coroutine = self._call
+
+    cache, stats = {}, {}
+    t = d._wrap_cached(_Tool(), cache, stats)
+
+    async def main():
+        return await asyncio.gather(*[t.coroutine({"q": "구리"}) for _ in range(7)])
+
+    out = asyncio.run(main())
+    assert out == ["결과"] * 7
+    assert hits["n"] == 1, f"7석이 동시에 불렀는데 실제 호출이 {hits['n']}회다"
+    assert stats["miss"] == 1 and stats["hit"] == 6
+
+
+def test_실패는_캐시에_굳지_않는다():
+    """일시적 실패를 캐시하면 그 심의 내내 같은 조회가 죽는다."""
+    import asyncio
+
+    import deliberation as d
+
+    calls = {"n": 0}
+
+    class _Tool:
+        name = "flaky"
+
+        async def _call(self, args):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("일시 오류")
+            return "두 번째는 성공"
+
+        def __init__(self):
+            self.coroutine = self._call
+
+    t = d._wrap_cached(_Tool(), {}, {})
+
+    async def main():
+        try:
+            await t.coroutine({"a": 1})
+        except RuntimeError:
+            pass
+        return await t.coroutine({"a": 1})
+
+    assert asyncio.run(main()) == "두 번째는 성공"
+    assert calls["n"] == 2, "실패가 캐시에 굳어 재시도가 막혔다"
