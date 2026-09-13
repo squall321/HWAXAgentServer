@@ -536,8 +536,17 @@ def test_자유_조회_도구에_스키마_예산이_있다():
     import deliberation as d
 
     assert d._FREE_TOOL_TOKENS > 0, "예산이 꺼져 있다 — 종전의 조용한 실패로 되돌아간다"
-    # 좌석 수 × 라운드만큼 곱해지므로 챗보다 작아야 한다.
-    assert d._FREE_TOOL_TOKENS < app.TOOL_SCHEMA_BUDGET
+    # 고정값이면 작은 창에서 그대로 400 이다(실측: 12,000 으로도 dev 16K 에서 좌석 전원 400).
+    # 천장은 크게 두되 **실제 값은 컨텍스트에서** 나와야 한다.
+    for ctx, cap in ((16384, 8000), (128000, None), (1000000, None)):
+        app._ctx_cache["n"] = ctx
+        d._free_tok_cache.clear()
+        got = d._free_tool_tokens()
+        assert got > 0 and got <= d._FREE_TOOL_TOKENS
+        assert got < ctx, f"컨텍스트 {ctx:,} 인데 도구 예산만 {got:,}토큰"
+        if cap:
+            assert got <= cap, f"작은 창({ctx:,})에서 {got:,}토큰은 여전히 넘친다"
+    d._free_tok_cache.clear()
 
 
 def test_도구를_자를_때_입구부터_남긴다():
@@ -566,3 +575,55 @@ def test_예산이_커도_한_종은_남긴다():
 
     kept = d._trim_free_tools({"search_x": _T("search_x"), "y": _T("y")}, "q", budget=1)
     assert len(kept) == 1
+
+
+# ── 좌석마다 자기 분야 도구를 쥐어준다 ─────────────────────────────────────────────
+def _fake_area_pool(monkeypatch):
+    """게이트웨이 분류(tool_areas)를 흉내 낸다 — 실제 분류는 465종 전부 돼 있다."""
+    import deliberation as d
+
+    AREA = {
+        "list_materials": "material", "search_by_property": "material",
+        "get_material_properties": "material", "find_materials_in_property_range": "material",
+        "compute_abd_matrix": "calc", "analyze_laminate": "calc", "compute_neutral_axis": "calc",
+        "compute_buckling": "calc", "predict_sed": "calc", "predict_sed_batch": "calc",
+        "compute_thermal_response": "calc",
+        "query_voc": "voc", "search_voc": "voc", "get_top_issues": "voc",
+        "search_reports": "report", "list_reports": "report", "get_report": "report",
+        "list_recent_jobs": "sim", "slurm_list_nodes": "sim",
+    }
+    monkeypatch.setattr(app, "_area_of", lambda n: (AREA.get(n, ""), ""))
+
+    class _T:
+        def __init__(self, n):
+            self.name, self.description, self.args_schema = n, "", {"a": "b" * 200}
+
+    return d, {n: _T(n) for n in AREA}, AREA
+
+
+def test_좌석마다_자기_분야_도구를_받는다(monkeypatch):
+    """전원에게 같은 목록을 주면 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은
+    못 고르고 큰 모델도 엉뚱한 데를 뒤진다(사용자 제안)."""
+    d, g, AREA = _fake_area_pool(monkeypatch)
+    q = "구리를 12um 로 낮출 것인가"
+
+    mat = d._tools_for_seat(g, {"key": "mat-poly", "role": "재료 물성 탄성계수 CTE"}, q, 900)
+    assert AREA[next(iter(mat))] == "material", f"물성 좌석 1순위가 {next(iter(mat))}"
+
+    voc = d._tools_for_seat(g, {"key": "voc-field", "role": "시장 VOC 고객 불만 클레임"}, q, 900)
+    assert AREA[next(iter(voc))] == "voc", f"VOC 좌석 1순위가 {next(iter(voc))}"
+
+
+def test_같은_영역이라도_좌석이_다르면_도구가_다르다(monkeypatch):
+    """적층과 열충격은 둘 다 calc 다 — 영역만 보면 **똑같은 목록**을 받는다(실측).
+    이름이 겹치는 것을 앞세워 갈라야 predict_sed 가 열충격 좌석에 간다."""
+    d, g, _ = _fake_area_pool(monkeypatch)
+    q = "구리를 12um 로 낮출 것인가"
+
+    lam = list(d._tools_for_seat(g, {"key": "comp-lam", "role": "적층 laminate ABD 중립면"}, q, 600))
+    ts = list(d._tools_for_seat(
+        g, {"key": "pkg-ts", "role": "열충격 thermal shock SED 예측"}, q, 600))
+
+    assert lam[:3] != ts[:3], "적층과 열충격이 같은 도구를 받는다"
+    assert any("laminate" in t or "abd" in t for t in lam[:3]), lam[:3]
+    assert any("sed" in t for t in ts[:3]), ts[:3]

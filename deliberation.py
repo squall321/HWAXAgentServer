@@ -1937,9 +1937,28 @@ def _wrap_cached(tool, cache: dict):
     return tool
 
 
-# 자유 조회에 바인딩할 도구 스키마의 추정 토큰 상한. 0=무제한(종전 동작).
-# 챗의 TOOL_SCHEMA_BUDGET(40,000)보다 작게 잡는다 — 좌석 수 × 라운드만큼 곱해지기 때문이다.
-_FREE_TOOL_TOKENS = _env_int("DELIB_FREE_TOOL_TOKENS", 12000)
+# 자유 조회에 바인딩할 도구 스키마의 **천장**(추정 토큰). 실제 값은 모델 컨텍스트에서
+# 유도한다 — 고정값을 쓰면 작은 창에서 그대로 400 이 난다(실측: 12,000 으로도 dev 16K 에서
+# 좌석 전원 400). 좌석 프롬프트는 도구 스키마 + 페르소나 + 직전 논의 발췌 + 응답이다.
+_FREE_TOOL_TOKENS = _env_int("DELIB_FREE_TOOL_TOKENS", 40000)
+_FREE_PROMPT_RESERVE = _env_int("DELIB_FREE_PROMPT_RESERVE", 4000)   # 그 나머지 몫(토큰)
+_free_tok_cache: dict = {}
+
+
+def _free_tool_tokens() -> int:
+    """이번 심의에서 좌석 하나에 실을 도구 스키마 예산(토큰)."""
+    if "n" in _free_tok_cache:
+        return _free_tok_cache["n"]
+    try:
+        from app import _model_context_tokens  # noqa: PLC0415 — 순환 방지용 늦은 import
+        ctx = _model_context_tokens()
+    except Exception:  # noqa: BLE001
+        ctx = 128000
+    # 조회 단계는 발언 단계와 별개 호출이라 컨텍스트를 통째로 쓸 수 있지만, 응답·재시도
+    # 여유를 두고 절반만 쓴다. 프롬프트 나머지(페르소나·발췌)는 _FREE_PROMPT_RESERVE.
+    n = min(_FREE_TOOL_TOKENS, max(1200, int(ctx * 0.5) - _FREE_PROMPT_RESERVE))
+    _free_tok_cache["n"] = n
+    return n
 
 
 def _tool_cost(t) -> int:
@@ -1973,6 +1992,72 @@ def _trim_free_tools(g: dict, question: str, budget: int) -> dict:
     ranked = sorted(g.items(), key=lambda kv: -_score(kv[0], kv[1]))
     kept, used = {}, 0
     for name, tool in ranked:
+        c = _tool_cost(tool)
+        if kept and used + c > budget:
+            continue
+        kept[name] = tool
+        used += c
+    return kept
+
+
+# 좌석 역할 → 도구 영역. 전문가가 쓸 법한 것을 **쥐어 준다** — 77종을 늘어놓고 알아서
+# 고르라고 하면 작은 모델은 못 고르고, 큰 모델도 엉뚱한 데를 뒤진다. 사용자 제안(2026-09-13):
+# "물성·적층·열충격은 DB 와 계산기가 있으니 어떤 걸 써야 하는지 짐작이 가능하다."
+_AREA_HINT: dict = {
+    "material": "물성 재료 소재 material 수지 금속 접착 폴리이미드 구리 에폭시 도금 코팅 필름 "
+                "탄성 계수 강성 밀도 열팽창 CTE 유전 점탄성 크리프",
+    "calc":     "적층 라미네이트 laminate 복합재 composite 굽힘 좌굴 피로 fatigue 열충격 thermal "
+                "shock SED 응력 변형률 ABD 중립면 예측 계산 해석식 파손 delamination 워피지 warpage",
+    "sim":      "시뮬레이션 시뮬 해석 낙하 drop 충격 impact 잡 제출 실행 LS-DYNA dyna 솔버 solver "
+                "클러스터 slurm 모델링 케이스 러닝",
+    "result":   "결과 분석 에너지 피크 분포 후처리 판정 d3plot 이력 곡선",
+    "mesh":     "메시 mesh 요소 절점 전처리 K파일 덱 모델 구성",
+    "cad":      "형상 CAD STEP 어셈블리 파트 치수 간극 조립 기구 mech 구조",
+    "voc":      "VOC 고객 불만 클레임 시장 리뷰 품질 이슈 필드",
+    "report":   "보고서 문서 과거 사례 이력 선례 기록",
+    "knowledge": "지식 검색 사내 자료 표준 규격 논문",
+}
+# 어느 좌석에나 필요한 입구 — 없으면 모델이 식별자를 지어내 호출하다 차단된다.
+_AREA_ALWAYS = ("knowledge", "report", "system")
+
+
+def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
+    """이 좌석이 쓸 도구 — **자기 분야를 앞에** 두고 예산 안에서 남긴다.
+
+    좌석 전원에게 같은 목록을 주면 물성 전문가도 적층 전문가도 똑같은 77종을 받는다.
+    역할 문장과 영역 힌트의 낱말이 겹치는 영역을 그 좌석의 분야로 보고 그쪽을 먼저 채운다.
+    """
+    import re as _re
+    from app import _area_of  # noqa: PLC0415 — 순환 방지용 늦은 import
+
+    role = f"{persona.get('key', '')} {persona.get('role', '') or ''} {persona.get('name', '') or ''}"
+    rtok = {w.lower() for w in _re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", role)}
+    qtok = {w.lower() for w in _re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", question or "")}
+
+    def _area_score(area: str) -> int:
+        hint = {w.lower() for w in (_AREA_HINT.get(area) or "").split()}
+        if not hint:
+            return 0
+        # 좌석 역할이 더 중요하다 — 화두는 모든 좌석에 같지만 역할은 그 사람 것이다.
+        return 3 * len(rtok & hint) + len(qtok & hint)
+
+    scored = []
+    for name, tool in g.items():
+        area = _area_of(name)[0] or ""
+        s = _area_score(area) if area else 0
+        if area in _AREA_ALWAYS:
+            s += 2
+        n = name.lower()
+        # 영역이 같아도(예: calc 안의 적층 vs 열충격) 이름이 겹치면 그 좌석 것이다.
+        # 영역만 보면 적층 전문가와 열충격 전문가가 **똑같은 29종**을 받는다(실측).
+        s += 6 * sum(1 for w in rtok if len(w) > 2 and w in n.replace("_", " "))
+        if any(n.startswith(e) or e in n for e in ("search", "list", "find", "guide", "describe")):
+            s += 4                      # 입구 도구
+        scored.append((s, name, tool))
+    scored.sort(key=lambda x: -x[0])
+
+    kept, used = {}, 0
+    for _s, name, tool in scored:
         c = _tool_cost(tool)
         if kept and used + c > budget:
             continue
@@ -2592,6 +2677,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 위 무절단(CATALOG) 로드를 재사용하면 조회 한 번이 컨텍스트를 삼킨다. 유령 ID 게이트는
     # _turn_ids 가 이미 시드돼 있어 이 로드의 _prep_tool 래퍼에도 그대로 걸린다.
     g_agent = None
+    free_pool: dict = {}      # 자유 조회 후보 전체 — 좌석별로 여기서 골라 쓴다
     if opts.free_tools:
         try:
             from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
@@ -2643,19 +2729,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 174종을 통째로 바인딩하면 좌석 프롬프트가 16K 모델에서 그대로 400 이 나고,
             # 실패는 print 한 줄로만 남아 심의는 정상처럼 끝난다(실측: 7명 전원 400).
             # 큰 창에서도 좌석×라운드만큼 곱해지므로 그냥 낭비다.
-            if _g and _FREE_TOOL_TOKENS > 0:
-                # ⚠ 좌석(personas)은 **아직 발굴 전**이다 — 이 준비는 discover 단계보다 앞선다.
-                #   여기서 personas 를 쓰면 UnboundLocalError 다(실제로 냈다). 화두로만 고른다.
-                _before = len(_g)
-                _g = _trim_free_tools(_g, question, _FREE_TOOL_TOKENS)
-                if len(_g) < _before:
-                    yield _sse("status", {"step": f"자유 조회 도구 예산 — {_before}종 → {len(_g)}종"
-                                                  f"(스키마 {_FREE_TOOL_TOKENS:,}토큰 상한)",
-                                          "tool": None})
             if _g:
-                g_agent = create_react_agent(llm, list(_g.values()))
-                yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종, "
-                                              f"1인당 최대 {opts.tool_budget}회", "tool": None})
+                # ⚠ 좌석(personas)은 **아직 발굴 전**이다 — 이 준비는 discover 단계보다 앞선다.
+                #   그래서 여기서는 후보만 쥐고, **좌석별 선정은 발굴 뒤**에 한다(_tools_for_seat).
+                free_pool = _g
+                g_agent = create_react_agent(llm, list(_g.values()))   # 좌석 매칭 실패 시 폴백
+                yield _sse("status", {"step": f"전문가 자유 조회 활성 — 읽기 전용 도구 {len(_g)}종 후보"
+                                              f"(좌석마다 분야에 맞춰 추림), 1인당 최대 {opts.tool_budget}회",
+                                      "tool": None})
             else:
                 # ⚠ 조용히 넘어가면 안 된다. 자유 조회를 켜 놓고 도구가 하나도 안 붙으면 심의는
                 # **자유 조회가 원래 없던 것처럼** 끝나고, 화면은 정상 심의와 구별되지 않는다.
@@ -3133,8 +3214,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _gathered = {}
         if g_agent is not None and kind != "converge":
             _gctx = (prev_t[-4000:] if (rnd > 1 and prev_t) else base[:4000])
+            # 좌석마다 **자기 분야 도구**로 에이전트를 만든다. 전원에게 같은 목록을 주면
+            # 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은 못 고르고 큰 모델도
+            # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
+            _seat_agents, _seat_n = {}, {}
+            for p in personas:
+                _st = _tools_for_seat(free_pool, p, question, _free_tool_tokens()) if free_pool else {}
+                _seat_agents[p["key"]] = create_react_agent(llm, list(_st.values())) if _st else g_agent
+                _seat_n[p["key"]] = len(_st)
+            if _seat_n and rnd == 1:
+                yield _sse("status", {"step": "좌석별 도구 배정 — "
+                                              + " · ".join(f"{k} {n}종" for k, n in
+                                                           list(_seat_n.items())[:6]),
+                                      "tool": None})
             _gt = [asyncio.ensure_future(
-                _free_gather_one(g_agent, p, question, _gctx, opts.tool_budget)) for p in personas]
+                _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
+                                 _gctx, opts.tool_budget)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
             # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
             # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,
