@@ -2,6 +2,7 @@
 # 스텝별 추론을 담당한다. 코어 로직은 재사용 워크플로 hwax-deliberate.js 와 동형 — 오케스트레이션은
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
+import hashlib
 import json
 import math
 import os
@@ -2033,6 +2034,7 @@ def _free_result_chars(tool_budget: int) -> int:
 # 고정이라 20석이 되어도 프롬프트가 선형으로 커지지 않는다.
 _SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
 _SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
+_PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자)
 
 
 def _share_budget() -> int:
@@ -2041,26 +2043,46 @@ def _share_budget() -> int:
     return min(_SHARE_BUDGET, max(600, int(_pre_budget() * 0.15)))
 
 
-def _share_block(pool: list, exclude_key: str, budget: int) -> str:
-    """다른 좌석이 조회해 온 것 — 같은 (도구·인자)는 한 번만 싣는다.
+def _share_block(pool: list, key: str, budget: int, *,
+                 mine: bool = False, cur_round: int = 0) -> tuple[str, int, int]:
+    """공용 조회 결과 블록 → (블록, 실린 수, 빠진 수). 풀 항목은 (라운드, 좌석, 도구, 인자, 결과).
 
-    이걸 안 주면 A 가 찾은 구리 CTE 를 B 는 못 보고 기억으로 말한다. 좌석마다 따로 조회해
-    놓고 서로 못 보면, 심의가 아니라 독립된 1인 답변 여러 개다.
+    `mine=False` 는 **다른 좌석이** 조회한 것, `mine=True` 는 **내가 앞 라운드에** 조회한 것이다.
+    후자가 따로 필요한 이유 — `_gathered` 는 이번 라운드 것만 담는데 공용 블록은 자기 것을
+    빼므로, 이번에 조회를 안 한 좌석(특히 수렴 라운드는 전원)은 **자기가 DB 로 조회한 값을
+    어디서도 못 본다.** 그러면 프롬프트 지시대로 그 수치를 (경험칙) 으로 강등해 결정문에 싣는다.
+
+    ⚠ **최신부터 채운다.** 오래된 것부터 채우면 예산이 차는 순간 그 뒤 라운드의 조회는 영영
+    어느 좌석에도 안 간다(실측: 풀이 120 → 720 으로 늘어도 실리는 것은 1라운드 9줄 그대로).
+
+    ⚠ 예산에서 밀린 수를 **돌려준다.** 감추면 좌석에게는 '반박할 거리가 없다' 로 보인다.
     """
-    seen, lines, used = set(), [], 0
-    for seat, tool, args, out in pool:
-        if seat == exclude_key:
-            continue                      # 자기 것은 '당신이 직접 조회한 결과'에 이미 있다
+    # 같은 (도구·인자)를 나도 불렀으면 그건 '남의 근거' 가 아니다 — 캐시가 같은 호출을
+    # 접으므로 두 좌석이 같은 값을 받는 것이 기본 패턴이고, 그대로 두면 자기가 조회한 값이
+    # 남의 이름표를 달고 돌아와 좁은 예산 한 칸을 먹는다.
+    own_sigs = {(t, a) for _r, s, t, a, _o in pool if s == key}
+    if mine:
+        cand = [e for e in pool if e[1] == key and e[0] != cur_round]
+    else:
+        cand = [e for e in pool if e[1] != key and (e[2], e[3]) not in own_sigs]
+
+    seen, picked, used, dropped = set(), [], 0, 0
+    for rnd, seat, tool, args, out in reversed(cand):      # 최신 → 과거
         sig = (tool, args)
         if sig in seen:
             continue
         seen.add(sig)
-        line = f"- [{seat}] {tool}({args}): {out[:_SHARE_ITEM_MAX]}"
-        if lines and used + len(line) > budget:
+        # 결과의 개행을 접는다 — 한 항목이 한 줄이어야 모델이 경계를 안 헷갈리고, 세는
+        # 쪽도 항목 수를 센다(예쁘게 찍힌 JSON 한 건이 23줄로 세어지고 있었다).
+        body = " ".join(str(out).split())[:_SHARE_ITEM_MAX]
+        line = (f"- [R{rnd} {tool}] {body}" if mine
+                else f"- [R{rnd} {seat}] {tool}({args}): {body}")
+        if picked and used + len(line) + 1 > budget:
+            dropped += 1
             continue
-        lines.append(line)
-        used += len(line)
-    return "\n".join(lines)
+        picked.append(line)
+        used += len(line) + 1
+    return "\n".join(reversed(picked)), len(picked), dropped
 
 
 def _tool_cost(t) -> int:
@@ -2123,6 +2145,19 @@ _AREA_HINT: dict = {
 _AREA_ALWAYS = ("knowledge", "report", "system")
 
 
+def _name_hit(word: str, tool_name: str) -> bool:
+    """역할 낱말이 도구 이름의 **낱말**과 맞는가 — 부분문자열이 아니다.
+
+    부분문자열로 보면 키 'str-laminate' 의 'str' 이 li**st**-in**str**uments·
+    di**str**ibution·**str**ess 에 6점씩 붙어, 영역 분류가 없을 때 점수가 통째로 쓰레기가
+    된다(실측). 4자 이상일 때만 접두 일치를 허용해 material↔materials 는 살린다.
+    """
+    for x in tool_name.replace("-", "_").split("_"):
+        if word == x or (len(word) >= 4 and (x.startswith(word) or word.startswith(x))):
+            return True
+    return False
+
+
 def _seat_tool_rank(names, persona: dict, question: str) -> list[str]:
     """이 전문가가 쓸 법한 순서로 도구 **이름**을 정렬한다(개수·예산 제한은 호출부 몫).
 
@@ -2151,8 +2186,7 @@ def _seat_tool_rank(names, persona: dict, question: str) -> list[str]:
         hint = {w.lower() for w in (_AREA_HINT.get(area) or "").split()}
         # 영역이 같아도(예: calc 안의 적층 vs 열충격) 이름이 겹치면 그 좌석 것이다.
         # 영역만 보면 적층 전문가와 열충격 전문가가 **똑같은 29종**을 받는다(실측).
-        role = 3 * len(rtok & hint) + 6 * sum(1 for w in rtok
-                                              if len(w) > 2 and w in n.replace("_", " "))
+        role = 3 * len(rtok & hint) + 6 * sum(1 for w in rtok if _name_hit(w, n))
         s = role + (len(qtok & hint) if area else 0)
         if area in _AREA_ALWAYS:
             s += 2
@@ -2178,11 +2212,15 @@ def _seat_tool_prefer(names, persona: dict, question: str, n: int) -> list[str]:
     rtok = {w.lower() for w in _re.findall(r"[A-Za-z]{3,}|[가-힣]{2,}", role)}
     if not rtok:
         return []
+    # ⚠ 영역 분류를 하나도 못 받았으면 짐작을 그만둔다. _tools_map 은 실패를 print 한 줄로
+    #   삼키고 구 게이트웨이면 areas 를 빈 dict 로 덮어쓴다 — 그러면 _AREA_HINT 항이 전부
+    #   0 이 되어 점수가 이름 매칭만 남고, 상태줄은 그럴듯한 숫자로 계속 뜬다.
+    if not any(_area_of(x)[0] for x in names):
+        return []
 
     def _role_part(name: str) -> int:
         hint = {w.lower() for w in (_AREA_HINT.get(_area_of(name)[0] or "") or "").split()}
-        return 3 * len(rtok & hint) + 6 * sum(1 for w in rtok
-                                              if len(w) > 2 and w in name.lower().replace("_", " "))
+        return 3 * len(rtok & hint) + 6 * sum(1 for w in rtok if _name_hit(w, name.lower()))
 
     ranked = [x for x in _seat_tool_rank(names, persona, question) if _role_part(x) > 0]
     return ranked[:n]
@@ -2261,14 +2299,22 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
             if isinstance(body, list):
                 body = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in body)
             if mtype == "tool":
-                calls.append((getattr(m, "name", "?") or "?",
-                              json.dumps(args_by_id.get(getattr(m, "tool_call_id", None)) or {},
-                                         ensure_ascii=False, default=str)[:140],
-                              str(body)))
+                _raw = json.dumps(args_by_id.get(getattr(m, "tool_call_id", None)) or {},
+                                  ensure_ascii=False, default=str)
+                # 140자에서 자르면 차이가 141자 이후에 있는 두 호출이 **같은 서명**이 되어
+                # 공용 블록에서 뒤엣것이 조용히 사라진다(인자 많은 list_records·report_query).
+                # 잘릴 때만 짧은 지문을 붙여 서로 다른 호출임을 유지한다.
+                _ap = _raw if len(_raw) <= 140 else (
+                    _raw[:140] + "…#" + hashlib.sha1(_raw.encode()).hexdigest()[:6])
+                calls.append((getattr(m, "name", "?") or "?", _ap, str(body)))
             elif mtype == "ai" and isinstance(body, str) and body.strip():
                 summary = body.strip()
     except Exception as exc:  # noqa: BLE001 — 메시지 해석 실패가 발언을 막지 않는다
+        # ⚠ 사유를 summary 에 남긴다. 종전에는 print 만 해서 _err 가 빈 문자열이 되고,
+        #   호출부의 warning 경로를 안 타 화면이 '이 좌석은 조회할 게 없다고 판단했다' 와
+        #   픽셀 단위로 같았다(근거 0건·경고 0건·공용 풀 기여 0건).
         print(f"[deliberation] free-gather 해석 실패({persona.get('key')}): {exc!r}")
+        summary = f"(조회 도중 중단: 해석 실패 {type(exc).__name__})"
     calls = calls[:budget]
     # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
     # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
@@ -3379,7 +3425,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                                            list(_seat_n.items())[:6]),
                                       "tool": None})
             # 앞 라운드에 이미 불린 호출을 알려 준다(결과가 아니라 **호출 서명**만 — 싸다).
-            _prior = "\n".join(dict.fromkeys(f"- {t}({a})" for _s, t, a, _o in gather_pool))[:1200]
+            # ⚠ 최신부터 담고 **줄 단위로** 자른다. 앞에서부터 1,200자로 자르면 (a) 되풀이를
+            #   막고 싶은 최근 호출이 잘려 나가고 (b) 마지막 줄이 JSON 한가운데서 끊긴 조각으로
+            #   들어간다. 실측 평균 줄 길이 64자라 18건이면 이미 잘리기 시작한다.
+            _sigs = list(dict.fromkeys(f"- {t}({a})" for _r, _s, t, a, _o in gather_pool))
+            _keep, _plen = [], 0
+            for _ln in reversed(_sigs):
+                if _keep and _plen + len(_ln) + 1 > _PRIOR_BUDGET:
+                    break
+                _keep.append(_ln)
+                _plen += len(_ln) + 1
+            _prior = "\n".join(reversed(_keep))
+            if len(_sigs) > len(_keep):
+                _prior += f"\n(… 그 앞 {len(_sigs) - len(_keep)}건 생략 — 오래된 순)"
             _gt = [asyncio.ensure_future(
                 _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
                                  _gctx, opts.tool_budget, _prior)) for p in personas]
@@ -3392,7 +3450,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 for _fut in asyncio.as_completed(_gt):
                     try:
                         _k, _calls, _blk, _err = await _fut
-                    except Exception:  # noqa: BLE001
+                    except Exception as _fe:  # noqa: BLE001
+                        # 조용히 continue 하면 그 좌석의 조회가 통째로 사라지고, 결과가 공용
+                        # 풀에도 안 들어가 **나머지 좌석의 근거에서도** 사라진다. 공유를 넣은
+                        # 뒤로 이 삼킴의 영향 반경이 1석에서 전석으로 넓어졌다.
+                        print(f"[deliberation] free-gather 태스크 실패: {_fe!r}")
+                        yield _sse("warning", {"code": "free_gather_failed",
+                                               "message": f"좌석 하나의 자유 조회가 실패했습니다 — "
+                                                          f"{type(_fe).__name__}"})
                         continue
                     if _err:
                         # 조용히 넘기면 '좌석이 조회할 게 없다고 판단' 과 구별되지 않는다.
@@ -3408,7 +3473,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                          included=True)
                             # 공용 풀 — 이 값을 다른 좌석도 본다. 안 넣으면 A 가 조회한 수치를
                             # B 는 못 보고 기억으로 말한다(근거 패널에는 떠 있는데 좌석엔 없다).
-                            gather_pool.append((_k, _tn, _ap, _out))
+                            # ⚠ 원문이 아니라 **쓸 만큼만** 담는다. 결과 1건 상한은 컨텍스트에서
+                            #   유도돼 128K 에서 11,679자·1M 에서 151,200자까지 가는데, 공용
+                            #   블록은 어차피 _SHARE_ITEM_MAX 까지만 쓴다. 원문을 담으면 20석
+                            #   6라운드 심의 하나가 17MB~218MB 를 심의 내내 붙잡는다.
+                            gather_pool.append((rnd, _k, _tn, _ap, _out[:_SHARE_ITEM_MAX * 2]))
                     _gathered[_k] = _blk
             finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
                 for _t in _gt:
@@ -3422,18 +3491,30 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
         # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
         _kn = knowledge_by_key if kind != "converge" else {}
-        # 공용 조회 결과 — 다른 좌석이 찾아 온 값. 수렴 라운드에도 준다(정리하려면 수치가 있어야
-        # 한다). 좌석마다 자기 것을 뺀 목록이라 같은 내용이 두 번 실리지 않는다.
-        _share = ({p["key"]: _share_block(gather_pool, p["key"], _share_budget()) for p in personas}
-                  if gather_pool else {})
-        if _share and any(_share.values()):
-            _n_share = len({(t, a) for _s, t, a, _o in gather_pool})
-            yield _sse("status", {"step": f"공용 근거 {_n_share}건을 좌석 전원이 함께 본다 "
-                                          f"(1인당 최대 {_share_budget():,}자)", "tool": None})
-        if any(_kn.values()) or any(_gathered.values()) or any(_share.values()):
+        # 공용 조회 결과 — 다른 좌석이 찾아 온 값과 **내가 앞 라운드에** 찾아 온 값.
+        # 수렴 라운드에도 준다(정리하려면 수치가 있어야 한다). 수렴 라운드는 _gathered 가
+        # 구조적으로 비므로, 앞 라운드 자기 조회를 안 주면 전 좌석이 자기가 DB 로 뽑은 값을
+        # 잃고 (경험칙) 으로 강등해 결정문에 싣는다.
+        _share, _mine, _drop, _shown = {}, {}, 0, 0
+        for p in personas if gather_pool else ():
+            _b, _n, _d = _share_block(gather_pool, p["key"], _share_budget())
+            _share[p["key"]] = _b
+            _drop = max(_drop, _d)
+            _shown = max(_shown, _n)
+            _mb, _mn, _md = _share_block(gather_pool, p["key"], _share_budget(),
+                                         mine=True, cur_round=rnd)
+            _mine[p["key"]] = _mb
+        if any(_share.values()) or any(_mine.values()):
+            # ⚠ 풀 크기도, 블록의 줄 수도 아니고 **_share_block 이 센 항목 수**를 말한다.
+            #   풀을 세면 300건 조회에 "300건 전달" 이 되고, 줄을 세면 예쁘게 찍힌 JSON
+            #   한 건이 23건으로 세어진다(실측으로 둘 다 겪었다).
+            yield _sse("status", {"step": f"공용 근거 — 좌석당 최대 {_shown}건 전달"
+                                          + (f" · 예산 밖 {_drop}건 생략" if _drop else "")
+                                          + f" (1인당 {_share_budget():,}자)", "tool": None})
+        if any(_kn.values()) or any(_gathered.values()) or any(_share.values()) or any(_mine.values()):
             _base_fn = prompt_fn
 
-            def prompt_fn(p, _f=_base_fn, _kn=_kn, _g=_gathered, _sh=_share):
+            def prompt_fn(p, _f=_base_fn, _kn=_kn, _g=_gathered, _sh=_share, _mn=_mine, _dr=_drop):
                 out = _f(p)
                 kb = _kn.get(p["key"]) or ""
                 if kb:
@@ -3443,11 +3524,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if blk:
                     out += ("\n\n[당신이 직접 조회한 결과 — 발언에 인용하세요. 여기·공용 근거에 "
                             "없는 수치는 (경험칙) 표기]\n" + blk)
+                mnb = _mn.get(p["key"]) or ""
+                if mnb:
+                    out += ("\n\n[당신이 앞 라운드에 조회한 결과 — 당신 근거입니다. 이 수치는 "
+                            "(경험칙) 이 아니라 조회 기록입니다]\n" + mnb)
                 shb = _sh.get(p["key"]) or ""
                 if shb:
                     out += ("\n\n[다른 전문가가 조회한 결과 — 공용 근거다. 당신 주장에 그대로 "
                             "인용해도 되고, 값이 당신 판단과 어긋나면 그 점을 반박에 쓰세요. "
-                            "누가 조회했는지는 [좌석키]로 표시돼 있습니다]\n" + shb)
+                            "누가 조회했는지는 [R라운드 좌석키]로 표시돼 있습니다]\n" + shb
+                            + (f"\n(예산상 {_dr}건은 여기 싣지 못했습니다 — 없다는 뜻이 아닙니다)"
+                               if _dr else ""))
                 return out
 
         cur = []

@@ -1110,6 +1110,13 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
 
     core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
+        # 캡이 없거나 안 걸리면 **아무것도 떨어뜨리지 않는다.** 다만 순서는 바꾼다 —
+        # 전문가 도구를 465종 한가운데 묻어 두면 모델이 못 찾고, 상태줄이 "우선" 이라고
+        # 말한 것이 거짓이 된다. 운영(cae00)은 원격 GLM 이라 update-all 이 TOOL_MAX=0 을
+        # 박으므로, 여기를 안 고치면 이 기능은 **운영에서 100% 무효**다(실측).
+        if prefer:
+            _r = {n: i for i, n in enumerate(prefer)}
+            return sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
         return tools
     pin = set(pinned or []) | set(first or [])
     top = set(first or [])
@@ -1546,9 +1553,12 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     캐시 키에 포함한다(무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 반영).
     ⚠ prefer 를 키에서 빼면 전문가를 바꿔도 앞 전문가로 만든 에이전트가 재사용돼 **조용히**
     무시된다 — 소스 토글에서 이미 같은 사고가 났다(아래 주석)."""
-    pin_key = ((tuple(sorted(pinned or [])), tuple(sorted(first or [])), core_names,
-                tuple(prefer or []))
-               if ((pinned or first or prefer or core_names is not None) and TOOL_MAX > 0) else ())
+    # ⚠ prefer 는 TOOL_MAX 와 **무관하게** 키에 들어가야 한다. 캡이 없어도 바인딩 **순서**를
+    #   바꾸기 때문이다(운영 cae00 이 정확히 TOOL_MAX=0 이다). 조건에 TOOL_MAX>0 을 걸면
+    #   전문가를 바꿔도 앞 전문가 순서로 만든 에이전트가 재사용된다.
+    pin_key = ((tuple(sorted(pinned or [])), tuple(sorted(first or [])), core_names)
+               if ((pinned or first or core_names is not None) and TOOL_MAX > 0) else ())
+    pin_key = (pin_key, tuple(prefer or [])) if prefer else pin_key
     # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
     # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
@@ -1978,13 +1988,18 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
     # note 는 '역할이 비었다' 의 **사유**다. 비어 있으면 '역할 문서가 원래 없다', 차 있으면
     # '못 물어봤다' — 그 둘은 다른 사실이고, 호출부가 사용자에게 갈라서 말해야 한다
     # (지식카드 경로가 이미 _persona_knowledge.last_note 로 같은 일을 한다).
-    meta: dict = {"role": "", "operator": False, "apps": [], "key_tools": [], "note": ""}
+    # key·name 도 담는다. 도구 점수(_seat_tool_rank)가 역할뿐 아니라 **키와 이름**의 낱말을
+    # 쓰는데, 챗은 이 둘을 안 넘겨 심의와 다른 순위가 나오고 있었다 — 같은 기준을 쓴다는
+    # 주장이 실제로는 절반만 참이었다(실측: pcb_warpage_surrogate 가 챗에서만 빠졌다).
+    meta: dict = {"key": agent_type, "name": "", "role": "",
+                  "operator": False, "apps": [], "key_tools": [], "note": ""}
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 역할 원문을 JSON 으로 읽는다
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
         sd = _first_dict(sess.get("data", sess))
         # ⚠ _role_doc 으로 허브 사용 안내를 떼고 싣는다. 원문을 그대로 주면 실측 69%가
         #   다른 클라이언트용 안내문이고, 그 안내가 포털 챗에서는 틀린 지시다.
+        meta["name"] = str(sd.get("name") or "")[:120]
         meta["role"] = (_role_doc(str(sd.get("system_prompt") or ""))
                         or str(sd.get("description") or ""))[:PERSONA_ROLE_MAX]
         rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}
@@ -2325,8 +2340,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 말투·판단 기준까지만 갔다. 심의 좌석과 같은 기준(_seat_tool_rank)을 쓴다.
         # 사용자가 콕 집은 것(pinned)·앱 핀보다는 **뒤**다(_select_tools 의 3순위).
         prefer: list[str] = []
-        if persona and not (req.pinned_tools or req.pinned_apps):
-            _names = list(_tools_map())
+        if persona and not (req.pinned_tools or req.pinned_apps or apps):
+            # ⚠ 캐시 미스면 동기 urlopen(5초)이라 이벤트 루프를 막는다. 종전엔 앱 핀 턴만
+            #   탔는데 이제 전문가를 앉힌 **모든 턴**이 타므로 스레드로 뺀다(같은 함수의
+            #   임베딩 호출이 이미 같은 이유로 to_thread 다).
+            _names = list(await asyncio.to_thread(_tools_map))
             if _names:
                 prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
         if prefer:

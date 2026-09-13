@@ -24,9 +24,14 @@ PLAIN_SESSION = {"agent_type": "rel-drop-impact", "name": "낙하 전문가", "d
                  "system_prompt": "낙하 전문가 역할", "response_config": {}}
 
 
-def _prime_tools_map(monkeypatch, mapping):
+def _prime_tools_map(monkeypatch, mapping, areas=None):
     monkeypatch.setitem(a._TOOLS_MAP_CACHE, "at", time.time())
     monkeypatch.setitem(a._TOOLS_MAP_CACHE, "map", mapping)
+    # 영역도 같은 응답에 온다 — 안 채우면 _seat_tool_prefer 가 '분류 없음' 으로 보고 빈
+    # 목록을 주는데, 실제 게이트웨이는 areas 를 함께 준다.
+    monkeypatch.setitem(a._TOOLS_MAP_CACHE, "areas",
+                        areas if areas is not None else {n: "sim" for n in mapping})
+    monkeypatch.setitem(a._TOOLS_MAP_CACHE, "area_meta", {"sim": {"area": "sim", "label": "해석"}})
 
 
 def _stub_session(monkeypatch, sessions, calls=None):
@@ -213,8 +218,9 @@ def test_일반_전문가는_종전대로_지식카드를_조회한다(monkeypat
     assert "agent_search" in sink["messages"][0][1]
     assert sink["pinned"] == [] and sink["first"] == []
     assert sink["core"] is None, "일반 전문가는 종전 핵심 예약 그대로"
-    # 낙하 전문가의 역할은 이 맵(열충격 도구)과 안 걸린다 → 짐작이 안 되므로 순위를 안 바꾼다.
-    assert sink["prefer"] == [], "짐작이 안 되는데 순위를 바꾸면 질문 어휘로 고른 도구를 밀어낸다"
+    # 낙하 전문가 + 해석(sim) 영역 도구 → 분야 도구가 붙는다.
+    assert sink["prefer"], "도메인 전문가를 골랐는데 분야 도구가 하나도 안 붙었다"
+    assert len(sink["prefer"]) <= a._PERSONA_PREFER_N
 
 
 def test_전문가_역할이_도구와_걸리면_분야_도구가_붙는다(monkeypatch):
@@ -372,3 +378,64 @@ def test_역할이_있으면_경고하지_않는다(monkeypatch):
                       "apps": [], "key_tools": []})
     assert "persona_load_failed" not in out and "persona_role_empty" not in out
     assert "휨 해석 전문가다" in sink["messages"][0][1]
+
+
+# ── 캡이 없어도 전문가 도구가 앞에 선다(운영 cae00 은 TOOL_MAX=0) ──────────────
+def test_캡이_없어도_전문가_도구가_앞에_선다(monkeypatch):
+    """update-all.sh 가 원격 GLM 을 보면 TOOL_MAX=0 을 박는다. 조기 반환하면 이 기능이
+    운영에서 100% 무효인데 상태줄은 '우선 바인딩' 이라고 말한다."""
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    tools = [_tool("zzz"), _tool("list_materials"), _tool("aaa")]
+    kept = [t.name for t in a._select_tools(tools, "물성", prefer=["list_materials"])]
+    assert kept[0] == "list_materials"
+    assert len(kept) == 3, "캡이 없으면 아무것도 떨어뜨리지 않는다"
+
+
+def test_캡이_안_걸려도_마찬가지다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 200)
+    tools = [_tool("zzz"), _tool("list_materials")]
+    assert [t.name for t in a._select_tools(tools, "물성",
+                                            prefer=["list_materials"])][0] == "list_materials"
+
+
+def test_분야_도구가_없으면_순서를_안_건드린다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    tools = [_tool("zzz"), _tool("aaa")]
+    assert [t.name for t in a._select_tools(tools, "물성")] == ["zzz", "aaa"]
+
+
+def test_캡이_없어도_prefer_가_캐시_키에_들어간다(monkeypatch):
+    """빠지면 전문가를 바꿔도 앞 전문가 순서로 만든 에이전트가 재사용된다(조용히)."""
+    import inspect
+    src = inspect.getsource(a._agent_for)
+    assert "pin_key = (pin_key, tuple(prefer or [])) if prefer else pin_key" in src
+
+
+# ── 챗과 심의가 정말 같은 순위를 낸다 ────────────────────────────────────────
+def test_챗_페르소나에도_키와_이름이_있다(monkeypatch):
+    """_seat_tool_rank 는 역할뿐 아니라 키·이름의 낱말도 쓴다. 챗이 안 넘기면 '같은 기준' 은
+    절반만 참이고, 그 페르소나에 가장 맞는 도구가 조용히 빠진다."""
+    _stub_session(monkeypatch, {"rel-drop-impact": PLAIN_SESSION})
+    m = asyncio.run(a._persona_meta(NS(state=NS()), [], "rel-drop-impact"))
+    assert m["key"] == "rel-drop-impact"
+    assert m["name"] == "낙하 전문가"
+    names = ["drop_impact_calc", "list_materials", "zzz"]
+    assert d._seat_tool_rank(names, m, "낙하") == d._seat_tool_rank(
+        names, {"key": m["key"], "name": m["name"], "role": m["role"]}, "낙하")
+
+
+# ── 영역 분류를 못 받으면 짐작을 그만둔다 ────────────────────────────────────
+def test_영역_분류가_없으면_분야_도구를_안_준다(monkeypatch):
+    """_tools_map 은 실패를 print 한 줄로 삼키고 구 게이트웨이면 areas 를 빈 dict 로
+    덮어쓴다. 그러면 점수가 이름 매칭만 남아 쓰레기가 되는데 상태줄은 계속 뜬다."""
+    _prime_tools_map(monkeypatch, TS_MAP, areas={})
+    assert d._seat_tool_prefer(list(TS_MAP), {"key": "rel-drop-impact",
+                                              "role": "낙하 충격 전문가"}, "낙하", 12) == []
+
+
+def test_세글자_역할어가_엉뚱한_도구에_안_걸린다(monkeypatch):
+    """'str-laminate' 의 str 이 instruments·distribution·stress 에 6점씩 붙던 자리다."""
+    assert not d._name_hit("str", "list_instruments")
+    assert not d._name_hit("str", "chart_country_distribution")
+    assert d._name_hit("pcb", "pcb_warpage_surrogate"), "낱말로 맞으면 3자라도 붙는다"
+    assert d._name_hit("material", "list_materials"), "4자 이상은 접두 일치를 살린다"
