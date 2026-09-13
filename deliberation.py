@@ -1741,6 +1741,40 @@ KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 120.0)
 KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 
 
+# 카드의 인과 검증 상태 → 모델에게 보일 꼬리표. validated 는 안 붙인다(기본이라 소음이 된다).
+_CAUSAL_NOTE = {
+    "unknown": "⚠미검증 관측(인과 불명) — 단독 근거 금지",
+    "hypothesized": "가설",
+}
+
+
+def knowledge_line(h) -> str:
+    """agent_search hit 한 건 → 한 줄. 챗·심의·띵킹이 **같은 함수**를 쓴다.
+
+    실측 형태(2026-08-05): {record_id, section_id, title, section_title, snippet, score,
+    tags, causal_status, …} — 본문은 snippet 에 있다.
+
+    ⚠ `record_id` 와 `causal_status` 를 반드시 싣는다. 시스템 프롬프트는 "출처(record_id)를
+    함께 적으세요" 를, 페르소나 역할 문서 첫머리는 "causal_status: unknown 카드를 어떤
+    결론의 단독 근거로 쓰지 마라" 를 지시하는데 종전에는 **둘 다 떼고 줬다.** 지시는 있고
+    재료가 없으면 모델은 지킬 수가 없다 — 제목으로 얼버무리거나 그럴듯한 ID 를 지어내고,
+    미검증 관측이 검증된 사실과 똑같은 모습으로 결론에 들어간다.
+    """
+    if not isinstance(h, dict):
+        return str(h)[:300]
+    title = h.get("title") or ""
+    sec = h.get("section_title") or ""
+    body = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
+    head = title + (f" › {sec}" if sec else "")
+    if not (head or body):
+        return json.dumps(h, ensure_ascii=False, default=str)[:300]
+    rid = str(h.get("record_id") or h.get("id") or "")[:60]
+    sid = str(h.get("section_id") or "")[:40]
+    src = f" (출처: {rid}{f' §{sid}' if sid else ''})" if rid else ""
+    cz = _CAUSAL_NOTE.get(str(h.get("causal_status") or "").strip().lower(), "")
+    return f"• [{head}]{src}{f' [{cz}]' if cz else ''} {str(body).strip()}"[:700]
+
+
 async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
                              mode: str = "hybrid",
                              timeout_s: float | None = None) -> tuple[list, str]:
@@ -3065,18 +3099,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if _env_int("DELIB_PERSONA_KNOWLEDGE", 1) and "agent_search" in tools:
         _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
 
-        def _hit_line(h):
-            # agent_search hit 실측 형태(2026-08-05): {record_id, section_id, title,
-            # section_title, snippet, score, tags, …} — 본문은 snippet 에 있다.
-            if not isinstance(h, dict):
-                return str(h)[:300]
-            t = h.get("title") or ""
-            sec = h.get("section_title") or ""
-            x = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
-            head = f"{t}" + (f" › {sec}" if sec else "")
-            if not (head or x):
-                return json.dumps(h, ensure_ascii=False, default=str)[:300]
-            return f"• [{head}] {str(x).strip()}"[:700]
+        _hit_line = knowledge_line      # 챗과 같은 포맷 — 출처·인과상태가 함께 간다
 
         async def _kn_one(p):
             # 타임아웃·강등은 _agent_search_hits 가 판정한다. 여기서 조용히 0건으로 만들면

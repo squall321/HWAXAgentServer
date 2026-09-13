@@ -53,6 +53,7 @@ from deliberation import (
     _agent_search_hits,
     _tool_schema_brief,
     _seat_tool_prefer,
+    knowledge_line,
     _env_float,
     _env_int,
     _first_dict,
@@ -1974,18 +1975,25 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
     hit = cache.get(agent_type)
     if hit and time.time() - hit[0] < PERSONA_TTL_S:
         return hit[1]
-    meta: dict = {"role": "", "operator": False, "apps": [], "key_tools": []}
+    # note 는 '역할이 비었다' 의 **사유**다. 비어 있으면 '역할 문서가 원래 없다', 차 있으면
+    # '못 물어봤다' — 그 둘은 다른 사실이고, 호출부가 사용자에게 갈라서 말해야 한다
+    # (지식카드 경로가 이미 _persona_knowledge.last_note 로 같은 일을 한다).
+    meta: dict = {"role": "", "operator": False, "apps": [], "key_tools": [], "note": ""}
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 역할 원문을 JSON 으로 읽는다
         sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": agent_type})))
         sd = _first_dict(sess.get("data", sess))
-        meta["role"] = str(sd.get("system_prompt") or sd.get("description") or "")[:PERSONA_ROLE_MAX]
+        # ⚠ _role_doc 으로 허브 사용 안내를 떼고 싣는다. 원문을 그대로 주면 실측 69%가
+        #   다른 클라이언트용 안내문이고, 그 안내가 포털 챗에서는 틀린 지시다.
+        meta["role"] = (_role_doc(str(sd.get("system_prompt") or ""))
+                        or str(sd.get("description") or ""))[:PERSONA_ROLE_MAX]
         rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}
         if rc.get("persona_kind") == "mcp_operator":
             meta["operator"] = True
             meta["apps"] = [a.strip()[:80] for a in (rc.get("mcp_apps") or []) if isinstance(a, str) and a.strip()][:3]
             meta["key_tools"] = [n.strip()[:80] for n in (rc.get("key_tools") or []) if isinstance(n, str) and n.strip()][:12]
-    except Exception as exc:  # noqa: BLE001 — 실패 시 페르소나 없이 일반 챗
+    except Exception as exc:  # noqa: BLE001 — 실패 시 페르소나 없이 일반 챗(단, 조용히는 아니다)
+        meta["note"] = f"{type(exc).__name__}: {str(exc)[:120]}"
         print(f"[agent] persona load failed for {agent_type}: {exc!r}")
     if meta["role"]:
         cache[agent_type] = (time.time(), meta)
@@ -2014,18 +2022,9 @@ async def _knowledge_tools(app: FastAPI, groups: list[str]) -> dict:
     return tools
 
 
-def _knowledge_line(h) -> str:
-    """agent_search hit 한 건 → 한 줄. 실측 형태(2026-08-05)는
-    {record_id, section_id, title, section_title, snippet, score, tags, …} 로 본문은 snippet 에 있다."""
-    if not isinstance(h, dict):
-        return str(h)[:300]
-    title = h.get("title") or ""
-    sec = h.get("section_title") or ""
-    body = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
-    head = title + (f" › {sec}" if sec else "")
-    if not (head or body):
-        return json.dumps(h, ensure_ascii=False, default=str)[:300]
-    return f"• [{head}] {str(body).strip()}"[:700]
+# 지식카드 한 줄 포맷은 deliberation 의 것을 그대로 쓴다 — 챗·심의가 따로 만들면
+# 한쪽만 필드를 빠뜨린다(실제로 record_id·causal_status 를 둘 다 빠뜨리고 있었다).
+_knowledge_line = knowledge_line
 
 
 async def _persona_knowledge(app: FastAPI, groups: list[str], agent_type: str, query: str) -> str:
@@ -2405,6 +2404,24 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 sys_prompt += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
                                f"아래 역할과 범위를 지켜 그 전문가로서 답하라.\n{role}\n"
                                f"이 전문가 도메인의 데이터 조회는 agent_search(\"{agent_key}\", 질문) 를 우선 사용하라.")
+            else:
+                # 역할이 비면 종전에는 **조용히** 건너뛰었다. 사용자는 전문가를 골라 놓고
+                # 일반 답을 받으면서 그 사실을 모른다 — 바로 아래 지식카드 경로가 이미
+                # '없다' 와 '못 물어봤다' 를 갈라 말하는데 정작 역할은 안 그러고 있었다.
+                _pnote = persona.get("note") or ""
+                if _pnote:
+                    sys_prompt += (f"\n\n[전문가 페르소나]\n'{agent_key}' 의 역할 문서를 불러오지 "
+                                   f"못했다. 일반 지식으로 답하되 '이 전문가의 역할 문서를 "
+                                   f"불러오지 못했다'고 먼저 밝혀라.")
+                    yield _sse("warning", {"code": "persona_load_failed",
+                                           "message": f"{agent_key} 역할 문서를 불러오지 못했습니다 — "
+                                                      f"{_pnote}. 이번 답변은 그 전문가로서가 아닙니다."})
+                    yield _sse("status", {"step": f"역할 문서 조회 실패 — {_pnote}", "tool": None})
+                else:
+                    yield _sse("warning", {"code": "persona_role_empty",
+                                           "message": f"{agent_key} 에 등록된 역할 문서가 비어 있습니다 "
+                                                      f"— 전문가 말투·범위가 적용되지 않습니다."})
+                    yield _sse("status", {"step": f"{agent_key} 역할 문서 없음", "tool": None})
             # 그 전문가의 지식카드를 코드가 미리 조회해 붙인다. 위 지시만으로는 모델이 안 부르면
             # 그만이고, 사용자에겐 '이 전문가는 아는 게 없다'로만 보인다. 질의는 도구 선별과 같은
             # _sel_q(최근 히스토리 + 현재 발화) 를 쓴다 — 현재 발화만 넣으면 '그럼 더 자세히' 같은
@@ -3584,15 +3601,28 @@ class AgentDetailRequest(BaseModel):
 # AIDataHub 가 역할 원문 뒤에 붙이는 공용 도구 안내(build_system_prompt 의 '## How to access this hub'
 # 블록) — 모든 전문가에게 같은 영문 안내라 사람이 읽을 역할이 아니다. 역할 원문이 없는 에이전트는
 # 'You are an assistant for "…"' 자동 틀을 받는데, 그것도 역할 문서가 아니다.
-_HUB_GUIDE_SEP = "\n\n---\n\n## How to access this hub"
+_HUB_GUIDE_RE = re.compile(r"\n#{1,4}\s*How to access this hub", re.I)
 
 
 def _role_doc(system_prompt: str) -> str:
+    """역할 원문에서 **이 클라이언트와 무관한 허브 사용 안내**를 떼어 낸다.
+
+    AIDataHub 가 붙이는 '## How to access this hub' 이하는 MCP 클라이언트용이다.
+    실측(sim-pcb-warpage, 2026-09-13): 원문 4,100자 중 2,840자(**69%**)가 그 안내였고
+    내용도 포털 챗에서는 틀리거나 해롭다 — "do NOT use WebFetch"(여기엔 없는 도구),
+    "curl -s http://127.0.0.1:8001/…"(내부 주소를 프롬프트에 흘린다),
+    "get_agent_session 을 FIRST 로 불러라"(서버가 이미 불렀다. 한 번 더 시킨다).
+
+    구분자는 정규식으로 찾는다 — 정확한 문자열 하나에 기대면 허브가 머리말을 조금만 바꿔도
+    **조용히** 안 잘리고 원문이 통째로 들어간다.
+    """
     sp = system_prompt or ""
     if sp.startswith('You are an assistant for "'):
-        return ""
-    i = sp.find(_HUB_GUIDE_SEP)
-    return (sp[:i] if i >= 0 else sp).strip()
+        return ""          # 자동 생성 플레이스홀더 — 역할이 아니다
+    m = _HUB_GUIDE_RE.search(sp)
+    if m:
+        sp = sp[:m.start()]
+    return sp.rstrip().removesuffix("---").strip()
 
 
 @app.post("/catalog/agent")

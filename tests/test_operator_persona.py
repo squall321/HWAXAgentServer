@@ -319,3 +319,56 @@ def test_물성_전문가는_물성_도구를_받는다(monkeypatch):
     names = ["get_guide", "describe_template", "list_materials", "get_material_properties"]
     got = d._seat_tool_prefer(names, {"key": "mat-cu", "role": "구리 물성 담당"}, "구리", 12)
     assert got and all("material" in g for g in got), f"물성 전문가가 받은 것: {got}"
+
+
+# ── 역할 주입 실패를 사용자에게 말한다(during-F1) ─────────────────────────────
+def _stream_with_persona(monkeypatch, meta):
+    sink: dict = {}
+    _prime_tools_map(monkeypatch, TS_MAP)
+
+    async def fake_meta(*_a, **_k):
+        return meta
+
+    async def fake_agent_for(app, groups, pinned=None, query="", sources=None, user="", user_pat="",
+                             first=None, core_names=None, prefer=None):
+        return _FakeAgent(sink)
+
+    async def fake_knowledge(*_a, **_k):
+        return ""
+
+    monkeypatch.setattr(a, "_persona_meta", fake_meta)
+    monkeypatch.setattr(a, "_agent_for", fake_agent_for)
+    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
+    a._persona_knowledge.last_note = ""
+    fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
+    req = a.ChatRequest(message="휨 봐줘", groups=[], pinned_agent="sim-pcb-warpage")
+
+    async def consume():
+        return [c async for c in a._agent_stream(fake_app, req)]
+
+    return sink, b"".join(asyncio.run(consume())).decode("utf-8")
+
+
+def test_역할을_못_불러오면_사용자에게_말한다(monkeypatch):
+    """전문가를 골라 놓고 일반 답을 받는데 화면에 아무 표시가 없으면 사용자는 모른다."""
+    sink, out = _stream_with_persona(
+        monkeypatch, {"role": "", "note": "RuntimeError: gateway down",
+                      "operator": False, "apps": [], "key_tools": []})
+    assert "persona_load_failed" in out
+    assert "gateway down" in out
+    assert "불러오지 못했다" in sink["messages"][0][1], "모델에게도 알려야 전문가인 척하지 않는다"
+
+
+def test_역할이_비어_있으면_다르게_말한다(monkeypatch):
+    """'못 물어봤다' 와 '원래 없다' 는 다른 사실이다 — 지식카드 경로와 같은 원칙."""
+    _sink, out = _stream_with_persona(
+        monkeypatch, {"role": "", "note": "", "operator": False, "apps": [], "key_tools": []})
+    assert "persona_role_empty" in out and "persona_load_failed" not in out
+
+
+def test_역할이_있으면_경고하지_않는다(monkeypatch):
+    sink, out = _stream_with_persona(
+        monkeypatch, {"role": "휨 해석 전문가다", "note": "", "operator": False,
+                      "apps": [], "key_tools": []})
+    assert "persona_load_failed" not in out and "persona_role_empty" not in out
+    assert "휨 해석 전문가다" in sink["messages"][0][1]
