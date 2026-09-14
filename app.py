@@ -476,6 +476,11 @@ def _detach_stream(gen, label: str):
 # 32000 도 부족했다: recommend_agents(top_k=40) 한 번이 53KB 다(실측). prod 는 GLM(대형 컨텍스트)
 # 이므로 기본을 120000(≈35K 토큰)까지 올린다 — 소형 모델 박스만 .env 로 낮춘다.
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "200000"))
+
+# 도구 호출이 **실패했다**는 기계 표지. 예외는 _cap_tool 이 문자열로 바꿔 돌려주므로
+# (그래야 LLM 이 스키마를 보고 교정한다) 스트림에서는 성공과 구분이 안 됐다. 이 표지가
+# 그 판단을 실어 나른다 — 절차 원장의 `ok` 가 여기서 나온다(PLAN §9-9 ③).
+_TOOL_FAIL_MARK = "\u2716"   # ✖ — 사람 눈에도 보이고 기계도 찾는다
 # 결정적 카탈로그 조회(recommend_agents·list_agents·get_agent_session·list_records)는 LLM 프롬프트가
 # 아니라 **코드가 JSON 으로 파싱**한다. 여기에 프롬프트 보호용 절단을 걸면 JSON 이 중간에서 끊겨
 # 파싱이 조용히 실패하고 "추천 0명"·"풀 9명" 같은 빈 결과가 나온다(실측 원인). 사실상 무제한으로 둔다.
@@ -855,7 +860,11 @@ def _cap_tool(tool, result_max=None):
                 "validation error", "field required", "missing required arg", "unexpected keyword",
                 "invalid arguments", "입력 스키마 위반", "type_error", "value_error"))
             hint = _arg_hint() if _is_argerr else ""
-            msg = f"도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
+            # ⚠ 이 자리가 **성패를 삼키던 곳**이다. 예외를 잡아 문자열로 돌려주므로
+            # LangGraph 는 정상 반환으로 보고, 스트림은 실패한 호출을 성공한 호출과
+            # 구분할 수 없었다 — 이 리포가 반복해서 만나는 모양이다. 판단은 이미 위에서
+            # 내리고 있으니(_is_transport·_is_argerr) **버리지만 않으면** 된다.
+            msg = f"{_TOOL_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
             if hint:
                 msg += f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{hint}"
             elif _is_transport:
@@ -1952,7 +1961,12 @@ def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> st
 
 
 def _tool_preview(v, n: int = 220) -> str:
-    """활동 패널 드릴다운용 도구 입출력 요약 — 안전 문자열화 + 공백 압축 + 절단."""
+    """도구 입출력 요약 — 안전 문자열화 + 공백 압축 + **표식 붙인** 절단.
+
+    ⚠ 표식 없이 자르면 **다른 호출이 같은 서명이 된다.** n 자 뒤에서만 갈리는 두 호출은
+    잘린 문자열이 똑같아져, 활동 목록에서 뒤엣것이 조용히 사라진다. 심의 쪽은 이미
+    `…#sha1[:6]` 로 이 문제를 풀어 뒀다(deliberation.py:2356) — 여기도 같게 맞춘다.
+    """
     try:
         if v is None:
             return ""
@@ -1961,7 +1975,9 @@ def _tool_preview(v, n: int = 220) -> str:
             v = content
         s = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else str(v)
         s = re.sub(r"\s+", " ", s).strip()
-        return s[:n]
+        if len(s) <= n:
+            return s
+        return s[:n] + "…#" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:6]
     except Exception:  # noqa: BLE001 — 미리보기 실패가 스트림을 죽이면 안 됨
         return ""
 
@@ -2604,7 +2620,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                           "tool": event.get("name")})
                 args = _tool_preview(event.get("data", {}).get("input"))
                 turn_calls.append((str(event.get("name") or "?"), args or ""))
+                # `run_id` 는 **같은 호출의 시작·완료에 같은 값**으로 온다. 이게 없어서
+                # 인자와 결과를 짝지을 수 없었고, 화면은 도구 **이름**으로 묶어 같은 도구
+                # N번 호출이 한 줄로 합쳐졌다(§5-5 predict_sed 다섯 번).
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
+                                      **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"detail": args} if args else {})})
             elif kind == "on_tool_end":
                 # 도구 출력에 실린 아티팩트 URL 수집 — contextvar 는 LangGraph 실행 컨텍스트를
@@ -2630,7 +2650,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 #   덮어썼다가 다음 토큰의 full.append 가 AttributeError 로 챗을 죽였다(감사 C35).
                 _hand = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
                 _post_tool_chars = 0   # 이 결과 뒤에 모델이 말을 했는지만 본다
+                _ok = not (isinstance(_txt, str)
+                           and (_TOOL_FAIL_MARK in _txt or _PHANTOM_ID_MARK in _txt))
                 yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
+                                      "ok": _ok,
+                                      **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"result_preview": out} if out else {}),
                                       **({"result_full": _hand} if len(_hand) > len(out) else {})})
     except Exception as exc:
@@ -2785,14 +2809,22 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 text = (text + _close).strip()
                 yield _sse("token", {"delta": _close})
             else:
+                # 직접 실행 경로에도 같은 계약을 준다 — 짝 지을 키(call)·성패(ok)·표식 절단.
+                # 여기만 빠지면 "핀 도구로 돌린 것" 은 절차로 못 편다.
+                _cid = f"direct-{_tn}-{len(text)}"
                 yield _sse("status", {"step": f"도구 직접 실행: {_tn}", "tool": _tn,
-                                      "detail": json.dumps(_argd, ensure_ascii=False)[:200]})
+                                      "call": _cid,
+                                      "detail": _tool_preview(_argd, 200)})
+                _ok = True
                 try:
                     _out = await _call(_tmap, _tn, _argd)
                 except Exception as exc:  # noqa: BLE001
-                    _out = f"(tool {_tn} error: {exc})"
+                    _ok = False
+                    _out = f"{_TOOL_FAIL_MARK} (tool {_tn} error: {exc})"
                 _out = _cap(str(_out))
-                yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn})
+                yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn,
+                                      "call": _cid, "ok": _ok,
+                                      "result_preview": _tool_preview(_out)})
                 try:
                     _final = (await _llm_text(
                         app.state.llm,

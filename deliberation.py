@@ -1722,6 +1722,16 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
 
 # 유령 ID 게이트(app._cap_tool)가 '실행하지 않았다'는 뜻으로 돌려주는 표지. 챗과 심의 양쪽에서
 # 판정에 쓰이므로 하위 모듈인 여기에 두고 app 이 import 한다(app→deliberation 단방향 유지).
+def _delib_preview(v, n: int = 140) -> str:
+    """표식 붙인 절단 — 표식 없이 자르면 n 자 뒤에서만 갈리는 두 호출이 **같은 서명**이 되어
+    공용 블록에서 뒤엣것이 조용히 사라진다(2356행 주석이 적어 둔 그 사고)."""
+    import hashlib as _h
+    import json as _j
+
+    s = v if isinstance(v, str) else _j.dumps(v, ensure_ascii=False, default=str)
+    return s if len(s) <= n else s[:n] + "…#" + _h.sha1(s.encode("utf-8")).hexdigest()[:6]
+
+
 _PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 
 
@@ -2360,7 +2370,11 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
                 # 잘릴 때만 짧은 지문을 붙여 서로 다른 호출임을 유지한다.
                 _ap = _raw if len(_raw) <= 140 else (
                     _raw[:140] + "…#" + hashlib.sha1(_raw.encode()).hexdigest()[:6])
-                calls.append((getattr(m, "name", "?") or "?", _ap, str(body)))
+                # ⚠ 짝은 **여기서는 맞다**(tool_call_id 로 조인했다). 잃는 것은 방출부다 —
+                # 인자는 status 로, 결과는 evidence 로 갈라져 나가 다시 못 붙었다.
+                # id 를 함께 싣고 두 이벤트에 같이 태운다(PLAN §9-9 ②).
+                calls.append((getattr(m, "name", "?") or "?", _ap, str(body),
+                              str(getattr(m, "tool_call_id", None) or "")))
             elif mtype == "ai" and isinstance(body, str) and body.strip():
                 summary = body.strip()
     except Exception as exc:  # noqa: BLE001 — 메시지 해석 실패가 발언을 막지 않는다
@@ -3093,7 +3107,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if not isinstance(_argd, dict) or _argd.get("skip"):
                     break
                 yield _sse("status", {"step": f"지정 도구 호출: {_tn}", "tool": _tn,
-                                      "detail": json.dumps(_argd, ensure_ascii=False)[:200]})
+                                      "detail": _delib_preview(_argd, 200)})
                 _out = await _call(tools, _tn, _argd)
                 if not isinstance(_out, str):
                     _out = json.dumps(_out, ensure_ascii=False, default=str) if _out is not None else ""
@@ -3519,12 +3533,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                                "message": f"{_k} 자유 조회 실패 — {_err}"})
                         yield _delib("evidence", source=f"{_k} · 자유 조회 실패",
                                      text=_err, included=False)
-                    for _tn, _ap, _out in _calls:
-                        yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn, "detail": _ap})
-                        if _delib_tool_result_ok(_out) and _out.strip() not in ("[]", "{}", "null", ""):
+                    for _tn, _ap, _out, _cid in _calls:
+                        _ok = _delib_tool_result_ok(_out)
+                        yield _sse("status", {"step": f"{_k} 조회: {_tn}", "tool": _tn,
+                                              "detail": _ap, "ok": _ok,
+                                              **({"call": _cid} if _cid else {})})
+                        if _ok and _out.strip() not in ("[]", "{}", "null", ""):
                             ev_count["tool"] += 1
                             yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:_FREE_EVID_SHOW],
-                                         included=True)
+                                         included=True, tool=_tn, args=_ap,
+                                         **({"call": _cid} if _cid else {}))
                             # 공용 풀 — 이 값을 다른 좌석도 본다. 안 넣으면 A 가 조회한 수치를
                             # B 는 못 보고 기억으로 말한다(근거 패널에는 떠 있는데 좌석엔 없다).
                             # ⚠ 원문이 아니라 **쓸 만큼만** 담는다. 결과 1건 상한은 컨텍스트에서
