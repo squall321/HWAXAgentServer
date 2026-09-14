@@ -2618,14 +2618,21 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     # 같은 도구·같은 인자 반복 — 더 해도 결과가 달라지지 않는다.
                     yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
                                           "tool": event.get("name")})
-                args = _tool_preview(event.get("data", {}).get("input"))
+                _in = event.get("data", {}).get("input")
+                args = _tool_preview(_in)
+                # 절차 도출용 날것 — 220자 미리보기로 만든 절차는 **인자가 손상돼 있다**
+                # (적층 정의·시나리오 같은 큰 인자는 통째로 잘린다). 결과에 result_full 을
+                # 두는 것과 같은 이유이고 같은 상한을 쓴다. 표시용보다 길 때만 싣는다.
+                _args_full = _tool_preview(_in, HANDOFF_RESULT_CHARS)
                 turn_calls.append((str(event.get("name") or "?"), args or ""))
                 # `run_id` 는 **같은 호출의 시작·완료에 같은 값**으로 온다. 이게 없어서
                 # 인자와 결과를 짝지을 수 없었고, 화면은 도구 **이름**으로 묶어 같은 도구
                 # N번 호출이 한 줄로 합쳐졌다(§5-5 predict_sed 다섯 번).
                 yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
-                                      **({"detail": args} if args else {})})
+                                      **({"detail": args} if args else {}),
+                                      **({"detail_full": _args_full}
+                                         if len(_args_full) > len(args) else {})})
             elif kind == "on_tool_end":
                 # 도구 출력에 실린 아티팩트 URL 수집 — contextvar 는 LangGraph 실행 컨텍스트를
                 # 넘지 못해(실측 빈 값) 스트림 쪽에서 직접 회수한다.
