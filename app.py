@@ -1960,6 +1960,25 @@ def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> st
             + "\n\n".join(parts))
 
 
+def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
+    """`invoke_tool(name=…, arguments=…)` 는 **경유**다 — 기록에는 안쪽 도구가 남아야 한다.
+
+    이 허브의 안내가 "목록에 없는 도구는 invoke_tool 로 부르라" 이므로 실제 챗 호출의
+    상당수가 이 경유를 탄다. 그런데 기록에는 `invoke_tool` 만 남아서 —
+      · 절차 도출이 `invoke_tool` 단계만 늘어놓고
+      · 어느 앱인지 못 찾아 **전부 결손**이 되고
+      · 같은 도구를 몇 번 불렀는지도 안 보인다.
+    경유 사실은 `via` 로 남기고 `tool` 은 안쪽 이름으로 바꾼다.
+    """
+    if name != "invoke_tool" or not isinstance(inp, dict):
+        return name, None
+    inner = inp.get("name")
+    if not isinstance(inner, str) or not inner:
+        return name, None
+    args = inp.get("arguments")
+    return inner, (args if isinstance(args, dict) else {})
+
+
 def _tool_preview(v, n: int = 220) -> str:
     """도구 입출력 요약 — 안전 문자열화 + 공백 압축 + **표식 붙인** 절단.
 
@@ -2619,16 +2638,21 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
                                           "tool": event.get("name")})
                 _in = event.get("data", {}).get("input")
+                # 경유 껍데기를 벗긴다 — 안 벗기면 기록이 전부 `invoke_tool` 이 된다
+                _tname, _inner_args = _inner_tool(str(event.get("name") or ""), _in)
+                if _inner_args is not None:
+                    _in = _inner_args
                 args = _tool_preview(_in)
                 # 절차 도출용 날것 — 220자 미리보기로 만든 절차는 **인자가 손상돼 있다**
                 # (적층 정의·시나리오 같은 큰 인자는 통째로 잘린다). 결과에 result_full 을
                 # 두는 것과 같은 이유이고 같은 상한을 쓴다. 표시용보다 길 때만 싣는다.
                 _args_full = _tool_preview(_in, HANDOFF_RESULT_CHARS)
-                turn_calls.append((str(event.get("name") or "?"), args or ""))
+                turn_calls.append((_tname or "?", args or ""))
                 # `run_id` 는 **같은 호출의 시작·완료에 같은 값**으로 온다. 이게 없어서
                 # 인자와 결과를 짝지을 수 없었고, 화면은 도구 **이름**으로 묶어 같은 도구
                 # N번 호출이 한 줄로 합쳐졌다(§5-5 predict_sed 다섯 번).
-                yield _sse("status", {"step": f"도구 호출: {event['name']}", "tool": event["name"],
+                yield _sse("status", {"step": f"도구 호출: {_tname}", "tool": _tname,
+                                      **({"via": "invoke_tool"} if _inner_args is not None else {}),
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"detail": args} if args else {}),
                                       **({"detail_full": _args_full}
@@ -2659,7 +2683,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 _post_tool_chars = 0   # 이 결과 뒤에 모델이 말을 했는지만 본다
                 _ok = not (isinstance(_txt, str)
                            and (_TOOL_FAIL_MARK in _txt or _PHANTOM_ID_MARK in _txt))
-                yield _sse("status", {"step": f"도구 완료: {event['name']}", "tool": event["name"],
+                # 짝이 맞으려면 완료도 **같은 이름**이어야 한다 — 한쪽만 안쪽 이름이면
+                # 화면과 원장이 두 줄로 갈라진다.
+                _tname2, _iv = _inner_tool(str(event.get("name") or ""),
+                                           (event.get("data") or {}).get("input"))
+                yield _sse("status", {"step": f"도구 완료: {_tname2}", "tool": _tname2,
+                                      **({"via": "invoke_tool"} if _iv is not None else {}),
                                       "ok": _ok,
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"result_preview": out} if out else {}),

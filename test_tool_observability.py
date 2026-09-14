@@ -12,14 +12,17 @@ import deliberation as D
 
 
 # ── ① 짝 — 인자와 결과를 잇는 키 ─────────────────────────────────────────
+def _block(src: str, head: str, n: int = 520) -> str:
+    i = src.index(head)
+    return src[i:i + n]
+
+
 def test_도구_이벤트에_호출_식별자가_실린다():
     """`run_id` 는 같은 호출의 시작·완료에 같은 값으로 온다. 안 실으면 짝을 못 짓는다."""
     src = open("app.py", encoding="utf-8").read()
-    start = src.index('"step": f"도구 호출: {event[\'name\']}"')
-    end = src.index('"step": f"도구 완료: {event[\'name\']}"')
-    for name, at in (("시작", start), ("완료", end)):
-        blk = src[at:at + 420]
-        assert '"call": str(event["run_id"])' in blk, f"{name} 이벤트에 call 이 없다"
+    for name, head in (("시작", '"step": f"도구 호출: {_tname}"'),
+                       ("완료", '"step": f"도구 완료: {_tname2}"')):
+        assert '"call": str(event["run_id"])' in _block(src, head), f"{name} 이벤트에 call 이 없다"
 
 
 def test_같은_도구_두_번_호출이_서로_다른_줄로_남는다():
@@ -34,8 +37,7 @@ def test_같은_도구_두_번_호출이_서로_다른_줄로_남는다():
 def test_실패_표지가_있고_완료_이벤트가_성패를_싣는다():
     src = open("app.py", encoding="utf-8").read()
     assert "_TOOL_FAIL_MARK" in src
-    blk = src[src.index('"step": f"도구 완료: {event[\'name\']}"') - 300:]
-    assert '"ok": _ok' in blk[:600], "완료 이벤트에 ok 가 없다"
+    assert '"ok": _ok' in _block(src, '"step": f"도구 완료: {_tname2}"'), "완료 이벤트에 ok 가 없다"
 
 
 def test_도구_예외는_표지를_달고_돌아온다():
@@ -93,3 +95,29 @@ def test_evidence_가_인자_없이_나가지_않는다():
     src = open("deliberation.py", encoding="utf-8").read()
     j = src.index('_delib("evidence", source=f"{_k} · {_tn}"')
     assert "args=_ap" in src[j:j + 260]
+
+
+# ── 경유(invoke_tool)는 벗긴다 ───────────────────────────────────────────
+def test_경유를_벗겨_안쪽_도구_이름으로_기록한다():
+    """이 허브의 안내가 "목록에 없는 도구는 invoke_tool 로 부르라" 라서 실제 호출의 상당수가
+    경유를 탄다. 안 벗기면 기록이 전부 `invoke_tool` 이 되고 —
+      · 절차 도출이 `invoke_tool` 단계만 늘어놓고
+      · 어느 앱인지 못 찾아 **전부 결손**이 된다.
+    """
+    name, args = A._inner_tool("invoke_tool",
+                               {"name": "predict_sed", "arguments": {"ap_cx": 50.1}})
+    assert name == "predict_sed" and args == {"ap_cx": 50.1}
+
+
+def test_경유가_아니면_그대로_둔다():
+    assert A._inner_tool("search_voc", {"keyword": "발열"}) == ("search_voc", None)
+    # 안쪽 이름이 없으면 벗길 수 없다 — 지어내지 않는다
+    assert A._inner_tool("invoke_tool", {"arguments": {}}) == ("invoke_tool", None)
+    assert A._inner_tool("invoke_tool", "문자열") == ("invoke_tool", None)
+
+
+def test_시작과_완료가_같은_이름을_쓴다():
+    """한쪽만 안쪽 이름이면 화면과 원장이 두 줄로 갈라진다."""
+    src = open("app.py", encoding="utf-8").read()
+    assert '"tool": _tname,' in src and '"tool": _tname2,' in src
+    assert '"via": "invoke_tool"' in src, "경유했다는 사실이 안 남는다"
