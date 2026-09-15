@@ -56,6 +56,10 @@ def test_본문이_실패라고_말하는_것도_실패다():
         assert A._result_ok(txt) is False, obj
         assert D._delib_tool_result_ok(txt) is False, obj
 
+    # 완화(`valid`·`ok:true` 면 errors 는 산출물)는 **복수에만** — 단수 error 는 오류 채널이다
+    for obj in ({"valid": True, "error": "백엔드 불통"}, {"ok": True, "error": "timeout"}):
+        assert A._result_ok(json.dumps(obj, ensure_ascii=False)) is False, obj
+
     goods = [{"ok": True, "rows": [1, 2]}, {"ok": True, "errors": []},
              {"exit_code": 0, "stdout": "{}"}, {"status": "warning", "data": 1}]
     for obj in goods:

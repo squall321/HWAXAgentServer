@@ -1934,14 +1934,14 @@ def envelope_failed(s) -> bool:
     # `{"valid": false, "errors":[…]}`, isError=false). 그걸 실패로 적으면 화면에 빨간
     # '실패' 배지가 붙고 절차 원장에서 그 단계가 빠진다 — 도구는 제대로 일했는데.
     # **성공을 명시한 신호가 있으면** errors 로 실패를 단정하지 않는다(6차 감사).
+    # ⚠ **완화는 `errors`(복수)에만.** `error`(단수)는 관례상 오류 채널이라 덮으면
+    # `{"valid": true, "error": "백엔드 불통"}` 이 성공이 된다.
+    # 형도 포털과 맞춘다 — 맨 참으로 보면 `errors: 12`(개수)를 실패로 센다.
     verdict_shape = "valid" in v or v.get("ok") is True
-    if not verdict_shape:
-        # 형도 포털과 맞춘다 — 맨 참으로 보면 `errors: 12`(개수)·`errors: {…}`(집계)를
-        # 실패로 센다. 같은 본문을 두 리포가 다르게 판정하면 그게 W-77 이 고친 문제다.
-        if isinstance(v.get("error"), (str, dict)) and v.get("error"):
-            return True
-        if isinstance(v.get("errors"), list) and v.get("errors"):
-            return True
+    if isinstance(v.get("error"), (str, dict)) and v.get("error"):
+        return True
+    if not verdict_shape and isinstance(v.get("errors"), list) and v.get("errors"):
+        return True
     code = v.get("exit_code")
     return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
@@ -2170,7 +2170,13 @@ def _share_block(pool: list, key: str, budget: int, *,
         seen.add(sig)
         # 결과의 개행을 접는다 — 한 항목이 한 줄이어야 모델이 경계를 안 헷갈리고, 세는
         # 쪽도 항목 수를 센다(예쁘게 찍힌 JSON 한 건이 23줄로 세어지고 있었다).
-        body = " ".join(str(out).split())[:_SHARE_ITEM_MAX]
+        # ⚠ **잘렸으면 표식을 붙인다.** 이 파일의 다른 절단들은 전부 `…` 를 달고 있는데
+        # 여기만 없었다. 조회한 좌석은 원문을 보고 **나머지 좌석은 꼬리 수치를 못 보는데**,
+        # 잘린 줄 모르면 "그 값은 조회에 없었다" 로 읽는다 — 근거가 있는데 없다고 말하는
+        # 쪽이라 가장 나쁜 모양이다(7차 감사).
+        _flat = " ".join(str(out).split())
+        body = _flat if len(_flat) <= _SHARE_ITEM_MAX else (
+            _flat[:_SHARE_ITEM_MAX] + f"… (앞 {_SHARE_ITEM_MAX}자만 · 전체 {len(_flat)}자)")
         line = (f"- [R{rnd} {tool}] {body}" if mine
                 else f"- [R{rnd} {seat}] {tool}({args}): {body}")
         if picked and used + len(line) + 1 > budget:
@@ -2372,7 +2378,7 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
              + (f"[이미 조회된 것 — 결과는 공용 근거로 받게 된다. 같은 호출을 되풀이하지 말고 "
                 f"보완할 각도를 조회하라]\n{prior}\n\n" if prior else "")
              + f"당신 발언에 필요한 조회를 지금 수행하라.")
-    calls, summary = [], ""
+    calls, summary, interrupted = [], "", ""
     msgs: list = []
     try:
         # ⚠ ainvoke 로 받으면 **중간에 터질 때 앞서 받은 도구 결과까지 통째로 사라진다.**
@@ -2390,7 +2396,12 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         if not msgs:
             return persona["key"], [], "", f"{type(exc).__name__}: {str(exc)[:120]}"
         # 여기까지 받은 것은 쓴다 — 사유는 남겨 화면에 '일부만' 임을 알린다.
-        summary = f"(조회 도중 중단: {type(exc).__name__})"
+        # ⚠ **중단 사실을 `summary` 에만 두면 안 된다.** 아래 해석 루프가 AI 메시지를
+        # 만나면 `summary` 를 덮어쓴다 — 모델이 머리말 한 줄만 냈어도 중단 표식이 사라지고,
+        # `_err` 가 빈 문자열이 되어 호출부의 경고 경로를 안 탄다. 그러면 화면이
+        # '이 좌석은 조회할 게 없다고 판단했다' 와 픽셀 단위로 같아진다(7차 감사).
+        interrupted = f"(조회 도중 중단: {type(exc).__name__})"
+        summary = interrupted
     try:
         args_by_id = {}
         for m in msgs:
@@ -2420,7 +2431,8 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         #   호출부의 warning 경로를 안 타 화면이 '이 좌석은 조회할 게 없다고 판단했다' 와
         #   픽셀 단위로 같았다(근거 0건·경고 0건·공용 풀 기여 0건).
         print(f"[deliberation] free-gather 해석 실패({persona.get('key')}): {exc!r}")
-        summary = f"(조회 도중 중단: 해석 실패 {type(exc).__name__})"
+        interrupted = f"(조회 도중 중단: 해석 실패 {type(exc).__name__})"
+        summary = interrupted
     calls = calls[:budget]
     # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
     # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
@@ -2431,7 +2443,8 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     # 받아 `continue` 로 넘어간다. 그러면 **도구를 부른 좌석만** 근거 0건이 되고,
     # 아무것도 안 부른 좌석은 멀쩡해서 화면상 "조회할 게 없었나 보다" 로 보인다.
     good = [(n, ap, b) for n, ap, b, _cid in calls if _has_content(b)]
-    _err = summary if summary.startswith("(조회 도중 중단") else ""
+    # 중단은 **따로 들고 있던 값**으로 판정한다 — `summary` 는 덮일 수 있다.
+    _err = interrupted or (summary if summary.startswith("(조회 도중 중단") else "")
     if not good:
         return persona["key"], calls, "", _err
     block = "\n".join(f"- {n}({ap}): {b[:900]}" for n, ap, b in good)[:3500]
@@ -3530,9 +3543,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _seat_agents[p["key"]] = create_react_agent(llm, list(_st.values())) if _st else g_agent
                 _seat_n[p["key"]] = len(_st)
             if _seat_n and rnd == 1:
+                # ⚠ **영역 분류를 못 받았으면 그렇다고 말한다.** `_tools_map` 은 실패를
+                # 한 줄로 삼키고 구 게이트웨이면 areas 가 빈 dict 다 — 그러면 좌석 배정이
+                # 이름 매칭만 남아 좌석끼리 거의 같아지는데(실측 겹침 0.018→0.818),
+                # 상태줄은 "cad-assy 49종" 처럼 **그럴듯한 숫자**를 그대로 낸다.
+                # 챗 쪽 `_seat_tool_prefer` 에는 이 가드가 있는데 여기만 없었다(7차 감사).
+                from app import _area_of  # noqa: PLC0415 — 순환 방지용 늦은 import
+
+                _no_area = free_pool and not any(_area_of(x)[0] for x in free_pool)
                 yield _sse("status", {"step": "좌석별 도구 배정 — "
                                               + " · ".join(f"{k} {n}종" for k, n in
-                                                           list(_seat_n.items())[:6]),
+                                                           list(_seat_n.items())[:6])
+                                              + (" ⚠ 영역 분류를 못 받아 **이름 매칭만**으로 "
+                                                 "나눴다 — 좌석별 차이가 거의 없다"
+                                                 if _no_area else ""),
                                       "tool": None})
             # 앞 라운드에 이미 불린 호출을 알려 준다(결과가 아니라 **호출 서명**만 — 싸다).
             # ⚠ 최신부터 담고 **줄 단위로** 자른다. 앞에서부터 1,200자로 자르면 (a) 되풀이를

@@ -73,3 +73,37 @@ def test_여러_번_부르면_예산까지만_남는다():
     _key, calls, block, _err = _run(msgs, budget=2)
     assert len(calls) == 2, calls
     assert block.count("\n- ") + 1 == 2, block
+
+
+class _Dies:
+    """중간까지 흘리고 터지는 가짜 — 클라이언트 끊김·컨텍스트 초과가 이 모양이다."""
+
+    def __init__(self, msgs):
+        self._msgs = msgs
+
+    async def astream(self, _inp, config=None, stream_mode=None):
+        yield {"messages": self._msgs}
+        raise RuntimeError("컨텍스트 초과")
+
+
+def test_중단은_AI_머리말이_있어도_보고된다():
+    """중단 표식을 `summary` 에만 두면 **해석 루프가 AI 메시지로 덮어쓴다** — 모델이
+    머리말 한 줄만 냈어도 표식이 사라지고 경고 경로를 안 탄다. 그러면 화면이
+    '이 좌석은 조회할 게 없다고 판단했다' 와 픽셀 단위로 같아진다(7차 감사)."""
+    # ① AI 머리말이 **있는** 경우 — 여기가 덮이던 자리다
+    msgs = [_Msg("ai", "먼저 재료를 찾아보겠습니다."),
+            _Msg("ai", "", tool_calls=[{"id": "c1", "args": {}}]),
+            _Msg("tool", '{"v": 1}', tool_call_id="c1")]
+    _k, _calls, _blk, err = asyncio.run(
+        d._free_gather_one(_Dies(msgs), PERSONA, "질문", "맥락", 3))
+    assert err and "중단" in err, f"중단이 보고되지 않았다: {err!r}"
+
+    # ② 머리말이 **없는** 경우도 그대로 — 원래 되던 것을 깨지 않았는지
+    _k2, _c2, _b2, err2 = asyncio.run(
+        d._free_gather_one(_Dies([_Msg("tool", '{"v": 1}', tool_call_id="c1")]),
+                           PERSONA, "질문", "맥락", 3))
+    assert err2 and "중단" in err2
+
+    # ③ 정상 완주는 사유가 비어 있어야 한다 — 아무 때나 경고하면 경고가 소음이 된다
+    _k3, _c3, _b3, err3 = _run([_Msg("ai", "조회 요약: 끝")])
+    assert err3 == ""
