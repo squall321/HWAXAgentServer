@@ -50,6 +50,7 @@ from evidence import (fit_document, sig_numbers as _sig_numbers,
 from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
+    envelope_failed,
     _call,
     _agent_search_hits,
     _tool_schema_brief,
@@ -1990,9 +1991,14 @@ def _result_ok(txt) -> bool:
     if not isinstance(txt, str):
         return True          # 성패를 말해 주는 문자열이 아니다 — 실패로 몰지 않는다
     head = txt.lstrip()[:400]
-    return not (head.startswith(_TOOL_FAIL_MARK)
-                or head.startswith("(tool ")
-                or _PHANTOM_ID_MARK in head)
+    if (head.startswith(_TOOL_FAIL_MARK) or head.startswith("(tool ")
+            or _PHANTOM_ID_MARK in head):
+        return False
+    # ⚠ **본문이 실패라고 말하는 것도 본다.** 표식만 보면 `isError=false` 로 오는 실패를
+    # 전부 성공으로 적는다 — 실호출로 확인했다(`{"status":"error",…}`·`{"error":"…"}`).
+    # 같은 리포의 심의 판정기는 그걸 잡고 있었다. 판정기가 갈라져 있던 것이지
+    # 좁게 두기로 한 것이 아니다(2026-09-15 5차 감사).
+    return not envelope_failed(txt)
 
 
 def _t0_remember(cid: str) -> None:

@@ -34,3 +34,36 @@ def test_문자열이_아니면_실패로_몰지_않는다():
     """성패를 말해 주는 문자열이 아닌 것과, 실패라고 말한 것은 다르다."""
     for v in ({"rows": []}, [1, 2], None, 0):
         assert A._result_ok(v) is True, v
+
+
+# ── 5차 감사 — 한 리포에 판정기가 둘인데 답이 달랐다 ──────────────────────
+def test_본문이_실패라고_말하는_것도_실패다():
+    """`isError=false` 로 오는 실패를 표식만 보고 전부 성공으로 적었다. 아래 둘은
+    **실호출로 확인된 실물 본문**이다 — 챗 판정기는 성공, 심의 판정기는 실패로 봤다.
+    챗 쪽이 성공으로 보면 화면에 '실패' 배지가 안 붙고(실패가 성공과 똑같이 보인다),
+    절차 원장에도 성공으로 적혀 **검증된 단계인 양** 굳는다."""
+    import json
+
+    import deliberation as D
+
+    fails = [{"status": "error", "data": None, "errors": [{"code": "E101"}]},
+             {"status": "error", "data": None, "errors": []},      # errors 가 비어도 실패다
+             {"error": "not_visible", "message": "볼 수 없는 id 입니다"},
+             {"refused": True, "reason": "근거 점수가 임계 밑"},     # 허브 관례
+             {"exit_code": 2, "stderr": "죽었다"}]
+    for obj in fails:
+        txt = json.dumps(obj, ensure_ascii=False)
+        assert A._result_ok(txt) is False, obj
+        assert D._delib_tool_result_ok(txt) is False, obj
+
+    goods = [{"ok": True, "rows": [1, 2]}, {"ok": True, "errors": []},
+             {"exit_code": 0, "stdout": "{}"}, {"status": "warning", "data": 1}]
+    for obj in goods:
+        txt = json.dumps(obj, ensure_ascii=False)
+        assert A._result_ok(txt) is True, obj
+
+
+def test_평문_결과는_그대로_성공이다():
+    """봉투 검사가 넓어졌다고 JSON 이 아닌 결과까지 실패로 몰면 안 된다."""
+    for txt in ("그냥 결과 문자열", "", "규칙 점검\nR1: ✔\nR2: ✖", "[1,2,3]"):
+        assert A._result_ok(txt) is True, txt

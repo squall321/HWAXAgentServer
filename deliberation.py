@@ -1899,13 +1899,39 @@ def _delib_tool_result_ok(s: str) -> bool:
         return False
     if head.lower().startswith("error:") or head.startswith("오류:"):
         return False
+    return not envelope_failed(s)
+
+
+def envelope_failed(s) -> bool:
+    """`isError=false` 로 왔는데 **본문이 실패라고 말하는** 모양인가.
+
+    ⚠ **판정이 한 곳에 있어야 한다.** 이 리포에 판정기가 둘(`_result_ok`·
+    `_delib_tool_result_ok`)이고 포털에 또 하나(`judge._envelope_fail`)인데, 셋이 서로
+    다른 부분집합을 보고 있었다. 실호출로 확인된 어긋남 —
+      · `{"status":"error","data":null,"errors":[…]}`(analyze_laminate 실패)
+      · `{"error":"not_visible","message":"볼 수 없는 id 입니다"}`(risk_get_coverage)
+      둘 다 챗 판정기는 **성공**으로, 심의 판정기는 실패로 봤다. 챗 쪽이 성공으로 보면
+      화면의 '실패' 배지가 안 붙고(실패한 호출이 성공과 똑같이 보인다), 절차 원장에도
+      성공으로 적혀 **검증된 단계인 양** 굳는다.
+    포털 `judge._envelope_fail` 과 같은 목록을 본다 — `status`·`ok`·`refused`·`error`·
+    `errors`·`exit_code`.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return False          # 성패를 말해 주는 본문이 아니다 — 실패로 몰지 않는다
     try:
         v = json.loads(s)
-        if isinstance(v, dict) and (v.get("ok") is False or v.get("errors") or v.get("error")):
-            return False
     except (ValueError, TypeError):
-        pass  # JSON 아님 — 텍스트 결과는 위 검사 통과로 충분
-    return True
+        return False          # JSON 아님 — 텍스트는 호출부의 문구 검사가 본다
+    if not isinstance(v, dict):
+        return False
+    if str(v.get("status") or "").lower() in ("error", "failed", "failure"):
+        return True
+    if v.get("ok") is False or v.get("refused") is True:
+        return True
+    if v.get("error") or v.get("errors"):
+        return True
+    code = v.get("exit_code")
+    return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
 
 def _tool_schema_brief(t) -> str:
