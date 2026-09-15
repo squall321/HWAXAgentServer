@@ -36,6 +36,7 @@ import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 �
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -1961,8 +1962,20 @@ def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> st
 
 
 # 호출별 시작 시각 — 소요(ms)를 재려면 시작을 기억해야 한다. 짝 키(run_id)로 담는다.
-# 완료에서 꺼내 쓰고 지운다. 짝이 안 오면(중단·예외) 그 항목만 남는데, 턴 단위로 짧다.
-_t0_by_call: dict[str, float] = {}
+# 완료에서 꺼내 쓰고 지운다.
+#
+# ⚠ **모듈 전역이라 동시 스트림이 공유한다.** 키가 LangGraph run_id(UUID)라 섞이지는
+# 않지만, **짝이 안 오는 시작**(클라이언트 중단·예외·게이트 차단)은 영영 남는다.
+# 서버가 몇 주 떠 있으면 그만큼 샌다 — 상한을 두고 오래된 것부터 버린다.
+# (버려진 항목은 소요만 못 재고 기록 자체는 남는다 — `ms` 가 빠질 뿐이다.)
+_T0_MAX = 512
+_t0_by_call: "OrderedDict[str, float]" = OrderedDict()
+
+
+def _t0_remember(cid: str) -> None:
+    _t0_by_call[cid] = time.monotonic()
+    while len(_t0_by_call) > _T0_MAX:
+        _t0_by_call.popitem(last=False)   # 가장 오래된 것부터
 
 
 def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
@@ -2646,7 +2659,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 소요는 **시작을 기억해야** 잴 수 있다. 짝 키로 기억한다 — 같은 도구를
                 # N번 부르면 이름으로는 못 잰다(§5-5 가 그 기계다).
                 if event.get("run_id"):
-                    _t0_by_call[str(event["run_id"])] = time.monotonic()
+                    _t0_remember(str(event["run_id"]))
                 # 경유 껍데기를 벗긴다 — 안 벗기면 기록이 전부 `invoke_tool` 이 된다
                 _tname, _inner_args = _inner_tool(str(event.get("name") or ""), _in)
                 if _inner_args is not None:
