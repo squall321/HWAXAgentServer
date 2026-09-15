@@ -2001,7 +2001,7 @@ def _t0_remember(cid: str) -> None:
         _t0_by_call.popitem(last=False)   # 가장 오래된 것부터
 
 
-def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
+def _inner_tool(name: str, inp) -> tuple[str, dict | str | None]:
     """`invoke_tool(name=…, arguments=…)` 는 **경유**다 — 기록에는 안쪽 도구가 남아야 한다.
 
     이 허브의 안내가 "목록에 없는 도구는 invoke_tool 로 부르라" 이므로 실제 챗 호출의
@@ -2019,21 +2019,25 @@ def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
     args = inp.get("arguments")
     if isinstance(args, dict):
         return inner, args
-    # ⚠ **`{}` 로 뭉개지 않는다.** 모델은 `arguments` 를 JSON **문자열**로 곧잘 보낸다.
-    # 그때 빈 dict 를 돌려주면 호출부가 진짜 입력을 그것으로 갈아 끼워 기록이
-    # `"{}"` 가 된다 — 절차 초안은 **인자 없는 단계**를 만들고, `detail_full`(날것을
-    # 싣는 칸)의 존재 이유가 사라진다. 풀 수 있으면 풀고, 못 풀면 원래 입력을 둔다.
-    # `None` 은 이 함수에서 이미 **"경유가 아니다"** 라는 뜻이다(위 두 이른 반환).
-    # 여기서 재사용하면 `via: invoke_tool` 표시까지 사라진다 — 대신 **바깥 입력 그대로**를
-    # 돌려준다. 문자열 인자는 거기 들어 있으니 기록이 비지 않는다.
-    if isinstance(args, str) and args.strip():
+    # **인자가 없다** — 이 허브가 권하는 정상 모양이다(`invoke_tool(name="list_materials")`).
+    # 여기서 바깥 dict 를 돌려주면 `name` 이 **그 도구의 인자인 양** 기록돼, 저장 검증이
+    # "스키마에 없는 인자 — name" 으로 사람이 넣은 적 없는 것을 거절한다.
+    if args is None or (isinstance(args, str) and not args.strip()):
+        return inner, {}
+    # 모델은 `arguments` 를 JSON **문자열**로 곧잘 보낸다. 풀리면 그것이 진짜 인자다.
+    if isinstance(args, str):
         try:
             got = json.loads(args)
         except ValueError:
-            return inner, inp
+            got = None
         if isinstance(got, dict):
             return inner, got
-    return inner, inp
+    # 인자가 **있긴 한데 우리가 못 읽는** 모양이다(깨진 JSON·배열·스칼라).
+    # `{}` 로 뭉개면 '인자 없음' 과 같아지고, 바깥 dict 를 돌려주면 `name` 을 지어낸다.
+    # 원문을 그대로 돌려준다 — 기록에는 남고, 초안은 이것을 `args_not_structured`
+    # 결손으로 잡는다(`derive.draft`). 모르는 것을 아는 척하지 않는다.
+    return inner, args if isinstance(args, str) else json.dumps(args, ensure_ascii=False,
+                                                                default=str)
 
 
 def _tool_preview(v, n: int = 220) -> str:

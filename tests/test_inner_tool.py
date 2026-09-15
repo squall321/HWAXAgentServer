@@ -25,12 +25,30 @@ def test_인자가_JSON_문자열이어도_푼다():
     assert args == {"laminate": {"plies": 4}}, args
 
 
-def test_못_풀면_바깥_입력을_그대로_둔다():
-    """`{}` 로 뭉개면 기록이 빈다. 못 푸는 것과 비어 있는 것은 다르다."""
-    inp = {"name": "x", "arguments": "이건 JSON 이 아니다"}
-    name, args = A._inner_tool("invoke_tool", inp)
-    assert name == "x" and args == inp, args
+def test_인자가_없으면_빈_것으로_둔다():
+    """이 허브가 권하는 정상 모양이다 — `invoke_tool(name="list_materials")`.
+
+    ⚠ 한때 여기서 **바깥 dict 를 통째로** 돌려줬다. 그러면 `name` 이 그 도구의 인자인 양
+    기록돼, 저장 검증이 "스키마에 없는 인자 — name" 으로 **사람이 넣은 적 없는 것**을
+    거절한다. 스키마가 자유 object 인 도구면 재생 때 실제로 전송된다.
+    """
+    for inp in ({"name": "list_materials"},
+                {"name": "x", "arguments": None},
+                {"name": "x", "arguments": "   "}):
+        name, args = A._inner_tool("invoke_tool", inp)
+        assert args == {}, (inp, args)
+        assert "name" not in args
+
+
+def test_못_풀면_원문을_그대로_둔다():
+    """`{}` 로 뭉개면 '인자 없음' 과 같아지고, 바깥 dict 면 `name` 을 지어낸다.
+    원문을 두면 기록에 남고 초안이 `args_not_structured` 결손으로 잡는다."""
+    name, args = A._inner_tool("invoke_tool", {"name": "x", "arguments": "이건 JSON 이 아니다"})
+    assert name == "x" and args == "이건 JSON 이 아니다"
     assert args is not None, "None 이면 `via: invoke_tool` 표시까지 사라진다"
+    # dict 가 아닌 JSON 도 마찬가지 — 인자 이름을 지어내지 않는다
+    _n, a2 = A._inner_tool("invoke_tool", {"name": "x", "arguments": [1, 2]})
+    assert not isinstance(a2, dict), a2
 
 
 def test_경유가_아니면_건드리지_않는다():
