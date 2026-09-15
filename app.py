@@ -2017,7 +2017,23 @@ def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
     if not isinstance(inner, str) or not inner:
         return name, None
     args = inp.get("arguments")
-    return inner, (args if isinstance(args, dict) else {})
+    if isinstance(args, dict):
+        return inner, args
+    # ⚠ **`{}` 로 뭉개지 않는다.** 모델은 `arguments` 를 JSON **문자열**로 곧잘 보낸다.
+    # 그때 빈 dict 를 돌려주면 호출부가 진짜 입력을 그것으로 갈아 끼워 기록이
+    # `"{}"` 가 된다 — 절차 초안은 **인자 없는 단계**를 만들고, `detail_full`(날것을
+    # 싣는 칸)의 존재 이유가 사라진다. 풀 수 있으면 풀고, 못 풀면 원래 입력을 둔다.
+    # `None` 은 이 함수에서 이미 **"경유가 아니다"** 라는 뜻이다(위 두 이른 반환).
+    # 여기서 재사용하면 `via: invoke_tool` 표시까지 사라진다 — 대신 **바깥 입력 그대로**를
+    # 돌려준다. 문자열 인자는 거기 들어 있으니 기록이 비지 않는다.
+    if isinstance(args, str) and args.strip():
+        try:
+            got = json.loads(args)
+        except ValueError:
+            return inner, inp
+        if isinstance(got, dict):
+            return inner, got
+    return inner, inp
 
 
 def _tool_preview(v, n: int = 220) -> str:
