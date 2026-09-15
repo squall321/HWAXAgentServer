@@ -2388,7 +2388,11 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
     def _has_content(b: str) -> bool:
         return _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")
-    good = [(n, ap, b) for n, ap, b in calls if _has_content(b)]
+    # ⚠ `calls` 는 **4-튜플**이다(짝 키를 싣느라 늘렸다 — 2377행). 여기서 3개로 풀면
+    # `ValueError` 가 나는데, 이 줄은 위 try 밖이라 호출부(3521행)의 blanket except 가
+    # 받아 `continue` 로 넘어간다. 그러면 **도구를 부른 좌석만** 근거 0건이 되고,
+    # 아무것도 안 부른 좌석은 멀쩡해서 화면상 "조회할 게 없었나 보다" 로 보인다.
+    good = [(n, ap, b) for n, ap, b, _cid in calls if _has_content(b)]
     _err = summary if summary.startswith("(조회 도중 중단") else ""
     if not good:
         return persona["key"], calls, "", _err
