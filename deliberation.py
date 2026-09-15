@@ -1928,8 +1928,20 @@ def envelope_failed(s) -> bool:
         return True
     if v.get("ok") is False or v.get("refused") is True:
         return True
-    if v.get("error") or v.get("errors"):
-        return True
+    # ⚠ `errors[]`·`error` 는 **실패 채널일 수도, 산출물일 수도** 있다. 검사기(validator)의
+    # 계약이 `{valid, errors:[{path, message}…]}` 인 자리가 있다 — 거기서 errors 는
+    # **찾아낸 문제**이지 고장이 아니다(실호출: `validate_block{"type":"nope"}` →
+    # `{"valid": false, "errors":[…]}`, isError=false). 그걸 실패로 적으면 화면에 빨간
+    # '실패' 배지가 붙고 절차 원장에서 그 단계가 빠진다 — 도구는 제대로 일했는데.
+    # **성공을 명시한 신호가 있으면** errors 로 실패를 단정하지 않는다(6차 감사).
+    verdict_shape = "valid" in v or v.get("ok") is True
+    if not verdict_shape:
+        # 형도 포털과 맞춘다 — 맨 참으로 보면 `errors: 12`(개수)·`errors: {…}`(집계)를
+        # 실패로 센다. 같은 본문을 두 리포가 다르게 판정하면 그게 W-77 이 고친 문제다.
+        if isinstance(v.get("error"), (str, dict)) and v.get("error"):
+            return True
+        if isinstance(v.get("errors"), list) and v.get("errors"):
+            return True
     code = v.get("exit_code")
     return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
