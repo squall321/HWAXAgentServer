@@ -1960,6 +1960,11 @@ def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> st
             + "\n\n".join(parts))
 
 
+# 호출별 시작 시각 — 소요(ms)를 재려면 시작을 기억해야 한다. 짝 키(run_id)로 담는다.
+# 완료에서 꺼내 쓰고 지운다. 짝이 안 오면(중단·예외) 그 항목만 남는데, 턴 단위로 짧다.
+_t0_by_call: dict[str, float] = {}
+
+
 def _inner_tool(name: str, inp) -> tuple[str, dict | None]:
     """`invoke_tool(name=…, arguments=…)` 는 **경유**다 — 기록에는 안쪽 도구가 남아야 한다.
 
@@ -2638,6 +2643,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
                                           "tool": event.get("name")})
                 _in = event.get("data", {}).get("input")
+                # 소요는 **시작을 기억해야** 잴 수 있다. 짝 키로 기억한다 — 같은 도구를
+                # N번 부르면 이름으로는 못 잰다(§5-5 가 그 기계다).
+                if event.get("run_id"):
+                    _t0_by_call[str(event["run_id"])] = time.monotonic()
                 # 경유 껍데기를 벗긴다 — 안 벗기면 기록이 전부 `invoke_tool` 이 된다
                 _tname, _inner_args = _inner_tool(str(event.get("name") or ""), _in)
                 if _inner_args is not None:
@@ -2687,9 +2696,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 화면과 원장이 두 줄로 갈라진다.
                 _tname2, _iv = _inner_tool(str(event.get("name") or ""),
                                            (event.get("data") or {}).get("input"))
+                _cid2 = str(event.get("run_id") or "")
+                _t0 = _t0_by_call.pop(_cid2, None)
                 yield _sse("status", {"step": f"도구 완료: {_tname2}", "tool": _tname2,
                                       **({"via": "invoke_tool"} if _iv is not None else {}),
-                                      "ok": _ok,
+                                      "ok": _ok, "ts": int(time.time() * 1000),
+                                      **({"ms": round((time.monotonic() - _t0) * 1000)}
+                                         if _t0 is not None else {}),
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"result_preview": out} if out else {}),
                                       **({"result_full": _hand} if len(_hand) > len(out) else {})})
