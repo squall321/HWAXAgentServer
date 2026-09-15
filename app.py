@@ -1972,6 +1972,29 @@ _T0_MAX = 512
 _t0_by_call: "OrderedDict[str, float]" = OrderedDict()
 
 
+def _result_ok(txt) -> bool:
+    """도구 결과가 성공인가. **머리만 본다.**
+
+    ⚠ 예전엔 결과 **전체**(최대 20만 자)에서 ✖ 를 찾았다. 표식은 실패를 만들 때 맨 앞에
+    찍히므로(867행) 뒤쪽에서 찾는 ✖ 는 전부 남의 것이다 — 합격/불합격 표를 내는
+    `check_design_rules`·`qa_run`, ✔/✖ 를 쓰는 한국어 문서, VOC 행. 그것들이 걸리면
+    **성공한 호출이 실패로** 기록됐다. 화면은 빨갛고, 절차 원장은 그 라벨을 오류 문구로
+    남기고, 쓰기 도구면 "실제로 만들어졌을 수 있으니 확인하라" 까지 띄웠다 — 이미 잘 끝난
+    쓰기를 확인하러 보냈다. `_tool_text_ok` 는 진작 `[:160]` 만 보고 있었다(둘이 어긋났다).
+
+    반대 방향도 여기서 막는다. `deliberation._call` 은 예외를 `"(tool X error: …)"`
+    **문자열로 삼켜** 돌려주므로 `except` 로는 실패를 못 잡는다 — 직접 실행 경로가
+    실패를 `ok: True` 로 내보내고 있었다. 성패를 모르는 것이 아니라 **틀리게 아는** 것이라
+    더 나쁘다.
+    """
+    if not isinstance(txt, str):
+        return True          # 성패를 말해 주는 문자열이 아니다 — 실패로 몰지 않는다
+    head = txt.lstrip()[:400]
+    return not (head.startswith(_TOOL_FAIL_MARK)
+                or head.startswith("(tool ")
+                or _PHANTOM_ID_MARK in head)
+
+
 def _t0_remember(cid: str) -> None:
     _t0_by_call[cid] = time.monotonic()
     while len(_t0_by_call) > _T0_MAX:
@@ -2703,8 +2726,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 #   덮어썼다가 다음 토큰의 full.append 가 AttributeError 로 챗을 죽였다(감사 C35).
                 _hand = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
                 _post_tool_chars = 0   # 이 결과 뒤에 모델이 말을 했는지만 본다
-                _ok = not (isinstance(_txt, str)
-                           and (_TOOL_FAIL_MARK in _txt or _PHANTOM_ID_MARK in _txt))
+                _ok = _result_ok(_txt)
                 # 짝이 맞으려면 완료도 **같은 이름**이어야 한다 — 한쪽만 안쪽 이름이면
                 # 화면과 원장이 두 줄로 갈라진다.
                 _tname2, _iv = _inner_tool(str(event.get("name") or ""),
@@ -2719,6 +2741,26 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"result_preview": out} if out else {}),
                                       **({"result_full": _hand} if len(_hand) > len(out) else {})})
+            elif kind == "on_tool_error":
+                # ⚠ LangChain 은 도구가 **터지면** on_tool_end 대신 이것을 낸다. 아무도
+                # 안 받는 동안 그 호출은 완료 이벤트가 아예 안 나갔다 — 화면에는 인자만
+                # 있고 결과도 성패도 없어 **아직 도는 중과 똑같이** 보였고, 절차 원장은
+                # 결과 없음·ok 없음을 성공으로 접어 넣었다(from_chat 의 `ok is not False`).
+                # 시작 시각도 안 꺼내져 그것만 상한에 밀려 버려졌다.
+                _err = (event.get("data") or {}).get("error")
+                _tname3, _iv3 = _inner_tool(str(event.get("name") or ""),
+                                            (event.get("data") or {}).get("input"))
+                _cid3 = str(event.get("run_id") or "")
+                _t03 = _t0_by_call.pop(_cid3, None)
+                _emsg = f"{_TOOL_FAIL_MARK} 도구 {_tname3} 호출 실패: {str(_err)[:500]}"
+                _post_tool_chars = 0
+                yield _sse("status", {"step": f"도구 실패: {_tname3}", "tool": _tname3,
+                                      **({"via": "invoke_tool"} if _iv3 is not None else {}),
+                                      "ok": False, "ts": int(time.time() * 1000),
+                                      **({"ms": round((time.monotonic() - _t03) * 1000)}
+                                         if _t03 is not None else {}),
+                                      **({"call": _cid3} if _cid3 else {}),
+                                      "result_preview": _tool_preview(_emsg)})
     except Exception as exc:
         # 상세는 서버 로그에만(내부 유출 방지). 단 AGENT_DEBUG_ERRORS=1 이면 예외 타입·메시지를
         # 브라우저 응답에도 실어 운영자가 바로 원인을 본다(기본 꺼짐 — 켜면 재시작 필요).
@@ -2877,13 +2919,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 yield _sse("status", {"step": f"도구 직접 실행: {_tn}", "tool": _tn,
                                       "call": _cid,
                                       "detail": _tool_preview(_argd, 200)})
-                _ok = True
                 try:
                     _out = await _call(_tmap, _tn, _argd)
                 except Exception as exc:  # noqa: BLE001
-                    _ok = False
                     _out = f"{_TOOL_FAIL_MARK} (tool {_tn} error: {exc})"
                 _out = _cap(str(_out))
+                # ⚠ `except` 로는 못 잡는다 — `_call` 이 예외를 문자열로 삼켜 돌려준다.
+                # 문자열을 봐야 실패를 안다(그래서 위 try 에서 _ok 를 정하지 않는다).
+                _ok = _result_ok(_out)
                 yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn,
                                       "call": _cid, "ok": _ok,
                                       "result_preview": _tool_preview(_out)})
