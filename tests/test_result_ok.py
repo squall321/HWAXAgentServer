@@ -71,3 +71,14 @@ def test_평문_결과는_그대로_성공이다():
     """봉투 검사가 넓어졌다고 JSON 이 아닌 결과까지 실패로 몰면 안 된다."""
     for txt in ("그냥 결과 문자열", "", "규칙 점검\nR1: ✔\nR2: ✖", "[1,2,3]"):
         assert A._result_ok(txt) is True, txt
+
+
+def test_평문_error_머리는_실패다():
+    """KooSlurm(smarttwin_*·slurm_*)은 실패를 `error: …` 평문으로 준다(isError=false, 2026-09-16).
+    포털 절차 판정기(judge._TEXT_FAIL)와 같은 규칙 — 첫 줄만 본다."""
+    assert A._result_ok("error: 제출 실패(status=500): Internal Server Error") is False
+    assert A._result_ok("  \nerror: sim_type 은 fullangle_drop | partial_impact 중 하나여야 합니다.") is False
+    assert A._result_ok("오류: 잡을 찾지 못했다") is False
+    # 정상 평문과 본문 중간의 error: 는 성공 그대로
+    assert A._result_ok("[DRY-RUN] 제출 계획 (실제 제출은 dry_run=False)") is True
+    assert A._result_ok("━━ 옵션 카탈로그 ━━\n- on_fail: error: 로 시작하는 줄을 남긴다") is True

@@ -1973,6 +1973,9 @@ _T0_MAX = 512
 _t0_by_call: "OrderedDict[str, float]" = OrderedDict()
 
 
+_TEXT_FAIL_HEAD = re.compile(r"^(error|오류)\s*[:：]", re.I)
+
+
 def _result_ok(txt) -> bool:
     """도구 결과가 성공인가. **머리만 본다.**
 
@@ -1993,6 +1996,13 @@ def _result_ok(txt) -> bool:
     head = txt.lstrip()[:400]
     if (head.startswith(_TOOL_FAIL_MARK) or head.startswith("(tool ")
             or _PHANTOM_ID_MARK in head):
+        return False
+    # ⚠ **평문으로 실패를 알리는 도구**가 있다 — KooSlurm(smarttwin_*·slurm_*)은 실패를
+    #   `"error: 제출 실패(status=500)"` 평문으로 주고 isError=false 다. 아래 봉투 검사는 JSON 만
+    #   보므로 이 경우를 **성공으로** 적었다(2026-09-16). 포털 절차 판정기(judge._TEXT_FAIL)와 같은
+    #   규칙 — **첫 줄만** 본다(본문 중간의 "error:" 는 로그 인용일 수 있다).
+    first = next((ln.strip() for ln in head.splitlines() if ln.strip()), "")
+    if _TEXT_FAIL_HEAD.match(first):
         return False
     # ⚠ **본문이 실패라고 말하는 것도 본다.** 표식만 보면 `isError=false` 로 오는 실패를
     # 전부 성공으로 적는다 — 실호출로 확인했다(`{"status":"error",…}`·`{"error":"…"}`).
