@@ -1854,6 +1854,47 @@ async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
     return hits2, f"{note} → {fb} 로 되물음"
 
 
+_RA_FAIL_WRAP = re.compile(r"^(?:\u2716 도구 \S+ 호출 실패: |\(tool \S+ error: )")
+
+
+def _ra_save_failure(raw) -> str:
+    """RA 쓰기 응답이 실패로 보이면 그 사유(도구가 준 문구 그대로, 앞 500자), 성공으로 보이면 "".
+
+    게이트웨이는 RA 토큰을 등록하지 않은 사용자의 호출을 '포털 API 토큰 페이지에서 등록하라' 는 문구로
+    거부한다(2026-09-29). 그 문구가 `app._cap_tool` 의 ✖ 표식이나 `_call` 의 "(tool … error" 로 싸여 오는데,
+    종전엔 보고서 번호가 없다는 것만 보고 'RA 미가용, 나중에 다시' 로 뭉개거나(/보고서) 이어붙인 것처럼
+    알렸다(심의 이어하기). 사유를 버리지 않는다 — 다시 시도해도 소용없고 등록해야 풀린다."""
+    if raw is None:
+        return "보고서 도구가 없다"
+    s = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, default=str)
+    head = s.strip()
+    if not head:
+        return "빈 응답"
+    if (head.startswith(("(tool ", "\u2716")) or head.lower().startswith("error:")
+            or head.startswith("오류:") or envelope_failed(s)):
+        if head.startswith("(tool ") and head.endswith(")"):
+            head = head[:-1]                     # _call 의 "(tool X error: …)" 닫는 괄호
+        return _RA_FAIL_WRAP.sub("", head)[:500]
+    return ""
+
+
+def _ra_save_outcome(raw, append_to, do_save: bool) -> tuple[int | None, str]:
+    """심의 저장의 결과 → (보고서 번호, 결정문 끝에 붙일 안내). 이어붙이기는 응답에 번호가 없을 수
+    있어 대상 번호로 갈음하는데, **성공일 때만** 그렇게 한다 — 거부된 이어붙이기가 '#N 에 이어붙임' 으로
+    보이고 결과 카드까지 그려졌다(검토 2026-09-29)."""
+    if not do_save:
+        return None, ""
+    fail = _ra_save_failure(raw)
+    if fail:
+        print(f"[deliberation] RA 저장 실패: {fail[:300]}")
+        return None, f"\n\n⚠ Report Archive 저장 실패 — {fail}"
+    rid = _ra_report_id(_parse_json(raw)) or append_to
+    if not rid:
+        return None, "\n\n⚠ Report Archive 저장 응답에서 보고서 번호를 받지 못했다 — 저장 여부를 RA 에서 확인하라."
+    return rid, (f"\n\n📄 Report Archive 보고서 #{rid} 에 페이지로 이어붙임." if append_to
+                 else f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨.")
+
+
 def _ra_report_id(made) -> int | None:
     """RA 저장 응답에서 보고서 id — 응답 모양이 셋이라 전부 받는다.
 
@@ -1897,7 +1938,9 @@ def _delib_tool_result_ok(s: str) -> bool:
     # 그 교정문이 _err_note 로 LLM 에 피드백돼 스스로 ID 를 다시 찾는다(self-repair).
     if _PHANTOM_ID_MARK in head:
         return False
-    if head.lower().startswith("error:") or head.startswith("오류:"):
+    # ✖ 는 app._cap_tool 의 실패 표식(app._TOOL_FAIL_MARK, app 은 늦게 import 해서 글자로 둔다) — app._result_ok 는
+    # 이미 거르는데 여기만 몰라서 게이트웨이 거부 문구가 '실호출 정량 결과' 근거로 주입됐다(검토 2026-09-29).
+    if head.lower().startswith("error:") or head.startswith("오류:") or head.startswith("\u2716"):
         return False
     return not envelope_failed(s)
 
@@ -3927,20 +3970,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "template_id": "deliberation", "template_version": 1,
                 "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
                 "tags": ["심의", "chat-deliberation"]})
-        # _call 은 도구 예외를 "(tool … error: …)" 문자열로 삼킨다 — 그러면 아래 파싱이 None 이
-        # 되어 실패 원인이 어디에도 안 남았다(감사 C29). 오류 문자열이면 원인을 찍는다.
-        if _raw_made is not None and isinstance(_raw_made, str) and _raw_made.lstrip().startswith("(tool"):
-            print(f"[deliberation] create_report_draft 도구 오류: {_raw_made[:300]}")
-        made = _parse_json(_raw_made) if _raw_made is not None else None
-        # ⚠ 응답 키가 두 모양이다. RA 배포본은 최상위 report_id 를 주는데(실측 2026-09-06:
-        # {"report_id":58,"title":…,"page_count":1,"url":…}) 종전 파서는 report.id 만 봤다.
-        # 그래서 저장은 실제로 되는데 id 를 못 읽어 "저장됨" 안내가 한 번도 붙지 않았고,
-        # 이어붙이기·잡 원장도 대상 보고서를 알 수 없었다. 세 모양을 다 받는다.
-        rid = _ra_report_id(made) or (_append_to if (_do_save and _append_to) else None)
-        if rid:
-            report_note = (f"\n\n📄 Report Archive 보고서 #{rid} 에 페이지로 이어붙임."
-                           if _append_to else
-                           f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨.")
+        # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
+        # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
+        rid, report_note = _ra_save_outcome(_raw_made, _append_to, _do_save)
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
 
@@ -4131,22 +4163,27 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
             "minutes": minutes[:40],
         }
 
-    rid = None
+    rid, fail = None, ""
     try:
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-        made = _parse_json(await _call(tools, "create_report_draft", {
+        raw = await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
             "title": title, "blocks": _ra_blocks(blocks),
-            "tags": ["심의", "conversation-report"]}))
-        # _call 은 도구 예외를 "(tool … error: …)" **문자열**로 삼켜 반환하므로 아래 except 가
-        # 안 걸린다. 진짜 도구 오류와 파싱 결손이 사용자에게 똑같이 보이지 않게 여기서 가른다.
-        if isinstance(made, str) and not _tool_text_ok(made):
-            print(f"[report] RA 저장 도구 오류: {made.strip()[:200]}")
-        rid = _ra_report_id(made)
+            "tags": ["심의", "conversation-report"]})
+        # 도구 오류는 _call·_cap_tool 이 **문자열로 싸서 정상 반환**하므로 아래 except 가 안 걸린다.
+        # 사유를 뭉개지 않는다 — 게이트웨이의 'RA 토큰을 등록하라' 가 여기로 온다(다시 시도해도 소용없다).
+        fail = _ra_save_failure(raw)
+        rid = None if fail else _ra_report_id(_parse_json(raw))
+        if fail:
+            print(f"[report] RA 저장 실패: {fail[:200]}")
     except Exception as exc:  # noqa: BLE001 — RA 미가용(cae00 등)은 비치명적 폴백
         print(f"[report-save] create_report_draft failed: {exc!r}")
-    text = (f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
-            if rid else "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요.")
+    if rid:
+        text = f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
+    elif fail:
+        text = f"Report Archive 저장 실패 — {fail} (대화는 서버에 남아 있습니다)"
+    else:
+        text = "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요."
     yield _sse("token", {"delta": text})
     yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
