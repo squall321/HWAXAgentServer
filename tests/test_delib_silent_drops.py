@@ -208,3 +208,54 @@ def test_일부만_버려지면_카드는_하나고_나머지는_실린다(monke
 def test_버린_것이_없으면_카드도_없다(monkeypatch):
     events = _stream(monkeypatch, {"evidence": [{"result": "본문 A"}]})
     assert _cards(events, included=False) == []
+
+
+# ── 좌석에 주지 않은 근거는 MCP 호출자에게도 보인다 ──────────────────────────────
+# 웹은 근거 패널에 '제외' 카드가 뜨지만 MCP 호출자가 보는 것은 잡 원장뿐이다. 원장이 근거
+# 카드를 아예 안 적어서, 위 카드를 내도 deliberate_status / deliberate_result 로는 안 보였다.
+def _mcp_view(monkeypatch, events):
+    """이벤트를 잡 원장에 반영한 뒤 **실제 MCP 도구 함수**가 돌려주는 것을 받는다."""
+    import mcp_server
+
+    job = {"id": "t-silent-drops", "status": "running", "question": "q", "started_at": 0.0}
+    for ev, data in events:
+        delib_jobs._apply(job, ev, data)
+    monkeypatch.setitem(delib_jobs._JOBS, job["id"], job)
+    return {fn.__name__: asyncio.run(fn(job["id"]))
+            for fn in (mcp_server.deliberate_status, mcp_server.deliberate_result)}
+
+
+def test_버려진_근거가_진행_조회와_결과_회수에_보인다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [{"source": f"E{i}"} for i in range(25)]})
+    for name, out in _mcp_view(monkeypatch, events).items():
+        notes = out.get("evidence_omitted") or []
+        assert [n["source"] for n in notes] == ["사전 근거 본문 없음"], (name, out)
+        assert "25건" in notes[0]["text"] and "result" in notes[0]["text"], (name, notes)
+
+
+def test_예산_초과로_빠진_근거도_원장에_남는다(monkeypatch):
+    """종전부터 있던 카드다 — 화면에는 떴지만 MCP 호출자는 볼 길이 없었다."""
+    big = "가" * (d._evid_budget() // 2)
+    events = _stream(monkeypatch, {"evidence": [{"result": big}, {"result": big}, {"result": big}]})
+    for name, out in _mcp_view(monkeypatch, events).items():
+        srcs = [n["source"] for n in out.get("evidence_omitted") or []]
+        assert srcs == ["사전 근거 예산 초과"], (name, srcs)
+
+
+def test_좌석에_준_근거는_원장에_싣지_않는다(monkeypatch):
+    """넣은 근거까지 적으면 원장이 근거 본문만큼 커진다 — 빠진 것만 적는다."""
+    events = _stream(monkeypatch, {"evidence": [{"result": "본문 A"}, {"text": "본문 B"}]})
+    assert _cards(events, included=True), "시험 전제 — 좌석에 준 카드가 있어야 한다"
+    for name, out in _mcp_view(monkeypatch, events).items():
+        assert out.get("evidence_omitted") == [], (name, out)
+
+
+def test_원장에_남기는_건수에는_상한이_있고_넘으면_그렇다고_적는다():
+    job = {"id": "t-cap"}
+    for i in range(delib_jobs.OMITTED_MAX + 5):
+        delib_jobs._apply(job, "delib", {"kind": "evidence", "source": f"s{i}", "included": False,
+                                         "text": "x" * 5000})
+    ex = job["evidence_omitted"]
+    assert len(ex) == delib_jobs.OMITTED_MAX + 1 and "note" in ex[-1], ex[-1]
+    assert ex[0]["source"] == "s0", "먼저 온 것(라운드 전에 오는 사전 근거 드롭)이 밀려나면 안 된다"
+    assert len(ex[0]["text"]) < 5000

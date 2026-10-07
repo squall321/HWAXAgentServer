@@ -39,6 +39,12 @@ MAX_RUNNING = int(os.environ.get("DELIB_JOB_MAX_RUNNING", "2") or 2)
 KEEP_IN_MEM = 200
 # 좌석 발언 전사 보존 상한(턴 수). 넘으면 이후 발언은 버리고 그 사실을 한 줄 남긴다.
 TURN_MAX = int(os.environ.get("DELIB_JOB_TURN_MAX", "400") or 400)
+# 좌석에 주지 않은 근거(화면의 included=False 카드) 보존 상한 — 건수와 건당 글자. 이름을
+# excluded 로 짓지 않는다 — 리스크 앱에서 그 말은 '사람이 뺀 근거' 다. 좌석별 자유 조회 실패 카드는
+# 좌석 × 라운드로 불어나므로 막아 둔다. **먼저 온 것**을 남긴다 — 사전 근거의 드롭은 라운드가
+# 돌기 전에 오고, 그게 호출자가 가장 먼저 알아야 하는 것이다.
+OMITTED_MAX = 30
+OMITTED_TEXT_MAX = 400
 
 # ── 심의 메뉴 — 포털 웹의 정본 택소노미를 그대로 옮긴다 ──────────────────────────────
 # 정본: HWAXPortal/frontend/src/components/chat/delibTaxonomy.ts (JOBS + JOB_ROUTING)
@@ -201,6 +207,17 @@ def _apply(job: dict, event: str, data: dict) -> None:
                 t.append({"note": f"전사 상한 {TURN_MAX}턴 초과 — 이후 발언은 기록하지 않는다"})
         elif kind == "checkpoint":
             job["checkpoint"] = {k: v for k, v in data.items() if k != "kind"}
+        elif kind == "evidence" and data.get("included") is False:
+            # 좌석에 **주지 않은** 근거. 웹은 근거 패널에 카드로 뜨지만 MCP 호출자가 보는 것은
+            # 이 원장뿐인데, 근거 카드를 통째로 안 적고 있었다 — 본문 키가 달라 근거 25건이
+            # 전부 버려진 심의가 끝까지 돌았고 호출자는 결정문을 받고도 몰랐다(2026-10-07).
+            # 좌석에 준 카드는 싣지 않는다(근거 본문만큼 원장이 커진다).
+            ex = job.setdefault("evidence_omitted", [])
+            if len(ex) < OMITTED_MAX:
+                ex.append({"source": str(data.get("source") or ""),
+                           "text": str(data.get("text") or "")[:OMITTED_TEXT_MAX]})
+            elif len(ex) == OMITTED_MAX:
+                ex.append({"note": f"상한 {OMITTED_MAX}건 초과 — 이후는 기록하지 않는다"})
     elif event == "status":
         step = data.get("step")
         if step:
@@ -276,7 +293,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "seats": [], "round": 0, "total_rounds": None,
         "decision": None, "result_text": None, "report_id": None, "plain": None,
         "turns": [], "checkpoint": None,
-        "error": None, "warnings": [],
+        "error": None, "warnings": [], "evidence_omitted": [],
         "started_at": _now(), "updated_at": _now(), "finished_at": None,
         "user": user_email or "",
     }
@@ -358,6 +375,7 @@ def summary(job: dict, *, full: bool = False) -> dict:
         out["decision"] = job.get("decision") or job.get("result_text")
         out["plain"] = job.get("plain")
         out["warnings"] = job.get("warnings") or []
+        out["evidence_omitted"] = job.get("evidence_omitted") or []
         out["steps"] = job.get("steps") or []
         out["seats_detail"] = job.get("seats") or []
         out["applied_opts"] = job.get("opts") or {}

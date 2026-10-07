@@ -281,7 +281,11 @@ async def deliberate_status(job_id: str) -> dict:
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
-    return delib_jobs.summary(job)
+    out = delib_jobs.summary(job)
+    # 좌석에 주지 않은 근거는 **도는 동안** 보여야 한다 — 결정문을 받을 때 알면 이미 수십 분을
+    # 쓴 뒤다. 목록(deliberate_list)에는 싣지 않으려고 summary 가 아니라 여기서 붙인다.
+    out["evidence_omitted"] = job.get("evidence_omitted") or []
+    return out
 
 
 @mcp.tool(title="심의 결과(결정 문서) 회수",
