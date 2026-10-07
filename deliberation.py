@@ -2126,6 +2126,19 @@ def _llm_fail_note(exc: BaseException, llm) -> tuple[str, str]:
     return f"{name}: {str(exc)[:120]}", ""
 
 
+def _skip_notice(code: str, what: str, after: str, exc: BaseException, llm) -> list:
+    """부가 단계(요약·쉬운 설명·VOC 환기·근거 선주입)를 실패로 건너뛸 때의 알림 — [상태줄, 경고].
+
+    이 단계들은 실패해도 심의를 죽이지 않는다(그 동작은 그대로다). 다만 종전엔 서버 로그 한 줄뿐이라, LLM 호출
+    한도에 걸려 빠진 요약·환기가 **처음부터 없던 것**과 똑같이 보였다. what 은 못 한 일(한 구절), after 는 그래서
+    어떻게 되는지(끝에 붙는 한 문장)다. 설정 이름은 knob 으로 싣는다."""
+    note, knob = _llm_fail_note(exc, llm)
+    kw = {"knob": knob} if knob else {}
+    print(f"[deliberation] ⚠ {what}({code}): {exc!r}")
+    return [_sse("status", {"step": f"⚠ {what} — {note}", "tool": None, **kw}),
+            _sse("warning", {"code": code, "message": f"{what} — {note}. {after}", **kw})]
+
+
 async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = (),
                       validator_fn=None, opts=_DEFAULT_OPTS, fails: dict | None = None):
     """라운드 발언을 완료되는 순서대로 산출(async generator) — 라이브 회의 스트림의 핵심.
@@ -3096,33 +3109,42 @@ _WEB_CITE = re.compile(r"\[W:(d_[0-9a-f]{12})#(\d+)\]")
 
 
 async def _verify_web_citations(app, groups: list, text: str,
-                                user: str = "", user_pat: str = "") -> tuple[int, int, list]:
-    """결정문의 웹 인용을 원장과 대조한다. 반환은 (검증됨, 날조, 날조 목록).
+                                user: str = "", user_pat: str = "") -> tuple[int, int, list, list]:
+    """결정문의 웹 인용을 원장과 대조한다. 반환은 (검증됨, 날조, 날조 목록, 확인하지 못한 목록).
 
     대조는 get_quote 도구로 한다 — 브로커 앱이 유일한 원장 소유자이고, 여기서 직접
-    파일을 읽으면 앱 경계를 넘어 배포가 어긋날 때 조용히 깨진다."""
+    파일을 읽으면 앱 경계를 넘어 배포가 어긋날 때 조용히 깨진다.
+
+    ⚠ **확인하지 못한 것은 날조가 아니다.** 종전엔 조회 호출이 실패한 인용(시간 초과·게이트웨이 불통)도
+    날조로 세어 '이 항목의 근거는 신뢰하지 마세요' 를 붙였다 — 원장에 멀쩡히 있는 문장이 도구 한도 때문에
+    지어낸 인용이 됐다. 날조는 원장이 **'그런 문장 없다' 고 답한 것**만이다. 도구 실패는 예외가 아니라
+    문자열로 온다(_call 의 "(tool … error", app._cap_tool 의 ✖) — 그 모양으로 가른다."""
     cites = _WEB_CITE.findall(text or "")
     if not cites:
-        return 0, 0, []
+        return 0, 0, [], []
+    tags = [f"[W:{doc_id}#{idx}]" for doc_id, idx in cites[:40]]
     try:
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-    except Exception:  # noqa: BLE001
-        return 0, 0, []
+    except Exception:  # noqa: BLE001 — 도구를 못 받았다. 하나도 대조하지 못한 것이다
+        return 0, 0, [], tags
     if "get_quote" not in tools:
-        return 0, 0, []
-    ok_n, bad = 0, []
-    for doc_id, idx in cites[:40]:
+        return 0, 0, [], []
+    ok_n, bad, unknown = 0, [], []
+    for (doc_id, idx), tag in zip(cites[:40], tags):
         try:
             raw = await _call(tools, "get_quote", {"doc_id": doc_id, "index": int(idx)})
-            d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
         except Exception:  # noqa: BLE001
-            bad.append(f"[W:{doc_id}#{idx}]")
+            unknown.append(tag)
             continue
+        if isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
+            unknown.append(tag)
+            continue
+        d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
         if isinstance(d, dict) and d.get("ok") and (d.get("data") or {}).get("text"):
             ok_n += 1
         else:
-            bad.append(f"[W:{doc_id}#{idx}]")
-    return ok_n, len(bad), bad
+            bad.append(tag)
+    return ok_n, len(bad), bad, unknown
 
 
 def _evidence_note(ev: dict) -> str:
@@ -3660,8 +3682,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
             sf_display, sf_inject, sf_used = await _defect_briefing(tools, llm, question, history)
-        except Exception:  # noqa: BLE001 — 환기 실패가 심의를 죽이지 않게
+        except Exception as exc:  # noqa: BLE001 — 환기 실패가 심의를 죽이지 않게
             sf_display, sf_inject, sf_used = "", "", []
+            for _c in _skip_notice("voc_recall_skipped", "최근 불량 이슈 환기(VOC)를 하지 못했다", exc=exc, llm=llm,
+                                   after="VOC 없이 질문만으로 진행합니다."):
+                yield _c
         if sf_used:  # 활동 패널용 — 환기에서 실제 호출된 SF 도구들
             yield _sse("status", {"step": "불량 환기 완료", "tool": None, "tools_used": sf_used})
         if sf_display:
@@ -3676,8 +3701,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": "정량 근거 수집 — 지식·보고서 검색", "tool": "hybrid_search"})
         try:
             ev_display, ev_inject, ev_used = await _evidence_prepass(tools, llm, question)
-        except Exception:  # noqa: BLE001 — 근거 수집 실패가 심의를 죽이지 않게
+        except Exception as exc:  # noqa: BLE001 — 근거 수집 실패가 심의를 죽이지 않게
             ev_display, ev_inject, ev_used = "", "", []
+            for _c in _skip_notice("evidence_prepass_skipped", "정량 근거 선주입을 하지 못했다", exc=exc, llm=llm,
+                                   after="사전 근거 없이 진행합니다."):
+                yield _c
         if ev_used:
             yield _sse("status", {"step": "정량 근거 수집 완료", "tool": None, "tools_used": ev_used})
         if ev_display:
@@ -4707,7 +4735,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "① 최종 결론 한 줄 ② 핵심 근거 1~2개(가능하면 수치) ③ 소수의견/합의 여부. "
                 f"머리말·제목 없이 불릿만.\n\n{decision[:6000]}")).strip()
         except Exception as exc:  # noqa: BLE001 — 요약 실패해도 의사결정문은 그대로 저장
-            print(f"[deliberation] summary failed: {exc!r}")
+            for _c in _skip_notice("summary_skipped", "핵심 요약을 만들지 못했다", exc=exc, llm=llm,
+                                   after="결정문은 그대로입니다."):
+                yield _c
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
@@ -4732,7 +4762,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "새로운 내용을 지어내지 말고 원문에 있는 것만 쉽게 바꿔라.\n\n"
                 f"{decision[:7000]}")).strip()
         except Exception as exc:  # noqa: BLE001 — 실패해도 의사결정문은 그대로
-            print(f"[deliberation] plain summary failed: {exc!r}")
+            for _c in _skip_notice("plain_skipped", "쉬운 설명을 만들지 못했다", exc=exc, llm=llm,
+                                   after="결정문은 그대로입니다."):
+                yield _c
     if _plain:
         decision = f"{decision}\n\n---\n\n■ 쉬운 설명\n{_plain}"
         # 별도 이벤트로도 내보내 프론트가 결정문과 분리된 카드로 렌더할 수 있게 한다.
@@ -4744,16 +4776,29 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
     if opts.search_sources and not _chair_failed:
-        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision,
-                                                          user, user_pat)
-        if _ok_n or _bad_n:
-            yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건",
+        _ok_n, _bad_n, _bad, _unk = await _verify_web_citations(app, groups, decision,
+                                                                user, user_pat)
+        if _ok_n or _bad_n or _unk:
+            yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건"
+                                          + (f" / 확인 못 함 {len(_unk)}건(원장 조회 실패)" if _unk else ""),
                                   "tool": "get_quote"})
+            if _unk:
+                # 조회가 실패한 인용 — 날조라고 적지 않는다. 다만 확인된 것도 아니므로 그렇게 남긴다
+                # (보고서에 실린다 — 이 대조는 저장 전에 한다).
+                decision += ("\n\n> ⚠ 아래 인용은 원장 조회가 실패해 **확인하지 못했습니다**(날조라는 뜻이 "
+                             "아닙니다) — " + ", ".join(_unk[:8])
+                             + (f" 외 {len(_unk) - 8}건" if len(_unk) > 8 else "")
+                             + "\n> 원장에서 다시 확인하기 전에는 근거로 삼지 마세요.")
+                yield _sse("warning", {"code": "web_cite_unverified",
+                                       "message": f"웹 인용 {len(_unk)}건은 원장 조회가 실패해 확인하지 "
+                                                  "못했습니다 — 날조로 세지 않았고, 결정문에 그렇게 적었습니다.",
+                                       "knob": "도구 호출 한도 MCP_CALL_TIMEOUT_S · 게이트웨이 "
+                                               "GATEWAY_CALL_TIMEOUT"})
             if _bad_n:
                 decision += ("\n\n> ⚠ 아래 인용은 원장에서 확인되지 않았습니다(날조 가능) — "
                              + ", ".join(_bad[:8])
                              + "\n> 이 항목의 근거는 신뢰하지 마세요.")
-            else:
+            elif _ok_n and not _unk:
                 decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
                              "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
                              "별도 판단입니다.")
