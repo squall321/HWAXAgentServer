@@ -732,7 +732,10 @@ def _seal(req_opts: dict) -> tuple[dict, list]:
     reopen = [f"{k}={_delib_preview(req_opts[k], 60)}" for k, (closed, _label) in _SEALED_CLOSE.items()
               if req_opts.get(k) not in (None, "", [], closed)
               and str(req_opts[k]).strip().lower() != str(closed)]
-    return {**req_opts, **{k: c for k, (c, _label) in _SEALED_CLOSE.items()}, "sealed": 1}, reopen
+    # 빈 목록은 요청마다 새로 만든다 — 표의 목록을 그대로 실으면 잡 기록들이 한 객체를 함께 물고,
+    # 하나를 고치는 순간 표가 바뀌어 다음 봉인 심의부터 그 길이 열린다.
+    closed = {k: (list(c) if isinstance(c, list) else c) for k, (c, _label) in _SEALED_CLOSE.items()}
+    return {**req_opts, **closed, "sealed": 1}, reopen
 
 
 def _resolve_opts(req_opts):

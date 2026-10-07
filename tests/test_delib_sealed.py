@@ -164,6 +164,16 @@ def test_닫는_목록과_시험이_아는_목록이_같다():
     assert {k: c for k, (c, _l) in d._SEALED_CLOSE.items()} == _ALL_CLOSED
 
 
+def test_닫힌_값을_요청끼리_나눠_쓰지_않는다():
+    """닫는 값의 빈 목록이 표의 **그 객체**면, 잡 기록 하나의 opts 를 고치는 순간 표가 바뀌고
+    다음 봉인 심의부터 그 길이 열린 채 돈다."""
+    first, _ = d._seal({"sealed": 1})
+    first["tools"].append("report_query")
+    first["search_sources"].append("web")
+    assert _closed(d._resolve_opts({"sealed": 1})) == _ALL_CLOSED
+    assert {k: c for k, (c, _l) in d._SEALED_CLOSE.items()} == _ALL_CLOSED
+
+
 @pytest.mark.parametrize("key,value", [
     ("voc", "always"), ("voc", "auto"), ("evidence_prepass", 1), ("tools", ["report_query"]),
     ("free_tools", 1), ("persona_knowledge", 1), ("search_sources", ["web", "scholar"]),
