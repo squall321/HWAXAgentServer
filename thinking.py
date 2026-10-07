@@ -50,7 +50,10 @@ CONCURRENCY = int(os.environ.get("THINK_CONCURRENCY", "4"))
 # 좌석당 지식카드 주입 문자 예산.
 KNOWLEDGE_BUDGET = int(os.environ.get("THINK_KNOWLEDGE_BUDGET", "2500"))
 # 좌석 1콜 상한(초). 넘으면 그 좌석만 빠지고 나머지는 진행한다.
-SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "180"))
+# 180 → 600 (2026-10-08). 심의와 같은 공유 LLM 을 쓴다 — 20석 넘는 심의가 LLM 을 차지한 동안에는 띵킹 좌석
+# 호출이 큐에서 180초를 넘겨 전 좌석이 '초과' 로 빠졌다. 챗 LLM 의 호출 한도(LLM_TIMEOUT_S 900초)보다 짧은
+# 것은 의도다 — 좌석 하나가 답을 붙들 수 있는 상한이다.
+SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "600"))
 # 위임 명사구 상한(좌석당).
 REFER_MAX = 3
 
@@ -227,7 +230,8 @@ async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
                 _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs)), SEAT_TIMEOUT_S)
         except asyncio.TimeoutError:
             return {**seat, "verdict": "error", "scope": "", "answer": "",
-                    "basis": [], "refer": [], "error": f"{SEAT_TIMEOUT_S:.0f}초 초과"}
+                    # 어느 값을 올리면 되는지 같이 적는다 — 띵킹에는 설정 이름을 따로 싣는 자리가 없다.
+                    "basis": [], "refer": [], "error": f"{SEAT_TIMEOUT_S:.0f}초 초과(THINK_SEAT_TIMEOUT_S)"}
         except Exception as exc:  # noqa: BLE001 — 한 좌석의 실패가 나머지를 죽이지 않게
             return {**seat, "verdict": "error", "scope": "", "answer": "",
                     "basis": [], "refer": [], "error": repr(exc)[:160]}

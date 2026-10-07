@@ -177,6 +177,30 @@ def test_judge_prose_without_verdict_counts_as_answer():
     assert r["verdict"] == "answer"
 
 
+def test_judge_timeout_names_the_knob(monkeypatch):
+    """좌석 호출이 상한을 넘기면 그 좌석만 빠진다 — 몇 초였고 어느 설정을 올리면 되는지 같이 적는다.
+    심의가 공유 LLM 을 차지한 동안 띵킹 전 좌석이 이 문구로 빠졌는데 종전엔 '180초 초과' 뿐이었다."""
+    class _Slow:
+        async def ainvoke(self, _msgs):
+            await asyncio.sleep(5)
+
+    monkeypatch.setattr(t, "SEAT_TIMEOUT_S", 0.05)
+    seat = {"key": "dom-x", "name": "x", "role": "r", "knowledge": ""}
+    r = asyncio.run(t._judge_one(_Slow(), seat, "질의", asyncio.Semaphore(1)))
+    assert r["verdict"] == "error" and r["error"] == "0초 초과(THINK_SEAT_TIMEOUT_S)", r
+    out = _sum(errored=[r])
+    assert "THINK_SEAT_TIMEOUT_S" in out and "기권이 아니라" in out, out
+
+
+def test_seat_timeout_default_is_600():
+    """환경값이 아니라 소스의 기본값을 본다. 챗 LLM 호출 한도(900초)보다 짧아야 좌석 상한이 먼저 걸린다."""
+    import re
+
+    src = open(t.__file__, encoding="utf-8").read()
+    m = re.search(r'^SEAT_TIMEOUT_S = float\(os\.environ\.get\("THINK_SEAT_TIMEOUT_S", "(\d+)"\)\)$', src, re.M)
+    assert m and int(m.group(1)) == 600 and int(m.group(1)) < 900, m and m.group(0)
+
+
 # ── 종합 문구 — 기권과 장애를 섞지 않는다 ─────────────────────────────────────
 def _sum(answered=(), passed=(), screened=(), errored=(), capped=(), hops=0) -> str:
     return t._summary_text("q", list(answered), list(passed), list(screened),
