@@ -259,3 +259,43 @@ def test_원장에_남기는_건수에는_상한이_있고_넘으면_그렇다�
     assert len(ex) == delib_jobs.OMITTED_MAX + 1 and "note" in ex[-1], ex[-1]
     assert ex[0]["source"] == "s0", "먼저 온 것(라운드 전에 오는 사전 근거 드롭)이 밀려나면 안 된다"
     assert len(ex[0]["text"]) < 5000
+
+
+# ── 1-3. 건수 상한을 넘긴 근거도 조용히 사라지지 않는다 ──────────────────────────
+def _many(n, prefix="본문"):
+    return [{"source": f"S{i}", "result": f"{prefix} {i}"} for i in range(1, n + 1)]
+
+
+def test_건수_상한을_넘긴_수를_센다():
+    o = _ev(_many(d._EVID_ITEMS + 3))
+    assert len(o.evidence) == d._EVID_ITEMS and o.evidence_over == 3
+    assert o.evidence[-1]["result"] == f"본문 {d._EVID_ITEMS}", "앞에서부터 채워야 한다(앞쪽이 더 관련 있다)"
+    assert d._DEFAULT_OPTS.evidence_over == 0 and _ev(_many(d._EVID_ITEMS)).evidence_over == 0
+
+
+def test_빈_항목이_자리를_먹지_않는다():
+    """상한을 먼저 자르면 빈 항목 다섯이 앞자리를 먹고, 뒤의 **본문 있는** 다섯이 밀려난다 —
+    피할 수 있는 드롭이다(JS 파이프라인도 거르고 나서 자른다)."""
+    o = _ev([{"source": "빈것"}] * 5 + _many(d._EVID_ITEMS))
+    assert len(o.evidence) == d._EVID_ITEMS
+    assert (o.evidence_dropped_empty, o.evidence_over) == (5, 0)
+
+
+def test_건수_초과가_카드와_원장에_숫자와_설정_이름으로_남는다(monkeypatch):
+    n = d._EVID_ITEMS + 3
+    events = _stream(monkeypatch, {"evidence": _many(n)})
+    out = [c for c in _cards(events, included=False) if c["source"] == "사전 근거 건수 초과"]
+    assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
+    for want in (f"{n}건", "3건", f"{d._EVID_ITEMS}건", "DELIB_EVID_ITEMS"):
+        assert want in out[0]["text"], (want, out[0]["text"])
+    assert len(_cards(events, included=True)) == d._EVID_ITEMS
+    for name, view in _mcp_view(monkeypatch, events).items():
+        assert "사전 근거 건수 초과" in [x["source"] for x in view["evidence_omitted"]], (name, view)
+
+
+def test_본문_없음과_건수_초과가_같이_나도_합계가_맞는다(monkeypatch):
+    n = d._EVID_ITEMS + 2
+    events = _stream(monkeypatch, {"evidence": ["항목 아님"] + _many(n)})
+    by = {c["source"]: c["text"] for c in _cards(events, included=False)}
+    assert f"근거 {n + 1}건 중 1건" in by["사전 근거 본문 없음"], by
+    assert f"{n}건 중 뒤쪽 2건" in by["사전 근거 건수 초과"], by

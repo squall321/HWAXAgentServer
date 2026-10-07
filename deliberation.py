@@ -677,6 +677,8 @@ def _resolve_opts(req_opts):
         # 본문이 없어(또는 객체가 아니어서) 버린 근거 수 — 스트림이 카드로 알린다. 0 이 아닌데
         # 조용하면 좌석도 호출자도 전부 실렸다고 믿는다.
         evidence_dropped_empty=0,
+        # 건수 상한(_EVID_ITEMS)을 넘겨 버린 근거 수 — 같은 이유로 센다. 41번째부터 말없이 사라졌다.
+        evidence_over=0,
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
@@ -786,10 +788,15 @@ def _resolve_opts(req_opts):
         ev = req_opts.get("evidence")
         if isinstance(ev, list):
             o.evidence = []
-            for it in ev[:_EVID_ITEMS]:
+            # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
+            # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
+            for it in ev:
                 res = _ev_body(it) if isinstance(it, dict) else ""
                 if not res:
                     o.evidence_dropped_empty += 1
+                    continue
+                if len(o.evidence) >= _EVID_ITEMS:
+                    o.evidence_over += 1
                     continue
                 o.evidence.append({
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
@@ -3435,12 +3442,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                               "수치·주장을 발언·결정문에 쓸 때는 해당 [e:N] 표지를 함께 적어라]\n" + "\n".join(_items))
     # ⚠ 위 블록 **밖**이다. 전부 버려지면 opts.evidence 가 비어 그 블록에 아예 안 들어간다 —
     #   근거 0건으로 도는 가장 나쁜 경우에 가장 조용해진다.
+    _ev_valid = len(opts.evidence) + opts.evidence_over
     if opts.evidence_dropped_empty:
         yield _delib("evidence", source="사전 근거 본문 없음", included=False,
-                     text=f"근거 {len(opts.evidence) + opts.evidence_dropped_empty}건 중 "
+                     text=f"근거 {_ev_valid + opts.evidence_dropped_empty}건 중 "
                           f"{opts.evidence_dropped_empty}건은 본문이 없어(또는 항목이 객체가 아니어서) "
                           f"좌석에 주지 않았다. 본문은 'result' 에 넣는다"
                           f"({'·'.join(_EVID_BODY_KEYS[1:])} 도 차례로 찾는다).")
+    if opts.evidence_over:
+        yield _delib("evidence", source="사전 근거 건수 초과", included=False,
+                     text=f"본문이 있는 근거 {_ev_valid}건 중 뒤쪽 {opts.evidence_over}건은 건수 상한"
+                          f"({_EVID_ITEMS}건 — DELIB_EVID_ITEMS)을 넘겨 좌석에 주지 않았다.")
     # 얹을 층(2층 Modifier) — 켠 것들의 지시 블록. _tail 에 실어 base·base_blind(좌석·의장) 전체에 적용.
     mod_inject = _modifier_note(opts.modifiers)
     # 챗에서 이어진 대화 — 사람의 전제와 챗의 잠정 해석을 지위를 붙여 넣는다(둘 다 검증 대상).
