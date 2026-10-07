@@ -486,11 +486,17 @@ async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
 
 @mcp.tool(
     title="심의 전사 — 좌석별 라운드 발언",
-    description=("HWAX 심의에서 어느 좌석이 몇 라운드에 무엇을 말했는지 원문을 본다. "
-                 "결정문만으로 부족할 때, 그리고 리스크 원장에 패널 결과를 제출할 때 쓴다."),
+    # '원문을 본다' 고 적어 두었는데 내주는 것은 회의 버블용으로 줄인 글이었다 — 그 글을 믿고 리스크 원장에
+    # 제출하면 잘린 뒤쪽의 인용이 사라진다. 기본이 줄인 글이라는 것과 줄이지 않은 글을 받는 법을 적는다.
+    # 길이 숫자는 적지 않는다(엔진 설정을 따라간다 — 낡는다).
+    description=("HWAX 심의에서 어느 좌석이 몇 라운드에 무엇을 말했는지 본다. 기본은 **화면에 뜨는 줄인 "
+                 "발언**이다 — 줄인 턴에는 say_clipped 와 온전한 길이(say_full_chars)가 붙는다. full=true 면 "
+                 "줄이지 않은 발언을 준다(길어지니 limit 을 줄여라). 발언은 라운드에 따라 관점·권장 / "
+                 "수용·반박·심화 / 최종 입장·표결을 이어 붙인 글이다(해석 목록·우려 목록은 여기 없다). "
+                 "결정문만으로 부족할 때 쓰고, 리스크 원장에 패널 결과를 제출할 때는 full=true 로 받는다."),
 )
 async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
-                                offset: int = 0, limit: int = 40) -> dict:
+                                offset: int = 0, limit: int = 40, full: bool = False) -> dict:
     """좌석 발언 전사를 페이지로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 준다.
 
     Args:
@@ -498,9 +504,10 @@ async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
         round: 특정 라운드만. 0 이면 전체.
         seat: 특정 좌석 키가 포함된 발언만.
         offset: 건너뛸 턴 수 · limit: 가져올 턴 수(≤200).
+        full: True 면 화면용으로 줄이지 않은 발언을 준다(기본은 줄인 글 + say_clipped 표식).
     """
     return delib_jobs.transcript(job_id, rnd=(round or None), seat=seat,
-                                 offset=offset, limit=limit)
+                                 offset=offset, limit=limit, full=full)
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",

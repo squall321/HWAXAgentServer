@@ -347,8 +347,10 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "plain":
             job["plain"] = data.get("text") or data.get("content")
         elif kind == "turn":
-            # 좌석 발언 원문. 이것이 없으면 결과만 있고 과정이 없는 심의가 된다(이어하기·원장 제출의 재료).
-            # 상한을 둔다 — 21석×6R 이 수십만 자라 원장 파일이 커진다.
+            # 좌석 발언. 이것이 없으면 결과만 있고 과정이 없는 심의가 된다(이어하기·원장 제출의 재료).
+            # say 는 화면용으로 줄인 글이고, 줄였을 때는 줄이지 않은 발언이 say_full 로 함께 온다(transcript 가
+            # 가려 내준다). 상한을 둔다 — 21석×6R 이 수십만 자라 원장 파일이 커진다(say_full 까지 최악
+            # TURN_MAX × DELIB_TRANSCRIPT_CLIP — 보통의 21석 6라운드는 0.4M 자쯤이다).
             t = job.setdefault("turns", [])
             if len(t) < TURN_MAX:
                 t.append({k: v for k, v in data.items() if k != "kind"})
@@ -644,9 +646,30 @@ def rounds_end(job: dict) -> int:
     return prev_off + int(job.get("total_rounds") or job.get("round") or 0)
 
 
+def _turn_view(t: dict, full: bool) -> dict:
+    """원장의 턴 하나를 응답 모양으로. say 는 화면용으로 줄인 글이고, 줄였을 때만 줄이지 않은 발언이
+    say_full 에 있다. 기본은 줄인 글에 **줄였다는 표식**(say_clipped)과 온전한 길이를 붙여 준다. full 이면
+    줄이지 않은 발언을 say 로 준다 — 저장 상한(DELIB_TRANSCRIPT_CLIP)에서도 잘렸으면 그때도 표식을 남긴다."""
+    if "say_full" not in t:
+        return t        # 줄이지 않은 턴 · 표식 이전에 돈 잡의 턴
+    row = {k: v for k, v in t.items() if k != "say_full"}
+    if full:
+        row["say"] = t["say_full"]
+        if int(t.get("say_full_chars") or 0) > len(t["say_full"]):
+            row["say_clipped"] = True
+        else:
+            row.pop("say_full_chars", None)
+    else:
+        row["say_clipped"] = True
+    return row
+
+
 def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
-               offset: int = 0, limit: int = 40) -> dict:
-    """좌석 발언 전사를 페이지로 돌려준다. 전량은 클라이언트 컨텍스트를 터뜨린다."""
+               offset: int = 0, limit: int = 40, full: bool = False) -> dict:
+    """좌석 발언 전사를 페이지로 돌려준다. 전량은 클라이언트 컨텍스트를 터뜨린다.
+
+    기본은 화면에 뜨는 줄인 발언이다(줄인 턴은 say_clipped). full 이면 줄이지 않은 발언을 준다 — 한 쪽이
+    몇 배로 커지므로 기본으로 주지 않는다(40턴 쪽은 줄인 글 기준으로 잡은 크기다)."""
     job = get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id}")
@@ -658,10 +681,17 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
     total = len(rows)
     off = max(0, int(offset))
     lim = max(1, min(200, int(limit)))
+    page = [_turn_view(t, full) for t in rows[off:off + lim]]
+    clipped = sum(1 for t in page if t.get("say_clipped"))
     return {"job_id": job_id, "total": total, "offset": off, "limit": lim,
-            "turns": rows[off:off + lim],
+            "turns": page,
             "note": ("전사가 없다 — 이 잡은 전사 보존 이전에 돌았거나 아직 라운드에 못 갔다"
-                     if not total else None)}
+                     if not total else
+                     f"이 쪽의 {clipped}턴은 say 가 화면용으로 줄인 글이다(say_clipped · 온전한 길이는 "
+                     "say_full_chars). 줄이지 않은 발언은 full=true 로 받는다 — 길어지니 limit 을 줄여라."
+                     if clipped and not full else
+                     f"이 쪽의 {clipped}턴은 저장 상한에서 잘린 발언이다(say_clipped · 온전한 길이는 "
+                     "say_full_chars)." if clipped else None)}
 
 
 def list_jobs(limit: int = 20) -> list[dict]:

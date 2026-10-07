@@ -4340,8 +4340,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _reb = _rebut_items(o)
             if _reb:
                 extra["rebut"] = _reb
+            # say 는 회의 버블용으로 줄인 글이다(문장 경계에서 끊으면 표식도 없다). 잡 원장은 이 턴을 그대로
+            # 쌓고 deliberate_transcript 가 그것을 내주는데, 그 도구는 '원문' 이라고 말해 왔다 — 2,700자를 쓴
+            # 좌석이 560자로 돌아왔다. 줄였을 때만 줄이지 않은 발언을 **따로** 싣는다(say 는 웹 버블의 계약이라
+            # 건드리지 않는다 — 포털·리스크 앱은 필드를 이름으로 집는다). 길이로 견주지 않는다 — 문장부호 없는
+            # 글은 줄인 것이 원문과 같은 길이일 수 있다.
+            _say, _say_full = _say_of(render, o), _say_of(render, o, full=True)
+            if _say_full != _say:
+                extra["say_full"] = _say_full[:_TRANSCRIPT_CLIP]
+                extra["say_full_chars"] = len(_say_full)
             yield _delib("turn", round=rnd, display_round=_dr(rnd), persona=o["persona"],
-                         say=_say_of(render, o), **extra)
+                         say=_say, **extra)
             if out is not None and extra.get("non_negotiable"):
                 _nn = str(extra["non_negotiable"]).strip()
                 if _nn and _nn not in out["non_negotiables"]:
@@ -4634,7 +4643,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             transcript.append(f"— {_dr(r)}라운드 — {lbl} —")
             render = 1 if r == 1 else 3 if r == N else 2
             # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다.
-            # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 2000자)일 뿐.
+            # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 12,000자)일 뿐.
             transcript += [f"[{o['persona']}] {_say_of(render, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
         results_t = rounds_data[N - 2][1] if N >= 3 else rounds_data[0][1]   # 마지막 심화 라운드, 없으면 1R
         blocks = {
