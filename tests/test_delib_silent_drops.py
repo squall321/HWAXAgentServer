@@ -271,6 +271,70 @@ def test_예산을_넘겨_통째로_빠진_항목을_실었다고_적지_않는�
     assert [c["source"] for c in _cards(events, included=False)] == ["사전 근거 예산 초과"]
 
 
+# ── 항목 하나를 항목 상한에서 줄여 실었으면 알린다 ───────────────────────────────────
+# 긴 문서 한 건을 통째로 넣으면(안내가 '미리 자르지 마라' 고 한다) 엔진이 항목 상한에 맞춰 덜어낸다. 그 상한은
+# 합계 예산을 넘지 못해 128K 창에서는 약 18,000자다 — 65,000자 보고서는 72% 가 빠진다. 덜어낸 사실은 본문
+# 끝의 한 줄뿐이라 좌석만 알았다. 화면 카드는 앞 4,000자만 보여 그 줄이 안 보였고, 잡 원장에는 흔적이 없었다.
+_ITEM_CUT = "사전 근거 항목 상한 초과"
+
+
+def _item_cap():
+    return min(d._EVID_ITEM_MAX, d._evid_budget())
+
+
+def test_항목_상한에서_줄여_실은_근거를_카드와_원장에_남긴다(monkeypatch):
+    cap = _item_cap()
+    assert cap < d._EVID_ITEM_MAX, "시험 전제 — 128K 창에서는 합계 예산이 항목 천장보다 작아 그 값이 걸린다"
+    doc = "서론 " + "가" * (cap * 3) + " 결론-표식"
+    events = _stream(monkeypatch, {"evidence": [{"source": "신뢰성 보고서", "key": "E7", "result": doc}]})
+    out = [c for c in _cards(events, included=False) if c["source"] == _ITEM_CUT]
+    assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
+    for want in ("[e:1|E7]", "신뢰성 보고서", f"원문 {len(doc):,}자", f"앞 {cap:,}자만", f"상한({cap:,}자", "합계 예산"):
+        assert want in out[0]["text"], (want, out[0]["text"])
+    assert "DELIB_" not in out[0]["text"], "화면 글에 설정 이름을 넣었다(knob 으로 따로 싣는다)"
+    shown = _cards(events, included=True)
+    assert len(shown) == 1 and shown[0]["text"].startswith("[줄여 실음"), shown[0]["text"][:80]
+    assert "결론-표식" not in shown[0]["text"]
+    for name, view in _mcp_view(monkeypatch, events).items():
+        kept = [x for x in view["evidence_omitted"] if x.get("source") == _ITEM_CUT]
+        assert len(kept) == 1, (name, view["evidence_omitted"])
+        # 걸린 것은 합계 예산이다 — 항목 천장을 올리라고 가리키면 원인이 아닌 설정을 만지게 한다.
+        assert "DELIB_EVID_BUDGET" in kept[0]["text"] and "DELIB_EVID_ITEM_MAX" not in kept[0]["text"], kept[0]
+
+
+def test_항목_천장이_걸린_것이면_그_설정을_가리킨다(monkeypatch):
+    monkeypatch.setattr(d, "_EVID_ITEM_MAX", 3000)
+    events = _stream(monkeypatch, {"evidence": [{"result": "짧은 본문"}, {"source": "긴 것", "result": "가" * 9000}]})
+    out = next(c for c in _cards(events, included=False) if c["source"] == _ITEM_CUT)
+    assert "[e:2]" in out["text"] and "앞 3,000자만" in out["text"] and "상한(3,000자)" in out["text"], out["text"]
+    assert "[e:1]" not in out["text"], "줄이지 않은 항목을 적었다"
+    assert out["knob"] == "DELIB_EVID_ITEM_MAX", out
+
+
+def test_낱장_표지가_있는_문서는_어느_낱장이_빠졌는지를_적는다(monkeypatch):
+    cap = _item_cap()
+    doc = "".join(f"## [s.{i}] 제목 {i}\n" + "가" * (cap // 10) + "\n" for i in range(1, 41))
+    events = _stream(monkeypatch, {"evidence": [{"source": "발표자료", "result": doc}]})
+    out = next(c for c in _cards(events, included=False) if c["source"] == _ITEM_CUT)
+    assert "[e:1]" in out["text"] and "낱장이 빠짐" in out["text"], out["text"]
+
+
+def test_줄이지_않은_근거는_카드도_머리말도_없다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [{"source": "짧은 것", "result": "본문 그대로"}]})
+    assert _cards(events, included=False) == []
+    assert [c["text"] for c in _cards(events, included=True)] == ["본문 그대로"]
+    assert d._resolve_opts({"evidence": [{"result": "x"}]}).evidence[0]["cut"] is None
+
+
+def test_줄였지만_예산을_넘겨_통째로_빠진_항목은_줄여_실었다고_적지_않는다(monkeypatch):
+    """항목 상한이 합계 예산과 같은 창에서는 줄인 항목 하나가 예산을 다 먹는다 — 그 뒤 항목은 줄여졌어도
+    통째로 빠진다. 좌석이 받지 못한 것을 '줄여 실었다' 고 적으면 거짓이다(예산 카드가 말한다)."""
+    cap = _item_cap()
+    assert cap == d._evid_budget(), "시험 전제 — 128K 창에서는 항목 상한이 합계 예산이다"
+    events = _stream(monkeypatch, {"evidence": [{"result": "짧은 본문"}, {"result": "가" * (cap * 2)}]})
+    assert [c["source"] for c in _cards(events, included=False)] == ["사전 근거 예산 초과"]
+
+
 # ── 좌석에 주지 않은 근거는 MCP 호출자에게도 보인다 ──────────────────────────────
 # 웹은 근거 패널에 '제외' 카드가 뜨지만 MCP 호출자가 보는 것은 잡 원장뿐이다. 원장이 근거
 # 카드를 아예 안 적어서, 위 카드를 내도 deliberate_status / deliberate_result 로는 안 보였다.

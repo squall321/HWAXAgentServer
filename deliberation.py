@@ -1020,6 +1020,7 @@ def _resolve_opts(req_opts):
                     o.evidence_shadowed.append((len(o.evidence) + 1, _used, len(res),
                                                 [(k, len(b)) for k, b in _cands[1:]]))
                 _key = it.get("key")
+                _body, _cutinfo = _fit_ev(res)
                 o.evidence.append({
                     "key": _key if isinstance(_key, str) and _EVID_KEY_RE.fullmatch(_key) else "",
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
@@ -1027,7 +1028,8 @@ def _resolve_opts(req_opts):
                     "args": str(it.get("args") or "")[:_EVID_ARGS_MAX],
                     # 앞에서 자르지 않는다 — 발표자료·보고서는 결론이 뒤에 있다.
                     # 낱장 표지가 있으면 경계에서 가운데를 덜어내고 무엇이 빠졌는지 밝힌다.
-                    "result": _fit_ev(res),
+                    # cut — 줄였으면 (원문 길이, 무엇을 뺐는지). 항목에 달아 둔다(스트림이 **실린** 항목만 알린다).
+                    "result": _body, "cut": _cutinfo,
                 })
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
@@ -1079,13 +1081,16 @@ def _ev_bodies(it: dict) -> list:
     return out
 
 
-def _fit_ev(res: str) -> str:
+def _fit_ev(res: str) -> tuple:
     """근거 항목 하나를 항목 예산에 맞춘다 — 잘랐으면 원문 길이와 함께 밝힌다.
 
+    반환 (실을 본문, 줄였으면 (원문 길이, 무엇을 뺐는지) · 안 줄였으면 None).
     항목 상한이 합계 예산보다 클 수 없다 — 작은 컨텍스트에서 항목 하나가 예산을 통째로
-    먹으면 나머지 근거가 전부 드롭된다."""
+    먹으면 나머지 근거가 전부 드롭된다.
+    본문 끝의 표식은 좌석이 본다. 그것만으로는 호출자가 모른다 — 화면 카드는 앞부분만 보이고 잡 원장에는
+    본문이 안 실린다. 줄인 사실을 따로 돌려주어 스트림이 카드로 알리게 한다."""
     body, note = fit_document(res, min(_EVID_ITEM_MAX, _evid_budget()))
-    return body if not note else f"{body}\n…[원문 {len(res):,}자 · {note}]"
+    return (body, None) if not note else (f"{body}\n…[원문 {len(res):,}자 · {note}]", (len(res), note))
 
 
 _DEFAULT_OPTS = _resolve_opts(None)   # env 기본값 스냅샷 — 요청 미지정 시 사용
@@ -3805,7 +3810,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     chat_ev_inject = ""
     _ev_in = 0                # 실제로 좌석에 실린 근거 수 — 예산을 넘긴 뒤쪽은 통째로 빠진다
     if opts.evidence:
-        _items, _budget, _dropped = [], 0, 0
+        _items, _budget, _dropped, _cut_lines = [], 0, 0, []
         for _ei, _e in enumerate(opts.evidence, start=1):
             _src, _res = _e.get("source") or "챗", _e.get("result", "")
             _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
@@ -3817,13 +3822,36 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 break
             _items.append(_line)
             _budget += len(_line)
-            yield _delib("evidence", source=f"챗 정리 · {_src}", text=_res[:_EVID_SHOW], included=True)
+            _shown = _res[:_EVID_SHOW]
+            if _e.get("cut"):
+                # 항목 상한에서 줄여 실었다 — 카드 머리에 적는다. 본문 끝의 표식은 표시 상한(_EVID_SHOW) 밖이라
+                # 화면에 안 보였고, 카드는 '심의에 포함' 으로만 떴다.
+                _cut_len, _cut_what = _e["cut"]
+                _shown = f"[줄여 실음 — 원문 {_cut_len:,}자 · {_cut_what}]\n" + _shown
+                _cut_lines.append(f"[e:{_ei}{'|' + _e['key'] if _e.get('key') else ''}] {_src}: "
+                                  f"원문 {_cut_len:,}자 · {_cut_what}")
+            yield _delib("evidence", source=f"챗 정리 · {_src}", text=_shown, included=True)
             ev_count["tool"] += 1
         # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
         if _dropped:
             yield _delib("evidence", source="사전 근거 예산 초과",
                          text=f"근거 {len(opts.evidence)}건 중 뒤쪽 {_dropped}건은 예산"
                               f"({_evid_budget():,}자)을 넘겨 좌석에 주지 않았다.", included=False)
+        # 줄여 실은 항목 — 좌석은 본문 끝 표식으로 알지만 호출자는 몰랐다. 안내가 '미리 자르지 마라' 고 하니
+        # 긴 문서 한 건이 보통의 경우인데, 128K 창에서 65,000자 보고서는 72% 가 빠지고도 잡 기록에는 '근거 1건'
+        # 뿐이었다. **실린 항목만** 적는다 — 줄인 뒤 예산을 넘겨 통째로 빠진 항목은 위 예산 카드가 말한다.
+        if _cut_lines:
+            _icap, _by_item = min(_EVID_ITEM_MAX, _evid_budget()), _EVID_ITEM_MAX <= _evid_budget()
+            yield _delib("evidence", source="사전 근거 항목 상한 초과", included=False,
+                         # 어느 쪽이 걸렸는지 가려 적는다 — 합계 예산이 걸렸는데 항목 천장을 가리키면 원인이
+                         # 아닌 설정을 만지게 한다.
+                         knob=("DELIB_EVID_ITEM_MAX" if _by_item else
+                               "합계 예산은 모델 컨텍스트에서 유도 — 천장 DELIB_EVID_BUDGET"),
+                         text=f"근거 {len(_cut_lines)}건은 항목 하나의 상한({_icap:,}자"
+                              + ("" if _by_item else " — 합계 예산이 항목 천장보다 작아 그 값이 걸린다")
+                              + ")을 넘어 줄여 실었다 — " + " / ".join(_cut_lines[:5])
+                              + (f" 외 {len(_cut_lines) - 5}건" if len(_cut_lines) > 5 else "")
+                              + ". 빠진 부분은 좌석이 보지 못했다.")
         _ev_in = len(_items)
         if _items:
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
