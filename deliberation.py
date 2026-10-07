@@ -100,6 +100,11 @@ _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 _EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
 _EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 150000)  # 항목당 **천장**(자) — 큰 발표자료 한 건
 _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
+# 근거 본문을 찾는 키 — 순서가 우선순위다. 정본은 `result` 이고 나머지는 폴백이다.
+# 종전엔 `result` 만 읽어서, 본문을 다른 키에 넣은 호출자의 근거가 **통째로 조용히** 사라졌다
+# (실사용: 25건을 넣은 심의가 근거 0건으로 끝까지 돌았다 — 2026-10-07). 도구 설명
+# (mcp_server)이 이 목록을 읽어 적는다.
+_EVID_BODY_KEYS = ("result", "text", "content", "excerpt", "summary", "body", "output", "data")
 _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천장**(자) — 1M 창 기준
 # ⚠ 위 값은 천장이고 실제 예산은 모델 컨텍스트에서 유도한다. 좌석 프롬프트 하나는
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
@@ -669,6 +674,9 @@ def _resolve_opts(req_opts):
         # 챗 워크스페이스가 정리해 넘긴 원천 근거(도구결과+출처) — 심의가 '검증 대상·결론 아님'으로
         # 좌석에 주입한다(요약 아닌 날것). 브리프의 결론이 심의를 오염시키지 않게 — 핸드오프 P1.
         evidence=[],
+        # 본문이 없어(또는 객체가 아니어서) 버린 근거 수 — 스트림이 카드로 알린다. 0 이 아닌데
+        # 조용하면 좌석도 호출자도 전부 실렸다고 믿는다.
+        evidence_dropped_empty=0,
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
@@ -774,15 +782,14 @@ def _resolve_opts(req_opts):
                     picked.append(m)
             o.modifiers = picked[:5]
         # 챗 핸드오프 원천 근거 — 항목당 {source, tool, args, result} 로 정규화·클램프.
-        # 결과 없는 항목은 근거가 아니므로 버린다. 상한은 _EVID_* 손잡이다(문서 한 건이 들어간다).
+        # 본문 없는 항목은 근거가 아니므로 버리되 **센다**. 상한은 _EVID_* 손잡이다(문서 한 건이 들어간다).
         ev = req_opts.get("evidence")
         if isinstance(ev, list):
             o.evidence = []
             for it in ev[:_EVID_ITEMS]:
-                if not isinstance(it, dict):
-                    continue
-                res = str(it.get("result") or "").strip()
+                res = _ev_body(it) if isinstance(it, dict) else ""
                 if not res:
+                    o.evidence_dropped_empty += 1
                     continue
                 o.evidence.append({
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
@@ -814,6 +821,26 @@ def _resolve_opts(req_opts):
     if o.timeout_s is not None:
         o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
     return o
+
+
+def _ev_body(it: dict) -> str:
+    """근거 항목의 본문 — _EVID_BODY_KEYS 를 차례로 보고 처음으로 비지 않은 값을 쓴다.
+
+    문자열이 아닌 값(표·목록)은 JSON 으로 싣는다. repr 로 실으면 홑따옴표·None·True 가 섞여
+    좌석이 수치를 다시 읽지 못하고, 한글은 이스케이프돼 사람도 못 읽는다.
+    참·거짓은 본문이 아니다 — `{"result": true, "data": …}` 의 result 는 성패 표시라, 그걸
+    본문으로 집으면 진짜 본문(data)을 가린다."""
+    for k in _EVID_BODY_KEYS:
+        v = it.get(k)
+        if isinstance(v, str):
+            body = v.strip()
+        elif v is None or isinstance(v, bool) or (isinstance(v, (list, dict)) and not v):
+            body = ""
+        else:
+            body = json.dumps(v, ensure_ascii=False, default=str)
+        if body:
+            return body
+    return ""
 
 
 def _fit_ev(res: str) -> str:
@@ -3406,6 +3433,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
                               "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라. 이 항목의 "
                               "수치·주장을 발언·결정문에 쓸 때는 해당 [e:N] 표지를 함께 적어라]\n" + "\n".join(_items))
+    # ⚠ 위 블록 **밖**이다. 전부 버려지면 opts.evidence 가 비어 그 블록에 아예 안 들어간다 —
+    #   근거 0건으로 도는 가장 나쁜 경우에 가장 조용해진다.
+    if opts.evidence_dropped_empty:
+        yield _delib("evidence", source="사전 근거 본문 없음", included=False,
+                     text=f"근거 {len(opts.evidence) + opts.evidence_dropped_empty}건 중 "
+                          f"{opts.evidence_dropped_empty}건은 본문이 없어(또는 항목이 객체가 아니어서) "
+                          f"좌석에 주지 않았다. 본문은 'result' 에 넣는다"
+                          f"({'·'.join(_EVID_BODY_KEYS[1:])} 도 차례로 찾는다).")
     # 얹을 층(2층 Modifier) — 켠 것들의 지시 블록. _tail 에 실어 base·base_blind(좌석·의장) 전체에 적용.
     mod_inject = _modifier_note(opts.modifiers)
     # 챗에서 이어진 대화 — 사람의 전제와 챗의 잠정 해석을 지위를 붙여 넣는다(둘 다 검증 대상).

@@ -133,3 +133,78 @@ def test_검색_오류_문구가_키_한가운데서_끊기지_않는다():
     hits, note = asyncio.run(d._agent_search_hits({"agent_search": tool}, "delib-baseline-defender", "질의"))
     assert hits == []
     assert note.count("delib-baseline-defender") == 2, note      # 첫 시도와 폴백 둘 다 온전히
+
+
+# ── 1-2. 본문이 `result` 가 아닌 키에 있어도 버리지 않는다 ───────────────────────
+def _ev(req_evidence):
+    return d._resolve_opts({"evidence": req_evidence})
+
+
+@pytest.mark.parametrize("key", ["result", "text", "content", "excerpt", "summary", "body", "output", "data"])
+def test_본문_키가_달라도_근거로_받는다(key):
+    """`result` 만 읽어서, 본문을 `text` 에 넣은 25건이 통째로 사라진 심의가 끝까지 돌았다."""
+    o = _ev([{"source": "E1-CH-015", key: "스프링백 0.42mm"}])
+    assert [e["result"] for e in o.evidence] == ["스프링백 0.42mm"]
+    assert o.evidence_dropped_empty == 0
+
+
+def test_본문_키는_순서대로_찾고_빈_값은_건너뛴다():
+    o = _ev([{"result": "  ", "text": "", "content": "셋째", "data": "여덟째"}])
+    assert o.evidence[0]["result"] == "셋째"
+    assert _ev([{"text": "둘째", "result": "첫째"}]).evidence[0]["result"] == "첫째"
+
+
+def test_객체_본문은_JSON_으로_싣는다():
+    """repr 로 실으면 홑따옴표·None·True 가 섞여 좌석이 수치를 다시 못 읽는다."""
+    o = _ev([{"source": "표", "data": {"부품": "힌지", "ok": True, "gap": None, "값": [1.5, 2]}}])
+    body = o.evidence[0]["result"]
+    assert body == '{"부품": "힌지", "ok": true, "gap": null, "값": [1.5, 2]}'
+    assert _ev([{"result": ["a", {"b": 1}]}]).evidence[0]["result"] == '["a", {"b": 1}]'
+
+
+def test_성패_표시는_본문이_아니다():
+    """`{"result": true, "data": …}` 모양 — result 를 본문으로 집으면 진짜 본문을 가린다."""
+    o = _ev([{"result": True, "data": {"gap_mm": 0.12}}, {"result": 0.42}, {"result": False}])
+    assert [e["result"] for e in o.evidence] == ['{"gap_mm": 0.12}', "0.42"]
+    assert o.evidence_dropped_empty == 1
+
+
+def test_본문이_없는_항목과_객체가_아닌_항목을_센다():
+    o = _ev([{"source": "빈것"}, {"result": ""}, {"data": {}}, {"output": []}, "문자열 항목", None,
+             {"result": "유일한 본문"}])
+    assert [e["result"] for e in o.evidence] == ["유일한 본문"]
+    assert o.evidence_dropped_empty == 6
+
+
+def test_버린_것이_없으면_0_이고_기본값에도_있다():
+    assert _ev([{"result": "x"}]).evidence_dropped_empty == 0
+    assert d._DEFAULT_OPTS.evidence_dropped_empty == 0
+    assert d._resolve_opts({"evidence": "목록이 아님"}).evidence_dropped_empty == 0
+
+
+def _cards(events, included=None):
+    return [data for ev, data in events if ev == "delib" and data.get("kind") == "evidence"
+            and (included is None or data.get("included") is included)]
+
+
+def test_전부_버려져도_카드가_나간다(monkeypatch):
+    """종전 카드 자리는 `if opts.evidence:` 안이다 — 전부 버려지면 그 블록에 아예 안 들어가서,
+    가장 나쁜 경우(근거 0건으로 돈 심의)에 가장 조용했다."""
+    events = _stream(monkeypatch, {"evidence": [{"source": f"E{i}"} for i in range(25)]})
+    out = _cards(events, included=False)
+    assert len(out) == 1, [c.get("source") for c in out]
+    assert "25건" in out[0]["text"] and "result" in out[0]["text"], out[0]["text"]
+    assert not _cards(events, included=True), "본문이 없는데 좌석에 준 근거가 있다"
+
+
+def test_일부만_버려지면_카드는_하나고_나머지는_실린다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [{"result": "본문 A"}, {"source": "빈것"}, "항목 아님",
+                                                {"text": "본문 B"}]})
+    out = _cards(events, included=False)
+    assert len(out) == 1 and "4건 중 2건" in out[0]["text"], out
+    assert [c["text"] for c in _cards(events, included=True)] == ["본문 A", "본문 B"]
+
+
+def test_버린_것이_없으면_카드도_없다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [{"result": "본문 A"}]})
+    assert _cards(events, included=False) == []
