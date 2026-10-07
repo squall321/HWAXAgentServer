@@ -105,6 +105,16 @@ def test_voc_와_chair_template_이_advanced_안내에_있다():
             assert tpl in text, f"의장 틀 {tpl} 이 안내에 없다"
 
 
+def test_persona_knowledge_가_advanced_안내에_있다():
+    """요청 단위로 끌 수 있어도 안내에 없으면 호출자는 모른다 — voc 가 정확히 그렇게 묻혀 있었다."""
+    help_adv = asyncio.run(m.deliberate_jobs())["options"]["advanced"]
+    for text in (_listed("deliberate_start"), help_adv, m.deliberate_start.__doc__ or ""):
+        assert "persona_knowledge" in text, text[-300:]
+    for text in (_listed("deliberate_start"), help_adv):
+        at = text.index("persona_knowledge(")
+        assert "지식카드" in text[at:at + 200] and "소급" in text[at:at + 200], text[at:at + 200]
+
+
 def test_안내한_손잡이가_실제로_엔진까지_간다():
     o = d._resolve_opts(m._build_opts(advanced={"voc": "off", "chair_template": "mechanism"}))
     assert (o.voc, o.chair_template) == ("off", "mechanism")

@@ -169,12 +169,15 @@ _EVID_DESC = (
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
 # 엔진이 처음부터 받았는데 어디에도 안 적혀 있어, 소급 검증에 최근 VOC 가 섞여 들어갔다.
+# persona_knowledge 는 종전에 환경변수뿐이라 한 심의만 끌 방법이 없었다(S26U 피드백 1-5).
 _ADV_DESC = (
     "advanced(품질 손잡이 dict, 보통 비운다) — free_tools·tool_budget·chair_bestof·chair_cite·"
     "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries·timeout_s · "
     "voc(불량 환기: auto|off|always — auto 는 화두에 불량 낱말이 있으면 최근 VOC 를 조회해 좌석에 "
     "깐다. 리스크 심사 화두에는 '이슈'·'품질' 이 거의 항상 들어 있어 사실상 매번 돈다. 그 시점 "
     "자료만으로 다시 심사하는 소급 검증에서는 off 로 꺼라) · "
+    "persona_knowledge(좌석 지식카드 조회: 1|0 — 1 이면 좌석마다 제 지식카드에서 화두 관련 발췌를 "
+    "조회해 깐다. 카드는 지금 시점의 것이라 소급 검증에서는 0 으로 꺼라) · "
     f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
     "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다)."
 )
@@ -249,7 +252,8 @@ async def deliberate_start(
                      않으려 할 때. 기본 True.
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
-                  parse_retries · timeout_s · voc · chair_template. 보통 비운다(뜻은 _ADV_DESC).
+                  parse_retries · timeout_s · voc · persona_knowledge · chair_template.
+                  보통 비운다(뜻은 _ADV_DESC).
     """
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
                        tools=tools, apps=apps, human_note=human_note, options=options,

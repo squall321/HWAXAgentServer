@@ -726,12 +726,17 @@ def _resolve_opts(req_opts):
         # 이어하기 좌석 재심사 — 요청 단위로 끌 수 있어야 한다. 사람이 이어하기 명단을 **직접 고르면**
         # 포털이 0 을 보낸다: 고른 명단 위에 재심사가 좌석을 몰래 더 얹으면 '고르게 했다'가 거짓이 된다.
         rescreen=_RESCREEN,
+        # 페르소나 지식카드 조회(결정적 RAG) — 요청 단위로 끌 수 있어야 한다. 종전엔 환경변수뿐이라
+        # 끄려면 서버를 다시 띄워야 했고, 그건 그 시각 심의 중인 전원에게 걸린다. 그 시점 자료만으로
+        # 다시 심사하는 소급 검증은 지식카드를 빼야 한다 — 카드는 오늘의 카드다(S26U 피드백 1-5).
+        persona_knowledge=_env_int("DELIB_PERSONA_KNOWLEDGE", 1),
     )
     if isinstance(req_opts, dict):
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
                   "free_tools", "tool_budget", "stop_after_round", "build_plan",
-                  "rounds_so_far", "save_report", "append_to_report_id", "rescreen"):
+                  "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
+                  "persona_knowledge"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -3357,7 +3362,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 태그 가중치)를 자동 적용하므로 검색 폭은 전문가 설정을 따르고, 주입량은 문자 예산으로 자른다
     # (카드 전문을 통째로 넣으면 인원수 × 라운드로 곱해져 컨텍스트가 폭발한다).
     knowledge_by_key: dict = {}
-    if _env_int("DELIB_PERSONA_KNOWLEDGE", 1) and "agent_search" in tools:
+    if opts.persona_knowledge and "agent_search" in tools:
         _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
 
         _hit_line = knowledge_line      # 챗과 같은 포맷 — 출처·인과상태가 함께 간다
