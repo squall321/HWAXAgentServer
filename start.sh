@@ -50,6 +50,10 @@ PORT="${AGENT_PORT:-9009}"                                   # 9000 is taken by 
 HOST="${AGENT_HOST:-127.0.0.1}"
 export VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8000/v1}"
 export VLLM_MODEL="${VLLM_MODEL:-qwen2.5-7b-dev}"
+# 챗 **스트리밍** 응답에서 청크 사이 침묵을 기다리는 한도(초 — 첫 토큰 대기도 여기 든다). langchain-openai 의
+# 기본은 120 이고 어디에도 안 적혀 있었다. 좌석 많은 심의가 공유 LLM 을 수 시간 차지하면 챗의 첫 토큰이 큐에서
+# 120초를 넘겨 끊긴다 — 300 으로 넉넉히 둔다. 심의 경로는 비스트리밍이라 이 값과 무관하다(DELIB_TIMEOUT_S).
+export LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S="${LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S:-300}"
 # 미치환 마커 가드 — .env 가 apply-envs.sh 치환 없이 킷을 그대로 복사·수동편집돼 @FROM_RA:...@
 # 마커가 남으면, 서버는 그 엉터리 주소로 vLLM 에 붙으려다 매 요청 APIConnectionError 로 죽는다.
 # cryptic 한 연결 에러 대신 기동 시 즉시·명확히 멈춘다(값 교체 방법도 안내).

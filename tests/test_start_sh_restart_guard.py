@@ -1,4 +1,4 @@
-# start.sh 의 재기동 가드 — 도는 심의가 있으면 떠 있는 서버를 내리지 않는지, /health 가 그 수를 주는지
+# start.sh 의 재기동 가드와 서버에 넘기는 환경 — 도는 심의가 있으면 떠 있는 서버를 내리지 않는지, /health 가 그 수를 주는지
 #
 # 재기동은 도는 심의와 줄 선 심의를 전부 끊는다. 좌석 20석 넘는 패널은 수 시간 도는데, 코드를 고치고
 # ./start.sh 를 부르는 순간(update-forges 도 직접 부른다) 그 심의가 말없이 사라졌다. 한도를 아무리 넉넉히 잡아도
@@ -48,7 +48,8 @@ exit 0
 }
 _VENV = {
     "pip": "#!/usr/bin/env bash\nexit 0\n",
-    "uvicorn": "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$STUB_DIR/uvicorn.args\"\nexit 0\n",
+    "uvicorn": ("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$STUB_DIR/uvicorn.args\"\n"
+                "printf '%s\\n' \"${LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S:-없음}\" > \"$STUB_DIR/chunk\"\nexit 0\n"),
 }
 
 
@@ -180,6 +181,29 @@ def test_유예를_설정으로_바꾼다(box):
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
     box.run(AGENT_STOP_GRACE_S="7")
     assert box.read("sleep.args")[0] == "7", box.read("sleep.args")
+
+
+# ── 서버에 넘기는 환경 ───────────────────────────────────────────────────────
+def test_챗_스트리밍_청크_한도를_300초로_내보내고_설정이_있으면_그_값이다(box):
+    """langchain-openai 의 기본은 120초다 — 심의가 공유 LLM 을 차지한 동안 챗의 첫 토큰이 그 안에 안 온다."""
+    box.close()                                   # 옛 서버 없이 곧바로 띄운다
+    box.run()
+    assert box.read("chunk") == ["300"], box.read("chunk")
+    box.run(LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S="45")
+    assert box.read("chunk") == ["45"]
+    (box.dir / ".env").write_text("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S=600\n", encoding="utf-8")
+    box.run()
+    assert box.read("chunk") == ["600"], "박스 .env 의 값이 기본값에 덮였다"
+
+
+def test_라이브러리가_그_이름의_환경변수를_읽는다(monkeypatch):
+    """이름이 틀리면 내보내도 아무 일도 없다 — 라이브러리를 올릴 때 이 이름이 바뀌면 여기서 걸린다."""
+    from langchain_openai import ChatOpenAI
+
+    monkeypatch.setenv("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S", "300")
+    assert ChatOpenAI(base_url="http://127.0.0.1:1/v1", api_key="EMPTY", model="x").stream_chunk_timeout == 300.0
+    monkeypatch.delenv("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S")
+    assert ChatOpenAI(base_url="http://127.0.0.1:1/v1", api_key="EMPTY", model="x").stream_chunk_timeout == 120.0
 
 
 # ── /health 가 그 수를 준다 ───────────────────────────────────────────────────
