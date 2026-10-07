@@ -119,11 +119,13 @@ def test_요청_단위_한도로_돈_심의는_그_값을_말한다(monkeypatch)
 
 def test_연결하지_못한_것은_한도를_늘리라고_하지_않는다(monkeypatch):
     """느린 것이 아니라 닿지 않는 것이다 — 호출 한도를 올려도 풀리지 않는다."""
-    for exc, name in ((_connect_timeout(), "APITimeoutError"), (_refused(), "APIConnectionError")):
+    # 연결 시간 초과는 걸린 연결 한도(10초)를 말하고, 거절은 한도와 무관하니 말하지 않는다.
+    for exc, want in ((_connect_timeout(), "LLM 서버에 10초 안에 연결하지 못했다(APITimeoutError)"),
+                      (_refused(), "LLM 서버에 연결하지 못했다(APIConnectionError)")):
         status, warning, card = _loss(_run(monkeypatch, {"mat-c": exc}))
         for text in (status["step"], warning["message"], card["text"]):
-            assert f"mat-c · LLM 서버에 연결하지 못했다({name})" in text, text
-            assert "늘린다" not in text and "초 안에" not in text, text
+            assert f"mat-c · {want}" in text, text
+            assert "늘린다" not in text and "1,800초" not in text, text
         assert "VLLM_BASE_URL" in card["knob"] and "LLM_CONNECT_TIMEOUT_S" in card["knob"], card["knob"]
         assert "DELIB_TIMEOUT_S" not in card["knob"], card["knob"]
 

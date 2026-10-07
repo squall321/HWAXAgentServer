@@ -2198,7 +2198,11 @@ def _llm_fail_note(exc: BaseException, llm) -> tuple[str, str]:
     # openai 는 연결 시간 초과도 APITimeoutError 로 올린다 — 원인 사슬의 httpx 예외로 가른다. 연결 쪽은
     # 한도를 늘릴 일이 아니다(느린 것이 아니라 닿지 않는 것이다).
     if any("Connect" in n for n in chain):
-        return (f"LLM 서버에 연결하지 못했다({name}) — LLM 서버 주소와 상태를 확인하라",
+        # 연결 **시간 초과**면 걸린 연결 한도를 적는다(거절·이름 풀이 실패는 한도와 무관하다).
+        conn = getattr(getattr(llm, "request_timeout", None), "connect", None)
+        within = (f"{conn:,.0f}초 안에 " if any("ConnectTimeout" in n for n in chain)
+                  and isinstance(conn, (int, float)) and conn else "")
+        return (f"LLM 서버에 {within}연결하지 못했다({name}) — LLM 서버 주소와 상태를 확인하라",
                 "VLLM_BASE_URL · 연결 한도 LLM_CONNECT_TIMEOUT_S")
     if any("Timeout" in n for n in chain):
         return ("LLM 호출이 " + (f"{read:,.0f}초 안에 " if read else "제한 시간 안에 ") + "끝나지 않았다("
