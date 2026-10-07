@@ -189,7 +189,14 @@ _EVID_DESC = (
 # 이 글만 낡는다(근거 상한 '12,000자' 가 그렇게 낡았다).
 _ADV_DESC = (
     "advanced(품질 손잡이 dict, 보통 비운다) — free_tools·tool_budget·chair_bestof·chair_cite·"
-    "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries·timeout_s · "
+    "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries · "
+    # 종전엔 이름만 있었다 — '심의 타임아웃' 으로 읽고 심의 전체 시간을 넣거나, 엔진이 받는 최대값을 몰라
+    # 넘겨 보내고 말없이 죄였다. 범위는 엔진 상수에서 읽어 적는다.
+    f"timeout_s(**LLM 호출 1회**의 한도(초) — 심의 전체 시간이 아니다. 심의에는 전체 시간 한도가 없다. "
+    "좌석 발언·자유 조회 스텝·의장·요약 호출 하나하나에 걸린다. 비우면 서버 기본값(DELIB_TIMEOUT_S — "
+    f"지금 값은 deliberate_jobs 의 limits.timeout_s_default)이고, {_engine._TIMEOUT_REQ_MIN_S:.0f}~"
+    f"{_engine.DELIB_TIMEOUT_MAX_S:.0f}초로 받는다(상한은 서버 설정 DELIB_TIMEOUT_MAX_S). 범위 밖이면 "
+    "그 끝값으로 돌고 deliberate_status 의 evidence_omitted 에 뜬다. 좌석이 '시간 초과' 로 빠지면 올린다) · "
     "voc(불량 환기: auto|off|always — auto 는 화두에 불량 낱말이 있으면 최근 VOC 를 조회해 좌석에 "
     "깐다. 리스크 심사 화두에는 '이슈'·'품질' 이 거의 항상 들어 있어 사실상 매번 돈다. 그 시점 "
     "자료만으로 다시 심사하는 소급 검증에서는 off 로 꺼라) · "
@@ -369,8 +376,10 @@ def _carry_seats(prev: dict) -> list:
 # 찍힌 보고서에 페이지로 이어 붙였다. 호출자에게는 막을 인자도 알림도 없었다. voc=off · free_tools=0 ·
 # persona_knowledge=0 도 같이 풀렸고, 저장하지 말라던(save_report=False) 심의가 이어하기에서 보고서를 만들었다.
 # tools(지정 도구 사전 호출)는 넣지 않는다 — 이어받으면 같은 도구를 또 불러 유입이 는다.
+# timeout_s(LLM 호출 1회 한도)도 이어받는다 — 큰 패널이라 한도를 올려 돈 심의를 이어가면 서버 기본값으로
+# 돌아가, 첫 회차에 멀쩡하던 좌석이 이어하기에서 시간 초과로 빠졌다. 원장에는 상한에서 죈 값이 적혀 있다.
 _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_prepass", "search_sources",
-               "apps", "save_report")
+               "apps", "save_report", "timeout_s")
 
 
 @mcp.tool(
@@ -611,7 +620,10 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
         },
         "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX,
                    "seats": _engine.MAX_REQ_SEATS, "tools": _engine._TOOLS_MAX,
-                   "apps": _engine._APPS_MAX, "options": _engine._OPTIONS_MAX},
+                   "apps": _engine._APPS_MAX, "options": _engine._OPTIONS_MAX,
+                   # LLM 호출 1회 한도(초) — 요청이 청할 수 있는 최대값과, 안 주면 걸리는 서버 기본값(0=무제한).
+                   "timeout_s_max": _engine.DELIB_TIMEOUT_MAX_S,
+                   "timeout_s_default": getattr(getattr(_APP, "state", None), "delib_timeout_s", None)},
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,

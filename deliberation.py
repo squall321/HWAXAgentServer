@@ -101,6 +101,24 @@ _TOOLS_MAX, _APPS_MAX, _OPTIONS_MAX, _NN_MAX = 6, 3, 8, 12
 # 몫으로 줄인다 — 이어 붙여 자르면 뒤쪽 도구가 통째로 빠진다(스트림의 0.7 단계).
 _TOOL_CHUNK_MAX, _TOOL_INJECT_MAX = 2000, 5000
 _SUMMARY_MAX, _NN_ITEM_MAX, _OPTION_ITEM_MAX, _ROLE_REQ_MAX = 8000, 1200, 400, 2000
+# 요청이 청할 수 있는 LLM 호출 한도(delib_opts.timeout_s · MCP advanced.timeout_s)의 범위(초). **LLM 호출
+# 시도 1회** 기준이고 심의 전체 시간이 아니다 — 서버 기본값은 DELIB_TIMEOUT_S 이고 심의에는 벽시계가 없다.
+# 종전엔 10~1800 이 리터럴이었고 넘으면 **말없이** 죄었다. 2시간을 청한 호출자는 30분으로 돈 줄 몰랐고,
+# 잡 기록에는 보낸 값이 걸린 것처럼 남았다. 같은 1800 이 포털 스키마·프론트 클램프에도 따로 박혀 있어, 한쪽
+# 값만 아는 호출자가 포털에서 요청 전체를 422 로 잃었다.
+# ⚠ 이 **기본값**이 정본이다 — 포털 DelibOpts.timeout_s 의 le 와 프론트 클램프가 같은 수여야 한다
+#   (HWAXPortal backend/tests/test_delib_timeout_cap_contract 가 이 줄을 읽어 대조한다). 한 박스에서만 더
+#   받으려면 기본값은 두고 환경값을 올린다. 올리면 바깥 한도를 같이 본다 — LLM 논리 호출 1회의 최악이
+#   (1+DELIB_LLM_MAX_RETRIES)×이 값이라(기본 28,808초), 리스크 앱 패널 벽시계와 포털·nginx·리스크 앱의
+#   침묵 한도가 그보다 커야 한다.
+_TIMEOUT_REQ_MIN_S = 10.0
+DELIB_TIMEOUT_MAX_S = _env_float("DELIB_TIMEOUT_MAX_S", 14400.0)
+if DELIB_TIMEOUT_MAX_S < _TIMEOUT_REQ_MIN_S:
+    # 0·음수는 '상한 없음' 이 아니다 — 하한과 뒤집혀 timeout_s 를 준 요청이 전부 10초로 돈다(좌석 전원이
+    # 시간 초과로 빠진다). 이 파일의 다른 손잡이는 0 이 무제한이라 그렇게 넣기 쉽다. 기본값으로 읽는다.
+    print(f"[deliberation] env DELIB_TIMEOUT_MAX_S={DELIB_TIMEOUT_MAX_S:g} 는 하한 "
+          f"{_TIMEOUT_REQ_MIN_S:g}초 미만 — 기본값 14400 으로 읽는다")
+    DELIB_TIMEOUT_MAX_S = 14400.0
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
@@ -893,6 +911,8 @@ def _resolve_opts(req_opts):
         # (신뢰 안 되는 입력이 심의를 죽이지 않게), 그 사실을 스트림이 카드로 알린다. req_cut 과 따로 둔다 —
         # 그쪽 카드는 '상한을 넘어 앞에서부터 남겼다' 라 여기엔 틀린 말이다.
         req_unread={},
+        # 호출당 한도(timeout_s)를 받는 범위로 죄었으면 (보낸 값, 걸린 값) — 스트림이 카드로 알린다.
+        timeout_clamped=None,
     )
     if isinstance(req_opts, dict):
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
@@ -1047,7 +1067,8 @@ def _resolve_opts(req_opts):
             if o.search_sources:
                 o.rebut_quote = 1
                 o.chair_cite = 1
-    # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5, 타임아웃 10~1800s
+    # 안전 보정 — 인용 계약 켜면 재시도 하한 2(신규 스키마 준수율), best-of 1~5,
+    # 타임아웃 10~DELIB_TIMEOUT_MAX_S 초
     if o.rebut_quote and o.parse_retries < 2:
         o.parse_retries = 2
     o.parse_retries = max(0, min(10, o.parse_retries))   # 방어심층 — 직접 호출 시 재시도 폭주 상한
@@ -1058,7 +1079,10 @@ def _resolve_opts(req_opts):
     o.rescreen = 1 if o.rescreen else 0
     o.tool_budget = max(1, min(6, o.tool_budget))        # 자유 조회 1인당 호출 상한
     if o.timeout_s is not None:
-        o.timeout_s = max(10.0, min(1800.0, o.timeout_s))
+        _asked = o.timeout_s
+        o.timeout_s = max(_TIMEOUT_REQ_MIN_S, min(DELIB_TIMEOUT_MAX_S, o.timeout_s))
+        if o.timeout_s != _asked:       # nan 도 여기로 온다(자기와도 같지 않다) — 상한으로 돈다
+            o.timeout_clamped = (_asked, o.timeout_s)
     return o
 
 
@@ -3271,6 +3295,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         opts_b.req_cut = {}     # 줄인 요청 값은 1단이 이미 알렸다 — 여기서부터는 요약·좌석·의견을 엔진이 갈아 끼운다
         opts_b.req_unread = {}  # 읽지 못한 값도 1단이 알렸다 — 단마다 같은 카드를 또 내지 않는다
         opts_b.seats_no_key = None      # 키 없는 지정 좌석도 같다 — 지정 좌석은 1단에 앉았다
+        opts_b.timeout_clamped = None   # 죈 호출당 한도도 같다 — 값은 단마다 그대로 걸리고 알림은 1단이 냈다
         opts_b.chair_template = "sim-plan"
         opts_b.continue_summary = decision_a[:8000]
         opts_b.continue_non_negotiables = nn_a[:12]
@@ -3306,6 +3331,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             opts_c.req_cut = {}
             opts_c.req_unread = {}
             opts_c.seats_no_key = None
+            opts_c.timeout_clamped = None
             opts_c.chair_template = "build-plan"
             opts_c.continue_summary = decision_b[:20000]
             opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
@@ -3893,6 +3919,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="요청 값 상한 초과", included=False,
                      text="요청에 실린 값이 상한을 넘어 앞에서부터 남겼다 — " + " / ".join(opts.req_cut.values())
                           + ". 뒤쪽은 이 심의에 쓰이지 않았다.")
+    # 호출당 한도(timeout_s)를 받는 범위로 죄었다 — 같은 이름의 카드로 알리되 글은 따로 쓴다(위 글은 목록을
+    # 앞에서부터 남긴 것이라 숫자 하나에는 틀린 말이다). 알림이지 좌석에 안 준 근거가 아니다(notice).
+    # 설정·필드 이름은 글에 넣지 않고 knob 으로 싣는다(화면에도 뜨는 글이다 — 잡 원장이 붙인다).
+    if opts.timeout_clamped:
+        _t_asked, _t_got = opts.timeout_clamped
+        yield _delib("evidence", source="요청 값 상한 초과", included=False, notice=True,
+                     knob="timeout_s · 상한 DELIB_TIMEOUT_MAX_S",
+                     text=f"요청한 호출당 타임아웃 {_t_asked:,.0f}초는 받는 범위({_TIMEOUT_REQ_MIN_S:,.0f}~"
+                          f"{DELIB_TIMEOUT_MAX_S:,.0f}초) 밖이라 {_t_got:,.0f}초로 돈다 — LLM 호출 1회의 "
+                          "한도이고 심의 전체 시간이 아니다.")
     # 읽지 못한 요청 값 — 기본값으로 돌았다는 것을 알린다. 말없이 넘기면 호출자는 자기가 끈 줄 안다.
     if opts.req_unread:
         yield _delib("evidence", source="요청 값 해석 불가", included=False,

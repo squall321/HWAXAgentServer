@@ -507,7 +507,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 상한에서 줄인 것(rounds=99)이 걸린 값처럼 남는다 — 호출자가 손잡이를 끈 줄 아는 그 기록이 된다.
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
-    applied = {**applied, **{k: getattr(_read, k) for k in applied if k in _INT_KEYS or k == "voc"}}
+    # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
+    applied = {**applied, **{k: getattr(_read, k) for k in applied
+                             if k in _INT_KEYS or k in ("voc", "timeout_s")}}
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
