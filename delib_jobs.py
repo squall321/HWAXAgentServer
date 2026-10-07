@@ -384,8 +384,10 @@ def _apply(job: dict, event: str, data: dict) -> None:
     elif event == "status":
         step = data.get("step")
         if step:
-            job["step"] = str(step)
-            job["steps"] = (job.get("steps") or [])[-29:] + [str(step)]
+            # 설정 이름(knob)은 좌석에 주지 않은 카드와 같다 — 화면 글에는 없고 여기서 붙인다.
+            step = str(step) + (f" (설정 {data['knob']})" if data.get("knob") else "")
+            job["step"] = step
+            job["steps"] = (job.get("steps") or [])[-29:] + [step]
             # 창(최근 30줄) 밖으로 밀려난 줄이 있는지 호출자가 알게 전체 수를 센다. 경고도 같다.
             job["steps_total"] = int(job.get("steps_total") or 0) + 1
     elif event == "result":

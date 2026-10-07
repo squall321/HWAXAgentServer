@@ -3741,6 +3741,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(_kn_seats)}명 "
                                       f"(한 번에 {_kn_par}명 · 건당 최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)",
                               "tool": "agent_search"})
+        # 묻지 않은 좌석은 그렇다고 한 줄로 말한다. 인원수에서 빼기만 하면 '주입 — 2/2명 확보' 가 전원에게
+        # 물은 것으로 읽힌다 — 반대석을 등록하고 설정에 적는 것을 잊은 박스에서는 그 한 석이 빠졌다는 것을
+        # 좌석 목록과 수를 맞춰 봐야만 알았다. 경고·카드로 내지 않는다(설계된 건너뛰기다 — 진짜 강등과
+        # 섞이면 안 된다). 줄 머리를 '지식카드 ' 로 시작하지 않는다 — 좌석별 진행 줄과 같아 보이면 물은
+        # 것으로 읽힌다. 설정 이름은 글에 넣지 않고 knob 으로 싣는다(화면에 뜨는 줄이다 — 잡 원장이 붙인다).
+        _kn_asked = {p["key"] for p in _kn_seats}
+        _kn_skip = [p["key"] for p in personas if p["key"] not in _kn_asked]
+        if _kn_skip:
+            yield _sse("status", {"step": f"합성 지정석 {len(_kn_skip)}석은 지식카드를 묻지 않는다 — "
+                                          f"{', '.join(_kn_skip)} (전문가 레지스트리에 없는 키다. 등록해 "
+                                          "두었으면 서버 설정에 그 키를 적어야 조회한다)",
+                                  "tool": None, "knob": "DELIB_KNOWLEDGE_SYNTHETIC_SEATS"})
         _kn_notes: list[str] = []
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).

@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import deliberation as d  # noqa: E402
 
 # 같은 하네스를 쓴다 — 스트림을 실제로 돌린다(_pin_context 는 이 파일에도 걸리게 이름째 가져온다).
@@ -61,6 +63,63 @@ def test_합성이_아닌_좌석은_적지_않아도_조회한다(monkeypatch):
     """이 설정은 합성 지정석을 **더 여는** 목록이다 — 조회할 좌석을 고르는 허용 목록이 아니다."""
     asked, _ = _asked(monkeypatch, [DEFENDER], {})
     assert asked == {"mech-a", "rel-b"}, sorted(asked)
+
+
+# ── 묻지 않은 좌석은 그렇다고 말한다 ─────────────────────────────────────────────
+# 묻지 않은 좌석을 인원수에서 빼기만 하면 '지식카드 주입 — 2/2명 확보' 가 전원에게 물은 것으로 읽힌다. 반대석을
+# AIDataHub 에 등록하고 설정에 적는 것을 잊은 박스에서는 그 한 석이 빠졌다는 것을 알 길이 좌석 목록과 수를
+# 맞춰 보는 것뿐이었다. 한 줄로 말한다 — 경고가 아니다(설계된 건너뛰기다. 진짜 강등과 섞이면 안 된다).
+_KNOB = "DELIB_KNOWLEDGE_SYNTHETIC_SEATS"
+
+
+def _skip_lines(events):
+    return [data for ev, data in events if ev == "status" and "묻지 않는다" in data.get("step", "")]
+
+
+def test_묻지_않은_합성_지정석을_한_줄로_밝힌다(monkeypatch):
+    _asked_keys, events = _asked(monkeypatch, [], {"chair_template": "risk-review"})
+    lines = _skip_lines(events)
+    assert len(lines) == 1, _steps(events)
+    step = lines[0]["step"]
+    assert DEFENDER in step and "1석" in step and "레지스트리" in step, step
+    assert not step.startswith("지식카드 "), "좌석별 진행 줄(지식카드 N/M — 키)과 같은 머리를 쓰면 물어본 것으로 읽힌다"
+    # 설정 이름은 화면 글에 넣지 않고 따로 싣는다 — 잡 원장이 붙여 MCP 호출자와 운영자가 본다(아래 시험).
+    assert _KNOB not in step and lines[0].get("knob") == _KNOB, lines[0]
+    assert not [data for ev, data in events if ev == "warning"], "설계된 건너뛰기를 강등 경고로 냈다"
+    steps = _steps(events)
+    assert any(s.startswith("지식카드 주입 — 2/2명") for s in steps), "인원수는 물어본 좌석만 센다"
+
+
+def test_잡_원장의_상태줄에는_그_설정_이름이_붙는다():
+    import delib_jobs
+
+    job = {"id": "t-step-knob"}
+    delib_jobs._apply(job, "status", {"step": "합성 지정석 1석은 지식카드를 묻지 않는다", "knob": _KNOB})
+    delib_jobs._apply(job, "status", {"step": "보통 줄"})
+    assert job["steps"] == [f"합성 지정석 1석은 지식카드를 묻지 않는다 (설정 {_KNOB})", "보통 줄"], job["steps"]
+    assert job["step"] == "보통 줄"
+
+
+def test_설정에_적은_좌석은_빼고_적지_않은_좌석만_밝힌다(monkeypatch):
+    seats = _SEATS + [{"key": DEFENDER, "role": "기준선 옹호", "origin": "adversary"},
+                      {"key": "delib-contrarian", "role": "반대"}]
+    _asked_keys, events = _asked(monkeypatch, [DEFENDER], {"personas": seats})
+    (line,) = _skip_lines(events)
+    assert "delib-contrarian" in line["step"] and DEFENDER not in line["step"], line["step"]
+
+
+def test_전원에게_물었으면_그_줄이_없다(monkeypatch):
+    _asked_keys, events = _asked(monkeypatch, [DEFENDER], {"chair_template": "risk-review"})
+    assert _skip_lines(events) == []
+    _asked_keys, events = _asked(monkeypatch, [], {})          # 합성 좌석이 없는 패널
+    assert _skip_lines(events) == []
+
+
+@pytest.mark.parametrize("off", [{"persona_knowledge": 0}, {"sealed": 1}])
+def test_지식카드를_아예_안_묻는_심의에서는_그_줄도_없다(monkeypatch, off):
+    """아무에게도 안 묻는데 한 석만 집어 '묻지 않는다' 고 하면 나머지는 물은 것으로 읽힌다."""
+    _asked_keys, events = _asked(monkeypatch, [], {"chair_template": "risk-review", **off})
+    assert _skip_lines(events) == []
 
 
 # ── 봉인은 이것도 닫는다 ─────────────────────────────────────────────────────────
