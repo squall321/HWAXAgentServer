@@ -281,14 +281,15 @@ async def deliberate_start(
         personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 상한은
                   deliberation.MAX_REQ_SEATS(지금 값은 deliberate_jobs 의 limits) — 넘친 좌석은 빼고
                   상태줄로 알린다. 지정 반대석은 상한 밖에서 한 석 더 앉는다.
-        tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름(최대 6).
-        apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다(최대 3).
+        tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름. 상한은 deliberation._TOOLS_MAX
+               (지금 값은 deliberate_jobs 의 limits) — 넘친 것은 빼고 evidence_omitted 로 알린다.
+        apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다. 상한은 deliberation._APPS_MAX(위와 같다).
         human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation.HUMAN_NOTE_MAX
                     (지금 값은 deliberate_jobs 의 limits) — 넘으면 앞부분만 싣고 evidence_omitted 로 알린다.
         search_sources: 웹 리서치 소스 토글. 지정하면 인용 계약이 강제된다.
-        options: 후보안 목록(안 선택용, 최대 8). 2개 이상이면 최종 라운드가 이 중에서 고르는 표결을
-                 요구한다. 없으면 표결을 강제하지 않는다 — 후보 없이 표를 받으면 좌석이 방금 자기가
-                 함께 만든 결론에 찬성표를 던져 정보량이 0 이 된다.
+        options: 후보안 목록(안 선택용, 상한은 deliberation._OPTIONS_MAX). 2개 이상이면 최종 라운드가
+                 이 중에서 고르는 표결을 요구한다. 없으면 표결을 강제하지 않는다 — 후보 없이 표를 받으면
+                 좌석이 방금 자기가 함께 만든 결론에 찬성표를 던져 정보량이 0 이 된다.
         stop_after_round: 1 이면 초기 라운드까지만 돌고 사람 검토를 기다린다(체크포인트).
         save_report: False 면 Report Archive 저장을 건너뛴다. 탐색적 심의로 아카이브를 어지럽히지
                      않으려 할 때. 기본 True.
@@ -482,16 +483,19 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
             "evidence": _EVID_DESC,
             "personas": f"좌석 직접 지정(≤{_engine.MAX_REQ_SEATS} — 넘친 좌석은 빼고 상태줄로 알린다. "
                         "지정 반대석은 상한 밖에서 한 석 더 앉는다). 비우면 서버가 발굴한다",
-            "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
+            "tools": f"심의 전 실제 호출할 도구(≤{_engine._TOOLS_MAX}) · apps: 좌석 자유 조회 범위"
+                     f"(≤{_engine._APPS_MAX}). 넘친 것은 빼고 deliberate_status 의 evidence_omitted 로 알린다",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달. limits.human_note_chars(0=무제한)를 "
                           "넘으면 앞부분만 싣고 deliberate_status 의 evidence_omitted 로 알린다",
-            "options": "후보안 목록(≤8). 2개 이상이면 최종 라운드가 그 중에서 고르는 표결을 요구한다",
+            "options": f"후보안 목록(≤{_engine._OPTIONS_MAX}). 2개 이상이면 최종 라운드가 그 중에서 고르는 "
+                       "표결을 요구한다",
             "stop_after_round": "1 이면 초기 라운드에서 멈추고 사람 검토를 기다린다",
             "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
             "advanced": _ADV_DESC,
         },
         "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX,
-                   "seats": _engine.MAX_REQ_SEATS},
+                   "seats": _engine.MAX_REQ_SEATS, "tools": _engine._TOOLS_MAX,
+                   "apps": _engine._APPS_MAX, "options": _engine._OPTIONS_MAX},
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,

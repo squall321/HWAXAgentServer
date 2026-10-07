@@ -118,3 +118,17 @@ def test_persona_knowledge_가_advanced_안내에_있다():
 def test_안내한_손잡이가_실제로_엔진까지_간다():
     o = d._resolve_opts(m._build_opts(advanced={"voc": "off", "chair_template": "mechanism"}))
     assert (o.voc, o.chair_template) == ("off", "mechanism")
+
+
+def test_지정_도구_앱_후보안_상한도_엔진_값을_읽어_적는다(monkeypatch):
+    """근거 상한 '12,000자' 가 낡은 것과 같은 자리다 — 메뉴에 ≤6·≤3·≤8 을 손으로 적어 두었다."""
+    monkeypatch.setattr(d, "_TOOLS_MAX", 9)
+    monkeypatch.setattr(d, "_APPS_MAX", 4)
+    monkeypatch.setattr(d, "_OPTIONS_MAX", 11)
+    menu = asyncio.run(m.deliberate_jobs())
+    assert "≤9" in menu["options"]["tools"] and "≤4" in menu["options"]["tools"], menu["options"]["tools"]
+    assert "≤11" in menu["options"]["options"], menu["options"]["options"]
+    assert (menu["limits"]["tools"], menu["limits"]["apps"], menu["limits"]["options"]) == (9, 4, 11)
+    doc = m.deliberate_start.__doc__ or ""
+    for stale in ("최대 6", "최대 3", "최대 8"):
+        assert stale not in doc, f"독스트링에 손으로 적은 '{stale}' 이 남아 있다"
