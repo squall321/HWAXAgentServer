@@ -546,6 +546,18 @@ async def _starts_now():
     return _st(job)
 
 
+def test_시험_세션의_기본_원장_경로는_실_원장이_아니다():
+    """시험은 원장 경로를 바꿔 끼우고 돌지만, 그건 시험이 끝나면 풀린다. 그 뒤에 도는 뒷정리가 하나라도
+    있으면 **모듈의 기본 경로**에 쓴다 — 그 기본 경로가 실 원장이면 시험 기록이 운영 목록에 뜬다
+    (2026-10-07 에 한 건이 그렇게 쓰였다). conftest 가 세션 내내 임시 디렉터리로 돌려 둔다."""
+    import tempfile
+
+    where = os.environ.get("DELIB_JOB_DIR", "")    # 변수로 받는다 — 단언에 environ 을 넣으면 깨질 때 환경 전체가 찍힌다
+    assert where, "conftest 가 원장 경로를 돌려 두지 않았다"
+    assert str(delib_jobs.JOB_DIR) == where
+    assert Path(tempfile.gettempdir()).resolve() in delib_jobs.JOB_DIR.resolve().parents, delib_jobs.JOB_DIR
+
+
 def test_호출자_토큰과_근거_본문은_파일에_남지_않고_띄울_때_그대로_간다(eng, monkeypatch):
     _caps(monkeypatch, 1)
     opts = {"evidence": [{"source": "E1", "result": "근거 본문 — 스프링백 0.42mm"}], "rounds": 2}
