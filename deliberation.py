@@ -4277,12 +4277,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
         + list(knowledge_by_key.values()) + seat_lookups
         + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
-    _bad_num = unsourced_numbers(decision, _num_src)
+    _bad_num = unsourced_numbers(decision, _num_src, limit=0)
     if _bad_num:
+        # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
+        # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
+        _cnt = (f"표시 6건 · 총 {len(_bad_num)}건" if len(_bad_num) > 6 else f"{len(_bad_num)}건")
         decision += ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다 — 의장이 "
-                     "추론·계산한 값일 수 있으니 그대로 인용하지 마십시오: "
-                     + ", ".join(f"`{v}`" for v in _bad_num))
-        yield _sse("status", {"step": f"결정문 수치 대조 — 출처 미확인 {len(_bad_num)}건", "tool": None})
+                     f"추론·계산한 값일 수 있으니 그대로 인용하지 마십시오({_cnt}): "
+                     + ", ".join(f"`{v}`" for v in _bad_num[:6]))
+        yield _sse("status", {"step": f"결정문 수치 대조 — 출처 미확인 {_cnt}", "tool": None})
     if out is not None:
         out["decision"] = decision
     yield _delib("decision", text=decision + report_note)

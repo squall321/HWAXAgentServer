@@ -41,6 +41,10 @@ def unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
     부분문자열로 대조한다 — '48039.32' 가 원문에 그대로 있으면 근거 있는 값으로 본다.
     부분 일치라 '232' 가 '1232' 에 걸려 통과하는 느슨함이 있는데, 이 방향의 오차는
     '근거 있다고 잘못 보는' 쪽이라 경고 남발보다 낫다(과다 경고는 기능을 죽인다).
+
+    limit 은 돌려줄 건수 상한이고 **0 이하면 전부**다. 상한에서 끊으면 나머지가 있다는 것도 함께
+    사라진다 — 7건이든 70건이든 6건으로 보였다. 총 건수를 알려야 하는 호출부(심의 결정문)는 전부
+    받아서 보일 만큼만 보이고 건수를 적는다.
     """
     if not sources:
         return []
@@ -52,7 +56,7 @@ def unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
         seen.add(norm)
         if norm not in src_norm:
             bad.append(raw)
-        if len(bad) >= limit:
+        if 0 < limit <= len(bad):
             break
     return bad
 

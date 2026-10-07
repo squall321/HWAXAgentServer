@@ -137,3 +137,34 @@ def test_지어낸_수치가_없으면_경고도_없다(monkeypatch):
     events, _chair, final = _run(monkeypatch, _cite(CUT_AWAY, KNOWLEDGE, LOOKUP_OWN, LOOKUP_POOL))
     assert _WARN not in final, final[-300:]
     assert not any(s.startswith("결정문 수치 대조") for s in _steps(events))
+
+
+# ── 6건에서 끊어도 총 건수는 말한다 ───────────────────────────────────────────────
+# 대조는 6건에서 멈추고 나머지가 있다는 것도 감췄다 — 7건이든 70건이든 '6건' 으로 보였다.
+_MANY = [f"{9000 + i}.5" for i in range(1, 10)]          # 어디에도 없는 수치 9개
+
+
+def test_대조_함수는_기본_6건이고_0_이면_전부_준다():
+    from evidence import unsourced_numbers
+
+    answer = " ".join(f"값 {n}" for n in _MANY) + f" 또 {_MANY[0]}"      # 되풀이한 값은 한 번만 센다
+    assert unsourced_numbers(answer, "무관한 출처") == _MANY[:6], "기본 동작(챗 근거 블록)이 바뀌었다"
+    assert unsourced_numbers(answer, "무관한 출처", limit=0) == _MANY
+    assert unsourced_numbers(answer, "무관한 출처", limit=3) == _MANY[:3]
+    assert unsourced_numbers(answer, "", limit=0) == [], "출처가 없으면 판정하지 않는다(종전 그대로)"
+
+
+def test_6건을_넘으면_6건만_보이고_총_건수를_적는다(monkeypatch):
+    events, _chair, final = _run(monkeypatch, _cite(*_MANY))
+    assert _flagged(final) == _MANY[:6], _flagged(final)
+    assert "표시 6건 · 총 9건" in final.split(_WARN, 1)[1], final[-300:]
+    step = next(s for s in _steps(events) if s.startswith("결정문 수치 대조"))
+    assert "표시 6건 · 총 9건" in step, step
+
+
+def test_6건_이하면_전부_보이고_건수만_적는다(monkeypatch):
+    events, _chair, final = _run(monkeypatch, _cite(*_MANY[:6]))
+    assert _flagged(final) == _MANY[:6]
+    assert "표시" not in final.split(_WARN, 1)[1], "다 보였는데 일부만 보인 것처럼 적었다"
+    step = next(s for s in _steps(events) if s.startswith("결정문 수치 대조"))
+    assert step.endswith("출처 미확인 6건"), step
