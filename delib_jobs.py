@@ -152,6 +152,17 @@ _TASKS: dict[str, asyncio.Task] = {}
 # ⚠ 메모리에만 둔다 — 띄울 때 쓸 인자에 호출자 토큰과 근거 본문이 들어 있어 파일에 적지 않는다. 그래서
 #   줄 선 잡은 재기동을 넘기지 못한다(reap_orphans 가 '다시 시작하라' 로 닫는다).
 _PENDING: dict[str, tuple] = {}
+# 서버가 내려가는 중이면 참 — 자리가 나도 줄 선 잡을 띄우지 않는다(_pump). 내려갈 때는 도는 심의가 전부
+# 취소되면서 자리가 한꺼번에 나는데, 그 자리에 줄 선 잡을 띄우면 뜨자마자 죽는다. 헛도는 조회를 쏘고, 죽은
+# 모양에 따라 **결정문 없는 done** 으로 남는다(재기동 정리는 done 을 건드리지 않는다). 줄에 그대로 두면
+# 다음 기동이 '다시 시작하라' 로 닫는다(reap_orphans).
+_CLOSING = False
+
+
+def closing(on: bool = True) -> None:
+    """서버가 내려간다(on) / 다시 받는다(off) — app 의 기동·종료 절차가 mcp_server 를 거쳐 부른다."""
+    global _CLOSING  # noqa: PLW0603 — 프로세스에 하나뿐인 원장의 상태다
+    _CLOSING = on
 
 
 def _now() -> float:
@@ -216,6 +227,8 @@ def _pump() -> None:
     못하고 접힌 태스크(_settle). 세고 띄우는 사이에 await 가 없어 이벤트 루프가 끼어들지 못한다 — 그래서 자리
     하나에 둘이 뜨지 않고, 부른 뒤에는 '자리가 비었는데 뜰 수 있는 잡이 줄에 있다' 가 남지 않는다.
     제 사용자별 상한에 걸린 잡은 **건너뛴다** — 거기서 멈추면 한 사람이 줄 전체를 세운다."""
+    if _CLOSING:
+        return
     for jid, (job, spawn) in list(_PENDING.items()):
         if running_count() >= MAX_RUNNING:
             return
@@ -268,7 +281,8 @@ def queue_state(user_email: str = "") -> dict:
 def _prune() -> None:
     if len(_JOBS) <= KEEP_IN_MEM:
         return
-    # 줄 선 잡은 끝난 것이 아니다 — 끝난 시각이 없어 '가장 오래 전에 끝난 잡' 으로 정렬돼 맨 먼저 버려졌다.
+    # 줄 선 잡은 끝난 것이 아니다 — 끝난 시각이 없어, 걸러 내지 않으면 '가장 오래 전에 끝난 잡' 으로
+    # 정렬돼 맨 먼저 버려진다(줄에는 있는데 원장에는 없는 잡이 된다).
     done = sorted((j for j in _JOBS.values() if j["status"] not in ("running", "queued")),
                   key=lambda j: j.get("finished_at") or 0)
     for j in done[: len(_JOBS) - KEEP_IN_MEM]:

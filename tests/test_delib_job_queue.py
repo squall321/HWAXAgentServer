@@ -69,6 +69,7 @@ def eng(monkeypatch, tmp_path):
     monkeypatch.setattr(delib_jobs, "_JOBS", {})
     monkeypatch.setattr(delib_jobs, "_TASKS", {})
     monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(delib_jobs, "_CLOSING", False)
     monkeypatch.setattr(d, "run_deliberation", e.entry)
     monkeypatch.setattr(m, "_APP", object())
     return e
@@ -488,6 +489,61 @@ def test_줄_선_잡은_재기동을_못_넘기고_다시_시작하라고_남는
     listed = asyncio.run(m.deliberate_list())
     assert (listed["running"], listed["queued"]) == (0, 0), listed
     assert delib_jobs.reap_orphans() == 0, "정리한 잡을 또 정리했다"
+
+
+def test_서버가_내려가는_동안에는_줄_선_심의를_띄우지_않는다(eng, monkeypatch):
+    """내려갈 때는 도는 심의가 전부 취소되면서 자리가 한꺼번에 난다. 그 자리에 줄 선 심의를 띄우면 뜨자마자
+    죽는다 — 헛도는 조회를 쏘고, 죽은 모양에 따라 **결정문 없는 done** 으로 남는다(다음 기동의 정리는 done 을
+    건드리지 않는다). 줄에 그대로 두어야 다음 기동이 '다시 시작하라' 로 닫는다.
+    실제 기동·종료 절차(app.lifespan)를 열었다 닫고, 이벤트 루프의 뒷정리까지 돌려서 본다."""
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    import app as a
+
+    @asynccontextmanager
+    async def _no_session_manager(_app):          # MCP 세션 매니저는 프로세스에 한 번만 열 수 있다 — 건너뛴다
+        yield
+
+    _caps(monkeypatch, 1)
+    monkeypatch.setattr(a, "_load_mcp_config", dict)                 # 실 게이트웨이 설정을 읽지 않는다
+    monkeypatch.setattr(a._DELIB_MCP.router, "lifespan_context", _no_session_manager)
+    jobs = {}
+
+    async def serve():
+        async with a.lifespan(FastAPI()):
+            jobs["가"], jobs["나"], jobs["다"] = _start("가"), _start("나"), _start("다")
+            await _tick()
+            assert [_st(j) for j in jobs.values()] == ["running", "queued", "queued"]
+        # 여기서 돌아가면 asyncio.run 이 남은 태스크를 전부 취소한다 — 서버가 내려갈 때 그대로다.
+
+    try:
+        asyncio.run(serve())
+        assert eng.started == ["가"], f"내려가는 중에 줄 선 심의를 띄웠다 — {eng.started}"
+        assert [_on_disk(j)["status"] for j in jobs.values()] == ["cancelled", "queued", "queued"]
+    finally:
+        # ⚠ 이 시험이 깨질 때(내려가는 중에 잡이 떠 버렸을 때) 그 태스크는 루프가 닫힌 뒤에도 남는다. 그대로
+        #   두면 시험이 끝나 원장 경로가 **실 경로로 되돌아간 뒤에** 뒷정리가 돌아 실 원장에 기록을 쓴다
+        #   (2026-10-07 에 실제로 한 건 썼다). 경로가 아직 임시 경로인 지금 닫는다.
+        for task in list(delib_jobs._TASKS.values()):
+            try:
+                task.get_coro().close()
+            except RuntimeError:
+                pass
+    for store in (delib_jobs._JOBS, delib_jobs._TASKS, delib_jobs._PENDING):
+        store.clear()
+    m.bind(object())                              # 다음 기동
+    for q in ("나", "다"):
+        rec = asyncio.run(m.deliberate_status(jobs[q]["id"]))
+        assert rec["status"] == "interrupted" and "시작하지 못했다" in rec["error"], rec
+    assert _play(_starts_now) == "running", "다시 뜬 서버가 새 심의를 띄우지 않는다"
+
+
+async def _starts_now():
+    job = _start("새 화두")
+    await _tick()
+    return _st(job)
 
 
 def test_호출자_토큰과_근거_본문은_파일에_남지_않고_띄울_때_그대로_간다(eng, monkeypatch):

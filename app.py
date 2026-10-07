@@ -318,7 +318,12 @@ async def lifespan(app: FastAPI):
         try:
             async with _DELIB_MCP.router.lifespan_context(_DELIB_MCP):
                 print("[agent] deliberation MCP mounted at /mcp")
-                yield
+                try:
+                    yield
+                finally:
+                    # 내려가는 중 — 곧 도는 심의가 전부 취소되며 자리가 난다. 그 자리에 줄 선 심의를
+                    # 띄우지 않게 먼저 닫는다(띄우면 뜨자마자 죽고 결정문 없는 done 으로 남는다).
+                    _delib_mcp_module.unbind()
             return
         except Exception:  # noqa: BLE001
             logging.getLogger("agent").exception("[agent] 심의 MCP lifespan 실패 — /mcp 없이 계속")

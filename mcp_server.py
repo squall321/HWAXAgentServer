@@ -62,10 +62,16 @@ _APP = None
 def bind(app) -> None:
     global _APP  # noqa: PLW0603 — 프로세스당 하나뿐인 FastAPI 앱을 늦게 주입한다
     _APP = app
+    delib_jobs.closing(False)
     try:
-        delib_jobs.reap_orphans()   # 재기동으로 죽은 running 잡을 interrupted 로 정리
+        delib_jobs.reap_orphans()   # 재기동으로 죽은 running·queued 잡을 interrupted 로 정리
     except Exception:  # noqa: BLE001
         log.exception("잡 원장 정리 실패 — 계속")
+
+
+def unbind() -> None:
+    """서버가 내려간다 — 이제부터 자리가 나도 줄 선 심의를 띄우지 않는다(delib_jobs.closing)."""
+    delib_jobs.closing(True)
 
 
 def _need_app():
