@@ -43,7 +43,7 @@ def _seats(n=_N_SEATS):
     return [{"key": f"dom{i:02d}-seat", "role": "역할"} for i in range(1, n + 1)]
 
 
-def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, **opts):
+def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, tools=None, **opts):
     """심의를 끝까지 돌려 (이벤트, 의장 시스템 프롬프트, 의장 본문, 라운드별 블록)을 받는다.
 
     좌석 발언은 좌석·필드마다 다른 꼬리표로 감싼 긴 글이다 — 의장 프롬프트에서 어느 좌석의 어느
@@ -70,7 +70,7 @@ def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, **opts):
     monkeypatch.setattr(d, "_SER_CLIP", 0)
     events = _stream(monkeypatch, {"personas": _seats(seats), "rounds": rounds, "save_report": 0,
                                    "persona_knowledge": 0, "rebut_quote": 0, **opts},
-                     until=lambda ev, _data: ev == "done", llm=llm)
+                     until=lambda ev, _data: ev == "done", llm=llm, tools=tools)
     system, human = next((s, h) for s, h in seen if "엔지니어링 톤" in s)
     marks = list(_HEAD.finditer(human))
     assert len(marks) == rounds, f"의장 프롬프트에 라운드 머리가 {len(marks)}개다 — 하네스가 낡았다"
@@ -264,6 +264,33 @@ def test_줄였으면_화면과_잡_원장에_남는다(monkeypatch):
     assert any(s.startswith("의장 전사 상한") for s in _steps(events))
     for name, view in _mcp_view(monkeypatch, events).items():
         assert [x for x in view["evidence_omitted"] if x.get("source") == _CUT], (name, view["evidence_omitted"])
+
+
+def test_좌석마다_자유_조회가_실패해도_의장_전사를_줄였다는_것이_원장에_남는다(monkeypatch):
+    """잡 원장은 좌석에 주지 않은 근거를 30건까지만 적는다. 패널 전원의 자유 조회가 실패하면(실제로 있었다 —
+    7명 전원 400) 실패 카드가 좌석 × 라운드로 그 자리를 다 채우고, 맨 끝에 오는 이 카드가 빠졌다."""
+    import langgraph.prebuilt
+    import delib_jobs
+    from test_delib_silent_drops import _Tool
+
+    async def _all_fail(_agent, persona, *_a, **_k):       # (좌석, 호출목록, 주입 블록, 실패사유)
+        return persona["key"], [], "", "조회 도구가 400 으로 거절됐다"
+
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda *_a, **_k: object())
+    monkeypatch.setattr(d, "_free_gather_one", _all_fail)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))     # 게이트웨이 /tools-map 을 타지 않게
+    _ctx(monkeypatch, 128000)
+    events, _system, _human, _blocks = _run(
+        monkeypatch, free_tools=1,
+        tools={"agent_search": _Tool("agent_search"), "list_materials": _Tool("list_materials")})
+    failed = [c for c in _cards(events, included=False) if c["source"].endswith("자유 조회 실패")]
+    assert len(failed) >= delib_jobs.OMITTED_MAX, f"시험 전제 — 실패 카드가 원장 상한을 채워야 한다({len(failed)}건)"
+    assert [c for c in _cards(events, included=False) if c["source"] == _CUT], "시험 전제 — 의장 전사를 줄였다"
+    for name, view in _mcp_view(monkeypatch, events).items():
+        kept = view["evidence_omitted"]
+        assert kept[-1].get("source") == _CUT, (name, kept[-3:])
+        assert "note" in kept[delib_jobs.OMITTED_MAX], (name, kept[delib_jobs.OMITTED_MAX])
 
 
 def test_의장_전사도_짧은_좌석이_남긴_몫을_긴_좌석에_돌린다():

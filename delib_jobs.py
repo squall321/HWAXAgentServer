@@ -79,7 +79,11 @@ TURN_MAX = _env_int("DELIB_JOB_TURN_MAX", 400)
 # excluded 로 짓지 않는다 — 리스크 앱에서 그 말은 '사람이 뺀 근거' 다. 좌석별 자유 조회 실패 카드는
 # 좌석 × 라운드로 불어나므로 막아 둔다. **먼저 온 것**을 남긴다 — 사전 근거의 드롭은 라운드가
 # 돌기 전에 오고, 그게 호출자가 가장 먼저 알아야 하는 것이다.
+# 그리고 **맨 나중에 온 것**도 조금 남긴다(OMITTED_TAIL). 먼저 온 것만 남기면 심의 맨 끝에 오는 알림
+# (의장 전사 상한 초과)이 늘 빠진다 — 실패 카드가 자리를 다 채우는 큰 패널이 바로 의장 전사도 줄어드는
+# 패널이라 둘은 같이 난다. 머리 30건은 그대로 두고, 그 뒤로는 마지막 몇 건만 굴리며 사이에서 빠진 수를 적는다.
 OMITTED_MAX = 30
+OMITTED_TAIL = 5
 OMITTED_TEXT_MAX = 400
 
 # ── 심의 메뉴 — 포털 웹의 정본 택소노미를 그대로 옮긴다 ──────────────────────────────
@@ -358,18 +362,25 @@ def _apply(job: dict, event: str, data: dict) -> None:
             # 전부 버려진 심의가 끝까지 돌았고 호출자는 결정문을 받고도 몰랐다(2026-10-07).
             # 좌석에 준 카드는 싣지 않는다(근거 본문만큼 원장이 커진다).
             ex = job.setdefault("evidence_omitted", [])
+            txt = str(data.get("text") or "")
+            # 잘랐으면 표식을 붙인다 — 없으면 호출자는 꼬리가 원래 없던 줄 안다.
+            if len(txt) > OMITTED_TEXT_MAX:
+                txt = txt[:OMITTED_TEXT_MAX] + f"… (앞 {OMITTED_TEXT_MAX}자만 · 전체 {len(txt):,}자)"
+            # 그 상한을 바꾸는 설정 이름(knob) — 카드 글에는 없다(웹 사용자가 읽는 글이라 엔진이 따로
+            # 싣는다). 호출자가 그 이름을 볼 곳은 여기뿐이라 붙여 둔다. 자른 **뒤에** 붙여야 안 잘린다.
+            if data.get("knob"):
+                txt += f" (설정 {data['knob']})"
+            row = {"source": str(data.get("source") or ""), "text": txt}
             if len(ex) < OMITTED_MAX:
-                txt = str(data.get("text") or "")
-                # 잘랐으면 표식을 붙인다 — 없으면 호출자는 꼬리가 원래 없던 줄 안다.
-                if len(txt) > OMITTED_TEXT_MAX:
-                    txt = txt[:OMITTED_TEXT_MAX] + f"… (앞 {OMITTED_TEXT_MAX}자만 · 전체 {len(txt):,}자)"
-                # 그 상한을 바꾸는 설정 이름(knob) — 카드 글에는 없다(웹 사용자가 읽는 글이라 엔진이 따로
-                # 싣는다). 호출자가 그 이름을 볼 곳은 여기뿐이라 붙여 둔다. 자른 **뒤에** 붙여야 안 잘린다.
-                if data.get("knob"):
-                    txt += f" (설정 {data['knob']})"
-                ex.append({"source": str(data.get("source") or ""), "text": txt})
-            elif len(ex) == OMITTED_MAX:
-                ex.append({"note": f"상한 {OMITTED_MAX}건 초과 — 이후는 기록하지 않는다"})
+                ex.append(row)
+            else:
+                # 상한 뒤 — [머리 OMITTED_MAX 건] [안내 한 줄] [마지막 OMITTED_TAIL 건] 모양으로 둔다(온 순서 그대로).
+                over = job["evidence_omitted_over"] = int(job.get("evidence_omitted_over") or 0) + 1
+                tail = (ex[OMITTED_MAX + 1:] + [row])[-OMITTED_TAIL:]
+                gap = over - len(tail)
+                ex[OMITTED_MAX:] = [{"note": f"상한 {OMITTED_MAX}건 초과 — 그 뒤로 온 {over}건 중 "
+                                             + (f"{gap}건은 기록하지 않고 " if gap else "")
+                                             + f"마지막 {len(tail)}건만 아래에 남긴다"}] + tail
     elif event == "status":
         step = data.get("step")
         if step:

@@ -259,9 +259,39 @@ def test_원장에_남기는_건수에는_상한이_있고_넘으면_그렇다�
         delib_jobs._apply(job, "delib", {"kind": "evidence", "source": f"s{i}", "included": False,
                                          "text": "x" * 5000})
     ex = job["evidence_omitted"]
-    assert len(ex) == delib_jobs.OMITTED_MAX + 1 and "note" in ex[-1], ex[-1]
+    head, note, tail = ex[:delib_jobs.OMITTED_MAX], ex[delib_jobs.OMITTED_MAX], ex[delib_jobs.OMITTED_MAX + 1:]
+    assert "note" in note and "5건" in note["note"], note
     assert ex[0]["source"] == "s0", "먼저 온 것(라운드 전에 오는 사전 근거 드롭)이 밀려나면 안 된다"
+    assert [x["source"] for x in head] == [f"s{i}" for i in range(delib_jobs.OMITTED_MAX)]
+    assert [x["source"] for x in tail] == [f"s{delib_jobs.OMITTED_MAX + i}" for i in range(5)], tail
     assert len(ex[0]["text"]) < 5000
+
+
+def test_상한을_넘겨도_맨_나중에_온_알림은_남고_사이에서_빠진_수를_적는다():
+    """먼저 온 것만 남기면 **맨 끝에 오는 알림**이 늘 빠진다. 좌석별 자유 조회 실패 카드는 좌석 × 라운드로
+    불어나는데(20석 2라운드면 40건), 의장 전사를 줄였다는 카드는 심의 맨 끝에 온다 — 패널이 클수록 둘이
+    같이 나고, 호출자는 의장이 줄인 전사로 결정문을 썼다는 것을 원장에서 못 본다."""
+    job, n = {"id": "t-tail"}, delib_jobs.OMITTED_MAX + 40
+    for i in range(n):
+        delib_jobs._apply(job, "delib", {"kind": "evidence", "source": f"s{i}", "included": False, "text": "x"})
+    delib_jobs._apply(job, "delib", {"kind": "evidence", "source": "의장 전사 상한 초과", "included": False,
+                                     "text": "줄였다", "knob": "DELIB_DECISION_CTX"})
+    ex = job["evidence_omitted"]
+    assert ex[-1] == {"source": "의장 전사 상한 초과", "text": "줄였다 (설정 DELIB_DECISION_CTX)"}, ex[-1]
+    assert [x["source"] for x in ex[:3]] == ["s0", "s1", "s2"], "앞쪽이 밀려났다"
+    assert len(ex) == delib_jobs.OMITTED_MAX + 1 + delib_jobs.OMITTED_TAIL, len(ex)
+    note = ex[delib_jobs.OMITTED_MAX]["note"]
+    # 상한 뒤로 41건이 왔고 그중 마지막 OMITTED_TAIL 건만 남았다 — 사이에서 빠진 수를 적는다.
+    assert "41건" in note and f"{41 - delib_jobs.OMITTED_TAIL}건" in note, note
+    assert sum(1 for x in ex if "note" in x) == 1, "안내 줄이 여러 번 쌓였다"
+
+
+def test_상한을_딱_채우면_안내_줄이_없다():
+    job = {"id": "t-exact"}
+    for i in range(delib_jobs.OMITTED_MAX):
+        delib_jobs._apply(job, "delib", {"kind": "evidence", "source": f"s{i}", "included": False, "text": "x"})
+    assert len(job["evidence_omitted"]) == delib_jobs.OMITTED_MAX
+    assert not [x for x in job["evidence_omitted"] if "note" in x]
 
 
 # ── 1-3. 건수 상한을 넘긴 근거도 조용히 사라지지 않는다 ──────────────────────────
