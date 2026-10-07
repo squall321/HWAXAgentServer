@@ -67,6 +67,7 @@ from deliberation import (
     _has_defect_topic,
     _call,
     _llm_text,
+    _llm_limit,
     _tools_by_name,
     is_deliberation,
     is_operator,
@@ -2994,7 +2995,20 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 원인을 뭉뚱그리지 않는다. LLM 미도달은 '에이전트 오류' 가 아니라 인프라
                 # 문제이고, 사용자가 질문을 바꿔도 해결되지 않는다 — 그렇게 말해 줘야 한다.
                 _kind = type(exc).__name__
-                if "APIConnection" in _kind or "APITimeout" in _kind or "Connection" in _kind:
+                # 시간 초과는 '연결하지 못했다' 가 아니다 — 붙었는데 답이 한도 안에 안 온 것이다. 심의가 공유
+                # LLM 을 차지한 동안 챗이 이렇게 끝나는데, 종전 문구로는 LLM 서버가 내려간 줄 알았다.
+                # 연결 시간 초과도 SDK 가 APITimeoutError 로 올려서 원인 사슬의 httpx 예외로 가른다.
+                _chain, _e = [], exc
+                while _e is not None and len(_chain) < 6:
+                    _chain.append(type(_e).__name__)
+                    _e = _e.__cause__ or _e.__context__
+                if "APITimeout" in _kind and not any("Connect" in _n for _n in _chain):
+                    _read, _n_try = _llm_limit(getattr(app.state, "llm", None))
+                    _msg = ("LLM 응답이 " + (f"{_read:,.0f}초 안에 " if _read else "제한 시간 안에 ")
+                            + "오지 않았습니다(LLM_TIMEOUT_S" + (f" · {_n_try}회 시도" if _n_try else "")
+                            + ") — LLM 이 밀려 있거나 멈췄습니다. 잠시 후 다시 시도해 주세요 — "
+                            f"질문을 바꿔도 해결되지 않습니다.{detail}")
+                elif "APIConnection" in _kind or "APITimeout" in _kind or "Connection" in _kind:
                     _msg = ("LLM 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요 — "
                             f"질문을 바꿔도 해결되지 않습니다.{detail}")
                 else:
