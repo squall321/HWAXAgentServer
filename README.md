@@ -21,7 +21,8 @@ ChatDock (portal frontend)
   `status` → `token`×N → `result` → `done` (or `error`).
 - `GET /health` — `{status, delib_active, delib_queued, model, vllm, mcp, tool_scoping, …}`.
   `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
-  `start.sh` and the portal's update-all read them before a restart.
+  `start.sh` reads them before it replaces a running instance, and any unattended restart
+  (the portal's update-all) should do the same.
 
 ## Run (dev)
 
@@ -47,7 +48,14 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 
 A deliberation with 20+ seats on a shared LLM can run for hours. Every limit on that path is an
 env knob; an inner limit must stay smaller than the one that wraps it, and nothing here cuts a
-whole deliberation by wall clock. Values are read once at startup (restart to apply).
+whole deliberation by wall clock. Values are read once at startup (restart to apply); the
+`AGENT_*` ones are read by `start.sh`.
+
+Chain (seconds, inner < outer): LLM connect 10 < one attempt 1800 < one logical call 3608 <
+chair worst case 7216. Tool calls: gateway 600 (outer 660) < `MCP_CALL_TIMEOUT_S` 900. The
+knowledge lookup (180) is a fallback switch, not a layer. Limits that wrap this server — the
+risk app's panel wall clock and the portal / nginx / risk-app idle limits — live in those repos
+and must stay above one logical call at the request maximum (2×`DELIB_TIMEOUT_MAX_S`+8 = 28808).
 
 | var | default | meaning |
 |---|---|---|
@@ -56,16 +64,16 @@ whole deliberation by wall clock. Values are read once at startup (restart to ap
 | `DELIB_TIMEOUT_MAX_S` | `14400` | Largest per-call timeout a request may ask for (`delib_opts.timeout_s`, MCP `advanced.timeout_s`); the floor is 10. A value outside the range runs at the nearest end and the stream says so (card "요청 값 상한 초과", job ledger `evidence_omitted`). The **default** is the contract number: portal `DelibOpts.timeout_s` (`le`) and the frontend clamp must equal it (portal test `test_delib_timeout_cap_contract`). Values below 10 are read as the default. |
 | `DELIB_LLM_MAX_RETRIES` | `1` | openai SDK retries for deliberation calls (a timeout retry restarts generation from scratch). Worst case of one logical call = (1+retries)×`DELIB_TIMEOUT_S` + backoff = 3608 s by default; outer limits (risk app panel wall clock, portal/nginx idle limits) are sized on this. |
 | `DELIB_CHAIR_RETRIES` | `1` | How many more times the chair's decision synthesis is called after it fails (timeout or error); `0` = never again. No separate timeout — it uses `DELIB_TIMEOUT_S`, so the worst case is (1+this)×one logical LLM call (7216 s by default). If it still fails the rounds are kept: the seats' last positions go out in the decision slot, the report (minutes) is saved, the stream ends with `error` code `chair_failed`, and the job can be continued. |
+| `LLM_TIMEOUT_S` | `900` | Read timeout of one attempt of a chat / Thinking / pre-deliberation helper call. `0` = unlimited (logged at startup). Used to be unset = unlimited. |
+| `LLM_MAX_RETRIES` | `2` | openai SDK retries for chat calls (the library default, now named). |
+| `LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S` | `300` | Chat **streaming** only: longest gap between chunks, including the wait for the first token. Exported by `start.sh` (the library default is 120). Deliberation calls do not stream and ignore it. |
+| `THINK_SEAT_TIMEOUT_S` | `600` | One seat's answer in Thinking mode; past it only that seat drops out (`N초 초과(THINK_SEAT_TIMEOUT_S)`). Shorter than `LLM_TIMEOUT_S` on purpose — a per-seat cap. Was 180, which every seat exceeded while a large deliberation held the shared LLM. |
 | `MCP_CALL_TIMEOUT_S` | `900` | How long this server waits for one tool call through the gateway (seat lookups, VOC, role restore, report save). Set as the MCP session request deadline; `0` = none. Must stay **larger** than the gateway's `GATEWAY_CALL_TIMEOUT` (600, outer deadline 660) — the gateway should expire first and name the slow backend; this is the last net for a hung gateway. |
 | `KNOWLEDGE_TIMEOUT_S` | `180` | One seat's knowledge-card lookup (`agent_search`) before the round starts; on expiry it asks once more in `KNOWLEDGE_FALLBACK_MODE` and the seat's status line says so. Intentionally **shorter** than the gateway limit — it is the switch to the fallback, not a wrapping layer. Must stay above AIDataHub's `DB_POOL_TIMEOUT` (60) + `AIDH_SEARCH_STATEMENT_TIMEOUT_S` (90). |
-| `LLM_TIMEOUT_S` | `900` | Read timeout of one attempt of a chat / Thinking / pre-deliberation helper call. `0` = unlimited (logged at startup). Used to be unset = unlimited. |
-| `THINK_SEAT_TIMEOUT_S` | `600` | One seat's answer in Thinking mode; past it only that seat drops out (`N초 초과(THINK_SEAT_TIMEOUT_S)`). Shorter than `LLM_TIMEOUT_S` on purpose — a per-seat cap. Was 180, which every seat exceeded while a large deliberation held the shared LLM. |
-| `LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S` | `300` | Chat **streaming** only: longest gap between chunks, including the wait for the first token. Exported by `start.sh` (the library default is 120). Deliberation calls do not stream and ignore it. |
-| `LLM_MAX_RETRIES` | `2` | openai SDK retries for chat calls (the library default, now named). |
+| `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
 | `AGENT_RESTART_FORCE` | `0` | `start.sh` will not stop a running instance that reports running or queued deliberations — a restart cuts all of them. It prints the counts and exits `3` (skipped), leaving the instance up. `1` restarts anyway. If the counts cannot be read (no answer, older build) it says so and restarts. |
 | `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. |
 | `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. |
-| `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
 
 ## Status
 
