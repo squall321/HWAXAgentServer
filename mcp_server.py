@@ -251,7 +251,8 @@ async def deliberate_start(
                   recommend_agents 로 발굴한다.
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름(최대 6).
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다(최대 3).
-        human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다(최대 2000자).
+        human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation.HUMAN_NOTE_MAX
+                    (지금 값은 deliberate_jobs 의 limits) — 넘으면 앞부분만 싣고 evidence_omitted 로 알린다.
         search_sources: 웹 리서치 소스 토글. 지정하면 인용 계약이 강제된다.
         options: 후보안 목록(안 선택용, 최대 8). 2개 이상이면 최종 라운드가 이 중에서 고르는 표결을
                  요구한다. 없으면 표결을 강제하지 않는다 — 후보 없이 표를 받으면 좌석이 방금 자기가
@@ -429,13 +430,14 @@ async def deliberate_jobs() -> dict:
             "evidence": _EVID_DESC,
             "personas": "좌석 직접 지정(≤20). 비우면 서버가 발굴한다",
             "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
-            "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달",
+            "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달. limits.human_note_chars(0=무제한)를 "
+                          "넘으면 앞부분만 싣고 deliberate_status 의 evidence_omitted 로 알린다",
             "options": "후보안 목록(≤8). 2개 이상이면 최종 라운드가 그 중에서 고르는 표결을 요구한다",
             "stop_after_round": "1 이면 초기 라운드에서 멈추고 사람 검토를 기다린다",
             "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
             "advanced": _ADV_DESC,
         },
-        "limits": _evid_limits(),
+        "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX},
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,

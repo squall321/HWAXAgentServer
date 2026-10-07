@@ -74,6 +74,14 @@ N_PERSONAS = _env_int("DELIB_PERSONAS", 5)          # 참여 페르소나 수
 # 엔진이 얹는 좌석까지 21석 라운드도 있었다(감사 C22). 교차심문이 켜져 좌석 프롬프트가
 # O(N) 이 된 뒤로 20 으로 올렸다. 폭주 방지선으로는 여전히 필요하다(좌석 = 동시 LLM 호출).
 MAX_REQ_SEATS = 20
+# 사람 의견(human_note) 상한(자), 0=무제한. 종전엔 2,000 을 코드에 박고 **말없이** 잘랐다 — 포털은 이 칸에
+# 8,000자까지 받으므로 길게 쓴 의견은 뒤쪽이 좌석에 안 갔고, 쓴 사람은 전부 반영된 줄 알았다
+# (S26U 피드백 1-11). 잘랐으면 스트림이 카드로 알린다.
+# 기본값을 포털에 맞춰 올리지 않는 이유 — 이 글은 매 라운드 전 좌석 프롬프트에 실리는데 컨텍스트
+# 회계(_pre_budget)에 들어 있지 않다. 크게 잡으면 좁은 창에서 좌석이 넘친다.
+# ⚠ 이 **기본값**은 포털 DelibOpts.human_note(max_length) 이하여야 한다(포털 계약 시험이 이 줄을 읽어
+#   대조한다 — HWAXPortal docs/delib-engine-feedback D-7). 포털 상한 위로 올리려면 포털도 같이 올린다.
+HUMAN_NOTE_MAX = _env_int("DELIB_HUMAN_NOTE_MAX", 2000)
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
@@ -728,6 +736,8 @@ def _resolve_opts(req_opts):
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
+        # 사람 의견이 상한(HUMAN_NOTE_MAX)에서 잘렸으면 (원문 길이, 실은 글) — 스트림이 카드로 알린다.
+        human_note_cut=None,
         # 불량 환기(SignalForge) — auto(질문에 불량 단어가 있을 때만, 종전) | off | always.
         # 포털 'VOC 먼저 보기' 에서 사람이 이미 골랐으면 off 로 온다 — 자동 환기를 또 돌리면
         # 사람이 뺀 VOC 가 다시 들어간다.
@@ -811,7 +821,9 @@ def _resolve_opts(req_opts):
             o.voc = vm
         hn = req_opts.get("human_note")
         if isinstance(hn, str):
-            o.human_note = hn[:2000]
+            o.human_note = hn[:HUMAN_NOTE_MAX] if HUMAN_NOTE_MAX > 0 else hn
+            if len(o.human_note) < len(hn):
+                o.human_note_cut = (len(hn), o.human_note)
         ct = req_opts.get("chair_template")
         if isinstance(ct, str) and ct in _CHAIR_ITEMS:
             o.chair_template = ct
@@ -3502,6 +3514,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      text="\n".join(f"- {x}" for x in opts.continue_non_negotiables)[:1500], included=True)
     if opts.human_note:
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:_EVID_SHOW], included=True)
+    # 사람 의견을 상한에서 잘랐으면 알린다 — 말없이 자르면 쓴 사람은 전부 반영된 줄 안다. 좌석에 주지
+    # 않은 카드라 잡 원장에도 실려 MCP 호출자가 본다.
+    # ⚠ **실은 글이 그 의견일 때만** 말한다. 다단 심의(해석 설계·시험 설계)는 이 칸을 엔진 지시문과
+    #   현황 조회 결과로 갈아 끼운다 — 거기서 '앞 N자만 실었다' 고 적으면 거짓이다(아예 안 실린다).
+    if opts.human_note_cut and opts.human_note == opts.human_note_cut[1]:
+        _hn_full = opts.human_note_cut[0]
+        yield _delib("evidence", source="사람 의견 상한 초과", included=False,
+                     text=f"사람 의견(human_note) {_hn_full:,}자 중 앞 {len(opts.human_note):,}자만 좌석에 "
+                          f"실었다 — 뒤 {_hn_full - len(opts.human_note):,}자는 좌석이 보지 못한다"
+                          f"(상한 {HUMAN_NOTE_MAX:,}자 — DELIB_HUMAN_NOTE_MAX).")
     # 챗 워크스페이스 핸드오프 원천 근거(P1) — 요약이 아니라 날것 도구결과+출처를 좌석에 준다.
     # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
     # 예산(_EVID_BUDGET) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).
