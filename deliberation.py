@@ -171,18 +171,21 @@ def _pre_budget() -> int:
     시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + **여기** + 도구 스키마이고, 심의는 좌석이
     동시에 돌아 넘치면 라운드가 통째로 죽는다.
     """
-    if "pre" in _evid_cache:
-        return _evid_cache["pre"]
     try:
         from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
         ctx = _model_context_tokens()
     except Exception:
         ctx = 128000
+    # 어느 창에서 유도했는지 함께 적어 두고, 창이 같을 때만 꺼내 쓴다. 창 조회가 실패하면 기본값을 잠깐
+    # 가정하다가 다시 묻는데(app._model_context_tokens), 여기가 그 가정값으로 굳어 있으면 창이 바로잡혀도
+    # 좌석 예산은 내내 틀린 창 기준이다.
+    if _evid_cache.get("pre_ctx") == ctx and "pre" in _evid_cache:
+        return _evid_cache["pre"]
     # 안전 계수 — 이 계산은 구조상 **정확히 컨텍스트에 딱 맞게** 떨어진다(실측 128,000/128,000).
     # 여유 0 이면 토큰 추정 오차 한 번에 넘치고, 심의는 좌석이 동시에 죽는다. 조금 손해 본다.
     avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
     n = max(2000, int(avail * _EVID_KO_CPT * _PRE_SAFETY))
-    _evid_cache["pre"] = n
+    _evid_cache["pre"], _evid_cache["pre_ctx"] = n, ctx
     return n
 
 
@@ -2381,12 +2384,13 @@ def _free_ctx_tokens() -> int:
 
 def _free_tool_tokens() -> int:
     """좌석 하나에 실을 **도구 스키마** 예산(토큰)."""
-    if "n" in _free_tok_cache:
+    ctx = _free_ctx_tokens()
+    if _free_tok_cache.get("ctx") == ctx and "n" in _free_tok_cache:   # 창이 같을 때만 — _pre_budget 과 같은 까닭
         return _free_tok_cache["n"]
     # 조회 턴 = 스키마 + 프롬프트 + **도구 결과**. 결과 몫을 안 떼면 결과 하나가 창을 터뜨린다
     # (실측: dev 의 TOOL_RESULT_MAX=6,000자 × 3회 ≈ 17,000토큰 — 16K 창을 결과 혼자 넘긴다).
-    n = min(_FREE_TOOL_TOKENS, max(1200, int(_free_ctx_tokens() * 0.45) - _FREE_PROMPT_RESERVE))
-    _free_tok_cache["n"] = n
+    n = min(_FREE_TOOL_TOKENS, max(1200, int(ctx * 0.45) - _FREE_PROMPT_RESERVE))
+    _free_tok_cache["n"], _free_tok_cache["ctx"] = n, ctx
     return n
 
 

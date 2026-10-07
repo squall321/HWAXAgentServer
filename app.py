@@ -1850,6 +1850,7 @@ DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 �
 DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", str(TOOL_SCHEMA_BUDGET + 16000)))
 DOC_SAFETY = float(os.environ.get("DOC_SAFETY", "0.97"))                 # 변환 오차 안전 계수
 _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
+_CTX_RETRY_S = 60.0     # 조회가 실패한 뒤 다시 묻기까지(초) — 그동안은 기본값으로 간다
 _ctx_cache: dict = {}
 
 # 토큰 환산 — 한글은 토큰당 1자 남짓, 라틴 문자는 3~4자다. 한 값으로 뭉뚱그리면 한국어 문서에서
@@ -1884,10 +1885,13 @@ def _model_context_tokens() -> int:
     """이 모델이 받는 최대 토큰. OpenAI 호환 /v1/models 의 max_model_len 을 한 번만 읽는다.
 
     박스마다 모델이 다르다(dev 16K · 운영 GLM). env 로 박아 두면 한쪽에서 반드시 틀리고,
-    틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다."""
+    틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다.
+    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다."""
     if "n" in _ctx_cache:
         return _ctx_cache["n"]
     n = _CTX_FALLBACK
+    if time.monotonic() < _ctx_cache.get("retry_at", 0.0):
+        return n        # 방금 못 물어봤다 — 죽은 엔드포인트를 호출마다 5초씩 기다리지 않는다
     try:
         import httpx
 
@@ -1901,7 +1905,14 @@ def _model_context_tokens() -> int:
         if isinstance(v, int) and v > 0:
             n = v
     except Exception as e:      # 못 물어보면 기본값으로 간다 — 기능을 막지는 않는다
-        print(f"[agent] 모델 컨텍스트 조회 실패({e}) — {n:,} 토큰으로 가정한다")
+        # ⚠ 이 값은 굳히지 않는다. 첫 호출자는 /health 이고 재기동 직후에는 LLM 이 아직 안 떠 있다 —
+        #   그 한 번의 실패로 기본값이 프로세스 수명 내내 남아, 창이 더 작은 박스에서 예산이 전부 실제
+        #   창 밖으로 잡혔다(dev 16K 를 128K 로 — 의장 프롬프트가 넘쳐 다 돈 심의의 결정문이 400 으로 죽는다).
+        #   답은 왔는데 창 크기가 없는 것은 실패가 아니다(다시 물어도 같다) — 그건 아래에서 굳힌다.
+        print(f"[agent] 모델 컨텍스트 조회 실패({e}) — {n:,} 토큰으로 가정한다"
+              f"({_CTX_RETRY_S:.0f}초 뒤 다시 묻는다)")
+        _ctx_cache["retry_at"] = time.monotonic() + _CTX_RETRY_S
+        return n
     _ctx_cache["n"] = n
     print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰")
     return n
