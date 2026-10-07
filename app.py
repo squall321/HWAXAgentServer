@@ -39,6 +39,7 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -92,6 +93,13 @@ MCP_SERVERS = os.environ.get("MCP_SERVERS", "")
 # 에이전트 캐시 상한. 사용자 × 30분 창 × 질의선택 조합이라 상한이 없으면 계속 는다.
 AGENT_CACHE_MAX = int(os.environ.get("AGENT_CACHE_MAX", "64"))
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
+# 도구 호출 1건을 엔진이 기다리는 기한(초), 0=없음. 종전엔 없었다 — 게이트웨이가 ping 만 보내며 멈추면
+# (전송 한도 30초/300초는 바이트 사이 침묵만 재므로 ping 이 되감는다) 좌석 자유 조회·RA 저장·VOC·역할 복원이
+# 끝없이 기다렸고, 그 대기가 심의 잡 자리를 붙들었다. MCP 세션의 요청 기한으로 건다(_with_groups).
+# ⚠ 게이트웨이의 GATEWAY_CALL_TIMEOUT(600초 — 전송 read·단발 세션 바깥 기한 660초)보다 **커야 한다.**
+#   안쪽이 먼저 걸려야 어느 백엔드가 느린지 구체적인 문구가 나오고, 이 값은 게이트웨이 자체가 멈췄을 때의
+#   마지막 그물이다. 게이트웨이 한도를 올리면 이 값도 같은 폭으로 올린다.
+MCP_CALL_TIMEOUT_S = _env_float("MCP_CALL_TIMEOUT_S", 900.0)
 from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
@@ -233,8 +241,20 @@ def _with_groups(connections: dict, groups: list[str], user: str = "",
         # 없으면 종전대로 서비스 계정으로 돈다(발급 실패가 챗을 막지 않는다).
         if user_pat:
             cfg["headers"]["Authorization"] = f"Bearer {user_pat}"
+        # 도구 호출 1건의 기한 — MCP ClientSession 의 요청 기한으로 건다(어댑터가 session_kwargs 를 그대로
+        # 세션에 넘긴다). 박스 설정에 session_kwargs 가 있으면 그 위에 얹는다.
+        if MCP_CALL_TIMEOUT_S > 0:
+            cfg["session_kwargs"] = {**(cfg.get("session_kwargs") or {}),
+                                     "read_timeout_seconds": timedelta(seconds=MCP_CALL_TIMEOUT_S)}
         out[name] = cfg
     return out
+
+
+def _mcp_call_timed_out(exc: BaseException) -> bool:
+    """그 예외가 엔진측 도구 기한(MCP_CALL_TIMEOUT_S)에 걸린 것인가 — MCP 세션이 408 로 올린다."""
+    return (type(exc).__name__ == "McpError"
+            and (getattr(getattr(exc, "error", None), "code", None) == 408
+                 or "Timed out while waiting for response" in str(exc)))
 
 
 @asynccontextmanager
@@ -943,6 +963,13 @@ def _cap_tool(tool, result_max=None):
             # 구분할 수 없었다 — 이 리포가 반복해서 만나는 모양이다. 판단은 이미 위에서
             # 내리고 있으니(_is_transport·_is_argerr) **버리지만 않으면** 된다.
             msg = f"{_TOOL_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
+            if _mcp_call_timed_out(exc):
+                # 엔진측 기한이 걸렸다. SDK 문구('Timed out while waiting for response to ClientRequest')만
+                # 실으면 무엇이 얼마를 기다렸는지, 어느 값을 봐야 하는지 없다 — 기한과 손잡이를 말한다.
+                msg = (f"{_TOOL_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: "
+                       f"{MCP_CALL_TIMEOUT_S:,.0f}초 안에 답하지 않았다(MCP_CALL_TIMEOUT_S) — 게이트웨이 무응답이다. "
+                       "게이트웨이가 살아 있으면 제 한도(GATEWAY_CALL_TIMEOUT)에서 먼저 답하므로, 여기까지 "
+                       "왔으면 게이트웨이가 멈췄거나 이 값이 게이트웨이 한도보다 작다(커야 한다)")
             if hint:
                 msg += f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출]\n{hint}"
             elif _is_transport:
