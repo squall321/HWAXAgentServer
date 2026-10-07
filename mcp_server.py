@@ -247,8 +247,9 @@ async def deliberate_start(
         evidence: 원천 근거 주입. [{source, tool, args, result}] — 이미 도구로 뽑아 둔 결과를 좌석에
                   '검증 대상'으로 깐다. 상한·본문 키·표식 규칙은 _EVID_DESC 가 정본이다(엔진 상수에서
                   읽어 만든다) — 여기 숫자를 다시 적지 마라, 적어 둔 값이 낡아 호출자가 근거를 버렸다.
-        personas: 좌석 지정(최대 20 — deliberation.MAX_REQ_SEATS). [{key, role}] — 비우면 서버가
-                  recommend_agents 로 발굴한다.
+        personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 상한은
+                  deliberation.MAX_REQ_SEATS(지금 값은 deliberate_jobs 의 limits) — 넘친 좌석은 빼고
+                  상태줄로 알린다. 지정 반대석은 상한 밖에서 한 석 더 앉는다.
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름(최대 6).
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다(최대 3).
         human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation.HUMAN_NOTE_MAX
@@ -428,7 +429,8 @@ async def deliberate_jobs() -> dict:
         },
         "options": {
             "evidence": _EVID_DESC,
-            "personas": "좌석 직접 지정(≤20). 비우면 서버가 발굴한다",
+            "personas": f"좌석 직접 지정(≤{_engine.MAX_REQ_SEATS} — 넘친 좌석은 빼고 상태줄로 알린다. "
+                        "지정 반대석은 상한 밖에서 한 석 더 앉는다). 비우면 서버가 발굴한다",
             "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달. limits.human_note_chars(0=무제한)를 "
                           "넘으면 앞부분만 싣고 deliberate_status 의 evidence_omitted 로 알린다",
@@ -437,7 +439,8 @@ async def deliberate_jobs() -> dict:
             "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
             "advanced": _ADV_DESC,
         },
-        "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX},
+        "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX,
+                   "seats": _engine.MAX_REQ_SEATS},
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
