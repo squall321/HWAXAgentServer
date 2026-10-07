@@ -41,6 +41,16 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 | `MCP_CONFIG` | _(unset)_ | path to a gitignored JSON file holding the gateway entry + token (takes precedence) |
 | `MCP_SERVERS` | _(empty)_ | fallback `name=url` pairs when `MCP_CONFIG` is unset (no auth headers) |
 
+### Time limits
+
+A deliberation with 20+ seats on a shared LLM can run for hours. Every limit on that path is an
+env knob; an inner limit must stay smaller than the one that wraps it, and nothing here cuts a
+whole deliberation by wall clock. Values are read once at startup (restart to apply).
+
+| var | default | meaning |
+|---|---|---|
+| `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the

@@ -310,6 +310,11 @@ async def lifespan(app: FastAPI):
     # 값: (raw_tools, ts). 게이트웨이 도구는 자주 안 바뀌므로 짧은 불통은 이걸로 흡수된다.
     app.state.tool_snapshot = {}  # (frozenset(groups), user_lower) -> (raw_tools, ts)
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
+    if DELIB_HEARTBEAT_S <= 0:
+        print("[agent] ⚠ DELIB_HEARTBEAT_S=0 — 심의 SSE heartbeat(ping)가 꺼졌다. LLM 호출 한 번이 도는 동안 "
+              "스트림이 조용하므로, 바깥 침묵 한도 셋(포털 AGENT_STREAM_IDLE_TIMEOUT_S · nginx "
+              "NGINX_AGENT_READ_TIMEOUT · 리스크 앱 HWAXRISK_ENGINE_READ_TIMEOUT_S)이 2×DELIB_TIMEOUT_S 보다 "
+              "커야 살아 있는 심의의 구독이 끊기지 않는다")
     # 심의 MCP(/mcp) — streamable_http_app 은 자체 lifespan(task group)이 있어야 동작하는데
     # FastAPI 의 mount() 는 하위 앱 lifespan 을 전파하지 않는다. 여기서 명시적으로 연다.
     # 실패해도 서버는 뜬다 — 심의 MCP 는 부가 진입점이고, 웹(/chat) 경로는 이것과 무관하다.
@@ -441,6 +446,14 @@ def _sse(event: str, data: dict) -> bytes:
 # 죽였다(취소 스택만 남고 GPU 시간 전소). 심의 본체를 백그라운드 태스크로 옮기고
 # SSE 는 큐 구독만 한다 — 구독이 끊겨도 태스크는 계속 돌아 저장까지 완주한다.
 _DETACHED_TASKS: set = set()   # 태스크 GC 방지 — 참조가 사라지면 asyncio 가 조용히 버린다
+# 심의 SSE heartbeat 간격(초), 0=끔. 이벤트가 없는 동안에도 이 간격으로 `event: ping` 을 흘린다.
+# 심의는 LLM 호출 한 번(의장 결정문·좌석 발언·요약)이 도는 동안 스트림에 바이트가 0 이다 — 그 침묵이
+# 바깥의 침묵 한도(포털 릴레이·nginx /agent/·리스크 앱 읽기 한도·사내 프록시)를 넘기면 **살아 있는**
+# 심의의 구독이 끊긴다. LLM 한도(DELIB_TIMEOUT_S)를 넉넉히 올릴 수 있는 것은 이 ping 이 있어서다.
+# 이벤트 이름은 ping 으로 고정한다 — 이 스트림을 읽는 셋(포털 릴레이 파서 · 포털 프론트 dispatch ·
+# 리스크 앱 collect_stream)이 모르는 이름을 버린다(status 로 보내면 리스크 앱 events[] 400칸을 채운다).
+# 끄면(0) 바깥 침묵 한도 셋이 LLM 논리 호출 1회(재시도 포함 약 2×DELIB_TIMEOUT_S)보다 커야 한다.
+DELIB_HEARTBEAT_S = _env_float("DELIB_HEARTBEAT_S", 15.0)
 
 
 def _detach_stream(gen, label: str):
@@ -461,9 +474,27 @@ def _detach_stream(gen, label: str):
     task.add_done_callback(_DETACHED_TASKS.discard)
 
     async def _subscribe():
+        # ⚠ q.get() 을 wait_for 로 감싸지 않는다. wait_for 는 만료 때마다 안쪽 get 을 **취소**하고, 취소와
+        #   도착이 겹친 프레임이 살아남는지는 asyncio 구현에 달렸다(이 venv 는 Python 3.10 이다). 사본에서
+        #   박자를 맞춰 흘려서는 잃는 것을 재현하지 못했지만, 그 프레임이 결정문일 수 있어 구현에 기대지
+        #   않는다 — get 태스크를 **쥔 채** asyncio.wait(timeout) 으로 기다리고(wait 는 취소하지 않는다),
+        #   만료되면 ping 만 내고 같은 태스크를 다시 기다린다.
+        #   생성기(_drive)는 감싸지 않는다 — 거기에 시간 한도를 걸면 진행 중인 LLM 호출이 취소된다.
+        get, last = None, time.monotonic()
         try:
             while True:
-                chunk = await q.get()
+                if get is None:
+                    get = asyncio.ensure_future(q.get())
+                if DELIB_HEARTBEAT_S > 0:
+                    done, _pending = await asyncio.wait({get}, timeout=DELIB_HEARTBEAT_S)
+                    if not done:
+                        # 내용 없는 프레임 — idle_s 는 마지막 **진짜** 프레임 뒤 경과(화면이 '마지막 진행
+                        # N초 전' 을 그린다), ts 는 이 파일의 다른 이벤트와 같은 epoch 밀리초다.
+                        yield _sse("ping", {"idle_s": int(time.monotonic() - last),
+                                            "ts": int(time.time() * 1000)})
+                        continue
+                chunk, get = await get, None
+                last = time.monotonic()
                 if chunk is None:
                     break
                 yield chunk
@@ -471,6 +502,9 @@ def _detach_stream(gen, label: str):
             logging.getLogger("agent").warning(
                 "[detach:%s] SSE 구독 절단 — 심의는 백그라운드에서 계속 완주한다(저장 포함)", label)
             raise
+        finally:
+            if get is not None and not get.done():
+                get.cancel()     # 구독이 끊겼다 — 기다리던 get 만 접는다(큐의 프레임은 그대로 남는다)
 
     return _subscribe()
 
