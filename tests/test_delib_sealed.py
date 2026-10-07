@@ -67,19 +67,28 @@ class _Tripwire(dict):
 
         return _Rec(name, self._ANSWERS.get(name, '{"hits": []}'))
 
-    def items(self):                     # 자유 조회 준비가 훑는 목록 — 읽기 도구 하나를 내준다
-        return [("list_materials", self.get("list_materials"))]
+    def items(self):
+        """자유 조회 준비가 훑는 목록. 뒤엣것은 리스크 심사 의장일 때만 열리는 도구다(_RISK_KEEP_TOOLS —
+        읽기 접두사에 안 걸려 그 조건이 유일한 통로다)."""
+        return [(n, self.get(n)) for n in ("list_materials", "pcb_warpage_surrogate")]
 
 
 def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, **start_kw):
     """**실제 MCP 도구 함수**(deliberate_start)로 열어 **실제 엔진**을 끝까지 돌린다.
 
     반환: SimpleNamespace(job=잡 원장, tools=부른 도구 이름들, chair=의장이 받은 프롬프트,
-                          free=자유 조회가 준비·실행된 횟수)
+                          free=자유 조회를 돈 좌석들, bound=자유 조회에 묶인 도구 이름들,
+                          steps=상태줄 전부)
     잡 원장은 tmp_path 로 돌린다 — 실 원장(/data 쪽)에 시험 잡을 쓰지 않는다."""
     import langgraph.prebuilt
 
-    wire, seen, free = _Tripwire(), [], []
+    wire, seen, free, bound, steps = _Tripwire(), [], [], [], []
+    real_apply = delib_jobs._apply
+
+    def _apply(job, event, data):        # 원장의 steps 는 최근 30줄만 남는다 — 전부 따로 적는다
+        if event == "status" and data.get("step"):
+            steps.append(str(data["step"]))
+        return real_apply(job, event, data)
 
     async def _fake_tools(*_a, **_k):
         return wire
@@ -99,7 +108,8 @@ def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, *
     monkeypatch.setattr(d, "_app_of_tools", lambda: {})            # 게이트웨이 /tools-map 을 타지 않게
     monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent",
-                        lambda *_a, **_k: free.append("agent") or object())
+                        lambda _llm, tools, **_k: bound.extend(t.name for t in tools) or object())
+    monkeypatch.setattr(delib_jobs, "_apply", _apply)
     monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
     monkeypatch.setattr(delib_jobs, "_JOBS", {})
     monkeypatch.setattr(delib_jobs, "_TASKS", {})
@@ -114,7 +124,7 @@ def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, *
     job_rec = asyncio.run(go())
     assert job_rec["status"] == "done", f"심의가 끝까지 못 갔다 — {job_rec.get('error')}"
     chair = next((h for s, h in seen if "엔지니어링 톤" in s), "")
-    return SimpleNamespace(job=job_rec, tools=wire.called, chair=chair, free=free)
+    return SimpleNamespace(job=job_rec, tools=wire.called, chair=chair, free=free, bound=bound, steps=steps)
 
 
 # ── Job 표 ───────────────────────────────────────────────────────────────────
@@ -195,17 +205,18 @@ def test_봉인하지_않은_리스크_심사는_바깥_자료를_가져온다(m
                        ("hybrid_search", "사전 검색"), ("report_query", "지정 도구"),
                        ("agent_search", "지식카드")):
         assert name in r.tools, f"{path} 경로가 하네스에서 안 돈다 — {name} 을 부르지 않았다"
-    assert "agent" in r.free and "mech-a" in r.free, "자유 조회 경로가 하네스에서 안 돈다"
+    assert "mech-a" in r.free and "list_materials" in r.bound, "자유 조회 경로가 하네스에서 안 돈다"
+    assert "pcb_warpage_surrogate" in r.bound, "리스크 심사가 더 여는 조회 도구 경로가 하네스에서 안 돈다"
     assert delib_jobs.summary(r.job)["sealed"] is False
     assert "봉인" not in (r.job["decision"] or "") and "봉인" not in r.chair
-    assert not any(str(s).startswith("봉인") for s in r.job["steps"])
+    assert not any(s.startswith("봉인") for s in r.steps)
 
 
 def test_봉인하면_호출자가_전부_열어도_바깥_자료를_가져오지_않는다(monkeypatch, tmp_path):
     r = _run(monkeypatch, tmp_path, tools=["report_query"], search_sources=["web"],
              advanced=dict(_REOPEN))
     assert set(r.tools) <= _ALLOWED, f"봉인했는데 부른 도구가 있다 — {sorted(set(r.tools) - _ALLOWED)}"
-    assert r.free == [], f"봉인했는데 자유 조회를 준비했다 — {r.free}"
+    assert r.free == [] and r.bound == [], f"봉인했는데 자유 조회를 준비했다 — {r.free} {r.bound}"
     assert "get_agent_session" in r.tools, "시험 전제 — 좌석 역할 복원은 돈다"
 
 
@@ -239,8 +250,8 @@ def test_잡_기록이_봉인과_닫힌_값을_보여_준다(monkeypatch, tmp_pa
 
 def test_시작할_때_닫은_경로를_상태줄로_밝힌다(monkeypatch, tmp_path):
     r = _run(monkeypatch, tmp_path)
-    line = next((s for s in r.job["steps"] if s.startswith("봉인 실행")), "")
-    assert line, f"봉인 상태줄이 없다 — {r.job['steps'][:5]}"
+    assert r.steps[0].startswith("봉인 실행"), f"봉인 상태줄이 맨 앞에 없다 — {r.steps[:3]}"
+    line = r.steps[0]
     for _closed_value, label in d._SEALED_CLOSE.values():
         assert label in line, f"닫은 경로 '{label}' 이 상태줄에 없다"
     assert d._SEALED_OPEN in line, "닫지 않은 것을 감추면 전부 닫혔다고 읽힌다"
