@@ -10,6 +10,8 @@ from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest  # noqa: E402
+
 import app as a  # noqa: E402
 import deliberation as d  # noqa: E402
 import thinking as th  # noqa: E402
@@ -325,6 +327,45 @@ def test_물성_전문가는_물성_도구를_받는다(monkeypatch):
     names = ["get_guide", "describe_template", "list_materials", "get_material_properties"]
     got = d._seat_tool_prefer(names, {"key": "mat-cu", "role": "구리 물성 담당"}, "구리", 12)
     assert got and all("material" in g for g in got), f"물성 전문가가 받은 것: {got}"
+
+
+def test_품질_전문가는_불량_이력_도구를_VOC_도구보다_먼저_받는다(monkeypatch):
+    """게이트웨이 분류표에 quality(품질·불량 이력 — 사내 PLM 문제점) 영역이 생겼는데 역할 낱말 표
+    (_AREA_HINT)에는 줄이 없었다. 그 영역 도구는 역할 점수가 0 이라 '이 전문가 것' 에서 빠지고,
+    '품질' 은 voc 줄에만 있어 품질 전문가가 VOC 도구만 받았다."""
+    area = {"plm_case_detail": "quality", "plm_similar_cases": "quality",
+            "get_top_issues": "voc", "query_voc": "voc"}
+    monkeypatch.setattr(a, "_area_of", lambda n: (area.get(n, ""), ""))
+    seat = {"key": "qual-field-defect", "role": "품질 불량 분석 담당 — 과거 문제점과 대책 이력을 본다"}
+    got = d._seat_tool_prefer(list(reversed(area)), seat, "힌지 크랙", 12)
+    assert got[:2] == ["plm_similar_cases", "plm_case_detail"], f"품질 전문가가 받은 것: {got}"
+
+
+def test_VOC_전문가는_종전대로_VOC_도구를_먼저_받는다(monkeypatch):
+    area = {"plm_case_detail": "quality", "get_top_issues": "voc", "query_voc": "voc"}
+    monkeypatch.setattr(a, "_area_of", lambda n: (area.get(n, ""), ""))
+    seat = {"key": "voc-market-signal", "role": "VOC 고객 불만 분석 담당"}
+    got = d._seat_tool_prefer(list(area), seat, "힌지 크랙", 12)
+    assert set(got[:2]) == {"get_top_issues", "query_voc"}, got
+
+
+# 역할 낱말 줄이 없는 영역 — **알고 남겨 둔 것만** 적는다(2026-10-07 기준). 역할 문장으로 짐작해 쥐어 줄
+# 도구가 아니거나(system·expert) 아직 줄을 쓰지 않은 영역이다. 줄을 쓰면 여기서 뺀다.
+_NO_HINT = {"research", "expert", "data", "system"}
+
+
+def test_게이트웨이_영역마다_역할_낱말_줄이_있거나_알고_남겨_둔_것이다():
+    """영역 키로 된 고정 표는 세 리포에서 이것 하나다. 게이트웨이에 영역이 늘면 여기는 말없이 낡는다 —
+    quality 가 그렇게 빠져 있었다. 새 영역이 생기면 _AREA_HINT 에 줄을 넣거나 _NO_HINT 에 적는다."""
+    gw = Path(__file__).resolve().parents[2] / "HWAXMcpGateway" / "tool_areas.json"
+    if not gw.exists():
+        pytest.skip(f"형제 리포 없음: {gw}")
+    keys = {x["key"] for x in json.loads(gw.read_text(encoding="utf-8"))["areas"]}
+    assert len(keys) >= 10, f"영역 키 추출 실패: {sorted(keys)}"        # 못 뽑으면 조용히 통과한다
+    missing = keys - set(d._AREA_HINT) - _NO_HINT
+    assert not missing, ("게이트웨이 영역인데 역할 낱말 줄이 없다 — 그 영역 도구는 역할 낱말로는 어느 좌석에도 "
+                         f"걸리지 않는다: {sorted(missing)}")
+    assert not (_NO_HINT & set(d._AREA_HINT)), "줄을 썼으면 _NO_HINT 에서 뺀다"
 
 
 # ── 역할 주입 실패를 사용자에게 말한다(during-F1) ─────────────────────────────
