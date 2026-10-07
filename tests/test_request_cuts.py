@@ -210,9 +210,12 @@ def test_해석_설계는_첫_단에서만_알린다(monkeypatch):
     assert b.req_cut == {} and c.req_cut == {}
 
 
-def test_시험_설계는_갈아_끼운_좌석에_대해서는_말하지_않는다(monkeypatch):
+def test_시험_설계는_지정_좌석을_고정_좌석_뒤에_앉히므로_줄인_것도_그대로_알린다(monkeypatch):
+    """종전엔 호출자 좌석을 고정 좌석으로 갈아 끼웠다 — 그때는 '줄였다' 가 거짓이라 지웠다. 이제 앉히므로
+    역할을 상한에서 줄였다는 것은 참이고, 알려야 한다."""
     (o,) = _stages(monkeypatch, d.run_test_plan, dict(_OVER))
-    assert set(o.req_cut) == {"tools", "continue_summary"}, o.req_cut
+    assert [p["key"] for p in o.continue_personas] == list(d._TEST_FIXED) + ["mech-a", "rel-b"]
+    assert set(o.req_cut) == {"tools", "continue_summary", "personas"}, o.req_cut
 
 
 # ── 이어하기 — 이전 결정문을 미리 자르지 않는다 ─────────────────────────────────────

@@ -286,12 +286,16 @@ async def deliberate_start(
                   읽어 만든다) — 여기 숫자를 다시 적지 마라, 적어 둔 값이 낡아 호출자가 근거를 버렸다.
         personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 상한은
                   deliberation.MAX_REQ_SEATS(지금 값은 deliberate_jobs 의 limits) — 넘친 좌석은 빼고
-                  상태줄로 알린다. 지정 반대석은 상한 밖에서 한 석 더 앉는다.
+                  상태줄로 알린다. 지정 반대석은 상한 밖에서 한 석 더 앉는다. test-plan 은 고정 좌석을
+                  먼저 앉히고 지정 좌석을 그 뒤에 앉힌다. sim-plan·build-plan 은 지정 좌석이 1단에 앉는다
+                  (2단부터는 서버가 CAE 좌석을 앉히고 1단 좌석 일부만 유임한다).
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름. 상한은 deliberation._TOOLS_MAX
                (지금 값은 deliberate_jobs 의 limits) — 넘친 것은 빼고 evidence_omitted 로 알린다.
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다. 상한은 deliberation._APPS_MAX(위와 같다).
         human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation.HUMAN_NOTE_MAX
                     (지금 값은 deliberate_jobs 의 limits) — 넘으면 앞부분만 싣고 evidence_omitted 로 알린다.
+                    sim-plan·build-plan 은 1단에만 싣는다(2단부터는 1단 결정문이 그 방향을 넘긴다).
+                    test-plan 은 엔진이 까는 지시문 뒤에 이어 싣는다.
         search_sources: 웹 리서치 소스 토글. 지정하면 인용 계약이 강제된다.
         options: 후보안 목록(안 선택용, 상한은 deliberation._OPTIONS_MAX). 2개 이상이면 최종 라운드가
                  이 중에서 고르는 표결을 요구한다. 없으면 표결을 강제하지 않는다 — 후보 없이 표를 받으면
@@ -343,11 +347,13 @@ async def deliberate_continue(
     Args:
         previous_job_id: 이어갈 심의의 job_id.
         human_note: 넣을 사람 의견. 이것이 이어하기의 핵심이다 — 패널이 갖지 못한 관측을 넣는다.
+                    sim-plan·build-plan 을 이어가면 1단에만 실린다(deliberate_start 의 human_note 와 같다).
         question: 화두를 바꾸려면 지정. 비우면 이전 화두를 그대로 쓴다.
         job: 심의 종류를 바꾸려면 지정. 비우면 이전과 같다.
         rounds: 라운드 수. 0 이면 기본값.
         non_negotiables: 이전 결정의 양보 불가 조항. 요약에 섞으면 소실되므로 따로 넘긴다.
         keep_seats: True 면 이전 좌석을 그대로 앉힌다(발굴 생략). False 면 다시 발굴한다.
+                    test-plan 은 고정 좌석 뒤에 이전 좌석을 앉히고, sim-plan·build-plan 은 1단에 앉힌다.
         append_report: True 면 이전 회차의 Report Archive 보고서에 페이지로 이어붙인다 — 한 사안이
                        보고서 여러 건으로 흩어지지 않는다. 이전 보고서가 없으면 새로 만든다.
         modifiers: 이번 회차에 얹을 층.
@@ -490,10 +496,14 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
         "options": {
             "evidence": _EVID_DESC,
             "personas": f"좌석 직접 지정(≤{_engine.MAX_REQ_SEATS} — 넘친 좌석은 빼고 상태줄로 알린다. "
-                        "지정 반대석은 상한 밖에서 한 석 더 앉는다). 비우면 서버가 발굴한다",
+                        "지정 반대석은 상한 밖에서 한 석 더 앉는다). 비우면 서버가 발굴한다. test-plan 은 "
+                        "고정 좌석을 먼저 앉히고 지정 좌석을 그 뒤에 앉힌다. sim-plan·build-plan 은 지정 "
+                        "좌석이 1단에 앉는다(2단부터는 서버가 CAE 좌석을 앉히고 1단 좌석 일부만 유임한다)",
             "tools": f"심의 전 실제 호출할 도구(≤{_engine._TOOLS_MAX}) · apps: 좌석 자유 조회 범위"
                      f"(≤{_engine._APPS_MAX}). 넘친 것은 빼고 deliberate_status 의 evidence_omitted 로 알린다",
-            "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달. limits.human_note_chars(0=무제한)를 "
+            "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달(sim-plan·build-plan 은 1단에만 싣는다 — "
+                          "2단부터는 1단 결정문이 그 방향을 넘긴다. test-plan 은 엔진이 까는 지시문 뒤에 "
+                          "이어 싣는다). limits.human_note_chars(0=무제한)를 "
                           "넘으면 앞부분만 싣고 deliberate_status 의 evidence_omitted 로 알린다",
             "options": f"후보안 목록(≤{_engine._OPTIONS_MAX}). 2개 이상이면 최종 라운드가 그 중에서 고르는 "
                        "표결을 요구한다",

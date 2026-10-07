@@ -138,12 +138,59 @@ def test_엔진이_깐_지시문과_현황은_자르지_않는다(monkeypatch):
     assert [c for c in _cards(events) if c["source"] == _CUT] == []
 
 
-def test_갈아_끼운_경로에서는_실었다고_말하지_않는다(monkeypatch):
-    """이 경로는 호출자의 의견을 아예 싣지 않는다 — '앞 2,000자만 실었다' 고 적으면 거짓이다."""
-    events = _test_plan_events(monkeypatch, _note(d.HUMAN_NOTE_MAX + 3000))
-    assert [c for c in _cards(events) if c["source"] == _CUT] == []
+def test_시험_설계는_엔진_지시문_뒤에_호출자_의견을_싣고_잘랐으면_그_길이로_알린다(monkeypatch):
+    """종전엔 이 경로가 호출자의 의견을 통째로 버렸다(tests/test_test_plan_caller_inputs). 이제 지시문 뒤에
+    싣는다 — 그러니 상한에서 자른 것도 알려야 하고, 길이는 **호출자 의견의** 길이여야 한다(칸 전체에는 엔진
+    지시문과 수천 자짜리 물성 현황이 같이 들어 있다)."""
+    seen = {}
+    real = d._cont_block
+
+    def _spy(summary, nn, human_note):
+        seen["note"] = human_note
+        return real(summary, nn, human_note)
+
+    monkeypatch.setattr(d, "_cont_block", _spy)
+    n = d.HUMAN_NOTE_MAX + 3000
+    events = _test_plan_events(monkeypatch, _note(n))
+    assert seen["note"].startswith("이미 실측이 있는 항목"), "엔진 지시문이 머리에 없다"
+    assert "A" * d.HUMAN_NOTE_MAX in seen["note"] and "Z" not in seen["note"], "호출자 의견(상한까지)이 좌석에 안 간다"
+    out = [c for c in _cards(events, included=False) if c["source"] == _CUT]
+    assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
+    assert f"{n:,}자 중 앞 {d.HUMAN_NOTE_MAX:,}자만" in out[0]["text"] and "3,000자" in out[0]["text"], out[0]["text"]
     shown = next(c for c in _cards(events, included=True) if c["source"] == "인간 검토자 의견")
-    assert "AAAA" not in shown["text"] and shown["text"].startswith("이미 실측이 있는 항목"), shown["text"][:60]
+    assert "AAAA" in shown["text"], "화면의 사람 의견 카드에 호출자 의견이 안 보인다"
+
+
+def test_엔진이_의견_칸을_통째로_갈아_끼운_단에서는_실었다고_말하지_않는다(monkeypatch):
+    """해석 설계 2·3단은 이 칸을 엔진 지시문으로 **갈아 끼운다**(호출자 의견은 1단에 실렸고 거기서 알렸다).
+    그 단에서 '앞 N자만 실었다' 고 또 적으면 거짓이다 — 아예 안 실린다."""
+    from test_delib_silent_drops import _at_round1
+
+    async def _fake_tools(*_a, **_k):
+        return {"agent_search": _Tool("agent_search")}
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    opts = d._resolve_opts({"human_note": _note(d.HUMAN_NOTE_MAX + 3000), "free_tools": 0, "voc": "off",
+                            "rescreen": 0, "personas": [{"key": "mech-a", "role": "기구"},
+                                                        {"key": "rel-b", "role": "신뢰성"}]})
+    assert opts.human_note_cut, "시험 전제 — 1단에서 이미 잘렸다"
+    opts.human_note = "사내 보유 도구를 우선 검토하라."          # run_sim_deliberation 이 2단에서 하는 일
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
+
+    async def go():
+        out, gen = [], d._deliberation_stream(stub, "해석 설계", [], opts)
+        try:
+            async for chunk in gen:
+                out.append(delib_jobs._parse_sse(chunk))
+                if _at_round1(*out[-1]):
+                    break
+        finally:
+            await gen.aclose()
+        return out
+
+    events = asyncio.run(go())
+    assert _at_round1(*events[-1]), [e for e in events if e[0] == "error"]
+    assert [c for c in _cards(events) if c["source"] == _CUT] == []
 
 
 # ── 안내 ─────────────────────────────────────────────────────────────────────

@@ -132,3 +132,13 @@ def test_지정_도구_앱_후보안_상한도_엔진_값을_읽어_적는다(mo
     doc = m.deliberate_start.__doc__ or ""
     for stale in ("최대 6", "최대 3", "최대 8"):
         assert stale not in doc, f"독스트링에 손으로 적은 '{stale}' 이 남아 있다"
+
+
+def test_사람_의견과_지정_좌석이_다단_심의에서_어디에_실리는지_메뉴가_말한다():
+    """'매 라운드 좌석에 전달' 만 적혀 있었다 — 해석 설계 2단부터는 그 칸을 엔진이 갈아 끼우고, 시험 설계는
+    고정 좌석을 먼저 앉힌다. 적어 두지 않으면 호출자는 넣은 의견·좌석이 전 단에 걸린 줄 안다."""
+    menu = asyncio.run(m.deliberate_jobs())["options"]
+    for key in ("human_note", "personas"):
+        for want in ("sim-plan", "build-plan", "1단", "test-plan"):
+            assert want in menu[key], (key, want, menu[key])
+    assert "고정 좌석" in menu["personas"], menu["personas"]

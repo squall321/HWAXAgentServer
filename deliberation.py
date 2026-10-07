@@ -3194,6 +3194,9 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         opts_b.continue_summary = decision_a[:8000]
         opts_b.continue_non_negotiables = nn_a[:12]
         opts_b.continue_personas = sim_seats
+        # 호출자의 사람 의견·지정 좌석은 **1단의 입력**이다(hwax-sim-deliberate.js 의 humanNote 도 '1단에 주입할
+        # 사람 의견' 이다). 여기서는 이어 붙이지 않는다 — 1단 좌석 전원이 그 의견을 받았고, 그 방향은 1단
+        # 결정문(continue_summary)으로 넘어온다. 시험 설계(run_test_plan)는 단이 하나라 지시문 뒤에 싣는다.
         opts_b.human_note = ("사내 보유 도구를 우선 검토하라. 파라미터 식별성 판정과 "
                              "이 해석이 답할 수 없는 것을 비워두지 마라.")
         # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
@@ -3270,13 +3273,24 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
         yield _sse("done", {}); return
     opts.chair_template = "test-plan"
-    # 고정 좌석을 앞에 세우고 나머지는 질문으로 발굴하게 둔다(재료 계열·현상 도메인).
-    opts.continue_personas = [{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
-    opts.req_cut.pop("personas", None)      # 호출자 좌석은 위에서 갈아 끼웠다 — '줄였다' 고 적으면 거짓이다
+    # 고정 좌석을 앞에 세우고, 호출자가 지정한 좌석을 그 뒤에 앉힌다. 나머지는 질문으로 발굴하게 둔다
+    # (재료 계열·현상 도메인). 사람 의견도 엔진 지시문 뒤에 **이어 붙인다.**
+    # ⚠ 종전엔 둘 다 덮어썼다 — 호출자의 좌석은 앉지 않았고 의견은 어느 좌석 프롬프트에도 없었는데 카드도
+    #   경고도 없었다. 이어하기는 그 의견이 부르는 까닭 전부다. 정본 파이프라인(hwax-test-plan.js)은 처음부터
+    #   이 순서로 둘 다 싣는다(FIXED_SEATS 뒤에 personas · BASE_NOTE 뒤에 humanNote).
+    #   지정 좌석은 좌석 상한(MAX_REQ_SEATS)까지이고 고정 좌석은 그 **밖에서** 앉는다(지정 반대석과 같은 규칙).
+    _caller_seats = [p for p in opts.continue_personas if p["key"] not in _TEST_FIXED]
+    _caller_note = opts.human_note
+    opts.continue_personas = ([{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
+                              + _caller_seats)
     opts.human_note = ("이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마라. "
                        "우선순위는 '민감도 × 근거 공백 × 확보 난이도' 로 서열화하고, "
                        "하나만 먼저 한다면 무엇인지 반드시 답하라. "
                        "경시·수명 항목은 결과까지 수개월이 걸리므로 착수 순서에서 앞에 두라.")
+    # 물성 현황(수천~수만 자)보다 **앞에** 붙인다 — 뒤에 두면 화면의 사람 의견 카드(_EVID_SHOW)와 좌석
+    # 재심사 질의(앞 1,000자)가 보는 창 밖으로 밀려난다.
+    if _caller_note:
+        opts.human_note += "\n\n[호출자가 넣은 사람 의견]\n" + _caller_note
     try:
         # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
         try:
@@ -3717,17 +3731,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="인간 검토자 의견", text=opts.human_note[:_EVID_SHOW], included=True)
     # 사람 의견을 상한에서 잘랐으면 알린다 — 말없이 자르면 쓴 사람은 전부 반영된 줄 안다. 좌석에 주지
     # 않은 카드라 잡 원장에도 실려 MCP 호출자가 본다.
-    # ⚠ **실은 글이 그 의견일 때만** 말한다. 다단 심의(해석 설계·시험 설계)는 이 칸을 엔진 지시문과
-    #   현황 조회 결과로 갈아 끼운다 — 거기서 '앞 N자만 실었다' 고 적으면 거짓이다(아예 안 실린다).
-    if opts.human_note_cut and opts.human_note == opts.human_note_cut[1]:
-        _hn_full = opts.human_note_cut[0]
+    # ⚠ **그 의견이 실제로 실렸을 때만** 말한다. 해석 설계 2·3단은 이 칸을 엔진 지시문으로 갈아 끼운다 —
+    #   거기서 '앞 N자만 실었다' 고 적으면 거짓이다(아예 안 실린다. 1단에 실렸고 1단이 알렸다). 시험 설계는
+    #   엔진 지시문 뒤에 그 의견을 이어 붙이므로 실린 것이다. 길이는 칸 전체가 아니라 **의견의** 길이로 적는다
+    #   (칸에는 엔진 지시문과 물성 현황이 같이 들어 있다).
+    if opts.human_note_cut and opts.human_note_cut[1] in opts.human_note:
+        _hn_full, _hn_kept = opts.human_note_cut[0], len(opts.human_note_cut[1])
         # 설정·필드 이름은 글에 넣지 않고 따로 싣는다(knob). 이 글은 웹 화면에도 뜬다 — 포털의 이어하기 칸은
         # 길이 제한이 없어, 길게 쓴 일반 사용자가 'human_note'·'DELIB_HUMAN_NOTE_MAX' 를 읽게 됐다. 그 이름이
         # 필요한 것은 MCP 호출자이고, 잡 원장이 knob 을 받아 글 끝에 붙인다(delib_jobs._apply).
         yield _delib("evidence", source="사람 의견 상한 초과", included=False,
                      knob="human_note · DELIB_HUMAN_NOTE_MAX",
-                     text=f"사람 의견 {_hn_full:,}자 중 앞 {len(opts.human_note):,}자만 좌석에 "
-                          f"실었다 — 뒤 {_hn_full - len(opts.human_note):,}자는 좌석이 보지 못한다"
+                     text=f"사람 의견 {_hn_full:,}자 중 앞 {_hn_kept:,}자만 좌석에 "
+                          f"실었다 — 뒤 {_hn_full - _hn_kept:,}자는 좌석이 보지 못한다"
                           f"(상한 {HUMAN_NOTE_MAX:,}자).")
     # 요청에 실린 나머지 값도 같다 — 상한에서 줄였으면 무엇을 얼마나 줄였는지 카드 하나로 알린다.
     if opts.req_cut:
