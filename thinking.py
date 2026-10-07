@@ -21,6 +21,7 @@ import json
 import os
 
 from deliberation import (
+    _KN_CONC,
     _agent_search_hits,
     _call,
     _first_dict,
@@ -369,7 +370,17 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
 
         yield _sse("status", {"step": f"예심 — 좌석별 보유 근거 확인({len(seats)}명)",
                               "tool": "agent_search"})
-        screened = await asyncio.gather(*[_screen_one(tools, s, q) for s in seats])
+        # 한 번에 도는 수를 묶는다 — 심의의 좌석 지식카드 조회와 같은 호출이 같은 곳(AIDataHub)으로 간다.
+        # 종전엔 소집한 좌석 수(기본 10)만큼 한꺼번에 쐈고, 심의와 겹치면 그쪽 연결 풀을 넘겼다. 상한은
+        # 심의와 같은 손잡이다(DELIB_KNOWLEDGE_CONCURRENCY, 0=무제한). 자리를 잡은 **뒤에** 묻는다 —
+        # 제한시간(SCREEN_TIMEOUT_S)이 줄 선 시간까지 세면 뒤쪽 좌석이 묻지도 못하고 강등된다.
+        _scr_sem = asyncio.Semaphore(max(1, min(len(seats), _KN_CONC) if _KN_CONC > 0 else len(seats)))
+
+        async def _screen_gated(s: dict) -> dict:
+            async with _scr_sem:
+                return await _screen_one(tools, s, q)
+
+        screened = await asyncio.gather(*[_screen_gated(s) for s in seats])
         live = []
         for s in screened:
             yield _think("screen", key=s["key"], hits=s["hits"], top=s["top"],

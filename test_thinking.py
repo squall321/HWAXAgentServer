@@ -70,6 +70,72 @@ def test_screen_collects_knowledge_lines_within_budget():
     assert r["knowledge"].startswith("• [t0]")
 
 
+# ── 예심 조회 — 소집한 좌석 수만큼 한꺼번에 쏘지 않는다 ─────────────────────────
+# 예심은 좌석마다 agent_search 를 부른다 — 심의의 좌석 지식카드 조회와 같은 호출이 같은 곳(AIDataHub)으로
+# 간다. 심의는 한 번에 도는 수를 묶었는데(DELIB_KNOWLEDGE_CONCURRENCY) 여기는 소집 수만큼(기본 10)
+# 한꺼번에 쐈다 — 심의 둘과 겹치면 다시 AIDataHub 연결 풀을 넘긴다.
+class _CountingSearch:
+    """동시에 몇 건이 돌고 있는지 세는 agent_search."""
+
+    def __init__(self):
+        self.now = self.peak = self.calls = 0
+
+    async def ainvoke(self, _args):
+        self.now += 1
+        self.peak = max(self.peak, self.now)
+        try:
+            await asyncio.sleep(0.01)
+            self.calls += 1
+            return '{"hits": [{"title": "t", "snippet": "s"}]}'
+        finally:
+            self.now -= 1
+
+
+def _screen_stage(monkeypatch, seats: int, conc: int) -> _CountingSearch:
+    """run_thinking 을 **실제로** 돌려 예심이 끝난 자리에서 멈춘다(본심 LLM 은 부르지 않는다)."""
+    import json
+    from types import SimpleNamespace
+
+    search = _CountingSearch()
+
+    class _Recommend:
+        async def ainvoke(self, _args):
+            return json.dumps({"agents": [{"agent_type": f"mech-s{i:02d}", "desc_match": 0.5}
+                                          for i in range(seats)]})
+
+    async def _fake_tools(*_a, **_k):
+        return {"recommend_agents": _Recommend(), "agent_search": search}
+
+    monkeypatch.setattr(t, "_tools_by_name", _fake_tools)
+    monkeypatch.setattr(t, "_KN_CONC", conc)
+    monkeypatch.setattr(t, "CANDIDATES", seats)
+
+    async def go():
+        gen = t.run_thinking(SimpleNamespace(state=SimpleNamespace(llm=object())), "힌지 크랙 원인", [])
+        try:
+            async for chunk in gen:
+                if b'"kind": "screen"' in chunk:
+                    return
+        finally:
+            await gen.aclose()
+        raise AssertionError("예심 결과까지 가지 못했다 — 하네스가 낡았다")
+
+    asyncio.run(go())
+    return search
+
+
+def test_screen_lookups_run_at_most_the_knowledge_concurrency(monkeypatch):
+    search = _screen_stage(monkeypatch, seats=10, conc=3)
+    assert search.calls == 10, "안 물어본 좌석이 있다"
+    assert search.peak == 3, f"예심 조회 {search.peak}건이 동시에 돌았다(상한 3)"
+
+
+def test_screen_lookups_zero_means_unbounded(monkeypatch):
+    """심의 쪽 손잡이와 같은 뜻이다 — 0 을 넣으면 영영 안 열리는 것이 아니라 무제한이다."""
+    search = _screen_stage(monkeypatch, seats=10, conc=0)
+    assert (search.calls, search.peak) == (10, 10)
+
+
 # ── 자기판정 파싱 ─────────────────────────────────────────────────────────────
 class _FakeLLM:
     def __init__(self, text):

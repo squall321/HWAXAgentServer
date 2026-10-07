@@ -1989,6 +1989,7 @@ KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 # 좌석 지식카드 조회를 한 번에 몇 석까지 돌리나, 0=무제한. 종전엔 좌석 수만큼을 **한꺼번에** 쐈다 —
 # 20석이면 조회 20건이 동시에 AIDataHub 로 가고, 심의 둘이 겹치면 40건이다. 밀려서 늦어진 조회는
 # 제한시간을 넘겨 폴백으로 한 번씩 더 쏜다(S26U 피드백 1-8). 제한시간은 줄 선 시간을 빼고 건마다 잰다.
+# 띵킹의 예심 조회(thinking._run_hop)도 같은 호출이라 이 값을 함께 쓴다.
 _KN_CONC = _env_int("DELIB_KNOWLEDGE_CONCURRENCY", 6)
 # 합성 지정석(_CHAIR_ADVERSARY 의 `delib-*`) 가운데 지식카드를 **조회할** 좌석 키 — 쉼표 목록, 기본은 빈 값.
 # 합성 지정석은 레지스트리에 없는 키라 묻지 않는다(물으면 매번 404 였다 — S26U 피드백 1-1). 그런데 그
