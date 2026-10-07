@@ -49,7 +49,7 @@ class _Tripwire(dict):
 
     def __init__(self):
         super().__init__()
-        self.called = []
+        self.called, self.args = [], {}          # 부른 이름(순서대로) · 이름별 마지막 인자
 
     def __bool__(self):                  # 비어 보이면 엔진이 '게이트웨이 불통' 으로 선다
         return True
@@ -58,11 +58,12 @@ class _Tripwire(dict):
         return True
 
     def get(self, name, default=None):
-        log = self.called
+        log, last = self.called, self.args
 
         class _Rec(_Tool):
             async def ainvoke(self, args):
                 log.append(self.name)
+                last[self.name] = args
                 return await super().ainvoke(args)
 
         return _Rec(name, self._ANSWERS.get(name, '{"hits": []}'))
@@ -124,7 +125,8 @@ def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, *
     job_rec = asyncio.run(go())
     assert job_rec["status"] == "done", f"심의가 끝까지 못 갔다 — {job_rec.get('error')}"
     chair = next((h for s, h in seen if "엔지니어링 톤" in s), "")
-    return SimpleNamespace(job=job_rec, tools=wire.called, chair=chair, free=free, bound=bound, steps=steps)
+    return SimpleNamespace(job=job_rec, tools=wire.called, args=wire.args, chair=chair, free=free,
+                           bound=bound, steps=steps)
 
 
 # ── Job 표 ───────────────────────────────────────────────────────────────────
@@ -296,6 +298,13 @@ def test_의장_프롬프트와_결정문에_봉인이_찍힌다(monkeypatch, tm
             assert label in text, f"닫은 경로 '{label}' 이 빠졌다"
         assert d._SEALED_OPEN in text
     assert r.job["decision"].count("■ 봉인 실행") == 1
+
+
+def test_저장되는_보고서에도_봉인이_찍혀_있다(monkeypatch, tmp_path):
+    """결정문은 RA 보고서로 남는다 — 저장한 **뒤에** 찍으면 화면에는 있고 남는 기록에는 없다."""
+    r = _run(monkeypatch, tmp_path)
+    saved = r.args["create_report_draft"]["blocks"]["recommendation"]
+    assert saved[0].startswith("■ 봉인 실행"), saved[0][:80]
 
 
 def test_다른_단발_심의도_봉인_손잡이로_닫힌다(monkeypatch, tmp_path):
