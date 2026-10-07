@@ -286,11 +286,22 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     q = (question or "").strip()
     if not q:
         raise ValueError("question 이 비어 있다 — 심의할 화두가 필요하다")
-    if running_count() >= MAX_RUNNING:
+    # ⚠ 거절 문구에 **남의 job_id 를 싣지 않는다.** 종전엔 진행 중인 잡 id 를 전부 찍었는데,
+    #   deliberate_cancel·deliberate_result 는 id 만 받으므로 거절당한 사람이 남의 심의를 들여다보고
+    #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
+    #   신원 없는 호출(서비스 계정)끼리도 서로 남이다 — 빈 이름이 같다고 한 사람으로 묶지 않는다.
+    total = running_count()
+    me = (user_email or "").strip().lower()
+    mine = [x["id"] for x in _JOBS.values() if me and x.get("status") == "running"
+            and str(x.get("user") or "").strip().lower() == me]
+    if total >= MAX_RUNNING:
         raise RuntimeError(
-            f"동시 실행 상한({MAX_RUNNING})에 걸렸다 — 진행 중인 심의가 끝난 뒤 다시. "
-            f"진행 중: {[x['id'] for x in _JOBS.values() if x['status'] == 'running']}. "
-            f"필요하면 deliberate_cancel 로 하나를 접어라.")
+            f"동시 실행 상한에 걸렸다(전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING) — "
+            + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if me
+               else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
+            + f" · 전체 {total}/{MAX_RUNNING}. "
+            + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
+               else "진행 중인 심의가 끝난 뒤 다시 하라."))
 
     from deliberation import (_SEALED_UNSUPPORTED, _seal, run_deliberation,  # noqa: PLC0415
                               run_sim_deliberation, run_test_plan)
