@@ -27,6 +27,23 @@ from pathlib import Path
 
 log = logging.getLogger("agent.delib_jobs")
 
+
+def _env_int(name: str, default: int) -> int:
+    """정수 설정을 읽는다 — 숫자가 아니면 경고하고 기본값이다(deliberation._env_int 와 같은 규칙).
+
+    여기서 예외를 올리면 `import mcp_server` 가 죽고, app.py 는 경고 한 줄만 남긴 채 /mcp 없이 뜬다 —
+    서버는 살아 있는데 게이트웨이에서 deliberate_* 가 전부 사라진다. env 키트의 줄을 줄 끝 설명째 옮겨
+    적으면 그 값이 된다(start.sh 는 `#` 뒤를 떼지 않는다). 엔진 것을 가져다 쓰지 않는 까닭 — 이 모듈은
+    deliberation 을 늦게 import 한다(start 의 주석)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("env %s=%r 정수 파싱 실패 — 기본값 %d 로 읽는다", name, raw[:60], default)
+        return default
+
 # 잡 산출물은 artifacts 와 같은 뿌리에 둔다(이관 시 함께 움직이도록 — ARTIFACT_DIR 이 /data 를 가리키면 여기도 따라간다).
 _ART = os.environ.get("ARTIFACT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts"))
 # ⚠ realpath 로 먼저 푼다 — 리포의 artifacts 는 /data 로 가는 심링크라, 그냥 dirname 하면
@@ -37,7 +54,7 @@ JOB_DIR = Path(os.environ.get(
 # 동시 실행 상한 — 심의 하나가 좌석 수만큼 LLM 을 물고 있어서, 무제한이면 vLLM 큐가 잠긴다.
 # 0 이하는 기본값으로 읽는다 — `int("0" or 2)` 는 0 이라, 0 을 넣은 박스는 모든 시작이 '상한 0건' 에
 # 걸렸다(빈 값만 기본값으로 가고 "0" 은 문자열이라 참이다). 사용자별 상한의 0 과 같은 뜻으로 맞춘다.
-MAX_RUNNING = int(os.environ.get("DELIB_JOB_MAX_RUNNING", "2") or 2)
+MAX_RUNNING = _env_int("DELIB_JOB_MAX_RUNNING", 2)
 if MAX_RUNNING < 1:
     log.warning("env DELIB_JOB_MAX_RUNNING=%d 는 1 미만 — 기본값 2 로 읽는다", MAX_RUNNING)
     MAX_RUNNING = 2
@@ -45,7 +62,7 @@ if MAX_RUNNING < 1:
 # 0 이면 전역을 따른다 = 따로 걸리지 않는다). 전역 2 는 LLM 큐 보호선이고 용량은 여기서 잴 수 없어
 # 기본 동작을 바꾸지 않는다 — 운영이 전역을 올리고 이 값을 낮춰 쓴다(예: 6 · 2). 자리가 없으면
 # 줄을 세운다(아래 QUEUE_MAX).
-_PER_USER = int(os.environ.get("DELIB_JOB_MAX_RUNNING_PER_USER", "0") or 0)
+_PER_USER = _env_int("DELIB_JOB_MAX_RUNNING_PER_USER", 0)
 MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 대기열 길이 — 자리가 없으면 거절하지 않고 줄을 세우고, 자리가 나면 스스로 시작한다. **0 이면 종전처럼
 # 거절한다.** 종전엔 상한에 걸리면 거절뿐이라, 패널 14개를 돌리려는 사람이 빈 자리를 지켜보다 하나씩
@@ -53,11 +70,11 @@ MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 건너뛴다(_pump) — 한 사람이 줄 맨 앞을 차지해도 다른 사람은 간다. 다만 사용자별 상한이 전역과 같은
 # 기본값에서는 건너뛸 일이 없어 한 사람의 잡 여럿이 줄을 통째로 차지할 수 있다 — 그게 싫으면 사용자별
 # 상한을 전역보다 낮춘다.
-QUEUE_MAX = max(0, int(os.environ.get("DELIB_JOB_QUEUE_MAX", "20") or 20))
+QUEUE_MAX = max(0, _env_int("DELIB_JOB_QUEUE_MAX", 20))
 # 메모리 원장 보존 개수(파일은 지우지 않는다 — 결과 회수는 파일에서도 된다).
 KEEP_IN_MEM = 200
 # 좌석 발언 전사 보존 상한(턴 수). 넘으면 이후 발언은 버리고 그 사실을 한 줄 남긴다.
-TURN_MAX = int(os.environ.get("DELIB_JOB_TURN_MAX", "400") or 400)
+TURN_MAX = _env_int("DELIB_JOB_TURN_MAX", 400)
 # 좌석에 주지 않은 근거(화면의 included=False 카드) 보존 상한 — 건수와 건당 글자. 이름을
 # excluded 로 짓지 않는다 — 리스크 앱에서 그 말은 '사람이 뺀 근거' 다. 좌석별 자유 조회 실패 카드는
 # 좌석 × 라운드로 불어나므로 막아 둔다. **먼저 온 것**을 남긴다 — 사전 근거의 드롭은 라운드가

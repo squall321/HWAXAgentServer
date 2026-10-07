@@ -227,3 +227,46 @@ def test_기본값에서는_전체가_찼을_때만_거절한다(ledger, monkeyp
         assert _start(ME)["user"] == ME
     else:
         _refused(ME)
+
+
+# ── 오타 값 — 심의 MCP 를 통째로 떼지 않는다 ─────────────────────────────────────
+# 네 손잡이를 맨 int() 로 읽어서, 값 하나가 숫자가 아니면 delib_jobs 가 import 에서 죽었다. app.py 는
+# `import mcp_server` 실패를 경고 한 줄로 넘기고 /mcp 없이 뜬다 — 서버는 살아 있고 /health 는 초록인데
+# 게이트웨이에서 deliberate_* 가 전부 사라진다. env 키트의 줄을 설명째 옮겨 적으면 바로 그 모양이 된다
+# (start.sh 는 줄 끝 설명을 떼지 않는다).
+_KNOBS = {"DELIB_JOB_MAX_RUNNING": ("MAX_RUNNING", 2), "DELIB_JOB_MAX_RUNNING_PER_USER": ("MAX_RUNNING_PER_USER", 2),
+          "DELIB_JOB_QUEUE_MAX": ("QUEUE_MAX", 20), "DELIB_JOB_TURN_MAX": ("TURN_MAX", 400)}
+_BAD = ["abc", "2.5", "20             # 줄의 길이"]
+
+
+def _import(code, tmp_path, **env):
+    """다른 프로세스에서 모듈을 새로 읽는다 — 원장 경로는 임시 디렉터리로 못박는다(실 원장에 닿지 않게)."""
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("DELIB_JOB_")}
+    return subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120,
+                          env={**clean, **env, "DELIB_JOB_DIR": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"})
+
+
+@pytest.mark.parametrize("knob", list(_KNOBS))
+@pytest.mark.parametrize("bad", _BAD)
+def test_숫자가_아닌_값은_기본값으로_읽고_어느_설정인지_남긴다(knob, bad, tmp_path):
+    attr, default = _KNOBS[knob]
+    r = _import(f"import delib_jobs as j; print(j.{attr})", tmp_path, **{knob: bad})
+    assert r.returncode == 0, f"{knob}={bad!r} 가 모듈 로드를 죽였다 — {r.stderr[-300:]}"
+    assert int(r.stdout.split()[-1]) == default, r.stdout
+    assert knob in r.stderr, f"어느 설정이 틀렸는지 남기지 않았다 — {r.stderr[-300:]}"
+
+
+def test_숫자가_아닌_값이_있어도_심의_MCP_가_붙은_채로_뜬다(tmp_path):
+    r = _import("import app; print('mcp', app._DELIB_MCP is not None, "
+                "any(getattr(x, 'path', '') == '/mcp' for x in app.app.routes))", tmp_path,
+                DELIB_JOB_QUEUE_MAX=_BAD[2])
+    assert r.returncode == 0, r.stderr[-600:]
+    assert r.stdout.split()[-3:] == ["mcp", "True", "True"], (r.stdout[-200:], r.stderr[-300:])
+
+
+def test_멀쩡한_값은_종전대로_읽는다(tmp_path):
+    r = _import("import delib_jobs as j; print(j.MAX_RUNNING, j.MAX_RUNNING_PER_USER, j.QUEUE_MAX, j.TURN_MAX)",
+                tmp_path, DELIB_JOB_MAX_RUNNING="6", DELIB_JOB_MAX_RUNNING_PER_USER="2",
+                DELIB_JOB_QUEUE_MAX="-4", DELIB_JOB_TURN_MAX=" 50 ")
+    assert r.returncode == 0, r.stderr[-300:]
+    assert r.stdout.split() == ["6", "2", "0", "50"], r.stdout        # 줄 길이의 음수는 0(거절) — 종전 그대로
