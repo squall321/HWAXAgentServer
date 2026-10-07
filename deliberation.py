@@ -2322,7 +2322,8 @@ def _free_result_chars(tool_budget: int) -> int:
 
 
 # 다른 좌석이 조회한 결과를 공용으로 돌릴 때의 **천장**(자). 좌석 수와 무관하게 상한이
-# 고정이라 20석이 되어도 프롬프트가 선형으로 커지지 않는다.
+# 고정이라 20석이 되어도 프롬프트가 선형으로 커지지 않는다. 1라운드 값이고 라운드에 비례해 는다
+# (_share_budget) — 풀이 라운드마다 쌓이기 때문이다.
 _SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
 _SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
 _PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자)
@@ -2333,10 +2334,16 @@ _PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 �
 _FREE_EVID_SHOW = max(_env_int("DELIB_FREE_EVID_SHOW", 2000), _SHARE_ITEM_MAX)
 
 
-def _share_budget() -> int:
+def _share_budget(rnd: int = 1) -> int:
     """공용 조회 결과 몫(자). 발언 턴은 도구를 안 묶으므로(_round_live 는 도구 없는 텍스트 턴)
-    _EVID_RESERVE 가 잡아 둔 스키마 몫이 실제로는 비어 있다 — 그 여유에서 쓴다."""
-    return min(_SHARE_BUDGET, max(600, int(_pre_budget() * 0.15)))
+    _EVID_RESERVE 가 잡아 둔 스키마 몫이 실제로는 비어 있다 — 그 여유에서 쓴다.
+
+    천장(_SHARE_BUDGET)은 **라운드에 비례해** 는다. 풀(gather_pool)은 라운드를 넘어 쌓이는데 몫이
+    고정이라 라운드가 갈수록 빠지는 비율이 커졌다(S26U 피드백 1-13 — 6석이 라운드마다 3건씩 조회하는
+    시험으로 재면 0.20 → 0.55 → 0.65).
+    ⚠ 컨텍스트 쪽 상한(_pre_budget 의 15%)은 그대로다. 창이 좁으면 1라운드부터 그 상한이 걸려 있어
+    늘지 않는다(128K 에서 3,850자) — 거기서 더 주려면 이 상한의 근거부터 다시 재야 한다."""
+    return min(_SHARE_BUDGET * max(1, rnd), max(600, int(_pre_budget() * 0.15)))
 
 
 def _share_block(pool: list, key: str, budget: int, *,
@@ -3907,7 +3914,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 잃고 (경험칙) 으로 강등해 결정문에 싣는다.
         # ⚠ 예산은 좌석 하나가 받는 **총량**이다. share 와 mine 에 각각 통째로 주면 실제
         #   주입량이 표기의 두 배가 된다(실측: 표기 1,500자 / 실제 2,670자). 나눠 쓴다.
-        _sb = _share_budget()
+        _sb = _share_budget(rnd)
         # 자기 조회 몫은 1/3 을 노리되 **절반을 넘지 않는다.** 바닥값만 두면 작은 창에서
         # 비율이 뒤집힌다(실측: dev 600자에서 공용 200 / 자기 400 이 됐다).
         _mbudget = min(_sb // 2, max(200, _sb // 3))
