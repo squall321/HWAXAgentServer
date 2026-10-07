@@ -1730,10 +1730,15 @@ def _ser(o: dict, keys: tuple, primary: str = "", clip: int | None = None) -> st
         (짧은 부수 키 하나로 폴백이 막혀 최종입장이 유실되는 구멍 방지),
     (2) 구조화 키가 전부 비면 say 원문으로 폴백 — 종전 {lens: null,…} 무음 유실 방지."""
     picked = {k: _ser_val(o.get(k), clip) for k in keys if o.get(k) not in (None, "", [])}
+    # say 폴백도 다른 값과 **같은 상한**을 탄다(_ser_val). 종전엔 여기만 800자에서 표식 없이 끊었다 — 구조화에
+    # 실패한 좌석의 원문(최대 2,000자)이 다음 라운드와 의장에게 800자로 가는데 '…' 조차 없어 완결된 발언으로
+    # 읽혔고, 끊은 판과 온전한 판이 같아 보여 '직렬화 값 상한' 알림도 안 나갔다. 같은 길을 타면 좌석 쪽은
+    # DELIB_SER_CLIP 에서 '…' 를 달고 끊기며 그 알림(상태줄·카드)이 나가고, 의장 쪽은 전사 상한이 받는 만큼
+    # 온전히 실린다(_chair_rows 가 clip 을 풀어 부른다 — 그쪽은 _decision_ctx 가 창 안에 들게 지킨다).
     if primary and primary not in picked and o.get("say"):
-        picked["say"] = str(o.get("say"))[:800]
+        picked["say"] = _ser_val(o.get("say"), clip)
     if not picked and o.get("say"):
-        picked = {"say": str(o.get("say"))[:800]}
+        picked = {"say": _ser_val(o.get("say"), clip)}
     return json.dumps(picked, ensure_ascii=False)
 
 
