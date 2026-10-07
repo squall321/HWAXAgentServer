@@ -1377,6 +1377,11 @@ _GROUP_LABEL = {
 
 
 _APPS_CACHE: dict = {"apps": {}, "at": 0.0}
+# /tools-map 조회가 실패한 뒤 다시 묻기까지(초) — 그동안은 가진 것(없으면 빈 것)으로 간다. 5초 한도는 짧아야
+# 맞다(죽은 게이트웨이를 재는 값이다). 문제는 실패를 캐시하지 않던 것이다 — 이 조회는 동기 urlopen 이라 이벤트
+# 루프를 통째로 막는데, 게이트웨이가 매달리면 도구 수 × 좌석 수만큼 5초씩 다시 물었다. 그 동안은 심의의
+# heartbeat(ping)까지 멈춰 바깥에서는 서버가 죽은 것처럼 보인다(컨텍스트 조회 _CTX_RETRY_S 와 같은 방식).
+_GW_RETRY_S = 60.0
 
 
 def _gw_apps() -> dict:
@@ -1389,14 +1394,17 @@ def _gw_apps() -> dict:
     now = time.time()
     if _APPS_CACHE["apps"] and now - _APPS_CACHE["at"] < 300:
         return _APPS_CACHE["apps"]
+    if time.monotonic() < _APPS_CACHE.get("retry_at", 0.0):
+        return _APPS_CACHE["apps"]      # 방금 못 물어봤다 — 죽은 게이트웨이를 호출마다 5초씩 기다리지 않는다
     try:
         with urllib.request.urlopen(f"{_GW_HTTP}/tools-map", timeout=5) as r:
             data = json.loads(r.read().decode("utf-8"))
         apps = {a["app"]: a for a in (data.get("apps") or []) if a.get("app")}
         if apps:
             _APPS_CACHE.update({"apps": apps, "at": now})
-    except Exception:  # noqa: BLE001 — 게이트웨이 불통은 비치명적. 폴백 표로 계속 간다.
-        pass
+    except Exception as exc:  # noqa: BLE001 — 게이트웨이 불통은 비치명적. 폴백 표로 계속 간다.
+        print(f"[tools] apps fetch failed — {_GW_RETRY_S:.0f}초 뒤 다시 묻는다: {exc!r}")
+        _APPS_CACHE["retry_at"] = time.monotonic() + _GW_RETRY_S
     return _APPS_CACHE["apps"]
 
 
@@ -1415,6 +1423,8 @@ def _tools_map() -> dict:
     now = time.time()
     if _TOOLS_MAP_CACHE["map"] and now - _TOOLS_MAP_CACHE["at"] < 300:
         return _TOOLS_MAP_CACHE["map"]
+    if time.monotonic() < _TOOLS_MAP_CACHE.get("retry_at", 0.0):
+        return _TOOLS_MAP_CACHE["map"]  # 방금 못 물어봤다 — _GW_RETRY_S 뒤에 다시 묻는다(_GW_RETRY_S 주석)
     try:
         with urllib.request.urlopen(f"{_GW_HTTP}/tools-map", timeout=5) as r:
             data = json.loads(r.read()) or {}
@@ -1426,7 +1436,8 @@ def _tools_map() -> dict:
                                      "area_meta": {a["area"]: a for a in (data.get("area_meta") or [])
                                                    if isinstance(a, dict) and a.get("area")}})
     except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
-        print(f"[tools] map fetch failed: {exc!r}")
+        print(f"[tools] map fetch failed — {_GW_RETRY_S:.0f}초 뒤 다시 묻는다: {exc!r}")
+        _TOOLS_MAP_CACHE["retry_at"] = time.monotonic() + _GW_RETRY_S
     return _TOOLS_MAP_CACHE["map"]
 
 
