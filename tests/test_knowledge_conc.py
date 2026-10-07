@@ -81,11 +81,11 @@ def test_차례를_기다린_시간은_조회_제한시간에_안_들어간다(m
     """제한시간(KNOWLEDGE_TIMEOUT_S)은 **조회 한 건**의 것이다. 줄 선 시간까지 재면 뒤쪽 좌석이 조회를
     시작도 못 하고 '시간 초과' 로 강등된다 — 상한을 넣어서 새로 생길 수 있는 조용한 실패다."""
     monkeypatch.setattr(d, "_KN_CONC", 1)
-    monkeypatch.setattr(d, "KNOWLEDGE_TIMEOUT_S", 0.4)
-    tool, events = _lookup(monkeypatch, 12, _Counting(hold=0.05))     # 한 줄로 0.6초 — 제한시간보다 길다
-    assert tool.peak == 1 and len(tool.calls) == 12, "강등돼 폴백으로 다시 물었다"
+    monkeypatch.setattr(d, "KNOWLEDGE_TIMEOUT_S", 0.5)
+    tool, events = _lookup(monkeypatch, 20, _Counting(hold=0.03))     # 한 줄로 0.6초 — 제한시간보다 길다
+    assert tool.peak == 1 and len(tool.calls) == 20, "강등돼 폴백으로 다시 물었다"
     assert not [data for ev, data in events if ev == "warning"], "기다리기만 한 좌석이 강등됐다"
-    assert any(s.startswith("지식카드 주입 — 12/12명") for s in _steps(events))
+    assert any(s.startswith("지식카드 주입 — 20/20명") for s in _steps(events))
 
 
 def test_심의를_잇달아_돌려도_된다(monkeypatch):
