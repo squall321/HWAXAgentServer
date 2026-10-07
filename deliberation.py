@@ -1909,13 +1909,17 @@ _PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 #    타임아웃과 정상 응답이 같은 타입으로 돌아온다. 문자열을 봐야 구분된다.
 #  ③ 비었다는 것과 못 물어봤다는 것은 다르다 — 섞으면 "이 전문가는 아는 게 없다"로
 #    오독된다. 그래서 사유를 함께 돌려주고 호출부가 그것을 사용자에게 보인다.
-# 좌석 지식카드 검색 타임아웃. 좌석은 **병렬**(asyncio.gather)이라 이 값을 올려도 전체
-# 시간은 '가장 느린 하나' 로 끝난다 — 20초는 너무 빡빡했다(agent_search 하이브리드가
+# 좌석 지식카드 검색 타임아웃. 좌석은 **병렬**(한 번에 _KN_CONC 석)이라 이 값을 올려도 전체
+# 시간은 묶음마다 '가장 느린 하나' 로 끝난다 — 20초는 너무 빡빡했다(agent_search 하이브리드가
 # 102초 걸린 전례가 있다. docs/gotchas 지식카드 검색 지연). 넉넉히 두고, 대신 강등되면
 # 화면에 남긴다. 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
 KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 120.0)
 # hybrid 가 늦으면 semantic 으로 한 번 되묻는다. hybrid 가 느린 것이지 semantic 은 0.1초다.
 KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
+# 좌석 지식카드 조회를 한 번에 몇 석까지 돌리나, 0=무제한. 종전엔 좌석 수만큼을 **한꺼번에** 쐈다 —
+# 20석이면 조회 20건이 동시에 AIDataHub 로 가고, 심의 둘이 겹치면 40건이다. 밀려서 늦어진 조회는
+# 제한시간을 넘겨 폴백으로 한 번씩 더 쏜다(S26U 피드백 1-8). 제한시간은 줄 선 시간을 빼고 건마다 잰다.
+_KN_CONC = _env_int("DELIB_KNOWLEDGE_CONCURRENCY", 6)
 
 
 # 카드의 인과 검증 상태 → 모델에게 보일 꼬리표. validated 는 안 붙인다(기본이라 소음이 된다).
@@ -3502,10 +3506,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _kn_seats = [p for p in personas
                      if p.get("origin") != "adversary" and not str(p["key"]).startswith("delib-")]
 
+        # 한 번에 도는 수(_KN_CONC). 세마포어는 **여기서** 만든다 — 모듈에 하나 두면 처음 쓴 이벤트
+        # 루프에 묶여, 다른 루프에서 도는 심의가 줄을 서는 순간 죽는다.
+        _kn_par = min(len(_kn_seats), _KN_CONC) if _KN_CONC > 0 else len(_kn_seats)
+        _kn_sem = asyncio.Semaphore(max(1, _kn_par))
+
         async def _kn_one(p):
             # 타임아웃·강등은 _agent_search_hits 가 판정한다. 여기서 조용히 0건으로 만들면
             # '지식이 없는 전문가' 와 '못 물어본 전문가' 가 구분되지 않는다.
-            hits, note = await _agent_search_hits(tools, p["key"], question)
+            # 자리를 잡은 **뒤에** 묻는다 — 제한시간이 줄 선 시간까지 세면 뒤쪽 좌석이 조회를 시작도
+            # 못 하고 '시간 초과' 로 강등된다.
+            async with _kn_sem:
+                hits, note = await _agent_search_hits(tools, p["key"], question)
             if not hits:
                 return p["key"], "", note
             lines, total, seen = [], 0, set()
@@ -3519,7 +3531,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             return p["key"], "\n".join(lines), note
 
         yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(_kn_seats)}명 "
-                                      f"(최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)", "tool": "agent_search"})
+                                      f"(한 번에 {_kn_par}명 · 건당 최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)",
+                              "tool": "agent_search"})
         _kn_notes: list[str] = []
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
