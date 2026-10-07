@@ -537,7 +537,7 @@ def test_좌석_계약_접미가_복원된_역할_뒤에_붙는다():
 def test_계약_접미는_역할_복원_다음에_온다():
     """_restore_role 이 role 을 통째로 덮으므로 순서가 뒤집히면 계약이 100% 유실된다."""
     src = Path(d.__file__).read_text(encoding="utf-8")
-    restore = src.index('p["role"] = await _restore_role(tools, p["key"], p.get("role") or "")')
+    restore = src.index('p["role"] = await _restore_role(tools, p["key"], p.get("role") or "", why=_rr_why)')
     suffix = src.index('if opts.chair_template == "risk-review":')
     assert restore < suffix
 
