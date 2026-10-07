@@ -22,6 +22,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 import delib_jobs
+import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
 
 log = logging.getLogger("agent.mcp")
 
@@ -141,6 +142,40 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
     return o
 
 
+# 근거 인자 안내 — **숫자를 손으로 적지 않는다.** 종전 독스트링은 "최대 40, 항목당 12,000자" 를
+# 적어 두었는데 엔진 상수(_EVID_ITEM_MAX)는 150,000 이었다. 실사용 팀이 그 글을 믿고 제 근거를
+# 미리 잘라 92% 를 버렸다(S26U 피드백 1-4, 2026-10-07). 상수에서 읽어 만들면 낡을 수 없다.
+# 그리고 그 독스트링은 클라이언트에 **간 적이 없다** — description 을 따로 넘기면 FastMCP 는
+# 독스트링을 안 쓴다. 호출자가 받는 글(_START_DESC)에 실어야 읽힌다.
+# ⚠ 합계 예산(_evid_budget)은 여기서 재지 않는다. 모델 컨텍스트에서 유도하는 값인데, 이 모듈은
+#   app.py 가 반쯤 import 된 시점에 로드돼 그 조회가 실패하고, 엔진은 폴백 값을 프로세스 내내
+#   캐시한다(dev 16K 창에서 좌석 전원이 400 으로 죽는다). 부를 때 재서 준다(_evid_limits).
+_EVID_DESC = (
+    f"evidence(원천 근거) — [{{source, tool, args, result}}], 최대 {_engine._EVID_ITEMS}건. "
+    "**본문은 `result` 에 넣는다**"
+    f"({'·'.join(_engine._EVID_BODY_KEYS[1:])} 도 차례로 찾지만 정본은 result 다). "
+    f"**미리 자르지 마라** — 항목당 천장은 {_engine._EVID_ITEM_MAX:,}자이고, 넘으면 엔진이 덜어낸 뒤 "
+    "무엇을 뺐는지 본문에 밝힌다(낱장 표지 `## [s.N]`·`## [p.N]` 가 있으면 그 경계에서 가운데를, "
+    "없으면 뒤쪽을 덜어낸다). 먼저 걸리는 것은 **합계 예산**이다 — 모델 컨텍스트에서 유도되고"
+    f"(천장 {_engine._EVID_BUDGET:,}자, 작은 창에서는 훨씬 작다) 항목 하나도 이 값을 넘지 못한다. "
+    "앞 항목부터 채우다 넘치면 뒤 항목은 통째로 빠지므로, 여러 건이면 합이 deliberate_jobs 의 "
+    "limits(지금 걸리는 값) 안에 들게 하고 중요한 것을 앞에 둬라. 빠진 항목(예산·건수 초과, 본문 "
+    "없음)은 deliberate_status 의 evidence_omitted 에 뜬다. 호출자 표식(예: E1-CH-015)은 `source` 에 "
+    "넣으면 [e:N] 옆에 그대로 찍힌다. 결론이 아니라 원천만 넣어라."
+)
+
+# advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
+# 엔진이 처음부터 받았는데 어디에도 안 적혀 있어, 소급 검증에 최근 VOC 가 섞여 들어갔다.
+_ADV_DESC = (
+    "advanced(품질 손잡이 dict, 보통 비운다) — free_tools·tool_budget·chair_bestof·chair_cite·"
+    "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries·timeout_s · "
+    "voc(불량 환기: auto|off|always — auto 는 화두에 불량 낱말이 있으면 최근 VOC 를 조회해 좌석에 "
+    "깐다. 리스크 심사 화두에는 '이슈'·'품질' 이 거의 항상 들어 있어 사실상 매번 돈다. 그 시점 "
+    "자료만으로 다시 심사하는 소급 검증에서는 off 로 꺼라) · "
+    f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
+    "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다)."
+)
+
 _START_DESC = (
     "HWAX 전문가 심의를 시작한다. 사용자가 '심의해줘'·'원인 규명'·'불량 원인'·'안 선택'·"
     "'트레이드오프'·'신뢰 판정'·'리스크 심사'·'위험 도출'·'해석 설계'·'시뮬레이션 심의'·"
@@ -148,8 +183,20 @@ _START_DESC = (
     "포털 웹 심의와 같은 엔진이다. 여러 전문가 좌석이 라운드를 돌며 도구 근거 위에서 수렴해 "
     "결정 문서를 만든다. **즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다** — "
     "결과는 deliberate_status / deliberate_result 로 받는다. 응답을 붙잡고 기다리지 마라. "
-    "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다."
+    "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다.\n\n"
+    + _EVID_DESC + "\n\n" + _ADV_DESC
 )
+
+
+def _evid_limits() -> dict:
+    """지금 이 서버에서 실제로 걸리는 근거 상한 — 합계 예산이 모델 컨텍스트를 따라가므로 부를 때 잰다.
+
+    항목당 상한도 합계 예산을 넘지 못한다(엔진 _fit_ev). 실측(2026-10-07) 128K 창에서 합계가
+    17,967자다 — 설명에 적힌 천장만 믿고 긴 항목을 여럿 넣으면 뒤쪽이 통째로 빠진다."""
+    total = _engine._evid_budget()
+    return {"evidence_items": _engine._EVID_ITEMS,
+            "evidence_item_chars": min(_engine._EVID_ITEM_MAX, total),
+            "evidence_total_chars": total}
 
 
 @mcp.tool(title="심의 시작 (원인규명·안선택·신뢰판정·해석설계·시험설계·구축계획·자유)",
@@ -182,8 +229,9 @@ async def deliberate_start(
         rounds: 라운드 수. 0 이면 기본값 3. 2~8 로 클램프된다.
         modifiers: 얹을 층 — voi(교착 정산) · premortem(사전부검) · toulmin(논증 엄밀) ·
                    eliminative(완결 기준) · anon1r(익명 1R). 최대 5개.
-        evidence: 원천 근거 주입(최대 40, 항목당 12,000자). [{source, tool, args, result}] — 이미 도구로 뽑아 둔
-                  결과를 좌석에 '검증 대상'으로 깐다. 결론이 아니라 원천만 넣어라.
+        evidence: 원천 근거 주입. [{source, tool, args, result}] — 이미 도구로 뽑아 둔 결과를 좌석에
+                  '검증 대상'으로 깐다. 상한·본문 키·표식 규칙은 _EVID_DESC 가 정본이다(엔진 상수에서
+                  읽어 만든다) — 여기 숫자를 다시 적지 마라, 적어 둔 값이 낡아 호출자가 근거를 버렸다.
         personas: 좌석 지정(최대 20 — deliberation.MAX_REQ_SEATS). [{key, role}] — 비우면 서버가
                   recommend_agents 로 발굴한다.
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름(최대 6).
@@ -198,7 +246,7 @@ async def deliberate_start(
                      않으려 할 때. 기본 True.
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
-                  parse_retries · timeout_s. 보통 비운다.
+                  parse_retries · timeout_s · voc · chair_template. 보통 비운다(뜻은 _ADV_DESC).
     """
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
                        tools=tools, apps=apps, human_note=human_note, options=options,
@@ -337,7 +385,8 @@ async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",
-          description="심의 종류 7가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, 옵션 목록.")
+          description="심의 종류 7가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, 옵션 목록, "
+                      "지금 걸리는 근거 상한(limits).")
 async def deliberate_jobs() -> dict:
     """포털 웹 심의 메뉴와 같은 택소노미. job 값을 고르는 데 쓴다."""
     return {
@@ -353,16 +402,16 @@ async def deliberate_jobs() -> dict:
             "anon1r": "익명 1R — 초반 쏠림·거수기 우려",
         },
         "options": {
-            "evidence": "이미 뽑아 둔 도구 결과·문서 추출문을 원천 근거로 주입(≤40) — 결론 말고 원천만",
+            "evidence": _EVID_DESC,
             "personas": "좌석 직접 지정(≤20). 비우면 서버가 발굴한다",
             "tools": "심의 전 실제 호출할 도구(≤6) · apps: 좌석 자유 조회 범위(≤3)",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달",
             "options": "후보안 목록(≤8). 2개 이상이면 최종 라운드가 그 중에서 고르는 표결을 요구한다",
             "stop_after_round": "1 이면 초기 라운드에서 멈추고 사람 검토를 기다린다",
             "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
-            "advanced": "free_tools·tool_budget·chair_bestof·chair_cite·rebut_quote·cross_exam·"
-                        "anchor·evidence_prepass·prose_first·parse_retries·timeout_s",
+            "advanced": _ADV_DESC,
         },
+        "limits": _evid_limits(),
         "running_max": delib_jobs.MAX_RUNNING,
         "note": "meeting_* 도구는 발표자료 제작용 디자인 회의체다 — 공학 심의가 아니다.",
     }
