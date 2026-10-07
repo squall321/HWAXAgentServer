@@ -352,6 +352,17 @@ async def deliberate_start(
     return out
 
 
+def _carry_seats(prev: dict) -> list:
+    """이어하기가 되넘길 이전 좌석 — 좌석 목록(누가·어떤 성격으로 앉았나)은 seats 에서, 역할은 잡이 적어 둔
+    **줄이지 않은 것**(seat_roles)에서 가져온다.
+
+    seats 의 역할은 소개 카드용 앞 280자다. 레지스트리 좌석은 엔진이 원본으로 복원하지만(_restore_role),
+    호출자가 지어 준 좌석은 원본이 없어 그 사본이 그대로 역할이 된다 — 그래서 그 좌석만 이어하기에서 역할
+    대부분을 잃었다. seat_roles 가 없는 옛 잡은 종전대로 seats 의 역할을 쓴다."""
+    full = prev.get("seat_roles") or {}
+    return [{**s, "role": full.get(s.get("key")) or s.get("role") or ""} for s in (prev.get("seats") or [])]
+
+
 @mcp.tool(
     title="심의 이어하기",
     description=("끝난 HWAX 심의에 사람 의견을 넣어 이어서 돌린다. 이전 좌석과 양보 불가 조항을 "
@@ -408,7 +419,7 @@ async def deliberate_continue(
         # 상한 초과'). 여기서 떼어 넘기면 엔진은 줄어든 줄 모르고, 이어받은 사람도 모른다.
         continue_summary=summary_text,
         non_negotiables=non_negotiables,
-        personas=(prev.get("seats") or []) if keep_seats else None,
+        personas=_carry_seats(prev) if keep_seats else None,
         rounds_so_far=delib_jobs.rounds_end(prev),
         append_to_report_id=(int(prev.get("report_id") or 0) if append_report else 0),
     )

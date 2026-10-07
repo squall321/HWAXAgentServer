@@ -480,8 +480,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
-    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _resolve_opts, _seal,  # noqa: PLC0415
-                              run_deliberation, run_sim_deliberation, run_test_plan)
+    from deliberation import (_INT_KEYS, _ROLE_REQ_MAX, _SEALED_UNSUPPORTED, _resolve_opts,  # noqa: PLC0415
+                              _seal, _seat_key, run_deliberation, run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
 
@@ -507,6 +507,12 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "chair_template": opts.get("chair_template"), "opts": _opts_echo(applied),
         "status": "queued", "stage": "queued", "step": "", "steps": [],
         "seats": [], "round": 0, "total_rounds": None,
+        # 호출자가 준 좌석 역할 — **줄이지 않은 것**(엔진이 읽는 상한까지). seats 는 엔진의 personas 이벤트에서
+        # 오는데 그 역할은 소개 카드용 앞 280자뿐이다. 이어하기는 좌석을 여기서 되넘기므로, 레지스트리에 없는
+        # 좌석(호출자가 지어 준 키 — 엔진이 원본을 다시 읽어 올 데가 없다)은 그 280자가 역할이 됐다.
+        # seats 는 화면·목록이 읽는 모양이라 그대로 두고 역할 전문만 따로 적는다(mcp_server._carry_seats).
+        "seat_roles": {_seat_key(p): str(p["role"])[:_ROLE_REQ_MAX] for p in (opts.get("personas") or [])
+                       if _seat_key(p) and isinstance(p.get("role"), str) and p["role"]},
         "decision": None, "result_text": None, "report_id": None, "plain": None,
         "turns": [], "checkpoint": None,
         "error": None, "warnings": [], "evidence_omitted": [],
