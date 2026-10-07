@@ -182,7 +182,7 @@ _ADV_DESC = (
     "조회해 깐다. 카드는 지금 시점의 것이라 소급 검증에서는 0 으로 꺼라) · "
     f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
     "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다) · "
-    "sealed(봉인: 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다: "
+    "sealed(봉인: 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다 — "
     f"{' · '.join(label for _closed, label in _engine._SEALED_CLOSE.values())}. 같이 보낸 손잡이로 "
     "다시 열 수 없고, 열려다 닫힌 것은 deliberate_status 의 evidence_omitted 에 뜬다. 봉인 사실과 닫은 "
     f"경로가 잡 기록과 결정문 머리에 남는다. 닫지 않는 것: {_engine._SEALED_OPEN}. "
