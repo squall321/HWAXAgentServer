@@ -91,6 +91,12 @@ if MAX_REQ_SEATS < 2:
 # ⚠ 이 **기본값**은 포털 DelibOpts.human_note(max_length) 이하여야 한다(포털 계약 시험이 이 줄을 읽어
 #   대조한다 — HWAXPortal docs/delib-engine-feedback D-7). 포털 상한 위로 올리려면 포털도 같이 올린다.
 HUMAN_NOTE_MAX = _env_int("DELIB_HUMAN_NOTE_MAX", 2000)
+# 요청에 실린 나머지 값들의 상한 — 지정 도구·앱·후보안의 건수, 이전 요약·조항·후보안·좌석 역할의 길이.
+# 넘으면 앞에서부터 남기고 **줄였다는 것을 적어 둔다**(_resolve_opts 의 req_cut — 스트림이 카드로 알린다).
+# 종전엔 숫자가 _resolve_opts 안에 흩어져 있었고 말없이 잘랐다 — 도구 8개를 보낸 호출자는 6개만 돌았다는
+# 것을, 이어하기를 부른 사람은 이전 결정문이 앞 8,000자만 실렸다는 것을 알 길이 없었다.
+_TOOLS_MAX, _APPS_MAX, _OPTIONS_MAX, _NN_MAX = 6, 3, 8, 12
+_SUMMARY_MAX, _NN_ITEM_MAX, _OPTION_ITEM_MAX, _ROLE_REQ_MAX = 8000, 1200, 400, 2000
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
@@ -752,6 +758,23 @@ def _seal(req_opts: dict) -> tuple[dict, list]:
     return {**req_opts, **closed, "sealed": 1}, reopen
 
 
+def _cut_note(what: str, items: list, cap: int, item_cap: int = 0, *, unit: str = "개",
+              item: str = "항목", dropped: list | None = None, knob: str = "") -> str:
+    """목록을 상한에서 줄였으면 무엇을 얼마나 줄였는지 한 줄로, 안 줄였으면 빈 문자열.
+
+    건수(cap)를 넘긴 것과, 남긴 항목 가운데 길이(item_cap)를 넘긴 것을 따로 적는다 — 빠진 항목의
+    길이까지 '줄였다' 고 적으면 틀린 말이다. dropped 를 주면 빠진 것의 이름을, knob 을 주면 그 상한을
+    바꾸는 설정 이름을 함께 적는다."""
+    notes = []
+    if len(items) > cap:
+        notes.append(f"{len(items)}{unit} 중 앞 {cap}{unit}만" + (f"(상한 설정 {knob})" if knob else "")
+                     + (f" — 뺀 것: {', '.join(str(x)[:60] for x in dropped[:20])}" if dropped else ""))
+    long = sum(1 for x in items[:cap] if item_cap and len(str(x)) > item_cap)
+    if long:
+        notes.append(f"{item} {long}개는 앞 {item_cap:,}자만")
+    return f"{what} {' · '.join(notes)}" if notes else ""
+
+
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
     미지정 키는 env 기본값 유지(하위호환). 값은 화이트리스트 키만 읽고 정수/실수로 강제·클램프
@@ -820,6 +843,10 @@ def _resolve_opts(req_opts):
         persona_knowledge=_env_int("DELIB_PERSONA_KNOWLEDGE", 1),
         # 봉인 실행(소급 검증) 여부와, 봉인이 닫은 손잡이 중 호출자가 열려던 것(스트림이 카드로 알린다).
         sealed=0, sealed_reopen=[],
+        # 상한에서 줄인 요청 값 — 요청 키 → 무엇을 얼마나 줄였는지. 스트림이 카드 하나로 알린다.
+        # 키별로 두는 까닭 — 다단 심의는 일부 값을 엔진이 갈아 끼우는데, 그 값에 대해 '요청을 줄였다' 고
+        # 적으면 거짓이다. 갈아 끼우는 쪽이 제 키를 지운다.
+        req_cut={},
     )
     if isinstance(req_opts, dict):
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
@@ -855,35 +882,60 @@ def _resolve_opts(req_opts):
             o.chair_template = ct
         cs = req_opts.get("continue_summary")
         if isinstance(cs, str):
-            o.continue_summary = cs[:8000]
+            o.continue_summary = cs[:_SUMMARY_MAX]
+            if len(cs) > _SUMMARY_MAX:
+                o.req_cut["continue_summary"] = (f"이전 심의 요약(continue_summary) {len(cs):,}자 중 "
+                                                 f"앞 {_SUMMARY_MAX:,}자만")
         # 이전 심의의 양보 불가 조항(F11) — 요약 문자열에 섞으면 소실되므로 별도 필드로 받는다.
         nn = req_opts.get("non_negotiables") or req_opts.get("continue_non_negotiables")
         if isinstance(nn, list):
-            o.continue_non_negotiables = [str(x)[:1200] for x in nn if str(x).strip()][:12]
+            _nn = [str(x) for x in nn if str(x).strip()]
+            o.continue_non_negotiables = [x[:_NN_ITEM_MAX] for x in _nn][:_NN_MAX]
+            _cut = _cut_note("양보 불가 조항(non_negotiables)", _nn, _NN_MAX, _NN_ITEM_MAX)
+            if _cut:
+                o.req_cut["non_negotiables"] = _cut
         cp = req_opts.get("personas")
         if isinstance(cp, list):
             # origin 승계 — 호출자(리스크 심사 러너 등)가 좌석 성격을 구분해 보내면 그대로 쓴다.
             # 화이트리스트는 _origin_label 이 아는 5종이다. 밖·미지정은 종전대로 carry 다(setdefault 와 같은 값).
             _cp_ok = [p for p in cp if isinstance(p, dict) and p.get("key")]
-            o.continue_personas = [{"key": str(p.get("key"))[:120], "role": str(p.get("role") or "")[:2000],
+            o.continue_personas = [{"key": str(p.get("key"))[:120],
+                                    "role": str(p.get("role") or "")[:_ROLE_REQ_MAX],
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
                                                else "carry")}
                                    for p in _cp_ok[:MAX_REQ_SEATS]]
             # 잘린 좌석은 알린다 — 포털은 422 로 막지만 MCP 호출자는 여기까지 온다. 종전엔
             # 13번째부터 소리 없이 사라졌다(발굴 단계에서 status 로 흘린다).
             o.seats_clamped = [str(p.get("key")) for p in _cp_ok[MAX_REQ_SEATS:]]
+            # 상태줄은 잡 원장의 최근 30줄 창 밖으로 밀려난다 — MCP 호출자가 보게 카드에도 싣는다.
+            _cut = _cut_note("좌석(personas)", [str(p.get("role") or "") for p in _cp_ok], MAX_REQ_SEATS,
+                             _ROLE_REQ_MAX, unit="석", item="역할", dropped=o.seats_clamped,
+                             knob="DELIB_MAX_SEATS")
+            if _cut:
+                o.req_cut["personas"] = _cut
         # 후보안 — 배열 또는 '1안 X | 2안 Y' 구분자 문자열 둘 다 받는다(JS 계약과 동일).
         op = req_opts.get("options")
         if isinstance(op, str):
             op = [x.strip() for x in re.split(r"\s*\|\s*|\n+", op) if x.strip()]
         if isinstance(op, list):
-            o.options = [str(x).strip()[:400] for x in op[:8] if str(x).strip()]
+            o.options = [str(x).strip()[:_OPTION_ITEM_MAX] for x in op[:_OPTIONS_MAX] if str(x).strip()]
+            _cut = _cut_note("후보안(options)", [str(x).strip() for x in op], _OPTIONS_MAX, _OPTION_ITEM_MAX)
+            if _cut:
+                o.req_cut["options"] = _cut
         tl = req_opts.get("tools")
         if isinstance(tl, list):
-            o.delib_tools = [str(n).strip()[:80] for n in tl[:6] if isinstance(n, str) and str(n).strip()]
+            o.delib_tools = [str(n).strip()[:80] for n in tl[:_TOOLS_MAX]
+                             if isinstance(n, str) and str(n).strip()]
+            _cut = _cut_note("지정 도구(tools)", tl, _TOOLS_MAX, dropped=[str(n) for n in tl[_TOOLS_MAX:]])
+            if _cut:
+                o.req_cut["tools"] = _cut
         ap = req_opts.get("apps")
         if isinstance(ap, list):
-            o.delib_apps = [str(a).strip()[:80] for a in ap[:3] if isinstance(a, str) and str(a).strip()]
+            o.delib_apps = [str(a).strip()[:80] for a in ap[:_APPS_MAX]
+                            if isinstance(a, str) and str(a).strip()]
+            _cut = _cut_note("지정 앱(apps)", ap, _APPS_MAX, dropped=[str(a) for a in ap[_APPS_MAX:]])
+            if _cut:
+                o.req_cut["apps"] = _cut
         # 얹을 층(2층) — 화이트리스트 밖 값은 드롭, 최대 5개. 중복 제거하되 순서 보존.
         md = req_opts.get("modifiers")
         if isinstance(md, list):
@@ -3096,6 +3148,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         # ── 2단 — 해석 설계 심의 ─────────────────────────────────────────────
         yield _sse("status", {"step": "2단 — 해석 설계 심의", "tool": None})
         opts_b = _resolve_opts(req_opts)
+        opts_b.req_cut = {}     # 줄인 요청 값은 1단이 이미 알렸다 — 여기서부터는 요약·좌석·의견을 엔진이 갈아 끼운다
         opts_b.chair_template = "sim-plan"
         opts_b.continue_summary = decision_a[:8000]
         opts_b.continue_non_negotiables = nn_a[:12]
@@ -3125,6 +3178,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         if opts.build_plan and decision_b:
             yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
             opts_c = _resolve_opts(req_opts)
+            opts_c.req_cut = {}
             opts_c.chair_template = "build-plan"
             opts_c.continue_summary = decision_b[:20000]
             opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
@@ -3176,6 +3230,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     opts.chair_template = "test-plan"
     # 고정 좌석을 앞에 세우고 나머지는 질문으로 발굴하게 둔다(재료 계열·현상 도메인).
     opts.continue_personas = [{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
+    opts.req_cut.pop("personas", None)      # 호출자 좌석은 위에서 갈아 끼웠다 — '줄였다' 고 적으면 거짓이다
     opts.human_note = ("이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마라. "
                        "우선순위는 '민감도 × 근거 공백 × 확보 난이도' 로 서열화하고, "
                        "하나만 먼저 한다면 무엇인지 반드시 답하라. "
@@ -3628,6 +3683,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      text=f"사람 의견(human_note) {_hn_full:,}자 중 앞 {len(opts.human_note):,}자만 좌석에 "
                           f"실었다 — 뒤 {_hn_full - len(opts.human_note):,}자는 좌석이 보지 못한다"
                           f"(상한 {HUMAN_NOTE_MAX:,}자 — DELIB_HUMAN_NOTE_MAX).")
+    # 요청에 실린 나머지 값도 같다 — 상한에서 줄였으면 무엇을 얼마나 줄였는지 카드 하나로 알린다.
+    if opts.req_cut:
+        yield _delib("evidence", source="요청 값 상한 초과", included=False,
+                     text="요청에 실린 값이 상한을 넘어 앞에서부터 남겼다 — " + " / ".join(opts.req_cut.values())
+                          + ". 뒤쪽은 이 심의에 쓰이지 않았다.")
     # 챗 워크스페이스 핸드오프 원천 근거(P1) — 요약이 아니라 날것 도구결과+출처를 좌석에 준다.
     # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
     # 예산(_EVID_BUDGET) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).

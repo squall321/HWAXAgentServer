@@ -363,7 +363,9 @@ async def deliberate_continue(
                          "돌아 그 결정문에 바깥 자료가 섞여 있다. 봉인 심의를 새로 시작하라.")
     opts = _build_opts(
         rounds=rounds, modifiers=modifiers, human_note=human_note,
-        continue_summary=summary_text[:8000],
+        # 미리 자르지 않는다 — 엔진이 상한에서 줄이고 **줄였다고 알린다**(evidence_omitted 의 '요청 값
+        # 상한 초과'). 여기서 떼어 넘기면 엔진은 줄어든 줄 모르고, 이어받은 사람도 모른다.
+        continue_summary=summary_text,
         non_negotiables=non_negotiables,
         personas=(prev.get("seats") or []) if keep_seats else None,
         rounds_so_far=delib_jobs.rounds_end(prev),
