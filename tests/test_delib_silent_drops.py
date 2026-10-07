@@ -55,11 +55,12 @@ def _at_round1(ev, data):
     return ev == "delib" and data.get("kind") == "stage" and str(data.get("stage")) == "r1"
 
 
-def _stream(monkeypatch, req_opts, *, tools=None, until=_at_round1):
+def _stream(monkeypatch, req_opts, *, tools=None, until=_at_round1, llm=None):
     """run_deliberation 을 **실제로** 돌려 이벤트 목록을 받는다. `until` 이 참이 되면 멈춘다
     (기본은 1라운드 문턱 — 거기까지는 LLM 이 필요 없다).
 
     좌석은 지정으로 주고(발굴 생략) 자유 조회·VOC·재심사를 끈다 — 전부 망을 타는 단계다.
+    `llm` 은 심의 LLM 자리에 끼울 객체다(엔진이 그 설정값을 읽는 시험용 — 호출은 시험이 가로챈다).
     """
     tools = {"agent_search": _Tool("agent_search")} if tools is None else tools
 
@@ -67,7 +68,7 @@ def _stream(monkeypatch, req_opts, *, tools=None, until=_at_round1):
         return tools
 
     monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
-    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
+    stub = SimpleNamespace(state=SimpleNamespace(llm=llm or object(), delib_llm=None))
     opts = {"personas": _SEATS, "free_tools": 0, "voc": "off", "rescreen": 0, **req_opts}
 
     async def go():

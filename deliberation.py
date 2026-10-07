@@ -110,7 +110,8 @@ _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(�
 _DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000) if os.environ.get("DELIB_DECISION_CTX") else None
 _DECISION_CTX_MIN = 6000     # 유도값의 바닥 — 종전 기본값. 좁은 창이 종전보다 덜 받지 않게 한다
 # 의장 턴의 시스템·**출력**(결정문) 몫(토큰). 의장은 도구를 묶지 않는 텍스트 턴이라(_llm_text) 좌석의
-# _EVID_RESERVE 와 달리 스키마 몫(40,000)을 떼지 않는다 — 그만큼이 전사에 간다.
+# _EVID_RESERVE 와 달리 스키마 몫(40,000)을 떼지 않는다 — 그만큼이 전사에 간다. 그 LLM 에 걸린
+# max_tokens 가 이 값보다 크면 그쪽을 뗀다(_decision_ctx).
 _CHAIR_RESERVE = _env_int("DELIB_CHAIR_RESERVE", 16000)
 # 좌석 프롬프트에 싣는 직전 라운드 텍스트 상한(자), 0=무제한. 의장엔 위 클립이 있는데 좌석엔
 # 없었다 — 그리고 **수렴 라운드는 교차심문과 무관하게** 직전 라운드 전문을 전원에게 준다
@@ -1506,13 +1507,16 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
             for k, t in rows], share
 
 
-def _decision_ctx(fixed: int, n_rounds: int) -> int:
+def _decision_ctx(fixed: int, n_rounds: int, out_tokens: int = 0) -> int:
     """의장 프롬프트에 싣는 라운드 전사의 **라운드당** 상한(자), 0=무제한.
 
     DELIB_DECISION_CTX 를 명시했으면 그 값이다. 안 줬으면 모델 컨텍스트에서 유도한다 — 좌석 예산
     (_pre_budget)과 같은 환산이다. 의장 프롬프트는 고정부(fixed 자 — 시스템 + 주제·**실제로 실린**
     근거 블록 + 산출 지시) + 라운드 전사 × n_rounds 이고, 출력 몫(_CHAIR_RESERVE)을 뺀 나머지를
     **실제로 돈 라운드 수**로 나눈다(8라운드 심의가 3라운드 몫을 여덟 번 싣지 않게).
+    out_tokens 는 그 LLM 에 걸린 max_tokens 다 — 출력 몫보다 크면 그쪽을 뗀다. 서버는 프롬프트 +
+    max_tokens 가 창을 넘으면 자르지 않고 400 으로 거절하고, 의장은 맨 끝에 한 번 도는 호출이라
+    거기서 죽으면 라운드를 다 돌고도 결정문이 없다.
 
     ⚠ 바닥(_DECISION_CTX_MIN)이 걸리는 좁은 창에서는 컨텍스트 안에 든다는 보장이 없다. 종전에도
     그랬다(최악 환산으로 6,000자 × 3 은 17,000토큰 — 16K 창 밖이다). 종전보다 나빠지지 않게만 한다.
@@ -1524,7 +1528,7 @@ def _decision_ctx(fixed: int, n_rounds: int) -> int:
         ctx = _model_context_tokens()
     except Exception:  # noqa: BLE001
         ctx = 128000
-    avail = ctx - _CHAIR_RESERVE - int(fixed / _EVID_KO_CPT)
+    avail = ctx - max(_CHAIR_RESERVE, out_tokens) - int(fixed / _EVID_KO_CPT)
     return max(_DECISION_CTX_MIN, int(avail * _EVID_KO_CPT * _PRE_SAFETY) // max(1, n_rounds))
 
 
@@ -4068,7 +4072,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         "결정문의 모든 수치는 결정적 후검증으로 근거·발언 원문과 대조된다.")
     # 라운드 전사 — 고정부(시스템·주제·실제로 실린 근거 블록·위 산출 지시)를 **실제 글자 수**로 재고
     # 남는 창을 돈 라운드 수로 나눈다(_decision_ctx). 넘는 라운드는 좌석마다 같은 몫으로 줄인다.
-    _dctx = _decision_ctx(len(chair_sys) + len(base) + len(chair_tail), len(rounds_data))
+    _dctx = _decision_ctx(len(chair_sys) + len(base) + len(chair_tail), len(rounds_data),
+                          getattr(llm, "max_tokens", None) or 0)
     _rtexts = [_cap_ctx([(o["persona"], _ser_kind(o, _kind(i + 1))) for o in lst], _dctx)
                for i, (lst, _t) in enumerate(rounds_data)]
     # 태그는 회차 안 위치로 판정하고(초기/최종), 번호만 이어 센다.

@@ -43,7 +43,7 @@ def _seats(n=_N_SEATS):
     return [{"key": f"dom{i:02d}-seat", "role": "역할"} for i in range(1, n + 1)]
 
 
-def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, **opts):
+def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, **opts):
     """심의를 끝까지 돌려 (이벤트, 의장 시스템 프롬프트, 의장 본문, 라운드별 블록)을 받는다.
 
     좌석 발언은 좌석·필드마다 다른 꼬리표로 감싼 긴 글이다 — 의장 프롬프트에서 어느 좌석의 어느
@@ -70,7 +70,7 @@ def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, **opts):
     monkeypatch.setattr(d, "_SER_CLIP", 0)
     events = _stream(monkeypatch, {"personas": _seats(seats), "rounds": rounds, "save_report": 0,
                                    "persona_knowledge": 0, "rebut_quote": 0, **opts},
-                     until=lambda ev, _data: ev == "done")
+                     until=lambda ev, _data: ev == "done", llm=llm)
     system, human = next((s, h) for s, h in seen if "엔지니어링 톤" in s)
     marks = list(_HEAD.finditer(human))
     assert len(marks) == rounds, f"의장 프롬프트에 라운드 머리가 {len(marks)}개다 — 하네스가 낡았다"
@@ -197,6 +197,22 @@ def test_상한_계산이_고정부와_라운드_수를_함께_본다(monkeypatc
                         tokens, rounds, fixed, cap)
         assert d._decision_ctx(2000, 3) > d._decision_ctx(2000, 8), "라운드가 늘어도 라운드당 몫이 같다"
         assert d._decision_ctx(2000, 3) > d._decision_ctx(60000, 3), "근거가 늘어도 전사 몫이 같다"
+
+
+def test_LLM_에_max_tokens_가_크게_걸려_있으면_그만큼을_출력_몫으로_뗀다(monkeypatch):
+    """서버는 프롬프트 + max_tokens 가 창을 넘으면 자르지 않고 400 으로 거절한다. 의장은 맨 끝에 한 번
+    도는 호출이라 거기서 죽으면 라운드를 다 돌고도 결정문이 없다."""
+    from types import SimpleNamespace
+
+    _ctx(monkeypatch, 128000)
+    big = 60000                                    # 기본 출력 몫(_CHAIR_RESERVE)보다 큰 max_tokens
+    assert big > d._CHAIR_RESERVE
+    _events, system, human, blocks = _run(monkeypatch, llm=SimpleNamespace(max_tokens=big))
+    assert (len(system) + len(human)) / d._EVID_KO_CPT + big <= 128000, (
+        f"의장 프롬프트 {len(system) + len(human):,}자 + max_tokens {big:,} — 창을 넘어 400 이 난다")
+    assert all(len(b) > 6000 for b in blocks), "창이 남는데 바닥까지 줄였다"
+    assert d._decision_ctx(3000, 3, big) < d._decision_ctx(3000, 3)
+    assert d._decision_ctx(3000, 3, 8192) == d._decision_ctx(3000, 3), "작은 max_tokens 가 몫을 줄였다"
 
 
 # ── 한 라운드 맞추기(_cap_ctx) ───────────────────────────────────────────────────
