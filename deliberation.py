@@ -103,7 +103,15 @@ _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
 _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
-_DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000)  # 의장 프롬프트 라운드당 상한(자), 0=무제한
+# 의장 프롬프트 라운드당 상한(자), 0=무제한. **명시하면 그 값**이고(종전 의미 그대로), 안 주면(None)
+# 모델 컨텍스트에서 유도한다(_decision_ctx). 종전 기본값 6,000 은 dev 16K 창의 방어값인데 운영 창
+# (128K)에서도 그대로였다 — 실사용 라운드는 37,000자였고 의장은 그 1/6 로 결정문을 썼다(S26U
+# 피드백 1-7). 좌석은 같은 라운드를 48,000자(_SEAT_CTX)까지 받는다.
+_DECISION_CTX = _env_int("DELIB_DECISION_CTX", 6000) if os.environ.get("DELIB_DECISION_CTX") else None
+_DECISION_CTX_MIN = 6000     # 유도값의 바닥 — 종전 기본값. 좁은 창이 종전보다 덜 받지 않게 한다
+# 의장 턴의 시스템·**출력**(결정문) 몫(토큰). 의장은 도구를 묶지 않는 텍스트 턴이라(_llm_text) 좌석의
+# _EVID_RESERVE 와 달리 스키마 몫(40,000)을 떼지 않는다 — 그만큼이 전사에 간다.
+_CHAIR_RESERVE = _env_int("DELIB_CHAIR_RESERVE", 16000)
 # 좌석 프롬프트에 싣는 직전 라운드 텍스트 상한(자), 0=무제한. 의장엔 위 클립이 있는데 좌석엔
 # 없었다 — 그리고 **수렴 라운드는 교차심문과 무관하게** 직전 라운드 전문을 전원에게 준다
 # (실측 15석 수렴 직전 라운드 164,854자 × 15석). 넘치면 400 이지 절단이 아니라서 좌석이 유실된다
@@ -1486,7 +1494,7 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
 
     반환 (rows, share) — share 는 줄였을 때의 좌석당 몫, 안 줄였으면 0.
 
-    의장용 `_cap_ctx` 는 머리·꼬리를 남긴다. 좌석에게 그러면 중간 좌석이 **통째로** 안 보인다
+    이어 붙인 전사의 머리·꼬리만 남기면(종전 의장용 `_cap_ctx`) 중간 좌석이 **통째로** 안 보인다
     (감사 C22 — 머리만 남겼더니 완료순 앞쪽 3~4석만 닿았다). 수렴 라운드는 '형성된 다수 의견'을
     읽고 스탠스를 정하는 자리라, 모두가 조금씩 보이는 쪽이 누군가가 전부 보이는 쪽보다 낫다.
     floor 는 몫이 너무 작아 발언이 한 문장도 안 남는 것을 막는다(좌석이 아주 많을 때)."""
@@ -1498,21 +1506,46 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
             for k, t in rows], share
 
 
-def _cap_ctx(s: str) -> str:
-    """의장 프롬프트에 싣는 라운드 텍스트의 라운드당 상한(DELIB_DECISION_CTX, 0=무제한) —
-    3개 라운드 합산이 좁은 컨텍스트(dev 16K)에서 의장 호출을 밀어내는 꼬리위험 방지.
+def _decision_ctx(fixed: int, n_rounds: int) -> int:
+    """의장 프롬프트에 싣는 라운드 전사의 **라운드당** 상한(자), 0=무제한.
 
-    ⚠ 머리만 남기면 **완료순 앞쪽 3~4석만 의장에게 닿는다**(감사 C22 — 21석 라운드 직렬화
-    ~44K 에서 6K 만 남았고, 잘린 게 뒤쪽 = 나중에 끝난 좌석 전부였다). 예산을 머리·꼬리로
-    갈라 양끝 좌석이 살게 하고, 몇 자가 빠졌는지 의장에게 말한다."""
-    if _DECISION_CTX > 0 and len(s) > _DECISION_CTX:
-        head = int(_DECISION_CTX * 0.6)
-        tail = _DECISION_CTX - head
-        return (s[:head].rstrip()
-                + f"\n…[라운드 전사 {len(s):,}자 중 앞 {head:,}·뒤 {tail:,}자만 — 중간 좌석 발언 생략됨. "
-                  "생략 좌석의 입장을 아는 척하지 마라]…\n"
-                + s[-tail:].lstrip())
-    return s
+    DELIB_DECISION_CTX 를 명시했으면 그 값이다. 안 줬으면 모델 컨텍스트에서 유도한다 — 좌석 예산
+    (_pre_budget)과 같은 환산이다. 의장 프롬프트는 고정부(fixed 자 — 시스템 + 주제·**실제로 실린**
+    근거 블록 + 산출 지시) + 라운드 전사 × n_rounds 이고, 출력 몫(_CHAIR_RESERVE)을 뺀 나머지를
+    **실제로 돈 라운드 수**로 나눈다(8라운드 심의가 3라운드 몫을 여덟 번 싣지 않게).
+
+    ⚠ 바닥(_DECISION_CTX_MIN)이 걸리는 좁은 창에서는 컨텍스트 안에 든다는 보장이 없다. 종전에도
+    그랬다(최악 환산으로 6,000자 × 3 은 17,000토큰 — 16K 창 밖이다). 종전보다 나빠지지 않게만 한다.
+    """
+    if _DECISION_CTX is not None:
+        return _DECISION_CTX
+    try:
+        from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
+        ctx = _model_context_tokens()
+    except Exception:  # noqa: BLE001
+        ctx = 128000
+    avail = ctx - _CHAIR_RESERVE - int(fixed / _EVID_KO_CPT)
+    return max(_DECISION_CTX_MIN, int(avail * _EVID_KO_CPT * _PRE_SAFETY) // max(1, n_rounds))
+
+
+def _cap_ctx(rows: list, cap: int) -> str:
+    """의장 프롬프트에 싣는 한 라운드 — [(좌석키, 발언 직렬화)] 를 라운드당 상한(cap 자, 0=무제한 —
+    _decision_ctx)에 맞춘다. 안 넘으면 라운드 전사와 한 글자도 다르지 않다.
+
+    ⚠ 넘으면 **좌석마다 같은 몫**으로 줄인다(_fit_rows). 종전엔 이어 붙인 전사의 머리·꼬리만 남겨
+    가운데 좌석이 **통째로** 빠졌고(20석 37,000자 라운드에서 16석), 결정문이 '생략된 좌석의 입장은
+    반영하지 못했다' 고 적어 냈다(S26U 피드백 1-7). 몇 자를 뺐는지는 여전히 의장에게 말한다.
+    좌석 표지(• 키:)·절단 표식(좌석당 30자 이내)·안내 줄(120자 이내)도 상한 안이다 — 그 몫을 먼저
+    뺀다. 바닥은 1자다 — 좌석용 바닥(1,200자)을 쓰면 좁은 창에서 21석 × 1,200 = 25,200자를 실어
+    상한 6,000자의 네 배가 된다. 상한이 표지 몫보다도 작으면(명시값 수백 자) 그때만 상한을 넘는다."""
+    s = "\n".join(f"• {k}: {t}" for k, t in rows)
+    if cap <= 0 or len(s) <= cap:
+        return s
+    body = sum(len(t) for _, t in rows)
+    fit, share = _fit_rows(rows, max(len(rows), cap - (len(s) - body) - 30 * len(rows) - 120), floor=1)
+    return (f"[라운드 전사 {len(s):,}자 — 좌석마다 앞 {share:,}자까지만 실었다("
+            f"{sum(max(0, len(t) - share) for _, t in rows):,}자 생략, 잘린 좌석에는 표식이 있다). "
+            "잘린 뒷부분의 입장을 아는 척하지 마라]\n" + "\n".join(f"• {k}: {t}" for k, t in fit))
 
 
 def _clip_sent(text, n: int) -> str:
@@ -3987,9 +4020,6 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      opts.chair_template, "의사결정문")
     chair_sys = "당신은 심의체 의장입니다. 한국어 엔지니어링 톤으로 명확하게."
     _rtag = lambda r: "초기입장" if r == 1 else "최종" if r == N else "심화"
-    # 태그는 회차 안 위치로 판정하고(초기/최종), 번호만 이어 센다.
-    rounds_block = "\n\n".join(
-        f"[{_dr(i + 1)}R {_rtag(i + 1)}]\n{_cap_ctx(t)}" for i, (lst, t) in enumerate(rounds_data))
     _loss_note = ""
     if seat_loss:
         _loss_note = ("[좌석 유실 — 아래 좌석은 그 라운드에서 오류로 발언하지 못했다. "
@@ -3999,8 +4029,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _seal_note = (f"[봉인 실행 — {_SEALED_LINE} 이 줄은 결정문 머리에 따로 찍힌다. (0) 커버리지 한계에 "
                   "'바깥 자료 없이 주어진 근거만으로 판정했다' 는 전제를 적고, 좌석이 도구로 조회·확인했다고 "
                   "쓰지 마라]\n" if opts.sealed else "")
-    chair_human = (
-        base + f"\n{rounds_block}\n\n"
+    chair_tail = (
         f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
@@ -4014,6 +4043,26 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         "라운드별 심화·수렴은 위 항목 중 해당하는 자리에서 다루고, 본문 전체에 흩뿌리지 마라. "
         "근거 인용 — [원천 데이터] 항목의 수치·주장을 쓸 때는 그 [e:N] 표지를 함께 적어라. "
         "결정문의 모든 수치는 결정적 후검증으로 근거·발언 원문과 대조된다.")
+    # 라운드 전사 — 고정부(시스템·주제·실제로 실린 근거 블록·위 산출 지시)를 **실제 글자 수**로 재고
+    # 남는 창을 돈 라운드 수로 나눈다(_decision_ctx). 넘는 라운드는 좌석마다 같은 몫으로 줄인다.
+    _dctx = _decision_ctx(len(chair_sys) + len(base) + len(chair_tail), len(rounds_data))
+    _rtexts = [_cap_ctx([(o["persona"], _ser_kind(o, _kind(i + 1))) for o in lst], _dctx)
+               for i, (lst, _t) in enumerate(rounds_data)]
+    # 태그는 회차 안 위치로 판정하고(초기/최종), 번호만 이어 센다.
+    rounds_block = "\n\n".join(f"[{_dr(i + 1)}R {_rtag(i + 1)}]\n{x}" for i, x in enumerate(_rtexts))
+    chair_human = base + f"\n{rounds_block}\n\n" + chair_tail
+    _rcut = [f"{_dr(i + 1)}R {len(t):,}자 → {len(x):,}자"
+             for i, ((_l, t), x) in enumerate(zip(rounds_data, _rtexts)) if x != t]
+    if _rcut:
+        # 줄였으면 화면과 잡 원장에 남긴다. 종전엔 의장만 알았다 — 읽는 사람은 결정문의 '생략된 좌석의
+        # 입장은 반영하지 못했다' 한 줄로만 눈치챘고, MCP 호출자는 그마저 결정문을 다 읽어야 보였다.
+        _why = "DELIB_DECISION_CTX" if _DECISION_CTX is not None else "모델 컨텍스트에서 유도"
+        yield _sse("status", {"step": f"의장 전사 상한 — 라운드당 {_dctx:,}자({_why}), {len(_rcut)}개 "
+                                      "라운드를 좌석마다 같은 몫으로 줄여 싣는다", "tool": None})
+        yield _delib("evidence", source="의장 전사 상한 초과", included=False,
+                     text=f"의장에게 준 라운드 전사를 라운드당 {_dctx:,}자({_why})로 줄였다 — "
+                          + " · ".join(_rcut) + ". 좌석마다 같은 몫으로 줄여 빠진 좌석은 없고, "
+                          "잘린 것은 각 좌석 발언의 뒷부분이다.")
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
     n_cand = max(1, opts.chair_bestof)
