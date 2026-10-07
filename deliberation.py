@@ -529,7 +529,7 @@ def _modifier_note(mods):
 
 # 신규 Job 전용 지정 좌석 — 방법론의 반대/반증 역할을 "좌석 구조"로 보장한다. 프롬프트로 역할을
 # 요청만 하면 그 역할을 맡을 좌석이 없을 수 있어(발굴이 반대석을 안 뽑음), 합성 좌석을 못박아 앉힌다.
-# 합성 키(레지스트리에 없음)라 지식카드 RAG 는 빈값(try/except 안전), 역할은 시스템 프롬프트에 직접 실린다.
+# 합성 키(레지스트리에 없음)라 지식카드 RAG 는 조회하지 않고(_kn_seats), 역할은 시스템 프롬프트에 직접 실린다.
 _CHAIR_ADVERSARY = {
     "credibility": {
         "key": "delib-redteam", "label": "red-team 지정석",
@@ -1833,7 +1833,9 @@ async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
         except Exception as exc:  # noqa: BLE001
             return None, f"{m} 검색 실패({type(exc).__name__})"
         if isinstance(raw, str) and not _tool_text_ok(raw):
-            return None, f"{m} 검색 오류({raw.strip()[:80]})"
+            # 80자에서 끊으면 원인이 든 꼬리가 잘린다 — 실제로 'agent not found: del' 까지만 보여서
+            # 사람이 그걸 **키를 쪼개는 버그**로 읽고 엉뚱한 곳을 팠다(2026-10-07 실사용 피드백).
+            return None, f"{m} 검색 오류({raw.strip()[:400]})"
         d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
         if not isinstance(d, dict):
             return None, f"{m} 응답을 해석하지 못함"
@@ -3312,6 +3314,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
 
         _hit_line = knowledge_line      # 챗과 같은 포맷 — 출처·인과상태가 함께 간다
+        # 합성 지정석(_CHAIR_ADVERSARY)은 레지스트리에 없는 키라 물으면 **매번 404** 다. 폴백까지
+        # 돌아 좌석 하나에 최대 2 × KNOWLEDGE_TIMEOUT_S 를 쓰고(실사용 로그에서 74회), 그 404 가
+        # '지식카드 강등' 으로 떠서 진짜 강등과 섞였다. 묻지 않은 좌석은 인원수에서도 뺀다 —
+        # '관련 지식 없음' 으로 적으면 못 물어본 것과 없는 것이 또 섞인다. 이어하기로 승계된
+        # 지정석은 origin 이 떨어져 올 수 있어 키 접두사로도 알아본다.
+        _kn_seats = [p for p in personas
+                     if p.get("origin") != "adversary" and not str(p["key"]).startswith("delib-")]
 
         async def _kn_one(p):
             # 타임아웃·강등은 _agent_search_hits 가 판정한다. 여기서 조용히 0건으로 만들면
@@ -3329,13 +3338,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 seen.add(ln); lines.append(ln); total += len(ln)
             return p["key"], "\n".join(lines), note
 
-        yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(personas)}명 "
+        yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(_kn_seats)}명 "
                                       f"(최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)", "tool": "agent_search"})
         _kn_notes: list[str] = []
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
         _kn_done = 0
-        for _fut in asyncio.as_completed([_kn_one(p) for p in personas]):
+        for _fut in asyncio.as_completed([_kn_one(p) for p in _kn_seats]):
             _k, _blk, _note = await _fut
             _kn_done += 1
             if _blk:
@@ -3346,16 +3355,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _kn_notes.append(f"{_k}: {_note}")
                 print(f"[deliberation] 지식카드 강등({_k}): {_note}")
             yield _sse("status", {
-                "step": f"지식카드 {_kn_done}/{len(personas)} — {_k}"
+                "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
                         + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
                 "tool": None})
-        yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(personas)}명 "
+        yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(_kn_seats)}명 "
                                       f"관련 지식 확보", "tool": None})
         if _kn_notes:
             # 무음 강등 금지 — 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
             yield _sse("warning", {"code": "knowledge_degraded",
                                    "message": ("일부 전문가의 지식카드를 시간 안에 받지 못했습니다 — "
-                                               f"{len(_kn_notes)}/{len(personas)}명. "
+                                               f"{len(_kn_notes)}/{len(_kn_seats)}명. "
                                                "그 좌석은 지식 발췌 없이 발언합니다. "
                                                + "; ".join(_kn_notes[:4]))})
             yield _delib("evidence", source="지식카드 조회 강등",
