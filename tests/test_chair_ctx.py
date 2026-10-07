@@ -43,13 +43,18 @@ def _seats(n=_N_SEATS):
     return [{"key": f"dom{i:02d}-seat", "role": "역할"} for i in range(1, n + 1)]
 
 
-def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, tools=None, **opts):
+_SEAT_PROMPTS = []       # 마지막 _run 에서 좌석이 받은 프롬프트 [(좌석 키, 본문)] — 좌석 쪽을 보는 시험이 읽는다
+
+
+def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, tools=None, ser_clip=0, reads=0, **opts):
     """심의를 끝까지 돌려 (이벤트, 의장 시스템 프롬프트, 의장 본문, 라운드별 블록)을 받는다.
 
     좌석 발언은 좌석·필드마다 다른 꼬리표로 감싼 긴 글이다 — 의장 프롬프트에서 어느 좌석의 어느
     라운드가 얼마나 남았는지 셀 수 있다. 직렬화 값 상한(_SER_CLIP)은 풀어 둔다(라운드 길이를
-    좌석당 본문 길이로 정하려고)."""
+    좌석당 본문 길이로 정하려고) — 그 상한을 보는 시험은 ser_clip 으로 건다(None=박스 기본값).
+    reads 는 1라운드 해석(reads) 항목 수다 — 항목마다 꼬리표가 있어 몇 번째까지 닿았는지 셀 수 있다."""
     seen = []
+    _SEAT_PROMPTS.clear()
 
     async def _llm(_llm_obj, system, human):
         m = re.search(r"당신은 '([^']+)' 전문가", system)
@@ -57,17 +62,20 @@ def _run(monkeypatch, *, rounds=3, seats=_N_SEATS, llm=None, tools=None, **opts)
             seen.append((system, human))
             return "결정문 본문"
         k = m.group(1)
+        _SEAT_PROMPTS.append((k, human))
 
         def body(tag):
             return f"<{k}:{tag}>" + "가" * _SEAT_CHARS + f"</{k}:{tag}>"
 
-        return json.dumps({"lens": body("lens"), "reads": [], "recommendation": "권장", "concerns": ["A", "B"],
+        return json.dumps({"lens": body("lens"), "reads": [f"<{k}:read{j}>" + "나" * 30 for j in range(reads)],
+                           "recommendation": "권장", "concerns": ["A", "B"],
                            "position_short": "요약", "concede": [], "rebut": ["반박"], "deepen": body("deepen"),
                            "final_position": body("final"), "non_negotiable": "", "vote": "진행",
                            "stance": "동의"}, ensure_ascii=False)
 
     monkeypatch.setattr(d, "_llm_text", _llm)
-    monkeypatch.setattr(d, "_SER_CLIP", 0)
+    if ser_clip is not None:
+        monkeypatch.setattr(d, "_SER_CLIP", ser_clip)
     events = _stream(monkeypatch, {"personas": _seats(seats), "rounds": rounds, "save_report": 0,
                                    "persona_knowledge": 0, "rebut_quote": 0, **opts},
                      until=lambda ev, _data: ev == "done", llm=llm, tools=tools)
@@ -291,6 +299,104 @@ def test_좌석마다_자유_조회가_실패해도_의장_전사를_줄였다�
         kept = view["evidence_omitted"]
         assert kept[-1].get("source") == _CUT, (name, kept[-3:])
         assert "note" in kept[delib_jobs.OMITTED_MAX], (name, kept[delib_jobs.OMITTED_MAX])
+
+
+# ── 직렬화 값 상한(DELIB_SER_CLIP) — 의장에게는 창이 받는 만큼, 끊었으면 남긴다 ─────────────────
+# 라운드 발언은 항목(값)마다 700자에서 끊겨 직렬화된다. 좁은 창의 방어값인데, 의장 전사 상한을 창에서 유도하게
+# 된 뒤에도 의장은 여전히 이 끊은 판을 받았다 — 전사가 상한 안에 '들어서' 알림도 안 나갔다. 긴 관점의 뒤쪽,
+# 39건짜리 해석 목록의 18건째부터가 의장에게 없었고(리스크 심사 좌석은 지적을 그 목록에 적는다), 줄였다는
+# 카드가 나갈 때도 '원래 길이' 가 이미 끊은 뒤의 길이였다. 위 시험들은 이 상한을 풀고 돌아 이것을 못 봤다.
+_VCLIP = "직렬화 값 상한 초과"
+_TAGS = ("lens", "deepen", "final")
+
+
+def _tails(human, seats, tag):
+    """의장 프롬프트에 그 항목의 **끝 꼬리표**까지 닿은 좌석 수."""
+    return sum(1 for p in _seats(seats) if f"</{p['key']}:{tag}>" in human)
+
+
+def test_창이_받으면_값_상한_뒤의_발언도_의장에게_간다(monkeypatch):
+    _ctx(monkeypatch, 128000)
+    events, system, human, _blocks = _run(monkeypatch, seats=5, ser_clip=700, reads=39)
+    for tag in _TAGS:
+        assert _tails(human, 5, tag) == 5, f"{tag} 의 뒷부분이 의장에게 안 갔다 — 값마다 700자에서 끊은 판을 받았다"
+    got = [j for j in range(39) if f"<dom03-seat:read{j}>" in human]
+    assert got == list(range(39)), f"해석 39건 중 의장이 받은 것 — {len(got)}건"
+    assert _fits(system, human, 128000)
+    assert not [c for c in _cards(events, included=False) if c["source"] == _CUT], "창이 다 받았는데 줄였다고 했다"
+
+
+def test_창이_다_못_받으면_값_상한을_창이_받는_데까지_늘려_싣는다(monkeypatch):
+    """전부는 안 들어가지만 700자씩보다는 더 들어가는 패널 — 좌석을 빼지 않고 항목마다 더 길게 싣는다."""
+    _ctx(monkeypatch, 128000, explicit=12000)
+    events, _system, _human, blocks = _run(monkeypatch, seats=10, ser_clip=700)
+    for i, b in enumerate(blocks, start=1):
+        assert len(b) <= 12000, f"{i}라운드 블록이 상한을 넘는다 — {len(b):,}자"
+        assert _kept(b) >= 12000 * 0.85, f"{i}라운드에 {_kept(b):,}자만 실었다 — 상한이 남는데 700자씩에서 끊었다"
+        assert all(f"• {p['key']}: " in b for p in _seats(10)), f"{i}라운드에서 빠진 좌석이 있다"
+    card = next(c for c in _cards(events, included=False) if c["source"] == _CUT)
+    clip = int(re.search(r"값당 ([\d,]+)자", card["text"]).group(1).replace(",", ""))
+    assert 700 < clip < _SEAT_CHARS, card["text"]
+    assert f"1R {len(_full_round(10, 'lens')):,}자 →" in card["text"], card["text"]
+
+
+def _full_round(seats, tag):
+    """좌석이 실제로 쓴 한 라운드(항목을 끊지 않은 직렬화) — 카드가 적는 '원래 길이' 의 기준이다."""
+    def ser(k):
+        body = f"<{k}:{tag}>" + "가" * _SEAT_CHARS + f"</{k}:{tag}>"
+        obj = {"lens": {"lens": body, "recommendation": "권장", "concerns": "A; B"},
+               "deepen": {"rebut": "반박", "deepen": body},
+               "final": {"final_position": body, "vote": "진행", "stance": "동의"}}[tag]
+        return json.dumps(obj, ensure_ascii=False)
+
+    return "\n".join(f"• {p['key']}: {ser(p['key'])}" for p in _seats(seats))
+
+
+def test_좁은_창에서_줄였다는_카드는_좌석이_쓴_길이를_적는다(monkeypatch):
+    """종전 카드의 '몇 자 → 몇 자' 는 앞 숫자가 이미 값마다 끊은 뒤의 길이였다 — 덜 줄인 것처럼 읽힌다."""
+    _ctx(monkeypatch, 16384)
+    events, _system, _human, blocks = _run(monkeypatch, ser_clip=700)
+    card = next(c for c in _cards(events, included=False) if c["source"] == _CUT)
+    wrote = len(_full_round(_N_SEATS, "lens"))
+    assert wrote > _N_SEATS * _SEAT_CHARS, "시험 전제 — 좌석은 값 상한보다 길게 썼다"
+    assert f"1R {wrote:,}자 →" in card["text"] and "값당 700자" in card["text"], card["text"]
+    for i, b in enumerate(blocks, start=1):          # 좁은 창은 종전 그대로다 — 더 싣지 않는다
+        assert len(b) <= 6000 and all(f"• {p['key']}: " in b for p in _seats()), (i, len(b))
+
+
+def test_다음_라운드_좌석에게_값_상한에서_끊어_실었으면_남긴다(monkeypatch):
+    _ctx(monkeypatch, 128000)
+    events, _system, _human, _blocks = _run(monkeypatch, seats=5, ser_clip=700)
+    # 좌석 쪽 상한은 그대로다 — 좌석 프롬프트 예산(_SEAT_CTX)은 창에서 유도하지 않아, 풀면 좁은 창에서 넘친다.
+    later = [h for _k, h in _SEAT_PROMPTS if "라운드 전원]" in h or "지정 반박 표적" in h]
+    assert later and not any("</dom01-seat:lens>" in h or "</dom01-seat:deepen>" in h for h in later), (
+        "다음 라운드 좌석이 값 상한 뒤까지 받았다 — 좌석 쪽 상한이 풀렸다")
+    cards = [c for c in _cards(events, included=False) if c["source"] == _VCLIP]
+    assert len(cards) == 2, f"1·2라운드 뒤에 한 장씩이어야 한다 — {[c['text'][:40] for c in cards]}"
+    assert "1라운드" in cards[0]["text"] and "2라운드" in cards[1]["text"] and "700자" in cards[0]["text"]
+    assert "DELIB_" not in cards[0]["text"] and "DELIB_SER_CLIP" in cards[0]["knob"], cards[0]
+    assert sum(1 for s in _steps(events) if s.startswith("직렬화 값 상한")) == 2
+    for name, view in _mcp_view(monkeypatch, events).items():
+        kept = [x for x in view["evidence_omitted"] if x.get("source") == _VCLIP]
+        assert len(kept) == 2 and "DELIB_SER_CLIP" in kept[0]["text"], (name, view["evidence_omitted"])
+
+
+def test_끊은_값이_없으면_아무것도_안_남긴다(monkeypatch):
+    _ctx(monkeypatch, 128000)
+    monkeypatch.setattr(sys.modules[__name__], "_SEAT_CHARS", 300)       # 값 상한(700자)보다 짧은 발언
+    events, _system, human, _blocks = _run(monkeypatch, seats=5, ser_clip=700)
+    assert _tails(human, 5, "lens") == 5
+    assert not [c for c in _cards(events, included=False) if c["source"] in (_VCLIP, _CUT)]
+    assert not [s for s in _steps(events) if s.startswith(("직렬화 값 상한", "의장 전사 상한"))]
+
+
+def test_값_상한을_푼_박스는_종전과_같다(monkeypatch):
+    """DELIB_SER_CLIP=0 — 끊는 것이 없으니 알림도 없고, 의장 전사는 종전대로 좌석 몫으로만 줄인다."""
+    _ctx(monkeypatch, 128000)
+    events, _system, _human, _blocks = _run(monkeypatch, ser_clip=0)
+    assert not [c for c in _cards(events, included=False) if c["source"] == _VCLIP]
+    card = next(c for c in _cards(events, included=False) if c["source"] == _CUT)
+    assert "값당" not in card["text"], card["text"]
 
 
 def test_의장_전사도_짧은_좌석이_남긴_몫을_긴_좌석에_돌린다():

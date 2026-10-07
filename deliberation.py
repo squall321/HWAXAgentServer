@@ -112,6 +112,9 @@ _RA_ITEM_MAX = _env_int("DELIB_RA_ITEM_MAX", 1900)   # 서버 상한 2000 에 �
 _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
+# 이 값은 **다음 라운드 좌석**에게 그대로 걸린다(좌석 프롬프트 예산 _SEAT_CTX 는 창에서 유도하지 않는다 —
+# 풀면 좁은 창에서 좌석이 400 으로 유실된다). **의장**에게는 라운드 상한이 받는 데까지 늘려 싣는다
+# (_chair_rows). 어느 쪽이든 끊었으면 스트림이 알린다.
 _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
 # 의장 프롬프트 라운드당 상한(자), 0=무제한. **명시하면 그 값**이고(종전 의미 그대로), 안 주면(None)
 # 모델 컨텍스트에서 유도한다(_decision_ctx). 종전 기본값 6,000 은 dev 16K 창의 방어값인데 운영 창
@@ -1593,26 +1596,28 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
     return d
 
 
-def _ser_val(v) -> str:
+def _ser_val(v, clip: int | None = None) -> str:
     """직렬화 값 정규화 — 배열은 이어 붙이고, DELIB_SER_CLIP 여유 상한만 건다(0=무절단).
-    dict 항목(인용 반박 계약 등 구조화 출력)은 Python repr 로 새지 않게 JSON 으로 직렬화."""
+    dict 항목(인용 반박 계약 등 구조화 출력)은 Python repr 로 새지 않게 JSON 으로 직렬화.
+    clip 을 주면 그 값으로 끊는다(None=DELIB_SER_CLIP) — 의장 전사가 상한을 늘려 싣는 데 쓴다."""
+    clip = _SER_CLIP if clip is None else clip
     if isinstance(v, dict):
         v = json.dumps(v, ensure_ascii=False)
     if isinstance(v, list):
         v = "; ".join(json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else str(x)
                       for x in v if x)
     s = str(v)
-    if _SER_CLIP > 0 and len(s) > _SER_CLIP:
-        s = s[:_SER_CLIP].rstrip() + "…"
+    if clip > 0 and len(s) > clip:
+        s = s[:clip].rstrip() + "…"
     return s
 
 
-def _ser(o: dict, keys: tuple, primary: str = "") -> str:
+def _ser(o: dict, keys: tuple, primary: str = "", clip: int | None = None) -> str:
     """라운드 결과를 다음 라운드 컨텍스트용으로 직렬화. 커버리지 규칙 —
     (1) 핵심 키(primary: r1=lens, r2=deepen, r3=final_position)가 비고 say 가 있으면 say 병기
         (짧은 부수 키 하나로 폴백이 막혀 최종입장이 유실되는 구멍 방지),
     (2) 구조화 키가 전부 비면 say 원문으로 폴백 — 종전 {lens: null,…} 무음 유실 방지."""
-    picked = {k: _ser_val(o.get(k)) for k in keys if o.get(k) not in (None, "", [])}
+    picked = {k: _ser_val(o.get(k), clip) for k in keys if o.get(k) not in (None, "", [])}
     if primary and primary not in picked and o.get("say"):
         picked["say"] = str(o.get("say"))[:800]
     if not picked and o.get("say"):
@@ -1671,9 +1676,44 @@ def _decision_ctx(fixed: int, n_rounds: int, out_tokens: int = 0) -> int:
     return max(_DECISION_CTX_MIN, int(avail * _EVID_KO_CPT * _PRE_SAFETY) // max(1, n_rounds))
 
 
+def _chair_rows(lst: list, ser, cap: int) -> tuple:
+    """의장에게 줄 한 라운드 — ([(좌석키, 발언 직렬화)], 그때 건 값 상한(0=안 끊음), 좌석이 쓴 전문).
+
+    ser(o, clip) 는 좌석 발언 하나를 값 상한 clip 으로 직렬화한다(0=무절단). cap 은 라운드당 상한이다
+    (_decision_ctx, 0=무제한).
+    전문이 상한 안이면 **끊지 않고** 싣는다. 종전엔 의장도 값마다 DELIB_SER_CLIP(700자)에서 끊은 판을 받았다 —
+    의장 상한을 창에서 유도해 라운드당 3만 자가 넘게 비어 있어도 긴 관점의 뒤쪽, 수십 건짜리 해석 목록의
+    뒤쪽이 의장에게 없었고(리스크 심사 좌석은 지적을 그 목록에 적는다), 끊은 판이 상한 안에 '들어서' 줄였다는
+    알림도 안 나갔다. 전문이 넘치면 값 상한을 **상한이 받는 데까지 늘린다** — 좌석 몫으로 머리만 남기는
+    것보다 낫다(긴 관점 하나가 그 좌석의 해석·권장을 몫 밖으로 밀어낸다). DELIB_SER_CLIP 으로도 넘치면
+    종전 그대로다 — 그 행을 _cap_ctx 가 좌석마다 같은 몫으로 줄인다(좁은 창이 종전보다 더 받지 않는다)."""
+    def rows(clip):
+        return [(o["persona"], ser(o, clip)) for o in lst]
+
+    def size(rs):
+        return len("\n".join(f"• {k}: {t}" for k, t in rs))
+
+    full = rows(0)
+    full_t = "\n".join(f"• {k}: {t}" for k, t in full)
+    if _SER_CLIP <= 0 or cap <= 0 or len(full_t) <= cap:
+        return full, 0, full_t
+    best = rows(_SER_CLIP)
+    if size(best) > cap:
+        return best, _SER_CLIP, full_t
+    lo, hi = _SER_CLIP, max(len(t) for _k, t in full)      # 값 하나는 그 좌석의 직렬화보다 길 수 없다
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        cand = rows(mid)
+        if size(cand) <= cap:
+            lo, best = mid, cand
+        else:
+            hi = mid - 1
+    return best, lo, full_t
+
+
 def _cap_ctx(rows: list, cap: int) -> str:
     """의장 프롬프트에 싣는 한 라운드 — [(좌석키, 발언 직렬화)] 를 라운드당 상한(cap 자, 0=무제한 —
-    _decision_ctx)에 맞춘다. 안 넘으면 라운드 전사와 한 글자도 다르지 않다.
+    _decision_ctx)에 맞춘다. 안 넘으면 받은 행을 이어 붙인 것과 한 글자도 다르지 않다.
 
     ⚠ 넘으면 **좌석마다 같은 몫**으로 줄인다(_fit_rows). 종전엔 이어 붙인 전사의 머리·꼬리만 남겨
     가운데 좌석이 **통째로** 빠졌고(20석 37,000자 라운드에서 16석), 결정문이 '생략된 좌석의 입장은
@@ -3976,12 +4016,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     def _kind(r):  # 라운드 성격 — 프롬프트·직렬화·렌더 분기의 단일 기준
         return "initial" if r == 1 else "converge" if r == N else "deepen"
 
-    def _ser_kind(o, kind):  # 라운드 성격별 직렬화 키(다음 라운드 컨텍스트·회의록용)
+    def _ser_kind(o, kind, clip=None):  # 라운드 성격별 직렬화 키(다음 라운드 컨텍스트·회의록용). clip — _ser_val
         if kind == "initial":
-            return _ser(o, ("lens", "reads", "recommendation", "concerns"), primary="lens")
+            return _ser(o, ("lens", "reads", "recommendation", "concerns"), primary="lens", clip=clip)
         if kind == "deepen":
-            return _ser(o, ("concede", "rebut", "deepen"), primary="deepen")
-        return _ser(o, ("final_position", "non_negotiable", "vote", "stance"), primary="final_position")
+            return _ser(o, ("concede", "rebut", "deepen"), primary="deepen", clip=clip)
+        return _ser(o, ("final_position", "non_negotiable", "vote", "stance"), primary="final_position",
+                    clip=clip)
 
     rebut_spec = ("반박(rebut)은 객체 배열 — 각 항목 {target: 상대 키, quote: 상대 발언에서 "
                   "20자 이상 그대로 복사한 문구, counter: 반박 논지, basis: 수치·표준·실패모드}. "
@@ -4309,6 +4350,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
         rounds_data.append((cur, ct))
+        # 다음 라운드 좌석은 이 전사를 받는다 — 값마다 DELIB_SER_CLIP 에서 끊은 판이다(좌석 쪽은 풀지 않는다 —
+        # _SER_CLIP 주석). 끊었으면 알린다. 종전엔 값 끝의 '…' 한 글자가 유일한 흔적이라, 긴 관점·해석 목록의
+        # 뒤쪽이 다음 라운드에 안 갔다는 것을 좌석도 호출자도 몰랐다. 마지막 라운드는 좌석에게 안 간다(의장
+        # 몫은 의장 전사 카드가 말한다).
+        if rnd < N and _SER_CLIP > 0:
+            _ct_full = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind, clip=0)}" for o in cur)
+            if _ct_full != ct:
+                yield _sse("status", {"step": f"직렬화 값 상한 — {_dr(rnd)}라운드 발언 {len(_ct_full):,}자를 다음 "
+                                              f"라운드 좌석에게는 항목마다 앞 {_SER_CLIP:,}자까지만 실어 "
+                                              f"{len(ct):,}자로 준다", "tool": None})
+                yield _delib("evidence", source="직렬화 값 상한 초과", included=False,
+                             knob="DELIB_SER_CLIP — 0 이면 끊지 않는다(넓은 창에서만)",
+                             text=f"{_dr(rnd)}라운드 발언({len(cur)}석 · {len(_ct_full):,}자)을 다음 라운드 "
+                                  f"좌석에게 줄 때 발언의 항목(관점·해석·권장 등)마다 앞 {_SER_CLIP:,}자까지만 "
+                                  f"실었다({len(ct):,}자) — 긴 항목의 뒷부분은 다음 라운드 좌석이 보지 못한다. "
+                                  "의장에게는 창이 받는 만큼 더 싣는다.")
         # 좌석 유실 판정 — _round_live 는 한 명의 실패를 continue 로 삼킨다(라운드는 살리되).
         # 그 좌석은 회의록·다음 라운드·의장 어디에도 없는데 아무도 몰랐다(감사 C23 — MCP 경로의
         # 같은 결함이 실측 좌석 하나를 무음으로 지웠다). 라운드마다 세어 스트림·의장에 알린다.
@@ -4384,16 +4441,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         "근거 인용 — [원천 데이터] 항목의 수치·주장을 쓸 때는 그 [e:N] 표지를 함께 적어라. "
         "결정문의 모든 수치는 결정적 후검증으로 근거·발언 원문과 대조된다.")
     # 라운드 전사 — 고정부(시스템·주제·실제로 실린 근거 블록·위 산출 지시)를 **실제 글자 수**로 재고
-    # 남는 창을 돈 라운드 수로 나눈다(_decision_ctx). 넘는 라운드는 좌석마다 같은 몫으로 줄인다.
+    # 남는 창을 돈 라운드 수로 나눈다(_decision_ctx). 좌석이 쓴 전문이 그 안이면 끊지 않고 싣고, 넘으면 값 상한을
+    # 상한이 받는 데까지 늘려 싣는다(_chair_rows). 그래도 넘는 라운드는 좌석마다 같은 몫으로 줄인다(_cap_ctx).
     _dctx = _decision_ctx(len(chair_sys) + len(base) + len(chair_tail), len(rounds_data),
                           getattr(llm, "max_tokens", None) or 0)
-    _rtexts = [_cap_ctx([(o["persona"], _ser_kind(o, _kind(i + 1))) for o in lst], _dctx)
-               for i, (lst, _t) in enumerate(rounds_data)]
+    _chair = [_chair_rows(lst, lambda o, c, _k=_kind(i + 1): _ser_kind(o, _k, clip=c), _dctx)
+              for i, (lst, _t) in enumerate(rounds_data)]
+    _rtexts = [_cap_ctx(_rows, _dctx) for _rows, _vclip, _full_t in _chair]
     # 태그는 회차 안 위치로 판정하고(초기/최종), 번호만 이어 센다.
     rounds_block = "\n\n".join(f"[{_dr(i + 1)}R {_rtag(i + 1)}]\n{x}" for i, x in enumerate(_rtexts))
     chair_human = base + f"\n{rounds_block}\n\n" + chair_tail
-    _rcut = [f"{_dr(i + 1)}R {len(t):,}자 → {len(x):,}자"
-             for i, ((_l, t), x) in enumerate(zip(rounds_data, _rtexts)) if x != t]
+    # 줄였는지는 **좌석이 쓴 전문**과 견준다. 종전엔 값마다 끊은 전사와 견줘서, 끊은 판이 상한 안에 들면
+    # 줄인 것이 없다고 봤고, 카드가 나갈 때도 '몇 자 → 몇 자' 의 앞 숫자가 이미 끊은 뒤의 길이였다.
+    _rcut = [f"{_dr(i + 1)}R {len(_full_t):,}자 → {len(x):,}자" + (f"(값당 {_vclip:,}자)" if _vclip else "")
+             for i, ((_rows, _vclip, _full_t), x) in enumerate(zip(_chair, _rtexts)) if x != _full_t]
     if _rcut:
         # 줄였으면 화면과 잡 원장에 남긴다. 종전엔 의장만 알았다 — 읽는 사람은 결정문의 '생략된 좌석의
         # 입장은 반영하지 못했다' 한 줄로만 눈치챘고, MCP 호출자는 그마저 결정문을 다 읽어야 보였다.
@@ -4404,12 +4465,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _knob = "DELIB_DECISION_CTX" if _DECISION_CTX is not None else ""
         _why = "서버 설정값" if _knob else "모델 컨텍스트에서 유도"
         yield _sse("status", {"step": f"의장 전사 상한 — 라운드당 {_dctx:,}자({_why}), {len(_rcut)}개 "
-                                      "라운드를 좌석마다 같은 몫으로 줄여 싣는다", "tool": None})
+                                      "라운드를 줄여 싣는다(빠진 좌석은 없다)", "tool": None})
         yield _delib("evidence", source="의장 전사 상한 초과", included=False, notice=True,
                      **({"knob": _knob} if _knob else {}),
                      text=f"의장에게 준 라운드 전사를 라운드당 {_dctx:,}자({_why})로 줄였다 — "
-                          + " · ".join(_rcut) + ". 좌석마다 같은 몫으로 줄여 빠진 좌석은 없고, "
-                          "잘린 것은 각 좌석 발언의 뒷부분이다.")
+                          + " · ".join(_rcut)
+                          + (". 빠진 좌석은 없다. '값당' 이 붙은 라운드는 발언의 항목(관점·해석·권장 등)마다 "
+                             "그 길이에서 끊었고, 그래도 넘친 라운드는 좌석마다 같은 몫으로 뒷부분을 더 줄였다."
+                             if any(_vclip for _rows, _vclip, _full_t in _chair) else
+                             ". 좌석마다 같은 몫으로 줄여 빠진 좌석은 없고, 잘린 것은 각 좌석 발언의 뒷부분이다."))
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
     n_cand = max(1, opts.chair_bestof)
@@ -4529,7 +4593,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 없었다(실측 점검). 판정은 챗과 같은 공용 모듈이 한다 — 화면마다 기준이 달라지면 안 된다.
     # ⚠ 출처를 의장 프롬프트(chair_human)만으로 잡지 않는다. 거기 실린 전사는 상한에서 **줄인 판**이고
     #   좌석이 받은 지식카드·자유 조회 결과는 아예 없다 — 좌석이 근거를 대고 말한 수치가 '출처 미확인'
-    #   으로 찍혔다(S26U 피드백 1-10). 좌석의 원 발언(전사는 그것을 값마다 _SER_CLIP 에서 끊은 것이다)과
+    #   으로 찍혔다(S26U 피드백 1-10). 좌석의 원 발언(의장에게 간 전사는 값 상한·좌석 몫에서 줄인 것일 수 있다)과
     #   좌석이 실제로 받은 것을 함께 본다. 호출자가 보낸 근거 목록(opts.evidence)은 통째로 넣지 않는다 —
     #   예산을 넘겨 빠진 항목은 아무도 못 봤고, 실린 항목은 chair_human 에 이미 있다.
     _num_src = "\n".join(
