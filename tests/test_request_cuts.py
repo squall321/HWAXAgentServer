@@ -16,6 +16,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
 import mcp_server as m  # noqa: E402
@@ -103,6 +105,56 @@ def test_좌석_상한_초과가_원장에도_남는다(monkeypatch):
     for name, view in _mcp_view(monkeypatch, events).items():
         card = next((x for x in view["evidence_omitted"] if x["source"] == _CARD), None)
         assert card and "therm-c" in card["text"] and "3석 중 앞 2석만" in card["text"], (name, card)
+
+
+# ── 지정 반대석은 좌석 상한에 세지 않는다 ───────────────────────────────────────
+# 엔진은 지정 반대석을 상한 **밖에서** 얹는다(20석을 청하면 21석으로 돈다). 이어하기는 그 21석을 그대로
+# 되넘기므로, 반대석까지 세면 꽉 찬 패널을 이어갈 때마다 '21석 중 앞 20석만 — 뺀 것: 반대석' 이 원장에
+# 남았다. 그 좌석은 곧바로 다시 앉는다 — 앉아 있는 좌석을 뺐다고 적은 거짓 기록이고, 읽는 사람은 상한
+# 설정(DELIB_MAX_SEATS)을 올리려 든다.
+_ADV = "delib-baseline-defender"        # 리스크 심사의 지정 반대석
+
+
+def _seated(events):
+    return next(data["personas"] for ev, data in events if ev == "delib" and data.get("kind") == "personas")
+
+
+def _three():
+    return [{"key": f"sim-s{i}", "role": "역할"} for i in range(3)]
+
+
+def test_꽉_찬_패널을_이어가도_앉아_있는_반대석을_뺐다고_적지_않는다(monkeypatch):
+    monkeypatch.setattr(d, "MAX_REQ_SEATS", 3)
+    first = _seated(_stream(monkeypatch, {"personas": _three(), "chair_template": "risk-review"}))
+    assert [p["key"] for p in first] == ["sim-s0", "sim-s1", "sim-s2", _ADV], "시험 전제 — 상한 3석에 반대석이 얹힌다"
+    # 이어하기는 이전 좌석을 그대로 넘긴다(mcp_server.deliberate_continue · 포털 continueDeliberation).
+    assert d._resolve_opts({"personas": first, "chair_template": "risk-review"}).seats_clamped == []
+    events = _stream(monkeypatch, {"personas": first, "chair_template": "risk-review"})
+    again = _seated(events)
+    assert [p["key"] for p in again] == [p["key"] for p in first], "이어간 패널의 좌석이 달라졌다"
+    assert again[-1]["origin"] == "adversary", again[-1]
+    assert not [s for s in _steps(events) if "좌석 상한" in s], [s for s in _steps(events) if "좌석" in s]
+    assert not [c for c in _cards(events, included=False) if c["source"] == _CARD], (
+        [c["text"] for c in _cards(events, included=False)])
+
+
+def test_반대석을_빼고도_넘친_좌석은_종전대로_적는다(monkeypatch):
+    monkeypatch.setattr(d, "MAX_REQ_SEATS", 3)
+    seats = [{"key": f"sim-s{i}", "role": "역할"} for i in range(4)] + [{"key": _ADV, "role": "반대", "origin": "adversary"}]
+    o = d._resolve_opts({"personas": seats, "chair_template": "risk-review"})
+    assert o.seats_clamped == ["sim-s3"] and [p["key"] for p in o.continue_personas] == ["sim-s0", "sim-s1", "sim-s2"]
+    assert "4석 중 앞 3석만" in o.req_cut["personas"] and _ADV not in o.req_cut["personas"], o.req_cut
+    events = _stream(monkeypatch, {"personas": seats, "chair_template": "risk-review"})
+    assert [p["key"] for p in _seated(events)] == ["sim-s0", "sim-s1", "sim-s2", _ADV]
+
+
+@pytest.mark.parametrize("template", ["diagnosis", None])
+def test_이번_심의의_반대석이_아니면_넘친_좌석으로_센다(monkeypatch, template):
+    """다른 Job 으로 이어가면 옛 반대석은 엔진이 다시 앉히지 않는다 — 그때 '뺐다' 는 참이라 적어야 한다."""
+    monkeypatch.setattr(d, "MAX_REQ_SEATS", 3)
+    seats = _three() + [{"key": _ADV, "role": "반대", "origin": "adversary"}]
+    o = d._resolve_opts({"personas": seats, **({"chair_template": template} if template else {})})
+    assert o.seats_clamped == [_ADV] and _ADV in o.req_cut["personas"], (o.seats_clamped, o.req_cut)
 
 
 def test_줄인_것이_없으면_카드도_없다(monkeypatch):

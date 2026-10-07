@@ -926,7 +926,12 @@ def _resolve_opts(req_opts):
         if isinstance(cp, list):
             # origin 승계 — 호출자(리스크 심사 러너 등)가 좌석 성격을 구분해 보내면 그대로 쓴다.
             # 화이트리스트는 _origin_label 이 아는 5종이다. 밖·미지정은 종전대로 carry 다(setdefault 와 같은 값).
-            _cp_ok = [p for p in cp if isinstance(p, dict) and p.get("key")]
+            # 이 심의의 지정 반대석은 상한에 세지 않는다 — 스트림이 상한 **밖에서** 다시 앉힌다(MAX_REQ_SEATS 주석).
+            # 이어하기는 이전 좌석을 지정석째 되넘기므로, 세면 꽉 찬 패널을 이어갈 때마다 앉아 있는 지정석을
+            # '뺐다' 고 카드와 원장에 적었다(읽는 사람은 상한 설정을 올리려 든다). 다른 틀의 반대석은 그대로
+            # 센다 — Job 을 바꿔 이어가면 그 좌석은 다시 앉히지 않으니 '뺐다' 가 참이다.
+            _adv_key = (_CHAIR_ADVERSARY.get(o.chair_template) or {}).get("key")
+            _cp_ok = [p for p in cp if isinstance(p, dict) and p.get("key") and str(p.get("key")) != _adv_key]
             o.continue_personas = [{"key": str(p.get("key"))[:120],
                                     "role": str(p.get("role") or "")[:_ROLE_REQ_MAX],
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
