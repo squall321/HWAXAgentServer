@@ -1779,6 +1779,19 @@ def _chair_fail_text(why: str, tries: int, seat_note: str, rows: list, label: st
     return head + "\n".join(f"• {k}: {t}" for k, t in fit)
 
 
+def _fit_tool_results(got: list, cap: int) -> tuple:
+    """지정 도구 결과 [(머리줄, 결과 원문)] 을 합이 cap 자를 넘지 않게 **도구마다 같은 몫**으로 줄여 이어 붙인다.
+
+    반환 (글, 몫) — 몫은 줄였을 때 도구 하나에 돌아간 길이, 안 줄였으면 0(도구당 상한 _TOOL_CHUNK_MAX 만 걸린다).
+    줄인 결과에는 원문 길이와 실은 길이를 표식으로 붙인다. 좌석에 싣는 블록과, 다음 도구의 인자를 정하는 계획자에게
+    주는 '앞서 조회한 결과' 가 같이 쓴다 — 이어 붙인 글을 앞에서 자르면 뒤쪽 도구가 통째로 안 보인다."""
+    room = cap - sum(len(h) + 30 for h, _g in got)          # 머리줄·절단 표식 몫을 먼저 뗀다
+    _rows, share = _fit_rows([(h, g[:_TOOL_CHUNK_MAX]) for h, g in got], max(room, 1), floor=200)
+    tcap = share or _TOOL_CHUNK_MAX
+    return "\n\n".join(h + g[:tcap] + (f" …[{len(g):,}자 중 {tcap:,}자]" if len(g) > tcap else "")
+                         for h, g in got), share
+
+
 def _decision_ctx(fixed: int, n_rounds: int, out_tokens: int = 0) -> int:
     """의장 프롬프트에 싣는 라운드 전사의 **라운드당** 상한(자), 0=무제한.
 
@@ -3835,7 +3848,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     #      인자는 LLM 이 도구 스키마를 보고 구성(불가하면 skip) — 도구별 실패는 비치명.
     tool_inject = ""
     if opts.delib_tools:
-        _chunks, _used, _got = [], [], []     # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
+        _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
@@ -3852,9 +3865,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 인자 구성 → 호출. 도구가 스키마 위반 등 에러 응답(ok:false/errors)을 주면 그 에러를
             # 피드백해 1회 재시도(self-repair) — 에러 JSON 이 '정량 근거'로 주입되는 것을 막는다.
             _good, _err_note = "", ""
+            # 앞서 성공한 도구 결과 — 이 도구의 인자를 정하는 계획자에게 준다. 종전엔 이어 붙인 글을 앞 2,000자에서
+            # 잘랐다. 도구 하나의 결과가 2,000자까지라 **첫 도구의 결과만** 보였고(그마저 토막), 둘째 목록 도구가
+            # 준 id 는 계획자에게 없었다 — 상세 도구가 식별자를 지어내거나 건너뛰었다. 좌석에 싣는 것과 같은
+            # 상한·같은 몫으로 준다(_fit_tool_results): 전부 조금씩 보이는 쪽이 낫다. 줄였으면 글에 표식이 붙고
+            # (계획자가 잘린 뒤쪽의 id 를 아는 척하지 않게) 상태줄이 그렇다고 말한다.
+            _prev_ctx, _prev_share = _fit_tool_results(_got, _TOOL_INJECT_MAX) if _got else ("", 0)
             for _attempt in (1, 2):
                 yield _sse("status", {"step": f"지정 도구 인자 구성: {_tn}"
-                                              + (" (재시도)" if _attempt == 2 else ""), "tool": _tn})
+                                              + (" (재시도)" if _attempt == 2 else "")
+                                              + (f" — 앞선 결과 {len(_got)}건은 도구마다 앞 {_prev_share:,}자까지만 본다"
+                                                 if _prev_share else ""), "tool": _tn})
                 try:
                     _argd = _parse_json(await _llm_text(
                         llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
@@ -3864,8 +3885,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         # 가져다 쓰라는 뜻이다. 이게 없으면 각 도구가 서로를 모른 채 호출돼
                         # 상세 도구가 식별자를 추측한다(실측: list_materials 가 id=19 를 줬는데
                         # 바로 다음 get_mat_card 가 test_id=1 을 찍었다).
-                        + (f"\n[앞서 조회한 결과 — 여기 있는 id·test_id 를 그대로 쓰고 새로 지어내지 마라]\n"
-                           + "\n".join(_chunks)[:2000] + "\n" if _chunks else "")
+                        + (f"\n[앞서 조회한 결과 — 여기 있는 id·test_id 를 그대로 쓰고 새로 지어내지 마라"
+                           + (". 길어서 도구마다 앞부분만 실었다 — 잘린 뒤쪽에 있을 값을 짐작하지 마라" if _prev_share
+                              else "") + f"]\n{_prev_ctx}\n" if _prev_ctx else "")
                         + (f"\n[직전 시도 오류 — 반드시 교정해 다시 구성하라]\n{_err_note}\n" if _err_note else "")
                         + "\n주제의 정량 분석에 맞게 이 도구를 1회 호출할 인자 JSON 을 출력하라. "
                           "스키마의 타입을 정확히 지켜라(숫자는 숫자로). 스키마에 없는 키 금지. "
@@ -3886,8 +3908,6 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _err_note = (_out or "(빈 응답)")[:500]
             if _good:
                 _head = f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n"
-                _cut = (f" …[{len(_good):,}자 중 {_TOOL_CHUNK_MAX:,}자]" if len(_good) > _TOOL_CHUNK_MAX else "")
-                _chunks.append(f"{_head}{_good[:_TOOL_CHUNK_MAX]}{_cut}")
                 _got.append((_head, _good))
                 _used.append(_tn)
                 ev_count["tool"] += 1
@@ -3911,13 +3931,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 넷째부터는 좌석에 아예 안 갔는데, 도구마다 '심의에 포함' 카드가 뜨고 의장의 근거 프로파일은
             # '도구 조회 6건' 이었다. 목록·검색 도구를 먼저 돌리므로 빠지는 쪽은 늘 수치가 든 상세 도구였다.
             # 통째로 빼지 않고 몫을 나누는 까닭도 그것이다 — 전부 조금씩 보이는 쪽이 낫다.
-            _room = _TOOL_INJECT_MAX - sum(len(_h) + 30 for _h, _g in _got)     # 머리줄·절단 표식 몫을 먼저 뗀다
-            _, _tshare = _fit_rows([(_h, _g[:_TOOL_CHUNK_MAX]) for _h, _g in _got], max(_room, 1), floor=200)
-            _tcap = _tshare or _TOOL_CHUNK_MAX
+            _tblock, _tshare = _fit_tool_results(_got, _TOOL_INJECT_MAX)
             tool_inject = ("[사용자 지정 도구 정량 결과 (실호출 — 발언에 인용할 것. 여기 없는 수치는 "
-                           "지어내지 말 것)]\n" + "\n\n".join(
-                               _h + _g[:_tcap] + (f" …[{len(_g):,}자 중 {_tcap:,}자]" if len(_g) > _tcap else "")
-                               for _h, _g in _got) + "\n")
+                           "지어내지 말 것)]\n" + _tblock + "\n")
             if _tshare:
                 # 상태줄이 아니라 카드로 — 잡 원장은 좌석에 주지 않은 카드만 적는다(MCP 호출자가 보는 것은 그쪽이다).
                 yield _delib("evidence", source="지정 도구 근거 상한 초과", included=False,
