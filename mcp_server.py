@@ -42,6 +42,8 @@ _INSTRUCTIONS = f"""HWAX 전문가 심의 엔진.
 심의는 수 분에서 수 시간 걸린다. 그래서 3단이다 —
 deliberate_start 로 열고, deliberate_status 로 진행을 보고, deliberate_result 로 결정문을 받는다.
 start 는 즉시 돌아온다. 응답을 기다리며 붙잡고 있지 마라.
+동시 실행 상한이 차 있으면 start 는 status=queued 로 돌아온다 — 줄을 선 것이고 자리가 나면 스스로
+시작한다. 다시 시작하지 말고 deliberate_status 로 순번(queue)을 본다.
 
 ⚠ 이 서버의 도구가 HWAX 공학 심의의 정본 진입점이다. 이름이 비슷한 meeting_* 도구는
 발표자료(슬라이드) 제작용 디자인 회의체이지 공학 심의가 아니다."""
@@ -195,16 +197,40 @@ _ADV_DESC = (
     "build-plan 은 사내 자산 현황을 조회해 깔아야 해서 거절한다)."
 )
 
+# 잡 상태 안내 — 시작·진행 조회·메뉴가 같은 글을 쓴다. 종전 설명은 '즉시 시작한다' 뿐이었다. 줄을 세우기
+# 시작하면 그 글만 읽은 호출자는 queued 를 실패로 읽고 다시 시작한다 — 같은 심의가 두 번 줄을 선다.
+# 줄 길이는 설정에서 읽어 적는다(0 이면 줄을 세우지 않는 박스다 — 그때는 그렇게 적는다).
+_STATE_DESC = (
+    "status 는 queued → running → done 순으로 간다 — queued(동시 실행 상한이 차서 줄을 섰다. 내 순번은 "
+    "queue.position, 앞에 선 수는 queue.ahead 다. 자리가 나면 **스스로 시작한다** — 다시 시작하지 마라, "
+    "같은 심의가 두 번 줄을 선다. 그만두려면 deliberate_cancel) · running(진행 중 — 단계·라운드·좌석이 "
+    "보인다) · done(끝났다 — deliberate_result 로 결정문을 받는다). error·cancelled·interrupted 는 결정문 "
+    "없이 끝난 것이고 까닭은 error 에 있다(interrupted 는 서버 재기동 — 다시 시작해야 한다). "
+    + (f"줄은 {delib_jobs.QUEUE_MAX}건까지 선다(DELIB_JOB_QUEUE_MAX) — 줄까지 차면 시작이 오류로 거절되고, "
+       "그 문구에는 내 잡만 실린다." if delib_jobs.QUEUE_MAX > 0
+       else "이 서버는 줄을 세우지 않는다(DELIB_JOB_QUEUE_MAX=0) — 상한이 차 있으면 시작이 오류로 거절되고 "
+            "queued 는 나오지 않는다.")
+)
+
 _START_DESC = (
     "HWAX 전문가 심의를 시작한다. 사용자가 '심의해줘'·'원인 규명'·'불량 원인'·'안 선택'·"
     "'트레이드오프'·'신뢰 판정'·'리스크 심사'·'위험 도출'·'해석 설계'·'시뮬레이션 심의'·"
     "'시험 계획'·'시험 설계'·'구축 계획'·'메커니즘 규명' 을 요청하면 이 도구를 쓴다. "
     "포털 웹 심의와 같은 엔진이다. 여러 전문가 좌석이 라운드를 돌며 도구 근거 위에서 수렴해 "
-    "결정 문서를 만든다. **즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다** — "
+    "결정 문서를 만든다. **즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다**(동시 실행 상한이 차 "
+    "있으면 줄을 섰다가 돈다 — 아래 status) — "
     "결과는 deliberate_status / deliberate_result 로 받는다. 응답을 붙잡고 기다리지 마라. "
     "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다.\n\n"
-    + _EVID_DESC + "\n\n" + _ADV_DESC
+    "돌아오는 " + _STATE_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
+
+
+def _queued_note(q: dict) -> str:
+    """줄을 선 잡에 붙이는 안내 — 시작·이어하기 응답과 결과 회수가 같은 글을 쓴다."""
+    return (f"동시 실행 상한이 차서 대기열에 넣었다 — 내 순번 {q['position']}번째(앞에 {q['ahead']}건 · "
+            f"{q['why']}). 자리가 나면 스스로 시작하니 다시 시작하지 마라(같은 심의가 두 번 줄을 선다). "
+            "순번은 deliberate_status(job_id) 의 queue 로 보고, 그만두려면 deliberate_cancel(job_id). "
+            "사용자에게 job_id 와 순번을 알려라.")
 
 
 def _evid_limits() -> dict:
@@ -280,7 +306,8 @@ async def deliberate_start(
                            groups=groups, user_email=user)
     out = delib_jobs.summary(rec)
     out["caller"] = user or "(서비스 계정 — 게이트웨이가 신원 헤더를 안 보냈다)"
-    out["note"] = ("심의를 시작했다. 진행은 deliberate_status(job_id), 결정문은 "
+    out["note"] = (_queued_note(out["queue"]) if out.get("queue") else
+                   "심의를 시작했다. 진행은 deliberate_status(job_id), 결정문은 "
                    "deliberate_result(job_id). 보통 수 분~수십 분 걸리므로 즉시 다시 묻지 말고 "
                    "사용자에게 job_id 를 알려라.")
     return out
@@ -289,7 +316,8 @@ async def deliberate_start(
 @mcp.tool(
     title="심의 이어하기",
     description=("끝난 HWAX 심의에 사람 의견을 넣어 이어서 돌린다. 이전 좌석과 양보 불가 조항을 "
-                 "승계하므로 처음부터 다시 돌리는 것보다 싸고 결론이 되돌아가지 않는다."),
+                 "승계하므로 처음부터 다시 돌리는 것보다 싸고 결론이 되돌아가지 않는다. 동시 실행 상한이 "
+                 "차 있으면 deliberate_start 처럼 줄을 선다(status=queued — 다시 부르지 마라)."),
 )
 async def deliberate_continue(
     previous_job_id: str,
@@ -349,13 +377,18 @@ async def deliberate_continue(
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
     out["appending_to_report"] = (prev.get("report_id") if append_report else None)
+    if out.get("queue"):
+        out["note"] = _queued_note(out["queue"])
     return out
 
 
 @mcp.tool(title="심의 진행 상황",
-          description="진행 중인 HWAX 심의의 단계·라운드·좌석을 본다. 결정문은 아직 없을 수 있다.")
+          description="HWAX 심의가 어디까지 갔는지 본다 — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지. "
+                      + _STATE_DESC)
 async def deliberate_status(job_id: str) -> dict:
-    """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다."""
+    """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다.
+
+    queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다."""
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
@@ -367,7 +400,8 @@ async def deliberate_status(job_id: str) -> dict:
 
 
 @mcp.tool(title="심의 결과(결정 문서) 회수",
-          description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중이면 현재 단계만 돌려준다.")
+          description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중(running)이면 현재 단계만, "
+                      "줄을 선 채(queued)면 순번만 돌려준다.")
 async def deliberate_result(job_id: str) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id."""
     job = delib_jobs.get(job_id)
@@ -376,23 +410,28 @@ async def deliberate_result(job_id: str) -> dict:
     out = delib_jobs.summary(job, full=True)
     if job.get("status") == "running":
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
+    elif out.get("queue"):
+        out["note"] = "아직 시작 전이다 — " + _queued_note(out["queue"])
     return out
 
 
 @mcp.tool(title="심의 목록",
-          description="최근 HWAX 심의 잡 목록. 진행 중인 것과 끝난 것을 최신순으로 본다.")
+          description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다.")
 async def deliberate_list(limit: int = 20) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다."""
     rows = delib_jobs.list_jobs(max(1, min(100, int(limit or 20))))
     return {"jobs": rows, "running": sum(1 for r in rows if r["status"] == "running"),
+            "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
             "running_max": delib_jobs.MAX_RUNNING,
-            "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER}
+            "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
+            "queue_max": delib_jobs.QUEUE_MAX}
 
 
 @mcp.tool(title="심의 취소",
-          description="진행 중인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 자리를 비운다.")
+          description="진행 중이거나 대기 중(queued)인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 "
+                      "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다.")
 async def deliberate_cancel(job_id: str) -> dict:
-    """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다."""
+    """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다."""
     return delib_jobs.cancel(job_id)
 
 
@@ -417,9 +456,10 @@ async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",
           description=f"심의 종류 {len(delib_jobs.JOBS)}가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, "
-                      "옵션 목록, 지금 걸리는 근거 상한(limits).")
-async def deliberate_jobs() -> dict:
+                      "옵션 목록, 지금 걸리는 근거 상한(limits), 대기열 현황(queue — 길이와 내 순번).")
+async def deliberate_jobs(ctx: Context | None = None) -> dict:
     """포털 웹 심의 메뉴와 같은 택소노미. job 값을 고르는 데 쓴다."""
+    user, _groups = _caller(ctx)
     return {
         "jobs": [{"job": k, "group": v["group"], "label": v["label"], "when": v["what"],
                   "input": v["input"],
@@ -449,6 +489,9 @@ async def deliberate_jobs() -> dict:
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
+        # 줄 — 길이와 **호출자 자신의** 순번만. 남의 잡은 길이에 수로만 들어간다(id·화두를 싣지 않는다).
+        "queue": delib_jobs.queue_state(user),
+        "states": _STATE_DESC,
         "note": "meeting_* 도구는 발표자료 제작용 디자인 회의체다 — 공학 심의가 아니다.",
     }
 

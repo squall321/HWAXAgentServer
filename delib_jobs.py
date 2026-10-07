@@ -17,6 +17,7 @@ SSE 청크를 파싱해 진행 상태만 기록한다. 웹(SSE) 경로의 코드
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -43,9 +44,16 @@ if MAX_RUNNING < 1:
 # 사용자별 상한 — 한 사람이 전역 자리를 다 차지하지 못하게 한다. **기본은 전역 상한과 같다**(비우거나
 # 0 이면 전역을 따른다 = 따로 걸리지 않는다). 전역 2 는 LLM 큐 보호선이고 용량은 여기서 잴 수 없어
 # 기본 동작을 바꾸지 않는다 — 운영이 전역을 올리고 이 값을 낮춰 쓴다(예: 6 · 2). 자리가 없으면
-# 거절한다(대기 큐는 없다 — deliberate_start 는 즉시 running 을 돌려준다는 계약이다).
+# 줄을 세운다(아래 QUEUE_MAX).
 _PER_USER = int(os.environ.get("DELIB_JOB_MAX_RUNNING_PER_USER", "0") or 0)
 MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
+# 대기열 길이 — 자리가 없으면 거절하지 않고 줄을 세우고, 자리가 나면 스스로 시작한다. **0 이면 종전처럼
+# 거절한다.** 종전엔 상한에 걸리면 거절뿐이라, 패널 14개를 돌리려는 사람이 빈 자리를 지켜보다 하나씩
+# 다시 불러야 했다(S26U 피드백 1-9 ③). 줄은 먼저 선 순서로 빠지되, 제 사용자별 상한에 걸린 잡은
+# 건너뛴다(_pump) — 한 사람이 줄 맨 앞을 차지해도 다른 사람은 간다. 다만 사용자별 상한이 전역과 같은
+# 기본값에서는 건너뛸 일이 없어 한 사람의 잡 여럿이 줄을 통째로 차지할 수 있다 — 그게 싫으면 사용자별
+# 상한을 전역보다 낮춘다.
+QUEUE_MAX = max(0, int(os.environ.get("DELIB_JOB_QUEUE_MAX", "20") or 20))
 # 메모리 원장 보존 개수(파일은 지우지 않는다 — 결과 회수는 파일에서도 된다).
 KEEP_IN_MEM = 200
 # 좌석 발언 전사 보존 상한(턴 수). 넘으면 이후 발언은 버리고 그 사실을 한 줄 남긴다.
@@ -139,6 +147,11 @@ def resolve_job(name: str) -> str:
 
 _JOBS: dict[str, dict] = {}
 _TASKS: dict[str, asyncio.Task] = {}
+# 줄 선 잡 — job_id → (잡 기록, 그 잡의 태스크를 만드는 함수). **넣은 순서가 순번이다.** 상태가 queued 인
+# 잡과 이 사전의 키는 늘 같다.
+# ⚠ 메모리에만 둔다 — 띄울 때 쓸 인자에 호출자 토큰과 근거 본문이 들어 있어 파일에 적지 않는다. 그래서
+#   줄 선 잡은 재기동을 넘기지 못한다(reap_orphans 가 '다시 시작하라' 로 닫는다).
+_PENDING: dict[str, tuple] = {}
 
 
 def _now() -> float:
@@ -176,10 +189,87 @@ def running_count() -> int:
     return sum(1 for j in _JOBS.values() if j.get("status") == "running")
 
 
+def _owner(job: dict) -> str:
+    return str(job.get("user") or "").strip().lower()
+
+
+def _running_of(owner: str) -> list[str]:
+    """그 사람이 돌리고 있는 잡 id. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석)."""
+    return [j["id"] for j in _JOBS.values() if owner and j.get("status") == "running" and _owner(j) == owner]
+
+
+def _launch(job: dict, spawn) -> None:
+    job["status"], job["stage"] = "running", "start"
+    job["started_at"] = job["updated_at"] = _now()
+    _persist(job)
+    task = spawn()
+    _TASKS[job["id"]] = task
+    task.add_done_callback(lambda t: _settle(job, t))
+    log.info("[delib-job %s] 시작 job=%s chair=%s q=%.60s", job["id"], job["job"],
+             job.get("chair_template"), job["question"])
+
+
+def _pump() -> None:
+    """빈 자리만큼 줄 앞에서부터 띄운다. **잡을 띄우는 곳은 여기 하나뿐이다.**
+
+    자리 사정이 바뀌는 곳마다 부른다 — 새 요청, 끝남·취소·실패(_drive 의 finally), 본문에 들어가 보지도
+    못하고 접힌 태스크(_settle). 세고 띄우는 사이에 await 가 없어 이벤트 루프가 끼어들지 못한다 — 그래서 자리
+    하나에 둘이 뜨지 않고, 부른 뒤에는 '자리가 비었는데 뜰 수 있는 잡이 줄에 있다' 가 남지 않는다.
+    제 사용자별 상한에 걸린 잡은 **건너뛴다** — 거기서 멈추면 한 사람이 줄 전체를 세운다."""
+    for jid, (job, spawn) in list(_PENDING.items()):
+        if running_count() >= MAX_RUNNING:
+            return
+        if len(_running_of(_owner(job))) >= MAX_RUNNING_PER_USER:
+            continue
+        del _PENDING[jid]
+        _launch(job, spawn)
+
+
+def _settle(job: dict, task: asyncio.Task) -> None:
+    """태스크가 끝나면 불린다 — _drive 의 finally 가 **돌지 못한** 잡의 자리를 돌려주는 그물이다.
+
+    막 띄운 태스크가 첫 걸음을 떼기 전에 취소되면 코루틴 본문에 들어가 보지도 못해 finally 가 돌지
+    않는다. 그러면 잡은 영영 running 이고 자리는 돌아오지 않는다. 줄을 섰던 잡은 job_id 가 이미 호출자
+    손에 있어, 띄운 바로 그 틈에 deliberate_cancel 이 들어올 수 있다."""
+    if job["status"] != "running":
+        return      # _drive 가 제 손으로 끝냈다 — 자리도 거기서 넘겼다
+    job["status"], job["error"] = "cancelled", "취소됨"
+    job["finished_at"] = job["updated_at"] = _now()
+    _persist(job)
+    if _TASKS.get(job["id"]) is task:
+        del _TASKS[job["id"]]
+    _pump()
+
+
+def queue_info(job: dict) -> dict | None:
+    """줄 선 잡의 순번, 줄을 서 있지 않으면 None. **수만 싣는다** — 앞에 선 잡이 누구 것이고 무엇을 묻는지는
+    싣지 않는다. id 를 주면 그걸로 남의 심의를 들여다보고 접을 수 있고, 접으면 제 순번이 당겨진다."""
+    if job["id"] not in _PENDING:
+        return None
+    pos = list(_PENDING).index(job["id"]) + 1
+    # 무엇을 기다리는가 — 제 몫을 다 쓴 것이면 제 심의가 끝나야(또는 접어야) 차례가 오고, 그 사이
+    # 뒤에 선 다른 사람이 먼저 갈 수 있다.
+    mine = len(_running_of(_owner(job)))
+    why = (f"사용자별 상한 {MAX_RUNNING_PER_USER}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
+           "선 다른 사람이 먼저 갈 수 있다)" if mine >= MAX_RUNNING_PER_USER
+           else f"전역 상한 {MAX_RUNNING}건 — 진행 중인 심의가 끝나야 차례가 온다")
+    return {"position": pos, "ahead": pos - 1, "length": len(_PENDING), "max": QUEUE_MAX, "why": why,
+            "waited_s": round(_now() - (job.get("queued_at") or _now()), 1)}
+
+
+def queue_state(user_email: str = "") -> dict:
+    """대기열 현황 — 길이와 **그 사람의** 순번만. 남의 잡은 길이에 수로만 들어간다."""
+    me = (user_email or "").strip().lower()
+    return {"length": len(_PENDING), "max": QUEUE_MAX,
+            "mine": [{"job_id": jid, "position": i + 1, "ahead": i}
+                     for i, (jid, (job, _spawn)) in enumerate(_PENDING.items()) if me and _owner(job) == me]}
+
+
 def _prune() -> None:
     if len(_JOBS) <= KEEP_IN_MEM:
         return
-    done = sorted((j for j in _JOBS.values() if j["status"] != "running"),
+    # 줄 선 잡은 끝난 것이 아니다 — 끝난 시각이 없어 '가장 오래 전에 끝난 잡' 으로 정렬돼 맨 먼저 버려졌다.
+    done = sorted((j for j in _JOBS.values() if j["status"] not in ("running", "queued")),
                   key=lambda j: j.get("finished_at") or 0)
     for j in done[: len(_JOBS) - KEEP_IN_MEM]:
         _JOBS.pop(j["id"], None)
@@ -281,11 +371,15 @@ async def _drive(job: dict, gen) -> None:
         _persist(job)
         _TASKS.pop(job["id"], None)
         _prune()
+        _pump()      # 자리가 났다 — 끝났든 접혔든 터졌든. 상태를 바꾼 **같은 걸음에서** 넘겨준다
 
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "") -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
+
+    돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
+    스스로 시작한다)다. 줄까지 찼으면(또는 QUEUE_MAX 가 0 이면) RuntimeError 로 거절한다.
 
     job_kind 는 JOBS 의 키(별칭 허용). 진입 함수는 여기서 늦게 import 한다 —
     deliberation 모듈이 app.py 를 다시 부르는 순환을 피한다.
@@ -304,15 +398,16 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
     total = running_count()
     me = (user_email or "").strip().lower()
-    mine = [x["id"] for x in _JOBS.values() if me and x.get("status") == "running"
-            and str(x.get("user") or "").strip().lower() == me]
+    mine = _running_of(me)
     # 어느 상한에 걸렸는지 말한다 — 사용자별이면 제 것을 접으면 풀리고, 전역뿐이면 기다려야 한다.
     hit = []
     if total >= MAX_RUNNING:
         hit.append(f"전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING")
     if me and len(mine) >= MAX_RUNNING_PER_USER:
         hit.append(f"사용자별 {MAX_RUNNING_PER_USER}건 — DELIB_JOB_MAX_RUNNING_PER_USER")
-    if hit:
+    # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
+    # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
+    if hit and QUEUE_MAX <= 0:
         raise RuntimeError(
             f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if me
@@ -320,6 +415,17 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + f" · 전체 {total}/{MAX_RUNNING}. "
             + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
                else "진행 중인 심의가 끝난 뒤 다시 하라."))
+    if hit and len(_PENDING) >= QUEUE_MAX:
+        waiting = [x["job_id"] for x in queue_state(me)["mine"]]
+        raise RuntimeError(
+            f"동시 실행 상한에 걸렸고({' · '.join(hit)}) 대기열도 찼다"
+            f"({len(_PENDING)}/{QUEUE_MAX}건 — DELIB_JOB_QUEUE_MAX) — "
+            + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}"
+               f" · 내 대기 {len(waiting)}건{' ' + ', '.join(waiting) if waiting else ''}" if me
+               else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
+            + f" · 전체 진행 {total}/{MAX_RUNNING}. "
+            + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
+               else "줄이 빠진 뒤 다시 하라."))
 
     from deliberation import (_SEALED_UNSUPPORTED, _seal, run_deliberation,  # noqa: PLC0415
                               run_sim_deliberation, run_test_plan)
@@ -341,21 +447,32 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     job = {
         "id": job_id, "job": j, "kind": j, "label": spec["label"], "question": q,
         "chair_template": opts.get("chair_template"), "opts": _opts_echo(applied),
-        "status": "running", "stage": "start", "step": "", "steps": [],
+        "status": "queued", "stage": "queued", "step": "", "steps": [],
         "seats": [], "round": 0, "total_rounds": None,
         "decision": None, "result_text": None, "report_id": None, "plain": None,
         "turns": [], "checkpoint": None,
         "error": None, "warnings": [], "evidence_omitted": [],
-        "started_at": _now(), "updated_at": _now(), "finished_at": None,
+        "started_at": None, "updated_at": _now(), "finished_at": None,
         "user": user_email or "",
     }
     _JOBS[job_id] = job
-    _persist(job)
+    # 누구든 줄 끝에 세운 다음 줄을 한 번 돌린다 — 자리가 있으면 그 자리에서 곧바로 뜬다(종전과 같다).
+    # 띄우는 곳을 _pump 하나로 두어야 '먼저 선 잡보다 방금 온 잡이 먼저 뜬다' 가 생기지 않는다.
+    # ⚠ 태스크는 **이 요청의 컨텍스트에서** 만든다. 태스크는 만든 자리의 컨텍스트 변수를 물려받는데, 줄 선
+    #   잡은 앞 심의의 뒷정리 안에서 뜬다 — 그대로 만들면 앞 심의가 세운 요청 단위 표식(자격 강등
+    #   _pat_degraded · 유령 ID 출처 _turn_ids)을 달고 돈다. 곧바로 뜨는 잡은 종전과 같은 컨텍스트다.
+    groups, ctx = list(groups or []), contextvars.copy_context()
 
-    gen = entry(app, q, list(groups or []), opts or None, user_email, user_pat, None)
-    task = asyncio.create_task(_drive(job, gen), name=f"delib-job-{job_id}")
-    _TASKS[job_id] = task
-    log.info("[delib-job %s] 시작 job=%s chair=%s q=%.60s", job_id, j, opts.get("chair_template"), q)
+    def spawn() -> asyncio.Task:
+        gen = entry(app, q, groups, opts or None, user_email, user_pat, None)
+        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job_id}")
+
+    _PENDING[job_id] = (job, spawn)
+    _pump()
+    if job["status"] == "queued":
+        job["queued_at"] = job["updated_at"]
+        _persist(job)       # 재기동하면 이 기록으로 '줄이 사라졌다' 를 알린다(reap_orphans)
+        log.info("[delib-job %s] 대기 %d번째 job=%s q=%.60s", job_id, len(_PENDING), j, q)
     return job
 
 
@@ -373,10 +490,17 @@ def _opts_echo(opts: dict) -> dict:
 
 
 def cancel(job_id: str) -> dict:
-    """진행 중인 심의를 접는다. 동시 상한에 걸렸을 때 사람이 자리를 비울 수 있어야 한다."""
+    """진행 중이거나 줄 선 심의를 접는다. 동시 상한에 걸렸을 때 사람이 자리를 비울 수 있어야 한다."""
     job = _JOBS.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다(또는 이미 이 프로세스 밖이다): {job_id}")
+    if job_id in _PENDING:      # 줄 선 잡 — 태스크가 없다. 줄에서 빼면 끝이고, 도는 자리는 바뀌지 않는다
+        del _PENDING[job_id]
+        job["status"], job["error"] = "cancelled", "취소됨 — 줄을 선 채로 접었다(시작하지 않았다)"
+        job["finished_at"] = job["updated_at"] = _now()
+        _persist(job)
+        return {"job_id": job_id, "status": "cancelled",
+                "note": "대기열에서 뺐다 — 시작하지 않은 심의라 남은 것이 없다."}
     t = _TASKS.get(job_id)
     if job["status"] != "running" or t is None:
         return {"job_id": job_id, "status": job["status"], "note": "이미 끝난 잡이다 — 취소할 것이 없다"}
@@ -386,30 +510,36 @@ def cancel(job_id: str) -> dict:
 
 
 def reap_orphans() -> int:
-    """재기동 뒤 파일에 running 으로 남은 잡을 interrupted 로 정리한다.
+    """재기동 뒤 파일에 running·queued 로 남은 잡을 interrupted 로 정리한다.
 
     프로세스가 죽으면 태스크도 죽는데 파일은 running 인 채로 남는다 — 그대로 두면
-    영원히 '진행 중'으로 보이고 동시 상한 계산도 어긋난다."""
+    영원히 '진행 중'으로 보이고 동시 상한 계산도 어긋난다.
+    줄 선 잡(queued)도 같이 닫는다. 띄울 때 쓸 인자(호출자 토큰·근거 본문·좌석)는 메모리에만 있었으니
+    다시 줄을 세울 수가 없다 — queued 로 두면 호출자는 오지 않을 차례를 영영 기다린다."""
     n = 0
     try:
         for f in JOB_DIR.glob("*.json"):
             j = _load(f.stem)
-            if j and j.get("status") == "running" and j["id"] not in _JOBS:
+            if j and j.get("status") in ("running", "queued") and j["id"] not in _JOBS:
+                j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다. "
+                              "deliberate_start 로 다시 시작해야 한다" if j["status"] == "queued"
+                              else "서버 재기동으로 중단됨 — 다시 시작해야 한다")
                 j["status"] = "interrupted"
-                j["error"] = "서버 재기동으로 중단됨 — 다시 시작해야 한다"
                 j["finished_at"] = j.get("updated_at") or _now()
                 _persist(j)
                 n += 1
     except OSError:
         pass
     if n:
-        log.info("재기동 정리: running 으로 남은 잡 %d건을 interrupted 로", n)
+        log.info("재기동 정리: running·queued 로 남은 잡 %d건을 interrupted 로", n)
     return n
 
 
 def summary(job: dict, *, full: bool = False) -> dict:
     """도구 응답용 축약. full 이면 결정문 전문을 싣는다."""
-    elapsed = (job.get("finished_at") or _now()) - (job.get("started_at") or _now())
+    # 걸린 시간은 **돈 시간**이다 — 줄을 선 시간은 따로 적는다(waited_s). 시작도 못 하고 접힌 잡은 0 이다.
+    end = job.get("finished_at") or _now()
+    elapsed = end - (job.get("started_at") or end)
     out = {
         "job_id": job["id"], "job": job.get("job") or job.get("kind"), "label": job.get("label"),
         "status": job["status"], "question": job["question"],
@@ -424,6 +554,11 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "checkpoint": bool(job.get("checkpoint")),
         "error": job.get("error"),
     }
+    q = queue_info(job)
+    if q:
+        out["queue"] = q
+    elif job.get("queued_at"):
+        out["waited_s"] = round((job.get("started_at") or end) - job["queued_at"], 1)
     if full:
         out["decision"] = job.get("decision") or job.get("result_text")
         out["plain"] = job.get("plain")
@@ -473,5 +608,5 @@ def list_jobs(limit: int = 20) -> list[dict]:
                 seen[j["id"]] = j
     except OSError:
         pass
-    rows = sorted(seen.values(), key=lambda j: j.get("started_at") or 0, reverse=True)
+    rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     return [summary(j) for j in rows[:limit]]

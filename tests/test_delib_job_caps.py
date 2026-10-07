@@ -5,6 +5,9 @@
 # 상한도 전역 하나뿐이라 한 사람이 자리를 다 차지하면 나머지는 기다릴 수밖에 없었다 — 사용자별
 # 상한을 따로 둔다(기본은 전역과 같아 종전 동작 그대로다. HWAXPortal docs/delib-engine-feedback D-6).
 #
+# 지금은 상한에 걸리면 거절하지 않고 줄을 세운다(tests/test_delib_job_queue.py). 여기서는 **줄을 끈 박스**
+# (DELIB_JOB_QUEUE_MAX=0)의 거절 문구를 본다 — 그 박스에서는 종전 문구가 그대로 나가야 한다.
+#
 #   실행:  .venv/bin/python -m pytest tests/test_delib_job_caps.py -q
 import asyncio
 import os
@@ -35,6 +38,7 @@ def ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
     monkeypatch.setattr(delib_jobs, "_JOBS", {})
     monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
     monkeypatch.setattr(d, "run_deliberation", _fake_entry)
     return delib_jobs._JOBS
 
@@ -67,6 +71,7 @@ def _refused(user=""):
 def _caps(monkeypatch, total, per_user=None):
     monkeypatch.setattr(delib_jobs, "MAX_RUNNING", total)
     monkeypatch.setattr(delib_jobs, "MAX_RUNNING_PER_USER", total if per_user is None else per_user)
+    monkeypatch.setattr(delib_jobs, "QUEUE_MAX", 0)       # 줄을 끈다 — 상한에 걸리면 거절이다
 
 
 # ── 누출 ─────────────────────────────────────────────────────────────────────
