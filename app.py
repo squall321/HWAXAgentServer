@@ -690,10 +690,13 @@ def _evidence_block(calls: list, unsourced: list) -> str:
     if len(calls) > 8:
         lines.append(f"- … 외 {len(calls) - 8}건")
     if unsourced:
+        # 보이는 것은 6건까지다(경고가 답변을 덮지 않게). 대신 **총 건수**를 적는다 — 심의 결정문과 같은
+        # 표기다. 종전엔 세는 쪽이 6건에서 멈춰, 몇 건이 출처 없는 값인지 블록만 봐서는 알 수 없었다.
+        _cnt = f"(표시 6건 · 총 {len(unsourced)}건)" if len(unsourced) > 6 else ""
         lines.append("")
         lines.append("> ⚠ 다음 수치는 위 조회 결과에서 확인되지 않았습니다 — "
-                     "추론이거나 계산된 값일 수 있으니 그대로 인용하지 마십시오: "
-                     + ", ".join(f"`{v}`" for v in unsourced))
+                     f"추론이거나 계산된 값일 수 있으니 그대로 인용하지 마십시오{_cnt}: "
+                     + ", ".join(f"`{v}`" for v in unsourced[:6]))
     return "\n".join(lines)
 
 
@@ -3127,7 +3130,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     if turn_calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0":
         try:
             _src = "\n".join(turn_out) + "\n" + (req.message or "")
-            _bad = _unsourced_numbers(text, _src)
+            _bad = _unsourced_numbers(text, _src, limit=0)   # 전부 센다 — 블록이 6건만 보이고 총 건수를 적는다
             _ev = _evidence_block(turn_calls, _bad)
             if _ev:
                 text += _ev

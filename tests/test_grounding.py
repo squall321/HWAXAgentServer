@@ -328,6 +328,23 @@ def test_근거_블록에_출처없는_수치가_실린다():
     assert "310.5" in out and "확인되지 않았습니다" in out
 
 
+def test_근거_블록은_여섯_건만_보이고_총_건수를_적는다():
+    """6건에서 끊고 나머지가 있다는 것도 감추면 7건이든 70건이든 6건으로 보인다 — 심의 결정문은
+    '표시 6건 · 총 N건' 으로 적는데 챗만 그대로였다(같은 판정이 화면마다 다르게 보였다)."""
+    bad = [f"{i}.5" for i in range(100, 109)]
+    out = evidence_block([("get_material", "id=1234")], bad)
+    assert "표시 6건 · 총 9건" in out, out
+    assert "`105.5`" in out and "`106.5`" not in out, out
+    few = evidence_block([("get_material", "id=1234")], bad[:6])
+    assert "총" not in few and "`105.5`" in few, few
+
+
+def test_챗은_출처없는_수치를_전부_세어_근거_블록에_넘긴다():
+    """세는 쪽이 6건에서 멈추면 블록은 총 건수를 알 길이 없다. 챗 스트림은 모델·게이트웨이 없이 못
+    돌리므로 넘기는 자리의 소스를 본다."""
+    assert "_unsourced_numbers(text, _src, limit=0)" in APP.read_text(encoding="utf-8")
+
+
 # ── 재촉 → 이어하기 ───────────────────────────────────────────────────────────
 # 응답이 끊긴 뒤의 "야! 하라니까!" 는 내용이 없어, 그대로 넘기면 모델이 새 질문으로 읽는다.
 # 오판(진짜 새 질문을 재촉으로 봄)이 재촉을 놓치는 것보다 나쁘므로 판정을 좁게 잡는다.
