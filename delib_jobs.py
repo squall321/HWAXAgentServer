@@ -336,8 +336,31 @@ def _parse_sse(chunk: bytes) -> tuple[str, dict]:
     return event, (data if isinstance(data, dict) else {})
 
 
+def _event_label(event: str, data: dict) -> str:
+    """방금 온 이벤트를 한 줄로 — 진행 조회의 last_step 이다(무엇이 마지막으로 일어났나). 진행이 아닌
+    이벤트(토큰 조각·ping·모르는 이름)는 빈 문자열이다 — 적지 않는다."""
+    if event == "status":
+        return str(data.get("step") or "")[:160]
+    if event == "delib":
+        kind = data.get("kind")
+        if kind == "turn":
+            return f"좌석 발언 — {data.get('persona')} ({data.get('display_round') or data.get('round')}R)"
+        if kind == "stage":
+            return f"단계 — {data.get('stage')}"
+        if kind == "evidence":
+            return f"근거 — {str(data.get('source') or '')[:80]}"
+        return str(kind or "")
+    if event in ("warning", "error"):
+        return f"{'경고' if event == 'warning' else '오류'} — {str(data.get('message') or '')[:120]}"
+    return ""
+
+
 def _apply(job: dict, event: str, data: dict) -> None:
     """SSE 이벤트 하나를 잡 상태에 반영. deliberation.py 의 이벤트 계약을 읽기만 한다."""
+    # 마지막으로 일어난 일 — 상태줄뿐 아니라 좌석 발언·근거·단계 전환도 적는다. 상태줄(step)은 라운드가 도는
+    # 동안 그대로라, 그것만 보면 좌석이 하나씩 발언하고 있는 것과 멈춘 것이 구분되지 않는다.
+    if event and (label := _event_label(event, data)):
+        job["last_step"] = label
     if event == "delib":
         kind = data.get("kind")
         if kind == "stage":
@@ -639,6 +662,13 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "checkpoint": bool(job.get("checkpoint")),
         "error": job.get("error"),
     }
+    if job["status"] == "running":
+        # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
+        # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 LLM 호출 한 번이 도는 동안 이벤트가 없다 —
+        # 그 호출의 한도(시도 횟수 포함) 안이면 기다리는 중이다(mcp_server 가 그 값을 quiet_ok_s 로 붙인다).
+        # ⚠ 이 값으로 잡을 끊지 않는다. 시간으로 죽은 것을 판정하면 긴 심의를 죽은 것으로 읽는다.
+        out["idle_s"] = round(max(0.0, _now() - (job.get("updated_at") or _now())), 1)
+        out["last_step"] = job.get("last_step") or job.get("step")
     q = queue_info(job)
     if q:
         out["queue"] = q
