@@ -833,6 +833,9 @@ def _resolve_opts(req_opts):
         evidence_dropped_empty=0,
         # 건수 상한(_EVID_ITEMS)을 넘겨 버린 근거 수 — 같은 이유로 센다. 41번째부터 말없이 사라졌다.
         evidence_over=0,
+        # 본문 후보가 둘 이상이던 항목 — [(근거 번호, 실은 키, 그 길이, [(뺀 키, 길이)])]. 실리는 것은 맨 앞
+        # 키 하나라 나머지는 좌석에 안 간다. 스트림이 카드로 알린다.
+        evidence_shadowed=[],
         # 1이면 초기 라운드까지만 돌고 멈춘다(F7 인간 체크포인트). 사람이 빠진 관점을 보태
         # 이어하기를 부르면 좌석 재심사가 그 방향에 맞는 도메인을 불러온다.
         stop_after_round=0,
@@ -1005,13 +1008,17 @@ def _resolve_opts(req_opts):
             # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
             # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
             for it in ev:
-                res = _ev_body(it) if isinstance(it, dict) else ""
-                if not res:
+                _cands = _ev_bodies(it) if isinstance(it, dict) else []
+                if not _cands:
                     o.evidence_dropped_empty += 1
                     continue
                 if len(o.evidence) >= _EVID_ITEMS:
                     o.evidence_over += 1
                     continue
+                _used, res = _cands[0]
+                if len(_cands) > 1:     # 건수 상한을 통과한 뒤에 적는다 — 번호가 그 항목의 [e:N] 과 같게
+                    o.evidence_shadowed.append((len(o.evidence) + 1, _used, len(res),
+                                                [(k, len(b)) for k, b in _cands[1:]]))
                 _key = it.get("key")
                 o.evidence.append({
                     "key": _key if isinstance(_key, str) and _EVID_KEY_RE.fullmatch(_key) else "",
@@ -1046,13 +1053,19 @@ def _resolve_opts(req_opts):
     return o
 
 
-def _ev_body(it: dict) -> str:
-    """근거 항목의 본문 — _EVID_BODY_KEYS 를 차례로 보고 처음으로 비지 않은 값을 쓴다.
+def _ev_bodies(it: dict) -> list:
+    """근거 항목의 본문 **후보 전부** — [(키, 본문)] 을 _EVID_BODY_KEYS 순서로. 쓰는 것은 맨 앞 하나다
+    (처음으로 비지 않은 값 — 순서가 우선순위다).
 
     문자열이 아닌 값(표·목록)은 JSON 으로 싣는다. repr 로 실으면 홑따옴표·None·True 가 섞여
     좌석이 수치를 다시 읽지 못하고, 한글은 이스케이프돼 사람도 못 읽는다.
     참·거짓은 본문이 아니다 — `{"result": true, "data": …}` 의 result 는 성패 표시라, 그걸
-    본문으로 집으면 진짜 본문(data)을 가린다."""
+    본문으로 집으면 진짜 본문(data)을 가린다.
+    후보를 다 돌려주는 까닭 — 둘 이상이면 뒤엣것은 좌석에 안 가는데 그 사실이 어디에도 안 남았다
+    ({summary: 한 줄, body: 본문} 은 한 줄만 실린다). 어느 것이 진짜 본문인지 여기서 짐작해 고르지는 않는다 —
+    result 의 수(0.42)나 객체({"gap_mm": 0.12})는 정당한 본문이고, 상태 표시({"ok": true})와 가를 수 없다.
+    뺀 후보를 알린다(_resolve_opts 의 evidence_shadowed)."""
+    out = []
     for k in _EVID_BODY_KEYS:
         v = it.get(k)
         if isinstance(v, str):
@@ -1062,8 +1075,8 @@ def _ev_body(it: dict) -> str:
         else:
             body = json.dumps(v, ensure_ascii=False, default=str)
         if body:
-            return body
-    return ""
+            out.append((k, body))
+    return out
 
 
 def _fit_ev(res: str) -> str:
@@ -3790,6 +3803,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
     # 예산(_EVID_BUDGET) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).
     chat_ev_inject = ""
+    _ev_in = 0                # 실제로 좌석에 실린 근거 수 — 예산을 넘긴 뒤쪽은 통째로 빠진다
     if opts.evidence:
         _items, _budget, _dropped = [], 0, 0
         for _ei, _e in enumerate(opts.evidence, start=1):
@@ -3810,6 +3824,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="사전 근거 예산 초과",
                          text=f"근거 {len(opts.evidence)}건 중 뒤쪽 {_dropped}건은 예산"
                               f"({_evid_budget():,}자)을 넘겨 좌석에 주지 않았다.", included=False)
+        _ev_in = len(_items)
         if _items:
             chat_ev_inject = ("[챗 워크스페이스가 정리한 원천 데이터 — 검증 대상이지 결론이 아니다. 각 수치·"
                               "주장을 당신 도메인으로 재검토하고, 부족하면 도구로 더 확인하라. 이 항목의 "
@@ -3823,6 +3838,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           f"{opts.evidence_dropped_empty}건은 본문이 없어(또는 항목이 객체가 아니어서) "
                           f"좌석에 주지 않았다. 본문은 'result' 에 넣는다"
                           f"({'·'.join(_EVID_BODY_KEYS[1:])} 도 차례로 찾는다).")
+    # 본문 후보가 여럿이던 항목 — 실은 것만 적는다(예산을 넘겨 통째로 빠진 항목은 위 예산 카드가 말한다).
+    _shadow = [x for x in opts.evidence_shadowed if x[0] <= _ev_in]
+    if _shadow:
+        yield _delib("evidence", source="사전 근거 본문 후보 여럿", included=False,
+                     text=f"근거 {len(_shadow)}건은 본문이 든 키가 둘 이상이라 앞선 키 하나만 좌석에 실었다 — "
+                          + " · ".join(f"[e:{_n}] {_k} {_ln:,}자를 싣고 "
+                                       + ", ".join(f"{_ok} {_oln:,}자" for _ok, _oln in _rest) + "는 뺐다"
+                                       for _n, _k, _ln, _rest in _shadow[:3])
+                          + (f" 외 {len(_shadow) - 3}건" if len(_shadow) > 3 else "")
+                          + f". 본문은 'result' 하나에 넣는다(찾는 순서 {'·'.join(_EVID_BODY_KEYS)}).")
     if opts.evidence_over:
         yield _delib("evidence", source="사전 근거 건수 초과", included=False,
                      text=f"본문이 있는 근거 {_ev_valid}건 중 뒤쪽 {opts.evidence_over}건은 건수 상한"

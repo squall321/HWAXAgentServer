@@ -213,6 +213,64 @@ def test_버린_것이_없으면_카드도_없다(monkeypatch):
     assert _cards(events, included=False) == []
 
 
+# ── 본문 후보가 여럿이면 하나만 실린다 — 무엇을 실었고 무엇을 뺐는지 남긴다 ─────────────────
+# 본문 키는 순서대로 찾아 처음으로 비지 않은 것을 쓴다(요청대로다 — 순서는 그대로 둔다). 그런데 한 항목에
+# 후보가 둘이면 뒤엣것은 버려지고, 어느 키를 썼는지도 남지 않았다. {summary: 한 줄, body: 본문} 은 한 줄만
+# 실리고, {result: {"ok": true}, text: 본문} 은 성패 표시가 실린다 — 건수는 '실렸다' 로 세어진다.
+_SHADOW = "사전 근거 본문 후보 여럿"
+_LONG_BODY = "본문 " + "가" * 3000
+
+
+def test_본문_후보가_여럿인_항목은_실은_키와_뺀_키를_남긴다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [
+        {"result": "정본만"},
+        {"summary": "한 줄 요약", "body": _LONG_BODY},
+        {"result": {"ok": True}, "text": "진짜 본문"},
+        {"result": 0, "content": "진짜 본문"}]})
+    assert [c["text"] for c in _cards(events, included=True)] == ["정본만", "한 줄 요약", '{"ok": true}', "0"], (
+        "찾는 순서가 바뀌었다 — 처음으로 비지 않은 키를 쓴다")
+    out = [c for c in _cards(events, included=False) if c["source"] == _SHADOW]
+    assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
+    for want in ("3건", "[e:2] summary 6자", f"body {len(_LONG_BODY):,}자", "[e:3] result", "text 5자",
+                 "[e:4] result 1자", "content 5자"):
+        assert want in out[0]["text"], (want, out[0]["text"])
+    assert "[e:1]" not in out[0]["text"], "후보가 하나뿐인 항목을 적었다"
+    for name, view in _mcp_view(monkeypatch, events).items():
+        assert _SHADOW in [x.get("source") for x in view["evidence_omitted"]], (name, view["evidence_omitted"])
+
+
+def test_본문_후보가_하나뿐이면_어느_키에_있든_아무것도_남기지_않는다(monkeypatch):
+    """`text` 에 본문을 넣은 것은 버려진 것이 없다 — 그것까지 적으면 원장(30건)이 소음으로 찬다.
+    성패 표시(참·거짓)와 빈 값은 후보가 아니다."""
+    events = _stream(monkeypatch, {"evidence": [{"result": "A"}, {"text": "B"}, {"result": True, "data": "C"},
+                                                {"result": "  ", "summary": "D"}]})
+    assert [c["text"] for c in _cards(events, included=True)] == ["A", "B", "C", "D"]
+    assert _cards(events, included=False) == []
+
+
+def test_후보가_여럿인_항목이_많아도_카드는_하나고_앞의_몇_건만_적는다(monkeypatch):
+    events = _stream(monkeypatch, {"evidence": [{"summary": f"요약 {i}", "body": f"본문 {i}"} for i in range(9)]})
+    out = [c for c in _cards(events, included=False) if c["source"] == _SHADOW]
+    assert len(out) == 1 and "9건" in out[0]["text"] and "[e:1] " in out[0]["text"], out
+    assert "[e:9]" not in out[0]["text"] and "외 6건" in out[0]["text"], out[0]["text"]
+    assert len(out[0]["text"]) < delib_jobs.OMITTED_TEXT_MAX, "원장에서 잘릴 길이다"
+
+
+def test_번호는_좌석이_받는_근거_번호와_같다(monkeypatch):
+    """본문 없는 항목은 번호를 받지 않는다 — 그 뒤 항목의 번호가 밀리지 않게 엔진 번호로 적는다."""
+    events = _stream(monkeypatch, {"evidence": [{"source": "빈것"}, {"result": "A"},
+                                                {"summary": "요약", "body": "본문"}]})
+    out = next(c for c in _cards(events, included=False) if c["source"] == _SHADOW)
+    assert "[e:2] summary" in out["text"], out["text"]
+
+
+def test_예산을_넘겨_통째로_빠진_항목을_실었다고_적지_않는다(monkeypatch):
+    """'앞선 키 하나만 실었다' 는 좌석이 받은 항목에만 참이다 — 빠진 항목은 예산 카드가 말한다."""
+    big = "가" * (d._evid_budget() - 200)
+    events = _stream(monkeypatch, {"evidence": [{"result": big}, {"summary": "나" * 600, "body": "본문"}]})
+    assert [c["source"] for c in _cards(events, included=False)] == ["사전 근거 예산 초과"]
+
+
 # ── 좌석에 주지 않은 근거는 MCP 호출자에게도 보인다 ──────────────────────────────
 # 웹은 근거 패널에 '제외' 카드가 뜨지만 MCP 호출자가 보는 것은 잡 원장뿐이다. 원장이 근거
 # 카드를 아예 안 적어서, 위 카드를 내도 deliberate_status / deliberate_result 로는 안 보였다.
