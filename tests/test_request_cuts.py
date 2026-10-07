@@ -210,6 +210,24 @@ def test_해석_설계는_첫_단에서만_알린다(monkeypatch):
     assert b.req_cut == {} and c.req_cut == {}
 
 
+def test_해석_설계는_읽지_못한_값과_키_없는_좌석도_첫_단에서만_알린다(monkeypatch):
+    """줄인 값과 같다 — 단마다 엔진이 옵션을 다시 읽으므로 지우지 않으면 같은 카드가 단마다 또 나간다.
+    지정 좌석은 1단에 앉는다. 2단부터의 좌석은 엔진이 세운 것이라 '키가 없어 못 앉혔다' 가 거기엔 없는 말이다."""
+    req = {**_OVER, "build_plan": 1, "rounds": "여러 번",
+           "personas": _OVER["personas"] + [{"name": "키 없는 좌석"}]}
+    a, b, c = _stages(monkeypatch, d.run_sim_deliberation, req)
+    assert "rounds" in a.req_unread and a.seats_no_key and a.seats_no_key[:2] == (3, 1), (a.req_unread, a.seats_no_key)
+    for later in (b, c):
+        assert later.req_unread == {} and later.seats_no_key is None, (later.req_unread, later.seats_no_key)
+
+
+def test_시험_설계는_키_없는_좌석을_못_앉혔다는_것을_그대로_알린다(monkeypatch):
+    """시험 설계는 단이 하나이고 지정 좌석을 실제로 앉힌다 — 못 앉힌 좌석이 있으면 거기서 말해야 한다."""
+    (o,) = _stages(monkeypatch, d.run_test_plan, {"personas": [{"key": "mech-a"}, {"name": "키 없는 좌석"}]})
+    assert o.seats_no_key and o.seats_no_key[:2] == (2, 1), o.seats_no_key
+    assert [p["key"] for p in o.continue_personas] == list(d._TEST_FIXED) + ["mech-a"]
+
+
 def test_시험_설계는_지정_좌석을_고정_좌석_뒤에_앉히므로_줄인_것도_그대로_알린다(monkeypatch):
     """종전엔 호출자 좌석을 고정 좌석으로 갈아 끼웠다 — 그때는 '줄였다' 가 거짓이라 지웠다. 이제 앉히므로
     역할을 상한에서 줄였다는 것은 참이고, 알려야 한다."""

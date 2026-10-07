@@ -426,6 +426,9 @@ def _continue(r, note="두께를 다시 보라", **kw):
     ({"job": SEALED}, {"job": "risk-review"}),                           # 봉인 Job 을 봉인 없는 Job 으로 바꿔 잇기
     ({"job": SEALED}, {"job": "default"}),
     ({"job": SEALED}, {"advanced": {"sealed": 0, "voc": "always"}}),     # 이어가면서 풀어 보려 해도
+    # 아래 둘은 Job 표가 봉인을 다시 걸어 주지 않는 길이다 — 이어하기가 제 손으로 다시 걸어야 한다.
+    ({"job": "diagnosis", "advanced": {"sealed": 1}}, {"advanced": {"sealed": 0, "voc": "always"}}),
+    ({"job": SEALED}, {"job": "risk-review", "advanced": {"sealed": "0"}}),
 ])
 def test_봉인으로_돈_심의는_어떻게_이어도_봉인이다(monkeypatch, tmp_path, start, cont):
     r = _run(monkeypatch, tmp_path, **start)
@@ -440,7 +443,7 @@ def test_봉인으로_돈_심의는_어떻게_이어도_봉인이다(monkeypatch
 
 
 def test_이어가면서_봉인을_풀려던_손잡이는_닫히고_그렇다고_남는다(monkeypatch, tmp_path):
-    r = _run(monkeypatch, tmp_path)
+    r = _run(monkeypatch, tmp_path, job="diagnosis", advanced={"sealed": 1})
     c = _continue(r, advanced={"sealed": 0, "voc": "always", "free_tools": 1})
     card = next(x for x in c.job["evidence_omitted"] if x.get("source") == "봉인이 닫은 요청")
     assert "voc=always" in card["text"] and "free_tools=1" in card["text"], card
