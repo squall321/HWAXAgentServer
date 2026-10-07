@@ -106,7 +106,7 @@ def test_심의가_접히면_아직_안_끝난_조회도_접는다(monkeypatch, 
     돌았다 — 20석이면 접은 뒤에도 조회 18건이 AIDataHub 로 간다. 대기열이 붙은 뒤로는 접힌 자리에서 다음
     심의가 곧바로 뜨므로, 그 조회들이 새 심의의 조회와 겹쳐 한 번에 도는 수의 상한이 깨진다."""
     monkeypatch.setattr(d, "_KN_CONC", 2)
-    tool = _Counting(hold=0.05)
+    tool = _Counting(hold=0.2)                      # 넉넉히 — 박스가 바빠도 접는 사이에 다음 묶음이 끝나지 않게
 
     async def _fake_tools(*_a, **_k):
         return {"agent_search": tool}
@@ -133,7 +133,7 @@ def test_심의가_접히면_아직_안_끝난_조회도_접는다(monkeypatch, 
             await first.wait()
             task.cancel()                           # 잡 취소 — 생성기가 조회를 기다리던 자리에서 끊긴다
         await asyncio.wait([task])
-        await asyncio.sleep(0.4)                    # 안 접혔다면 남은 조회가 이 사이에 줄줄이 돈다
+        await asyncio.sleep(1.0)                    # 안 접혔다면 남은 조회가 이 사이에 줄줄이 돈다(10건쯤)
         return tool.now, len(tool.calls)
 
     running, finished = asyncio.run(go())

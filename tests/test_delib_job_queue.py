@@ -201,16 +201,20 @@ def test_자리_하나에_하나만_뜨고_빈_자리를_남기지_않는다(eng
 
 def test_줄을_선_동안의_시간은_걸린_시간에_세지_않고_따로_적는다(eng, monkeypatch):
     _caps(monkeypatch, 1)
+    clock = [1000.0]                              # 시계를 손으로 돌린다 — 박스가 바빠도 값이 흔들리지 않게
+    monkeypatch.setattr(delib_jobs, "_now", lambda: clock[0])
 
     async def scenario():
         a, b = _start("가"), _start("나")
         await _tick()
-        b["queued_at"] -= 90                      # 90초 전에 줄을 섰다
+        clock[0] += 90                            # 나 는 90초째 줄을 서 있다
         out = delib_jobs.summary(b)
-        assert out["elapsed_s"] == 0 and 89 < out["queue"]["waited_s"] < 92, out
-        await _end(eng, a)
+        assert (out["elapsed_s"], out["queue"]["waited_s"]) == (0, 90.0), out
+        await _end(eng, a)                        # 이제 나 가 돈다
+        clock[0] += 7
         out = delib_jobs.summary(b)
-        assert out["elapsed_s"] < 5 and 89 < out["waited_s"] < 92, out
+        assert (out["elapsed_s"], out["waited_s"]) == (7.0, 90.0), out
+        assert delib_jobs.summary(a)["elapsed_s"] == 90.0 and "waited_s" not in delib_jobs.summary(a)
 
     _play(scenario)
 
