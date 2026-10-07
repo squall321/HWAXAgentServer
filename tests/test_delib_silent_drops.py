@@ -351,6 +351,20 @@ def test_원장에_남길_때_잘랐으면_잘랐다고_적는다():
     assert short["text"] == "그대로"
 
 
+def test_원장에는_설정_이름을_붙이고_잘려도_남는다():
+    """화면 글에는 설정 이름을 싣지 않는다(웹 사용자가 읽는다). 그 이름이 필요한 것은 MCP 호출자인데 그가
+    보는 것은 이 원장뿐이다 — 카드가 따로 실어 준 이름(knob)을 여기서 붙인다. 글을 자른 **뒤에** 붙인다."""
+    job = {"id": "t-knob"}
+    for text in ("짧은 글", "가" * 5000):
+        delib_jobs._apply(job, "delib", {"kind": "evidence", "source": "상한 초과", "included": False,
+                                         "text": text, "knob": "DELIB_SOME_KNOB"})
+    delib_jobs._apply(job, "delib", {"kind": "evidence", "source": "이름 없음", "included": False, "text": "글"})
+    short, long, plain = job["evidence_omitted"]
+    assert short["text"] == "짧은 글 (설정 DELIB_SOME_KNOB)", short
+    assert long["text"].endswith("(설정 DELIB_SOME_KNOB)") and "전체 5,000자" in long["text"], long["text"][-80:]
+    assert plain["text"] == "글"
+
+
 # ── 경고는 도는 동안에도 보이고, 창 밖으로 밀려난 수가 남는다 ───────────────────────
 # 원장은 경고를 최근 10건·상태줄을 최근 30줄만 둔다. 경고는 결과 회수에만 실려 도는 동안은 볼 길이
 # 없었고, 좌석별 실패 경고가 쌓이면 맨 먼저 온 경고(자격 강등 — 이 심의가 서비스 계정 시야로 돈다)가

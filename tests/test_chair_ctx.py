@@ -143,7 +143,13 @@ def test_명시한_값이_유도를_덮는다(monkeypatch):
     assert all(len(b) <= 9000 for b in blocks), [len(b) for b in blocks]
     assert all(len(b) >= 9000 * 0.9 for b in blocks), [len(b) for b in blocks]
     card = next(c for c in _cards(events, included=False) if c["source"] == _CUT)
-    assert "DELIB_DECISION_CTX" in card["text"] and "9,000자" in card["text"], card["text"]
+    assert "9,000자" in card["text"], card["text"]
+    # 설정 이름은 화면 글에 싣지 않는다 — 따로 실어(knob) 잡 원장에만 붙인다. 상태줄도 화면에 나간다.
+    assert "DELIB_DECISION_CTX" not in card["text"] and card["knob"] == "DELIB_DECISION_CTX", card
+    assert not [s for s in _steps(events) if "DELIB_DECISION_CTX" in s]
+    for name, view in _mcp_view(monkeypatch, events).items():
+        kept = next(x for x in view["evidence_omitted"] if x.get("source") == _CUT)
+        assert "DELIB_DECISION_CTX" in kept["text"], (name, kept)
 
 
 def test_0_은_무제한이다(monkeypatch):
@@ -253,6 +259,8 @@ def test_줄였으면_화면과_잡_원장에_남는다(monkeypatch):
     card = next(c for c in _cards(events, included=False) if c["source"] == _CUT)
     for want in ("1R ", "2R ", "3R ", "모델 컨텍스트에서 유도"):
         assert want in card["text"], (want, card["text"])
+    # 이 카드는 좌석에 안 준 근거가 아니라 알림이다 — 포털이 '좌석에 주지 않음' 딱지를 붙이지 않게 표시한다.
+    assert card.get("notice") is True, card
     assert any(s.startswith("의장 전사 상한") for s in _steps(events))
     for name, view in _mcp_view(monkeypatch, events).items():
         assert [x for x in view["evidence_omitted"] if x.get("source") == _CUT], (name, view["evidence_omitted"])

@@ -3689,10 +3689,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     #   현황 조회 결과로 갈아 끼운다 — 거기서 '앞 N자만 실었다' 고 적으면 거짓이다(아예 안 실린다).
     if opts.human_note_cut and opts.human_note == opts.human_note_cut[1]:
         _hn_full = opts.human_note_cut[0]
+        # 설정·필드 이름은 글에 넣지 않고 따로 싣는다(knob). 이 글은 웹 화면에도 뜬다 — 포털의 이어하기 칸은
+        # 길이 제한이 없어, 길게 쓴 일반 사용자가 'human_note'·'DELIB_HUMAN_NOTE_MAX' 를 읽게 됐다. 그 이름이
+        # 필요한 것은 MCP 호출자이고, 잡 원장이 knob 을 받아 글 끝에 붙인다(delib_jobs._apply).
         yield _delib("evidence", source="사람 의견 상한 초과", included=False,
-                     text=f"사람 의견(human_note) {_hn_full:,}자 중 앞 {len(opts.human_note):,}자만 좌석에 "
+                     knob="human_note · DELIB_HUMAN_NOTE_MAX",
+                     text=f"사람 의견 {_hn_full:,}자 중 앞 {len(opts.human_note):,}자만 좌석에 "
                           f"실었다 — 뒤 {_hn_full - len(opts.human_note):,}자는 좌석이 보지 못한다"
-                          f"(상한 {HUMAN_NOTE_MAX:,}자 — DELIB_HUMAN_NOTE_MAX).")
+                          f"(상한 {HUMAN_NOTE_MAX:,}자).")
     # 요청에 실린 나머지 값도 같다 — 상한에서 줄였으면 무엇을 얼마나 줄였는지 카드 하나로 알린다.
     if opts.req_cut:
         yield _delib("evidence", source="요청 값 상한 초과", included=False,
@@ -4189,10 +4193,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if _rcut:
         # 줄였으면 화면과 잡 원장에 남긴다. 종전엔 의장만 알았다 — 읽는 사람은 결정문의 '생략된 좌석의
         # 입장은 반영하지 못했다' 한 줄로만 눈치챘고, MCP 호출자는 그마저 결정문을 다 읽어야 보였다.
-        _why = "DELIB_DECISION_CTX" if _DECISION_CTX is not None else "모델 컨텍스트에서 유도"
+        # 설정 이름은 화면 글(상태줄·카드)에 넣지 않고 knob 으로 따로 싣는다(사람 의견 카드와 같은 까닭).
+        # notice — 이 카드는 '좌석에 주지 않은 근거' 가 아니다. 줄인 것은 의장의 입력이고 좌석은 전부 받았다.
+        # included=False 는 잡 원장에 싣게 하는 깃발인데 포털은 그 깃발에 '좌석에 주지 않음' 딱지를 붙여,
+        # 바로 아래 글('빠진 좌석은 없고')과 어긋났다. 포털이 딱지를 가를 수 있게 표시한다.
+        _knob = "DELIB_DECISION_CTX" if _DECISION_CTX is not None else ""
+        _why = "서버 설정값" if _knob else "모델 컨텍스트에서 유도"
         yield _sse("status", {"step": f"의장 전사 상한 — 라운드당 {_dctx:,}자({_why}), {len(_rcut)}개 "
                                       "라운드를 좌석마다 같은 몫으로 줄여 싣는다", "tool": None})
-        yield _delib("evidence", source="의장 전사 상한 초과", included=False,
+        yield _delib("evidence", source="의장 전사 상한 초과", included=False, notice=True,
+                     **({"knob": _knob} if _knob else {}),
                      text=f"의장에게 준 라운드 전사를 라운드당 {_dctx:,}자({_why})로 줄였다 — "
                           + " · ".join(_rcut) + ". 좌석마다 같은 몫으로 줄여 빠진 좌석은 없고, "
                           "잘린 것은 각 좌석 발언의 뒷부분이다.")

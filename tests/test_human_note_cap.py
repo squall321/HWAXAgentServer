@@ -63,13 +63,18 @@ def test_상한은_환경변수로_바꾸고_0_이면_자르지_않는다():
 
 
 # ── 알리기 — 화면과 잡 원장 ──────────────────────────────────────────────────────
-def test_잘랐으면_카드에_몇_자_중_몇_자인지와_설정_이름이_남는다(monkeypatch):
+def test_잘랐으면_카드에_몇_자_중_몇_자인지가_남고_설정_이름은_화면_글에_없다(monkeypatch):
+    """카드 글은 웹 사용자가 읽는다 — 포털의 이어하기 칸은 길이 제한이 없어 길게 쓴 사람이 바로 이 카드를
+    본다. 설정·필드 이름은 따로 실어(knob) 잡 원장에만 붙인다(아래 시험)."""
     n = d.HUMAN_NOTE_MAX + 3000
     events = _stream(monkeypatch, {"human_note": _note(n)})
     out = [c for c in _cards(events, included=False) if c["source"] == _CUT]
     assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
-    for want in (f"{n:,}자 중 앞 {d.HUMAN_NOTE_MAX:,}자만", "3,000자", "DELIB_HUMAN_NOTE_MAX"):
+    for want in (f"{n:,}자 중 앞 {d.HUMAN_NOTE_MAX:,}자만", "3,000자", f"상한 {d.HUMAN_NOTE_MAX:,}자"):
         assert want in out[0]["text"], (want, out[0]["text"])
+    for internal in ("DELIB_HUMAN_NOTE_MAX", "human_note"):
+        assert internal not in out[0]["text"], f"화면에 나가는 글에 내부 이름 {internal} 이 있다 — {out[0]['text']}"
+    assert "DELIB_HUMAN_NOTE_MAX" in out[0]["knob"], out[0]
     shown = next(c for c in _cards(events, included=True) if c["source"] == "인간 검토자 의견")
     assert "Z" not in shown["text"], "잘린 뒷부분이 좌석에 준 카드에 보인다"
 

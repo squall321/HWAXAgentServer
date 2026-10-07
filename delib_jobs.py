@@ -363,6 +363,10 @@ def _apply(job: dict, event: str, data: dict) -> None:
                 # 잘랐으면 표식을 붙인다 — 없으면 호출자는 꼬리가 원래 없던 줄 안다.
                 if len(txt) > OMITTED_TEXT_MAX:
                     txt = txt[:OMITTED_TEXT_MAX] + f"… (앞 {OMITTED_TEXT_MAX}자만 · 전체 {len(txt):,}자)"
+                # 그 상한을 바꾸는 설정 이름(knob) — 카드 글에는 없다(웹 사용자가 읽는 글이라 엔진이 따로
+                # 싣는다). 호출자가 그 이름을 볼 곳은 여기뿐이라 붙여 둔다. 자른 **뒤에** 붙여야 안 잘린다.
+                if data.get("knob"):
+                    txt += f" (설정 {data['knob']})"
                 ex.append({"source": str(data.get("source") or ""), "text": txt})
             elif len(ex) == OMITTED_MAX:
                 ex.append({"note": f"상한 {OMITTED_MAX}건 초과 — 이후는 기록하지 않는다"})
