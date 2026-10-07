@@ -337,3 +337,14 @@ def test_예산_밖_생략은_사전_근거와_별개라고_밝힌다(monkeypatc
     step = _share_line(monkeypatch, calls_per_seat=30)
     assert "예산 밖 최대" in step and "건 생략" in step, step      # 시험 전제 — 실제로 넘쳤다
     assert "사전 근거와는 별개" in step, step
+
+
+def test_원장에_남길_때_잘랐으면_잘랐다고_적는다():
+    """표식 없이 자르면 MCP 호출자는 꼬리가 원래 없던 줄 안다 — 이 파일이 잡으려는 바로 그 모양이다."""
+    job = {"id": "t-clip"}
+    delib_jobs._apply(job, "delib", {"kind": "evidence", "source": "지식카드 조회 강등", "included": False,
+                                     "text": "가" * 5000})
+    delib_jobs._apply(job, "delib", {"kind": "evidence", "source": "짧은 것", "included": False, "text": "그대로"})
+    long, short = job["evidence_omitted"]
+    assert long["text"].startswith("가" * delib_jobs.OMITTED_TEXT_MAX) and "전체 5,000자" in long["text"], long
+    assert short["text"] == "그대로"

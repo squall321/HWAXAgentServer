@@ -69,7 +69,7 @@ def test_본문_키와_자르지_말라는_안내가_있다():
 def test_설명은_상수를_따라가고_로드_때_예산을_재지_않는다():
     """상수를 바꾸면 설명이 따라 바뀐다. 그리고 **모듈 로드 때 합계 예산을 부르지 않는다** —
     app.py 가 mcp_server 를 반쯤 import 된 채로 부르므로, 그때 재면 조회가 실패하고 엔진이
-    폴백 컨텍스트를 프로세스 내내 캐시한다(dev 16K 창에서 좌석이 전원 400 으로 죽는다)."""
+    폴백 컨텍스트를 프로세스 내내 캐시한다(사본 실측: 16K 창에 128K 기준 예산이 굳는다)."""
     code = (
         "import asyncio, app, deliberation as d, mcp_server as m\n"
         "assert 'pre' not in d._evid_cache and 'n' not in app._ctx_cache, '로드 때 예산을 쟀다'\n"

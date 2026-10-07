@@ -149,7 +149,8 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
 # 독스트링을 안 쓴다. 호출자가 받는 글(_START_DESC)에 실어야 읽힌다.
 # ⚠ 합계 예산(_evid_budget)은 여기서 재지 않는다. 모델 컨텍스트에서 유도하는 값인데, 이 모듈은
 #   app.py 가 반쯤 import 된 시점에 로드돼 그 조회가 실패하고, 엔진은 폴백 값을 프로세스 내내
-#   캐시한다(dev 16K 창에서 좌석 전원이 400 으로 죽는다). 부를 때 재서 준다(_evid_limits).
+#   캐시한다(사본으로 실측: 16K 창인데 예산이 128K 기준 17,967자로 굳는다 — 맞는 값은 2,000자.
+#   좌석 프롬프트가 창을 넘긴다). 부를 때 재서 준다(_evid_limits).
 _EVID_DESC = (
     f"evidence(원천 근거) — [{{source, tool, args, result, key}}], 최대 {_engine._EVID_ITEMS}건. "
     "**본문은 `result` 에 넣는다**"

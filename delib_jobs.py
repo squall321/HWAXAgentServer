@@ -214,8 +214,11 @@ def _apply(job: dict, event: str, data: dict) -> None:
             # 좌석에 준 카드는 싣지 않는다(근거 본문만큼 원장이 커진다).
             ex = job.setdefault("evidence_omitted", [])
             if len(ex) < OMITTED_MAX:
-                ex.append({"source": str(data.get("source") or ""),
-                           "text": str(data.get("text") or "")[:OMITTED_TEXT_MAX]})
+                txt = str(data.get("text") or "")
+                # 잘랐으면 표식을 붙인다 — 없으면 호출자는 꼬리가 원래 없던 줄 안다.
+                if len(txt) > OMITTED_TEXT_MAX:
+                    txt = txt[:OMITTED_TEXT_MAX] + f"… (앞 {OMITTED_TEXT_MAX}자만 · 전체 {len(txt):,}자)"
+                ex.append({"source": str(data.get("source") or ""), "text": txt})
             elif len(ex) == OMITTED_MAX:
                 ex.append({"note": f"상한 {OMITTED_MAX}건 초과 — 이후는 기록하지 않는다"})
     elif event == "status":
