@@ -38,6 +38,8 @@ def _pin_context():
 class _Tool:
     """_call 이 기대하는 최소 모양 — 받은 인자를 적어 두고 정해 둔 답을 준다."""
 
+    coroutine = None      # 자유 조회 준비(_wrap_cached)가 보는 자리 — 없으면 그대로 둔다
+
     def __init__(self, name, answer='{"hits": []}'):
         self.name, self._answer, self.calls = name, answer, []
 
@@ -299,3 +301,39 @@ def test_본문_없음과_건수_초과가_같이_나도_합계가_맞는다(mon
     by = {c["source"]: c["text"] for c in _cards(events, included=False)}
     assert f"근거 {n + 1}건 중 1건" in by["사전 근거 본문 없음"], by
     assert f"{n}건 중 뒤쪽 2건" in by["사전 근거 건수 초과"], by
+
+
+# ── 1-14. '공용 근거 … 예산 밖 N건 생략' 은 주입한 근거가 잘렸다는 말로 읽혔다 ──────
+def _share_line(monkeypatch, calls_per_seat=1):
+    """1라운드 자유 조회까지 실제로 돌려, 좌석끼리 나눠 보는 조회 결과의 상태줄을 받는다."""
+    import langgraph.prebuilt
+
+    async def _fake_gather(_agent, persona, *_a, **_k):   # (좌석, 호출목록, 주입 블록, 실패사유)
+        k = persona["key"]
+        return (k, [("list_materials", f'{{"q": "{k}-{i}"}}', f"{k} 가 찾은 값 {i} " + "가" * 500, "")
+                    for i in range(calls_per_seat)], "조회 요약", "")
+
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda *_a, **_k: object())
+    monkeypatch.setattr(d, "_free_gather_one", _fake_gather)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))     # 게이트웨이 /tools-map 을 타지 않게
+    events = _stream(monkeypatch, {"free_tools": 1},
+                     tools={"agent_search": _Tool("agent_search"),
+                            "list_materials": _Tool("list_materials")},
+                     until=lambda ev, data: ev == "status" and "좌석당 최대" in data.get("step", ""))
+    return events[-1][1]["step"]
+
+
+def test_좌석끼리_나눠_보는_조회_결과를_근거라고_부르지_않는다(monkeypatch):
+    """실사용 팀이 이 줄의 '예산 밖 N건 생략' 을 보고 **자기가 주입한 근거**가 잘린다고 믿었다.
+    이 줄이 세는 것은 다른 좌석의 자유 조회 결과다 — 사전 근거와는 통도 예산도 다르다."""
+    step = _share_line(monkeypatch)
+    assert step.startswith("다른 좌석의 조회 결과"), step
+    assert "공용 근거" not in step, step
+    assert "1건 전달" in step, step                       # 두 좌석이 하나씩 조회 → 서로 1건씩 받는다
+
+
+def test_예산_밖_생략은_사전_근거와_별개라고_밝힌다(monkeypatch):
+    step = _share_line(monkeypatch, calls_per_seat=30)
+    assert "예산 밖 최대" in step and "건 생략" in step, step      # 시험 전제 — 실제로 넘쳤다
+    assert "사전 근거와는 별개" in step, step

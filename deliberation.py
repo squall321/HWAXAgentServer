@@ -3754,9 +3754,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             #   풀을 세면 300건 조회에 "300건 전달" 이 되고, 줄을 세면 예쁘게 찍힌 JSON
             #   한 건이 23건으로 세어진다(실측으로 둘 다 겪었다).
             _dmax = max(_drop.values(), default=0)
-            yield _sse("status", {"step": f"공용 근거 — 좌석당 최대 {_shown}건 전달"
+            # ⚠ 화면에서는 '공용 근거' 라고 부르지 않는다. 실사용 팀이 "공용 근거 — … 예산 밖 N건
+            #   생략" 을 보고 **자기가 주입한 사전 근거**가 잘린다고 믿었다(2026-10-07). 여기서 세는
+            #   것은 좌석들의 자유 조회 결과이고 사전 근거와는 통도 예산도 다르다 — 줄에 그렇게 적는다.
+            yield _sse("status", {"step": f"다른 좌석의 조회 결과 — 좌석당 최대 {_shown}건 전달"
                                           + (f" · 예산 밖 최대 {_dmax}건 생략" if _dmax else "")
-                                          + f" (1인당 {_sb + _mbudget:,}자)", "tool": None})
+                                          + f" (1인당 {_sb + _mbudget:,}자 · 자기 앞 라운드 조회 포함 · "
+                                            "주입한 사전 근거와는 별개)", "tool": None})
         if any(_kn.values()) or any(_gathered.values()) or any(_share.values()) or any(_mine.values()):
             _base_fn = prompt_fn
 
