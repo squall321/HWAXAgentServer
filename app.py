@@ -51,6 +51,7 @@ from evidence import (fit_document, sig_numbers as _sig_numbers,
 from deliberation import (
     N_PERSONAS,
     _PHANTOM_ID_MARK,
+    _AUTH_REJECT_MARK,
     envelope_failed,
     _call,
     _agent_search_hits,
@@ -945,6 +946,11 @@ def _cap_tool(tool, result_max=None):
         try:
             out = await orig(*a, **kw)
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
+            # MCP 전송이 올리는 예외는 anyio TaskGroup 에 싸여 온다 — 문구가 'unhandled errors in a
+            # TaskGroup (1 sub-exception)' 뿐이라 진짜 원인(게이트웨이의 401·연결 거절)이 안 보였다.
+            # 안쪽 예외를 꺼내 그것으로 말하고 판정한다.
+            while getattr(exc, "exceptions", None):
+                exc = exc.exceptions[0]
             # 예외를 그대로 올리면 LangChain 이 원문만 보여줘 LLM 이 같은 실수를 반복한다.
             # 스키마를 실어 돌려주면 다음 시도에서 인자명·타입·단위가 교정된다.
             # ⚠ 모든 예외에 '인자를 고쳐 다시 호출' 힌트를 붙이면 안 된다. 타임아웃·백엔드
@@ -963,6 +969,12 @@ def _cap_tool(tool, result_max=None):
             # 구분할 수 없었다 — 이 리포가 반복해서 만나는 모양이다. 판단은 이미 위에서
             # 내리고 있으니(_is_transport·_is_argerr) **버리지만 않으면** 된다.
             msg = f"{_TOOL_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {str(exc)[:500]}"
+            if getattr(getattr(exc, "response", None), "status_code", None) == 401:
+                # 게이트웨이가 자격을 거절했다 — 시작할 때 받은 사용자 토큰이 도는 중에 만료·폐기된 것이다.
+                # 표지를 싣는다: 심의는 이것을 보고 서비스 계정으로 한 번 더 부른다(deliberation._svc_fallback).
+                msg = (f"{_TOOL_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {_AUTH_REJECT_MARK} — "
+                       "사용자 토큰이 만료됐거나 폐기됐다. 인자 문제가 아니다 — 같은 도구를 인자만 바꿔 다시 "
+                       "부르지 마라")
             if _mcp_call_timed_out(exc):
                 # 엔진측 기한이 걸렸다. SDK 문구('Timed out while waiting for response to ClientRequest')만
                 # 실으면 무엇이 얼마를 기다렸는지, 어느 값을 봐야 하는지 없다 — 기한과 손잡이를 말한다.

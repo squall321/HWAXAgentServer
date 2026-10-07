@@ -20,6 +20,14 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 # 강등을 로그로만 남기면 아무도 못 본다 — 심의가 남의 시야로 근거를 모으고도 정상처럼
 # 보인다(무음 강등). 사용자에게 보이는 두 층(라이브 SSE·결정문)에 모두 찍는다.
 _pat_degraded: contextvars.ContextVar = contextvars.ContextVar("pat_degraded", default=None)
+# 심의가 **도는 중에** 사용자 토큰이 거절돼(만료·폐기) 서비스 계정으로 넘어갔는지 적는 칸 — 값은 dict 다.
+# 도구 래퍼(_svc_fallback)가 채우고 스트림이 읽어 알린다. 문자열이 아니라 dict 를 담는 까닭 — 도구 호출은
+# 좌석별 자식 태스크에서 돌고, 자식이 ContextVar 를 다시 set 하면 부모는 못 본다. 같은 dict 를 물려주면 보인다.
+_cred_mid: contextvars.ContextVar = contextvars.ContextVar("cred_mid", default=None)
+# 게이트웨이가 호출자의 자격을 거절했다(HTTP 401)는 표지. app._cap_tool 이 실패 문구에 싣고 _svc_fallback 이
+# 이것을 보고 서비스 계정으로 한 번 더 부른다. 양쪽이 같은 글자를 봐야 해서 하위 모듈인 여기에 두고 app 이
+# import 한다(_PHANTOM_ID_MARK 와 같은 방식).
+_AUTH_REJECT_MARK = "게이트웨이가 자격을 거절했다(HTTP 401)"
 
 
 DELIBERATE_TRIGGERS = ("/심의", "/deliberate", "/토의")
@@ -1277,6 +1285,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     if not conns:
         return {}
     scoped = _with_groups(conns, sorted(groups), user, user_pat)
+    via_pat = bool(user_pat)        # 이 도구들이 사용자 토큰으로 붙는가 — 아래 로드 폴백을 타면 거짓이 된다
     try:
         tools = await MultiServerMCPClient(scoped).get_tools()
     except Exception as _pe:
@@ -1293,6 +1302,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         _pat_degraded.set("사용자 자격증명이 게이트웨이에 거절돼 서비스 계정으로 조회함")
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await MultiServerMCPClient(scoped).get_tools()
+        via_pat = False
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
@@ -1302,7 +1312,64 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         tools = [_prep_tool(t, result_max, desc_max) for t in tools]
     except Exception as exc:  # noqa: BLE001 — 래핑 실패해도 심의는 진행
         print(f"[deliberation] _prep_tool 적용 실패: {exc!r}")
+    if via_pat:
+        # 사용자 토큰은 시작할 때 받은 것을 끝까지 쓴다. 심의가 그 수명보다 길면 **도는 중에** 거절된다 —
+        # 종전엔 그 뒤의 좌석 조회와 마지막 보고서 저장이 전부 실패했고 사유는 'TaskGroup 오류' 한 줄이었다.
+        # 로드 때의 폴백(위)과 같은 처리를 호출 단위로 한다 — 거절되면 서비스 계정 도구로 그 호출을 한 번 더.
+        # 서비스 계정 도구는 처음 필요할 때 한 번만 받는다(좌석들이 한꺼번에 거절돼도 로드는 한 번).
+        _svc: dict = {}
+        _svc_lock = asyncio.Lock()
+
+        async def _svc_tools() -> dict:
+            async with _svc_lock:
+                if not _svc:
+                    got = await MultiServerMCPClient(_with_groups(conns, sorted(groups), user, "")).get_tools()
+                    try:
+                        from app import _prep_tool  # noqa: PLC0415
+                        got = [_prep_tool(t, result_max, desc_max) for t in got]
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[deliberation] _prep_tool 적용 실패(서비스 계정 도구): {exc!r}")
+                    _svc.update({t.name: t for t in got})
+            return _svc
+
+        tools = [_svc_fallback(t, _svc_tools, _cred_mid.get()) for t in tools]
     return {t.name: t for t in tools}
+
+
+def _auth_rejected(out) -> bool:
+    """도구 결과가 게이트웨이의 자격 거절(401)인가. 예외가 아니라 실패 문구로 온다(app._cap_tool)."""
+    s = out[0] if isinstance(out, tuple) and out else out
+    return isinstance(s, str) and _AUTH_REJECT_MARK in s.lstrip()[:300]
+
+
+def _svc_fallback(tool, svc_tools, flag: dict | None):
+    """사용자 토큰으로 붙은 도구를 감싼다 — 자격이 거절되면(401) 서비스 계정 도구로 그 호출을 **한 번** 더 한다.
+
+    svc_tools 는 서비스 계정 도구 사전을 주는 코루틴 함수, flag 는 강등 사실을 적을 칸(_cred_mid)이다.
+    서비스 계정으로 불러도 호출자 신원·그룹 헤더는 그대로 실린다 — 게이트웨이가 그것으로 도구 범위와 사람별
+    백엔드 자격을 정하므로, 폴백이 권한을 넓히지 않는다. 403(권한 없음)은 넘기지 않는다."""
+    orig = getattr(tool, "coroutine", None)
+    if orig is None:
+        return tool
+
+    async def guarded(*a, **kw):
+        out = await orig(*a, **kw)
+        if not _auth_rejected(out):
+            return out
+        try:
+            other = (await svc_tools()).get(tool.name)
+        except Exception as exc:  # noqa: BLE001 — 서비스 계정으로도 못 붙으면 처음 실패를 그대로 돌려준다
+            print(f"[deliberation] 서비스 계정 도구 로드 실패 — 자격 거절을 그대로 돌려준다: {exc!r}")
+            return out
+        if other is None or getattr(other, "coroutine", None) is None:
+            return out
+        if flag is not None and not flag.get("why"):
+            flag["why"] = "실행 중 사용자 자격이 거절돼(만료·폐기) 서비스 계정으로 조회·저장함"
+            print(f"[deliberation] ⚠ 실행 중 사용자 자격 거절(401) — 서비스 계정으로 넘어간다({tool.name})")
+        return await other.coroutine(*a, **kw)
+
+    tool.coroutine = guarded
+    return tool
 
 
 async def _call(tools: dict, name: str, args: dict):
@@ -3548,6 +3615,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 print(f"[deliberation] timeout override failed: {exc!r}")
     # 요청 단위 강등 표식 초기화 — 이 태스크가 재사용되는 경우에도 이전 요청의 값이 새지 않게.
     _pat_degraded.set(None)
+    # 실행 중 자격 강등 — 도구 래퍼가 이 칸을 채우면(_svc_fallback) 아래 _cred_notice 가 한 번 알린다.
+    _cred: dict = {}
+    _cred_mid.set(_cred)
+
+    def _cred_notice() -> list:
+        if not _cred.get("why") or _cred.get("told"):
+            return []
+        _cred["told"] = True
+        _pat_degraded.set(_cred["why"])     # 결정문 머리의 근거 프로파일(_evidence_note)에도 찍힌다
+        return [_sse("warning", {
+            "code": "credential_degraded",
+            "message": "심의가 도는 중에 요청자 자격이 만료(또는 폐기)돼, 그 뒤의 조회·저장은 서비스 계정으로 "
+                       "했습니다 — 결과가 요청자 시야와 다를 수 있습니다. 포털이 찍는 챗 토큰의 수명이 이 "
+                       "심의보다 짧습니다.",
+            "knob": "포털 CHAT_PAT_TTL_S"})]
     if opts.sealed:
         # 무엇을 닫았는지 먼저 밝힌다. 호출자가 열려던 손잡이는 카드로도 남긴다 — 잡 원장에 실려
         # MCP 호출자가 진행 조회에서 본다(말없이 덮으면 자기가 고른 도구·VOC 가 돈 줄 안다).
@@ -4208,6 +4290,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                               "잘린 것은 긴 발언의 뒷부분이다.")
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
+        for _c in _cred_notice():       # 앞 단계(발굴·지식카드·직전 라운드 조회)에서 자격이 거절됐으면 여기서 알린다
+            yield _c
         yield _delib("stage", stage=f"r{rnd}", n=len(personas))
         yield _sse("status", {"step": f"{_dr(rnd)}라운드 — {rlabel}", "tool": None})
 
@@ -4568,6 +4652,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     last_list, last_t = rounds_data[-1]
 
     # 4) 의사결정문 합성
+    for _c in _cred_notice():           # 마지막 라운드의 조회에서 거절됐으면 — 아래 근거 프로파일이 읽기 전에
+        yield _c
     yield _delib("stage", stage="decide")
     yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
     # 출처 태깅(DELIB_CHAIR_CITE) — 절충형 뭉개기(전 의견 나열 병합)를 가시화·감사 가능하게.
@@ -4886,6 +4972,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         rid, report_note = _ra_save_outcome(_raw_made, _append_to, _do_save)
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
+    for _c in _cred_notice():           # 보고서 저장에서 거절됐으면 — 수 시간 심의의 맨 끝이 가장 걸리기 쉽다
+        yield _c
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
     # ⚠ 분모는 **착석 수**다. 예전엔 len(last_list) — 즉 마지막 라운드 **응답자 수** 였고,
