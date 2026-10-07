@@ -195,6 +195,15 @@ def test_사용자별_기본값은_전역_상한이다():
     assert _loaded(DELIB_JOB_MAX_RUNNING="6", DELIB_JOB_MAX_RUNNING_PER_USER="0") == (6, 6)
 
 
+def test_전역_상한_0_은_전부_막는_것이_아니라_기본값이다():
+    """`int("0" or 2)` 는 0 이다 — 0 을 넣으면 모든 시작이 '상한 0건' 으로 거절됐다. 대기 큐가 있으면
+    거절도 아니고 영영 대기다. 빈 값과 같은 뜻(기본 2)으로 읽는다 — 사용자별 상한의 0 과 같은 규칙이다."""
+    assert _loaded(DELIB_JOB_MAX_RUNNING="0") == (2, 2)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="-3") == (2, 2)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="0", DELIB_JOB_MAX_RUNNING_PER_USER="1") == (2, 1)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="1") == (1, 1)
+
+
 def test_메뉴와_목록이_두_상한을_다_알려_준다(ledger, monkeypatch):
     """전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다."""
     import mcp_server

@@ -34,7 +34,12 @@ JOB_DIR = Path(os.environ.get(
     "DELIB_JOB_DIR", os.path.join(os.path.dirname(os.path.realpath(_ART).rstrip("/")), "delib-jobs")))
 
 # 동시 실행 상한 — 심의 하나가 좌석 수만큼 LLM 을 물고 있어서, 무제한이면 vLLM 큐가 잠긴다.
+# 0 이하는 기본값으로 읽는다 — `int("0" or 2)` 는 0 이라, 0 을 넣은 박스는 모든 시작이 '상한 0건' 에
+# 걸렸다(빈 값만 기본값으로 가고 "0" 은 문자열이라 참이다). 사용자별 상한의 0 과 같은 뜻으로 맞춘다.
 MAX_RUNNING = int(os.environ.get("DELIB_JOB_MAX_RUNNING", "2") or 2)
+if MAX_RUNNING < 1:
+    log.warning("env DELIB_JOB_MAX_RUNNING=%d 는 1 미만 — 기본값 2 로 읽는다", MAX_RUNNING)
+    MAX_RUNNING = 2
 # 사용자별 상한 — 한 사람이 전역 자리를 다 차지하지 못하게 한다. **기본은 전역 상한과 같다**(비우거나
 # 0 이면 전역을 따른다 = 따로 걸리지 않는다). 전역 2 는 LLM 큐 보호선이고 용량은 여기서 잴 수 없어
 # 기본 동작을 바꾸지 않는다 — 운영이 전역을 올리고 이 값을 낮춰 쓴다(예: 6 · 2). 자리가 없으면
