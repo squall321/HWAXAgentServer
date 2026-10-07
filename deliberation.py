@@ -105,6 +105,17 @@ _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기
 # (실사용: 25건을 넣은 심의가 근거 0건으로 끝까지 돌았다 — 2026-10-07). 도구 설명
 # (mcp_server)이 이 목록을 읽어 적는다.
 _EVID_BODY_KEYS = ("result", "text", "content", "excerpt", "summary", "body", "output", "data")
+# 근거 항목의 선택 키(`key`) — 호출자가 제 번호(E3·E1-CH-015)를 실어 보내면 표지를 `[e:N|KEY]` 로
+# 찍는다. 엔진 번호 N 은 버려진 항목을 건너뛰고 매겨져 호출자의 번호와 어긋난다 — 키가 있어야
+# 결정문의 인용을 호출자가 제 원장과 맞춰 볼 수 있다(S26U 피드백 3-2). 표지 안에 찍히므로 `]`·`|`·
+# 공백이 섞이면 표지가 깨진다 — 형식 밖은 버린다.
+# ⚠ 형식은 JS 파이프라인(hwax-deliberate.js)·리스크 앱(brief.py)과 함께 못박은 것이다
+#   (HWAXPortal docs/delib-engine-feedback D-4). 바꾸려면 셋을 같이 바꾼다.
+_EVID_KEY_MAX = 24
+_EVID_KEY_RE = re.compile(rf"[A-Za-z0-9_.-]{{1,{_EVID_KEY_MAX}}}")
+# 인용 표지 — 좌석·의장에게는 `[e:N]` 을 적으라고 하지만, 줄에 찍힌 `[e:N|KEY]` 를 그대로 옮겨
+# 적기도 한다. 둘 다 항목 N 이다(group 1).
+_EV_CITE_RE = re.compile(rf"\[e:(\d+)(?:\|{_EVID_KEY_RE.pattern})?\]")
 _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천장**(자) — 1M 창 기준
 # ⚠ 위 값은 천장이고 실제 예산은 모델 컨텍스트에서 유도한다. 좌석 프롬프트 하나는
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
@@ -798,7 +809,9 @@ def _resolve_opts(req_opts):
                 if len(o.evidence) >= _EVID_ITEMS:
                     o.evidence_over += 1
                     continue
+                _key = it.get("key")
                 o.evidence.append({
+                    "key": _key if isinstance(_key, str) and _EVID_KEY_RE.fullmatch(_key) else "",
                     "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
                     "tool": str(it.get("tool") or "")[:80],
                     "args": str(it.get("args") or "")[:_EVID_ARGS_MAX],
@@ -3423,7 +3436,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _src, _res = _e.get("source") or "챗", _e.get("result", "")
             _meta = (f" · {_e['tool']}" if _e.get("tool") else "") + (f"({_e['args']})" if _e.get("args") else "")
             # [e:N] 안정 id — 좌석·의장이 근거 항목을 지목해 인용할 참조 체계(JS 파이프라인 파리티).
-            _line = f"· [e:{_ei}] [{_src}{_meta}] {_res}"
+            # 호출자 키가 있으면 [e:N|KEY] — 인용은 종전대로 [e:N] 이고 어느 쪽으로 적어도 같은 항목이다.
+            _line = f"· [e:{_ei}{'|' + _e['key'] if _e.get('key') else ''}] [{_src}{_meta}] {_res}"
             if _budget + len(_line) > _evid_budget() and _items:
                 _dropped = len(opts.evidence) - len(_items)
                 break
@@ -3920,12 +3934,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _num_re = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{3,}")
     _nrm = lambda s: str(s).replace(",", "")  # noqa: E731
     _cit_corpus = _nrm("\n".join(
-        [f"{e.get('source', '')} {e.get('tool', '')} {e.get('args', '')} {e.get('result', '')}"
+        [f"{e.get('key', '')} {e.get('source', '')} {e.get('tool', '')} {e.get('args', '')} {e.get('result', '')}"
          for e in (opts.evidence or [])]
         + [question, opts.human_note or ""]
         + [json.dumps(lst, ensure_ascii=False, default=str) + "\n" + str(t)
            for lst, t in rounds_data]))
-    _dec_nums = [n for n in dict.fromkeys(_nrm(m.group(0)) for m in _num_re.finditer(decision))
+    # 근거 표지 [e:N]·[e:N|KEY] 는 인용이지 수치가 아니다 — 떼고 센다. 안 떼면 표지 속 숫자
+    # (e:120 의 120, 키 E1-CH-015 의 015)가 '어느 원문에도 없는 수치' 로 올라와 진짜 환각을 묻는다.
+    _dec_nums = [n for n in dict.fromkeys(_nrm(m.group(0))
+                                          for m in _num_re.finditer(_EV_CITE_RE.sub(" ", decision)))
                  if not re.fullmatch(r"(19|20)\d{2}", n)]
     _unmatched_nums = [n for n in _dec_nums if n not in _cit_corpus]
     if _unmatched_nums:

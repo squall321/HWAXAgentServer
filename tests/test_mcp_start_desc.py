@@ -62,6 +62,7 @@ def test_본문_키와_자르지_말라는_안내가_있다():
     assert "미리 자르지 마라" in desc and "무엇을 뺐는지" in desc
     assert "합계 예산" in desc and "통째로 빠지" in desc    # 먼저 걸리는 것은 항목 천장이 아니라 합계다
     assert "`source`" in desc and "[e:N]" in desc          # 호출자 표식이 어디에 찍히는지
+    assert "`key`" in desc and "[e:N|KEY]" in desc and f"{d._EVID_KEY_MAX}자" in desc
     assert "evidence_omitted" in desc                       # 버려진 것을 어디서 보는지
 
 

@@ -151,7 +151,7 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
 #   app.py 가 반쯤 import 된 시점에 로드돼 그 조회가 실패하고, 엔진은 폴백 값을 프로세스 내내
 #   캐시한다(dev 16K 창에서 좌석 전원이 400 으로 죽는다). 부를 때 재서 준다(_evid_limits).
 _EVID_DESC = (
-    f"evidence(원천 근거) — [{{source, tool, args, result}}], 최대 {_engine._EVID_ITEMS}건. "
+    f"evidence(원천 근거) — [{{source, tool, args, result, key}}], 최대 {_engine._EVID_ITEMS}건. "
     "**본문은 `result` 에 넣는다**"
     f"({'·'.join(_engine._EVID_BODY_KEYS[1:])} 도 차례로 찾지만 정본은 result 다). "
     f"**미리 자르지 마라** — 항목당 천장은 {_engine._EVID_ITEM_MAX:,}자이고, 넘으면 엔진이 덜어낸 뒤 "
@@ -161,7 +161,9 @@ _EVID_DESC = (
     "앞 항목부터 채우다 넘치면 뒤 항목은 통째로 빠지므로, 여러 건이면 합이 deliberate_jobs 의 "
     "limits(지금 걸리는 값) 안에 들게 하고 중요한 것을 앞에 둬라. 빠진 항목(예산·건수 초과, 본문 "
     "없음)은 deliberate_status 의 evidence_omitted 에 뜬다. 호출자 표식(예: E1-CH-015)은 `source` 에 "
-    "넣으면 [e:N] 옆에 그대로 찍힌다. 결론이 아니라 원천만 넣어라."
+    "넣으면 [e:N] 옆에 그대로 찍힌다. 제 번호를 `key`(선택 — 영문·숫자·`_.-`, "
+    f"{_engine._EVID_KEY_MAX}자 이내)에 넣으면 표지가 [e:N|KEY] 로 찍혀, 엔진 번호 N 이 빠진 항목 "
+    "때문에 밀려도 결정문의 인용을 제 원장과 맞춰 볼 수 있다. 결론이 아니라 원천만 넣어라."
 )
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
