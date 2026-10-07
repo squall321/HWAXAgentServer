@@ -142,3 +142,14 @@ def test_사람_의견과_지정_좌석이_다단_심의에서_어디에_실리�
         for want in ("sim-plan", "build-plan", "1단", "test-plan"):
             assert want in menu[key], (key, want, menu[key])
     assert "고정 좌석" in menu["personas"], menu["personas"]
+
+
+def test_좌석_항목의_모양이_클라이언트가_받는_글에_있다():
+    """`[{key, role}]` 은 Args 독스트링에만 있었다 — description 을 따로 넘기면 FastMCP 는 독스트링을 안 보낸다.
+    스키마에는 array<object> 뿐이라, 추천 도구가 준 `agent_type` 줄을 그대로 넘긴 호출자의 좌석이 전부 걸러졌다."""
+    desc = _listed("deliberate_start")
+    menu = asyncio.run(m.deliberate_jobs())["options"]["personas"]
+    for text in (desc, menu):
+        for want in ("personas", "`key`", "agent_type", "evidence_omitted"):
+            assert want in text, (want, text[-400:])
+    assert str(d.MAX_REQ_SEATS) + "석" not in desc, "좌석 상한을 설명에 손으로 박았다 — limits 를 가리킨다"

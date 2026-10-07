@@ -253,6 +253,79 @@ def test_좌석에_준_근거는_원장에_싣지_않는다(monkeypatch):
         assert out.get("evidence_omitted") == [], (name, out)
 
 
+# ── 키 없는 지정 좌석 — 말없이 버리고 서버가 고른 패널로 돌았다 ──────────────────────────
+# 좌석 항목은 {key, role} 인데 MCP 클라이언트가 받는 글 어디에도 그 모양이 없었다(Args 독스트링은 안 간다).
+# recommend_agents 는 좌석 키를 `agent_type` 으로 돌려준다 — 그 줄을 그대로 넘긴 21석 패널이 전부 걸러지고
+# 서버가 발굴한 좌석으로 끝까지 돌았다. 카드도 경고도 없었다(본문 키가 달라 근거 25건이 사라진 것과 같은 모양).
+_NO_KEY = "지정 좌석 키 없음"
+
+
+def _seated_keys(events):
+    return next(data["personas"] for ev, data in events if ev == "status" and data.get("personas"))
+
+
+def test_키_없는_좌석은_빼고_앉히되_몇_석을_왜_뺐는지_남긴다(monkeypatch):
+    events = _stream(monkeypatch, {"personas": _SEATS + [{"name": "therm-c"}, {"id": "disp-d"}, {"key": ""}]})
+    assert _seated_keys(events) == ["mech-a", "rel-b"]
+    out = [c for c in _cards(events, included=False) if c["source"] == _NO_KEY]
+    assert len(out) == 1, [c["source"] for c in _cards(events, included=False)]
+    for want in ("5석 중 3석", "key", "name", "agent_type"):
+        assert want in out[0]["text"], (want, out[0]["text"])
+    for name, view in _mcp_view(monkeypatch, events).items():
+        assert _NO_KEY in [x.get("source") for x in view["evidence_omitted"]], (name, view["evidence_omitted"])
+
+
+def test_전부_키가_없으면_서버가_발굴한_패널로_돈다는_것을_말한다(monkeypatch):
+    """포털·리스크 러너는 MCP 도구를 안 거치고 엔진을 바로 부른다 — 거기서는 발굴로 넘어가되 그 사실이 남아야
+    한다. 이 카드는 지정 좌석 갈래 **밖**에서 나가야 한다(전부 걸러지면 그 갈래에 아예 안 들어간다)."""
+    import json as _json
+
+    rec = _Tool("recommend_agents", _json.dumps({"agents": [{"agent_type": "auto-x1"}, {"agent_type": "auto-x2"}]}))
+    monkeypatch.setattr(d, "_COUNTER_SEATS", 0)
+    events = _stream(monkeypatch, {"personas": [{"name": "x"}, {"name": "y"}, {"name": "z"}]},
+                     tools={"recommend_agents": rec, "agent_search": _Tool("agent_search")})
+    assert _seated_keys(events) == ["auto-x1", "auto-x2"], "시험 전제 — 발굴한 좌석이 앉는다"
+    out = [c for c in _cards(events, included=False) if c["source"] == _NO_KEY]
+    assert len(out) == 1 and "3석 중 3석" in out[0]["text"] and "발굴" in out[0]["text"], out
+
+
+def test_추천_도구가_돌려준_agent_type_으로_보낸_좌석은_앉는다(monkeypatch):
+    events = _stream(monkeypatch, {"personas": [{"agent_type": "mech-a"}, {"key": "rel-b", "role": "신뢰성"}]})
+    assert _seated_keys(events) == ["mech-a", "rel-b"]
+    assert not [c for c in _cards(events, included=False) if c["source"] == _NO_KEY]
+
+
+def test_키가_다_있으면_좌석_카드가_없다(monkeypatch):
+    events = _stream(monkeypatch, {})
+    assert not [c for c in _cards(events, included=False) if c["source"] == _NO_KEY]
+    assert d._DEFAULT_OPTS.seats_no_key is None and d._resolve_opts({"personas": _SEATS}).seats_no_key is None
+
+
+def test_MCP_로_열_때_쓸_좌석이_하나도_없으면_시작하지_않는다(monkeypatch):
+    """한 시간짜리 심의가 지정하지 않은 패널로 돌고 보고서까지 남는다 — 시작 전에 막을 수 있는 유일한 자리다."""
+    import mcp_server
+
+    started = []
+    monkeypatch.setattr(delib_jobs, "start", lambda *a, **k: started.append((a, k)) or {})
+    monkeypatch.setattr(mcp_server, "_APP", object())
+    sent = [{"name": f"mech-s{i:02d}", "role": "역할"} for i in range(21)]
+    with pytest.raises(Exception) as e:
+        asyncio.run(mcp_server.mcp.call_tool("deliberate_start", {"question": "힌지 크랙", "personas": sent}))
+    for want in ("key", "agent_type", "name"):
+        assert want in str(e.value), (want, str(e.value))
+    assert not started, "거절해야 할 요청이 잡을 만들었다"
+
+
+def test_MCP_로_열_때_일부만_키가_없으면_엔진까지_넘겨_엔진이_세게_한다():
+    """도구가 먼저 걸러 버리면 엔진은 몇 석이 빠졌는지 모른다 — 알릴 수도 없다."""
+    import mcp_server
+
+    o = mcp_server._build_opts(personas=_SEATS + [{"name": "therm-c"}, "문자열 항목"])
+    r = d._resolve_opts(o)
+    assert [p["key"] for p in r.continue_personas] == ["mech-a", "rel-b"]
+    assert r.seats_no_key and r.seats_no_key[:2] == (4, 2), r.seats_no_key
+
+
 def test_원장에_남기는_건수에는_상한이_있고_넘으면_그렇다고_적는다():
     job = {"id": "t-cap"}
     for i in range(delib_jobs.OMITTED_MAX + 5):

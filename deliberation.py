@@ -761,6 +761,15 @@ def _seal(req_opts: dict) -> tuple[dict, list]:
     return {**req_opts, **closed, "sealed": 1}, reopen
 
 
+def _seat_key(p) -> str:
+    """지정 좌석 항목의 키, 없으면 빈 문자열. 정본은 `key` 다. 추천 도구(recommend_agents)는 좌석 키를
+    `agent_type` 으로 돌려주므로 그 이름으로 온 것도 받는다(발굴 _discover 가 읽는 이름과 같다) — 그 줄을
+    그대로 넘긴 호출자의 좌석이 전부 걸러지고 서버가 고른 패널로 돌았다."""
+    if not isinstance(p, dict):
+        return ""
+    return str(p.get("key") or p.get("agent_type") or "").strip()
+
+
 def _cut_note(what: str, items: list, cap: int, item_cap: int = 0, *, unit: str = "개",
               item: str = "항목", dropped: list | None = None, knob: str = "") -> str:
     """목록을 상한에서 줄였으면 무엇을 얼마나 줄였는지 한 줄로, 안 줄였으면 빈 문자열.
@@ -807,6 +816,9 @@ def _resolve_opts(req_opts):
         human_note="", continue_summary="", continue_personas=[],
         # 사람 의견이 상한(HUMAN_NOTE_MAX)에서 잘렸으면 (원문 길이, 실은 글) — 스트림이 카드로 알린다.
         human_note_cut=None,
+        # 키가 없어 앉히지 못한 지정 좌석이 있으면 (보낸 수, 못 앉힌 수, 처음 그런 항목이 들고 온 필드) —
+        # 스트림이 카드로 알린다. 전부 그러면 발굴이 대신 앉히는데, 조용하면 호출자는 지정한 패널이 돈 줄 안다.
+        seats_no_key=None,
         # 불량 환기(SignalForge) — auto(질문에 불량 단어가 있을 때만, 종전) | off | always.
         # 포털 'VOC 먼저 보기' 에서 사람이 이미 골랐으면 off 로 온다 — 자동 환기를 또 돌리면
         # 사람이 뺀 VOC 가 다시 들어간다.
@@ -931,15 +943,21 @@ def _resolve_opts(req_opts):
             # '뺐다' 고 카드와 원장에 적었다(읽는 사람은 상한 설정을 올리려 든다). 다른 틀의 반대석은 그대로
             # 센다 — Job 을 바꿔 이어가면 그 좌석은 다시 앉히지 않으니 '뺐다' 가 참이다.
             _adv_key = (_CHAIR_ADVERSARY.get(o.chair_template) or {}).get("key")
-            _cp_ok = [p for p in cp if isinstance(p, dict) and p.get("key") and str(p.get("key")) != _adv_key]
-            o.continue_personas = [{"key": str(p.get("key"))[:120],
+            _keyed = [p for p in cp if _seat_key(p)]
+            if len(_keyed) < len(cp):
+                _bad = next(x for x in cp if not _seat_key(x))
+                o.seats_no_key = (len(cp), len(cp) - len(_keyed),
+                                  (", ".join(str(k)[:30] for k in list(_bad)[:8]) or "없음")
+                                  if isinstance(_bad, dict) else f"객체가 아님({type(_bad).__name__})")
+            _cp_ok = [p for p in _keyed if _seat_key(p) != _adv_key]
+            o.continue_personas = [{"key": _seat_key(p)[:120],
                                     "role": str(p.get("role") or "")[:_ROLE_REQ_MAX],
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
                                                else "carry")}
                                    for p in _cp_ok[:MAX_REQ_SEATS]]
             # 잘린 좌석은 알린다 — 포털은 422 로 막지만 MCP 호출자는 여기까지 온다. 종전엔
             # 13번째부터 소리 없이 사라졌다(발굴 단계에서 status 로 흘린다).
-            o.seats_clamped = [str(p.get("key")) for p in _cp_ok[MAX_REQ_SEATS:]]
+            o.seats_clamped = [_seat_key(p) for p in _cp_ok[MAX_REQ_SEATS:]]
             # 상태줄은 잡 원장의 최근 30줄 창 밖으로 밀려난다 — MCP 호출자가 보게 카드에도 싣는다.
             _cut = _cut_note("좌석(personas)", [str(p.get("role") or "") for p in _cp_ok], MAX_REQ_SEATS,
                              _ROLE_REQ_MAX, unit="석", item="역할", dropped=o.seats_clamped,
@@ -3190,6 +3208,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         opts_b = _resolve_opts(req_opts)
         opts_b.req_cut = {}     # 줄인 요청 값은 1단이 이미 알렸다 — 여기서부터는 요약·좌석·의견을 엔진이 갈아 끼운다
         opts_b.req_unread = {}  # 읽지 못한 값도 1단이 알렸다 — 단마다 같은 카드를 또 내지 않는다
+        opts_b.seats_no_key = None      # 키 없는 지정 좌석도 같다 — 지정 좌석은 1단에 앉았다
         opts_b.chair_template = "sim-plan"
         opts_b.continue_summary = decision_a[:8000]
         opts_b.continue_non_negotiables = nn_a[:12]
@@ -3224,6 +3243,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             opts_c = _resolve_opts(req_opts)
             opts_c.req_cut = {}
             opts_c.req_unread = {}
+            opts_c.seats_no_key = None
             opts_c.chair_template = "build-plan"
             opts_c.continue_summary = decision_b[:20000]
             opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
@@ -3745,6 +3765,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      text=f"사람 의견 {_hn_full:,}자 중 앞 {_hn_kept:,}자만 좌석에 "
                           f"실었다 — 뒤 {_hn_full - _hn_kept:,}자는 좌석이 보지 못한다"
                           f"(상한 {HUMAN_NOTE_MAX:,}자).")
+    # 키가 없어 앉히지 못한 지정 좌석 — 지정 좌석 갈래(위 `if opts.continue_personas`) **밖**에서 알린다.
+    # 전부 걸러지면 그 갈래에 아예 안 들어가 발굴이 대신 앉힌다 — 지정하지 않은 패널로 끝까지 도는 가장
+    # 나쁜 경우에 가장 조용했다(본문 없는 근거와 같은 모양이다).
+    if opts.seats_no_key:
+        _sn, _sbad, _sfields = opts.seats_no_key
+        yield _delib("evidence", source="지정 좌석 키 없음", included=False,
+                     text=f"지정 좌석 {_sn}석 중 {_sbad}석은 좌석 키(key)가 없어 앉히지 못했다"
+                          f"(받은 필드: {_sfields}). 항목은 {{key, role}} 이고 key 는 전문가 키다 — "
+                          "recommend_agents 가 돌려주는 agent_type 값이다. "
+                          + ("키가 있는 좌석만 앉혔다." if opts.continue_personas else
+                             "앉힐 좌석이 하나도 없어 서버가 발굴한 좌석으로 돈다 — 지정한 패널이 아니다."))
     # 요청에 실린 나머지 값도 같다 — 상한에서 줄였으면 무엇을 얼마나 줄였는지 카드 하나로 알린다.
     if opts.req_cut:
         yield _delib("evidence", source="요청 값 상한 초과", included=False,

@@ -122,7 +122,9 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
     if evidence:
         o["evidence"] = [e for e in evidence if isinstance(e, dict)]
     if personas:
-        o["personas"] = [p for p in personas if isinstance(p, dict) and p.get("key")]
+        # 여기서 거르지 않는다 — 키 없는 항목을 먼저 떼면 엔진은 몇 석이 빠졌는지 모르고 알릴 수도 없다
+        # (종전엔 그렇게 떼어, 21석이 전부 걸러져도 엔진은 '좌석 지정 없음' 으로 읽고 발굴했다).
+        o["personas"] = list(personas)
     if tools:
         o["tools"] = [str(t).strip() for t in tools if str(t).strip()]
     if apps:
@@ -218,6 +220,20 @@ _STATE_DESC = (
             "queued 는 나오지 않는다.")
 )
 
+# 좌석 인자 안내 — 항목 모양은 Args 독스트링에만 있었고 그 글은 클라이언트에 가지 않는다(위 _EVID_DESC 의
+# 주석과 같은 까닭). 스키마에는 array<object> 뿐이라, 추천 도구가 돌려준 줄을 그대로 넘긴 호출자는 좌석 키가
+# `key` 라는 것을 알 길이 없었다. 상한 숫자는 적지 않는다 — 부를 때 재는 limits 를 가리킨다.
+_SEAT_DESC = (
+    "personas(좌석 지정) — [{key, role}]. **`key` 가 전문가 키다** — recommend_agents 가 돌려주는 "
+    "`agent_type` 값이다(그 이름 그대로 `agent_type` 으로 보내도 받는다). role 은 비워도 된다(서버가 "
+    "원본 역할을 채운다). 키가 없는 항목은 앉히지 못하고 deliberate_status 의 evidence_omitted 에 뜬다 — "
+    "쓸 수 있는 항목이 하나도 없으면 시작을 거절한다(서버가 고른 좌석으로 말없이 돌지 않는다). 상한은 "
+    "deliberate_jobs 의 limits.seats 이고 넘친 좌석은 빼고 evidence_omitted 로 알린다. 지정 반대석은 상한 "
+    "밖에서 한 석 더 앉는다. test-plan 은 고정 좌석을 먼저 앉히고 지정 좌석을 그 뒤에 앉힌다. "
+    "sim-plan·build-plan 은 지정 좌석이 1단에 앉는다(2단부터는 서버가 CAE 좌석을 앉히고 1단 좌석 일부만 "
+    "유임한다). 비우면 서버가 발굴한다."
+)
+
 _START_DESC = (
     "HWAX 전문가 심의를 시작한다. 사용자가 '심의해줘'·'원인 규명'·'불량 원인'·'안 선택'·"
     "'트레이드오프'·'신뢰 판정'·'리스크 심사'·'위험 도출'·'해석 설계'·'시뮬레이션 심의'·"
@@ -227,7 +243,7 @@ _START_DESC = (
     "있으면 줄을 섰다가 돈다 — 아래 status) — "
     "결과는 deliberate_status / deliberate_result 로 받는다. 응답을 붙잡고 기다리지 마라. "
     "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다.\n\n"
-    "돌아오는 " + _STATE_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
+    "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
 
 
@@ -284,11 +300,9 @@ async def deliberate_start(
         evidence: 원천 근거 주입. [{source, tool, args, result}] — 이미 도구로 뽑아 둔 결과를 좌석에
                   '검증 대상'으로 깐다. 상한·본문 키·표식 규칙은 _EVID_DESC 가 정본이다(엔진 상수에서
                   읽어 만든다) — 여기 숫자를 다시 적지 마라, 적어 둔 값이 낡아 호출자가 근거를 버렸다.
-        personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 상한은
-                  deliberation.MAX_REQ_SEATS(지금 값은 deliberate_jobs 의 limits) — 넘친 좌석은 빼고
-                  상태줄로 알린다. 지정 반대석은 상한 밖에서 한 석 더 앉는다. test-plan 은 고정 좌석을
-                  먼저 앉히고 지정 좌석을 그 뒤에 앉힌다. sim-plan·build-plan 은 지정 좌석이 1단에 앉는다
-                  (2단부터는 서버가 CAE 좌석을 앉히고 1단 좌석 일부만 유임한다).
+        personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 항목 모양·상한·
+                  다단 심의에서 어디에 앉는지는 _SEAT_DESC 가 정본이다(클라이언트가 받는 글은 그쪽이다 —
+                  이 독스트링은 가지 않는다).
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름. 상한은 deliberation._TOOLS_MAX
                (지금 값은 deliberate_jobs 의 limits) — 넘친 것은 빼고 evidence_omitted 로 알린다.
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다. 상한은 deliberation._APPS_MAX(위와 같다).
@@ -308,6 +322,17 @@ async def deliberate_start(
                   parse_retries · timeout_s · voc · persona_knowledge · chair_template · sealed.
                   보통 비운다(뜻은 _ADV_DESC).
     """
+    # 좌석을 지정했는데 쓸 수 있는 것이 하나도 없으면 시작하지 않는다. 이대로 열면 서버가 발굴한 좌석으로
+    # 수십 분을 돌고 보고서까지 남는다 — 지정한 패널이 아닌데 결과는 멀쩡해 보인다. 일부만 키가 없는 것은
+    # 엔진이 빼고 알린다(evidence_omitted). 이어하기는 원장의 좌석을 넘기므로 이 검사가 필요 없다.
+    if personas and not any(_engine._seat_key(p) for p in personas):
+        raise ValueError(
+            f"personas {len(personas)}건에 좌석 키가 하나도 없다 — 항목은 {{key, role}} 이고 key 는 전문가 키"
+            "(recommend_agents 가 돌려주는 agent_type 값)다. 받은 필드: "
+            + (", ".join(str(k)[:30] for k in list(personas[0])[:8]) if isinstance(personas[0], dict)
+               else type(personas[0]).__name__)
+            + ". 이대로 시작하면 지정한 패널이 아니라 서버가 발굴한 좌석으로 돈다 — 고쳐서 다시 불러라"
+              "(좌석을 서버에 맡기려면 personas 를 비운다).")
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
                        tools=tools, apps=apps, human_note=human_note, options=options,
                        search_sources=search_sources, stop_after_round=stop_after_round,
@@ -495,10 +520,7 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
         },
         "options": {
             "evidence": _EVID_DESC,
-            "personas": f"좌석 직접 지정(≤{_engine.MAX_REQ_SEATS} — 넘친 좌석은 빼고 상태줄로 알린다. "
-                        "지정 반대석은 상한 밖에서 한 석 더 앉는다). 비우면 서버가 발굴한다. test-plan 은 "
-                        "고정 좌석을 먼저 앉히고 지정 좌석을 그 뒤에 앉힌다. sim-plan·build-plan 은 지정 "
-                        "좌석이 1단에 앉는다(2단부터는 서버가 CAE 좌석을 앉히고 1단 좌석 일부만 유임한다)",
+            "personas": f"좌석 직접 지정(≤{_engine.MAX_REQ_SEATS}). " + _SEAT_DESC,
             "tools": f"심의 전 실제 호출할 도구(≤{_engine._TOOLS_MAX}) · apps: 좌석 자유 조회 범위"
                      f"(≤{_engine._APPS_MAX}). 넘친 것은 빼고 deliberate_status 의 evidence_omitted 로 알린다",
             "human_note": "사람 의견 주입 — 매 라운드 좌석에 전달(sim-plan·build-plan 은 1단에만 싣는다 — "
