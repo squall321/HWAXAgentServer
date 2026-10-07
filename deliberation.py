@@ -144,6 +144,13 @@ _DECISION_CTX_MIN = 6000     # 유도값의 바닥 — 종전 기본값. 좁은 
 # _EVID_RESERVE 와 달리 스키마 몫(40,000)을 떼지 않는다 — 그만큼이 전사에 간다. 그 LLM 에 걸린
 # max_tokens 가 이 값보다 크면 그쪽을 뗀다(_decision_ctx).
 _CHAIR_RESERVE = _env_int("DELIB_CHAIR_RESERVE", 16000)
+# 의장 결정문 합성이 실패하면(시간 초과·오류) 몇 번 **더** 부르나. 기본 1, 0=다시 부르지 않는다.
+# 의장은 맨 끝에 한 번 도는 호출이라 타임아웃 한 번의 값이 가장 비싼 자리다 — 수 시간 돈 22석 3라운드가 마지막
+# 한 호출로 통째로 '심의 처리 중 오류' 가 됐고, 보고서도 이어하기도 안 됐다. 전용 시간 한도는 두지 않는다
+# (DELIB_TIMEOUT_S 를 쓴다) — 최악은 (1+이 값)×LLM 논리 호출 1회다(기본 2×3608 = 7216초). 그래도 실패하면
+# 라운드를 버리지 않는다 — 결정문 자리에 좌석별 마지막 입장과 실패 사유를 내리고 보고서를 저장한다
+# (_chair_fail_text).
+_CHAIR_RETRIES = max(0, _env_int("DELIB_CHAIR_RETRIES", 1))
 # 좌석 프롬프트에 싣는 직전 라운드 텍스트 상한(자), 0=무제한. 의장엔 위 클립이 있는데 좌석엔
 # 없었다 — 그리고 **수렴 라운드는 교차심문과 무관하게** 직전 라운드 전문을 전원에게 준다
 # (실측 15석 수렴 직전 라운드 164,854자 × 15석). 넘치면 400 이지 절단이 아니라서 좌석이 유실된다
@@ -1673,6 +1680,22 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
     share = max(left // n, floor)
     return [(k, t if len(t) <= share else t[:share].rstrip() + f" …[{len(t):,}자 중 앞 {share:,}자]")
             for k, t in rows], share
+
+
+def _chair_fail_text(why: str, tries: int, seat_note: str, rows: list, label: str) -> str:
+    """의장이 결정문을 끝내 못 냈을 때 **결정문 자리에** 내리는 글 — 실패 사유와 좌석별 마지막 입장.
+
+    rows 는 [(좌석 키, 마지막 라운드 발언 직렬화)], label 은 그 라운드의 이름이다. 결정이 아니라는 것을 맨 앞에
+    적는다 — 이 글이 보고서의 권고 칸과 잡 원장의 결정문 칸에 들어가고, 이어하기는 이 글을 이전 요약으로 싣는다.
+    그래서 이어하기가 받는 길이(_SUMMARY_MAX) 안에 들게 좌석마다 같은 몫으로 줄인다 — 앞 좌석만 온전하고 뒤
+    좌석이 통째로 잘리면, 다시 수렴시킬 재료에서 그 도메인이 빠진다. 발언 전문은 회의록·전사에 있다."""
+    head = (f"■ 의장 결정문 없음 — 의장이 결정문을 내지 못했다({why} · 의장 호출 {tries}번).\n"
+            "아래는 결정이 아니라 **좌석별 마지막 입장 그대로**다(의장이 종합하지 못했다). 라운드 발언 전문은 "
+            "보고서 회의록과 심의 전사에 남아 있다. 호출당 타임아웃을 늘려 이어하기로 다시 수렴시키면 결정문을 "
+            f"받는다.\n\n[{seat_note}]\n\n[{label} — 좌석별 입장]\n")
+    room = _SUMMARY_MAX - len(head) - sum(len(k) + 30 for k, _t in rows)      # 줄 머리·절단 표식 몫을 먼저 뗀다
+    fit, _share = _fit_rows(rows, max(room, 1), floor=200)
+    return head + "\n".join(f"• {k}: {t}" for k, t in fit)
 
 
 def _decision_ctx(fixed: int, n_rounds: int, out_tokens: int = 0) -> int:
@@ -3312,8 +3335,13 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         personas_a = out_a.get("personas") or []
         nn_a = out_a.get("non_negotiables") or []
         if not decision_a:
+            # 의장이 결정문을 못 내 1단이 error 로 끝났으면 그 사유와 설정 이름을 이 오류에도 싣는다 — 잡 원장은
+            # 마지막 오류만 남기므로, 안 실으면 '왜' 가 이 줄에 덮인다.
+            _why_a, _knob_a = out_a.get("chair_failed") or ("", "")
             yield _sse("error", {"code": "sim_no_mechanism",
-                                 "message": "1단 메커니즘 심의가 결정문을 내지 못해 해석 설계로 넘어갈 수 없습니다."})
+                                 "message": "1단 메커니즘 심의가 결정문을 내지 못해 해석 설계로 넘어갈 수 없습니다."
+                                            + (f" — {_why_a}" if _why_a else ""),
+                                 **({"knob": _knob_a} if _knob_a else {})})
             yield _sse("done", {}); return
 
         # ── 좌석 전환 ────────────────────────────────────────────────────────
@@ -4587,30 +4615,56 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
     n_cand = max(1, opts.chair_bestof)
-    if n_cand == 1:
-        decision = await _llm_text(llm, chair_sys, chair_human)
-    else:
+
+    async def _chair_once() -> str:
+        if n_cand == 1:
+            return await _llm_text(llm, chair_sys, chair_human)
         raw_cands = await asyncio.gather(
             *[_llm_text(llm, chair_sys, chair_human) for _ in range(n_cand)],
             return_exceptions=True)
         cands = [c for c in raw_cands if isinstance(c, str) and c.strip()]
         if not cands:
-            raise RuntimeError("의장 의사결정문 합성 실패(후보 전멸)")
+            # 후보가 전부 실패했으면 그 예외를 그대로 올린다 — 사유(시간 초과인지)를 아래 알림이 읽는다.
+            raise (next((c for c in raw_cands if isinstance(c, Exception)), None)
+                   or RuntimeError("의장 의사결정문 합성 실패(후보 전멸)"))
         if len(cands) == 1:
-            decision = cands[0]
-        else:
-            pick = _parse_json(await _llm_text(
-                llm, "당신은 심의 기록 심사자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-                "\n\n".join(f"[후보 {i + 1}]\n{c[:4000]}" for i, c in enumerate(cands)) +
-                "\n\n위 의사결정문 후보 중 (a) 판정 수치가 구체적이고 (b) 라운드 발언에 접지되며 "
-                "(c) 소수의견이 보존되고 (d) 실행 가능한 것 하나를 고르세요. "
-                'JSON {"best": 후보번호} 로만.')) or {}
-            try:
-                b = int(pick.get("best", 1))
-                # 범위 밖(0·음수 — 음수 인덱싱으로 폴백을 조용히 우회 — ·후보수 초과)은 첫 후보로
-                decision = cands[b - 1] if 1 <= b <= len(cands) else cands[0]
-            except (ValueError, TypeError):
-                decision = cands[0]
+            return cands[0]
+        pick = _parse_json(await _llm_text(
+            llm, "당신은 심의 기록 심사자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+            "\n\n".join(f"[후보 {i + 1}]\n{c[:4000]}" for i, c in enumerate(cands)) +
+            "\n\n위 의사결정문 후보 중 (a) 판정 수치가 구체적이고 (b) 라운드 발언에 접지되며 "
+            "(c) 소수의견이 보존되고 (d) 실행 가능한 것 하나를 고르세요. "
+            'JSON {"best": 후보번호} 로만.')) or {}
+        try:
+            b = int(pick.get("best", 1))
+            # 범위 밖(0·음수 — 음수 인덱싱으로 폴백을 조용히 우회 — ·후보수 초과)은 첫 후보로
+            return cands[b - 1] if 1 <= b <= len(cands) else cands[0]
+        except (ValueError, TypeError):
+            return cands[0]
+
+    # 의장 호출이 실패하면 _CHAIR_RETRIES 번 더 부른다. 그래도 실패하면 **라운드를 버리지 않는다** — 종전엔
+    # 여기서 올라간 예외가 '심의 처리 중 오류' 한 줄이 되어 수 시간 돈 라운드가 보고서도 원장도 없이 사라졌다.
+    # 결정문 자리에 좌석별 마지막 입장과 실패 사유를 내리고, 아래 보고서 저장까지 간 뒤 error 로 끝낸다
+    # (결정문이 없는 것을 done 으로 끝내면 정상 심의와 똑같이 생긴다).
+    decision, _chair_failed, _chair_knob = "", "", ""
+    for _ctry in range(1 + _CHAIR_RETRIES):
+        try:
+            decision = await _chair_once()
+            _chair_failed = ""
+            break
+        except Exception as exc:  # noqa: BLE001 — 취소(CancelledError)는 여기 안 걸린다
+            _chair_failed, _chair_knob = _llm_fail_note(exc, llm)
+            print(f"[deliberation] ⚠ 의장 결정문 합성 실패({_ctry + 1}/{1 + _CHAIR_RETRIES}): {exc!r}")
+            if _ctry < _CHAIR_RETRIES:
+                yield _sse("status", {"step": f"⚠ 의장 결정문 합성 실패 — 다시 부른다({_ctry + 1}/"
+                                              f"{_CHAIR_RETRIES}): {_chair_failed}", "tool": None,
+                                      **({"knob": _chair_knob} if _chair_knob else {})})
+    if _chair_failed:
+        decision = _chair_fail_text(_chair_failed, 1 + _CHAIR_RETRIES, seat_note,
+                                    [(o["persona"], _ser_kind(o, _kind(N))) for o in last_list],
+                                    f"{_dr(N)}R {_rtag(N)}")
+        yield _sse("status", {"step": "⚠ 의장 결정문 없음 — 좌석별 마지막 입장과 회의록을 보존한다",
+                              "tool": None})
 
     # 4a-2) 인용 후검증(결정적, LLM 아님) — JS 파이프라인 citationAudit 파리티(감사 원장 (3)).
     #        결정문의 유의미 수치를 근거·발언 원문과 대조한다. unmatched 는 의장 신규 산술일 수도
@@ -4625,9 +4679,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
            for lst, t in rounds_data]))
     # 근거 표지 [e:N]·[e:N|KEY] 는 인용이지 수치가 아니다 — 떼고 센다. 안 떼면 표지 속 숫자
     # (e:120 의 120, 키 E1-CH-015 의 015)가 '어느 원문에도 없는 수치' 로 올라와 진짜 환각을 묻는다.
-    _dec_nums = [n for n in dict.fromkeys(_nrm(m.group(0))
-                                          for m in _num_re.finditer(_EV_CITE_RE.sub(" ", decision)))
-                 if not re.fullmatch(r"(19|20)\d{2}", n)]
+    # 의장이 결정문을 못 냈으면 아래 후처리(수치 대조·요약·쉬운 설명·인용 대조)를 돌리지 않는다 — 결정문이 아닌
+    # 글을 대조하면 '결정문 수치 N건 전부 확인' 같은 거짓 줄이 나가고, 요약·설명은 같은 LLM 을 또 기다린다.
+    _dec_nums = [] if _chair_failed else [
+        n for n in dict.fromkeys(_nrm(m.group(0))
+                                 for m in _num_re.finditer(_EV_CITE_RE.sub(" ", decision)))
+        if not re.fullmatch(r"(19|20)\d{2}", n)]
     _unmatched_nums = [n for n in _dec_nums if n not in _cit_corpus]
     if _unmatched_nums:
         yield _sse("status", {"step": f"근거 대조 — 결정문 수치 {len(_dec_nums)}건 중 "
@@ -4640,16 +4697,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
-    yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
-    try:
-        _summary = (await _llm_text(
-            llm, "당신은 심의체 의장입니다. 군더더기 없이 핵심만.",
-            "다음 의사결정문을 3~5줄 핵심 요약으로 압축하라 — 각 줄 '- '로 시작하는 한 문장 불릿. "
-            "① 최종 결론 한 줄 ② 핵심 근거 1~2개(가능하면 수치) ③ 소수의견/합의 여부. "
-            f"머리말·제목 없이 불릿만.\n\n{decision[:6000]}")).strip()
-    except Exception as exc:  # noqa: BLE001 — 요약 실패해도 의사결정문은 그대로 저장
-        print(f"[deliberation] summary failed: {exc!r}")
-        _summary = ""
+    _summary = ""
+    if not _chair_failed:
+        yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
+        try:
+            _summary = (await _llm_text(
+                llm, "당신은 심의체 의장입니다. 군더더기 없이 핵심만.",
+                "다음 의사결정문을 3~5줄 핵심 요약으로 압축하라 — 각 줄 '- '로 시작하는 한 문장 불릿. "
+                "① 최종 결론 한 줄 ② 핵심 근거 1~2개(가능하면 수치) ③ 소수의견/합의 여부. "
+                f"머리말·제목 없이 불릿만.\n\n{decision[:6000]}")).strip()
+        except Exception as exc:  # noqa: BLE001 — 요약 실패해도 의사결정문은 그대로 저장
+            print(f"[deliberation] summary failed: {exc!r}")
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
@@ -4660,20 +4718,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 4c) 쉬운 설명 — 의사결정문은 전문 용어·수치로 촘촘해 비전문가·경영층이 '그래서 뭘 하라는
     #     건지' 못 읽는다. 맨 뒤에 한마디 결론 + 왜 그런지 + 당장/다음/금지 를 평이한 말로 붙인다.
     # 정식 절차로 승격 — 스테퍼에 단계로 표시되고, 구조화 이벤트로도 방출된다.
-    yield _delib("stage", stage="explain")
-    yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
-    try:
-        _plain = (await _llm_text(
-            llm, "당신은 어려운 기술 결정을 비전문가에게 설명하는 사람입니다. 쉬운 말로, 과장 없이.",
-            "다음 의사결정문을 처음 보는 사람도 이해하게 정리하라. 형식:\n"
-            "### 한마디로\n(무엇을 하라는 것인지 한 문장)\n"
-            "### 왜 그런가\n(핵심 근거 2~3개 — 수치가 있으면 쉬운 말로 풀어서)\n"
-            "### 당장 할 일 / 다음에 할 일 / 하지 말 것\n(각 2~4개 불릿, 전문용어는 괄호로 풀어쓰기)\n"
-            "새로운 내용을 지어내지 말고 원문에 있는 것만 쉽게 바꿔라.\n\n"
-            f"{decision[:7000]}")).strip()
-    except Exception as exc:  # noqa: BLE001 — 실패해도 의사결정문은 그대로
-        print(f"[deliberation] plain summary failed: {exc!r}")
-        _plain = ""
+    _plain = ""
+    if not _chair_failed:
+        yield _delib("stage", stage="explain")
+        yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
+        try:
+            _plain = (await _llm_text(
+                llm, "당신은 어려운 기술 결정을 비전문가에게 설명하는 사람입니다. 쉬운 말로, 과장 없이.",
+                "다음 의사결정문을 처음 보는 사람도 이해하게 정리하라. 형식:\n"
+                "### 한마디로\n(무엇을 하라는 것인지 한 문장)\n"
+                "### 왜 그런가\n(핵심 근거 2~3개 — 수치가 있으면 쉬운 말로 풀어서)\n"
+                "### 당장 할 일 / 다음에 할 일 / 하지 말 것\n(각 2~4개 불릿, 전문용어는 괄호로 풀어쓰기)\n"
+                "새로운 내용을 지어내지 말고 원문에 있는 것만 쉽게 바꿔라.\n\n"
+                f"{decision[:7000]}")).strip()
+        except Exception as exc:  # noqa: BLE001 — 실패해도 의사결정문은 그대로
+            print(f"[deliberation] plain summary failed: {exc!r}")
     if _plain:
         decision = f"{decision}\n\n---\n\n■ 쉬운 설명\n{_plain}"
         # 별도 이벤트로도 내보내 프론트가 결정문과 분리된 카드로 렌더할 수 있게 한다.
@@ -4684,7 +4743,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 나중에 보고서만 읽는 사람은 지어낸 값을 그대로 믿는다(봉인 표식을 저장 전에 찍는 것과 같은 까닭).
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
-    if opts.search_sources:
+    if opts.search_sources and not _chair_failed:
         _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision,
                                                           user, user_pat)
         if _ok_n or _bad_n:
@@ -4711,7 +4770,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
         + list(knowledge_by_key.values()) + seat_lookups
         + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
-    _bad_num = unsourced_numbers(decision, _num_src, limit=0)
+    _bad_num = [] if _chair_failed else unsourced_numbers(decision, _num_src, limit=0)
     if _bad_num:
         # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
         # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
@@ -4795,9 +4854,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
-    if out is not None:
+    # 다음 단(시뮬 2·3단)에는 **진짜 결정문만** 넘긴다 — 의장이 못 낸 글을 넘기면 그 위에서 다음 단이 돈다.
+    # 못 냈으면 사유를 넘긴다(다단 래퍼가 제 오류에 싣는다).
+    if out is not None and not _chair_failed:
         out["decision"] = decision
-    yield _delib("decision", text=decision + report_note)
+    elif out is not None:
+        out["chair_failed"] = (_chair_failed, _chair_knob)
+    yield _delib("decision", text=decision + report_note, **({"chair_failed": True} if _chair_failed else {}))
     yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
@@ -4810,6 +4873,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
     yield _sse("token", {"delta": decision + report_note})
     yield _sse("result", {"type": "text", "content": stream_head + decision + report_note})
+    if _chair_failed:
+        # 결정문 없이 끝났다 — error 로 끝낸다(잡은 error 로 남고, 리스크 앱은 종전처럼 실패로 받는다). 위에서
+        # 내린 글과 저장한 보고서·전사는 그대로 남아 이어하기의 재료가 된다. 설정 이름은 knob 으로 싣는다.
+        yield _sse("error", {"code": "chair_failed",
+                             "message": (f"의장이 결정문을 내지 못했다 — {_chair_failed} (의장 호출 "
+                                         f"{1 + _CHAIR_RETRIES}번). 라운드 발언은 버리지 않았다 — 좌석별 마지막 "
+                                         "입장을 결과로 내렸고 회의록·전사가 남아 있다. 호출당 타임아웃을 늘려 "
+                                         "이어하기로 다시 수렴시키면 결정문을 받는다."),
+                             "knob": " · ".join(x for x in (_chair_knob,
+                                                           "의장 재호출 DELIB_CHAIR_RETRIES") if x)})
     yield _sse("done", {})
 
 
