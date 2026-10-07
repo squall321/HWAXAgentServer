@@ -170,6 +170,8 @@ _EVID_DESC = (
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
 # 엔진이 처음부터 받았는데 어디에도 안 적혀 있어, 소급 검증에 최근 VOC 가 섞여 들어갔다.
 # persona_knowledge 는 종전에 환경변수뿐이라 한 심의만 끌 방법이 없었다(S26U 피드백 1-5).
+# sealed 가 닫는 것·닫지 않는 것은 엔진 표에서 읽어 적는다 — 손으로 적으면 엔진에 유입 경로가 늘 때
+# 이 글만 낡는다(근거 상한 '12,000자' 가 그렇게 낡았다).
 _ADV_DESC = (
     "advanced(품질 손잡이 dict, 보통 비운다) — free_tools·tool_budget·chair_bestof·chair_cite·"
     "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries·timeout_s · "
@@ -179,7 +181,13 @@ _ADV_DESC = (
     "persona_knowledge(좌석 지식카드 조회: 1|0 — 1 이면 좌석마다 제 지식카드에서 화두 관련 발췌를 "
     "조회해 깐다. 카드는 지금 시점의 것이라 소급 검증에서는 0 으로 꺼라) · "
     f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
-    "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다)."
+    "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다) · "
+    "sealed(봉인: 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다: "
+    f"{' · '.join(label for _closed, label in _engine._SEALED_CLOSE.values())}. 같이 보낸 손잡이로 "
+    "다시 열 수 없고, 열려다 닫힌 것은 deliberate_status 의 evidence_omitted 에 뜬다. 봉인 사실과 닫은 "
+    f"경로가 잡 기록과 결정문 머리에 남는다. 닫지 않는 것: {_engine._SEALED_OPEN}. "
+    "job='risk-review-sealed' 가 이것을 켠 리스크 심사다. 단발 심의에만 선다 — sim-plan·test-plan·"
+    "build-plan 은 사내 자산 현황을 조회해 깔아야 해서 거절한다)."
 )
 
 _START_DESC = (
@@ -229,7 +237,8 @@ async def deliberate_start(
     Args:
         question: 심의할 화두. 구체적일수록 좌석 발굴이 정확하다.
         job: 심의 종류 — diagnosis(원인 규명) · option-select(안 선택) · credibility(신뢰 판정) ·
-             risk-review(리스크 심사) · mechanism(메커니즘 규명) · sim-plan(해석 설계 2단) ·
+             risk-review(리스크 심사) · risk-review-sealed(리스크 심사·봉인 — 소급 검증용,
+             호출자가 준 자료만으로 돈다) · mechanism(메커니즘 규명) · sim-plan(해석 설계 2단) ·
              test-plan(시험 설계) · build-plan(구축 계획 3단) · default(자유 심의).
              deliberate_jobs 로 목록을 본다.
         rounds: 라운드 수. 0 이면 기본값 3. 2~8 로 클램프된다.
@@ -252,7 +261,7 @@ async def deliberate_start(
                      않으려 할 때. 기본 True.
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
-                  parse_retries · timeout_s · voc · persona_knowledge · chair_template.
+                  parse_retries · timeout_s · voc · persona_knowledge · chair_template · sealed.
                   보통 비운다(뜻은 _ADV_DESC).
     """
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
@@ -310,6 +319,13 @@ async def deliberate_continue(
     summary_text = (prev.get("decision") or prev.get("result_text") or "").strip()
     if not summary_text:
         raise ValueError(f"이전 심의에 결정문이 없다(status={prev.get('status')}) — 끝난 뒤 이어하라")
+    # 봉인 심의는 봉인으로 돈 심의만 이어받는다. 이전 결정문이 요약으로 실리는데, 봉인 없이 돈 회차의
+    # 결정문에는 그때 조회한 VOC·지식카드가 녹아 있다 — 그걸 싣고 '봉인' 이라고 적으면 거짓 기록이다.
+    job = job or prev.get("job") or "default"
+    if ((delib_jobs.JOBS[delib_jobs.resolve_job(job)].get("opts") or {}).get("sealed")
+            and not (prev.get("opts") or {}).get("sealed")):
+        raise ValueError(f"봉인 심의({job})는 봉인으로 돈 심의만 이어받는다 — {previous_job_id} 는 봉인 없이 "
+                         "돌아 그 결정문에 바깥 자료가 섞여 있다. 봉인 심의를 새로 시작하라.")
     opts = _build_opts(
         rounds=rounds, modifiers=modifiers, human_note=human_note,
         continue_summary=summary_text[:8000],
@@ -319,7 +335,7 @@ async def deliberate_continue(
         append_to_report_id=(int(prev.get("report_id") or 0) if append_report else 0),
     )
     user, groups = _caller(ctx)
-    rec = delib_jobs.start(_need_app(), job or prev.get("job") or "default",
+    rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
                            groups=groups, user_email=user)
     out = delib_jobs.summary(rec)
@@ -392,8 +408,8 @@ async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",
-          description="심의 종류 7가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, 옵션 목록, "
-                      "지금 걸리는 근거 상한(limits).")
+          description=f"심의 종류 {len(delib_jobs.JOBS)}가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, "
+                      "옵션 목록, 지금 걸리는 근거 상한(limits).")
 async def deliberate_jobs() -> dict:
     """포털 웹 심의 메뉴와 같은 택소노미. job 값을 고르는 데 쓴다."""
     return {

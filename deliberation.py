@@ -666,6 +666,58 @@ _RISK_KEEP_TOOLS = ("search_objects", "get_object", "get_subgraph", "search_repo
                     "get_kg_relations", "search_scholar", "search_web")
 
 
+# ── 봉인 실행(sealed) ────────────────────────────────────────────────────────────
+# 소급 검증용이다 — '사람이 찾기 전에, 그때 있던 자료만으로 심사가 찾았겠는가' 를 보려면 호출자가
+# 준 것 밖의 정보가 심의 도중 들어올 길이 전부 닫혀 있어야 한다. 손잡이를 하나씩 끄게 두면 하나를
+# 빠뜨린다(실사용에서 VOC 자동 환기가 그렇게 샜다 — S26U 피드백 1-6). 봉인 하나로 아래를 한꺼번에
+# 닫는다. 요청 키 → (닫는 값, 상태줄·결정문에 적는 이름)이고, 닫는 값은 _resolve_opts 가 종전대로 읽는다.
+# ⚠ 심의 도중 **바깥에서 자료를 가져오는 자리**를 새로 만들면 그 손잡이를 여기에 넣는다. 안 넣으면
+#   tests/test_delib_sealed 가 잡는다 — 봉인 심의를 끝까지 돌려 부른 도구를 전부 센다.
+_SEALED_CLOSE = {
+    "voc": ("off", "VOC 자동 환기"),
+    "evidence_prepass": (0, "지식·보고서 사전 검색"),
+    "tools": ([], "지정 도구 사전 호출"),
+    # 리스크 심사가 더 여는 조회 도구(_RISK_READ_TOOLS·_RISK_KEEP_TOOLS — RA·VOC·문헌)는 자유 조회
+    # 준비 단계에만 묶이므로 이것 하나로 함께 닫힌다.
+    "free_tools": (0, "좌석 자유 조회"),
+    "persona_knowledge": (0, "좌석 지식카드"),
+    "search_sources": ([], "웹 리서치"),
+    "rescreen": (0, "이어하기 좌석 재심사"),
+}
+# 닫지 않는 것 — 봉인이라고 적는 자리마다 함께 적는다. 감추면 '전부 닫혔다' 로 읽힌다.
+# 좌석 발굴(recommend_agents)은 **누가 앉는가**만 정하고 그 응답은 프롬프트에 실리지 않는다. 다만 순위는
+# 지금 시점 레지스트리로 매겨지고, 역할문(get_agent_session)은 좌석 시스템 프롬프트에 그대로 실린다.
+_SEALED_OPEN = "좌석 구성과 역할 정의(지금 시점 전문가 레지스트리) · 모델이 학습으로 아는 것"
+_SEALED_LINE = ("호출자가 준 자료(화두·사전 근거·사람 의견·이어받은 요약)만으로 도는 심의다. 닫은 유입 경로: "
+                + " · ".join(_label for _closed, _label in _SEALED_CLOSE.values())
+                + f". 닫지 않은 것: {_SEALED_OPEN}.")
+# 다단 심의(해석 설계·시험 설계·구축 계획)는 봉인이 서지 않는다 — 단 사이에 좌석을 스스로 발굴해
+# 갈아 앉히고, 사내 자산·물성 현황을 **실제로 조회해** 깐다(_asset_snapshot 등).
+_SEALED_UNSUPPORTED = ("봉인 실행(sealed)은 단발 심의에서만 된다 — 해석 설계·시험 설계·구축 계획은 "
+                       "사내 자산·물성 현황을 실제로 조회해 깔기 때문에 바깥 유입을 닫을 수 없다. "
+                       "sealed 를 빼거나 단발 심의(예: risk-review-sealed)로 시작하라.")
+
+
+def _seal(req_opts: dict) -> tuple[dict, list]:
+    """봉인을 청한 요청이면 (유입 경로를 닫은 사본, 호출자가 열려던 손잡이들), 아니면 (받은 그대로, []).
+
+    해석 못 하는 값은 **봉인으로** 읽는다. 열린 채 돌고 잡 기록에 sealed 가 남으면 봉인한 줄 안다 —
+    틀릴 거면 닫힌 쪽으로 틀린다."""
+    v = req_opts.get("sealed")
+    try:
+        on = v not in (None, "") and int(v) != 0
+    except (ValueError, TypeError):
+        on = True
+    if not on:
+        # 끈 값도 0 으로 맞춰 돌려준다 — "0"(문자열)을 그대로 두면 잡 기록을 읽는 쪽이 참으로 본다.
+        return ({**req_opts, "sealed": 0} if "sealed" in req_opts else req_opts), []
+    # 호출자가 **닫힌 값과 다르게** 보낸 것 — 말없이 덮으면 자기가 고른 도구·VOC 가 돈 줄 안다.
+    reopen = [f"{k}={_delib_preview(req_opts[k], 60)}" for k, (closed, _label) in _SEALED_CLOSE.items()
+              if req_opts.get(k) not in (None, "", [], closed)
+              and str(req_opts[k]).strip().lower() != str(closed)]
+    return {**req_opts, **{k: c for k, (c, _label) in _SEALED_CLOSE.items()}, "sealed": 1}, reopen
+
+
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
     미지정 키는 env 기본값 유지(하위호환). 값은 화이트리스트 키만 읽고 정수/실수로 강제·클램프
@@ -730,13 +782,18 @@ def _resolve_opts(req_opts):
         # 끄려면 서버를 다시 띄워야 했고, 그건 그 시각 심의 중인 전원에게 걸린다. 그 시점 자료만으로
         # 다시 심사하는 소급 검증은 지식카드를 빼야 한다 — 카드는 오늘의 카드다(S26U 피드백 1-5).
         persona_knowledge=_env_int("DELIB_PERSONA_KNOWLEDGE", 1),
+        # 봉인 실행(소급 검증) 여부와, 봉인이 닫은 손잡이 중 호출자가 열려던 것(스트림이 카드로 알린다).
+        sealed=0, sealed_reopen=[],
     )
     if isinstance(req_opts, dict):
+        # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
+        # 값이 딸려 켜는 것(웹 리서치가 강제하는 인용 계약 등)이 남는다.
+        req_opts, o.sealed_reopen = _seal(req_opts)
         for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                   "chair_bestof", "chair_cite", "parse_retries", "rounds",
                   "free_tools", "tool_budget", "stop_after_round", "build_plan",
                   "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
-                  "persona_knowledge"):
+                  "persona_knowledge", "sealed"):
             v = req_opts.get(k)
             if v is not None:
                 try:
@@ -2890,6 +2947,9 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
     opts = _resolve_opts(req_opts)
+    if opts.sealed:   # 닫지 못한 채 '봉인' 이라고 적힌 결정문을 내느니 서지 않는다(_SEALED_UNSUPPORTED)
+        yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
+        yield _sse("done", {}); return
     # 단 사이 승계는 **코어가 직접 채우는 dict** 로 받는다. 예전에는 SSE 청크를 문자열로
     # 파싱해 가로챘는데, 가드가 chunk.startswith(b"data:") 였고 _sse 는 "event: …\ndata: …"
     # 를 내므로 **항상 거짓**이었다. decision_a 가 영영 비어 /시뮬심의 웹 경로는 도입
@@ -3015,6 +3075,9 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
     opts = _resolve_opts(req_opts)
+    if opts.sealed:   # 아래 물성 근거 현황 조회가 바깥 유입이다 — 봉인이 서지 않는다(_SEALED_UNSUPPORTED)
+        yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
+        yield _sse("done", {}); return
     opts.chair_template = "test-plan"
     # 고정 좌석을 앞에 세우고 나머지는 질문으로 발굴하게 둔다(재료 계열·현상 도메인).
     opts.continue_personas = [{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
@@ -3070,6 +3133,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 print(f"[deliberation] timeout override failed: {exc!r}")
     # 요청 단위 강등 표식 초기화 — 이 태스크가 재사용되는 경우에도 이전 요청의 값이 새지 않게.
     _pat_degraded.set(None)
+    if opts.sealed:
+        # 무엇을 닫았는지 먼저 밝힌다. 호출자가 열려던 손잡이는 카드로도 남긴다 — 잡 원장에 실려
+        # MCP 호출자가 진행 조회에서 본다(말없이 덮으면 자기가 고른 도구·VOC 가 돈 줄 안다).
+        yield _sse("status", {"step": f"봉인 실행 — {_SEALED_LINE}", "tool": None})
+        if opts.sealed_reopen:
+            yield _delib("evidence", source="봉인이 닫은 요청", included=False,
+                         text="봉인 실행이라 호출자가 보낸 다음 손잡이를 닫았다 — "
+                              + ", ".join(opts.sealed_reopen))
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
     # 심의는 도구를 LLM 에 바인딩하지 않는다 — 전부 _call 로 부르고 결과를 **코드가 JSON 으로
@@ -3890,9 +3961,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _loss_note = ("[좌석 유실 — 아래 좌석은 그 라운드에서 오류로 발언하지 못했다. "
                       "(0) 커버리지에 이 사실을 그대로 적고, 그 도메인 판단이 빠진 채 수렴했음을 밝혀라]\n"
                       + "\n".join(f"· {_dr(x['round'])}라운드: {', '.join(x['lost'])}" for x in seat_loss) + "\n")
+    # 봉인 실행 — 의장이 전제를 알고 쓰게 한다. 표식 자체는 아래에서 코드가 찍는다.
+    _seal_note = (f"[봉인 실행 — {_SEALED_LINE} 이 줄은 결정문 머리에 따로 찍힌다. (0) 커버리지 한계에 "
+                  "'바깥 자료 없이 주어진 근거만으로 판정했다' 는 전제를 적고, 좌석이 도구로 조회·확인했다고 "
+                  "쓰지 마라]\n" if opts.sealed else "")
     chair_human = (
         base + f"\n{rounds_block}\n\n"
-        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}"
+        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
@@ -3973,6 +4048,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _summary = ""
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
+    # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
+    # 똑같이 생긴다. 결정문은 이 심의의 내구 기록(RA 보고서)이라 저장 전에, 맨 위에 찍는다.
+    if opts.sealed:
+        decision = f"■ 봉인 실행 — {_SEALED_LINE}\n\n{decision}"
 
     # 4c) 쉬운 설명 — 의사결정문은 전문 용어·수치로 촘촘해 비전문가·경영층이 '그래서 뭘 하라는
     #     건지' 못 읽는다. 맨 뒤에 한마디 결론 + 왜 그런지 + 당장/다음/금지 를 평이한 말로 붙인다.

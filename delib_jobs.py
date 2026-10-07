@@ -88,6 +88,18 @@ JOBS: dict[str, dict] = {
                 "원장 연동 없이 단발로 도는 심사이고, 원장에 넣으려면 risk_submit_panel_result 를 이어 부른다.",
         "input": "심사할 설계 변경·해석 결과",
     },
+    # 봉인 리스크 심사 — 소급 검증용. 웹 메뉴(delibTaxonomy.ts)에는 없다(MCP 전용).
+    # 무엇을 닫는지는 여기 늘어놓지 않는다 — 엔진이 쥔다(deliberation._SEALED_CLOSE). 손잡이를 이 표에
+    # 복제해 두면 엔진에 유입 경로가 하나 늘 때 이 표만 낡고, 봉인이라고 적힌 심의에 그 길이 열린다.
+    "risk-review-sealed": {
+        "engine": "general", "chair": "risk-review", "opts": {"sealed": 1},
+        "group": "판단", "label": "리스크 심사(봉인)",
+        "what": "소급 검증용 리스크 심사 — '사람이 찾기 전에, 그때 있던 자료만으로 심사가 찾았겠는가'. "
+                "호출자가 준 자료(화두·evidence·human_note)만으로 돈다. 엔진이 심의 도중 바깥에서 자료를 "
+                "가져오는 길을 한꺼번에 닫고 호출자가 다시 열 수 없으며, 봉인 사실과 닫은 경로가 잡 기록과 "
+                "결정문 머리에 남는다. 닫는 것·닫지 않는 것은 옵션 안내의 sealed 를 보라.",
+        "input": "그 시점 자료(evidence)와 심사할 설계 변경",
+    },
     "mechanism": {
         "engine": "general", "chair": "mechanism", "group": "판단", "label": "메커니즘 규명",
         "what": "현상의 지배 물리를 좁힌다. 상태변수·지배방정식 후보·미지 파라미터·반증 관측까지. "
@@ -103,7 +115,8 @@ JOBS: dict[str, dict] = {
 
 # 옛 이름 → 정본 키. 초판(2026-09-05)이 general/sim 으로 열었으므로 깨지지 않게 남긴다.
 JOB_ALIASES = {"general": "default", "sim": "sim-plan", "simulation": "sim-plan",
-               "testplan": "test-plan", "test": "test-plan", "free": "default"}
+               "testplan": "test-plan", "test": "test-plan", "free": "default",
+               "sealed": "risk-review-sealed", "risk-sealed": "risk-review-sealed"}
 
 
 def resolve_job(name: str) -> str:
@@ -279,7 +292,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             f"진행 중: {[x['id'] for x in _JOBS.values() if x['status'] == 'running']}. "
             f"필요하면 deliberate_cancel 로 하나를 접어라.")
 
-    from deliberation import run_deliberation, run_sim_deliberation, run_test_plan  # noqa: PLC0415
+    from deliberation import (_SEALED_UNSUPPORTED, _seal, run_deliberation,  # noqa: PLC0415
+                              run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
 
@@ -287,11 +301,17 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     if spec.get("chair"):
         opts["chair_template"] = spec["chair"]
     opts.update(spec.get("opts") or {})
+    # 봉인(sealed) — 닫는 것은 엔진이다(_resolve_opts). 여기서는 잡 기록에 **실제로 걸린 값**이 남게
+    # 닫힌 사본을 적는다. 엔진에는 호출자가 보낸 그대로 넘긴다 — 무엇을 열려다 닫혔는지를 엔진이
+    # 화면과 원장에 남기려면 원래 값을 봐야 한다. 다단 엔진은 봉인이 서지 않으니 잡을 만들기 전에 막는다.
+    applied, _ = _seal(opts)
+    if applied.get("sealed") and spec["engine"] != "general":
+        raise ValueError(_SEALED_UNSUPPORTED)
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
         "id": job_id, "job": j, "kind": j, "label": spec["label"], "question": q,
-        "chair_template": opts.get("chair_template"), "opts": _opts_echo(opts),
+        "chair_template": opts.get("chair_template"), "opts": _opts_echo(applied),
         "status": "running", "stage": "start", "step": "", "steps": [],
         "seats": [], "round": 0, "total_rounds": None,
         "decision": None, "result_text": None, "report_id": None, "plain": None,
@@ -365,6 +385,7 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "job_id": job["id"], "job": job.get("job") or job.get("kind"), "label": job.get("label"),
         "status": job["status"], "question": job["question"],
         "chair_template": job.get("chair_template"),
+        "sealed": bool((job.get("opts") or {}).get("sealed")),
         "stage": job.get("stage"), "step": job.get("step"),
         "round": job.get("round"), "total_rounds": job.get("total_rounds"),
         "seats": [s.get("key") for s in (job.get("seats") or [])],
