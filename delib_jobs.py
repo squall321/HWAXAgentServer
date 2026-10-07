@@ -340,6 +340,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
         if step:
             job["step"] = str(step)
             job["steps"] = (job.get("steps") or [])[-29:] + [str(step)]
+            # 창(최근 30줄) 밖으로 밀려난 줄이 있는지 호출자가 알게 전체 수를 센다. 경고도 같다.
+            job["steps_total"] = int(job.get("steps_total") or 0) + 1
     elif event == "result":
         content = data.get("content")
         if content:
@@ -348,6 +350,7 @@ def _apply(job: dict, event: str, data: dict) -> None:
         job["error"] = str(data.get("message") or "알 수 없는 오류")
     elif event == "warning":
         job["warnings"] = (job.get("warnings") or [])[-9:] + [str(data.get("message") or "")]
+        job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
 
 
 async def _drive(job: dict, gen) -> None:
@@ -563,8 +566,10 @@ def summary(job: dict, *, full: bool = False) -> dict:
         out["decision"] = job.get("decision") or job.get("result_text")
         out["plain"] = job.get("plain")
         out["warnings"] = job.get("warnings") or []
+        out["warnings_total"] = int(job.get("warnings_total") or len(out["warnings"]))
         out["evidence_omitted"] = job.get("evidence_omitted") or []
         out["steps"] = job.get("steps") or []
+        out["steps_total"] = int(job.get("steps_total") or len(out["steps"]))
         out["seats_detail"] = job.get("seats") or []
         out["applied_opts"] = job.get("opts") or {}
         if job.get("checkpoint"):

@@ -396,6 +396,10 @@ async def deliberate_status(job_id: str) -> dict:
     # 좌석에 주지 않은 근거는 **도는 동안** 보여야 한다 — 결정문을 받을 때 알면 이미 수십 분을
     # 쓴 뒤다. 목록(deliberate_list)에는 싣지 않으려고 summary 가 아니라 여기서 붙인다.
     out["evidence_omitted"] = job.get("evidence_omitted") or []
+    # 경고도 같다 — 자격 강등(이 심의가 서비스 계정 시야로 돈다)·지식카드 강등은 도는 동안 알아야 한다.
+    # 원장은 최근 10건만 두므로 전체 수를 함께 싣는다(수가 더 크면 앞의 것이 밀려난 것이다).
+    out["warnings"] = job.get("warnings") or []
+    out["warnings_total"] = int(job.get("warnings_total") or len(out["warnings"]))
     return out
 
 

@@ -349,3 +349,39 @@ def test_원장에_남길_때_잘랐으면_잘랐다고_적는다():
     long, short = job["evidence_omitted"]
     assert long["text"].startswith("가" * delib_jobs.OMITTED_TEXT_MAX) and "전체 5,000자" in long["text"], long
     assert short["text"] == "그대로"
+
+
+# ── 경고는 도는 동안에도 보이고, 창 밖으로 밀려난 수가 남는다 ───────────────────────
+# 원장은 경고를 최근 10건·상태줄을 최근 30줄만 둔다. 경고는 결과 회수에만 실려 도는 동안은 볼 길이
+# 없었고, 좌석별 실패 경고가 쌓이면 맨 먼저 온 경고(자격 강등 — 이 심의가 서비스 계정 시야로 돈다)가
+# 말없이 밀려났다.
+def _ledger(monkeypatch, warnings=0, steps=0):
+    import mcp_server
+
+    job = {"id": "t-windows", "status": "running", "question": "q", "started_at": 0.0}
+    for i in range(warnings):
+        delib_jobs._apply(job, "warning", {"code": "w", "message": f"경고 {i}"})
+    for i in range(steps):
+        delib_jobs._apply(job, "status", {"step": f"단계 {i}"})
+    monkeypatch.setitem(delib_jobs._JOBS, job["id"], job)
+    return (asyncio.run(mcp_server.deliberate_status(job["id"])),
+            asyncio.run(mcp_server.deliberate_result(job["id"])))
+
+
+def test_경고가_진행_조회에도_보인다(monkeypatch):
+    status, result = _ledger(monkeypatch, warnings=2)
+    assert status["warnings"] == ["경고 0", "경고 1"] == result["warnings"], status.get("warnings")
+    assert status["warnings_total"] == 2 == result["warnings_total"]
+
+
+def test_창_밖으로_밀려난_경고와_상태줄은_수로_남는다(monkeypatch):
+    status, result = _ledger(monkeypatch, warnings=13, steps=45)
+    assert status["warnings"] == [f"경고 {i}" for i in range(3, 13)] and status["warnings_total"] == 13
+    assert result["steps"] == [f"단계 {i}" for i in range(15, 45)] and result["steps_total"] == 45
+    assert result["warnings_total"] == 13
+
+
+def test_밀려난_것이_없으면_수가_목록_길이와_같다(monkeypatch):
+    status, result = _ledger(monkeypatch, steps=3)
+    assert (status["warnings"], status["warnings_total"]) == ([], 0)
+    assert (len(result["steps"]), result["steps_total"]) == (3, 3)
