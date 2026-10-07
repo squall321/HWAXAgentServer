@@ -78,11 +78,43 @@ export MCP_CONFIG="${MCP_CONFIG:-$(pwd)/mcp_servers.json}"
 # in use'). 포트 리스너 PID 를 직접 종료한다 — uvicorn 이 상대경로(.venv/bin/uvicorn)로 실행돼
 # cmdline 절대경로 pkill 패턴이 빗나가던 것 방지(포트는 우리가 실제로 비워야 하는 대상 그 자체).
 port_pids() { ss -ltnp 2>/dev/null | grep ":${PORT} " | grep -oP 'pid=\K[0-9]+' | sort -u; }
+# 떠 있는 인스턴스가 돌리고 있는 심의 수 — "<진행> <대기>" 를 찍는다. **모르면 아무것도 안 찍는다**
+# (/health 무응답 · 그 수를 안 주는 옛 빌드 · curl 없음). '모름' 과 '0건' 을 섞지 않는다 — 섞으면 답 없는
+# 서버를 '심의 없음' 으로 읽는다. 출력을 먼저 변수에 받고 나서 가른다(판정을 파이프에 걸지 않는다).
+delib_load() {
+  local body act que probe="$HOST"
+  [ "$probe" = "0.0.0.0" ] && probe="127.0.0.1"
+  body="$(curl -s --noproxy '*' --max-time "${AGENT_HEALTH_PROBE_S:-3}" "http://${probe}:${PORT}/health" 2>/dev/null || true)"
+  act="$(printf '%s' "$body" | grep -oE '"delib_active": *[0-9]+' | grep -oE '[0-9]+$' || true)"
+  que="$(printf '%s' "$body" | grep -oE '"delib_queued": *[0-9]+' | grep -oE '[0-9]+$' || true)"
+  if [ -n "$act" ] && [ -n "$que" ]; then echo "$act $que"; fi
+}
 OLD_PIDS="$(port_pids || true)"
 if [ -n "$OLD_PIDS" ]; then
+  # 재기동은 도는 심의와 줄 선 심의를 **전부 끊는다**(도는 것은 interrupted 로 남고, 줄 선 것은 사라진다).
+  # 좌석 20석 넘는 패널은 수 시간 돈다 — 종전엔 코드를 고치고 이 스크립트를 부르는 순간(update-forges 도
+  # 직접 부른다) 그 심의가 말없이 사라졌다. 유예를 늘리는 것은 답이 아니다(수 시간을 기다릴 수는 없다).
+  # 도는 심의가 있으면 **내리지 않고 나간다**(exit 3 — 건너뜀). 강행은 AGENT_RESTART_FORCE=1.
+  # 수를 모르면(위 delib_load) 그대로 재기동한다 — 답 없는 서버는 다시 띄울 수 있어야 한다.
+  LOAD="$(delib_load || true)"
+  if [ -n "$LOAD" ]; then
+    D_ACT="${LOAD%% *}"; D_QUE="${LOAD##* }"
+    if [ $((D_ACT + D_QUE)) -gt 0 ]; then
+      echo "==> ⚠⚠ 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기 — 재기동하면 전부 끊긴다"
+      if [ "${AGENT_RESTART_FORCE:-0}" != "1" ]; then
+        echo "○ agent-server 재기동 건너뜀 — 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기. 끝난 뒤 ./start.sh -d, 지금 강행하려면 AGENT_RESTART_FORCE=1"
+        echo "    (떠 있는 인스턴스는 그대로 둔다. 진행 상황: curl -s http://127.0.0.1:${PORT}/health)"
+        exit 3
+      fi
+      echo "==> AGENT_RESTART_FORCE=1 — 강행한다. 진행 중 ${D_ACT}건은 interrupted 로 끊기고 대기 ${D_QUE}건은 사라진다"
+    fi
+  else
+    echo "==> 진행 중 심의 수를 확인하지 못했다(/health 무응답 또는 그 수를 안 주는 옛 빌드) — 그대로 재기동한다"
+  fi
   echo "==> stopping previous instance (${OLD_PIDS//$'\n'/ })"
   kill $OLD_PIDS 2>/dev/null || true
-  sleep 2
+  # TERM 뒤 KILL 까지의 유예(초). 긴 심의를 기다리는 값이 아니다 — 프로세스가 스스로 내려갈 짧은 틈이다.
+  sleep "${AGENT_STOP_GRACE_S:-2}"
   STILL="$(port_pids || true)"
   if [ -n "$STILL" ]; then kill -9 $STILL 2>/dev/null || true; sleep 1; fi   # 안 죽었으면 강제
 fi

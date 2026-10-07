@@ -4202,10 +4202,25 @@ def search_capability() -> dict:
     return _search_capability()
 
 
+def _delib_load() -> tuple[int, int]:
+    """(진행 중, 대기) 심의 수 — 웹 경로(분리 태스크)와 MCP 잡 원장을 합친다."""
+    active = len(_DETACHED_TASKS)
+    try:
+        import delib_jobs  # noqa: PLC0415 — 심의 MCP 가 비활성이어도 /health 는 답해야 한다
+        return active + delib_jobs.running_count(), len(delib_jobs._PENDING)
+    except Exception:  # noqa: BLE001
+        return active, 0
+
+
 @app.get("/health")
 def health() -> dict:
+    _active, _queued = _delib_load()
     return {
         "status": "ok",
+        # 지금 도는 심의·줄 선 심의 수. 재기동은 이것들을 전부 끊는다 — start.sh 와 update-all 이 이 수를 보고
+        # 재기동을 건너뛴다(강행은 AGENT_RESTART_FORCE=1). 이름을 바꾸면 그쪽이 '모름' 으로 읽고 그대로 내린다.
+        "delib_active": _active,
+        "delib_queued": _queued,
         "model": VLLM_MODEL,
         "vllm": VLLM_BASE_URL,
         "mcp": list(getattr(app.state, "connections", {})),

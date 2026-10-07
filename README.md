@@ -19,7 +19,9 @@ ChatDock (portal frontend)
   groups, handed off by the portal) are forwarded to the MCP Gateway, which returns only
   the tools those groups may use. Streams the portal's §5 SSE contract:
   `status` → `token`×N → `result` → `done` (or `error`).
-- `GET /health` — `{status, model, vllm, mcp, tool_scoping}`.
+- `GET /health` — `{status, delib_active, delib_queued, model, vllm, mcp, tool_scoping, …}`.
+  `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
+  `start.sh` and the portal's update-all read them before a restart.
 
 ## Run (dev)
 
@@ -59,6 +61,9 @@ whole deliberation by wall clock. Values are read once at startup (restart to ap
 | `LLM_TIMEOUT_S` | `900` | Read timeout of one attempt of a chat / Thinking / pre-deliberation helper call. `0` = unlimited (logged at startup). Used to be unset = unlimited. |
 | `THINK_SEAT_TIMEOUT_S` | `600` | One seat's answer in Thinking mode; past it only that seat drops out (`N초 초과(THINK_SEAT_TIMEOUT_S)`). Shorter than `LLM_TIMEOUT_S` on purpose — a per-seat cap. Was 180, which every seat exceeded while a large deliberation held the shared LLM. |
 | `LLM_MAX_RETRIES` | `2` | openai SDK retries for chat calls (the library default, now named). |
+| `AGENT_RESTART_FORCE` | `0` | `start.sh` will not stop a running instance that reports running or queued deliberations — a restart cuts all of them. It prints the counts and exits `3` (skipped), leaving the instance up. `1` restarts anyway. If the counts cannot be read (no answer, older build) it says so and restarts. |
+| `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. |
+| `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. |
 | `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
 
 ## Status
