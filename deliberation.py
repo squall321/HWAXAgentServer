@@ -2069,16 +2069,59 @@ def _delib(kind: str, **kw) -> bytes:
     return _sse("delib", {"kind": kind, **kw})
 
 
+def _llm_limit(llm) -> tuple[float, int]:
+    """그 LLM 에 **실제로 걸린** (호출 시도 1회의 한도(초) — 0 은 무제한이거나 모름, 시도 횟수 — 0 은 모름).
+    설정을 다시 읽지 않고 객체에서 읽는다 — 요청 단위 한도(timeout_s)로 갈아 끼운 LLM 이면 그 값이 나온다."""
+    to = getattr(llm, "request_timeout", None)
+    read = getattr(to, "read", to)          # httpx.Timeout 이면 read, 숫자 하나면 그 값
+    rt = getattr(llm, "max_retries", None)
+    return (float(read) if isinstance(read, (int, float)) and not isinstance(read, bool) else 0.0,
+            rt + 1 if isinstance(rt, int) and not isinstance(rt, bool) else 0)
+
+
+def _llm_fail_note(exc: BaseException, llm) -> tuple[str, str]:
+    """LLM 호출 실패를 (사람이 읽는 사유 한 구절, 그 한도를 바꾸는 설정 이름 — 없으면 "") 로.
+
+    좌석 유실과 의장 실패 알림이 함께 쓴다. 종전 문구는 '오류·시간초과' 뿐이라, 한도가 걸린 것인지 LLM 서버가
+    죽은 것인지, 한도라면 얼마가 걸렸고 어느 값을 올려야 하는지 알 수 없었다. 설정 이름은 글에 넣지 않고 따로
+    돌려준다 — 화면에도 뜨는 글이고, 이름은 knob 으로 실려 잡 원장이 붙인다."""
+    chain, e = [], exc
+    while e is not None and len(chain) < 6:
+        chain.append(type(e).__name__)
+        e = e.__cause__ or e.__context__
+    name = chain[0]
+    read, tries = _llm_limit(llm)
+    # openai 는 연결 시간 초과도 APITimeoutError 로 올린다 — 원인 사슬의 httpx 예외로 가른다. 연결 쪽은
+    # 한도를 늘릴 일이 아니다(느린 것이 아니라 닿지 않는 것이다).
+    if any("Connect" in n for n in chain):
+        return (f"LLM 서버에 연결하지 못했다({name}) — LLM 서버 주소와 상태를 확인하라",
+                "VLLM_BASE_URL · 연결 한도 LLM_CONNECT_TIMEOUT_S")
+    if any("Timeout" in n for n in chain):
+        return ("LLM 호출이 " + (f"{read:,.0f}초 안에 " if read else "제한 시간 안에 ") + "끝나지 않았다("
+                + (f"{tries}회 시도 · " if tries else "") + f"{name}) — 호출당 타임아웃을 늘린다",
+                "DELIB_TIMEOUT_S · 요청 timeout_s(상한 DELIB_TIMEOUT_MAX_S)")
+    return f"{name}: {str(exc)[:120]}", ""
+
+
 async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = (),
-                      validator_fn=None, opts=_DEFAULT_OPTS):
+                      validator_fn=None, opts=_DEFAULT_OPTS, fails: dict | None = None):
     """라운드 발언을 완료되는 순서대로 산출(async generator) — 라이브 회의 스트림의 핵심.
     gather(전원 대기)와 달리 as_completed 라 먼저 끝난 전문가부터 화면에 등장한다.
     required 는 라운드별 요구 키 — 파싱 재시도·say 보존 판정(_persona_round)에 쓰인다.
     validator_fn: 페르소나 → 내용 검증기(교차심문은 표적이 달라 검증 컨텍스트가 1인 1개).
-    opts: 요청 단위 손잡이 — _persona_round 로 전달(prose_first/parse_retries)."""
-    tasks = [asyncio.ensure_future(_persona_round(
-        llm, p, prompt_fn(p), required,
-        validator_fn(p) if validator_fn else None, opts=opts)) for p in personas]
+    opts: 요청 단위 손잡이 — _persona_round 로 전달(prose_first/parse_retries).
+    fails: 주면 실패한 좌석의 예외를 {좌석 키: 예외} 로 적는다 — 호출부가 유실 사유를 알린다
+    (as_completed 는 어느 좌석의 태스크였는지 돌려주지 않는다)."""
+    async def _one(p, prompt, validator):
+        try:
+            return await _persona_round(llm, p, prompt, required, validator, opts=opts)
+        except Exception as exc:  # noqa: BLE001 — 다시 올린다. 누구의 실패인지만 적어 둔다
+            if fails is not None:
+                fails[p["key"]] = exc
+            raise
+
+    tasks = [asyncio.ensure_future(_one(p, prompt_fn(p), validator_fn(p) if validator_fn else None))
+             for p in personas]
     try:
         for fut in asyncio.as_completed(tasks):
             try:
@@ -4357,9 +4400,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             f"필요하면 그 수치를 직접 조회하세요)")
                 return out
 
-        cur = []
+        cur, _fails = [], {}
         async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
-                                   validator_fn=validator_fn, opts=opts):
+                                   validator_fn=validator_fn, opts=opts, fails=_fails):
             cur.append(o)
             extra = {}
             if render == 1:
@@ -4418,17 +4461,27 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _lost_now = [pp["key"] for pp in personas if pp["key"] not in _spoke]
         if _lost_now:
             seat_loss.append({"round": rnd, "lost": _lost_now})
-            print(f"[deliberation] ⚠ r{rnd} 좌석 {len(_lost_now)}석 유실 — {', '.join(_lost_now)}")
-            yield _sse("status", {"step": f"⚠ {_dr(rnd)}라운드 좌석 유실: {', '.join(_lost_now)} (오류·시간초과)",
-                                  "tool": None})
+            # 왜 빠졌는지를 사유별로 묶어 말한다. 종전엔 '(오류·시간초과)' 뿐이라, LLM 호출 한도가 걸린 것인지
+            # 서버가 죽은 것인지, 한도라면 얼마였고 어느 값을 올려야 하는지 알 수 없었다. 설정 이름은 글이
+            # 아니라 knob 으로 싣는다(잡 원장이 붙인다) — 서버 로그에는 그대로 적는다.
+            _why: dict = {}
+            for _lk in _lost_now:
+                _why.setdefault(_llm_fail_note(_fails[_lk], llm) if _lk in _fails
+                                else ("사유를 알 수 없다", ""), []).append(_lk)
+            _why_t = " / ".join(f"{', '.join(_ks)} · {_note}" for (_note, _kb), _ks in _why.items())
+            _why_knob = " / ".join(dict.fromkeys(_kb for _note, _kb in _why if _kb))
+            _loss_kw = {"knob": _why_knob} if _why_knob else {}
+            print(f"[deliberation] ⚠ r{rnd} 좌석 {len(_lost_now)}석 유실 — {_why_t}"
+                  + (f" (설정 {_why_knob})" if _why_knob else ""))
+            yield _sse("status", {"step": f"⚠ {_dr(rnd)}라운드 좌석 유실: {_why_t}", "tool": None, **_loss_kw})
             # 상태줄만으로는 MCP 호출자에게 안 남는다 — 20석 심의는 상태줄이 160줄을 넘어 1라운드의 이 줄은
             # 결과를 받을 때 창(최근 30줄) 밖이다. 의장에게도 알리지만(_loss_note) 결정문에 옮겨 적을지는 모델
             # 손에 달렸다. 카드와 경고 둘 다 낸다 — 카드는 **먼저 온** 30건을, 경고는 **마지막** 10건을 남기므로
             # 좌석별 실패 카드가 자리를 채운 뒤의 늦은 유실도, 경고가 쌓인 뒤의 이른 유실도 한쪽에는 남는다.
-            _lost_msg = (f"{_dr(rnd)}라운드 좌석 유실 — {', '.join(_lost_now)} 이(가) 오류·시간초과로 이 라운드에 "
-                         "발언하지 못했다. 그 도메인의 판단이 빠진 채 진행한다.")
-            yield _sse("warning", {"code": "seat_lost", "message": _lost_msg})
-            yield _delib("evidence", source="좌석 유실", included=False, notice=True, text=_lost_msg)
+            _lost_msg = (f"{_dr(rnd)}라운드 좌석 유실 — {', '.join(_lost_now)} 이(가) 이 라운드에 발언하지 "
+                         f"못했다({_why_t}). 그 도메인의 판단이 빠진 채 진행한다.")
+            yield _sse("warning", {"code": "seat_lost", "message": _lost_msg, **_loss_kw})
+            yield _delib("evidence", source="좌석 유실", included=False, notice=True, text=_lost_msg, **_loss_kw)
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
         if opts.stop_after_round == 1 and rnd == 1:

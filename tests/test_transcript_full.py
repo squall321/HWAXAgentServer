@@ -33,7 +33,7 @@ def _make_job(monkeypatch, tmp_path):
     async def _tools(*_a, **_k):
         return {"agent_search": _Tool("agent_search")}
 
-    async def _round(_llm, personas, _prompt_fn, _rnd, required=(), validator_fn=None, opts=None):
+    async def _round(_llm, personas, _prompt_fn, _rnd, required=(), validator_fn=None, opts=None, fails=None):
         for p in personas:
             text = _LONG if p["key"] == "mech-a" else _SHORT
             yield {"persona": p["key"], "lens": text, "recommendation": text, "position_short": "R 확대"}

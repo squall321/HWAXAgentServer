@@ -407,7 +407,9 @@ def _apply(job: dict, event: str, data: dict) -> None:
     elif event == "error":
         job["error"] = str(data.get("message") or "알 수 없는 오류")
     elif event == "warning":
-        job["warnings"] = (job.get("warnings") or [])[-9:] + [str(data.get("message") or "")]
+        # 설정 이름(knob)은 상태줄·카드와 같다 — 화면 글에는 없고 여기서 붙인다.
+        job["warnings"] = (job.get("warnings") or [])[-9:] + [
+            str(data.get("message") or "") + (f" (설정 {data['knob']})" if data.get("knob") else "")]
         job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
 
 
