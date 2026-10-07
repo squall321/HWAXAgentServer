@@ -3688,6 +3688,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
     gather_pool: list = []    # [(라운드, 좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
+    seat_lookups: list = []   # 좌석이 받은 자기 조회 블록 — 라운드마다 비워지므로 따로 모은다(결정문 수치 대조의 출처)
 
     for rnd in range(1, N + 1):
         kind = _kind(rnd)
@@ -3886,6 +3887,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             #   6라운드 심의 하나가 17MB~218MB 를 심의 내내 붙잡는다.
                             gather_pool.append((rnd, _k, _tn, _ap, _out[:_SHARE_ITEM_MAX * 2]))
                     _gathered[_k] = _blk
+                    if _blk:
+                        seat_lookups.append(_blk)
             finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
                 for _t in _gt:
                     if not _t.done():
@@ -4261,10 +4264,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
                              "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
                              "별도 판단입니다.")
-    # 의사결정문 수치 대조 — **의장이 본 것**(좌석 발언·근거·화두)에 없는 수치는 의장이 지어낸
+    # 의사결정문 수치 대조 — **심의에 나온 것**(좌석 발언·근거·화두)에 없는 수치는 의장이 지어낸
     # 값이다. 챗에는 이 판정이 근거 블록으로 있었는데, 정작 가장 중요한 산출물인 결정문에는
     # 없었다(실측 점검). 판정은 챗과 같은 공용 모듈이 한다 — 화면마다 기준이 달라지면 안 된다.
-    _bad_num = unsourced_numbers(decision, chair_human + " " + (question or ""))
+    # ⚠ 출처를 의장 프롬프트(chair_human)만으로 잡지 않는다. 거기 실린 전사는 상한에서 **줄인 판**이고
+    #   좌석이 받은 지식카드·자유 조회 결과는 아예 없다 — 좌석이 근거를 대고 말한 수치가 '출처 미확인'
+    #   으로 찍혔다(S26U 피드백 1-10). 좌석의 원 발언(전사는 그것을 값마다 _SER_CLIP 에서 끊은 것이다)과
+    #   좌석이 실제로 받은 것을 함께 본다. 호출자가 보낸 근거 목록(opts.evidence)은 통째로 넣지 않는다 —
+    #   예산을 넘겨 빠진 항목은 아무도 못 봤고, 실린 항목은 chair_human 에 이미 있다.
+    _num_src = "\n".join(
+        [chair_human, question or ""]
+        + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
+        + list(knowledge_by_key.values()) + seat_lookups
+        + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
+    _bad_num = unsourced_numbers(decision, _num_src)
     if _bad_num:
         decision += ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다 — 의장이 "
                      "추론·계산한 값일 수 있으니 그대로 인용하지 마십시오: "
