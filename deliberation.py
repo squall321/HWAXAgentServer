@@ -576,6 +576,7 @@ def _modifier_note(mods):
 # 신규 Job 전용 지정 좌석 — 방법론의 반대/반증 역할을 "좌석 구조"로 보장한다. 프롬프트로 역할을
 # 요청만 하면 그 역할을 맡을 좌석이 없을 수 있어(발굴이 반대석을 안 뽑음), 합성 좌석을 못박아 앉힌다.
 # 합성 키(레지스트리에 없음)라 지식카드 RAG 는 조회하지 않고(_kn_seats), 역할은 시스템 프롬프트에 직접 실린다.
+# 키를 AIDataHub 에 등록하고 레코드를 묶었으면 그 키를 DELIB_KNOWLEDGE_SYNTHETIC_SEATS 에 적어 조회를 연다(_KN_SYNTH).
 _CHAIR_ADVERSARY = {
     "credibility": {
         "key": "delib-redteam", "label": "red-team 지정석",
@@ -1937,6 +1938,15 @@ KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 # 20석이면 조회 20건이 동시에 AIDataHub 로 가고, 심의 둘이 겹치면 40건이다. 밀려서 늦어진 조회는
 # 제한시간을 넘겨 폴백으로 한 번씩 더 쏜다(S26U 피드백 1-8). 제한시간은 줄 선 시간을 빼고 건마다 잰다.
 _KN_CONC = _env_int("DELIB_KNOWLEDGE_CONCURRENCY", 6)
+# 합성 지정석(_CHAIR_ADVERSARY 의 `delib-*`) 가운데 지식카드를 **조회할** 좌석 키 — 쉼표 목록, 기본은 빈 값.
+# 합성 지정석은 레지스트리에 없는 키라 묻지 않는다(물으면 매번 404 였다 — S26U 피드백 1-1). 그런데 그
+# 건너뛰기가 무조건이면, 반대석을 AIDataHub 에 에이전트로 등록하고 레코드(과거 기각 선례 등)를 묶어도
+# 엔진이 묻지 않아 코드를 다시 고쳐야 한다. **등록한 키만** 여기에 적는다 — 등록 안 된 키를 적으면 그
+# 좌석은 다시 매번 404 로 강등된다(예: DELIB_KNOWLEDGE_SYNTHETIC_SEATS=delib-baseline-defender).
+# 여는 것은 합성 지정석뿐이다 — 다른 좌석은 적지 않아도 조회하고, 지식카드 조회 자체가 꺼진 심의
+# (persona_knowledge=0 · 봉인)는 이 목록과 무관하게 아무 좌석도 묻지 않는다.
+_KN_SYNTH = frozenset(k.strip() for k in os.environ.get("DELIB_KNOWLEDGE_SYNTHETIC_SEATS", "").split(",")
+                      if k.strip())
 
 
 # 카드의 인과 검증 상태 → 모델에게 보일 꼬리표. validated 는 안 붙인다(기본이라 소음이 된다).
@@ -3526,9 +3536,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 돌아 좌석 하나에 최대 2 × KNOWLEDGE_TIMEOUT_S 를 쓰고(실사용 로그에서 74회), 그 404 가
         # '지식카드 강등' 으로 떠서 진짜 강등과 섞였다. 묻지 않은 좌석은 인원수에서도 뺀다 —
         # '관련 지식 없음' 으로 적으면 못 물어본 것과 없는 것이 또 섞인다. 이어하기로 승계된
-        # 지정석은 origin 이 떨어져 올 수 있어 키 접두사로도 알아본다.
+        # 지정석은 origin 이 떨어져 올 수 있어 키 접두사로도 알아본다. 등록했다고 설정에 적은
+        # 합성 지정석(_KN_SYNTH)은 다른 좌석과 똑같이 묻는다.
         _kn_seats = [p for p in personas
-                     if p.get("origin") != "adversary" and not str(p["key"]).startswith("delib-")]
+                     if p["key"] in _KN_SYNTH
+                     or (p.get("origin") != "adversary" and not str(p["key"]).startswith("delib-"))]
 
         # 한 번에 도는 수(_KN_CONC). 세마포어는 **여기서** 만든다 — 모듈에 하나 두면 처음 쓴 이벤트
         # 루프에 묶여, 다른 루프에서 도는 심의가 줄을 서는 순간 죽는다.
