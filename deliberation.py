@@ -96,6 +96,10 @@ HUMAN_NOTE_MAX = _env_int("DELIB_HUMAN_NOTE_MAX", 2000)
 # 종전엔 숫자가 _resolve_opts 안에 흩어져 있었고 말없이 잘랐다 — 도구 8개를 보낸 호출자는 6개만 돌았다는
 # 것을, 이어하기를 부른 사람은 이전 결정문이 앞 8,000자만 실렸다는 것을 알 길이 없었다.
 _TOOLS_MAX, _APPS_MAX, _OPTIONS_MAX, _NN_MAX = 6, 3, 8, 12
+# 지정 도구 결과 — 도구 하나의 상한과, 좌석 프롬프트에 싣는 합의 상한(자). 합은 매 라운드 전 좌석에 실리는데
+# 컨텍스트 회계(_pre_budget) 밖이라 넉넉히 올리지 않는다(사람 의견 상한과 같은 까닭). 넘으면 도구마다 같은
+# 몫으로 줄인다 — 이어 붙여 자르면 뒤쪽 도구가 통째로 빠진다(스트림의 0.7 단계).
+_TOOL_CHUNK_MAX, _TOOL_INJECT_MAX = 2000, 5000
 _SUMMARY_MAX, _NN_ITEM_MAX, _OPTION_ITEM_MAX, _ROLE_REQ_MAX = 8000, 1200, 400, 2000
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
 _TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
@@ -3391,7 +3395,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 파싱**한다(페르소나 발굴·역할 로드·지정 도구 근거). 그러므로 프롬프트 보호용 절단을 걸면
     # 안 된다. 실측 사고: TOOL_RESULT_MAX=6000 인 박스에서 recommend_agents 응답(≈6.5KB)이 잘려
     # 파싱이 실패했고, 심의가 매번 no_personas 로 죽었다. 라운드에 들어가는 양은 주입 시점의
-    # 별도 캡(_chunks 2000자 / tool_inject 5000자 / _ROLE_CLIP)이 이미 통제한다.
+    # 별도 캡(_TOOL_CHUNK_MAX / _TOOL_INJECT_MAX / _ROLE_CLIP)이 이미 통제한다.
     from app import CATALOG_DESC_MAX, CATALOG_RESULT_MAX  # noqa: PLC0415 — 순환 방지용 늦은 import
     tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX, user=user, user_pat=user_pat)
     if not tools:
@@ -3535,7 +3539,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     #      인자는 LLM 이 도구 스키마를 보고 구성(불가하면 skip) — 도구별 실패는 비치명.
     tool_inject = ""
     if opts.delib_tools:
-        _chunks, _used = [], []
+        _chunks, _used, _got = [], [], []     # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
@@ -3583,16 +3587,35 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     break
                 _err_note = (_out or "(빈 응답)")[:500]
             if _good:
-                _cut = f" …[{len(_good):,}자 중 2,000자]" if len(_good) > 2000 else ""
-                _chunks.append(f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n{_good[:2000]}{_cut}")
+                _head = f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n"
+                _cut = (f" …[{len(_good):,}자 중 {_TOOL_CHUNK_MAX:,}자]" if len(_good) > _TOOL_CHUNK_MAX else "")
+                _chunks.append(f"{_head}{_good[:_TOOL_CHUNK_MAX]}{_cut}")
+                _got.append((_head, _good))
                 _used.append(_tn)
                 ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
-        if _chunks:
+        if _got:
+            # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에
+            # 돌린다). 종전엔 이어 붙인 글을 상한에서 잘랐다 — 도구 셋만 길어도 셋째는 표식 없이 토막 나고
+            # 넷째부터는 좌석에 아예 안 갔는데, 도구마다 '심의에 포함' 카드가 뜨고 의장의 근거 프로파일은
+            # '도구 조회 6건' 이었다. 목록·검색 도구를 먼저 돌리므로 빠지는 쪽은 늘 수치가 든 상세 도구였다.
+            # 통째로 빼지 않고 몫을 나누는 까닭도 그것이다 — 전부 조금씩 보이는 쪽이 낫다.
+            _room = _TOOL_INJECT_MAX - sum(len(_h) + 30 for _h, _g in _got)     # 머리줄·절단 표식 몫을 먼저 뗀다
+            _, _tshare = _fit_rows([(_h, _g[:_TOOL_CHUNK_MAX]) for _h, _g in _got], max(_room, 1), floor=200)
+            _tcap = _tshare or _TOOL_CHUNK_MAX
             tool_inject = ("[사용자 지정 도구 정량 결과 (실호출 — 발언에 인용할 것. 여기 없는 수치는 "
-                           "지어내지 말 것)]\n" + "\n\n".join(_chunks)[:5000] + "\n")
+                           "지어내지 말 것)]\n" + "\n\n".join(
+                               _h + _g[:_tcap] + (f" …[{len(_g):,}자 중 {_tcap:,}자]" if len(_g) > _tcap else "")
+                               for _h, _g in _got) + "\n")
+            if _tshare:
+                # 상태줄이 아니라 카드로 — 잡 원장은 좌석에 주지 않은 카드만 적는다(MCP 호출자가 보는 것은 그쪽이다).
+                yield _delib("evidence", source="지정 도구 근거 상한 초과", included=False,
+                             text=f"지정 도구 결과 {len(_got)}건의 합이 상한({_TOOL_INJECT_MAX:,}자)을 넘어 "
+                                  f"도구마다 앞 {_tshare:,}자까지만 좌석에 실었다 — 줄인 것: "
+                                  + ", ".join(_n for _n, (_h, _g) in zip(_used, _got) if len(_g) > _tshare)
+                                  + ". 뒷부분의 수치는 좌석이 보지 못했다.")
             yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
                                   "tools_used": _used})
 
