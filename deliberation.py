@@ -3470,6 +3470,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 else:
                     yield _sse("status", {"step": "지정 앱의 조회 도구를 찾지 못해 전체 범위로 진행",
                                           "tool": None})
+                    # 상태줄 한 줄로는 잡 원장의 최근 30줄 창 밖으로 밀려난다(좌석마다 조회 줄이 찍힌다) — 그러면
+                    # MCP 호출자에게 남는 것은 지정한 앱이 그대로 적힌 잡 기록뿐이라 좁혀진 줄 안다. 카드로도
+                    # 남긴다(좌석에 안 준 근거가 아니라 알림이다 — notice).
+                    yield _delib("evidence", source="지정 앱 범위 제한 불가", included=False, notice=True,
+                                 text=f"지정한 앱({', '.join(opts.delib_apps)})의 조회 도구를 찾지 못해 좌석 자유 "
+                                      f"조회를 좁히지 못했다 — 전체 범위({len(_g)}종)로 돈다.")
             # ⚠ 스키마 예산 — 챗 경로엔 TOOL_SCHEMA_BUDGET 이 있는데 **여기엔 없었다.**
             # 174종을 통째로 바인딩하면 좌석 프롬프트가 16K 모델에서 그대로 400 이 나고,
             # 실패는 print 한 줄로만 남아 심의는 정상처럼 끝난다(실측: 7명 전원 400).
@@ -3540,6 +3546,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tool_inject = ""
     if opts.delib_tools:
         _chunks, _used, _got = [], [], []     # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
+        _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
@@ -3549,6 +3556,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _t = tools.get(_tn)
             if _t is None:
                 yield _sse("status", {"step": f"지정 도구 없음: {_tn} — 건너뜀", "tool": _tn})
+                _tool_miss.append(_tn)
                 continue
             _brief = _tool_schema_brief(_t)
             # 인자 구성 → 호출. 도구가 스키마 위반 등 에러 응답(ok:false/errors)을 주면 그 에러를
@@ -3596,6 +3604,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
+                _tool_fail.append(_tn)
+        # 돌지 않은 지정 도구 — 상태줄은 원장의 창 밖으로 밀려나고, 잡 기록에는 지정한 도구가 걸린 것처럼
+        # 적혀 있다. 도구마다 한 장씩 내지 않는다(원장은 30건까지다) — 한 장에 모은다.
+        if _tool_miss or _tool_fail:
+            yield _delib("evidence", source="지정 도구 미실행", included=False,
+                         text=f"지정 도구 {len(_ordered)}개 중 {len(_tool_miss) + len(_tool_fail)}개는 결과를 "
+                              "좌석에 주지 못했다 — "
+                              + " · ".join(x for x in (
+                                  f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
+                                  f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
+                              ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에
             # 돌린다). 종전엔 이어 붙인 글을 상한에서 잘랐다 — 도구 셋만 길어도 셋째는 표식 없이 토막 나고
@@ -3994,6 +4013,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _sshare:
             yield _sse("status", {"step": f"직전 라운드 {len(prev_t):,}자 — 좌석 프롬프트 상한 "
                                           f"{_SEAT_CTX:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
+            # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다).
+            yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
+                         text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
+                              f"({_SEAT_CTX:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
+                              "잘린 것은 긴 발언의 뒷부분이다.")
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
         yield _delib("stage", stage=f"r{rnd}", n=len(personas))
@@ -4295,6 +4319,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             print(f"[deliberation] ⚠ r{rnd} 좌석 {len(_lost_now)}석 유실 — {', '.join(_lost_now)}")
             yield _sse("status", {"step": f"⚠ {_dr(rnd)}라운드 좌석 유실: {', '.join(_lost_now)} (오류·시간초과)",
                                   "tool": None})
+            # 상태줄만으로는 MCP 호출자에게 안 남는다 — 20석 심의는 상태줄이 160줄을 넘어 1라운드의 이 줄은
+            # 결과를 받을 때 창(최근 30줄) 밖이다. 의장에게도 알리지만(_loss_note) 결정문에 옮겨 적을지는 모델
+            # 손에 달렸다. 카드와 경고 둘 다 낸다 — 카드는 **먼저 온** 30건을, 경고는 **마지막** 10건을 남기므로
+            # 좌석별 실패 카드가 자리를 채운 뒤의 늦은 유실도, 경고가 쌓인 뒤의 이른 유실도 한쪽에는 남는다.
+            _lost_msg = (f"{_dr(rnd)}라운드 좌석 유실 — {', '.join(_lost_now)} 이(가) 오류·시간초과로 이 라운드에 "
+                         "발언하지 못했다. 그 도메인의 판단이 빠진 채 진행한다.")
+            yield _sse("warning", {"code": "seat_lost", "message": _lost_msg})
+            yield _delib("evidence", source="좌석 유실", included=False, notice=True, text=_lost_msg)
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
         if opts.stop_after_round == 1 and rnd == 1:
