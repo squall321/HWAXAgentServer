@@ -247,7 +247,7 @@ async def lifespan(app: FastAPI):
     disable_stream = os.environ.get("LLM_DISABLE_STREAMING", "0") == "1"
 
     # LLM 튜닝은 전부 env — 환경(dev qwen 16K vs 상암 GLM)마다 다른 값을 배포 없이 적용한다.
-    # 미설정 시 기존 동작과 동일(temperature=0, max_tokens 미전송=무상한, effort·timeout 미전달).
+    # 미설정 시 temperature=0, max_tokens 미전송=무상한, effort 미전달. **시간 한도는 미설정이어도 걸린다.**
     # 파싱은 안전 파서(_env_*) — 오타 값이 lifespan 에서 서버 기동을 죽이지 않고 경고 후 기본값.
     #   LLM_TEMPERATURE      : 기본 0 (ReAct 도구호출 결정성)
     #   LLM_MAX_TOKENS       : 0/미설정=미전송. 설정 시 8192급 여유값 권장 — 2048~4096은
@@ -255,44 +255,78 @@ async def lifespan(app: FastAPI):
     #   LLM_REASONING_EFFORT : 빈 값=미전달(RA 규약). GLM 계열은 반드시 extra_body 경유
     #                          chat_template_kwargs 로 전달 — 톱레벨 reasoning_effort 필드는
     #                          OpenAI 표준 파라미터로 나가므로 쓰지 않는다.
-    #   LLM_TIMEOUT_S        : 챗(ReAct) 경로 포함 전역 타임아웃. 0/미설정=라이브러리 기본(600s).
-    #   DELIB_*              : 심의 라운드 전용 오버라이드(temperature/max_tokens/effort/timeout).
+    #   LLM_TIMEOUT_S        : 챗(ReAct)·띵킹·심의 전 도우미가 쓰는 기본 LLM 의 호출 시도 1회 한도(초).
+    #                          기본 900, 0=무제한. 종전 주석은 '미설정=라이브러리 기본 600s' 라고 적었지만
+    #                          걸려 있지 않았다 — langchain-openai 가 timeout=None 을 명시로 넘겨 openai 의
+    #                          기본값이 안 걸린다(실측: 요청에 실린 타임아웃 넷이 전부 None). 멈춘 호출 하나를
+    #                          끝없이 기다렸다. 심의가 공유 LLM 을 차지한 동안에도 버티게 600 보다 넉넉히 둔다.
+    #   LLM_CONNECT_TIMEOUT_S: LLM 서버에 **연결**하는 한도(초). 기본 10. 위 한도와 따로 준다 — float 하나를
+    #                          주면 connect 도 그 값이라, read 를 30분~4시간으로 올리는 순간 죽은 서버에 붙으려는
+    #                          시도도 그만큼 기다린다. 연결은 LLM 큐 대기와 무관하다(느린 일이 아니라 죽은
+    #                          상대를 재는 값이라 짧게 둔다).
+    #   LLM_MAX_RETRIES      : openai SDK 의 자동 재시도(타임아웃·연결 오류·429·5xx) 횟수. 기본 2(종전
+    #                          라이브러리 기본값 그대로 — 이름만 붙였다).
+    #   DELIB_*              : 심의 라운드 전용(temperature/max_tokens/effort/timeout/재시도).
     #                          챗 경로는 위 LLM_* 만 따르므로 심의 튜닝이 챗에 새지 않는다.
-    def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0) -> ChatOpenAI:
+    #   DELIB_TIMEOUT_S      : 심의 LLM 호출 **시도 1회**의 한도(초). 기본 1800, 0=무제한. 좌석 발언·자유 조회
+    #                          스텝·의장·요약이 전부 이 값을 쓴다. 심의 전체 시간이 아니다 — 심의에는 벽시계가
+    #                          없다. 20석 넘는 패널이 공유 LLM 에 동시 요청을 20~44건 올리면 한 호출의 시계에
+    #                          큐 대기가 들어가 600초는 짧았고, 미설정(종전 무제한)은 멈춘 호출 하나가 잡 자리를
+    #                          영영 붙들었다. 한 심의에서만 더 필요하면 요청 timeout_s 로 올린다
+    #                          (상한 DELIB_TIMEOUT_MAX_S). ⚠ LLM_TIMEOUT_S 를 물려받지 않는다 — 챗 한도를
+    #                          줄인 박스에서 심의가 같이 줄었다.
+    #   DELIB_LLM_MAX_RETRIES: 심의의 SDK 재시도 횟수. 기본 1. 타임아웃 재시도는 생성을 처음부터 다시 한다 —
+    #                          느리지만 진행 중인 호출에는 긴 한 번이 짧은 세 번보다 낫고, 막힌 LLM 에 같은 긴
+    #                          프롬프트를 세 번 넣으면 부하만 는다. 한 번은 순간 끊김·5xx 용으로 남긴다.
+    #                          **바깥 한도 계산의 기준이다** — LLM 논리 호출 1회의 최악 = (1+재시도)×한도 + 대기
+    #                          (기본 2×1800+8 = 3608초). 리스크 앱 패널 벽시계·포털 릴레이·nginx 침묵 한도가
+    #                          이 값보다 커야 한다.
+    import httpx  # noqa: PLC0415 — openai 가 이미 끌어오는 의존성이다. 여기서만 쓴다
+
+    conn_to = _env_float("LLM_CONNECT_TIMEOUT_S", 10.0)
+
+    def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0,
+                retries: int = 2) -> ChatOpenAI:
         kw: dict = dict(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL,
-                        temperature=temperature, disable_streaming=disable_stream)
+                        temperature=temperature, disable_streaming=disable_stream,
+                        # read·write·pool 은 timeout_s(0 이하면 무제한), connect 는 따로 준다.
+                        timeout=httpx.Timeout(timeout_s if timeout_s > 0 else None,
+                                              connect=conn_to if conn_to > 0 else None),
+                        max_retries=max(0, retries))
         if max_tokens > 0:
             kw["max_tokens"] = max_tokens
         if effort:
             kw["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": effort}}
-        if timeout_s > 0:
-            kw["timeout"] = timeout_s
         return ChatOpenAI(**kw)
 
     base_t = _env_float("LLM_TEMPERATURE", 0.0)
     base_mt = _env_int("LLM_MAX_TOKENS", 0)
     base_eff = os.environ.get("LLM_REASONING_EFFORT", "")
-    base_to = _env_float("LLM_TIMEOUT_S", 0.0)
-    app.state.llm = _mk_llm(base_t, base_mt, base_eff, base_to)
+    base_to = _env_float("LLM_TIMEOUT_S", 900.0)
+    base_rt = _env_int("LLM_MAX_RETRIES", 2)
+    app.state.llm = _mk_llm(base_t, base_mt, base_eff, base_to, base_rt)
 
-    # 심의(라운드 토론) 전용 오버라이드 — DELIB_* 가 하나라도 설정되면 별도 인스턴스.
-    if any(os.environ.get(k, "") for k in
-           ("DELIB_TEMPERATURE", "DELIB_MAX_TOKENS", "DELIB_REASONING_EFFORT", "DELIB_TIMEOUT_S")):
-        d_t = _env_float("DELIB_TEMPERATURE", base_t)
-        d_mt = _env_int("DELIB_MAX_TOKENS", base_mt)
-        d_eff = os.environ.get("DELIB_REASONING_EFFORT", "") or base_eff
-        d_to = _env_float("DELIB_TIMEOUT_S", base_to)
-        app.state.delib_llm = _mk_llm(d_t, d_mt, d_eff, d_to)
-        print(f"[agent] 심의 전용 LLM 오버라이드 — temperature={d_t}, "
-              f"max_tokens={d_mt or '미전송'}, effort={d_eff or '미전달'}, "
-              f"timeout={d_to or '기본'}")
-    else:
-        d_t, d_mt, d_eff, d_to = base_t, base_mt, base_eff, base_to
-        app.state.delib_llm = app.state.llm
-    # 요청 단위 타임아웃 오버라이드(웹 토글)용 — 같은 temperature/max_tokens/effort 로 timeout 만
+    # 심의(라운드 토론) 전용 — **늘** 별도 인스턴스다. 종전엔 DELIB_* 가 하나도 없으면 챗 LLM 을 그대로 써서
+    # '미설정 = 무제한' 이 심의에 걸렸다(dev 실측). 한도와 재시도 횟수가 챗과 다르므로 따로 만든다.
+    d_t = _env_float("DELIB_TEMPERATURE", base_t)
+    d_mt = _env_int("DELIB_MAX_TOKENS", base_mt)
+    d_eff = os.environ.get("DELIB_REASONING_EFFORT", "") or base_eff
+    d_to = _env_float("DELIB_TIMEOUT_S", 1800.0)
+    d_rt = _env_int("DELIB_LLM_MAX_RETRIES", 1)
+    app.state.delib_llm = _mk_llm(d_t, d_mt, d_eff, d_to, d_rt)
+    print(f"[agent] LLM 한도 — 챗: 호출 1회 {base_to or '무제한'}초·재시도 {base_rt}회(LLM_TIMEOUT_S·"
+          f"LLM_MAX_RETRIES) / 심의: 호출 1회 {d_to or '무제한'}초·재시도 {d_rt}회(DELIB_TIMEOUT_S·"
+          f"DELIB_LLM_MAX_RETRIES) / 연결 {conn_to or '무제한'}초(LLM_CONNECT_TIMEOUT_S)")
+    print(f"[agent] 심의 전용 LLM — temperature={d_t}, "
+          f"max_tokens={d_mt or '미전송'}, effort={d_eff or '미전달'}")
+    for _name, _v in (("LLM_TIMEOUT_S", base_to), ("DELIB_TIMEOUT_S", d_to)):
+        if _v <= 0:
+            print(f"[agent] ⚠ {_name}=0 — LLM 호출에 시간 한도가 없다. 멈춘 호출 하나를 끝없이 기다린다"
+                  "(심의면 잡 자리를 영영 붙든다)")
+    # 요청 단위 타임아웃 오버라이드(웹 토글)용 — 같은 temperature/max_tokens/effort/재시도로 timeout 만
     # 바꿔 재구성하는 팩토리(구성만·연결 없음). 기본 타임아웃도 노출해 오버라이드 필요 판정에 쓴다.
     app.state.delib_timeout_s = d_to
-    app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff: _mk_llm(_t, _m, _e, ts))
+    app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff, _r=d_rt: _mk_llm(_t, _m, _e, ts, _r))
     app.state.llm_nostream = disable_stream
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")

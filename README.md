@@ -49,6 +49,11 @@ whole deliberation by wall clock. Values are read once at startup (restart to ap
 
 | var | default | meaning |
 |---|---|---|
+| `LLM_CONNECT_TIMEOUT_S` | `10` | Connect timeout to the LLM endpoint, for chat and deliberation alike. Kept short on purpose: it detects a dead server, it does not measure a slow one. |
+| `DELIB_TIMEOUT_S` | `1800` | Read timeout of **one attempt** of one deliberation LLM call (seat turn, free-lookup step, chair, summary). Not a limit on the whole deliberation — there is none. `0` = unlimited (logged at startup). Does not inherit `LLM_TIMEOUT_S`. A single request may ask for more with `delib_opts.timeout_s`, up to `DELIB_TIMEOUT_MAX_S`. |
+| `DELIB_LLM_MAX_RETRIES` | `1` | openai SDK retries for deliberation calls (a timeout retry restarts generation from scratch). Worst case of one logical call = (1+retries)×`DELIB_TIMEOUT_S` + backoff = 3608 s by default; outer limits (risk app panel wall clock, portal/nginx idle limits) are sized on this. |
+| `LLM_TIMEOUT_S` | `900` | Read timeout of one attempt of a chat / Thinking / pre-deliberation helper call. `0` = unlimited (logged at startup). Used to be unset = unlimited. |
+| `LLM_MAX_RETRIES` | `2` | openai SDK retries for chat calls (the library default, now named). |
 | `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
 
 ## Status
