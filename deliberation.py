@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 
 from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
-from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
 # _tools_by_name 이 세우고, _evidence_note(결정문 헤더)와 스트림(라이브 배너)이 읽는다.
@@ -1277,6 +1276,21 @@ def _with_groups(connections: dict, groups: list, user: str = "", user_pat: str 
     return _impl(connections, list(groups), user, user_pat)
 
 
+# 게이트웨이에서 도구 목록을 받을 때의 시도 횟수(자격 하나당). 챗과 같은 수다(app._get_tools_retry 의 기본값).
+_TOOL_LOAD_TRIES = 3
+
+
+async def _load_tools(scoped: dict) -> list:
+    """게이트웨이에서 도구 목록을 받는다 — 챗과 **같은 재시도**를 쓴다(app._get_tools_retry: 일시 실패·빈
+    목록이면 0.5초·1초 쉬고 다시, 401·403 은 곧바로 올린다).
+
+    종전엔 심의만 한 번에 끝냈다. 게이트웨이 재기동과 겹친 1~2초 때문에, 대기열에서 수십 분 줄을 섰던 심의가
+    시작하자마자 '게이트웨이 도구를 불러오지 못했습니다' 로 죽었다. 전송 한도(30초/300초)는 그대로다 —
+    한도를 늘릴 자리가 아니라 다시 물을 자리다."""
+    from app import _get_tools_retry  # noqa: PLC0415 — 순환 방지용 늦은 import
+    return await _get_tools_retry(scoped, tries=_TOOL_LOAD_TRIES)
+
+
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
                          user_pat: str = "") -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
@@ -1287,7 +1301,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     scoped = _with_groups(conns, sorted(groups), user, user_pat)
     via_pat = bool(user_pat)        # 이 도구들이 사용자 토큰으로 붙는가 — 아래 로드 폴백을 타면 거짓이 된다
     try:
-        tools = await MultiServerMCPClient(scoped).get_tools()
+        tools = await _load_tools(scoped)
     except Exception as _pe:
         # 챗(app._agent_for)과 같은 안전망을 여기에도 둔다. 심의가 사용자 PAT 로 갈아탄
         # 뒤로는 게이트웨이가 그 PAT 를 거절하면 /심의·/시뮬심의·/시험계획·/보고서 가
@@ -1301,7 +1315,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         #   '이 심의는 서비스 계정으로 근거를 모았다'를 사용자에게 보인다. 무음 강등을 막는다.
         _pat_degraded.set("사용자 자격증명이 게이트웨이에 거절돼 서비스 계정으로 조회함")
         scoped = _with_groups(conns, sorted(groups), user, "")
-        tools = await MultiServerMCPClient(scoped).get_tools()
+        tools = await _load_tools(scoped)
         via_pat = False
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
@@ -1323,7 +1337,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         async def _svc_tools() -> dict:
             async with _svc_lock:
                 if not _svc:
-                    got = await MultiServerMCPClient(_with_groups(conns, sorted(groups), user, "")).get_tools()
+                    got = await _load_tools(_with_groups(conns, sorted(groups), user, ""))
                     try:
                         from app import _prep_tool  # noqa: PLC0415
                         got = [_prep_tool(t, result_max, desc_max) for t in got]
@@ -3646,10 +3660,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 파싱이 실패했고, 심의가 매번 no_personas 로 죽었다. 라운드에 들어가는 양은 주입 시점의
     # 별도 캡(_TOOL_CHUNK_MAX / _TOOL_INJECT_MAX / _ROLE_CLIP)이 이미 통제한다.
     from app import CATALOG_DESC_MAX, CATALOG_RESULT_MAX  # noqa: PLC0415 — 순환 방지용 늦은 import
-    tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX, user=user, user_pat=user_pat)
+    # 다시 물어도 못 받았으면 '심의 처리 중 오류' 가 아니라 이 오류로 끝낸다 — 몇 번 물었고 무엇이었는지 싣는다.
+    _load_exc = None
+    try:
+        tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX, user=user,
+                                     user_pat=user_pat)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[deliberation] 게이트웨이 도구 로드 실패({_TOOL_LOAD_TRIES}회 시도): {exc!r}")
+        tools, _load_exc = {}, exc
     if not tools:
+        _why = (f"{_TOOL_LOAD_TRIES}회 시도 · {type(_load_exc).__name__}" if _load_exc is not None
+                else f"{_TOOL_LOAD_TRIES}회 시도 · 도구 0개" if getattr(app.state, "connections", None)
+                else "MCP 연결 설정이 없다")
         yield _sse("error", {"code": "gateway_unavailable",
-                             "message": "게이트웨이 MCP 도구를 불러오지 못했습니다(게이트웨이 확인)."})
+                             "message": f"게이트웨이 MCP 도구를 불러오지 못했습니다({_why} — 게이트웨이 확인)."})
         yield _sse("done", {}); return
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
