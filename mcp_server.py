@@ -378,7 +378,8 @@ async def deliberate_list(limit: int = 20) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다."""
     rows = delib_jobs.list_jobs(max(1, min(100, int(limit or 20))))
     return {"jobs": rows, "running": sum(1 for r in rows if r["status"] == "running"),
-            "running_max": delib_jobs.MAX_RUNNING}
+            "running_max": delib_jobs.MAX_RUNNING,
+            "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER}
 
 
 @mcp.tool(title="심의 취소",
@@ -436,6 +437,8 @@ async def deliberate_jobs() -> dict:
         },
         "limits": _evid_limits(),
         "running_max": delib_jobs.MAX_RUNNING,
+        # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
+        "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
         "note": "meeting_* 도구는 발표자료 제작용 디자인 회의체다 — 공학 심의가 아니다.",
     }
 

@@ -1,10 +1,14 @@
-# 심의 잡 동시 실행 상한 — 거절할 때 남의 잡을 보여 주지 않는다
+# 심의 잡 동시 실행 상한 — 거절할 때 남의 잡을 보여 주지 않고, 어느 상한에 걸렸는지 말한다
 #
 # 종전 거절 문구는 진행 중인 잡 id 를 **전부** 찍었다. deliberate_cancel·deliberate_result 는 id 만
 # 받으므로, 거절당한 사람이 남의 심의를 들여다보고 접을 수 있었다(S26U 피드백 1-9).
+# 상한도 전역 하나뿐이라 한 사람이 자리를 다 차지하면 나머지는 기다릴 수밖에 없었다 — 사용자별
+# 상한을 따로 둔다(기본은 전역과 같아 종전 동작 그대로다. HWAXPortal docs/delib-engine-feedback D-6).
 #
 #   실행:  .venv/bin/python -m pytest tests/test_delib_job_caps.py -q
 import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +19,9 @@ import pytest  # noqa: E402
 
 import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
+
+# 메뉴(deliberate_jobs)가 근거 예산을 재느라 모델 컨텍스트를 묻는다 — 고정해 둔다(이름째 가져와 이 파일에도 건다).
+from test_delib_silent_drops import _pin_context  # noqa: E402, F401
 
 ME, YOU, THIRD = "me@example.com", "you@example.com", "third@example.com"
 
@@ -57,8 +64,9 @@ def _refused(user=""):
     return str(e.value)
 
 
-def _caps(monkeypatch, total):
+def _caps(monkeypatch, total, per_user=None):
     monkeypatch.setattr(delib_jobs, "MAX_RUNNING", total)
+    monkeypatch.setattr(delib_jobs, "MAX_RUNNING_PER_USER", total if per_user is None else per_user)
 
 
 # ── 누출 ─────────────────────────────────────────────────────────────────────
@@ -101,9 +109,107 @@ def test_신원_없는_호출에도_남의_잡_id_를_보여_주지_않는다(le
     msg = _refused("")
     assert not any(j in msg for j in anon), msg
     assert "전체 2/2" in msg and "신원 없는 호출" in msg, msg
+    assert "deliberate_cancel" not in msg, "제 것이 뭔지 모르는 호출자에게 접으라고 했다"
 
 
 def test_자리가_있으면_시작한다(ledger, monkeypatch):
     _caps(monkeypatch, 2)
     _running(ledger, YOU)
     assert _start(ME)["user"] == ME
+
+
+# ── 어느 상한인가 ────────────────────────────────────────────────────────────
+def test_전역_상한에만_걸리면_전역이라고_말한다(ledger, monkeypatch):
+    _caps(monkeypatch, 3, 2)
+    _running(ledger, ME, YOU, THIRD)
+    msg = _refused(ME)
+    assert "전역 3건" in msg and "DELIB_JOB_MAX_RUNNING" in msg, msg
+    assert "사용자별" not in msg, msg
+
+
+def test_사용자별_상한에만_걸리면_사용자별이라고_말한다(ledger, monkeypatch):
+    _caps(monkeypatch, 6, 2)
+    mine = _running(ledger, ME, ME, YOU)
+    msg = _refused(ME)
+    assert "사용자별 2건" in msg and "DELIB_JOB_MAX_RUNNING_PER_USER" in msg, msg
+    assert "전역" not in msg, msg
+    assert all(j in msg for j in mine[:2]) and mine[2] not in msg, msg
+    assert "내 진행 중 2건" in msg and "전체 3/6" in msg, msg
+
+
+def test_둘_다_걸리면_둘_다_말한다(ledger, monkeypatch):
+    _caps(monkeypatch, 2, 2)
+    _running(ledger, ME, ME)
+    msg = _refused(ME)
+    assert "전역 2건" in msg and "사용자별 2건" in msg, msg
+
+
+# ── 사용자별 상한 ────────────────────────────────────────────────────────────
+def test_한_사람이_제_몫을_다_써도_다른_사람은_시작한다(ledger, monkeypatch):
+    _caps(monkeypatch, 6, 2)
+    _running(ledger, ME, ME)
+    _refused(ME)
+    assert _start(YOU)["user"] == YOU
+
+
+def test_신원_없는_호출은_전역_상한만_받는다(ledger, monkeypatch):
+    """신원 헤더 없이 온 호출(서비스 계정)을 빈 이름으로 묶으면 서로 다른 호출자가 한 사람이 된다."""
+    _caps(monkeypatch, 4, 1)
+    _running(ledger, "", "", "")
+    assert _start("")["user"] == "", "신원 없는 호출을 사용자별 상한(1)으로 막았다"
+    anon = _running(ledger, "", "", "", "")              # 4/4 — 전역
+    msg = _refused("")
+    assert "전역 4건" in msg and "사용자별" not in msg, msg
+    assert not any(j in msg for j in anon), f"신원 없는 호출에 남의 잡 id 를 보여 줬다 — {msg}"
+
+
+def test_신원_없는_잡은_누구의_것으로도_세지_않는다(ledger, monkeypatch):
+    _caps(monkeypatch, 6, 1)
+    _running(ledger, "", "")
+    assert _start(ME)["user"] == ME
+
+
+def test_끝난_잡은_세지_않는다(ledger, monkeypatch):
+    _caps(monkeypatch, 2, 1)
+    (jid,) = _running(ledger, ME)
+    ledger[jid]["status"] = "done"
+    assert _start(ME)["user"] == ME
+
+
+# ── 기본값 — 종전 동작 그대로 ────────────────────────────────────────────────────
+def _loaded(**env):
+    code = "import delib_jobs as j; print(j.MAX_RUNNING, j.MAX_RUNNING_PER_USER)"
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("DELIB_JOB_MAX_RUNNING")}
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60,
+                       env={**clean, **env, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert r.returncode == 0, r.stderr[-600:]
+    return tuple(int(x) for x in r.stdout.split())
+
+
+def test_사용자별_기본값은_전역_상한이다():
+    """전역 2 는 LLM 큐 보호선이고 용량은 여기서 잴 수 없다 — 손잡이를 만들되 기본 동작은 안 바꾼다."""
+    assert _loaded() == (2, 2)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="6") == (6, 6)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="6", DELIB_JOB_MAX_RUNNING_PER_USER="2") == (6, 2)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="6", DELIB_JOB_MAX_RUNNING_PER_USER="") == (6, 6)
+    assert _loaded(DELIB_JOB_MAX_RUNNING="6", DELIB_JOB_MAX_RUNNING_PER_USER="0") == (6, 6)
+
+
+def test_메뉴와_목록이_두_상한을_다_알려_준다(ledger, monkeypatch):
+    """전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다."""
+    import mcp_server
+
+    _caps(monkeypatch, 6, 2)
+    for out in (asyncio.run(mcp_server.deliberate_jobs()), asyncio.run(mcp_server.deliberate_list())):
+        assert (out["running_max"], out["running_max_per_user"]) == (6, 2), out
+
+
+@pytest.mark.parametrize("owners,ok", [((), True), ((YOU,), True), ((ME,), True),
+                                        ((ME, YOU), False), ((YOU, THIRD), False), ((ME, ME), False)])
+def test_기본값에서는_전체가_찼을_때만_거절한다(ledger, monkeypatch, owners, ok):
+    _caps(monkeypatch, 2, 2)
+    _running(ledger, *owners)
+    if ok:
+        assert _start(ME)["user"] == ME
+    else:
+        _refused(ME)

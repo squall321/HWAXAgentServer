@@ -35,6 +35,12 @@ JOB_DIR = Path(os.environ.get(
 
 # 동시 실행 상한 — 심의 하나가 좌석 수만큼 LLM 을 물고 있어서, 무제한이면 vLLM 큐가 잠긴다.
 MAX_RUNNING = int(os.environ.get("DELIB_JOB_MAX_RUNNING", "2") or 2)
+# 사용자별 상한 — 한 사람이 전역 자리를 다 차지하지 못하게 한다. **기본은 전역 상한과 같다**(비우거나
+# 0 이면 전역을 따른다 = 따로 걸리지 않는다). 전역 2 는 LLM 큐 보호선이고 용량은 여기서 잴 수 없어
+# 기본 동작을 바꾸지 않는다 — 운영이 전역을 올리고 이 값을 낮춰 쓴다(예: 6 · 2). 자리가 없으면
+# 거절한다(대기 큐는 없다 — deliberate_start 는 즉시 running 을 돌려준다는 계약이다).
+_PER_USER = int(os.environ.get("DELIB_JOB_MAX_RUNNING_PER_USER", "0") or 0)
+MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 메모리 원장 보존 개수(파일은 지우지 않는다 — 결과 회수는 파일에서도 된다).
 KEEP_IN_MEM = 200
 # 좌석 발언 전사 보존 상한(턴 수). 넘으면 이후 발언은 버리고 그 사실을 한 줄 남긴다.
@@ -290,13 +296,20 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   deliberate_cancel·deliberate_result 는 id 만 받으므로 거절당한 사람이 남의 심의를 들여다보고
     #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
     #   신원 없는 호출(서비스 계정)끼리도 서로 남이다 — 빈 이름이 같다고 한 사람으로 묶지 않는다.
+    #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
     total = running_count()
     me = (user_email or "").strip().lower()
     mine = [x["id"] for x in _JOBS.values() if me and x.get("status") == "running"
             and str(x.get("user") or "").strip().lower() == me]
+    # 어느 상한에 걸렸는지 말한다 — 사용자별이면 제 것을 접으면 풀리고, 전역뿐이면 기다려야 한다.
+    hit = []
     if total >= MAX_RUNNING:
+        hit.append(f"전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING")
+    if me and len(mine) >= MAX_RUNNING_PER_USER:
+        hit.append(f"사용자별 {MAX_RUNNING_PER_USER}건 — DELIB_JOB_MAX_RUNNING_PER_USER")
+    if hit:
         raise RuntimeError(
-            f"동시 실행 상한에 걸렸다(전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING) — "
+            f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if me
                else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
             + f" · 전체 {total}/{MAX_RUNNING}. "
