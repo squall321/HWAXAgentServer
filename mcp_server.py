@@ -451,6 +451,13 @@ async def deliberate_continue(
                **{k: v for k, v in (advanced or {}).items() if v is not None}}
     if prev_sealed:
         carried["sealed"] = 1      # 풀려던 다른 손잡이는 엔진이 닫고 '봉인이 닫은 요청' 으로 알린다
+    # 남의 심의를 이어갈 때는 **그 사람의 보고서에 이어 붙이지 않는다.** 이전 잡의 주인을 보지 않아, 남의
+    # job_id 로 이어가면 그 사람의 Report Archive 보고서에 제 회차가 페이지로 붙었다 — 읽는 쪽이 아니라 쓰는
+    # 쪽이다. 이어가는 것 자체는 막지 않는다(결과 회수와 같은 읽기다 — 팀이 서로의 심의를 봐도 되는지는
+    # 아직 정하지 않았다). 새 보고서로 간다. 규칙은 접기·목록과 같다(delib_jobs._foreign).
+    user, groups = _caller(ctx)
+    foreign = delib_jobs._foreign(prev, user)
+    append_id = int(prev.get("report_id") or 0) if append_report and not foreign else 0
     opts = _build_opts(
         rounds=rounds, modifiers=modifiers, human_note=human_note,
         # 미리 자르지 않는다 — 엔진이 상한에서 줄이고 **줄였다고 알린다**(evidence_omitted 의 '요청 값
@@ -459,19 +466,21 @@ async def deliberate_continue(
         non_negotiables=non_negotiables,
         personas=_carry_seats(prev) if keep_seats else None,
         rounds_so_far=delib_jobs.rounds_end(prev),
-        append_to_report_id=(int(prev.get("report_id") or 0) if append_report else 0),
+        append_to_report_id=append_id,
         advanced=carried,
     )
-    user, groups = _caller(ctx)
     rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
                            groups=groups, user_email=user)
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
-    out["appending_to_report"] = (prev.get("report_id") if append_report else None)
-    if out.get("queue"):
-        out["note"] = _queued_note(out["queue"])
+    out["appending_to_report"] = (prev.get("report_id") if append_report and not foreign else None)
+    notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + (
+        ["남의 심의를 이어받았다 — 그 사람의 보고서에는 이어 붙이지 않는다(저장하면 새 보고서로 간다)."]
+        if foreign and append_report else [])
+    if notes:
+        out["note"] = " ".join(notes)
     return out
 
 
@@ -513,11 +522,18 @@ async def deliberate_result(job_id: str) -> dict:
 
 
 @mcp.tool(title="심의 목록",
-          description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다.")
-async def deliberate_list(limit: int = 20) -> dict:
-    """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다."""
-    rows = delib_jobs.list_jobs(max(1, min(100, int(limit or 20))))
-    return {"jobs": rows, "running": sum(1 for r in rows if r["status"] == "running"),
+          description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다. 내가 시작한 "
+                      "심의만 실린다(행의 mine 이 참이다 — 주인이 안 적힌 옛 잡은 mine 이 거짓인 채로 함께 "
+                      "실린다). running·queued 는 전체 수다 — 남의 심의는 수로만 보인다.")
+async def deliberate_list(limit: int = 20, ctx: Context | None = None) -> dict:
+    """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
+
+    신원 있는 호출자에게는 제 잡(과 주인이 안 적힌 잡)만 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는
+    길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다."""
+    user, _groups = _caller(ctx)
+    rows = delib_jobs.list_jobs(max(1, min(100, int(limit or 20))), viewer=user)
+    # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
+    return {"jobs": rows, "running": delib_jobs.running_count(),
             "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
             "running_max": delib_jobs.MAX_RUNNING,
             "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,

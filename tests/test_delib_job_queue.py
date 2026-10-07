@@ -410,6 +410,7 @@ def test_순번_안내_어디에도_남의_잡_id_와_화두가_없다(eng, monk
             "진행 조회": await m.deliberate_status(mine["job_id"]),
             "결과 회수": await m.deliberate_result(mine["job_id"]),
             "메뉴": await m.deliberate_jobs(ctx=_ctx(ME)),
+            "목록": await m.deliberate_list(ctx=_ctx(ME)),
             "줄이 찬 거절": _refused("내 화두 셋", ME),
             "접기": await m.deliberate_cancel(mine["job_id"]),
         }
@@ -421,6 +422,94 @@ def test_순번_안내_어디에도_남의_잡_id_와_화두가_없다(eng, monk
             for other in (YOU, THIRD):
                 assert other not in text, f"{name} 에 남의 계정이 실렸다"
         assert mine["job_id"] in views["줄이 찬 거절"], "제 잡 id 는 보여 줘야 접을 수 있다"
+
+    _play(scenario)
+
+
+# ── 목록은 제 것만 보여 준다 ───────────────────────────────────────────────────────
+# 거절·순번 문구에서 남의 job_id 를 뺐는데 목록(deliberate_list)은 전원의 id 와 화두를 그대로 내줬다 — 한 번만
+# 더 부르면 다 보였다. 운영자 페르소나는 '목록으로 보고 내 것 중 하나를 접어라' 고 하는데 행에 누구 것인지
+# 표시가 없어, 접어 보고 거절당해야만 제 것을 가릴 수 있었다.
+def _rows(out):
+    return [(r["question"], r["mine"]) for r in out["jobs"]]
+
+
+def test_신원_있는_호출의_목록에는_남의_잡이_없고_제_것에는_표시가_있다(eng, monkeypatch):
+    _caps(monkeypatch, 2, queue=5)
+
+    async def scenario():
+        _start("남의 화두 가", YOU), _start("내 화두 가", ME), _start("주인 없는 화두"), _start("남의 화두 나", THIRD)
+        await _tick()
+        mine = await m.deliberate_list(ctx=_ctx("Me@Example.com"))       # 대소문자가 달라도 같은 사람이다
+        assert sorted(_rows(mine)) == [("내 화두 가", True), ("주인 없는 화두", False)], _rows(mine)
+        assert not any(k in r for r in mine["jobs"] for k in ("user", "owner")), "행에 계정을 실었다"
+        # 수는 전체다 — 제 것만 세면 상한이 얼마나 찼는지를 틀리게 읽는다.
+        assert (mine["running"], mine["queued"], mine["running_max"]) == (2, 2, 2), mine
+        everyone = await m.deliberate_list()                               # 신원 없는 호출(운영이 쓰는 길)
+        assert len(everyone["jobs"]) == 4 and not any(r["mine"] for r in everyone["jobs"]), _rows(everyone)
+
+    _play(scenario)
+
+
+def test_남의_잡이_많아도_목록에서_제_잡이_밀려나지_않는다(eng, monkeypatch):
+    """남의 것을 뺀 **뒤에** limit 을 건다 — 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다."""
+    _caps(monkeypatch, 9)
+
+    async def scenario():
+        old = _start("내 오래된 화두", ME)
+        theirs = [_start(f"남의 화두 {i}", YOU) for i in range(3)]
+        await _tick()
+        old["started_at"] = 100.0
+        for i, job in enumerate(theirs):
+            job["started_at"] = 200.0 + i
+        out = await m.deliberate_list(limit=1, ctx=_ctx(ME))
+        assert _rows(out) == [("내 오래된 화두", True)], _rows(out)
+        return [old] + theirs
+
+    jobs = _play(scenario)
+    # 재기동 뒤 — 메모리에는 없고 파일만 있다. 파일을 최근 순으로 훑을 때도 남의 것을 세지 않는다.
+    import os
+
+    for store in (delib_jobs._JOBS, delib_jobs._TASKS, delib_jobs._PENDING):
+        store.clear()
+    for i, job in enumerate(jobs):          # 남의 잡 파일이 더 최근이다
+        path = delib_jobs.JOB_DIR / f"{job['id']}.json"
+        delib_jobs._persist(job)
+        os.utime(path, (1000.0 + i, 1000.0 + i))
+    out = asyncio.run(m.deliberate_list(limit=1, ctx=_ctx(ME)))
+    assert _rows(out) == [("내 오래된 화두", True)], _rows(out)
+    assert len(asyncio.run(m.deliberate_list(limit=4))["jobs"]) == 4
+
+
+# ── 남의 심의를 이어가도 그 사람의 보고서에는 쓰지 않는다 ─────────────────────────────
+# 이어하기는 기본으로 이전 회차의 Report Archive 보고서에 페이지를 이어 붙인다. 이전 잡의 주인을 보지 않아,
+# 남의 job_id 로 이어가면 **그 사람의 보고서**에 제 회차가 붙었다 — 읽는 쪽이 아니라 쓰는 쪽이다.
+def _done(owner, jid="prev-1"):
+    job = {"id": jid, "job": "default", "status": "done", "question": "힌지 크랙 원인", "decision": "이전 결정문",
+           "seats": [{"key": "mech-a", "role": "기구"}, {"key": "rel-b", "role": "신뢰성"}], "opts": {},
+           "report_id": 7, "user": owner, "started_at": 0.0}
+    delib_jobs._JOBS[jid] = job
+    return job
+
+
+@pytest.mark.parametrize("owner,caller,appends", [
+    (YOU, ME, False),            # 남의 심의 — 이어는 가되 그 보고서에는 붙이지 않는다
+    (ME, "Me@Example.com", True),   # 내 심의
+    ("", ME, True),              # 주인이 안 적힌 잡 — 누구 것인지 모르니 종전대로
+    (YOU, "", True),             # 신원 없는 호출(운영이 쓰는 길) — 종전대로
+])
+def test_남의_심의를_이어갈_때는_그_보고서에_이어_붙이지_않는다(eng, monkeypatch, owner, caller, appends):
+    _caps(monkeypatch, 3)
+
+    async def scenario():
+        _done(owner)
+        out = await m.deliberate_continue("prev-1", "두께를 다시 보라", ctx=_ctx(caller) if caller else None)
+        await _tick()
+        got = eng.seen["힌지 크랙 원인"].opts
+        assert (got.get("append_to_report_id") == 7) is appends, got
+        assert out["appending_to_report"] == (7 if appends else None), out
+        assert ("남의 심의" in (out.get("note") or "")) is (not appends), out.get("note")
+        assert YOU not in json.dumps(out, ensure_ascii=False) or caller == "", "응답에 주인의 계정을 실었다"
 
     _play(scenario)
 

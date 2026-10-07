@@ -225,6 +225,14 @@ def _owner(job: dict) -> str:
     return str(job.get("user") or "").strip().lower()
 
 
+def _foreign(job: dict, viewer: str) -> bool:
+    """그 잡이 viewer 에게 **남의 것**인가. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)에게는 남의 것이
+    없고, 주인이 안 적힌 잡은 누구에게도 남의 것이 아니다(누구 것인지 알 수 없다). 접기·목록·이어 붙이기가
+    같은 규칙을 봐야 해서 한 곳에 둔다."""
+    me = (viewer or "").strip().lower()
+    return bool(me and _owner(job) and _owner(job) != me)
+
+
 def _running_of(owner: str) -> list[str]:
     """그 사람이 돌리고 있는 잡 id. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석)."""
     return [j["id"] for j in _JOBS.values() if owner and j.get("status") == "running" and _owner(j) == owner]
@@ -562,8 +570,7 @@ def cancel(job_id: str, *, by: str = "") -> dict:
     job = _JOBS.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다(또는 이미 이 프로세스 밖이다): {job_id}")
-    me = (by or "").strip().lower()
-    if me and _owner(job) and _owner(job) != me:
+    if _foreign(job, by):
         # 누구 것인지는 말하지 않는다 — 주인의 계정도 남의 정보다.
         raise PermissionError(f"내가 시작한 심의가 아니다: {job_id} — 접을 수 있는 것은 제 것뿐이다")
     if job_id in _PENDING:      # 줄 선 잡 — 태스크가 없다. 줄에서 빼면 끝이고, 도는 자리는 바뀌지 않는다
@@ -700,15 +707,33 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
                      "say_full_chars)." if clipped else None)}
 
 
-def list_jobs(limit: int = 20) -> list[dict]:
-    """메모리 원장 + 파일 원장을 합쳐 최신순으로."""
-    seen = dict(_JOBS)
+# 목록을 만들 때 훑는 원장 파일 수의 상한. 남의 잡은 세지 않고 지나가므로(아래) 제 잡이 드문 사람은 파일을
+# 더 깊이 훑는다 — 원장이 아주 큰 박스에서 목록 한 번이 파일 전부를 읽지 않게 막아 둔다.
+LIST_SCAN_MAX = 300
+
+
+def list_jobs(limit: int = 20, *, viewer: str = "") -> list[dict]:
+    """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게 **남의 잡은 싣지 않는다.**
+
+    종전엔 전원의 잡을 id·화두째 내줬다. 거절·순번 문구에서 남의 job_id 를 뺀 것(start 의 주석)이 목록 한
+    번으로 무효였다 — 결과 회수·전사·이어하기는 id 만 받는다. 행마다 mine(내가 시작한 잡인가)을 싣는다 —
+    주인의 계정은 싣지 않는다(cancel 의 주석).
+    남의 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다."""
+    me = (viewer or "").strip().lower()
+    seen = {jid: j for jid, j in _JOBS.items() if not _foreign(j, viewer)}
     try:
-        for f in sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit * 3]:
+        kept = 0
+        for f in sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
+                        reverse=True)[:max(limit * 3, LIST_SCAN_MAX)]:
+            if kept >= limit * 3:
+                break
             j = _load(f.stem)
-            if j and j["id"] not in seen:
+            if not j or _foreign(j, viewer):
+                continue
+            kept += 1
+            if j["id"] not in seen:
                 seen[j["id"]] = j
     except OSError:
         pass
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
-    return [summary(j) for j in rows[:limit]]
+    return [{**summary(j), "mine": bool(me and _owner(j) == me)} for j in rows[:limit]]
