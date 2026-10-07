@@ -2163,7 +2163,15 @@ _PHANTOM_ID_MARK = "는 이번 대화 어디에도 없는 값이다"
 # 시간은 묶음마다 '가장 느린 하나' 로 끝난다 — 20초는 너무 빡빡했다(agent_search 하이브리드가
 # 102초 걸린 전례가 있다. docs/gotchas 지식카드 검색 지연). 넉넉히 두고, 대신 강등되면
 # 화면에 남긴다. 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
-KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 120.0)
+# 120 → 180 (2026-10-08). 120초는 게이트웨이 호출 한도와 **같은 값**이라 어느 쪽이 먼저 걸릴지 정해지지
+# 않았고, AIDataHub 가 풀 자리를 60초까지 기다린 뒤 검색이 44초까지 가면 104초로 거의 닿았다 — 20석 넘는
+# 패널이 조회를 몰아 쏠 때 멀쩡한 조회가 강등됐다. 180초면 그쪽의 풀 대기(60) + 검색 문장 한도(90)가 먼저
+# 걸려 원인이 구체적으로 나온다. 더 올리지 않는 까닭 — 1라운드 전에 전 좌석이 거친다(22석이면 4묶음,
+# 폴백까지 최악 4×360초 = 24분). 게이트웨이 호출 한도(600초)보다 **짧은 것은 의도다** — 감싸는 층이 아니라
+# semantic 폴백으로 넘어가는 스위치다.
+# ⚠ AIDataHub 의 DB_POOL_TIMEOUT(60) + AIDH_SEARCH_STATEMENT_TIMEOUT_S(90)보다 커야 한다 — 한쪽을 올리면
+#   다른 쪽을 같이 본다.
+KNOWLEDGE_TIMEOUT_S = _env_float("KNOWLEDGE_TIMEOUT_S", 180.0)
 # hybrid 가 늦으면 semantic 으로 한 번 되묻는다. hybrid 가 느린 것이지 semantic 은 0.1초다.
 KNOWLEDGE_FALLBACK_MODE = os.environ.get("KNOWLEDGE_FALLBACK_MODE", "semantic")
 # 좌석 지식카드 조회를 한 번에 몇 석까지 돌리나, 0=무제한. 종전엔 좌석 수만큼을 **한꺼번에** 쐈다 —
@@ -3904,7 +3912,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {
                     "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
                             + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
-                    "tool": None})
+                    "tool": None,
+                    # 시간 한도에 걸린 강등이면 그 한도의 설정 이름을 싣는다(잡 원장이 붙인다). 사유 문구는
+                    # _agent_search_hits 가 만든다 — 시간 초과는 '…초 초과' 로 적힌다.
+                    **({"knob": "KNOWLEDGE_TIMEOUT_S"} if "초 초과" in _note else {})})
         finally:
             for _t in _kn_tasks:
                 if not _t.done():
@@ -3913,13 +3924,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                       f"관련 지식 확보", "tool": None})
         if _kn_notes:
             # 무음 강등 금지 — 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
+            _kn_knob = {"knob": "KNOWLEDGE_TIMEOUT_S"} if any("초 초과" in x for x in _kn_notes) else {}
             yield _sse("warning", {"code": "knowledge_degraded",
                                    "message": ("일부 전문가의 지식카드를 시간 안에 받지 못했습니다 — "
                                                f"{len(_kn_notes)}/{len(_kn_seats)}명. "
                                                "그 좌석은 지식 발췌 없이 발언합니다. "
-                                               + "; ".join(_kn_notes[:4]))})
+                                               + "; ".join(_kn_notes[:4])), **_kn_knob})
             yield _delib("evidence", source="지식카드 조회 강등",
-                         text="\n".join(f"- {x}" for x in _kn_notes[:12]), included=False)
+                         text="\n".join(f"- {x}" for x in _kn_notes[:12]), included=False, **_kn_knob)
 
     # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
     # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
