@@ -778,6 +778,23 @@ def _cut_note(what: str, items: list, cap: int, item_cap: int = 0, *, unit: str 
     return f"{what} {' · '.join(notes)}" if notes else ""
 
 
+# 정수로 읽는 요청 손잡이 — _resolve_opts 가 읽고, 잡 원장(delib_jobs.start)이 '실제로 걸린 값' 을 적을 때
+# 같은 목록을 본다.
+_INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
+             "chair_bestof", "chair_cite", "parse_retries", "rounds",
+             "free_tools", "tool_budget", "stop_after_round", "build_plan",
+             "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
+             "persona_knowledge", "sealed")
+# 그 가운데 켜고 끄는 것(0|1)은 낱말로도 받는다. voc 는 off 로 끄고 persona_knowledge 는 0 으로 끈다 —
+# 안내에 나란히 적혀 있어, 소급 검증을 손으로 꾸리는 호출자는 둘 다 "off" 로 보낸다. int("off") 는 예외라
+# 기본값(켜짐)이 말없이 남았고 오늘의 지식카드가 실렸다. 개수(rounds·tool_budget 등)는 낱말을 안 받는다.
+# sealed 는 여기 없다 — 못 읽는 값을 닫힌 쪽으로 읽어야 해서 _seal 이 먼저 0/1 로 맞춘다.
+_ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
+                         "chair_cite", "free_tools", "stop_after_round", "build_plan", "save_report",
+                         "rescreen", "persona_knowledge"))
+_ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
+
+
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
     미지정 키는 env 기본값 유지(하위호환). 값은 화이트리스트 키만 읽고 정수/실수로 강제·클램프
@@ -850,31 +867,36 @@ def _resolve_opts(req_opts):
         # 키별로 두는 까닭 — 다단 심의는 일부 값을 엔진이 갈아 끼우는데, 그 값에 대해 '요청을 줄였다' 고
         # 적으면 거짓이다. 갈아 끼우는 쪽이 제 키를 지운다.
         req_cut={},
+        # 읽지 못한 요청 값 — 요청 키 → '보낸 값(대신 무엇으로 도는지)'. 기본값으로 도는 것은 종전 그대로이고
+        # (신뢰 안 되는 입력이 심의를 죽이지 않게), 그 사실을 스트림이 카드로 알린다. req_cut 과 따로 둔다 —
+        # 그쪽 카드는 '상한을 넘어 앞에서부터 남겼다' 라 여기엔 틀린 말이다.
+        req_unread={},
     )
     if isinstance(req_opts, dict):
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
         # 값이 딸려 켜는 것(웹 리서치가 강제하는 인용 계약 등)이 남는다.
         req_opts, o.sealed_reopen = _seal(req_opts)
-        for k in ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-                  "chair_bestof", "chair_cite", "parse_retries", "rounds",
-                  "free_tools", "tool_budget", "stop_after_round", "build_plan",
-                  "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
-                  "persona_knowledge", "sealed"):
+        for k in _INT_KEYS:
             v = req_opts.get(k)
-            if v is not None:
+            if v is not None and v != "":
+                if k in _ONOFF_KEYS and isinstance(v, str):
+                    v = _ONOFF_WORDS.get(v.strip().lower(), v)
                 try:
                     setattr(o, k, int(v))
                 except (ValueError, TypeError):
-                    pass
+                    o.req_unread[k] = f"{k}={_delib_preview(v, 40)}(대신 {getattr(o, k)} 로 돈다)"
         ts = req_opts.get("timeout_s")
-        if ts is not None:
+        if ts is not None and ts != "":
             try:
                 o.timeout_s = float(ts)
             except (ValueError, TypeError):
-                pass
-        vm = str(req_opts.get("voc") or "").strip().lower()
+                o.req_unread["timeout_s"] = f"timeout_s={_delib_preview(ts, 40)}(대신 서버 기본값으로 돈다)"
+        _voc = req_opts.get("voc")
+        vm = str("" if _voc is None else _voc).strip().lower()
         if vm in ("auto", "off", "always"):
             o.voc = vm
+        elif vm:    # 0·False·none 으로 끄려던 것도 여기다 — auto 로 돌아 최근 VOC 가 섞인다
+            o.req_unread["voc"] = f"voc={_delib_preview(_voc, 40)}(대신 {o.voc} 로 돈다 — auto|off|always)"
         hn = req_opts.get("human_note")
         if isinstance(hn, str):
             o.human_note = hn[:HUMAN_NOTE_MAX] if HUMAN_NOTE_MAX > 0 else hn
@@ -883,6 +905,9 @@ def _resolve_opts(req_opts):
         ct = req_opts.get("chair_template")
         if isinstance(ct, str) and ct in _CHAIR_ITEMS:
             o.chair_template = ct
+        elif ct not in (None, ""):
+            o.req_unread["chair_template"] = (f"chair_template={_delib_preview(ct, 40)}"
+                                              f"(대신 {o.chair_template} 로 돈다)")
         cs = req_opts.get("continue_summary")
         if isinstance(cs, str):
             o.continue_summary = cs[:_SUMMARY_MAX]
@@ -3159,6 +3184,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         yield _sse("status", {"step": "2단 — 해석 설계 심의", "tool": None})
         opts_b = _resolve_opts(req_opts)
         opts_b.req_cut = {}     # 줄인 요청 값은 1단이 이미 알렸다 — 여기서부터는 요약·좌석·의견을 엔진이 갈아 끼운다
+        opts_b.req_unread = {}  # 읽지 못한 값도 1단이 알렸다 — 단마다 같은 카드를 또 내지 않는다
         opts_b.chair_template = "sim-plan"
         opts_b.continue_summary = decision_a[:8000]
         opts_b.continue_non_negotiables = nn_a[:12]
@@ -3189,6 +3215,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
             opts_c = _resolve_opts(req_opts)
             opts_c.req_cut = {}
+            opts_c.req_unread = {}
             opts_c.chair_template = "build-plan"
             opts_c.continue_summary = decision_b[:20000]
             opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
@@ -3702,6 +3729,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="요청 값 상한 초과", included=False,
                      text="요청에 실린 값이 상한을 넘어 앞에서부터 남겼다 — " + " / ".join(opts.req_cut.values())
                           + ". 뒤쪽은 이 심의에 쓰이지 않았다.")
+    # 읽지 못한 요청 값 — 기본값으로 돌았다는 것을 알린다. 말없이 넘기면 호출자는 자기가 끈 줄 안다.
+    if opts.req_unread:
+        yield _delib("evidence", source="요청 값 해석 불가", included=False,
+                     text="요청에 실린 값을 읽지 못해 기본값으로 돈다 — " + " / ".join(opts.req_unread.values())
+                          + ". 켜고 끄는 값은 1|0(on|off 도 받는다)으로 보낸다.")
     # 챗 워크스페이스 핸드오프 원천 근거(P1) — 요약이 아니라 날것 도구결과+출처를 좌석에 준다.
     # '검증 대상, 결론 아님'으로 프레이밍해 좌석이 재검토하게 한다(브리프 결론이 심의를 오염 못 하게).
     # 예산(_EVID_BUDGET) 초과분은 중간 절단 없이 항목 통째로 드롭한다(앞쪽 = 챗이 정리한 순 = 더 관련).

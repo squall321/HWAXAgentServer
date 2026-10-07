@@ -476,8 +476,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
-    from deliberation import (_SEALED_UNSUPPORTED, _seal, run_deliberation,  # noqa: PLC0415
-                              run_sim_deliberation, run_test_plan)
+    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _resolve_opts, _seal,  # noqa: PLC0415
+                              run_deliberation, run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
 
@@ -491,6 +491,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     applied, _ = _seal(opts)
     if applied.get("sealed") and spec["engine"] != "general":
         raise ValueError(_SEALED_UNSUPPORTED)
+    # 손잡이는 엔진이 **읽은 값**으로 적는다. 보낸 값을 그대로 적으면 못 읽어 기본값으로 돈 것("끔")이나
+    # 상한에서 줄인 것(rounds=99)이 걸린 값처럼 남는다 — 호출자가 손잡이를 끈 줄 아는 그 기록이 된다.
+    # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
+    _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
+    applied = {**applied, **{k: getattr(_read, k) for k in applied if k in _INT_KEYS or k == "voc"}}
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
