@@ -12,10 +12,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
+import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
 
 # 같은 하네스를 쓴다 — 스트림을 실제로 돌린다(_pin_context 는 이 파일에도 걸리게 이름째 가져온다).
@@ -94,6 +98,47 @@ def test_심의를_잇달아_돌려도_된다(monkeypatch):
     for _ in range(2):
         tool, _ = _lookup(monkeypatch, 20)
         assert tool.peak == 6 and len(tool.calls) == 20
+
+
+@pytest.mark.parametrize("how", ["취소", "끊김"])
+def test_심의가_접히면_아직_안_끝난_조회도_접는다(monkeypatch, how):
+    """심의를 접어도(deliberate_cancel · 브라우저 닫힘) 남은 좌석의 조회는 아무도 기다리지 않는 채 끝까지
+    돌았다 — 20석이면 접은 뒤에도 조회 18건이 AIDataHub 로 간다. 대기열이 붙은 뒤로는 접힌 자리에서 다음
+    심의가 곧바로 뜨므로, 그 조회들이 새 심의의 조회와 겹쳐 한 번에 도는 수의 상한이 깨진다."""
+    monkeypatch.setattr(d, "_KN_CONC", 2)
+    tool = _Counting(hold=0.05)
+
+    async def _fake_tools(*_a, **_k):
+        return {"agent_search": tool}
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
+    opts = {"personas": _seats(20), "free_tools": 0, "voc": "off", "rescreen": 0}
+
+    async def go():
+        gen = d.run_deliberation(stub, "힌지 크랙 원인", [], opts)
+        first = asyncio.Event()
+
+        async def consume():
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                if ev == "status" and str(data.get("step", "")).startswith("지식카드 1/20"):
+                    if how == "끊김":
+                        await gen.aclose()          # 구독자가 떠났다 — 생성기가 yield 에서 닫힌다
+                        return
+                    first.set()
+
+        task = asyncio.ensure_future(consume())
+        if how == "취소":
+            await first.wait()
+            task.cancel()                           # 잡 취소 — 생성기가 조회를 기다리던 자리에서 끊긴다
+        await asyncio.wait([task])
+        await asyncio.sleep(0.4)                    # 안 접혔다면 남은 조회가 이 사이에 줄줄이 돈다
+        return tool.now, len(tool.calls)
+
+    running, finished = asyncio.run(go())
+    assert running == 0, f"심의가 접힌 뒤에도 조회 {running}건이 돌고 있다"
+    assert finished <= 4, f"심의가 접힌 뒤에도 남은 좌석을 계속 조회했다 — 끝난 조회 {finished}건(20석)"
 
 
 def test_기본값은_6_이고_환경변수로_바꾼다():

@@ -3573,20 +3573,30 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
         _kn_done = 0
-        for _fut in asyncio.as_completed([_kn_one(p) for p in _kn_seats]):
-            _k, _blk, _note = await _fut
-            _kn_done += 1
-            if _blk:
-                knowledge_by_key[_k] = _blk
-                ev_count["knowledge"] += 1
-                yield _delib("evidence", source=f"{_k} · 지식카드", text=_blk[:400], included=True)
-            if _note:
-                _kn_notes.append(f"{_k}: {_note}")
-                print(f"[deliberation] 지식카드 강등({_k}): {_note}")
-            yield _sse("status", {
-                "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
-                        + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
-                "tool": None})
+        _kn_tasks = [asyncio.ensure_future(_kn_one(p)) for p in _kn_seats]
+        # ⚠ try/finally 로 감싼다(_round_live·자유 조회와 같은 처리). 이 루프는 yield 를 하고 조회를
+        # 기다린다 — 심의가 접히면(잡 취소 · 브라우저 닫힘) 거기서 끊기는데, 남은 조회는 아무도 기다리지
+        # 않는 채 끝까지 돌았다. 접힌 자리에서 다음 심의가 곧바로 뜨면(잡 대기열) 그 조회들과 겹쳐
+        # 한 번에 도는 수(_KN_CONC)가 깨진다.
+        try:
+            for _fut in asyncio.as_completed(_kn_tasks):
+                _k, _blk, _note = await _fut
+                _kn_done += 1
+                if _blk:
+                    knowledge_by_key[_k] = _blk
+                    ev_count["knowledge"] += 1
+                    yield _delib("evidence", source=f"{_k} · 지식카드", text=_blk[:400], included=True)
+                if _note:
+                    _kn_notes.append(f"{_k}: {_note}")
+                    print(f"[deliberation] 지식카드 강등({_k}): {_note}")
+                yield _sse("status", {
+                    "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
+                            + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
+                    "tool": None})
+        finally:
+            for _t in _kn_tasks:
+                if not _t.done():
+                    _t.cancel()
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(_kn_seats)}명 "
                                       f"관련 지식 확보", "tool": None})
         if _kn_notes:
