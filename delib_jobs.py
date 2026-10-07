@@ -492,11 +492,19 @@ def _opts_echo(opts: dict) -> dict:
     return out
 
 
-def cancel(job_id: str) -> dict:
-    """진행 중이거나 줄 선 심의를 접는다. 동시 상한에 걸렸을 때 사람이 자리를 비울 수 있어야 한다."""
+def cancel(job_id: str, *, by: str = "") -> dict:
+    """진행 중이거나 줄 선 심의를 접는다. 동시 상한에 걸렸을 때 사람이 자리를 비울 수 있어야 한다.
+
+    by 는 접으려는 사람이다. **신원이 다른 사람의 심의는 접지 못한다** — 시작 거절 문구는 '접을 수 있는
+    것은 제 것뿐' 이라고 말해 왔는데 막는 코드는 없었고, 줄이 생긴 뒤로는 앞에 선 남의 잡을 접으면 제
+    순번이 당겨진다. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)과 주인이 안 적힌 잡은 종전대로다."""
     job = _JOBS.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다(또는 이미 이 프로세스 밖이다): {job_id}")
+    me = (by or "").strip().lower()
+    if me and _owner(job) and _owner(job) != me:
+        # 누구 것인지는 말하지 않는다 — 주인의 계정도 남의 정보다.
+        raise PermissionError(f"내가 시작한 심의가 아니다: {job_id} — 접을 수 있는 것은 제 것뿐이다")
     if job_id in _PENDING:      # 줄 선 잡 — 태스크가 없다. 줄에서 빼면 끝이고, 도는 자리는 바뀌지 않는다
         del _PENDING[job_id]
         job["status"], job["error"] = "cancelled", "취소됨 — 줄을 선 채로 접었다(시작하지 않았다)"

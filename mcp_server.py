@@ -436,10 +436,12 @@ async def deliberate_list(limit: int = 20) -> dict:
 
 @mcp.tool(title="심의 취소",
           description="진행 중이거나 대기 중(queued)인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 "
-                      "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다.")
-async def deliberate_cancel(job_id: str) -> dict:
+                      "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다. 접을 수 있는 것은 내가 "
+                      "시작한 심의뿐이다.")
+async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
     """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다."""
-    return delib_jobs.cancel(job_id)
+    user, _groups = _caller(ctx)
+    return delib_jobs.cancel(job_id, by=user)
 
 
 @mcp.tool(

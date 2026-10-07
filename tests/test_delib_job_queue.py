@@ -424,6 +424,43 @@ def test_순번_안내_어디에도_남의_잡_id_와_화두가_없다(eng, monk
     _play(scenario)
 
 
+# ── 남의 심의는 접지 못한다 ─────────────────────────────────────────────────────────
+# 시작 거절 문구는 '접을 수 있는 것은 제 것뿐' 이라고 말해 왔는데 막는 코드는 없었다 — job_id 만 알면 누구든
+# 접을 수 있었고, 목록(deliberate_list)은 전원의 id 를 보여 준다. 줄이 생긴 뒤로는 앞에 선 남의 잡을 접으면
+# 제 순번이 당겨지니 그럴 까닭까지 생겼다.
+def test_신원이_다른_사람은_남의_심의를_접지_못한다(eng, monkeypatch):
+    _caps(monkeypatch, 1)
+
+    async def scenario():
+        running, queued = _start("남의 화두 가", YOU), _start("남의 화두 나", YOU)
+        mine = _start("내 화두", ME)
+        await _tick()
+        for job in (running, queued):
+            with pytest.raises(PermissionError) as e:
+                await m.deliberate_cancel(job["id"], ctx=_ctx(ME))
+            assert YOU not in str(e.value) and job["question"] not in str(e.value), "거절 문구에 주인이 실렸다"
+        assert (_st(running), _st(queued), _st(mine)) == ("running", "queued", "queued")
+        assert delib_jobs.summary(mine)["queue"]["position"] == 2, "남의 잡이 줄에서 빠졌다"
+        assert (await m.deliberate_cancel(queued["id"], ctx=_ctx("You@Example.com")))["status"] == "cancelled"
+        assert (await m.deliberate_cancel(mine["id"], ctx=_ctx(ME)))["status"] == "cancelled"
+
+    _play(scenario)
+
+
+def test_신원_없는_호출과_주인_없는_잡은_종전대로다(eng, monkeypatch):
+    """신원 헤더 없이 오는 호출(서비스 계정 — 운영이 쓰는 길)은 무엇이든 접는다. 주인이 안 적힌 잡은
+    누구 것인지 알 수 없으니 누구든 접는다 — 막으면 아무도 못 접는 잡이 생긴다."""
+    _caps(monkeypatch, 1)
+
+    async def scenario():
+        owned, anon = _start("가", YOU), _start("나")
+        await _tick()
+        assert (await m.deliberate_cancel(anon["id"], ctx=_ctx(ME)))["status"] == "cancelled"
+        assert (await m.deliberate_cancel(owned["id"]))["status"] == "cancelling"
+
+    _play(scenario)
+
+
 # ── 재기동 ───────────────────────────────────────────────────────────────────
 def test_줄_선_잡은_재기동을_못_넘기고_다시_시작하라고_남는다(eng, monkeypatch):
     """띄울 때 쓸 인자(호출자 토큰·근거 본문)는 메모리에만 있다 — 재기동 뒤에는 띄울 수가 없다.
