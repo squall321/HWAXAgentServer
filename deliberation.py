@@ -123,7 +123,11 @@ _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
 # 종전 값(항목 2,000자 · 합계 11,000자)은 챗 도구결과 몇 건을 나르려고 잡은 것이라, 발표자료나
 # 보고서 한 건(추출하면 보통 30,000~80,000자)을 실으면 **첫 항목에서 잘려** 심의가 표지만 보고
 # 논의했다. 좌석 컨텍스트 상한(_SEAT_CTX 48K)과 같은 자릿수로 맞춘다.
-_EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 40)            # 근거 항목 수 상한
+# 건수 상한은 합계 예산이 담는 건수와 같은 자릿수로 둔다(500,000자 ÷ 건당 ≈4,000자 ≈ 125건). 종전 40 은
+# 예산이 남는데도 건수에서 먼저 걸려, 근거 41~49건짜리 패널의 뒤쪽이 잘렸다(S26U 피드백 4-1).
+# ⚠ 포털 DelibOpts.evidence·프론트 handoff.ts EVID_ITEMS 와 같은 값이어야 한다
+#   (HWAXPortal backend/tests/test_evidence_budget_contract.py).
+_EVID_ITEMS = _env_int("DELIB_EVID_ITEMS", 120)           # 근거 항목 수 상한
 _EVID_ITEM_MAX = _env_int("DELIB_EVID_ITEM_MAX", 150000)  # 항목당 **천장**(자) — 큰 발표자료 한 건
 _EVID_ARGS_MAX = _env_int("DELIB_EVID_ARGS_MAX", 1200)    # 항목 인자 표기 상한(자)
 # 근거 본문을 찾는 키 — 순서가 우선순위다. 정본은 `result` 이고 나머지는 폴백이다.
