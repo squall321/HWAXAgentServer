@@ -1493,7 +1493,7 @@ def _ser(o: dict, keys: tuple, primary: str = "") -> str:
 def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
     """[(좌석키, 발언 직렬화)] 의 합이 budget 을 넘으면 **좌석마다 같은 몫**으로 줄인다.
 
-    반환 (rows, share) — share 는 줄였을 때의 좌석당 몫, 안 줄였으면 0.
+    반환 (rows, share) — share 는 줄였을 때의 좌석당 몫(이보다 긴 발언만 여기서 끊긴다), 안 줄였으면 0.
 
     이어 붙인 전사의 머리·꼬리만 남기면(종전 의장용 `_cap_ctx`) 중간 좌석이 **통째로** 안 보인다
     (감사 C22 — 머리만 남겼더니 완료순 앞쪽 3~4석만 닿았다). 수렴 라운드는 '형성된 다수 의견'을
@@ -1502,7 +1502,16 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
     total = sum(len(t) for _, t in rows)
     if budget <= 0 or not rows or total <= budget:
         return rows, 0
-    share = max(budget // len(rows), floor)
+    # 짧은 좌석이 안 쓴 몫은 긴 좌석에 돌린다. 그냥 좌석 수로 나누면 그 몫이 버려져, 예산이 남는데도
+    # 긴 발언을 더 깎는다(긴 10석·짧은 11석 36,700자를 28,000자에 맞추면 21,000자만 실렸다).
+    # 몫보다 짧은 좌석을 짧은 순으로 빼 가며 남은 예산을 남은 좌석끼리 나눈다(합이 예산을 넘으니
+    # 적어도 한 석은 남는다).
+    left, n = budget, len(rows)
+    for ln in sorted(len(t) for _, t in rows):
+        if ln * n > left:
+            break
+        left, n = left - ln, n - 1
+    share = max(left // n, floor)
     return [(k, t if len(t) <= share else t[:share].rstrip() + f" …[{len(t):,}자 중 앞 {share:,}자]")
             for k, t in rows], share
 

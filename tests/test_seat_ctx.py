@@ -58,3 +58,49 @@ def test_기본값은_평범한_20석_라운드를_건드리지_않는다():
     # 상한을 올린 좌석 수(20)에서 중앙값 발언이면 자르지 않아야 한다 — 품질 회귀 방지선.
     assert d._SEAT_CTX >= 20 * 2000
     assert d.MAX_REQ_SEATS == 20
+
+
+# ── 짧은 발언이 안 쓴 몫은 긴 발언에 돌린다 ──────────────────────────────────────────
+def _uneven():
+    # 발언 길이는 고르지 않다 — 긴 좌석 10석(2,900자)과 짧은 좌석 11석(700자), 합 36,700자.
+    return [(f"long{i}", "가" * 2900) for i in range(10)] + [(f"short{i}", "나" * 700) for i in range(11)]
+
+
+def test_짧은_발언이_남긴_몫을_긴_발언이_쓴다():
+    """그냥 좌석 수로 나누면 짧은 발언이 안 쓴 몫이 버려진다 — 예산이 7,000자 남는데도 긴 발언을
+    1,333자에서 끊었다(실을 수 있는 것을 버린다)."""
+    out, share = d._fit_rows(_uneven(), 28000)
+    kept = sum(min(len(t), share) for _, t in _uneven())
+    assert kept <= 28000, f"예산을 넘겼다({kept:,}자)"
+    assert kept >= 28000 - 21, f"예산 28,000자 중 {kept:,}자만 실었다 — 남는 몫을 버렸다"
+    assert share == (28000 - 11 * 700) // 10
+    got = dict(out)
+    assert all(got[f"short{i}"] == "나" * 700 for i in range(11)), "짧은 발언을 건드렸다"
+    assert all(got[f"long{i}"].startswith("가" * share + " …[2,900자 중 앞") for i in range(10))
+
+
+def test_전부_몫보다_길면_종전과_같다():
+    rows = [("a", "가" * 9000), ("b", "나" * 5000), ("c", "다" * 7000)]
+    _out, share = d._fit_rows(rows, 6000)
+    assert share == 2000
+
+
+def test_어떤_길이_분포에서도_예산_안이고_남기지_않는다():
+    import random
+
+    rng = random.Random(20261007)
+    for _ in range(300):
+        n = rng.randint(1, 25)
+        rows = [(f"k{i}", "가" * rng.choice((rng.randint(1, 400), rng.randint(400, 3000), rng.randint(3000, 9000))))
+                for i in range(n)]
+        total = sum(len(t) for _, t in rows)
+        budget = rng.randint(n, max(n + 1, total + 500))
+        out, share = d._fit_rows(rows, budget, floor=1)
+        if total <= budget:
+            assert share == 0 and out == rows
+            continue
+        kept = sum(min(len(t), share) for _, t in rows)
+        assert share >= 1 and kept <= budget, (budget, share, kept)
+        assert kept > budget - n, f"예산 {budget:,}자 중 {kept:,}자만 실었다(좌석 {n}석)"
+        assert all(got == t for (_, t), (_, got) in zip(rows, out) if len(t) <= share), "몫보다 짧은 발언을 건드렸다"
+        assert [k for k, _ in out] == [k for k, _ in rows], "좌석이 빠지거나 순서가 바뀌었다"

@@ -256,3 +256,11 @@ def test_줄였으면_화면과_잡_원장에_남는다(monkeypatch):
     assert any(s.startswith("의장 전사 상한") for s in _steps(events))
     for name, view in _mcp_view(monkeypatch, events).items():
         assert [x for x in view["evidence_omitted"] if x.get("source") == _CUT], (name, view["evidence_omitted"])
+
+
+def test_의장_전사도_짧은_좌석이_남긴_몫을_긴_좌석에_돌린다():
+    rows = [(f"long{i}", "가" * 2900) for i in range(10)] + [(f"short{i}", "나" * 700) for i in range(11)]
+    out = d._cap_ctx(rows, 29000)
+    assert len(out) <= 29000
+    assert len(out) >= 29000 * 0.97, f"상한 29,000자 중 {len(out):,}자만 실었다 — 남는 몫을 버렸다"
+    assert all(f"• short{i}: " + "나" * 700 in out for i in range(11))
