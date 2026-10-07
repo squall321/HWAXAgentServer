@@ -10,7 +10,6 @@
 import asyncio
 import json
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,10 +51,8 @@ class _Roles(_Tool):
 
 def _run(monkeypatch, roles, conc=6, **req):
     monkeypatch.setattr(d, "_KN_CONC", conc)
-    t0 = time.monotonic()
-    events = _stream(monkeypatch, {"personas": _SEATS, "persona_knowledge": 0, **req},
-                     tools={"get_agent_session": roles})
-    return events, time.monotonic() - t0
+    return _stream(monkeypatch, {"personas": _SEATS, "persona_knowledge": 0, **req},
+                   tools={"get_agent_session": roles})
 
 
 def _lines(events):
@@ -64,10 +61,10 @@ def _lines(events):
 
 def test_좌석_역할을_한꺼번에_받고_좌석마다_줄을_낸다(monkeypatch):
     roles = _Roles()
-    events, took = _run(monkeypatch, roles)
+    events = _run(monkeypatch, roles)
     assert len(roles.calls) == _N
-    assert 1 < roles.peak <= 6, f"한 번에 {roles.peak}건이 돌았다 — 직렬이거나 상한(6)을 넘겼다"
-    assert took < _N * _DELAY, f"{took:.2f}초 — 직렬({_N * _DELAY:.2f}초)보다 빠르지 않다"
+    # 겹쳐 돈 수로 본다(걸린 시간으로 보면 바쁜 박스에서 흔들린다). 12건이 6자리에 줄을 서니 꼭 6건이 겹친다.
+    assert roles.peak == 6, f"한 번에 {roles.peak}건이 돌았다 — 직렬이거나 상한(6)을 넘겼다"
     lines = _lines(events)
     assert [ln.split(" — ")[0] for ln in lines] == [f"역할 복원 {i}/{_N}" for i in range(1, _N + 1)], lines
     assert {ln.split(" — ")[1] for ln in lines} == {p["key"] for p in _SEATS}
@@ -78,7 +75,7 @@ def test_좌석_역할을_한꺼번에_받고_좌석마다_줄을_낸다(monkeyp
 
 def test_좌석_순서와_받은_역할은_그대로다(monkeypatch):
     """끝나는 순서대로 줄을 내더라도 좌석 순서는 호출자가 준 그대로다."""
-    events, _took = _run(monkeypatch, _Roles())
+    events = _run(monkeypatch, _Roles())
     seated = next(data for ev, data in events if ev == "delib" and data.get("kind") == "personas")["personas"]
     assert [p["key"] for p in seated] == [p["key"] for p in _SEATS]
     assert all(p["role"] == f"{p['key']} 의 역할 원문" for p in seated), seated[:2]
@@ -92,7 +89,7 @@ def test_동시_실행_수는_지식카드_조회와_같은_설정을_따른다(
 
 
 def test_원문을_못_받은_좌석은_그렇다고_말하고_호출자가_준_역할로_앉는다(monkeypatch):
-    events, _took = _run(monkeypatch, _Roles(broken={"dom03-seat"}))
+    events = _run(monkeypatch, _Roles(broken={"dom03-seat"}))
     (bad,) = [ln for ln in _lines(events) if "dom03-seat" in ln]
     assert "원문을 받지 못해 호출자가 준 역할로 간다" in bad and "MCP_CALL_TIMEOUT_S" in bad, bad
     assert sum("받지 못해" in ln for ln in _lines(events)) == 1, "멀쩡히 받은 좌석까지 못 받았다고 적었다"

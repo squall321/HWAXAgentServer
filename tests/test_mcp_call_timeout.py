@@ -84,8 +84,9 @@ def _call(conns, name, args=None):
 
 def test_답하지_않는_도구를_기한에서_끊고_기한과_손잡이를_말한다(gateway, monkeypatch):
     monkeypatch.setattr(a, "MCP_CALL_TIMEOUT_S", 0.4)
-    out, took = _call(gateway, "slow_lookup")
-    assert took < _SLOW_S - 0.5, f"{took:.1f}초를 기다렸다 — 기한(0.4초)이 걸리지 않았다"
+    out, _took = _call(gateway, "slow_lookup")
+    # 기한이 걸렸는지는 받은 것으로 본다(걸린 시간으로 보면 바쁜 박스에서 흔들린다) — 안 걸렸으면 '늦은 답' 이 온다.
+    assert out != "늦은 답", "기한(0.4초)이 걸리지 않아 끝까지 기다렸다"
     assert isinstance(out, str) and out.startswith(a._TOOL_FAIL_MARK + " 도구 slow_lookup 호출 실패: "), out
     assert "0초 안에 답하지 않았다(MCP_CALL_TIMEOUT_S)" in out, out       # 0.4초를 정수로 적은 것이다
     assert "GATEWAY_CALL_TIMEOUT" in out and "게이트웨이 무응답" in out, out
