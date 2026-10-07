@@ -363,11 +363,26 @@ def _carry_seats(prev: dict) -> list:
     return [{**s, "role": full.get(s.get("key")) or s.get("role") or ""} for s in (prev.get("seats") or [])]
 
 
+# 이어하기가 이전 회차에서 이어받는 손잡이 — 심의 도중 **바깥에서 자료가 들어오는 길**을 여닫는 것들과
+# 보고서 저장 여부다. 종전엔 하나도 이어받지 않았다. 봉인을 손잡이(advanced.sealed)로 건 심의를 이어가면
+# Job 이름에 봉인이 없어 열린 채 돌았고 — VOC·지식카드·자유 조회를 다 하고 — 그 결과를 첫 장에 '봉인 실행' 이
+# 찍힌 보고서에 페이지로 이어 붙였다. 호출자에게는 막을 인자도 알림도 없었다. voc=off · free_tools=0 ·
+# persona_knowledge=0 도 같이 풀렸고, 저장하지 말라던(save_report=False) 심의가 이어하기에서 보고서를 만들었다.
+# tools(지정 도구 사전 호출)는 넣지 않는다 — 이어받으면 같은 도구를 또 불러 유입이 는다.
+_CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_prepass", "search_sources",
+               "apps", "save_report")
+
+
 @mcp.tool(
     title="심의 이어하기",
     description=("끝난 HWAX 심의에 사람 의견을 넣어 이어서 돌린다. 이전 좌석과 양보 불가 조항을 "
                  "승계하므로 처음부터 다시 돌리는 것보다 싸고 결론이 되돌아가지 않는다. 동시 실행 상한이 "
-                 "차 있으면 deliberate_start 처럼 줄을 선다(status=queued — 다시 부르지 마라)."),
+                 "차 있으면 deliberate_start 처럼 줄을 선다(status=queued — 다시 부르지 마라). "
+                 f"이전 회차에 건 손잡이({'·'.join(_CONT_CARRY)})도 이어받는다 — 끄고 돈 심의는 꺼진 채로, "
+                 "저장하지 않은 심의는 저장하지 않은 채로 이어진다. 바꾸려면 advanced 로 다시 건다. "
+                 "**봉인(sealed)은 풀 수 없다** — 봉인으로 돈 심의는 job 을 바꿔도 봉인으로만 이어지고"
+                 "(그 보고서에 이어 붙는다), 다단 심의(sim-plan·test-plan·build-plan)로는 이어받지 않는다. "
+                 "봉인 없이 돈 심의를 봉인으로 이어받지도 않는다. 열어서 다시 보려면 새 심의를 시작한다."),
 )
 async def deliberate_continue(
     previous_job_id: str,
@@ -379,6 +394,7 @@ async def deliberate_continue(
     keep_seats: bool = True,
     append_report: bool = True,
     modifiers: list[str] | None = None,
+    advanced: dict | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """이전 심의를 이어 돌린다.
@@ -388,14 +404,19 @@ async def deliberate_continue(
         human_note: 넣을 사람 의견. 이것이 이어하기의 핵심이다 — 패널이 갖지 못한 관측을 넣는다.
                     sim-plan·build-plan 을 이어가면 1단에만 실린다(deliberate_start 의 human_note 와 같다).
         question: 화두를 바꾸려면 지정. 비우면 이전 화두를 그대로 쓴다.
-        job: 심의 종류를 바꾸려면 지정. 비우면 이전과 같다.
+        job: 심의 종류를 바꾸려면 지정. 비우면 이전과 같다. 봉인으로 돈 심의는 무엇을 적어도 봉인으로
+             이어지고, 다단 심의(sim-plan·test-plan·build-plan)를 적으면 거절한다.
         rounds: 라운드 수. 0 이면 기본값.
         non_negotiables: 이전 결정의 양보 불가 조항. 요약에 섞으면 소실되므로 따로 넘긴다.
         keep_seats: True 면 이전 좌석을 그대로 앉힌다(발굴 생략). False 면 다시 발굴한다.
                     test-plan 은 고정 좌석 뒤에 이전 좌석을 앉히고, sim-plan·build-plan 은 1단에 앉힌다.
         append_report: True 면 이전 회차의 Report Archive 보고서에 페이지로 이어붙인다 — 한 사안이
-                       보고서 여러 건으로 흩어지지 않는다. 이전 보고서가 없으면 새로 만든다.
+                       보고서 여러 건으로 흩어지지 않는다. 이전 보고서가 없으면 새로 만든다 — 다만
+                       저장하지 않고(save_report=False) 돈 심의는 이어가도 저장하지 않는다(저장하려면
+                       advanced={"save_report": 1}).
         modifiers: 이번 회차에 얹을 층.
+        advanced: 이번 회차의 손잡이(deliberate_start 의 advanced 와 같다). 비우면 이전 회차에 건
+                  _CONT_CARRY 손잡이를 이어받고, 여기 적은 것은 그 위에 덮인다. sealed 는 풀 수 없다.
 
     라운드 번호는 이전 회차에 이어서 센다 — 3회차 회의록이 매번 '1R' 로 돌아가면
     어느 회차의 발언인지 구분이 안 된다.
@@ -406,13 +427,30 @@ async def deliberate_continue(
     summary_text = (prev.get("decision") or prev.get("result_text") or "").strip()
     if not summary_text:
         raise ValueError(f"이전 심의에 결정문이 없다(status={prev.get('status')}) — 끝난 뒤 이어하라")
-    # 봉인 심의는 봉인으로 돈 심의만 이어받는다. 이전 결정문이 요약으로 실리는데, 봉인 없이 돈 회차의
-    # 결정문에는 그때 조회한 VOC·지식카드가 녹아 있다 — 그걸 싣고 '봉인' 이라고 적으면 거짓 기록이다.
+    # 봉인은 **이전 회차에 실제로 걸렸던 것**을 따라간다 — Job 이름이 아니라(봉인은 표식이 아니라 손잡이다).
+    # 양쪽 다 막는다.
+    #  · 봉인 없이 돈 심의 → 봉인으로: 거절. 이전 결정문이 요약으로 실리는데 거기에는 그때 조회한 VOC·
+    #    지식카드가 녹아 있다 — 그걸 싣고 '봉인' 이라고 적으면 거짓 기록이다. Job 으로 청하든 손잡이로 청하든 같다.
+    #  · 봉인으로 돈 심의 → 봉인 없이: 못 한다. Job 을 바꾸든 advanced 로 풀려 하든 봉인을 다시 건다 — 그
+    #    회차는 봉인이 찍힌 보고서에 이어 붙는다. 틀릴 거면 닫힌 쪽으로 틀린다(엔진 _seal 과 같은 규칙).
+    #    다단 심의는 봉인이 서지 않아(사내 자산 현황을 조회해 깐다) 거절한다.
     job = job or prev.get("job") or "default"
-    if ((delib_jobs.JOBS[delib_jobs.resolve_job(job)].get("opts") or {}).get("sealed")
-            and not (prev.get("opts") or {}).get("sealed")):
+    spec = delib_jobs.JOBS[delib_jobs.resolve_job(job)]
+    prev_opts = prev.get("opts") or {}
+    prev_sealed = bool(prev_opts.get("sealed"))
+    if not prev_sealed and ((spec.get("opts") or {}).get("sealed")
+                            or _engine._seal(dict(advanced or {}))[0].get("sealed")):
         raise ValueError(f"봉인 심의({job})는 봉인으로 돈 심의만 이어받는다 — {previous_job_id} 는 봉인 없이 "
                          "돌아 그 결정문에 바깥 자료가 섞여 있다. 봉인 심의를 새로 시작하라.")
+    if prev_sealed and spec["engine"] != "general":
+        raise ValueError(f"봉인으로 돈 심의({previous_job_id})는 다단 심의({job})로 이어받지 않는다 — 다단 "
+                         "심의는 사내 자산·물성 현황을 실제로 조회해 깔아 봉인이 서지 않는다. 단발 심의로 "
+                         "이어가거나, 봉인 없이 보려면 새 심의를 시작하라.")
+    # 이전 회차에 건 손잡이 위에 이번에 적은 것을 덮는다. 원장에는 엔진이 읽은 값이 적혀 있다(delib_jobs.start).
+    carried = {**{k: prev_opts[k] for k in _CONT_CARRY if prev_opts.get(k) is not None},
+               **{k: v for k, v in (advanced or {}).items() if v is not None}}
+    if prev_sealed:
+        carried["sealed"] = 1      # 풀려던 다른 손잡이는 엔진이 닫고 '봉인이 닫은 요청' 으로 알린다
     opts = _build_opts(
         rounds=rounds, modifiers=modifiers, human_note=human_note,
         # 미리 자르지 않는다 — 엔진이 상한에서 줄이고 **줄였다고 알린다**(evidence_omitted 의 '요청 값
@@ -422,6 +460,7 @@ async def deliberate_continue(
         personas=_carry_seats(prev) if keep_seats else None,
         rounds_so_far=delib_jobs.rounds_end(prev),
         append_to_report_id=(int(prev.get("report_id") or 0) if append_report else 0),
+        advanced=carried,
     )
     user, groups = _caller(ctx)
     rec = delib_jobs.start(_need_app(), job,

@@ -397,6 +397,106 @@ def test_봉인으로_돈_심의는_봉인으로_이어진다(monkeypatch, tmp_p
     assert _closed(d._resolve_opts(got)) == _ALL_CLOSED
 
 
+# ── 이어하기 — 이전 회차에 걸린 봉인과 유입 손잡이를 이어받는다 ─────────────────────────────
+# 이어하기는 이전 회차의 손잡이를 하나도 이어받지 않았다. 봉인을 **손잡이로**(advanced.sealed) 건 심의를
+# 이어가면 Job 이름에 봉인이 없어 열린 채 돌았다 — VOC·지식카드·자유 조회를 다 하고, 그 결과를 첫 장에
+# '봉인 실행' 이 찍힌 보고서에 페이지로 이어 붙였다. 호출자에게는 막을 인자도 알림도 없었다.
+# voc=off · free_tools=0 · persona_knowledge=0 · save_report=False 도 같이 풀렸다.
+_INFLOW = {"alert_check", "daily_briefing", "query_voc", "agent_search", "hybrid_search", "recommend_agents"}
+
+
+def _continue(r, note="두께를 다시 보라", **kw):
+    """_run 이 끝낸 잡을 **실제 MCP 도구 함수**(deliberate_continue)로 이어 실제 엔진을 끝까지 돌린다.
+
+    반환: SimpleNamespace(out=도구 응답, job=이어하기 잡 원장, tools·free=이어하기 회차에서만 부른 것)."""
+    n_tools, n_free = len(r.tools), len(r.free)
+
+    async def go():
+        out = await m.deliberate_continue(r.job["id"], note, **kw)
+        await delib_jobs._TASKS[out["job_id"]]
+        return out, delib_jobs._JOBS[out["job_id"]]
+
+    out, job2 = asyncio.run(go())
+    assert job2["status"] == "done", f"이어하기가 끝까지 못 갔다 — {job2.get('error')}"
+    return SimpleNamespace(out=out, job=job2, tools=r.tools[n_tools:], free=r.free[n_free:])
+
+
+@pytest.mark.parametrize("start,cont", [
+    ({"job": "diagnosis", "advanced": {"sealed": 1}}, {}),              # 손잡이로 봉인 — Job 이름에는 봉인이 없다
+    ({"job": SEALED}, {"job": "risk-review"}),                           # 봉인 Job 을 봉인 없는 Job 으로 바꿔 잇기
+    ({"job": SEALED}, {"job": "default"}),
+    ({"job": SEALED}, {"advanced": {"sealed": 0, "voc": "always"}}),     # 이어가면서 풀어 보려 해도
+])
+def test_봉인으로_돈_심의는_어떻게_이어도_봉인이다(monkeypatch, tmp_path, start, cont):
+    r = _run(monkeypatch, tmp_path, **start)
+    assert delib_jobs.summary(r.job)["sealed"] is True, "시험 전제 — 첫 회차가 봉인으로 돌았다"
+    c = _continue(r, **cont)
+    assert c.out["sealed"] is True and c.job["opts"]["sealed"] == 1, c.job["opts"]
+    assert set(c.tools) <= _ALLOWED | {"get_report", "update_report_draft"}, (
+        f"봉인을 이어받지 않고 바깥 자료를 가져왔다 — {sorted(set(c.tools) & _INFLOW)}")
+    assert c.free == [], f"봉인을 이어받지 않고 자유 조회를 돌았다 — {c.free}"
+    assert (c.job["decision"] or "").startswith("■ 봉인 실행"), (c.job["decision"] or "")[:60]
+    assert c.out["appending_to_report"] == 7 and "update_report_draft" in c.tools, "봉인 보고서에 봉인 회차를 잇는다"
+
+
+def test_이어가면서_봉인을_풀려던_손잡이는_닫히고_그렇다고_남는다(monkeypatch, tmp_path):
+    r = _run(monkeypatch, tmp_path)
+    c = _continue(r, advanced={"sealed": 0, "voc": "always", "free_tools": 1})
+    card = next(x for x in c.job["evidence_omitted"] if x.get("source") == "봉인이 닫은 요청")
+    assert "voc=always" in card["text"] and "free_tools=1" in card["text"], card
+
+
+def test_봉인으로_돈_심의는_다단_Job_으로_이어받지_않는다(monkeypatch, tmp_path):
+    """다단 심의는 사내 자산 현황을 조회해 깐다 — 봉인이 서지 않으니 봉인 보고서에 이어 붙이지 않는다."""
+    r = _run(monkeypatch, tmp_path)
+    before = set(delib_jobs._JOBS)
+    for job in ("sim-plan", "test-plan", "build-plan"):
+        with pytest.raises(ValueError, match="봉인"):
+            asyncio.run(m.deliberate_continue(r.job["id"], "해석으로 확인하자", job=job))
+    assert set(delib_jobs._JOBS) == before, "거절했는데 잡이 생겼다"
+
+
+def test_봉인_없이_돈_심의를_손잡이로_봉인해_이어받지도_않는다(monkeypatch, tmp_path):
+    """Job 이름으로 막던 것과 같은 까닭이다 — 이전 결정문에 그때 조회한 바깥 자료가 녹아 있다."""
+    _prev(monkeypatch, tmp_path, sealed=False)
+    with pytest.raises(ValueError, match="봉인"):
+        asyncio.run(m.deliberate_continue("prev-1", "두께를 다시 보라", advanced={"sealed": 1}))
+    assert list(delib_jobs._JOBS) == ["prev-1"]
+
+
+def test_끄고_돈_유입_손잡이와_보고서_저장_안_함도_이어받는다(monkeypatch, tmp_path):
+    """봉인까지는 아니어도 VOC·자유 조회·지식카드를 끄고 저장 없이 돈 심의다 — 이어가면 전부 켜진 채 돌았고,
+    저장하지 말라던 심의가 보고서를 만들었다."""
+    r = _run(monkeypatch, tmp_path, job="diagnosis", save_report=False,
+             advanced={"voc": "off", "free_tools": 0, "persona_knowledge": 0})
+    assert not (set(r.tools) & (_INFLOW | {"create_report_draft"})) and r.free == [], "시험 전제 — 첫 회차가 닫고 돌았다"
+    c = _continue(r, keep_seats=True)
+    # 좌석 재심사(recommend_agents)는 세지 않는다 — 이어하기에서만 도는 단계라 첫 회차에 끈 적이 없고, 누가
+    # 앉는지만 정한다(봉인만 그것까지 닫는다).
+    leaked = set(c.tools) & ((_INFLOW - {"recommend_agents"}) | {"create_report_draft", "update_report_draft"})
+    assert not leaked and c.free == [], f"이어하기가 끈 손잡이를 다시 켰다 — {sorted(leaked)} {c.free}"
+    echo = c.job["opts"]
+    assert (echo["voc"], echo["free_tools"], echo["persona_knowledge"], echo["save_report"]) == ("off", 0, 0, 0), echo
+    assert c.out["sealed"] is False and "봉인" not in (c.job["decision"] or ""), "봉인하지 않은 심의에 봉인을 찍었다"
+
+
+def test_이어가면서_손잡이를_바꾸려면_advanced_로_다시_건다(monkeypatch, tmp_path):
+    """이어받는 것이 기본이고, 호출자가 다시 정하면 그 값이 이긴다(봉인만 빼고)."""
+    r = _run(monkeypatch, tmp_path, job="diagnosis", save_report=False,
+             advanced={"voc": "off", "free_tools": 0, "persona_knowledge": 0})
+    c = _continue(r, advanced={"persona_knowledge": 1, "save_report": 1})
+    assert "agent_search" in c.tools and "create_report_draft" in c.tools, sorted(set(c.tools))
+    assert "query_voc" not in c.tools and c.free == [], "바꾸지 않은 손잡이까지 풀렸다"
+
+
+def test_아무것도_끄지_않고_돈_심의는_종전대로_이어진다(monkeypatch, tmp_path):
+    """대조군 — 이어받을 것이 없으면 이어하기는 엔진 기본값으로 돈다."""
+    r = _run(monkeypatch, tmp_path, job="diagnosis")
+    c = _continue(r)
+    assert "agent_search" in c.tools and c.free, "기본값으로 돈 심의의 이어하기가 닫힌 채 돌았다"
+    assert c.out["sealed"] is False
+
+
 # ── 찾을 수 있다 ─────────────────────────────────────────────────────────────
 def test_메뉴와_도구_설명에서_찾을_수_있다():
     menu = asyncio.run(m.deliberate_jobs())
@@ -410,3 +510,13 @@ def test_메뉴와_도구_설명에서_찾을_수_있다():
             assert label in text, f"닫는 경로 '{label}' 이 안내에 없다 — 엔진 표에서 읽어 적는다"
         assert d._SEALED_OPEN in text
     assert f"{len(delib_jobs.JOBS)}가지" in tools["deliberate_jobs"], tools["deliberate_jobs"]
+
+
+def test_이어하기_설명이_무엇을_이어받는지와_봉인은_못_푼다는_것을_말한다():
+    """이어받는 것이 기본이 됐다 — 적어 두지 않으면 호출자는 이어하기가 왜 VOC 를 안 보는지 모른다."""
+    tool = next(t for t in asyncio.run(m.mcp.list_tools()) if t.name == "deliberate_continue")
+    for key in m._CONT_CARRY:
+        assert key in tool.description, f"이어받는 손잡이 {key} 가 설명에 없다"
+    for want in ("이어받는다", "advanced", "풀 수 없다"):
+        assert want in tool.description, want
+    assert "advanced" in tool.inputSchema["properties"], "설명은 advanced 로 바꾸라는데 인자가 없다"
