@@ -34,7 +34,7 @@ DROPPED = "8642.5"          # 예산을 넘겨 좌석에 주지 않은 사전 �
 INVENTED = "9191.5"         # 어디에도 없다
 
 
-def _run(monkeypatch, decision, ser_clip=0, **opts):
+def _run(monkeypatch, decision, ser_clip=0, tools=None, **opts):
     """심의를 끝까지 돌려 (이벤트, 의장이 받은 프롬프트, 최종 결정문)을 받는다. 의장 전사 상한을 작게
     못박아 좌석 발언의 뒷부분이 의장 프롬프트에서 잘리게 한다."""
     import langgraph.prebuilt
@@ -71,7 +71,7 @@ def _run(monkeypatch, decision, ser_clip=0, **opts):
                       ensure_ascii=False)
     events = _stream(monkeypatch, {"personas": _SEATS, "save_report": 0, "rebut_quote": 0, "free_tools": 1,
                                    **opts},
-                     tools={"agent_search": _Tool("agent_search", card)},
+                     tools={"agent_search": _Tool("agent_search", card), **(tools or {})},
                      until=lambda ev, _data: ev == "done")
     chair = next(h for s, h in seen if "엔지니어링 톤" in s)
     final = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
@@ -168,3 +168,34 @@ def test_6건_이하면_전부_보이고_건수만_적는다(monkeypatch):
     assert "표시" not in final.split(_WARN, 1)[1], "다 보였는데 일부만 보인 것처럼 적었다"
     step = next(s for s in _steps(events) if s.startswith("결정문 수치 대조"))
     assert step.endswith("출처 미확인 6건"), step
+
+
+# ── 남는 기록(RA 보고서)에도 경고가 실린다 ───────────────────────────────────────────
+# 경고는 보고서를 저장한 **뒤에** 결정문에 붙었다 — 화면의 결정문에는 '이 수치는 확인되지 않았다' 가
+# 있는데 Report Archive 에 남는 보고서에는 없었다. 나중에 보고서만 읽는 사람은 지어낸 값을 그대로 믿는다.
+def _saved(monkeypatch, decision, tools=None, **opts):
+    """보고서 저장까지 돌려 (저장 도구가 받은 권고 블록, 화면의 최종 결정문)을 받는다."""
+    save = _Tool("create_report_draft", '{"report_id": 7}')
+    _events, _chair, final = _run(monkeypatch, decision, save_report=1,
+                                  tools={"create_report_draft": save, **(tools or {})}, **opts)
+    assert len(save.calls) == 1, "보고서를 저장하지 않았다 — 시험 전제가 깨졌다"
+    return "\n\n".join(save.calls[0]["blocks"]["recommendation"]), final
+
+
+def test_출처_없는_수치_경고가_저장되는_보고서에도_실린다(monkeypatch):
+    saved, final = _saved(monkeypatch, _cite(CUT_AWAY, INVENTED))
+    assert _flagged(final) == [INVENTED], "시험 전제 — 화면의 결정문에는 경고가 있다"
+    assert _flagged(saved) == [INVENTED], f"저장된 보고서에 경고가 없다 — {saved[-200:]}"
+
+
+def test_지어낸_수치가_없으면_저장되는_보고서에도_경고가_없다(monkeypatch):
+    saved, final = _saved(monkeypatch, _cite(CUT_AWAY))
+    assert _WARN not in final and _WARN not in saved
+
+
+def test_확인_안_된_웹_인용_경고도_저장되는_보고서에_실린다(monkeypatch):
+    cite = "[W:d_0123456789ab#1]"
+    saved, final = _saved(monkeypatch, f"결정: 문헌에 따르면 그렇다 {cite}", search_sources=["web"],
+                          tools={"get_quote": _Tool("get_quote", '{"ok": false}')})
+    for text, where in ((final, "화면의 결정문"), (saved, "저장된 보고서")):
+        assert "원장에서 확인되지 않았습니다" in text and cite in text.split("원장에서 확인되지")[1], where

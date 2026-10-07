@@ -4281,6 +4281,48 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 별도 이벤트로도 내보내 프론트가 결정문과 분리된 카드로 렌더할 수 있게 한다.
         yield _delib("plain", text=_plain)
 
+    # 아래 두 대조(웹 인용 · 수치)는 **보고서를 저장하기 전에** 한다. 종전엔 저장한 뒤에 경고를 붙여서,
+    # 화면의 결정문에는 '이 수치는 확인되지 않았다' 가 있는데 Report Archive 에 남는 보고서에는 없었다 —
+    # 나중에 보고서만 읽는 사람은 지어낸 값을 그대로 믿는다(봉인 표식을 저장 전에 찍는 것과 같은 까닭).
+    # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
+    # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
+    if opts.search_sources:
+        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision,
+                                                          user, user_pat)
+        if _ok_n or _bad_n:
+            yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건",
+                                  "tool": "get_quote"})
+            if _bad_n:
+                decision += ("\n\n> ⚠ 아래 인용은 원장에서 확인되지 않았습니다(날조 가능) — "
+                             + ", ".join(_bad[:8])
+                             + "\n> 이 항목의 근거는 신뢰하지 마세요.")
+            else:
+                decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
+                             "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
+                             "별도 판단입니다.")
+    # 의사결정문 수치 대조 — **심의에 나온 것**(좌석 발언·근거·화두)에 없는 수치는 의장이 지어낸
+    # 값이다. 챗에는 이 판정이 근거 블록으로 있었는데, 정작 가장 중요한 산출물인 결정문에는
+    # 없었다(실측 점검). 판정은 챗과 같은 공용 모듈이 한다 — 화면마다 기준이 달라지면 안 된다.
+    # ⚠ 출처를 의장 프롬프트(chair_human)만으로 잡지 않는다. 거기 실린 전사는 상한에서 **줄인 판**이고
+    #   좌석이 받은 지식카드·자유 조회 결과는 아예 없다 — 좌석이 근거를 대고 말한 수치가 '출처 미확인'
+    #   으로 찍혔다(S26U 피드백 1-10). 좌석의 원 발언(전사는 그것을 값마다 _SER_CLIP 에서 끊은 것이다)과
+    #   좌석이 실제로 받은 것을 함께 본다. 호출자가 보낸 근거 목록(opts.evidence)은 통째로 넣지 않는다 —
+    #   예산을 넘겨 빠진 항목은 아무도 못 봤고, 실린 항목은 chair_human 에 이미 있다.
+    _num_src = "\n".join(
+        [chair_human, question or ""]
+        + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
+        + list(knowledge_by_key.values()) + seat_lookups
+        + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
+    _bad_num = unsourced_numbers(decision, _num_src, limit=0)
+    if _bad_num:
+        # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
+        # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
+        _cnt = (f"표시 6건 · 총 {len(_bad_num)}건" if len(_bad_num) > 6 else f"{len(_bad_num)}건")
+        decision += ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다 — 의장이 "
+                     f"추론·계산한 값일 수 있으니 그대로 인용하지 마십시오({_cnt}): "
+                     + ", ".join(f"`{v}`" for v in _bad_num[:6]))
+        yield _sse("status", {"step": f"결정문 수치 대조 — 출처 미확인 {_cnt}", "tool": None})
+
     # 5) Report Archive 기록(옵션·best-effort — 템플릿 있으면)
     # save_report=0 이면 도구 호출을 건너뛴다(블록 조립은 순수 문자열이라 비용이 없다).
     # 탐색적 심의까지 RA 를 어지럽히지 않게 하는 스위치이고 비용 문제이기도 하다 — 실측에서
@@ -4355,44 +4397,6 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
-    # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
-    # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
-    if opts.search_sources:
-        _ok_n, _bad_n, _bad = await _verify_web_citations(app, groups, decision,
-                                                          user, user_pat)
-        if _ok_n or _bad_n:
-            yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건",
-                                  "tool": "get_quote"})
-            if _bad_n:
-                decision += ("\n\n> ⚠ 아래 인용은 원장에서 확인되지 않았습니다(날조 가능) — "
-                             + ", ".join(_bad[:8])
-                             + "\n> 이 항목의 근거는 신뢰하지 마세요.")
-            else:
-                decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
-                             "인용된 문장이 실재한다는 뜻이며, 그 문장이 주장을 뒷받침하는지는 "
-                             "별도 판단입니다.")
-    # 의사결정문 수치 대조 — **심의에 나온 것**(좌석 발언·근거·화두)에 없는 수치는 의장이 지어낸
-    # 값이다. 챗에는 이 판정이 근거 블록으로 있었는데, 정작 가장 중요한 산출물인 결정문에는
-    # 없었다(실측 점검). 판정은 챗과 같은 공용 모듈이 한다 — 화면마다 기준이 달라지면 안 된다.
-    # ⚠ 출처를 의장 프롬프트(chair_human)만으로 잡지 않는다. 거기 실린 전사는 상한에서 **줄인 판**이고
-    #   좌석이 받은 지식카드·자유 조회 결과는 아예 없다 — 좌석이 근거를 대고 말한 수치가 '출처 미확인'
-    #   으로 찍혔다(S26U 피드백 1-10). 좌석의 원 발언(전사는 그것을 값마다 _SER_CLIP 에서 끊은 것이다)과
-    #   좌석이 실제로 받은 것을 함께 본다. 호출자가 보낸 근거 목록(opts.evidence)은 통째로 넣지 않는다 —
-    #   예산을 넘겨 빠진 항목은 아무도 못 봤고, 실린 항목은 chair_human 에 이미 있다.
-    _num_src = "\n".join(
-        [chair_human, question or ""]
-        + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
-        + list(knowledge_by_key.values()) + seat_lookups
-        + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
-    _bad_num = unsourced_numbers(decision, _num_src, limit=0)
-    if _bad_num:
-        # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
-        # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
-        _cnt = (f"표시 6건 · 총 {len(_bad_num)}건" if len(_bad_num) > 6 else f"{len(_bad_num)}건")
-        decision += ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다 — 의장이 "
-                     f"추론·계산한 값일 수 있으니 그대로 인용하지 마십시오({_cnt}): "
-                     + ", ".join(f"`{v}`" for v in _bad_num[:6]))
-        yield _sse("status", {"step": f"결정문 수치 대조 — 출처 미확인 {_cnt}", "tool": None})
     if out is not None:
         out["decision"] = decision
     yield _delib("decision", text=decision + report_note)
