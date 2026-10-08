@@ -48,11 +48,11 @@ done
 [ -f "$STUB_DIR/health" ] || exit 7
 cat "$STUB_DIR/health"
 ''',
-    # 자지 않고 몇 초를 자려 했는지만 적는다. 숫자가 아니면 실물처럼 실패한다(1).
+    # 자지 않고 몇 초를 자려 했는지만 적는다. 숫자가 아니면 실물처럼 실패한다(1). STUB_SLEEP_RC 를 주면 늘 그 값으로 끝난다.
     "sleep": '''#!/usr/bin/env bash
 printf '%s\\n' "$1" >> "$STUB_DIR/sleep.args"
 case "$1" in ''|.|*[!0-9.]*|*.*.*) echo "sleep: invalid time interval '$1'" >&2; exit 1 ;; esac
-exit 0
+exit "${STUB_SLEEP_RC:-0}"
 ''',
 }
 _VENV = {
@@ -237,6 +237,15 @@ def test_묻는_한도를_숫자로_못_읽어도_도는_심의를_끊지_않는
     assert "--max-time 3 " in box.read("curl.args")[0], box.read("curl.args")
     assert "AGENT_HEALTH_PROBE_S" in out and "기본값 3초" in out, out
     assert "확인하지 못했다" not in out, out
+
+
+def test_유예_sleep_이_실패해도_새_서버를_띄운다(box):
+    """옛 서버를 이미 내린 자리다 — 값이 멀쩡해도 sleep 이 무슨 까닭으로든 실패하면(신호로 끊기는 등) set -e 가
+    거기서 스크립트를 끝내 아무것도 안 떴다."""
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    rc, out = box.run(STUB_SLEEP_RC="130")
+    assert rc == 0 and not box.old_alive(), (rc, out)
+    assert box.started(), f"옛 서버를 내리고 새 서버를 띄우지 않았다 — {out}"
 
 
 def test_숫자로_읽히는_값에는_경고가_없다(box):
