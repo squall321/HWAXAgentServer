@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 import app as a  # noqa: E402
 import delib_jobs  # noqa: E402
+import deliberation as d  # noqa: E402
 
 
 def _frames(chunks):
@@ -171,6 +172,9 @@ def test_기본_간격은_15초다():
 
 
 def test_heartbeat_를_끄고_뜨면_기동_로그가_바깥_한도를_말한다(monkeypatch, capsys):
+    """끈 박스의 운영자는 이 한 줄을 보고 바깥 침묵 한도를 잡는다. 종전 문구는 '2×DELIB_TIMEOUT_S 보다 커야' 였는데
+    그것은 LLM 호출 한 번의 최악이다 — 좌석 발언 하나는 호출을 (1 + 파싱 재시도)번 잇고 그 사이에 스트림이
+    조용하므로, 그 글대로 nginx 를 2시간에 맞추면 살아 있는 구독이 끊긴다. 지금 설정으로 잰 수를 적는다."""
     from contextlib import asynccontextmanager
 
     from fastapi import FastAPI
@@ -181,20 +185,39 @@ def test_heartbeat_를_끄고_뜨면_기동_로그가_바깥_한도를_말한다
 
     monkeypatch.setattr(a, "_load_mcp_config", dict)                 # 실 게이트웨이 설정을 읽지 않는다
     monkeypatch.setattr(a._DELIB_MCP.router, "lifespan_context", _no_session_manager)
+    # 박스의 설정이 아래 숫자를 흔들지 않게 한다 — 코드 기본값(파싱 재시도 1, 인용 계약이 켜져 하한 2)으로 못박는다.
+    for knob in ("DELIB_TIMEOUT_S", "DELIB_LLM_MAX_RETRIES"):
+        monkeypatch.delenv(knob, raising=False)
+    monkeypatch.setattr(d, "_PARSE_RETRIES", 1)
+    monkeypatch.setattr(d, "_REBUT_QUOTE", 1)
+    monkeypatch.setattr(d, "_CHAIR_BESTOF", 1)
 
     async def boot():
         async with a.lifespan(FastAPI()):
             pass
 
+    def warned():
+        asyncio.run(boot())
+        return next((ln for ln in capsys.readouterr().out.splitlines() if "DELIB_HEARTBEAT_S=0" in ln), "")
+
     try:
         monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", 15.0)
-        asyncio.run(boot())
-        assert "DELIB_HEARTBEAT_S=0" not in capsys.readouterr().out
+        assert not warned()
         monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", 0.0)
-        asyncio.run(boot())
-        out = capsys.readouterr().out
-        assert "DELIB_HEARTBEAT_S=0" in out and "2×DELIB_TIMEOUT_S" in out, out
+        out = warned()
+        # 좌석 발언 하나 = 호출 3번(1 + 파싱 재시도 2) × 호출 한 번의 최악(2회 시도 × 1,800초 + 8).
+        assert "3×(2×DELIB_TIMEOUT_S+8) = 10,824초" in out and "파싱 재시도" in out, out
+        assert "DELIB_PARSE_RETRIES" in out, "그 수를 바꾸는 설정 이름을 말하지 않았다"
+        assert "이 2×DELIB_TIMEOUT_S 보다" not in out, "호출 한 번의 최악을 침묵 한도의 기준으로 적었다"
         for knob in ("AGENT_STREAM_IDLE_TIMEOUT_S", "NGINX_AGENT_READ_TIMEOUT", "HWAXRISK_ENGINE_READ_TIMEOUT_S"):
             assert knob in out, f"바깥 침묵 한도 {knob} 를 말하지 않았다"
+        # 그 박스에 걸린 값으로 잰다 — 옛 킷 값(600초 · 재시도 2회)이 남은 박스다.
+        monkeypatch.setenv("DELIB_TIMEOUT_S", "600")
+        monkeypatch.setenv("DELIB_LLM_MAX_RETRIES", "2")
+        assert "3×(3×DELIB_TIMEOUT_S+8) = 5,424초" in warned()
+        # 호출 한도까지 끈 박스에는 수를 지어내지 않는다.
+        monkeypatch.setenv("DELIB_TIMEOUT_S", "0")
+        out = warned()
+        assert "초보다 커야" not in out and "DELIB_TIMEOUT_S=0" in out, out
     finally:
         delib_jobs.closing(False)                 # 종료 절차가 '내려가는 중' 을 세워 두었다 — 다음 시험이 잡을 띄운다

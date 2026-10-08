@@ -68,6 +68,8 @@ from deliberation import (
     _call,
     _llm_text,
     _llm_limit,
+    _quiet_calls,
+    _resolve_opts,
     _tools_by_name,
     is_deliberation,
     is_operator,
@@ -367,10 +369,21 @@ async def lifespan(app: FastAPI):
     app.state.tool_snapshot = {}  # (frozenset(groups), user_lower) -> (raw_tools, ts)
     print(f"[agent] ready — model={VLLM_MODEL}, mcp={list(app.state.connections)}")
     if DELIB_HEARTBEAT_S <= 0:
-        print("[agent] ⚠ DELIB_HEARTBEAT_S=0 — 심의 SSE heartbeat(ping)가 꺼졌다. LLM 호출 한 번이 도는 동안 "
-              "스트림이 조용하므로, 바깥 침묵 한도 셋(포털 AGENT_STREAM_IDLE_TIMEOUT_S · nginx "
-              "NGINX_AGENT_READ_TIMEOUT · 리스크 앱 HWAXRISK_ENGINE_READ_TIMEOUT_S)이 2×DELIB_TIMEOUT_S 보다 "
-              "커야 살아 있는 심의의 구독이 끊기지 않는다")
+        # 종전 문구는 '2×DELIB_TIMEOUT_S 보다 커야' 였다 — LLM 호출 한 번의 최악이다. 좌석 발언 하나는 호출을
+        # (1 + 파싱 재시도)번 잇고 그 사이에 스트림이 조용하다(_quiet_calls). 그 글대로 nginx 를 2시간에 맞춘
+        # 박스는 마지막 좌석이 재시도 중일 때 살아 있는 구독이 끊긴다. 이 박스에 걸린 값으로 잰 수를 적는다
+        # (진행 조회의 quiet_ok_s 와 같은 식). 호출 한도까지 꺼져 있으면 수를 지어내지 않는다.
+        _read, _tries = _llm_limit(app.state.delib_llm)
+        _calls = _quiet_calls(_resolve_opts(None))
+        print("[agent] ⚠ DELIB_HEARTBEAT_S=0 — 심의 SSE heartbeat(ping)가 꺼졌다. 좌석 발언 하나가 끝날 때까지 "
+              "스트림이 조용하고, 그 발언은 LLM 호출을 (1 + 파싱 재시도)번 잇는다(DELIB_PARSE_RETRIES — 지금 "
+              f"설정으로 {_calls}번). 바깥 침묵 한도 셋(포털 AGENT_STREAM_IDLE_TIMEOUT_S · nginx "
+              "NGINX_AGENT_READ_TIMEOUT · 리스크 앱 HWAXRISK_ENGINE_READ_TIMEOUT_S)"
+              + (f"이 {_calls}×({_tries}×DELIB_TIMEOUT_S+8) = {_calls * (_read * _tries + 8):,.0f}초보다 커야 "
+                 "살아 있는 심의의 구독이 끊기지 않는다(자유 조회 단계와, timeout_s·parse_retries 를 올려 청한 "
+                 "심의는 그보다 길다)" if _read > 0 and _tries > 0 else
+                 " 어느 것이든 살아 있는 심의의 구독을 끊을 수 있다 — 호출 한도도 꺼져 있어(DELIB_TIMEOUT_S=0) "
+                 "그 침묵에 끝이 없다"))
     # 심의 MCP(/mcp) — streamable_http_app 은 자체 lifespan(task group)이 있어야 동작하는데
     # FastAPI 의 mount() 는 하위 앱 lifespan 을 전파하지 않는다. 여기서 명시적으로 연다.
     # 실패해도 서버는 뜬다 — 심의 MCP 는 부가 진입점이고, 웹(/chat) 경로는 이것과 무관하다.
@@ -508,7 +521,8 @@ _DETACHED_TASKS: set = set()   # 태스크 GC 방지 — 참조가 사라지면 
 # 심의의 구독이 끊긴다. LLM 한도(DELIB_TIMEOUT_S)를 넉넉히 올릴 수 있는 것은 이 ping 이 있어서다.
 # 이벤트 이름은 ping 으로 고정한다 — 이 스트림을 읽는 셋(포털 릴레이 파서 · 포털 프론트 dispatch ·
 # 리스크 앱 collect_stream)이 모르는 이름을 버린다(status 로 보내면 리스크 앱 events[] 400칸을 채운다).
-# 끄면(0) 바깥 침묵 한도 셋이 LLM 논리 호출 1회(재시도 포함 약 2×DELIB_TIMEOUT_S)보다 커야 한다.
+# 끄면(0) 바깥 침묵 한도 셋이 좌석 발언 하나의 침묵보다 커야 한다 — LLM 논리 호출 1회(재시도 포함 약
+# 2×DELIB_TIMEOUT_S)가 아니라 그것의 (1 + 파싱 재시도)배다(기본 3×3,608초. 기동 경고가 그 박스의 수를 적는다).
 DELIB_HEARTBEAT_S = _env_float("DELIB_HEARTBEAT_S", 15.0)
 
 

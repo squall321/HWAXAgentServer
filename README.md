@@ -57,6 +57,15 @@ knowledge lookup (180) is a fallback switch, not a layer. Limits that wrap this 
 risk app's panel wall clock and the portal / nginx / risk-app idle limits — live in those repos
 and must stay above one logical call at the request maximum (2×`DELIB_TIMEOUT_MAX_S`+8 = 28808).
 
+The longest stretch with **no stream event** is longer than one logical call. A seat turn chains
+1 + parse retries of them and emits nothing in between (`DELIB_PARSE_RETRIES`, default 1; the quote
+contract `DELIB_REBUT_QUOTE`, on by default, raises it to at least 2) — 3×3608 = 10824 by default —
+and a free-lookup seat chains more (its LLM steps plus tool calls). `deliberate_status` reports the
+seat-turn figure as `quiet_ok_s`: inside it the job is waiting; past it the job is **not** proven
+hung — with the call limits on, every inner wait is finite and a running job ends by itself.
+Nothing is cut on this value. It matters to the outer idle limits only when the heartbeat is off
+(`DELIB_HEARTBEAT_S` below).
+
 | var | default | meaning |
 |---|---|---|
 | `LLM_CONNECT_TIMEOUT_S` | `10` | Connect timeout to the LLM endpoint, for chat and deliberation alike. Kept short on purpose: it detects a dead server, it does not measure a slow one. |
@@ -70,7 +79,7 @@ and must stay above one logical call at the request maximum (2×`DELIB_TIMEOUT_M
 | `THINK_SEAT_TIMEOUT_S` | `600` | One seat's answer in Thinking mode; past it only that seat drops out (`N초 초과(THINK_SEAT_TIMEOUT_S)`). Shorter than `LLM_TIMEOUT_S` on purpose — a per-seat cap. Was 180, which every seat exceeded while a large deliberation held the shared LLM. |
 | `MCP_CALL_TIMEOUT_S` | `900` | How long this server waits for one tool call through the gateway (seat lookups, VOC, role restore, report save). Set as the MCP session request deadline; `0` = none. Must stay **larger** than the gateway's `GATEWAY_CALL_TIMEOUT` (600, outer deadline 660) — the gateway should expire first and name the slow backend; this is the last net for a hung gateway. |
 | `KNOWLEDGE_TIMEOUT_S` | `180` | One seat's knowledge-card lookup (`agent_search`) before the round starts; on expiry it asks once more in `KNOWLEDGE_FALLBACK_MODE` and the seat's status line says so. Intentionally **shorter** than the gateway limit — it is the switch to the fallback, not a wrapping layer. Must stay above AIDataHub's `DB_POOL_TIMEOUT` (60) + `AIDH_SEARCH_STATEMENT_TIMEOUT_S` (90). |
-| `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed 2×`DELIB_TIMEOUT_S`. Consumers must ignore unknown event names. |
+| `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed the silence of one seat turn, (1 + parse retries)×((1+`DELIB_LLM_MAX_RETRIES`)×`DELIB_TIMEOUT_S`+8) = 10824 s by default — not one logical call (the startup log prints the figure for the box). Consumers must ignore unknown event names. |
 | `AGENT_RESTART_FORCE` | `0` | `start.sh` will not stop a running instance that reports running or queued deliberations — a restart cuts all of them. It prints the counts and exits `3` (skipped), leaving the instance up. `1` restarts anyway. If the counts cannot be read (no answer, older build) it says so and restarts. |
 | `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. |
 | `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. |
