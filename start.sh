@@ -82,13 +82,30 @@ export MCP_CONFIG="${MCP_CONFIG:-$(pwd)/mcp_servers.json}"
 # in use'). 포트 리스너 PID 를 직접 종료한다 — uvicorn 이 상대경로(.venv/bin/uvicorn)로 실행돼
 # cmdline 절대경로 pkill 패턴이 빗나가던 것 방지(포트는 우리가 실제로 비워야 하는 대상 그 자체).
 port_pids() { ss -ltnp 2>/dev/null | grep ":${PORT} " | grep -oP 'pid=\K[0-9]+' | sort -u; }
+# 초로 읽는 손잡이 둘(AGENT_STOP_GRACE_S · AGENT_HEALTH_PROBE_S)은 쓰기 전에 숫자인지 본다 — 아니면 경고하고
+# 기본값으로 돈다(파이썬이 읽는 손잡이의 _env_int 와 같은 규칙이고, 킷이 그렇게 적는다). 위 .env 로더는 `=` 뒤를
+# 통째로 값으로 읽어 줄 끝 설명·끝 공백이 값에 남는다. 종전엔 그 값을 그대로 넘겼다 —
+#  · sleep 이 실패하면 set -e 가 **옛 서버를 내린 직후** 스크립트를 끝냈다(옛 것은 죽고 새 것은 안 떴다).
+#  · curl 이 --max-time 을 거절하면 답이 비고, 빈 답은 '모름' 이라 도는 심의를 끊고 재기동했다 — 바쁜 서버를 더
+#    기다리려고 올린 값이 보호를 껐다.
+# ⚠ .env 로더는 고치지 않는다 — 값에 `#` 가 들어갈 수 있다(URL·키). 숫자여야 하는 자리에서만 본다.
+secs_or() {   # secs_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는다
+  case "$2" in
+    ''|.|*[!0-9.]*|*.*.*)
+      echo "  ⚠ $1='$(printf '%.40s' "$2")' 를 초로 읽지 못했다 — 기본값 ${3}초로 돈다(.env 의 값 줄 끝에 설명·공백·단위를 두지 않는다)" >&2
+      printf '%s' "$3" ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+STOP_GRACE_S="$(secs_or AGENT_STOP_GRACE_S "${AGENT_STOP_GRACE_S:-2}" 2)"
+HEALTH_PROBE_S="$(secs_or AGENT_HEALTH_PROBE_S "${AGENT_HEALTH_PROBE_S:-3}" 3)"
 # 떠 있는 인스턴스가 돌리고 있는 심의 수 — "<진행> <대기>" 를 찍는다. **모르면 아무것도 안 찍는다**
 # (/health 무응답 · 그 수를 안 주는 옛 빌드 · curl 없음). '모름' 과 '0건' 을 섞지 않는다 — 섞으면 답 없는
 # 서버를 '심의 없음' 으로 읽는다. 출력을 먼저 변수에 받고 나서 가른다(판정을 파이프에 걸지 않는다).
 delib_load() {
   local body act que probe="$HOST"
   [ "$probe" = "0.0.0.0" ] && probe="127.0.0.1"
-  body="$(curl -s --noproxy '*' --max-time "${AGENT_HEALTH_PROBE_S:-3}" "http://${probe}:${PORT}/health" 2>/dev/null || true)"
+  body="$(curl -s --noproxy '*' --max-time "$HEALTH_PROBE_S" "http://${probe}:${PORT}/health" 2>/dev/null || true)"
   act="$(printf '%s' "$body" | grep -oE '"delib_active": *[0-9]+' | grep -oE '[0-9]+$' || true)"
   que="$(printf '%s' "$body" | grep -oE '"delib_queued": *[0-9]+' | grep -oE '[0-9]+$' || true)"
   if [ -n "$act" ] && [ -n "$que" ]; then echo "$act $que"; fi
@@ -118,7 +135,8 @@ if [ -n "$OLD_PIDS" ]; then
   echo "==> stopping previous instance (${OLD_PIDS//$'\n'/ })"
   kill $OLD_PIDS 2>/dev/null || true
   # TERM 뒤 KILL 까지의 유예(초). 긴 심의를 기다리는 값이 아니다 — 프로세스가 스스로 내려갈 짧은 틈이다.
-  sleep "${AGENT_STOP_GRACE_S:-2}"
+  # `|| true` — 옛 서버를 이미 내린 자리다. 여기서 sleep 이 무슨 까닭으로든 실패해 스크립트가 끝나면 아무것도 안 뜬다.
+  sleep "$STOP_GRACE_S" || true
   STILL="$(port_pids || true)"
   if [ -n "$STILL" ]; then kill -9 $STILL 2>/dev/null || true; sleep 1; fi   # 안 죽었으면 강제
 fi

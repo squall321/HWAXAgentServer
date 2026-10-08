@@ -35,14 +35,23 @@ fi
 exit 0
 ''',
     # /health 대역 — 파일이 있으면 그 내용을, 없으면 연결 실패(7)를 돌려준다. 부른 주소를 적어 둔다.
+    # --max-time 에 숫자가 아닌 것이 오면 실물처럼 거절한다(2) — 대역이 뭐든 받아 주면 나쁜 값이 시험에서만 통한다.
     "curl": '''#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$STUB_DIR/curl.args"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--max-time" ]; then
+    case "$arg" in ''|.|*[!0-9.]*|*.*.*) echo "curl: option --max-time: expected a proper numerical parameter" >&2; exit 2 ;; esac
+  fi
+  prev="$arg"
+done
 [ -f "$STUB_DIR/health" ] || exit 7
 cat "$STUB_DIR/health"
 ''',
-    # 자지 않고 몇 초를 자려 했는지만 적는다.
+    # 자지 않고 몇 초를 자려 했는지만 적는다. 숫자가 아니면 실물처럼 실패한다(1).
     "sleep": '''#!/usr/bin/env bash
 printf '%s\\n' "$1" >> "$STUB_DIR/sleep.args"
+case "$1" in ''|.|*[!0-9.]*|*.*.*) echo "sleep: invalid time interval '$1'" >&2; exit 1 ;; esac
 exit 0
 ''',
 }
@@ -181,6 +190,62 @@ def test_유예를_설정으로_바꾼다(box):
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
     box.run(AGENT_STOP_GRACE_S="7")
     assert box.read("sleep.args")[0] == "7", box.read("sleep.args")
+
+
+# ── 숫자로 못 읽는 초 단위 손잡이 — 경고하고 기본값으로 돈다 ─────────────────────────────
+# start.sh 의 .env 로더는 `=` 뒤를 통째로 값으로 읽는다(줄 끝 설명·끝 공백이 값에 남는다). 파이썬이 읽는 손잡이는
+# 그런 값에 경고하고 기본값으로 도는데(킷과 env-kits README 가 그렇게 적는다), 셸이 읽는 이 둘은 그러지 않았다.
+_BAD_SECS = ["2   # 종료 유예", "7 ", "abc", "1.2.3", "."]
+_BAD_PROBE = [*_BAD_SECS, "10s"]        # 단위를 붙인 값 — sleep 은 받지만 curl 은 거절한다
+
+
+def test_대역이_실물과_같은_값을_거절한다():
+    """아래 시험들은 sleep·curl 대역이 나쁜 값에 **실물처럼 실패해야** 뜻이 있다 — 박스의 실물에 같은 값을 줘 본다.
+    실제로 자는 값은 주지 않는다(전부 거절되거나 0초다)."""
+    for bad in _BAD_SECS:
+        assert subprocess.run(["/usr/bin/sleep", bad], capture_output=True).returncode != 0, bad
+    for ok in ("0", "0.", ".0", "00"):                      # start.sh 가 그대로 넘기는 모양은 실물도 받는다
+        assert subprocess.run(["/usr/bin/sleep", ok], capture_output=True).returncode == 0, ok
+    curl = shutil.which("curl")
+    if curl is None:
+        pytest.skip("이 박스에 curl 이 없다 — start.sh 는 그때 '모름' 으로 읽는다")
+    for bad in _BAD_PROBE:                                  # 2 = 인자 거절(연결을 해 보기도 전에 끝난다)
+        r = subprocess.run([curl, "-s", "--noproxy", "*", "--max-time", bad, "http://127.0.0.1:9/"], capture_output=True)
+        assert r.returncode == 2, (bad, r.returncode)
+
+
+@pytest.mark.parametrize("bad", _BAD_SECS)
+def test_유예를_숫자로_못_읽어도_옛_서버만_내리고_끝나지_않는다(box, bad):
+    """sleep 이 그 값에 실패하면 set -e 가 **옛 서버를 내린 직후** 스크립트를 끝냈다 — 옛 것은 죽고 새 것은 안 떴다."""
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    (box.dir / ".env").write_text(f"AGENT_STOP_GRACE_S={bad}\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and not box.old_alive(), (rc, out)
+    assert box.started(), f"옛 서버를 내리고 새 서버를 띄우지 않았다 — {out}"
+    assert box.read("sleep.args")[0] == "2", box.read("sleep.args")
+    assert "AGENT_STOP_GRACE_S" in out and "기본값 2초" in out, out
+
+
+@pytest.mark.parametrize("bad", _BAD_PROBE)
+def test_묻는_한도를_숫자로_못_읽어도_도는_심의를_끊지_않는다(box, bad):
+    """curl 이 --max-time 을 거절하면 답이 비고, 빈 답은 '모름' 이라 그대로 재기동했다 — 바쁜 서버를 더 기다리려고
+    올린 값이 보호를 껐고, 문구는 /health 탓을 해 같은 값을 또 올리게 했다."""
+    box.health('{"status":"ok","delib_active":2,"delib_queued":1}')
+    (box.dir / ".env").write_text(f"AGENT_HEALTH_PROBE_S={bad}\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 3 and box.old_alive() and not box.started(), (rc, out)
+    assert "--max-time 3 " in box.read("curl.args")[0], box.read("curl.args")
+    assert "AGENT_HEALTH_PROBE_S" in out and "기본값 3초" in out, out
+    assert "확인하지 못했다" not in out, out
+
+
+def test_숫자로_읽히는_값에는_경고가_없다(box):
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    (box.dir / ".env").write_text("AGENT_STOP_GRACE_S=0.5\nAGENT_HEALTH_PROBE_S=10\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and box.started(), (rc, out)
+    assert box.read("sleep.args")[0] == "0.5" and "--max-time 10 " in box.read("curl.args")[0]
+    assert "기본값" not in out, out
 
 
 # ── 서버에 넘기는 환경 ───────────────────────────────────────────────────────
