@@ -664,8 +664,9 @@ def summary(job: dict, *, full: bool = False) -> dict:
     }
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
-        # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 LLM 호출 한 번이 도는 동안 이벤트가 없다 —
-        # 그 호출의 한도(시도 횟수 포함) 안이면 기다리는 중이다(mcp_server 가 그 값을 quiet_ok_s 로 붙인다).
+        # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —
+        # 그 발언이 잇는 호출들((1 + 파싱 재시도)번, 호출마다 시도 횟수 포함)의 한도 안이면 기다리는 중이다
+        # (mcp_server 가 그 값을 quiet_ok_s 로 붙인다. 상한은 아니다 — 자유 조회는 더 길게 잇는다).
         # ⚠ 이 값으로 잡을 끊지 않는다. 시간으로 죽은 것을 판정하면 긴 심의를 죽은 것으로 읽는다.
         out["idle_s"] = round(max(0.0, _now() - (job.get("updated_at") or _now())), 1)
         out["last_step"] = job.get("last_step") or job.get("step")

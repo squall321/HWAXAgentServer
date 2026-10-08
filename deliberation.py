@@ -2201,6 +2201,19 @@ def _llm_limit(llm) -> tuple[float, int]:
             rt + 1 if isinstance(rt, int) and not isinstance(rt, bool) else 0)
 
 
+def _quiet_calls(opts) -> int:
+    """좌석 발언 하나가 **이벤트 없이** 잇달아 부르는 LLM 호출 수 — 진행 조회의 quiet_ok_s 와 heartbeat 를 끈
+    박스의 기동 경고가 '조용해도 되는 시간' 을 이 수로 잰다(× 호출 한 번의 최악).
+
+    발언은 첫 호출 뒤에 파싱 재시도(opts.parse_retries)만큼 더 부르고 그 사이에 이벤트를 낼 통로가 없다
+    (_persona_round — 라운드는 좌석의 발언이 통째로 끝나야 낸다). 의장 best-of 는 후보 묶음 뒤에 심판 호출이
+    이어져 둘이다(의장 재시도는 사이에 상태줄을 내므로 세지 않는다). 종전엔 '호출 한 번' 으로 쟀다 — 마지막
+    좌석이 파싱 재시도 중인 멀쩡한 심의가 그 값을 넘겼다(호출 1,500초 × 3번 = 4,500초 > 3,608초).
+    ⚠ 상한이 아니다 — 자유 조회는 좌석마다 LLM 스텝과 도구 호출을 이보다 길게 잇는다(_free_gather_one).
+      그래서 안내문은 '넘었다고 멈춘 것은 아니다' 를 같이 적는다."""
+    return max(1 + opts.parse_retries, 2 if opts.chair_bestof > 1 else 1)
+
+
 def _llm_fail_note(exc: BaseException, llm) -> tuple[str, str]:
     """LLM 호출 실패를 (사람이 읽는 사유 한 구절, 그 한도를 바꾸는 설정 이름 — 없으면 "") 로.
 

@@ -223,9 +223,15 @@ _STATE_DESC = (
     "queue.position, 앞에 선 수는 queue.ahead 다. 자리가 나면 **스스로 시작한다** — 다시 시작하지 마라, "
     "같은 심의가 두 번 줄을 선다. 그만두려면 deliberate_cancel) · running(진행 중 — 단계·라운드·좌석이 "
     "보인다. **좌석이 많은 대형 패널은 수 시간 걸린다.** idle_s 는 마지막 이벤트 뒤 경과(초), last_step 은 그 "
-    "이벤트다. 심의는 LLM 호출 한 번이 도는 동안 이벤트가 없다 — idle_s 가 quiet_ok_s(그 호출이 조용할 수 있는 "
-    "최장 시간 = 호출 한도 DELIB_TIMEOUT_S 또는 요청 timeout_s × 시도 횟수) 안이면 멈춘 것이 아니라 기다리는 "
-    "중이다. 다시 시작하지 마라) · done(끝났다 — deliberate_result 로 결정문을 받는다). "
+    # 종전엔 'LLM 호출 한 번이 도는 동안' 이라고 적고 그 한 번의 최악을 quiet_ok_s 로 줬다. 좌석 발언은 호출을
+    # (1 + 파싱 재시도)번 잇는다 — 마지막 좌석이 재시도 중인 멀쩡한 심의가 그 값을 넘겼고, 이 글대로 읽은
+    # 호출자는 멈췄다고 보고 접었다. 그 값도 상한은 아니므로(자유 조회) 넘은 뒤에 할 일까지 적는다.
+    "이벤트다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없고, 그 발언은 LLM 호출을 (1 + 파싱 재시도)번 "
+    "잇는다 — idle_s 가 quiet_ok_s(좌석 발언 하나가 조용할 수 있는 최장 시간 = (호출 한도 DELIB_TIMEOUT_S 또는 "
+    "요청 timeout_s × 시도 횟수 + 재시도 대기) × (1 + 파싱 재시도)) 안이면 멈춘 것이 아니라 기다리는 중이다. "
+    "**넘었다고 멈춘 것은 아니다** — 자유 조회 단계는 좌석마다 LLM 호출과 도구 호출을 그보다 길게 잇는다. "
+    "호출마다 한도가 걸려 있어(quiet_ok_s 가 null 이면 그 한도를 끈 서버다) 도는 잡은 스스로 끝난다. 다시 "
+    "시작하지 마라 — 그만두려면 deliberate_cancel) · done(끝났다 — deliberate_result 로 결정문을 받는다). "
     "error·cancelled·interrupted 는 결정문 "
     "없이 끝난 것이고 까닭은 error 에 있다(interrupted 는 서버 재기동 — 다시 시작해야 한다). "
     + (f"줄은 {delib_jobs.QUEUE_MAX}건까지 선다(DELIB_JOB_QUEUE_MAX) — 줄까지 차면 시작이 오류로 거절되고, "
@@ -270,16 +276,24 @@ def _queued_note(q: dict) -> str:
 
 
 def _quiet_ok_s(job: dict) -> float | None:
-    """그 잡에서 LLM 호출 한 번이 이벤트 없이 조용할 수 있는 최장 시간(초) — (호출 한도 × 시도 횟수) + 재시도
-    대기. 진행 조회의 idle_s 가 이 안이면 기다리는 중이다. 한도가 꺼져 있으면(무제한) None 이다.
+    """그 잡에서 좌석 발언 하나가 이벤트 없이 조용할 수 있는 최장 시간(초) — LLM 호출 한 번의 최악((호출 한도 ×
+    시도 횟수) + 재시도 대기)에 그 발언이 잇는 호출 수(1 + 파싱 재시도)를 곱한다. 진행 조회의 idle_s 가 이
+    안이면 기다리는 중이다. 한도가 꺼져 있으면(무제한) None 이다. **상한은 아니다**(엔진 _quiet_calls 의 ⚠).
 
     그 잡에 **실제로 걸린 값**으로 잰다 — 요청 timeout_s 로 돈 잡은 그 값(원장에 상한에서 죈 값이 적혀 있다),
     아니면 서버의 심의 LLM 에 걸린 값이다. 시도 횟수는 그 LLM 의 것이다(DELIB_LLM_MAX_RETRIES + 1)."""
     read, tries = _engine._llm_limit(getattr(getattr(_APP, "state", None), "delib_llm", None))
-    asked = (job.get("opts") or {}).get("timeout_s")
+    opts = job.get("opts") or {}
+    asked = opts.get("timeout_s")
     if isinstance(asked, (int, float)) and not isinstance(asked, bool) and asked > 0:
         read = float(asked)
-    return round(read * tries + 8, 1) if read > 0 and tries > 0 else None
+    if not (read > 0 and tries > 0):
+        return None
+    # 잇는 호출 수는 **엔진이 읽는 대로** 센다 — 원장에는 보낸 손잡이만 있고(안 보낸 것은 서버 기본값), 인용
+    # 계약·웹 리서치가 파싱 재시도 하한을 올린다. 그 넷만 넘긴다(원장의 좌석·근거는 본문이 아니라 건수다).
+    eff = _engine._resolve_opts({k: opts[k] for k in ("parse_retries", "rebut_quote", "chair_bestof",
+                                                      "search_sources") if k in opts})
+    return round(_engine._quiet_calls(eff) * (read * tries + 8), 1)
 
 
 def _evid_limits() -> dict:
@@ -374,7 +388,8 @@ async def deliberate_start(
                    "deliberate_result(job_id). 좌석 수와 LLM 사정에 따라 수 분에서 **수 시간** 걸린다(좌석이 "
                    "많은 대형 패널은 수 시간이다) — 즉시 다시 묻지 말고 사용자에게 job_id 를 알려라. "
                    "진행 조회의 idle_s(마지막 이벤트 뒤 경과)가 quiet_ok_s 안이면 멈춘 것이 아니라 LLM 을 "
-                   "기다리는 중이다. 다시 시작하지 마라.")
+                   "기다리는 중이다. 넘었다고 멈춘 것은 아니다 — 도는 잡은 스스로 끝난다. 다시 시작하지 마라"
+                   "(그만두려면 deliberate_cancel).")
     return out
 
 
@@ -531,7 +546,7 @@ async def deliberate_status(job_id: str) -> dict:
     out["warnings"] = job.get("warnings") or []
     out["warnings_total"] = int(job.get("warnings_total") or len(out["warnings"]))
     if "idle_s" in out:
-        # idle_s 를 무엇과 견줄지 — LLM 호출 한 번이 조용할 수 있는 최장 시간(무제한이면 None).
+        # idle_s 를 무엇과 견줄지 — 좌석 발언 하나가 조용할 수 있는 최장 시간(무제한이면 None).
         out["quiet_ok_s"] = _quiet_ok_s(job)
     return out
 
