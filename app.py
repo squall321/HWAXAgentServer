@@ -261,6 +261,22 @@ def _mcp_call_timed_out(exc: BaseException) -> bool:
                  or "Timed out while waiting for response" in str(exc)))
 
 
+def _stream_chunk_limit_note(exc: BaseException) -> str:
+    """그 예외가 챗 스트리밍의 청크 침묵 한도(LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S)에 걸린 것이면 화면에 낼
+    사유 한 구절, 아니면 "".
+
+    langchain-openai 가 StreamChunkTimeoutError 로 올린다. openai SDK 예외가 아니라 챗 오류 문구의 'APITimeout'·
+    'Connection' 가름 어디에도 안 걸렸고, 화면에는 '처리 중 내부 오류'·'에이전트 처리 중 오류' 로 나갔다(라이브러리
+    문구는 설정 이름을 말하지만 서버 로그에만 남는다). 스트리밍 박스에서는 이 한도(start.sh 기본 300초)가
+    LLM_TIMEOUT_S(900초)보다 **먼저** 걸린다 — 심의가 공유 LLM 을 차지한 동안 챗이 이렇게 끝난다.
+    걸린 값은 설정을 다시 읽지 않고 예외에서 읽는다(그 호출에 실제로 걸린 값이다)."""
+    if "StreamChunkTimeout" not in type(exc).__name__:
+        return ""
+    _s = getattr(exc, "timeout_s", None)
+    return ("LLM 이 " + (f"{_s:,.0f}초 동안 " if isinstance(_s, (int, float)) and _s > 0 else "제한 시간 동안 ")
+            + "토큰을 보내지 않았습니다(LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S) — LLM 이 밀려 있거나 멈췄습니다")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Build the LLM once. Tools are loaded per request (they depend on the caller's groups),
@@ -2961,9 +2977,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 부분 응답이 있으면 버리지 않는다 — 여기까지 스트리밍된 내용 + 중단 사실을 명시해
         # 대화 기록에 남긴다. 아무 설명 없이 초록불만 꺼지는 상태를 만들지 않는다.
         _partial = "".join(full).strip()
+        # 스트리밍 청크 한도에 걸린 것이면 '내부 오류' 가 아니라 그 한도를 말한다 — 곧바로 다시 보내면 밀린 LLM 에
+        # 한 건을 더 얹을 뿐이다. '응답이 여기서 중단되었습니다' 는 그대로 둔다(_INTERRUPTED_RE 가 끊긴 턴을 이 글로 안다).
+        _chunk_why = _stream_chunk_limit_note(exc)
         if _partial:
-            _note = ("\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다"
-                     f"{detail}. 같은 질문을 다시 보내면 재시도합니다.")
+            _note = ((f"\n\n⚠ {_chunk_why}. 응답이 여기서 중단되었습니다{detail}. "
+                      "잠시 후 같은 질문을 다시 보내 주세요 — 질문을 바꿔도 해결되지 않습니다.") if _chunk_why else
+                     ("\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다"
+                      f"{detail}. 같은 질문을 다시 보내면 재시도합니다."))
             yield _sse("token", {"delta": _note})
             yield _sse("result", {"type": "text", "content": _partial + _note})
         else:
@@ -2976,7 +2997,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             # 짧게 쉬었다 다시 한다. 간격 없이 붙이면 같은 실패를 그대로 다시 받는다.
             _tries = max(0, int(os.environ.get("CHAT_AUTO_RETRY", "2") or 0))
             for _attempt in range(1, _tries + 1):
-                yield _sse("status", {"step": f"오류 발생 — 자동 재시도 {_attempt}/{_tries}",
+                # 첫 재시도는 왜 다시 받는지 말한다 — 길게는 LLM_TIMEOUT_S × 시도 횟수를 기다리는 동안 화면에 뜨는
+                # 것이 이 줄뿐이다.
+                yield _sse("status", {"step": (f"{_chunk_why} — 스트리밍 없이 다시 받습니다 · "
+                                               if _chunk_why and _attempt == 1 else "오류 발생 — ")
+                                              + f"자동 재시도 {_attempt}/{_tries}",
                                       "tool": None})
                 if _attempt > 1:
                     await asyncio.sleep(min(4.0, 1.5 * (_attempt - 1)))
@@ -3016,7 +3041,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 while _e is not None and len(_chain) < 6:
                     _chain.append(type(_e).__name__)
                     _e = _e.__cause__ or _e.__context__
-                if "APITimeout" in _kind and not any("Connect" in _n for _n in _chain):
+                # 재시도까지 돈 뒤면 exc 는 마지막 재시도의 실패다 — 여기서 청크 한도가 잡히는 것은 재시도를 끈
+                # 박스(CHAT_AUTO_RETRY=0)뿐이다.
+                _chunk_last = _stream_chunk_limit_note(exc)
+                if _chunk_last:
+                    _msg = (f"{_chunk_last}. 잠시 후 다시 시도해 주세요 — "
+                            f"질문을 바꿔도 해결되지 않습니다.{detail}")
+                elif "APITimeout" in _kind and not any("Connect" in _n for _n in _chain):
                     _read, _n_try = _llm_limit(getattr(app.state, "llm", None))
                     _msg = ("LLM 응답이 " + (f"{_read:,.0f}초 안에 " if _read else "제한 시간 안에 ")
                             + "오지 않았습니다(LLM_TIMEOUT_S" + (f" · {_n_try}회 시도" if _n_try else "")
