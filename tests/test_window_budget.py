@@ -580,9 +580,11 @@ def test_넓은_창은_긴_사양_넷_뒤의_사람_조건을_싣는다():
     assert sum(len(ln) for ln in _ctx_lines(note)) <= d._chat_ctx_budget()
 
 
-def test_넓은_창의_긴_대화는_최근_답을_먼저_싣는다():
-    """25왕복(답 9,000자) — 오래된 답 0~18 이 실리고 최근 답이 '(이하 챗 답변 N건 생략)' 으로 빠졌다."""
-    _win(_BIG)
+@pytest.mark.parametrize("tokens", (128000, _BIG))
+def test_긴_대화는_최근_답을_먼저_싣는다(tokens):
+    """25왕복(답 9,000자) — 오래된 답 0~18 이 실리고 최근 답이 '(이하 챗 답변 N건 생략)' 으로 빠졌다(128K 는 종전부터 답
+    0~2 만 실렸다)."""
+    _win(tokens)
     hist = []
     for k in range(1, 26):
         hist += [{"role": "user", "content": f"질문 {k}"},
