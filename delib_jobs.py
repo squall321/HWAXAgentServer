@@ -387,6 +387,11 @@ def _apply(job: dict, event: str, data: dict) -> None:
                 t.append({k: v for k, v in data.items() if k != "kind"})
             elif len(t) == TURN_MAX:
                 t.append({"note": f"전사 상한 {TURN_MAX}턴 초과 — 이후 발언은 기록하지 않는다"})
+                # 전사 안의 note 한 줄로는 deliberate_status 를 보는 호출자가 모른다 — 경고로도 한 번 알린다.
+                job["warnings"] = (job.get("warnings") or [])[-9:] + [
+                    f"전사 상한 {TURN_MAX}턴 초과 — 이후 좌석 발언은 원장(deliberate_transcript)에 기록하지 않는다"
+                    "(결정문·보고서 회의록에는 실린다) (설정 DELIB_JOB_TURN_MAX)"]
+                job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
         elif kind == "checkpoint":
             job["checkpoint"] = {k: v for k, v in data.items() if k != "kind"}
         elif kind == "evidence" and data.get("included") is False:
@@ -579,7 +584,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
 
 
 def _opts_echo(opts: dict) -> dict:
-    """무엇이 실제로 걸렸는지 잡에 남긴다 — 부피 큰 값(evidence 본문)은 개수만."""
+    """무엇이 실제로 걸렸는지 잡에 남긴다 — 부피 큰 값(evidence 본문)은 개수만. 글(사람 의견·이어받은 요약)은
+    **전문**을 남긴다 — 종전엔 앞 117자 + '…' 로만 남아 원장으로는 좌석이 무엇을 받았는지 재현할 수 없었다.
+    응답에 실을 때 줄이는 것은 _opts_view 다(화면용과 원장을 가른다)."""
     out = {}
     for k, v in (opts or {}).items():
         if k == "knowledge_query" and isinstance(v, dict):
@@ -587,11 +594,15 @@ def _opts_echo(opts: dict) -> dict:
             out[k] = {"seats": len(v)}
         elif isinstance(v, list):
             out[k] = len(v) if k in ("evidence", "personas") else v
-        elif isinstance(v, str) and len(v) > 120:
-            out[k] = v[:117] + "…"
         else:
             out[k] = v
     return out
+
+
+def _opts_view(echo: dict) -> dict:
+    """원장의 요청 값을 응답(applied_opts)에 싣는 모양 — 긴 글은 앞부분과 전체 길이만(전문은 원장 파일에 있다)."""
+    return {k: (v[:117] + f"… (전체 {len(v):,}자)" if isinstance(v, str) and len(v) > 120 else v)
+            for k, v in (echo or {}).items()}
 
 
 def cancel(job_id: str, *, by: str = "") -> dict:
@@ -688,7 +699,7 @@ def summary(job: dict, *, full: bool = False) -> dict:
         out["steps"] = job.get("steps") or []
         out["steps_total"] = int(job.get("steps_total") or len(out["steps"]))
         out["seats_detail"] = job.get("seats") or []
-        out["applied_opts"] = job.get("opts") or {}
+        out["applied_opts"] = _opts_view(job.get("opts") or {})
         if job.get("checkpoint"):
             out["checkpoint_payload"] = job["checkpoint"]
     return out

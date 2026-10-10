@@ -174,3 +174,25 @@ def test_전사_도구_설명이_full_의_해석_우려를_없다고_하지_않�
     desc = next(t.description for t in asyncio.run(m.mcp.list_tools()) if t.name == "deliberate_transcript")
     assert "여기 없다" not in desc, desc
     assert "해석" in desc and "우려" in desc, desc
+
+
+# ── 잡 원장 — 전사 상한은 조용하지 않게, 걸린 요청 값은 원장에 전문으로 ──────────────────────────────
+def test_전사_상한에_걸리면_경고로_알린다(monkeypatch):
+    """종전엔 401번째 턴 자리에 note 한 줄뿐이라 deliberate_status 의 warnings 에 안 떴다."""
+    monkeypatch.setattr(delib_jobs, "TURN_MAX", 3)
+    job = {"id": "t-cap", "turns": []}
+    for i in range(5):
+        delib_jobs._apply(job, "delib", {"kind": "turn", "round": 1, "persona": f"s{i}", "say": "말"})
+    assert len(job["turns"]) == 4 and "note" in job["turns"][-1], job["turns"]
+    assert any("전사 상한" in w and "DELIB_JOB_TURN_MAX" in w for w in job.get("warnings") or []), job.get("warnings")
+    assert job.get("warnings_total") == 1, "한 번만 알린다"
+
+
+def test_원장은_요청_값을_전문으로_남기고_응답은_표식을_달아_줄인다():
+    """applied_opts 는 무엇이 걸렸는지의 기록이다 — 사람 의견이 앞 117자 + '…' 로만 남아 나중에 재현할 수 없었다."""
+    note = "사람 의견 " + "가" * 3000 + " [끝]"
+    echo = delib_jobs._opts_echo({"human_note": note, "evidence": [{"result": "x"}] * 3, "rounds": 3})
+    assert echo["human_note"] == note and echo["evidence"] == 3 and echo["rounds"] == 3, echo
+    job = {"id": "t-o", "status": "done", "question": "q", "opts": echo}
+    shown = delib_jobs.summary(job, full=True)["applied_opts"]["human_note"]
+    assert len(shown) < 300 and f"{len(note):,}자" in shown, shown
