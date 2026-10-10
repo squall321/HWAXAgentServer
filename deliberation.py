@@ -220,8 +220,8 @@ _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천�
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
 #   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.
 #   실측: 천장 160,000자(≈152,000토큰) + _SEAT_CTX 48,000자(≈45,700토큰) = 198,000토큰.
-#   1,048,576 토큰 창의 유도값은 416,787자라 이 천장에 걸리지 않는다 — 직전 라운드·조회 결과·지정 도구·이어하기
-#   요약·사람 의견·지식카드의 몫(_ROOM_SHARE)을 창에서 먼저 뗀다.
+#   1,048,576 토큰 창의 유도값은 389,648자라 이 천장에 걸리지 않는다 — 직전 라운드·조회 결과·지정 도구·이어하기
+#   요약·사람 의견·지식카드·조항과 후보안·지정 좌석 역할의 몫(_ROOM_SHARE)을 창에서 먼저 뗀다.
 _EVID_KO_CPT = 1.05          # 한국어 최악 기준 자/토큰 — 과대평가하면 400 이 난다
 # 시스템·페르소나·**도구 스키마**·출력 몫(토큰). 좌석은 자유 조회가 기본 켜짐이라
 # (DELIB_FREE_TOOLS=1) 도구가 바인딩된다 — 스키마 예산(기본 40,000)을 안 빼면 넘친다.
@@ -244,6 +244,13 @@ _ROOM_SHARE = {
     "summary": 0.03,    # 이어하기 요약(_summary_max) — 바닥 8,000자
     "note": 0.01,       # 사람 의견(_human_note_max) — 바닥 HUMAN_NOTE_MAX
     "knowledge": 0.02,  # 좌석 지식카드 발췌(_knowledge_budget) — 바닥 3,500자
+    # 양보 불가 조항·후보안의 합(_carry_max) — 바닥은 좁은 창 항목 상한의 최악(1,200자×12 + 400자×8). 넓은 창은 항목 하나를
+    # 이어하기 요약 길이까지 받는데(조항 12건·후보안 8건이면 58만 자) 이 합이 어느 몫에도 없어, 받는 범위 안의 요청으로 좌석
+    # 프롬프트가 창을 넘었다(engine-budget A23-3). 항목 상한은 그대로 두고 합을 이 몫으로 지킨다(_fit_carry).
+    "carry": 0.03,
+    # 지정 좌석 역할(_role_req_max) — 바닥 _ROLE_REQ_MAX. 역할은 좌석의 시스템 메시지에 실리는데 그 예비분(_EVID_RESERVE)은
+    # 창에서 유도되지 않는다 — 넓은 창에서 역할 하나를 이어하기 요약 길이까지 받으면 회계 밖이었다(A23-3).
+    "role": 0.01,
 }
 _evid_cache: dict = {}
 
@@ -315,6 +322,18 @@ def _tool_inject_caps() -> tuple[int, int]:
 def _summary_max() -> int:
     """이어하기 요약(이전 결정문)을 받는 길이(자) — 좁은 창은 종전 8,000자. 매 라운드 전 좌석에 실린다."""
     return _room("summary", _SUMMARY_MAX)
+
+
+def _carry_max() -> int:
+    """양보 불가 조항·후보안을 좌석 프롬프트에 싣는 합의 상한(자) — 매 라운드 전 좌석에 실린다. 좁은 창은 항목 상한이 묶는
+    최악(1,200자×12 + 400자×8 = 17,600자)이라 걸리지 않고, 넓은 창은 창에서 유도한다(1백만 토큰 창 29,077자)."""
+    return _room("carry", _NN_ITEM_MAX * _NN_MAX + _OPTION_ITEM_MAX * _OPTIONS_MAX)
+
+
+def _role_req_max() -> int:
+    """요청이 준 지정 좌석 역할을 받는 길이(자) — 좁은 창은 종전 2,000자, 넓은 창은 창에서 유도(1백만 토큰 창 9,692자).
+    엔진(_resolve_opts)과 잡 원장(delib_jobs 의 seat_roles)이 같은 값을 쓴다 — 다르면 이어하기가 역할을 다른 길이로 되넘긴다."""
+    return _room("role", _ROLE_REQ_MAX)
 
 
 def _transcript_clip() -> int:
@@ -1296,11 +1315,12 @@ def _resolve_opts(req_opts):
                 o.req_cut["continue_summary"] = (f"이전 심의 요약(continue_summary) {len(cs):,}자 중 "
                                                  f"앞 {_smax:,}자만")
         # 이전 심의의 양보 불가 조항(F11) — 요약 문자열에 섞으면 소실되므로 별도 필드로 받는다.
-        # 항목 길이 상한(조항·후보안·지정 좌석 역할)은 좁은 창의 값이다 — 넓은 창(_wide)은 항목 하나를 이어하기 요약이
-        # 받는 길이(_summary_max — 1백만 토큰 창 29,077자)까지 받는다(건수 상한은 그대로다 — 표결 목록·동시 호출 수라는
-        # 설계 값이다). 넘으면 종전대로 카드가 알린다.
-        _nn_item, _opt_item, _role_item = ((_summary_max(),) * 3 if _wide()
-                                           else (_NN_ITEM_MAX, _OPTION_ITEM_MAX, _ROLE_REQ_MAX))
+        # 항목 길이 상한(조항·후보안)은 좁은 창의 값이다 — 넓은 창(_wide)은 항목 하나를 이어하기 요약이 받는 길이
+        # (_summary_max — 1백만 토큰 창 29,077자)까지 받는다(건수 상한은 그대로다 — 표결 목록·동시 호출 수라는 설계 값이다).
+        # 둘의 합은 스트림이 carry 몫(_fit_carry)으로 지킨다. 지정 좌석 역할은 role 몫(_role_req_max)까지다 — 종전엔 넓은
+        # 창에서 역할도 29,077자까지 받아 시스템 메시지 예비분 밖으로 나갔다(A23-3). 넘으면 종전대로 카드가 알린다.
+        _nn_item, _opt_item = (_summary_max(),) * 2 if _wide() else (_NN_ITEM_MAX, _OPTION_ITEM_MAX)
+        _role_item = _role_req_max()
         nn = req_opts.get("non_negotiables") or req_opts.get("continue_non_negotiables")
         if isinstance(nn, list):
             _nn = [str(x) for x in nn if str(x).strip()]
@@ -3833,6 +3853,23 @@ async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: i
     return out[:limit]
 
 
+def _fit_carry(nn: list, options: list) -> tuple[list, list, str]:
+    """양보 불가 조항·후보안 → 좌석에 실을 (조항, 후보안, 알림 글). 합이 _carry_max 를 넘으면 _fit_rows 의 같은 몫으로
+    줄인다 — 짧은 항목은 온전히, 긴 항목만 앞부분과 원문 길이 표식. 건수는 그대로다(표결 목록이 바뀌지 않는다).
+    안 줄였으면 알림 글은 빈 문자열이다. 넓은 창에서 조항 12건·후보안 8건을 항목 상한까지 받으면 58만 자가 매 라운드 전
+    좌석에 실려 창을 넘었다(engine-budget A23-3). 다단 심의는 조항을 _resolve_opts 없이 넘기므로 싣는 자리에서 지킨다."""
+    rows = [(("nn", i), str(x)) for i, x in enumerate(nn)] + [(("opt", i), str(x)) for i, x in enumerate(options)]
+    total, cap = sum(len(t) for _k, t in rows), _carry_max()
+    if total <= cap:
+        return list(nn), list(options), ""
+    fit, share = _fit_rows(rows, max(1, cap - 32 * len(rows)), floor=200)     # 줄 머리·표식 몫을 먼저 뗀다
+    cut = sum(1 for (_k, a), (_k2, b) in zip(rows, fit) if a != b)
+    return ([t for (k, _i), t in fit if k == "nn"], [t for (k, _i), t in fit if k == "opt"],
+            f"양보 불가 조항 {len(nn)}건·후보안 {len(options)}건의 합 {total:,}자가 좌석 프롬프트 몫({cap:,}자 — 모델 창에서 "
+            f"유도)을 넘어 긴 항목 {cut}건을 항목마다 같은 몫(앞 {share:,}자)으로 줄여 실었다 — 건수는 그대로고 줄인 항목 끝에 "
+            "원문 길이를 적었다. 매 라운드 전 좌석에 실리는 값이라 창 안에 들게 지킨다.")
+
+
 def _cont_block(summary: str, non_negotiables: list, human_note: str) -> str:
     """이어하기 컨텍스트 블록 — 요약·양보 불가 조항·사람 의견.
 
@@ -4868,7 +4905,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 이어하기 컨텍스트 — 이전 심의 요약 + 사람 의견(스티어링). 사람 의견은 base 에 실려 매 라운드
     # 프롬프트에 자동 주입되므로 전 라운드에 걸쳐 방향을 잡는다. 사람 의견은 근거 카드로도 노출.
     # 이어하기 블록(F11) — 조항 승계를 요약 문자열에 의존하지 않는다.
-    cont = _cont_block(opts.continue_summary, opts.continue_non_negotiables, opts.human_note)
+    # 조항·후보안의 합은 carry 몫에 담는다(_fit_carry — 줄였으면 좌석에 주지 않은 카드로 알린다).
+    _nn_in, _opt_in, _carry_note = _fit_carry(opts.continue_non_negotiables, opts.options)
+    if _carry_note:
+        yield _delib("evidence", source="조항·후보안 몫 초과", included=False, text=_carry_note)
+    cont = _cont_block(opts.continue_summary, _nn_in, opts.human_note)
     if opts.continue_non_negotiables:
         yield _delib("evidence", source="이전 심의 양보 불가 조항",
                      text="\n".join(f"- {x}" for x in opts.continue_non_negotiables)[:1500], included=True)
@@ -5007,12 +5048,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 후보안(안 선택) — 상호 배타 후보를 목록으로 못박는다. 질문 문장에만 있으면 좌석마다
     # 다르게 읽고, 최종 라운드 표결이 무엇에 대한 표인지 흐려진다(hwax-deliberate.js OPT_LIST 와 같은 규율).
     _opt_inject = ""
-    if len(opts.options) >= 2:
+    if len(_opt_in) >= 2:
         _opt_inject = ("\n[후보안 — 이 중에서 고른다. 새 안을 지어내지 말고, 필요하면 둘 이상을 "
                        "결합한 하이브리드안을 제안하되 어느 후보의 조합인지 밝혀라]\n"
-                       + "\n".join(f"· ({i + 1}) {o}" for i, o in enumerate(opts.options)))
-    elif opts.options:
-        _opt_inject = f"\n[참고 — 검토 대상으로 제시된 안]\n· {opts.options[0]}"
+                       + "\n".join(f"· ({i + 1}) {o}" for i, o in enumerate(_opt_in)))
+    elif _opt_in:
+        _opt_inject = f"\n[참고 — 검토 대상으로 제시된 안]\n· {_opt_in[0]}"
     _tail = ((f"\n{sf_inject}" if sf_inject else "") + (f"\n{ev_inject}" if ev_inject else "")
              + (f"\n{tool_inject}" if tool_inject else "")
              + (f"\n{chat_ev_inject}" if chat_ev_inject else "") + chat_ctx_inject
@@ -5023,7 +5064,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 감추고 독립 판단을 받는다. 그 판단이 기존 결론과 충돌하면 그게 이어하기의 최대 소득이다.
     # 요약(이전 결론)은 감추되(앵커링 차단) 양보 불가 조항은 유지한다 — 조항은 매 라운드 구속력이라
     # 1R 에도 빠지면 안 된다(base 의 cont·JS BASE_BLIND 와 정합). human_note 도 유지. 요약만 뺀다.
-    _cont_blind = _cont_block("", opts.continue_non_negotiables, opts.human_note)
+    _cont_blind = _cont_block("", _nn_in, opts.human_note)
     base_blind = (f"[심의 주제]\n{question}\n" + _cont_blind + _tail +
                   "\n[안내] 당신은 이번 회차에 새로 합류했다. 이전 논의 결과는 의도적으로 제공하지 "
                   "않는다 — 먼저 당신 도메인의 독립적 판단을 내라. 다음 라운드에서 이전 결론을 받는다.\n")

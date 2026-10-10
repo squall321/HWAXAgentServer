@@ -135,10 +135,15 @@ def test_좁은_창의_자기_조회_블록은_3500자를_넘지_않는다(token
 
 # ── 1백만 토큰 창 — 직전 라운드 몫과 값당 직렬화 상한 ────────────────────────────────────
 def _worst_seat_chars():
-    """좌석 발언 턴 하나에 실릴 수 있는 가변부의 최악 합(자) — 근거·챗 맥락·직전 라운드·덧붙는 몫 전부."""
+    """좌석 발언 턴 하나에 실릴 수 있는 가변부의 최악 합(자) — 근거·챗 맥락·직전 라운드·덧붙는 몫 전부.
+
+    넓은 창은 조항·후보안의 합(carry)과 지정 좌석 역할(role) 몫도 더한다 — 종전엔 이 둘이 셈에 없어, 항목마다 29,077자까지
+    받는 조항 12건·후보안 8건이 창을 넘는 것을 이 시험이 보지 못했다(A23-3). 좁은 창의 그 둘은 종전 항목 상한(합 19,600자)이
+    묶는 회계 밖 값 그대로다(D-22 — 작은 창 박스용 장치를 만들지 않는다)."""
     return (d._evid_budget() + d._chat_ctx_budget() + d._seat_ctx() + d._lookup_budget()
             + max(d._share_budget(r) for r in range(1, 9)) + d._tool_inject_caps()[1] + d._summary_max()
-            + d._human_note_max() + d._knowledge_budget())
+            + d._human_note_max() + d._knowledge_budget()
+            + ((d._carry_max() + d._role_req_max()) if d._wide() else 0))
 
 
 def test_넓은_창은_직전_라운드_몫이_창에서_는다():
@@ -155,6 +160,19 @@ def test_몫을_다_채워도_좌석_발언_턴이_창_안에_든다(tokens):
     _win(tokens)
     worst = app._est_tokens("가" * _worst_seat_chars()) + d._EVID_RESERVE - 40000
     assert worst <= tokens * 0.99, f"창 {tokens:,} 에서 좌석 발언 턴 최악 {worst:,}토큰 — 넘는다"
+
+
+@pytest.mark.parametrize("tokens", (302000, 310000, 400000, _BIG, 2 * _BIG))
+def test_회계_밖으로_남는_것은_안전_여유_안에_든다(tokens):
+    """몫에 없는 것 — 자기 조회 자체 요약(_lookup_budget()//8)과 질문 — 은 _PRE_SAFETY 가 남긴 여유에 든다. 질문은 엔진이 창
+    크기까지 받으므로(포털 상한도 창 하나) 몫이 없다. 운영 창(1백만 토큰)에서는 그 여유가 질문 몫으로 3만 자 넘게 남는다 —
+    리스크 앱 패널 질문(변경 요지 600자 × 프로파일 배수)이 든다."""
+    _win(tokens)
+    slack = int(tokens * 0.99) - (app._est_tokens("가" * _worst_seat_chars()) + d._EVID_RESERVE - 40000)
+    left = slack - app._est_tokens("가" * (d._lookup_budget() // 8))
+    assert left >= 0, f"창 {tokens:,} 에서 자기 조회 자체 요약이 여유를 {-left:,}토큰 넘는다"
+    if tokens >= _BIG:
+        assert left >= app._est_tokens("가" * 30000), f"창 {tokens:,} 에서 질문 몫이 {left:,}토큰뿐이다"
 
 
 def test_넓은_창은_값당_직렬화_상한이_없다():
