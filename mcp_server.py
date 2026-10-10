@@ -427,7 +427,9 @@ _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_pre
                  "저장하지 않은 심의는 저장하지 않은 채로 이어진다. 바꾸려면 advanced 로 다시 건다. "
                  "**봉인(sealed)은 풀 수 없다** — 봉인으로 돈 심의는 job 을 바꿔도 봉인으로만 이어지고"
                  "(그 보고서에 이어 붙는다), 다단 심의(sim-plan·test-plan·build-plan)로는 이어받지 않는다. "
-                 "봉인 없이 돈 심의를 봉인으로 이어받지도 않는다. 열어서 다시 보려면 새 심의를 시작한다."),
+                 "봉인 없이 돈 심의를 봉인으로 이어받지도 않는다. 열어서 다시 보려면 새 심의를 시작한다. "
+                 "이전 회차의 근거(evidence) 본문은 원장에 건수만 남아 **이어지지 않는다** — 좌석이 다시 봐야 하면 "
+                 "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한)."),
 )
 async def deliberate_continue(
     previous_job_id: str,
@@ -440,6 +442,7 @@ async def deliberate_continue(
     append_report: bool = True,
     modifiers: list[str] | None = None,
     advanced: dict | None = None,
+    evidence: list[dict] | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """이전 심의를 이어 돌린다.
@@ -462,6 +465,8 @@ async def deliberate_continue(
         modifiers: 이번 회차에 얹을 층.
         advanced: 이번 회차의 손잡이(deliberate_start 의 advanced 와 같다). 비우면 이전 회차에 건
                   _CONT_CARRY 손잡이를 이어받고, 여기 적은 것은 그 위에 덮인다. sealed 는 풀 수 없다.
+        evidence: 이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같다). 이전 회차의 근거
+                  본문은 원장에 건수만 남아 이어지지 않는다 — 다시 봐야 하면 여기 다시 싣는다.
 
     라운드 번호는 이전 회차에 이어서 센다 — 3회차 회의록이 매번 '1R' 로 돌아가면
     어느 회차의 발언인지 구분이 안 된다.
@@ -504,7 +509,7 @@ async def deliberate_continue(
     foreign = delib_jobs._foreign(prev, user)
     append_id = int(prev.get("report_id") or 0) if append_report and not foreign else 0
     opts = _build_opts(
-        rounds=rounds, modifiers=modifiers, human_note=human_note,
+        rounds=rounds, modifiers=modifiers, human_note=human_note, evidence=evidence,
         # 미리 자르지 않는다 — 엔진이 상한에서 줄이고 **줄였다고 알린다**(evidence_omitted 의 '요청 값
         # 상한 초과'). 여기서 떼어 넘기면 엔진은 줄어든 줄 모르고, 이어받은 사람도 모른다.
         continue_summary=summary_text,

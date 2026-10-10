@@ -576,3 +576,32 @@ def test_웹_인용이_대조_상한을_넘으면_대조하지_않은_수를_적
     events, _llm = _run(monkeypatch, _BIG, chair="결정: " + " ".join(many), search_sources=["web"])
     final = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
     assert "45건 중 앞 40건" in final, final[-400:]
+
+
+# ── MCP 이어하기 — 근거를 다시 실을 자리가 없었다 ───────────────────────────────────────────
+def test_이어하기는_근거를_다시_받는다(monkeypatch, tmp_path):
+    """원장에는 이전 회차 근거가 건수만 남아 이어하기 좌석에 가지 않는다 — Claude 호출자가 다시 실을 인자가 없었다."""
+    prev = {"id": "prev-ev", "job": "default", "status": "done", "question": "힌지 크랙 원인",
+            "decision": "결정", "seats": list(_SEATS), "opts": {"evidence": 3}, "started_at": 0.0}
+    got = {}
+
+    async def _entry(_app, _q, _groups, opts, *_a):
+        got.update(opts or {})
+        yield d._sse("done", {})
+
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {prev["id"]: prev})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(d, "run_deliberation", _entry)
+    monkeypatch.setattr(m, "_APP", object())
+    ev = [{"source": "E1", "result": "측정 12.5MPa"}]
+
+    async def go():
+        out = await m.deliberate_continue("prev-ev", "두께를 다시 보라", evidence=ev)
+        await delib_jobs._TASKS[out["job_id"]]
+
+    asyncio.run(go())
+    assert got.get("evidence") == ev, got
+    desc = next(t.description for t in asyncio.run(m.mcp.list_tools()) if t.name == "deliberate_continue")
+    assert "evidence" in desc, desc
