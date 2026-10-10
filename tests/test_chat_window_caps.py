@@ -265,3 +265,18 @@ def test_챗_스트림이_출력_상한_절단을_경고한다():
     i = src.index('elif kind == "on_chat_model_end":')
     blk = src[i:i + 900]
     assert '_finish_reason(out_msg) == "length"' in blk and '"code": "output_cut"' in blk, blk
+
+
+# ── 붙인 문서 — 앞부분만 실었을 때도 상태줄이 말한다 ───────────────────────────────────────
+def test_문서를_앞부분만_실으면_상태줄이_말한다():
+    _win(16384)
+    block = app._doc_block([{"name": "memo.txt", "text": "가" * 200000}], 0)
+    assert "자만 실림" in block, "시험 전제 — 표지 없는 긴 글은 앞부분만 실린다"
+    step = app._doc_status(block, 1, 0)
+    assert "앞부분만" in step, step
+
+
+def test_문서를_줄이지_않으면_상태줄은_종전_그대로다():
+    _win(_BIG)
+    block = app._doc_block([{"name": "memo.txt", "text": "가" * 2000}], 0)
+    assert app._doc_status(block, 1, 0) == "붙인 문서 1건을 읽습니다"

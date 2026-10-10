@@ -2226,6 +2226,22 @@ def _doc_block(documents, history_tokens: int = 0, budget_tokens: int = 0) -> st
             + "\n\n".join(parts))
 
 
+def _doc_status(docs_block: str, n: int, hist_tokens: int) -> str:
+    """붙인 문서를 읽는다는 상태줄 — 줄여 실었으면 그렇다고 말한다. 종전엔 가운데를 덜어낸 경우(⋯ 가운데)만 말하고,
+    낱장 표지가 없어 **앞부분만** 실은 경우(fit_document 의 '앞 N자만 실림')는 화면에 아무 말이 없었다."""
+    step = f"붙인 문서 {n}건을 읽습니다"
+    # 문서 머리줄의 표식으로 가른다 — 규율 문구에도 '앞 N자만 실림' 이 글자 그대로 있어 낱말만 찾으면 늘 참이다.
+    mid, head = "⋯ 가운데" in docs_block, bool(re.search(r"자 — 앞 [\d,]+자만 실림", docs_block))
+    if mid or head:
+        # 대화가 길어 자리가 없는 것인지, 문서 자체가 긴 것인지 구분해 준다 —
+        # 앞의 경우엔 '새 대화에서 붙이면 더 읽는다' 가 답이라 조치가 다르다.
+        step += (" — 대화가 길어 문서에 줄 자리가 적습니다(새 대화에서 붙이면 더 읽습니다)"
+                 if hist_tokens > _model_context_tokens() * 0.3
+                 else " — 길어서 가운데 일부는 건너뜁니다" if mid
+                 else " — 길어서 앞부분만 실었습니다(낱장 표지가 없는 글)")
+    return step
+
+
 # 호출별 시작 시각 — 소요(ms)를 재려면 시작을 기억해야 한다. 짝 키(run_id)로 담는다.
 # 완료에서 꺼내 쓰고 지운다.
 #
@@ -2938,15 +2954,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _docs = _doc_block(req.documents, _hist_tokens)
         if _docs:
             sys_prompt += _docs
-            _n = min(len(req.documents), DOC_MAX_FILES)
-            _step = f"붙인 문서 {_n}건을 읽습니다"
-            if "⋯ 가운데" in _docs:
-                # 대화가 길어 자리가 없는 것인지, 문서 자체가 긴 것인지 구분해 준다 —
-                # 앞의 경우엔 '새 대화에서 붙이면 더 읽는다' 가 답이라 조치가 다르다.
-                _step += (" — 대화가 길어 문서에 줄 자리가 적습니다(새 대화에서 붙이면 더 읽습니다)"
-                          if _hist_tokens > _model_context_tokens() * 0.3
-                          else " — 길어서 가운데 일부는 건너뜁니다")
-            yield _sse("status", {"step": _step, "tool": None})
+            yield _sse("status", {"step": _doc_status(_docs, min(len(req.documents), DOC_MAX_FILES),
+                                                      _hist_tokens), "tool": None})
         messages = [("system", sys_prompt), *_hist_msgs, ("user", req.message)]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
