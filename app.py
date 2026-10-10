@@ -51,6 +51,8 @@ from evidence import (fit_document, sig_numbers as _sig_numbers,
 from deliberation import (
     N_PERSONAS,
     _EVID_ITEM_MAX,
+    _cut_mark,
+    _narrow_cap,
     _wide,
     _PHANTOM_ID_MARK,
     _AUTH_REJECT_MARK,
@@ -794,6 +796,46 @@ def _resume_target(history: list) -> tuple:
     if last_a is not None and last_a.strip() and not _INTERRUPTED_RE.search(last_a):
         return (None, None)          # 정상적으로 끝난 답변 — 이어하기 아님
     return (last_q, (last_a or "").strip())
+
+
+def _resume_part(part: str) -> str:
+    """이어하기에 싣는 '끊긴 지점까지 나온 내용' — 좁은 창은 종전 앞 2,000자(원문 길이 표식), 넓은 창은 전부."""
+    return _cut_mark(part, _narrow_cap(2000))
+
+
+def _rescue_excerpt(turn_out: list) -> str:
+    """빈 응답 구제에 주는 도구 결과 발췌 — 좁은 창은 종전 앞 12,000자, 넓은 창은 챗 이력 예산(창에서 유도)까지.
+    종전엔 1백만 토큰 창에서도 12,000자라, 큰 조회 뒤의 구제 답이 결과의 앞 한 토막만 보고 쓰였다."""
+    joined = "\n".join(turn_out)
+    cap = max(12000, _hist_budget_chars(joined[:20000])) if _wide() else 12000
+    return joined[:cap].strip()
+
+
+def _aux_budget(floor: int, sample: str = "") -> int:
+    """대화를 읽는 보조 LLM 호출(화두 뽑기·되묻기·좌석 축)의 대화 몫(자) — 좁은 창은 종전 고정값(floor), 넓은 창은
+    챗 이력 예산(창에서 유도)."""
+    return max(floor, _hist_budget_chars(sample)) if _wide() else floor
+
+
+def _recent_lines(history: list, budget: int, line_cap: int, fmt) -> list[str]:
+    """대화를 **최근부터** 예산 안에 담아 시간 순으로 돌려준다. 종전 셋(화두·되묻기·좌석 축)은 오래된 쪽부터 예산을
+    깎아, 긴 답 하나가 앞에 있으면 그 뒤(진짜 쟁점이 있는 자리)가 통째로 빠졌다. line_cap 은 줄 하나의 상한(0=무제한,
+    끊으면 원문 길이 표식)이고 예산은 실은 길이로 깎는다. fmt(m, 글) 이 한 줄을 만든다."""
+    out: list[str] = []
+    for m in reversed(history or []):
+        if not isinstance(m, dict):
+            continue
+        t = str(m.get("content") or "").strip()
+        if not t:
+            continue
+        line = fmt(m, _cut_mark(t, line_cap))
+        if out and len(line) > budget:
+            break
+        out.append(line)
+        budget -= len(line)
+        if budget <= 0:
+            break
+    return list(reversed(out))
 
 
 # ── 근거 표기 ───────────────────────────────────────────────────────────────
@@ -1954,15 +1996,17 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다.
     """
     items: list[tuple[str, str]] = []
+    # 항목 하나의 상한 — 좁은 창은 HIST_ITEM_MAX(종전 24,000자), 넓은 창은 그 턴의 이력 예산이 지킨다(항목 상한 없음).
+    # 포털은 항목을 창 하나까지 받는데(HWAXPortal ee24499) 종전엔 1백만 토큰 창에서도 24,000자에서 '…' 로 끊어, 이력의
+    # 결정문 뒤쪽이 빠졌다. 끊으면 원문 길이를 적는다.
+    _item_cap = _narrow_cap(HIST_ITEM_MAX)
     for entry in history:
         if not isinstance(entry, dict):
             continue
         role, content = entry.get("role"), entry.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str) or not content:
             continue
-        if len(content) > HIST_ITEM_MAX:
-            content = content[:HIST_ITEM_MAX] + "…"
-        items.append((role, content))
+        items.append((role, _cut_mark(content, _item_cap)))
     items = items[-HIST_MAX_ITEMS:]
 
     budget = _hist_budget_chars("".join(c for _, c in items[-6:]), has_docs)
@@ -2302,6 +2346,7 @@ PERSONA_MAX = _env_int("PERSONA_MAX", 5)
 # 보조 전문가의 역할 문구 길이. 주 전문가(PERSONA_ROLE_MAX)보다 짧게 싣는다 — 보조는 판단 기준만
 # 빌려주는 자리라 전문을 실으면 도구 스키마 예산을 그만큼 밀어낸다.
 PERSONA_HELPER_ROLE_MAX = _env_int("PERSONA_HELPER_ROLE_MAX", 3000)
+_PERSONA_HELPER_SET = bool(os.environ.get("PERSONA_HELPER_ROLE_MAX"))
 
 
 def _persona_keys(many: list[str] | None, one: str | None) -> list[str]:
@@ -2356,8 +2401,9 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
         # ⚠ _role_doc 으로 허브 사용 안내를 떼고 싣는다. 원문을 그대로 주면 실측 69%가
         #   다른 클라이언트용 안내문이고, 그 안내가 포털 챗에서는 틀린 지시다.
         meta["name"] = str(sd.get("name") or "")[:120]
-        meta["role"] = (_role_doc(str(sd.get("system_prompt") or ""))
-                        or str(sd.get("description") or ""))[:PERSONA_ROLE_MAX]
+        # 좁은 창만 PERSONA_ROLE_MAX(정본 동기화 상한과 같은 값)에서 끊고 원문 길이를 적는다 — 넓은 창은 역할 전문.
+        meta["role"] = _cut_mark(_role_doc(str(sd.get("system_prompt") or ""))
+                                 or str(sd.get("description") or ""), _narrow_cap(PERSONA_ROLE_MAX))
         rc = sd.get("response_config") if isinstance(sd.get("response_config"), dict) else {}
         if rc.get("persona_kind") == "mcp_operator":
             meta["operator"] = True
@@ -2627,7 +2673,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             req = req.model_copy(update={"message": (
                 f"{_orig}\n\n[이어하기] 직전 답변이 중간에 끊겼습니다. 위 요청을 처음부터 다시 "
                 f"수행해 끝까지 답하세요. 필요한 도구는 다시 호출하십시오."
-                + (f"\n[끊긴 지점까지 나온 내용]\n{_part[:2000]}" if _part else ""))})
+                + (f"\n[끊긴 지점까지 나온 내용]\n{_resume_part(_part)}" if _part else ""))})
             print(f"[agent] nudge→resume: {_orig[:60]!r}")
     yield _sse("status", {"step": "분석 중", "tool": None})
     try:
@@ -2844,7 +2890,10 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         if helpers:
             _blocks = []
             for _k, _m in helpers:
-                _r = (_m.get("role") or "")[:PERSONA_HELPER_ROLE_MAX]
+                # 보조 역할 — 좁은 창은 종전 상한(스키마 예산을 밀어내지 않게), 넓은 창은 명시값이 없으면 전문.
+                _r = _cut_mark(_m.get("role") or "",
+                               PERSONA_HELPER_ROLE_MAX if (not _wide() or _PERSONA_HELPER_SET)
+                               else 0)
                 _tag = "MCP 운영자" if _m.get("operator") else "도메인 전문가"
                 _apps_note = ""
                 if _m.get("operator") and _m.get("apps"):
@@ -3054,7 +3103,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 if _attempt > 1:
                     await asyncio.sleep(min(4.0, 1.5 * (_attempt - 1)))
                 try:
-                    _msgs = [("system", sys_prompt), *_history_messages(req.history),
+                    _msgs = [("system", sys_prompt),
+                             *_history_messages(req.history, has_docs=bool(req.documents)),
                              ("user", req.message)]
                     # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
                     _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
@@ -3131,7 +3181,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                         "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
                         "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라. "
                         "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라."),
-                       *_history_messages(req.history), ("user", req.message)]
+                       *_history_messages(req.history, has_docs=bool(req.documents)), ("user", req.message)]
             _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
             for m in reversed((_r2 or {}).get("messages") or []):
                 if getattr(m, "type", "") != "ai":
@@ -3321,7 +3371,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     # 예전 조건을 그대로 통과했고, 사용자에겐 '중간에 끊긴 응답'으로 보였다.
     if _needs_final_rescue(turn_calls, text, _post_tool_chars):
         _names = ", ".join(dict.fromkeys(n for n, _ in turn_calls))
-        _excerpt = "\n".join(turn_out)[:12000].strip()
+        _excerpt = _rescue_excerpt(turn_out)
         _before = text   # 구제로 뭐라도 보탰는지 판정용(예고만 남은 턴은 text 가 비지 않는다)
         print(f"[agent] {'stalled' if text.strip() else 'empty'} final after tools({_names}) — 자동 재시도")
         yield _sse("status", {"step": "도구 결과 뒤 응답이 없어 자동 재시도", "tool": None})
@@ -3487,19 +3537,10 @@ async def _seat_axes(llm, tools: dict, message: str, history: list) -> list[dict
     roster = await _domain_roster(tools)
     if not roster:
         return []
-    lines, budget = [], _AXIS_CTX_BUDGET
-    for m in history[:60]:
-        if not isinstance(m, dict):
-            continue
-        t = str(m.get("content") or "").strip()
-        if not t:
-            continue
-        who = "사람" if m.get("role") == "user" else "AI"
-        line = f"[{who}] {t[:800]}"
-        if budget - len(line) < 0:
-            break
-        lines.append(line)
-        budget -= len(line)
+    # 최근 60건을 최근부터 담는다(_recent_lines). 종전엔 **앞에서부터** 60건·5,000자라 긴 대화의 뒤쪽(쟁점이 옮겨 간
+    # 자리)이 축 추출에 안 갔다. 좁은 창은 종전 예산 5,000자·줄 800자, 넓은 창은 챗 이력 예산·줄 무절단.
+    lines = _recent_lines(history[-60:], _aux_budget(_AXIS_CTX_BUDGET), _narrow_cap(800),
+                          lambda m, t: f"[{'사람' if m.get('role') == 'user' else 'AI'}] {t}")
     if not lines:
         return []
     roster_txt = ", ".join(f"{r['domain']}({r['agents']}명)" for r in roster)
@@ -3508,7 +3549,7 @@ async def _seat_axes(llm, tools: dict, message: str, history: list) -> list[dict
             llm,
             "당신은 심의 좌석 편성자입니다. 지시한 형식의 줄만 출력하세요.",
             f"[전문가 풀의 도메인 분류 — 여기 있는 것만 쓸 수 있다]\n{roster_txt}\n\n"
-            f"[화두]\n{message[:1000]}\n\n[오간 대화]\n" + "\n".join(lines) +
+            f"[화두]\n{_cut_mark(message, _narrow_cap(1000))}\n\n[오간 대화]\n" + "\n".join(lines) +
             f"\n\n위 대화 전체를 읽고, 이 문제를 판단하려면 어느 도메인이 필요한지 위 목록에서 "
             f"고르라. 화두에 직접 쓰인 말만이 아니라 대화에서 드러난 조건·제약·의심까지 반영하라. "
             f"중요한 순서로 최대 {EXPERT_AXES}줄, 각 줄은 다음 형식뿐이다.\n"
@@ -3758,7 +3799,7 @@ def _voc_row(v: dict, kw: str) -> dict:
         "date": str(v.get("published_at") or "")[:10],
         "sentiment": str(v.get("sentiment_label") or "")[:16],
         "score": v.get("sentiment_score"),
-        "text": text[:600],
+        "text": _cut_mark(text, _narrow_cap(600)),   # 좁은 창만 앞 600자(표식) — 이 글이 심의 근거로도 간다
         "url": str(v.get("source_url") or "")[:300],
     }
 
@@ -3957,14 +3998,11 @@ async def _derive_topic(history: list, fallback: str = "") -> dict:
     두 곳이 다른 프롬프트를 쓰면 같은 대화에서 다른 화두가 나오고, 사용자는 어느 쪽이
     진짜인지 알 수 없다."""
     fb = (fallback or "").strip()
-    hist, budget = [], 12000
-    for m in (history or [])[-40:]:
-        t = str((m or {}).get("content") or "").strip()
-        if not t or budget <= 0:
-            continue
-        who = "사용자" if (m or {}).get("role") == "user" else "어시스턴트"
-        hist.append(f"{who}: {t[:2000]}")
-        budget -= len(t)
+    # 최근 40건을 **최근부터** 예산 안에 담는다(_recent_lines). 좁은 창은 종전 예산 12,000자·줄 2,000자, 넓은 창은 챗 이력
+    # 예산(창에서 유도)·줄 무절단. 종전엔 오래된 쪽부터 원문 길이로 예산을 깎아, 앞의 긴 답 하나가 뒤의 물음을 밀어냈다.
+    _h = (history or [])[-40:]
+    hist = _recent_lines(_h, _aux_budget(12000), _narrow_cap(2000),
+                         lambda m, t: f"{'사용자' if m.get('role') == 'user' else '어시스턴트'}: {t}")
     if not hist:
         return {"topic": fb, "why": "", "options": [], "error": "no_history"}
 
@@ -4021,20 +4059,16 @@ async def deliberate_clarify(req: ClarifyRequest) -> dict:
     묻지 않고 진행한다(묻지 못한 것을 '다 있다'로 꾸미지는 않는다 — error 로 알린다).
     칸이 응답에서 빠지면 그 칸은 묻지 않는다(괴롭히지 않는 쪽으로 틀린다)."""
     slots = _CLARIFY_SLOTS[_JOB_SLOTSET.get(req.job, "mechanism")]
-    hist: list[str] = []
-    budget = 3000
-    for m in req.history[-20:]:
-        t = str((m or {}).get("content") or "").strip()
-        if t and budget > 0:
-            hist.append(f"{m.get('role', 'user')}: {t[:budget]}")
-            budget -= len(t)
+    # 최근 20건을 최근부터 담는다(_recent_lines — 화두 뽑기와 같은 결함이 있었다). 좁은 창 종전 예산 3,000자.
+    hist: list[str] = _recent_lines(req.history[-20:], _aux_budget(3000), _narrow_cap(3000),
+                                    lambda m, t: f"{m.get('role', 'user')}: {t}")
     if not _clarify_applicable(req.job, req.message + "\n" + "\n".join(hist)):
         return {"applicable": False, "slots": [], "ask": []}   # LLM 을 부르지도 않는다
     spec = "\n".join(f"- {k}: {label} — {hint}" for k, label, hint, _o in slots)
     try:
         raw = await _llm_text(
             app.state.llm, "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-            f"[화두]\n{req.message[:3000]}\n"
+            f"[화두]\n{_cut_mark(req.message, _narrow_cap(3000))}\n"
             + (f"\n[앞선 대화]\n" + "\n".join(hist) + "\n" if hist else "")
             + f"\n아래는 이 심의에 필요한 최소 정보 칸이다.\n{spec}\n\n"
             "화두·대화에 **이미 적힌 것만** present=true 로 하고 value 에 짧게 옮겨라. 추측으로 채우지 마라. "
