@@ -442,3 +442,70 @@ def test_심의_좌석은_지식카드_줄을_자기_예산까지_받는다(monk
             until=lambda ev, data: ev == "delib" and data.get("kind") == "stage" and str(data.get("stage")) == "r2")
     kb = [h for h in seen if "[당신의 지식카드에서" in h]
     assert kb and all("<끝>" in h for h in kb), "지식카드 한 장의 뒤쪽이 좌석에 안 갔다 — 줄당 700자에서 끊었다"
+
+
+# ── 다른 좌석의 조회 결과(공용 풀) — 항목당 420자와 틀린 '전체 N자' 표식 ─────────────────────────
+class _PerSeat:
+    """좌석마다 다른 인자로 조회하는 가짜 에이전트 — 서명이 같으면 공용 블록이 자기 것으로 보고 뺀다."""
+
+    def __init__(self, size):
+        self.size = size
+
+    async def astream(self, inp, config=None, stream_mode=None):
+        import re
+        k = re.search(r"당신은 '([^']+)' 전문가", inp["messages"][0][1]).group(1)
+        yield {"messages": [_Msg("ai", "", tool_calls=[{"id": f"{k}-c", "args": {"seat": k}}]),
+                            _Msg("tool", f"<{k}>" + "값" * self.size + f"</{k}>", tool_call_id=f"{k}-c",
+                                 name="get_probe")]}
+
+
+def _share_prompts(monkeypatch, tokens, size):
+    import json
+    import re
+
+    import langgraph.prebuilt
+
+    from test_delib_silent_drops import _Tool
+    seen = {}
+
+    async def _llm(_obj, system, human):
+        m = re.search(r"당신은 '([^']+)' 전문가", system)
+        if not m:
+            return "결정문"
+        seen.setdefault(m.group(1), []).append(human)
+        return json.dumps({"lens": "관점", "reads": [], "recommendation": "권장", "concerns": ["A", "B"],
+                           "position_short": "요약", "concede": [], "rebut": ["반박"], "deepen": "심화",
+                           "final_position": "최종", "non_negotiable": "", "vote": "진행", "stance": "동의"},
+                          ensure_ascii=False)
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda _llm, _tools, **_k: _PerSeat(size))
+    _win(tokens)
+    _stream(monkeypatch, {"personas": [{"key": "mech-a", "role": "역할"}, {"key": "rel-b", "role": "역할"}],
+                          "rounds": 3, "save_report": 0, "rebut_quote": 0, "free_tools": 1, "persona_knowledge": 0},
+            tools={"agent_search": _Tool("agent_search"), "get_probe": _Tool("get_probe")},
+            until=lambda ev, _data: ev == "done")
+    blk = "[다른 전문가가 조회한 결과"
+    return [h[h.index(blk):] for h in seen["rel-b"] if blk in h]
+
+
+def test_공용_조회_결과의_표식은_원문_길이를_적는다(monkeypatch):
+    """풀에 넣을 때 이미 840자로 잘라 '전체 N자' 가 최대 840 이었다 — 15만 자 결과도 '전체 840자'."""
+    got = _share_prompts(monkeypatch, 128000, 150000)
+    assert got, "시험 전제 — rel-b 가 mech-a 의 조회 결과를 받았다"
+    line = next(ln for ln in got[0].splitlines() if "get_probe" in ln and "mech-a" in ln)
+    assert "원문 150,017자" in line, line[-80:]
+
+
+def test_넓은_창은_공용_조회_결과를_몫이_닿는_데까지_싣는다(monkeypatch):
+    got = _share_prompts(monkeypatch, _BIG, 5000)
+    assert got and all("</mech-a>" in g for g in got), "다른 좌석의 조회 결과가 420자에서 끊겼다"
+
+
+def test_좁은_창의_공용_조회_결과는_종전대로_항목당_420자다(monkeypatch):
+    got = _share_prompts(monkeypatch, 128000, 5000)
+    line = next(ln for ln in got[0].splitlines() if "get_probe" in ln and "mech-a" in ln)
+    assert "</mech-a>" not in line and "앞 420자만" in line, line[-80:]

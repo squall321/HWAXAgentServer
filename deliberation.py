@@ -2964,8 +2964,11 @@ def _share_budget(rnd: int = 1) -> int:
 
 
 def _share_block(pool: list, key: str, budget: int, *,
-                 mine: bool = False, cur_round: int = 0) -> tuple[str, int, int]:
+                 mine: bool = False, cur_round: int = 0, full_len: dict | None = None) -> tuple[str, int, int]:
     """공용 조회 결과 블록 → (블록, 실린 수, 빠진 수). 풀 항목은 (라운드, 좌석, 도구, 인자, 결과).
+
+    full_len — {(라운드, 좌석, 도구, 인자): 원문 길이}. 풀은 결과를 쓸 만큼만 담으므로(스트림) 원문 길이는 따로 받는다 —
+    종전엔 담은 것의 길이를 '전체 N자' 로 적어, 15만 자 결과도 '전체 840자' 였다.
 
     `mine=False` 는 **다른 좌석이** 조회한 것, `mine=True` 는 **내가 앞 라운드에** 조회한 것이다.
     후자가 따로 필요한 이유 — `_gathered` 는 이번 라운드 것만 담는데 공용 블록은 자기 것을
@@ -3001,6 +3004,10 @@ def _share_block(pool: list, key: str, budget: int, *,
                 if _by_seat[_s]:
                     order.append(_by_seat[_s].pop(0))
 
+    # 항목 하나의 상한 — 좁은 창은 종전 _SHARE_ITEM_MAX(420자). 넓은 창(_wide)은 몫을 이번 후보 수로 나눈 데까지 늘린다
+    # (후보가 적으면 항목마다 길게). 종전엔 1백만 토큰 창에서도 항목당 420자였다(사용자 지침 2026-10-10).
+    icap = (max(_SHARE_ITEM_MAX, budget // max(1, len({(e[2], e[3]) for e in order}))) if _wide()
+            else _SHARE_ITEM_MAX)
     seen, picked, used, dropped = set(), [], 0, 0
     for rnd, seat, tool, args, out in order:
         sig = (tool, args)
@@ -3014,8 +3021,9 @@ def _share_block(pool: list, key: str, budget: int, *,
         # 잘린 줄 모르면 "그 값은 조회에 없었다" 로 읽는다 — 근거가 있는데 없다고 말하는
         # 쪽이라 가장 나쁜 모양이다(7차 감사).
         _flat = " ".join(str(out).split())
-        body = _flat if len(_flat) <= _SHARE_ITEM_MAX else (
-            _flat[:_SHARE_ITEM_MAX] + f"… (앞 {_SHARE_ITEM_MAX}자만 · 전체 {len(_flat)}자)")
+        full = (full_len or {}).get((rnd, seat, tool, args)) or len(str(out))
+        body = _flat if (len(_flat) <= icap and full <= len(str(out))) else (
+            _flat[:icap] + f"… (앞 {min(icap, len(_flat)):,}자만 · 원문 {full:,}자)")
         line = (f"- [R{rnd} {tool}] {body}" if mine
                 else f"- [R{rnd} {seat}] {tool}({args}): {body}")
         if picked and used + len(line) + 1 > budget:
@@ -4610,6 +4618,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     seat_loss = []            # [{round, lost:[key]}] — 실패로 발언 못 한 좌석(의장·커버리지에 알림)
     r1_by_key = {}            # 1라운드 데이터(앵커용) — 1R 완료 후 채움
     gather_pool: list = []    # [(라운드, 좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
+    gather_lens: dict = {}    # {(라운드, 좌석, 도구, 인자): 원문 길이} — 풀은 쓸 만큼만 담으므로 표식용 길이를 따로 든다
     seat_lookups: list = []   # 좌석이 받은 자기 조회 블록 — 라운드마다 비워지므로 따로 모은다(결정문 수치 대조의 출처)
 
     for rnd in range(1, N + 1):
@@ -4816,9 +4825,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             # B 는 못 보고 기억으로 말한다(근거 패널에는 떠 있는데 좌석엔 없다).
                             # ⚠ 원문이 아니라 **쓸 만큼만** 담는다. 결과 1건 상한은 컨텍스트에서
                             #   유도돼 128K 에서 11,679자·1M 에서 151,200자까지 가는데, 공용
-                            #   블록은 어차피 _SHARE_ITEM_MAX 까지만 쓴다. 원문을 담으면 20석
-                            #   6라운드 심의 하나가 17MB~218MB 를 심의 내내 붙잡는다.
-                            gather_pool.append((rnd, _k, _tn, _ap, _out[:_SHARE_ITEM_MAX * 2]))
+                            #   블록은 어차피 항목 상한까지만 쓴다(좁은 창 _SHARE_ITEM_MAX, 넓은 창은 많아야 공용
+                            #   몫 전체). 원문을 담으면 20석 6라운드 심의 하나가 17MB~218MB 를 심의 내내 붙잡는다.
+                            gather_pool.append((rnd, _k, _tn, _ap, _out[:max(_SHARE_ITEM_MAX * 2,
+                                                                             _room("share", 0) if _wide() else 0)]))
+                            gather_lens[(rnd, _k, _tn, _ap)] = len(_out)
                     _gathered[_k] = _blk
                     if _blk:
                         seat_lookups.append(_blk)
@@ -4863,8 +4874,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _share, _mine, _drop, _shown = {}, {}, {}, 0
         for p in personas if gather_pool else ():
             _k2 = p["key"]
-            _b, _n, _d = _share_block(gather_pool, _k2, _sb)
-            _mb, _mn, _md = _share_block(gather_pool, _k2, _mbudget, mine=True, cur_round=rnd)
+            _b, _n, _d = _share_block(gather_pool, _k2, _sb, full_len=gather_lens)
+            _mb, _mn, _md = _share_block(gather_pool, _k2, _mbudget, mine=True, cur_round=rnd, full_len=gather_lens)
             _share[_k2], _mine[_k2] = _b, _mb
             # 좌석마다 실제로 빠진 수를 따로 센다. 전 좌석 최대값을 모두에게 말하면, 하나도
             # 안 빠진 좌석이 "2건 못 실었다" 를 듣고 없는 근거를 상상한다(실측).
