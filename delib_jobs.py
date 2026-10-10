@@ -380,8 +380,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "turn":
             # 좌석 발언. 이것이 없으면 결과만 있고 과정이 없는 심의가 된다(이어하기·원장 제출의 재료).
             # say 는 화면용으로 줄인 글이고, 줄였을 때는 줄이지 않은 발언이 say_full 로 함께 온다(transcript 가
-            # 가려 내준다). 상한을 둔다 — 21석×6R 이 수십만 자라 원장 파일이 커진다(say_full 까지 최악
-            # TURN_MAX × DELIB_TRANSCRIPT_CLIP — 보통의 21석 6라운드는 0.4M 자쯤이다).
+            # 가려 내준다). 상한을 둔다 — 21석×6R 이 수십만 자라 원장 파일이 커진다(say_full 은 좁은 창에서
+            # DELIB_TRANSCRIPT_CLIP 까지, 넓은 창은 끊지 않는다 — 보통의 21석 6라운드는 0.4M 자쯤이다).
             t = job.setdefault("turns", [])
             if len(t) < TURN_MAX:
                 t.append({k: v for k, v in data.items() if k != "kind"})

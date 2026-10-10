@@ -606,7 +606,8 @@ async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
     description=("HWAX 심의에서 어느 좌석이 몇 라운드에 무엇을 말했는지 본다. 기본은 **화면에 뜨는 줄인 "
                  "발언**이다 — 줄인 턴에는 say_clipped 와 온전한 길이(say_full_chars)가 붙는다. full=true 면 "
                  "줄이지 않은 발언을 준다(길어지니 limit 을 줄여라). 발언은 라운드에 따라 관점·권장 / "
-                 "수용·반박·심화 / 최종 입장·표결을 이어 붙인 글이다(해석 목록·우려 목록은 여기 없다). "
+                 "수용·반박·심화 / 최종 입장·표결을 이어 붙인 글이고, full=true 는 해석 목록·우려·양보 불가 "
+                 "조항까지 싣는다. "
                  "결정문만으로 부족할 때 쓰고, 리스크 원장에 패널 결과를 제출할 때는 full=true 로 받는다."),
 )
 async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",

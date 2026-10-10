@@ -135,13 +135,21 @@ if DELIB_TIMEOUT_MAX_S < _TIMEOUT_REQ_MIN_S:
           f"{_TIMEOUT_REQ_MIN_S:g}초 미만 — 기본값 14400 으로 읽는다")
     DELIB_TIMEOUT_MAX_S = 14400.0
 _ROLE_CLIP = _env_int("DELIB_ROLE_CLIP", 0)         # 페르소나 role 절단 — 0=무절단(기본)
-_TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)  # RA 회의록 발언당 상한(API 보호용)
+# 기록용 발언(잡 원장의 say_full·RA 회의록) 발언당 상한(자), 0=무절단. 좁은 창의 저장 보호값이다 — 넓은 창(1백만
+# 토큰)은 끊지 않는다(_transcript_clip). 종전엔 1백만 토큰 창에서도 12,000자라, 해석·우려까지 싣는 기록용 발언의 뒤가
+# deliberate_transcript(full=true)·리스크 앱 제출·RA 회의록에서 잘렸다(사용자 지침 2026-10-10). 명시하면 어느 창에서나 그 값이다.
+_TRANSCRIPT_CLIP = _env_int("DELIB_TRANSCRIPT_CLIP", 12000)
+_TRANSCRIPT_CLIP_SET = bool(os.environ.get("DELIB_TRANSCRIPT_CLIP"))
 _PARSE_RETRIES = _env_int("DELIB_PARSE_RETRIES", 1)  # JSON 파싱 실패 시 재호출 횟수
 # RA rich_text 는 **항목당 2000자**가 서버 스키마 상한이다(초과 시 create_report_draft 가
 # "Content invalid" 로 통째 거절). _TRANSCRIPT_CLIP(기본 12000)은 그보다 크므로, 발언이 길면
 # 저장이 매번 실패하고 except 의 print 한 줄로만 남는다 — 실제로 그렇게 조용히 실패해 왔다.
 # 그래서 절단이 아니라 **분할**로 푼다. 상한을 넘기면 문장 경계로 쪼개 전부 싣는다.
 _RA_ITEM_MAX = _env_int("DELIB_RA_ITEM_MAX", 1900)   # 서버 상한 2000 에 대한 여유값
+# 보고서 블록의 건수 상한 — 권고(결정문 문단)·회의록(발언 줄). RA 쪽 블록당 건수 한도는 확인하지 못했다(모른다) —
+# 보호값으로 두되, 걸리면 서버 로그만이 아니라 카드로 알린다(잡 원장·화면). 20석 × 8라운드도 회의록 170줄 안팎이다.
+_RA_PARAS_MAX = 200
+_RA_MINUTES_MAX = 400
 _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
@@ -306,6 +314,20 @@ def _tool_inject_caps() -> tuple[int, int]:
 def _summary_max() -> int:
     """이어하기 요약(이전 결정문)을 받는 길이(자) — 좁은 창은 종전 8,000자. 매 라운드 전 좌석에 실린다."""
     return _room("summary", _SUMMARY_MAX)
+
+
+def _transcript_clip() -> int:
+    """기록용 발언(say_full·RA 회의록) 발언당 상한(자), 0=무절단. 명시값(DELIB_TRANSCRIPT_CLIP)이 있으면 그 값이고,
+    없으면 좁은 창은 종전 12,000자, 넓은 창은 0 — 발언 하나의 길이는 모델 출력이 이미 묶는다. RA 의 항목 상한
+    (2,000자)은 자르지 않고 나눠 지킨다(_ra_split)."""
+    if _TRANSCRIPT_CLIP <= 0 or _TRANSCRIPT_CLIP_SET:
+        return max(0, _TRANSCRIPT_CLIP)
+    return 0 if _wide() else _TRANSCRIPT_CLIP
+
+
+def _clip_to(s: str, n: int) -> str:
+    """n 자에서 끊는다(0=무절단) — 표식은 호출부가 따로 싣는다(say_full_chars 처럼)."""
+    return s[:n] if n > 0 else s
 
 
 def _human_note_max() -> int:
@@ -5078,7 +5100,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 글은 줄인 것이 원문과 같은 길이일 수 있다.
             _say, _say_full = _say_of(render, o), _say_of(render, o, full=True)
             if _say_full != _say:
-                extra["say_full"] = _say_full[:_TRANSCRIPT_CLIP]
+                extra["say_full"] = _clip_to(_say_full, _transcript_clip())
                 extra["say_full_chars"] = len(_say_full)
             yield _delib("turn", round=rnd, display_round=_dr(rnd), persona=o["persona"],
                          say=_say, **extra)
@@ -5434,25 +5456,35 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             lbl = ("도메인별 초기 입장" if r == 1 else "수렴·최종 입장" if r == N else "상호 반박·심화")
             transcript.append(f"— {_dr(r)}라운드 — {lbl} —")
             render = 1 if r == 1 else 3 if r == N else 2
-            # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다.
-            # _TRANSCRIPT_CLIP 은 저장 API 보호용 여유 상한(기본 12,000자)일 뿐.
-            transcript += [f"[{o['persona']}] {_say_of(render, o, full=True)[:_TRANSCRIPT_CLIP]}" for o in arr]
+            # 기록 층위 — 버블용 절단문이 아니라 온전한 발언(full=True)을 남긴다. 발언당 상한은 좁은 창의 저장
+            # 보호값이고(_transcript_clip — 넓은 창은 끊지 않는다), RA 항목 상한은 나눠서 지킨다(_ra_blocks).
+            _tclip = _transcript_clip()
+            transcript += [f"[{o['persona']}] {_clip_to(_say_of(render, o, full=True), _tclip)}" for o in arr]
         results_t = rounds_data[N - 2][1] if N >= 3 else rounds_data[0][1]   # 마지막 심화 라운드, 없으면 1R
+        _paras = [p.strip() for p in decision.split("\n\n") if p.strip()]
         blocks = {
+            # 환기·선주입 근거와 '결과' 칸을 글자 수로 자르지 않는다 — RA 항목 상한(2,000자)은 _ra_blocks 가 나눠서
+            # 지킨다. 종전 '결과' 칸은 마지막 심화 라운드 전사의 앞 1,500자라 첫 좌석의 발언 일부만 남았다.
             "background": [f"심의 주제: {question}"]
-                          + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject[:1200]}"] if sf_inject else [])
-                          + ([f"정량 근거(도구 조회 선주입):\n{ev_inject[:1200]}"] if ev_inject else []),
-            "results": [results_t[:1500]],
+                          + ([f"최근 고객 불만 신호(SignalForge VOC) 환기:\n{sf_inject}"] if sf_inject else [])
+                          + ([f"정량 근거(도구 조회 선주입):\n{ev_inject}"] if ev_inject else []),
+            "results": [ln for ln in re.split(r"\n(?=• )", results_t) if ln.strip()],   # 좌석마다 한 항목
             # ⚠ 여기는 코드가 직접 도구를 부르는 경로다(에이전트 에코 아님) — 에코 출력 상한이
             #   없으므로 상한을 넉넉히 둔다. 종전 [:20]/[:40] 은 실측 6만자급에서 소수의견·
             #   뒤집힘 조건(뒤쪽 항목)과 수렴 라운드 회의록을 통째로 버렸다(감사 C24/C25).
-            "recommendation": [p.strip() for p in decision.split("\n\n") if p.strip()][:200],
+            "recommendation": _paras[:_RA_PARAS_MAX],
             "minutes": [f"참여: {', '.join(p['key'] for p in personas)}",
-                        f"{N}라운드 심의({_dr(1)}R 초기→…→{_dr(N)}R 수렴)."] + transcript[:400],
+                        f"{N}라운드 심의({_dr(1)}R 초기→…→{_dr(N)}R 수렴)."] + transcript[:_RA_MINUTES_MAX],
         }
-        _paras = [p.strip() for p in decision.split("\n\n") if p.strip()]
-        if len(_paras) > 200 or len(transcript) > 400:
-            print(f"[deliberation] RA 블록 절단 — 문단 {len(_paras)}/200 · 회의록 {len(transcript)}/400")
+        if len(_paras) > _RA_PARAS_MAX or len(transcript) > _RA_MINUTES_MAX:
+            _ra_cut = [f"{what} {n:,}건 중 앞 {cap:,}건만" for what, n, cap in
+                       (("결정문 문단(권고)", len(_paras), _RA_PARAS_MAX), ("회의록 줄", len(transcript), _RA_MINUTES_MAX))
+                       if n > cap]
+            print(f"[deliberation] RA 블록 절단 — {' · '.join(_ra_cut)}")
+            # 서버 로그만으로는 보고서만 읽는 사람도 호출자도 모른다 — 잡 원장(evidence_omitted)과 화면에 남긴다.
+            yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
+                         text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
+                              "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
         if not _do_save:
             _raw_made = None
         elif _append_to:
