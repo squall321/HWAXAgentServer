@@ -1100,8 +1100,10 @@ def _cap_tool(tool, result_max=None):
 
 
 def _cap_desc(s, limit=None):
-    limit = limit or TOOL_DESC_MAX
-    if isinstance(s, str) and len(s) > limit:
+    # 0 은 무제한이다(_cap 과 같은 약속). 종전엔 `limit or TOOL_DESC_MAX` 라 TOOL_DESC_MAX=0 이면 설명이 전부 '…' 가
+    # 됐고, 무절단을 뜻한 desc_max=0(CATALOG_DESC_MAX=0)은 바인딩 보호값 2,400 으로 떨어졌다.
+    limit = TOOL_DESC_MAX if limit is None else limit
+    if limit > 0 and isinstance(s, str) and len(s) > limit:
         return s[:limit] + "…"
     return s
 

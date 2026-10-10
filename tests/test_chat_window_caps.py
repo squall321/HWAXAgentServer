@@ -287,3 +287,13 @@ def test_직접_실행_경로도_핸드오프용_날것을_싣는다():
     src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
     blk = src[src.index('f"도구 직접 실행: {_tn}"'):][:2200]
     assert "_handoff_text(_out)" in blk and '"result_full": _hand3' in blk, blk
+
+
+# ── 도구 설명 상한 — 0 은 무제한이다(TOOL_RESULT_MAX 와 같은 약속) ─────────────────────────────────────
+def test_도구_설명_상한_0_은_무제한이다(monkeypatch):
+    """TOOL_DESC_MAX=0 이면 설명이 전부 '…' 한 글자가 됐고, desc_max=0 은 2,400 으로 떨어졌다."""
+    monkeypatch.setattr(app, "TOOL_DESC_MAX", 0)
+    assert app._cap_desc("가" * 50) == "가" * 50
+    monkeypatch.setattr(app, "TOOL_DESC_MAX", 2400)
+    assert app._cap_desc("가" * 5000, 0) == "가" * 5000
+    assert app._cap_desc("가" * 5000) == "가" * 2400 + "…", "기본 동작(바인딩 보호 2,400자)은 그대로다"
