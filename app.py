@@ -798,6 +798,16 @@ def _resume_target(history: list) -> tuple:
     return (last_q, (last_a or "").strip())
 
 
+def _finish_reason(msg) -> str:
+    """모델 응답의 finish_reason — response_metadata·additional_kwargs 어느 쪽에 와도 읽는다(심의 _llm_text 와 같다)."""
+    try:
+        meta = getattr(msg, "response_metadata", None) or {}
+        return str(meta.get("finish_reason")
+                   or (getattr(msg, "additional_kwargs", None) or {}).get("finish_reason") or "")
+    except Exception:  # noqa: BLE001 — 검출 실패가 챗을 죽이면 안 된다
+        return ""
+
+
 def _resume_part(part: str) -> str:
     """이어하기에 싣는 '끊긴 지점까지 나온 내용' — 좁은 창은 종전 앞 2,000자(원문 길이 표식), 넓은 창은 전부."""
     return _cut_mark(part, _narrow_cap(2000))
@@ -2953,18 +2963,27 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     full.append(token)
                     _post_tool_chars += len(token if isinstance(token, str) else str(token))
                     yield _sse("token", {"delta": token})
-            elif kind == "on_chat_model_end" and getattr(app.state, "llm_nostream", False):
-                # 비스트리밍 모드 — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
-                # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip).
+            elif kind == "on_chat_model_end":
                 out_msg = event.get("data", {}).get("output")
-                content = getattr(out_msg, "content", "") or ""
-                if isinstance(content, list):  # 멀티파트 content 방어
-                    content = "".join(
-                        p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-                if content:
-                    full.append(content)
-                    _post_tool_chars += len(content)
-                    yield _sse("token", {"delta": content})
+                # 출력 상한(max_tokens)에서 끊긴 응답 — 챗 루프는 finish_reason 을 한 번도 읽지 않아, 답이 문장 중간에서
+                # 끊겨도 정상 답과 똑같이 끝났다(심의 _llm_text 에는 이 검출이 있다). 운영은 max_tokens 를 안 보내
+                # 엔드포인트 기본 출력 상한이 걸린다. 끊겼으면 화면과 대화 기록에 남긴다.
+                if _finish_reason(out_msg) == "length":
+                    yield _sse("warning", {"code": "output_cut",
+                                           "message": "답이 모델 출력 상한에서 끊겼습니다 — 뒷부분이 빠졌을 수 "
+                                                      "있습니다. 범위를 나눠 다시 물어 주세요.",
+                                           "knob": "LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
+                if getattr(app.state, "llm_nostream", False):
+                    # 비스트리밍 모드 — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
+                    # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip).
+                    content = getattr(out_msg, "content", "") or ""
+                    if isinstance(content, list):  # 멀티파트 content 방어
+                        content = "".join(
+                            p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+                    if content:
+                        full.append(content)
+                        _post_tool_chars += len(content)
+                        yield _sse("token", {"delta": content})
             elif kind == "on_tool_start":
                 _budget["calls"] += 1
                 _fp = f"{event.get('name')}|{json.dumps(event.get('data', {}).get('input'), sort_keys=True, ensure_ascii=False, default=str)[:400]}"

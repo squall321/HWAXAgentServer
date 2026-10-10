@@ -250,3 +250,18 @@ def test_VOC_한_건은_좁은_창에서만_600자에서_끊는다(tokens):
     v = {"content_translated": "가" * 900 + " [VOC-끝]"}
     got = app._voc_row(v, "kw")["text"]
     assert ("[VOC-끝]" in got) == (tokens == _BIG), got[-60:]
+
+
+# ── 출력 상한 절단 — 챗도 finish_reason 을 읽는다 ────────────────────────────────────────
+def test_finish_reason_을_두_자리_어디서든_읽는다():
+    from types import SimpleNamespace as NS
+    assert app._finish_reason(NS(response_metadata={"finish_reason": "length"})) == "length"
+    assert app._finish_reason(NS(response_metadata={}, additional_kwargs={"finish_reason": "length"})) == "length"
+    assert app._finish_reason(NS()) == "" and app._finish_reason(None) == ""
+
+
+def test_챗_스트림이_출력_상한_절단을_경고한다():
+    src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    i = src.index('elif kind == "on_chat_model_end":')
+    blk = src[i:i + 900]
+    assert '_finish_reason(out_msg) == "length"' in blk and '"code": "output_cut"' in blk, blk
