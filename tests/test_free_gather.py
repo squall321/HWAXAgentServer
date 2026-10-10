@@ -9,7 +9,22 @@
 # 그래서 이 파일은 **반환값을 실제로 받아 본다.** 이름이 있는지만 보면 또 못 잡는다.
 import asyncio
 
+import pytest
+
+import app
 import deliberation as d
+
+
+@pytest.fixture(autouse=True)
+def _pin_context():
+    """조회 턴의 역할 상한·발언 턴 블록의 몫은 모델 창에서 유도한다 — 박스에 떠 있는 모델을 따라가지 않게 128K 로 고정한다."""
+    saved = dict(app._ctx_cache)
+    app._ctx_cache["n"] = 128000
+    d._evid_cache.clear()
+    yield
+    app._ctx_cache.clear()
+    app._ctx_cache.update(saved)
+    d._evid_cache.clear()
 
 
 class _Msg:
@@ -139,9 +154,11 @@ _RISK_SEAT = {"key": "mech-housing-structure",
 
 
 def test_조회_지침이_없는_좌석의_시스템_글은_종전과_한_글자도_다르지_않다():
-    """특성화 — 해시는 지침을 넣기 전 코드에서 뜬 값이다. 다른 의장 틀·합성 지정석·발굴된 좌석이 이 길이다."""
+    """특성화 — 해시는 지침을 넣기 전 코드에서 뜬 값이다. 다른 의장 틀·합성 지정석·발굴된 좌석이 이 길이다.
+    리스크 좌석은 역할(886자)이 조회 턴의 상한(좁은 창 280자)을 넘어, 잘랐다는 표식(' …[886자 중 앞 280자]')만큼
+    달라졌다 — 표식을 빼면 종전 해시(1e04c375…)와 같다(사용자 지침 2026-10-10 — 조용히 자르지 않는다)."""
     for persona, want in ((PERSONA, "dd52a224c163a55b5311a4d081c6fcaa17d6c8621e92241aa83caf4bfeb7f33d"),
-                          (_RISK_SEAT, "1e04c375fb1d0208112aabd102a634f8c16f4a22e3ce3af4ad7791a7d6ba7a77")):
+                          (_RISK_SEAT, "1cf2f060e8a38f2180ee40e7f48edfedd3be61dc94f2ff38e1258eb6ca831994")):
         sysmsg, _human = _prompts(persona)
         assert hashlib.sha256(sysmsg.encode()).hexdigest() == want, (persona["key"], sysmsg)
 

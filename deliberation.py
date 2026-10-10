@@ -1915,6 +1915,14 @@ def _fit_rows(rows: list, budget: int, floor: int = 1200) -> tuple:
             for k, t in rows], share
 
 
+def _cut_mark(s, n: int) -> str:
+    """n 자를 넘으면 앞 n 자만 남기고 원문 길이를 표식으로 붙인다(조용히 자르지 않는다). n<=0 은 자르지 않는다."""
+    s = str(s)
+    if n <= 0 or len(s) <= n:
+        return s
+    return s[:n].rstrip() + f" …[{len(s):,}자 중 앞 {n:,}자]"
+
+
 def _chair_fail_text(why: str, tries: int, seat_note: str, rows: list, label: str) -> str:
     """의장이 결정문을 끝내 못 냈을 때 **결정문 자리에** 내리는 글 — 실패 사유와 좌석별 마지막 입장.
 
@@ -3175,7 +3183,10 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     # 조회 지침 — 리스크 심사 좌석에만 있다(_rr_one 이 단다). 역할은 앞 280자만 실려 계약의 '필수 도구' 줄이 이
     # 단계에 닿지 않았다. 지침이 없는 좌석은 글이 한 글자도 바뀌지 않는다.
     _hint = str(persona.get("lookup_hint") or "")
-    sysmsg = (f"당신은 '{persona['key']}' 전문가({str(persona.get('role', ''))[:280]}). "
+    # 역할 — 좁은 창은 종전대로 앞 280자(조회 턴은 스키마·결과로 이미 빠듯하다), 넓은 창은 이 턴 창의 1% 까지(1백만
+    # 토큰 창에서 약 8,400자 — 역할 문서 통째). 잘랐으면 그렇다고 적는다 — 종전엔 말없이 끊었다.
+    _role_cap = max(280, int(_free_ctx_tokens() * 0.01)) if _wide() else 280
+    sysmsg = (f"당신은 '{persona['key']}' 전문가({_cut_mark(persona.get('role', ''), _role_cap)}). "
               + (f"[이 심의의 조회 지침] {_hint} " if _hint else "")
               + f"지금은 심의 발언 전의 데이터 조회 단계다. 필요한 조회를 도구로 직접 수행하라. "
               f"규칙: 최대 {budget}회. 대상을 이름으로 찾을 땐 목록·검색 도구 먼저 — 식별자"
@@ -3255,23 +3266,39 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         interrupted = f"(조회 도중 중단: 해석 실패 {type(exc).__name__})"
         summary = interrupted
     calls = calls[:budget]
-    # 빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이
-    # 수치 근거처럼 보인다. 이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다.
-    def _has_content(b: str) -> bool:
-        return _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")
-    # ⚠ `calls` 는 **4-튜플**이다(짝 키를 싣느라 늘렸다 — 2377행). 여기서 3개로 풀면
-    # `ValueError` 가 나는데, 이 줄은 위 try 밖이라 호출부(3521행)의 blanket except 가
-    # 받아 `continue` 로 넘어간다. 그러면 **도구를 부른 좌석만** 근거 0건이 되고,
-    # 아무것도 안 부른 좌석은 멀쩡해서 화면상 "조회할 게 없었나 보다" 로 보인다.
-    good = [(n, ap, b) for n, ap, b, _cid in calls if _has_content(b)]
+    # ⚠ `calls` 는 **4-튜플**이다(짝 키를 싣느라 늘렸다). 3개로 풀면 `ValueError` 가 나는데, 이 줄은 위 try 밖이라
+    # 호출부의 blanket except 가 받아 `continue` 로 넘어간다. 그러면 **도구를 부른 좌석만** 근거 0건이 되고,
+    # 아무것도 안 부른 좌석은 멀쩡해서 화면상 "조회할 게 없었나 보다" 로 보인다(_gather_good 이 푼다).
+    good = _gather_good(calls)
     # 중단은 **따로 들고 있던 값**으로 판정한다 — `summary` 는 덮일 수 있다.
     _err = interrupted or (summary if summary.startswith("(조회 도중 중단") else "")
     if not good:
         return persona["key"], calls, "", _err
-    block = "\n".join(f"- {n}({ap}): {b[:900]}" for n, ap, b in good)[:3500]
+    block = _gather_block(good)[0]
     if summary and not summary.startswith("조회 불필요"):
-        block += f"\n(전문가 자체 요약) {summary[:400]}"
+        block += f"\n(전문가 자체 요약) {_cut_mark(summary, _lookup_budget() // 8 if _wide() else 400)}"
     return persona["key"], calls, block, _err
+
+
+def _gather_good(calls: list) -> list:
+    """자유 조회 호출 [(도구, 인자, 결과, 짝 키)] 가운데 발언 턴에 실을 것 [(도구, 인자, 결과)].
+    빈 결과([]·{}·null)는 에러는 아니지만 근거도 아니다 — 주입하면 "조회했으나 없음"이 수치 근거처럼 보인다.
+    이력(SSE)에는 남기되 발언 주입 블록에서는 뺀다."""
+    return [(n, ap, b) for n, ap, b, _cid in calls
+            if _delib_tool_result_ok(b) and b.strip() not in ("[]", "{}", "null", "")]
+
+
+def _gather_block(good: list) -> tuple[str, int]:
+    """좌석이 직접 조회한 결과 [(도구, 인자, 결과)] → (그 좌석의 발언 턴에 싣는 블록, 줄였을 때 호출당 몫 — 안 줄였으면 0).
+
+    합이 _lookup_budget()(창에서 유도 — 좁은 창 3,500자)을 넘으면 호출마다 같은 몫으로 줄이고(짧은 결과가 남긴 몫은
+    긴 결과에 돌린다) 끊은 줄에 원문 길이를 남긴다. 종전엔 호출당 900자·합 3,500자에서 표식 없이 끊었다 — 조회 턴은
+    결과를 20만 자까지 받는데 발언 턴에는 그 몇 %만 갔고(1백만 토큰 창에서도), 끊긴 줄이 완결된 결과로 읽혔다.
+    스트림이 같은 입력으로 다시 불러 줄였는지를 알린다(_free_gather_one 의 반환 모양을 바꾸지 않으려고)."""
+    heads = [f"- {n}({ap}): " for n, ap, _b in good]
+    room = _lookup_budget() - sum(len(h) + 31 for h in heads)          # 머리줄·절단 표식·줄바꿈 몫을 먼저 뗀다
+    rows, share = _fit_rows([(h, b) for h, (_n, _a, b) in zip(heads, good)], max(room, 1), floor=200)
+    return "\n".join(h + t for h, t in rows), share
 
 def _dom_of(key: str) -> str:
     """페르소나 키의 도메인 접두사 — disp-burnin → disp. 커버리지 판정의 단위다."""
@@ -4717,6 +4744,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _prior = "\n".join(reversed(_keep))
             if len(_sigs) > len(_keep):
                 _prior += f"\n(… 그 앞 {len(_sigs) - len(_keep)}건 생략 — 오래된 순)"
+            _gcut: list = []      # [(좌석, 건수, 원문 합, 건당 몫)] — 발언 턴 몫에 맞춰 줄인 좌석
             _gt = [asyncio.ensure_future(
                 _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
                                  _gctx, opts.tool_budget, _prior)) for p in personas]
@@ -4764,10 +4792,25 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     _gathered[_k] = _blk
                     if _blk:
                         seat_lookups.append(_blk)
+                        # 발언 턴 몫에 맞춰 줄였는지 — 블록을 만든 것과 같은 입력으로 다시 잰다(_gather_block).
+                        _gd = _gather_good(_calls)
+                        _gsh = _gather_block(_gd)[1]
+                        if _gsh:
+                            _gcut.append((_k, len(_gd), sum(len(b) for _n, _a, b in _gd), _gsh))
             finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
                 for _t in _gt:
                     if not _t.done():
                         _t.cancel()
+            # 자기 조회 결과를 발언 턴 몫에 맞춰 줄였으면 라운드마다 한 장으로 알린다(좌석마다 내면 원장의 자리를 먼저
+            # 채운다). 끊은 줄에는 원문 길이 표식이 있어 좌석도 안다 — 이 카드는 호출자·원장의 몫이다.
+            if _gcut:
+                _glist = " / ".join(f"{k} {n}건 {tot:,}자 → 건마다 앞 {sh:,}자" for k, n, tot, sh in _gcut)
+                yield _sse("status", {"step": f"자기 조회 결과 상한 — {len(_gcut)}석의 조회 결과를 발언 턴 몫"
+                                              f"({_lookup_budget():,}자)에 맞춰 줄여 싣는다", "tool": None})
+                yield _delib("evidence", source="자기 조회 결과 상한 초과", included=False,
+                             text=f"{_dr(rnd)}라운드 좌석이 직접 조회한 결과를 그 좌석의 발언 턴에 실을 때 좌석당 몫"
+                                  f"({_lookup_budget():,}자 — 모델 창에서 유도)에 맞춰 호출마다 같은 몫으로 줄였다 — "
+                                  f"{_glist}. 빠진 부분은 그 좌석이 발언할 때 보지 못했다.")
             # 캐시가 실제로 먹었는지 보이게 — 안 보이면 좌석이 같은 걸 몇 번 부르는지 모른다.
             if _fstats.get("hit"):
                 yield _sse("status", {"step": f"조회 캐시 — 실제 호출 {_fstats.get('miss', 0)}회 · "

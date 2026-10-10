@@ -229,3 +229,80 @@ def test_좁은_창에서는_다음_라운드_좌석이_종전대로_값마다_�
     events, later = _run_rounds(monkeypatch, 128000)
     assert all("</dom0-seat>" not in h for h in later)
     assert [c for c in _cards(events, included=False) if c["source"] == "직렬화 값 상한 초과"]
+
+
+# ── 자기 조회 결과(발언 턴에 싣는 블록)와 조회 턴의 역할 ─────────────────────────────────────
+def _gather(tokens, n, size, role="r"):
+    _win(tokens)
+    rec = _Recorder(_calls(n, size))
+    out = asyncio.run(d._free_gather_one(rec, {"key": "mech-a", "role": role}, "질문", "맥락", n))
+    return out[2], rec.seen[0][0][1]
+
+
+def test_넓은_창은_자기_조회_결과를_온전히_발언_턴에_싣는다():
+    block, _sys = _gather(_BIG, 3, 5000)
+    assert all(f"</r{i}>" in block for i in range(3)), "조회 결과의 끝이 발언 턴에 안 갔다 — 호출당 900자에서 끊었다"
+
+
+@pytest.mark.parametrize("tokens", (128000, _BIG))
+def test_넘치면_호출마다_같은_몫으로_줄이고_원문_길이를_남긴다(tokens):
+    size = 300000 if tokens == _BIG else 5000
+    block, _sys = _gather(tokens, 3, size)
+    body = block.split("\n(전문가 자체 요약)")[0]
+    assert len(body) <= d._lookup_budget(), (len(body), d._lookup_budget())
+    for i in range(3):
+        line = next(ln for ln in body.splitlines() if ln.startswith(f"- tool{i}("))
+        assert f"{size + 9:,}자 중 앞 " in line, f"끊은 줄에 원문 길이가 없다 — {line[-60:]}"
+    assert len(body) >= d._lookup_budget() * 0.9, "몫이 남는데 덜 실었다"
+
+
+def test_넓은_창의_조회_단계는_역할을_자르지_않는다():
+    _block, sysmsg = _gather(_BIG, 1, 10, role=_ROLE)
+    assert f"전문가({_ROLE}). " in sysmsg
+
+
+def test_좁은_창의_조회_단계도_역할을_잘랐으면_말한다():
+    _block, sysmsg = _gather(128000, 1, 10, role=_ROLE)
+    assert f"전문가({_ROLE[:280]} …[2,000자 중 앞 280자]). " in sysmsg, sysmsg[:400]
+
+
+def _stream_gather(monkeypatch, tokens, size):
+    import json
+    import langgraph.prebuilt
+
+    from test_delib_silent_drops import _Tool
+
+    async def _llm(_obj, system, _human):
+        if "전문가입니다" not in system:
+            return "결정문"
+        return json.dumps({"lens": "관점", "reads": [], "recommendation": "권장", "concerns": ["A", "B"],
+                           "position_short": "요약", "concede": [], "rebut": ["반박"], "deepen": "심화",
+                           "final_position": "최종", "non_negotiable": "", "vote": "진행", "stance": "동의"},
+                          ensure_ascii=False)
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda _llm, _tools, **_k: _Recorder(_calls(3, size)))
+    _win(tokens)
+    return _stream(monkeypatch, {"personas": [{"key": "mech-a", "role": "역할"}, {"key": "rel-b", "role": "역할"}],
+                                 "rounds": 2, "save_report": 0, "rebut_quote": 0, "free_tools": 1,
+                                 "persona_knowledge": 0},
+                   tools={"agent_search": _Tool("agent_search"), "get_material": _Tool("get_material")},
+                   until=lambda ev, _data: ev == "done")
+
+
+def test_자기_조회_결과를_줄였으면_라운드마다_한_장으로_알린다(monkeypatch):
+    events = _stream_gather(monkeypatch, 128000, 5000)
+    cards = [c for c in _cards(events, included=False) if c["source"] == "자기 조회 결과 상한 초과"]
+    assert len(cards) == 1, [c["source"] for c in _cards(events, included=False)]   # 수렴 라운드는 조회하지 않는다
+    assert "mech-a" in cards[0]["text"] and "rel-b" in cards[0]["text"] and "15,027자" in cards[0]["text"], cards[0]
+    assert "DELIB_" not in cards[0]["text"]
+    assert any(s.startswith("자기 조회 결과 상한") for s in _steps(events))
+
+
+def test_넓은_창에서_다_실었으면_알리지_않는다(monkeypatch):
+    events = _stream_gather(monkeypatch, _BIG, 5000)
+    assert [c for c in _cards(events, included=True) if c["source"].startswith("mech-a · tool")], "시험 전제 — 조회가 돌았다"
+    assert not [c for c in _cards(events, included=False) if c["source"] == "자기 조회 결과 상한 초과"]
