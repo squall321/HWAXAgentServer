@@ -1848,12 +1848,15 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
     if not isinstance(d, dict):
         # 파싱 재시도 소진 — 발언을 통째로 버리지 않되 **강등 사실을 표식으로 남긴다**(감사 C28:
         # 5~7천자 논증이 800자로 무표식 붕괴해 회의록·다음 라운드가 완결 발언으로 읽었다).
-        d = {"say": "(구조화 실패 — 원문 강등, 일부만 보존) " + str(txt)[:2000]}
+        # 원문은 자르지 않는다 — 종전엔 앞 2,000자만 남겨 JSON 이 한 번 깨진 좌석의 발언 전체가 2,000자로 다음 라운드·
+        # 의장·회의록·앱으로 갔다(1백만 토큰 창에서도). 다음 라운드 좌석에게 줄 때의 길이는 직렬화(_ser_clip·_seat_ctx)가,
+        # 의장 쪽은 전사 상한(_decision_ctx)이, 회의록은 그쪽 상한이 지킨다.
+        d = {"say": f"(구조화 실패 — 원문 강등, 원문 {len(str(txt)):,}자 전부 보존) " + str(txt)}
     elif required and not any(d.get(k) not in (None, "", []) for k in required):
         # ⚠ 이쪽은 any 가 맞다. 여기는 '구조화가 통째로 실패했다' 를 구제하는 자리이고,
         # all 로 올리면 부분 성공한 dict 의 say 에까지 표식이 붙어 정상 발언을 오염시킨다.
-        # 요구 키 없는 dict({"response":…} 등) — 원문을 say 로 보존해 다음 라운드에 전달
-        d = {**d, "say": "(요구 키 누락 — 원문 보존) " + str(d.get("say") or txt)[:2000]}
+        # 요구 키 없는 dict({"response":…} 등) — 원문을 say 로 보존해 다음 라운드에 전달(자르지 않는다 — 위와 같다)
+        d = {**d, "say": "(요구 키 누락 — 원문 보존) " + str(d.get("say") or txt)}
     d["persona"] = persona["key"]
     return d
 

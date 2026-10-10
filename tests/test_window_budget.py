@@ -383,3 +383,27 @@ def test_넓은_창은_의장_실패_결정문_자리도_이어하기가_받는_
     _win(128000)
     text = d._chair_fail_text("시간 초과", 2, "좌석 10석", rows, "3R 최종")
     assert len(text) <= 8000 and "<끝0>" not in text
+
+
+# ── 좌석 JSON 이 깨졌을 때 — 원문 2,000자 ─────────────────────────────────────────────────
+def _persona_say(monkeypatch, reply):
+    async def _llm(_obj, _system, _human):
+        return reply
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    return asyncio.run(d._persona_round(object(), {"key": "mech-a", "role": "기구"}, "말하라",
+                                        required=("lens",)))["say"]
+
+
+def test_구조화에_실패해도_원문을_전부_보존한다(monkeypatch):
+    """창과 무관하다 — 다음 라운드·의장에게 줄 때의 길이는 직렬화가 지킨다(좁은 창은 값당 700자)."""
+    prose = "".join(f"<{i:03d}>" + "가" * 95 for i in range(60))       # 6,000자 — 100자마다 꼬리표
+    say = _persona_say(monkeypatch, prose)
+    assert say.startswith("(구조화 실패 — 원문 강등") and say.endswith(prose), say[:80]
+    assert "6,000자" in say.split(")")[0], "강등 표식에 원문 길이가 없다"
+
+
+def test_요구_키가_빠져도_원문을_전부_보존한다(monkeypatch):
+    import json
+    say = _persona_say(monkeypatch, json.dumps({"say": "나" * 5000}, ensure_ascii=False))
+    assert say.startswith("(요구 키 누락 — 원문 보존) ") and say.endswith("나" * 5000)
