@@ -3083,12 +3083,35 @@ def _free_tool_tokens() -> int:
     return n
 
 
+# 조회 턴이 받는 '지금까지의 논의·근거(발췌)' 와 '이미 조회된 것' 목록 — 좁은 창은 종전 값(4,000자·_PRIOR_BUDGET),
+# 넓은 창은 이 턴 창의 _GATHER_SHARE 를 둘이 3:1 로 나눈다(1백만 토큰 창에서 약 99,000자 · 33,000자). 그 몫은 결과
+# 몫(_free_result_chars)에서 먼저 뗀다 — 조회 턴 전체(스키마 + 프롬프트 + 결과)가 창 안에 들게.
+# 종전엔 1백만 토큰 창에서도 1라운드 조회 턴이 base 앞 4,000자만 받아, 화두가 길면 사전 근거·사람 의견이 한 글자도
+# 안 갔고 2라운드부터는 직전 전사의 꼬리 4,000자(마지막 한두 석)만 받았다.
+_GATHER_CTX = 4000
+_GATHER_SHARE = 0.15
+
+
+def _gather_room() -> int:
+    """넓은 창에서 조회 턴의 논의 발췌·조회 서명 목록에 떼어 두는 몫(토큰) — 좁은 창은 0(종전 예비분 안)."""
+    return int(_free_ctx_tokens() * _GATHER_SHARE) if _wide() else 0
+
+
+def _gather_caps() -> tuple[int, int]:
+    """조회 턴의 (논의 발췌 상한, '이미 조회된 것' 목록 상한)(자). 명시한 DELIB_PRIOR_BUDGET 은 낮추기만 한다."""
+    room = int(_gather_room() * _EVID_KO_CPT)
+    if not room:
+        return _GATHER_CTX, _PRIOR_BUDGET
+    prior = max(_PRIOR_BUDGET, room // 4)
+    return max(_GATHER_CTX, room - room // 4), (min(_PRIOR_BUDGET, prior) if _PRIOR_BUDGET_SET else prior)
+
+
 def _free_result_chars(tool_budget: int) -> int:
     """도구 결과 **1건당** 글자 상한 — 스키마·프롬프트를 뺀 나머지를 호출 수로 나눈다.
 
     결과는 ReAct 메시지에 그대로 쌓인다. 상한이 없으면 좌석이 조회를 마치고도 요약 턴에서
     컨텍스트 초과로 죽는다(부분 결과는 살리지만, 애초에 안 죽는 게 낫다)."""
-    left = _free_ctx_tokens() - _free_tool_tokens() - _FREE_PROMPT_RESERVE
+    left = _free_ctx_tokens() - _free_tool_tokens() - _FREE_PROMPT_RESERVE - _gather_room()
     per = max(400, left // max(1, tool_budget))
     from app import TOOL_RESULT_MAX  # noqa: PLC0415 — 전역 상한을 넘지는 않는다
     return min(TOOL_RESULT_MAX, int(per * 1.2))   # 토큰 → 글자(보수적 1.2자/토큰)
@@ -3100,7 +3123,8 @@ def _free_result_chars(tool_budget: int) -> int:
 _SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
 _SHARE_BUDGET_SET = bool(os.environ.get("DELIB_SHARE_BUDGET"))
 _SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
-_PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자)
+_PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자) — 좁은 창 값(_gather_caps)
+_PRIOR_BUDGET_SET = bool(os.environ.get("DELIB_PRIOR_BUDGET"))
 # 자유 조회 근거 카드의 화면 표시 상한. 종전에는 여기만 500 을 박아 다른 근거(_EVID_SHOW
 # 4,000)와 어긋나 있었다. **좌석이 받는 양보다 작아질 수 없다** — 사람이 좌석보다 덜 보면
 # "좌석은 봤는데 사람은 못 본 수치" 가 생기고, 그게 이 폴더에서 계속 잡아 온 결함 모양이다.
@@ -3443,8 +3467,11 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
                 # 140자에서 자르면 차이가 141자 이후에 있는 두 호출이 **같은 서명**이 되어
                 # 공용 블록에서 뒤엣것이 조용히 사라진다(인자 많은 list_records·report_query).
                 # 잘릴 때만 짧은 지문을 붙여 서로 다른 호출임을 유지한다.
-                _ap = _raw if len(_raw) <= 140 else (
-                    _raw[:140] + "…#" + hashlib.sha1(_raw.encode()).hexdigest()[:6])
+                # 넓은 창은 근거 항목의 인자 상한(_EVID_ARGS_MAX)까지 그대로 싣는다 — 서명이 공용 블록·근거 카드의
+                # 인자로 남는데, 140자에서 끊으면 어떤 인자로 조회한 값인지 원문이 어디에도 안 남았다.
+                _acap = _EVID_ARGS_MAX if _wide() else 140
+                _ap = _raw if len(_raw) <= _acap else (
+                    _raw[:_acap] + "…#" + hashlib.sha1(_raw.encode()).hexdigest()[:6])
                 # ⚠ 짝은 **여기서는 맞다**(tool_call_id 로 조인했다). 잃는 것은 방출부다 —
                 # 인자는 status 로, 결과는 evidence 로 갈라져 나가 다시 못 붙었다.
                 # id 를 함께 싣고 두 이벤트에 같이 태운다(PLAN §9-9 ②).
@@ -4930,7 +4957,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
         _gathered = {}
         if g_agent is not None and kind != "converge":
-            _gctx = (prev_t[-4000:] if (rnd > 1 and prev_t) else base[:4000])
+            # 조회 턴의 논의 발췌 — 1라운드는 base 의 앞, 2라운드부터는 직전 전사의 뒤. 상한은 _gather_caps(좁은 창 종전
+            # 4,000자). 끊었으면 원문 길이를 적는다 — 종전엔 말없이 끊어 조회 좌석은 무엇이 빠졌는지 몰랐다.
+            _gcap, _pcap = _gather_caps()
+            if rnd > 1 and prev_t:
+                _gctx = (prev_t if len(prev_t) <= _gcap else
+                         f"…[{len(prev_t):,}자 중 뒤 {_gcap:,}자]\n" + prev_t[-_gcap:])
+            else:
+                _gctx = _cut_mark(base, _gcap)
             # 좌석마다 **자기 분야 도구**로 에이전트를 만든다. 전원에게 같은 목록을 주면
             # 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은 못 고르고 큰 모델도
             # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
@@ -4964,7 +4998,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _sigs = list(dict.fromkeys(f"- {t}({a})" for _r, _s, t, a, _o in gather_pool))
             _keep, _plen = [], 0
             for _ln in reversed(_sigs):
-                if _keep and _plen + len(_ln) + 1 > _PRIOR_BUDGET:
+                if _keep and _plen + len(_ln) + 1 > _pcap:
                     break
                 _keep.append(_ln)
                 _plen += len(_ln) + 1

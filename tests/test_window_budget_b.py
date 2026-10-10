@@ -415,3 +415,63 @@ def test_16K_창의_정리본이_이력을_덜었으면_결과_문구에_적는�
     _blocks, events = _report(monkeypatch, _hist(n_turns=12, size=4000), note="정리", tokens=16384, agent=_Agent())
     text = next(data["content"] for ev, data in events if ev == "result")
     assert "#58" in text and "정리본은 대화 이력" in text, text
+
+
+# ── 자유 조회 턴 — '지금까지의 논의·근거(발췌)' 와 '이미 조회된 것' 목록 ──────────────────────────────
+def _gather_run(monkeypatch, tokens, *, note="", seat=_seat_plain, pool_calls=None, rounds=2, **req):
+    """자유 조회를 켜고 끝까지 돌려, 조회 턴이 받은 (라운드, 좌석, ctx, prior) 를 적는다."""
+    import langgraph.prebuilt
+
+    seen = []
+    rnd = {"n": 0}
+
+    async def _gather(_agent, persona, _q, ctx, _budget, prior=""):
+        seen.append((persona["key"], ctx, prior))
+        calls = (pool_calls or {}).get(persona["key"], [])
+        return persona["key"], calls, "", ""
+
+    monkeypatch.setattr(d, "_free_gather_one", _gather)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda _llm, _tools, **_k: object())
+    events, _llm = _run(monkeypatch, tokens, seat=seat, free_tools=1, rounds=rounds, human_note=note,
+                        tools={"agent_search": _Tool("agent_search"), "get_material": _Tool("get_material")}, **req)
+    return seen, events
+
+
+_NOTE = _long("사람의견-끝", 6000)
+
+
+@pytest.mark.parametrize("tokens", _SMALL)
+def test_좁은_창의_조회_턴은_논의_발췌_4000자를_받는다(monkeypatch, tokens):
+    seen, _ev = _gather_run(monkeypatch, tokens, note=_NOTE)
+    ctx = seen[0][1]
+    assert ctx.startswith("[심의 주제]") and "[사람의견-끝]" not in ctx
+    assert len(ctx) <= 4100, len(ctx)
+
+
+def test_넓은_창의_조회_턴은_논의를_4000자에서_끊지_않는다(monkeypatch):
+    """1라운드 조회 턴이 base 앞 4,000자만 받아, 화두가 길면 사전 근거·사람 의견이 한 글자도 안 갔다."""
+    seen, _ev = _gather_run(monkeypatch, _BIG, note=_NOTE)
+    assert "[사람의견-끝]" in seen[0][1], len(seen[0][1])
+
+
+def test_좁은_창에서_조회_턴_발췌를_끊으면_원문_길이를_적는다(monkeypatch):
+    seen, _ev = _gather_run(monkeypatch, 128000, evidence=[{"source": "E1", "result": _NOTE}])
+    assert "자 중 앞 4,000자" in seen[0][1], seen[0][1][-200:]
+
+
+def test_넓은_창의_2라운드_조회_턴은_직전_라운드를_꼬리_4000자만_받지_않는다(monkeypatch):
+    seen, _ev = _gather_run(monkeypatch, _BIG, rounds=3,
+                            seat=lambda k: {**_seat_plain(k), "lens": _long(f"{k}-1R관점", 4000)})
+    r2 = [ctx for _k, ctx, _p in seen[len(_SEATS):]]
+    assert r2 and all("[mech-a-1R관점]" in c and "[rel-b-1R관점]" in c for c in r2), [len(c) for c in r2]
+
+
+def test_넓은_창의_이미_조회된_것_목록은_1200자에서_끊지_않는다(monkeypatch):
+    calls = {"mech-a": [("get_material", json.dumps({"id": i, "q": "가" * 60}, ensure_ascii=False),
+                         '{"v": 1}', f"c{i}") for i in range(40)]}
+    seen, _ev = _gather_run(monkeypatch, _BIG, pool_calls=calls, rounds=3)
+    prior = [p for _k, _c, p in seen if p]
+    assert prior and "생략" not in prior[-1] and '"id": 0' in prior[-1], prior[-1][-300:]
