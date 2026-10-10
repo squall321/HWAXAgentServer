@@ -5645,9 +5645,22 @@ _TIDY_PROMPT = """다음은 엔지니어링 포털에서 오간 대화 이력이
 """
 
 
+_TIDY_FLOOR = 60000
+
+
+def _tidy_budget(joined: str) -> int:
+    """'/보고서 정리' 가 LLM 에 주는 이력의 길이(자) — 챗 이력 예산(창에서 유도), 바닥 종전 60,000자."""
+    try:
+        from app import _hist_budget_chars  # noqa: PLC0415 — 순환 import 회피
+        return max(_TIDY_FLOOR, _hist_budget_chars(joined[:20000]))
+    except Exception:  # noqa: BLE001
+        return _TIDY_FLOOR
+
+
 async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
-                         user_pat: str = "") -> str:
-    """대화를 보고서 마크다운으로 재구성. 실패하면 빈 문자열(호출부가 실패로 처리한다)."""
+                         user_pat: str = "", cut: list | None = None) -> str:
+    """대화를 보고서 마크다운으로 재구성. 실패하면 빈 문자열(호출부가 실패로 처리한다).
+    이력을 가운데서 덜었으면 cut(목록)에 그 사실을 적는다 — 호출부가 사용자에게 알린다."""
     lines = []
     for m in history:
         c = str(m.get("content", "")).strip()
@@ -5656,8 +5669,13 @@ async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
             lines.append(f"[{who}] {c}")
     _joined = "\n\n".join(lines)
     # 이력은 오래된 것→최신 순 — 머리만 남기면 잘리는 쪽이 최신 = 심의 결정문이다(감사 C30).
-    body = _joined if len(_joined) <= 60000 else (
-        _joined[:15000] + f"\n\n…[이력 {len(_joined):,}자 중 중간 생략]…\n\n" + _joined[-45000:])
+    # 읽는 길이는 챗 이력 예산(app._hist_budget_chars — 창에서 유도)이고 바닥은 종전 60,000자다(dev 16K 는 종전대로).
+    # 종전엔 1백만 토큰 창에서도 60,000자라 긴 대화의 가운데가 정리본에서 빠졌다. 넘으면 앞 1/4 + 뒤 3/4 를 남긴다.
+    cap = _tidy_budget(_joined)
+    body = _joined if len(_joined) <= cap else (
+        _joined[:cap // 4] + f"\n\n…[이력 {len(_joined):,}자 중 중간 생략]…\n\n" + _joined[-(cap - cap // 4):])
+    if cut is not None and len(_joined) > cap:
+        cut.append(f"정리본은 대화 이력 {len(_joined):,}자 중 앞 {cap // 4:,}자와 뒤 {cap - cap // 4:,}자만 읽고 썼습니다")
     if note:
         body += f"\n\n[사용자가 직접 끌어낸 결론] {note}"
     try:
@@ -5722,23 +5740,31 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     title = f"심의 — {question[:50]}"
     yield _sse("status", {"step": "Report Archive 보고서 저장 중", "tool": "create_report_draft",
                           "detail": title})
-    # 회의록 — 대화 전개(누가 무엇을 말했는지) 순서대로. 발언당 400자 캡(RA 웹 가독성).
+    # 회의록 — 대화 전개(누가 무엇을 말했는지) 순서대로. 원문 보존형이라 발언을 글자 수로 자르지 않는다 — RA 항목
+    # 상한(2,000자)은 _ra_blocks 가 나눠서 지킨다. 종전엔 발언당 400자·40건, 질문 전문 1,200자, 결과는 답 6건 × 1,500자,
+    # 권고는 마지막 답의 앞 10문단이라, '원문 보존' 보고서에 심의 결정문 한 건이 400자로 들어갔다.
+    # 건수 상한(_RA_MINUTES_MAX·_RA_PARAS_MAX — RA 쪽 블록당 한도를 몰라 둔 보호값)에 걸리면 결과 문구에 적는다.
     minutes = []
     for m in history:
         who = "사용자" if m.get("role") == "user" else "어시스턴트"
         c = str(m.get("content", "")).strip()
         if c:
-            minutes.append(f"[{who}] {c[:400]}")
+            minutes.append(f"[{who}] {c}")
+    _results = bots[:-1] if len(bots) > 1 else bots
+    _rec = [p.strip() for p in bots[-1].split("\n\n") if p.strip()] if bots else []
+    _cut = [f"{what} {len(v):,}건 중 앞 {cap:,}건" for what, v, cap in
+            (("회의록", minutes, _RA_MINUTES_MAX), ("결과(이전 답)", _results, _RA_PARAS_MAX),
+             ("권고(마지막 답 문단)", _rec, _RA_PARAS_MAX)) if len(v) > cap]
     blocks = {
-        "background": [f"심의 주제: {question}"] + ([f"질문 전문:\n{users[0][:1200]}"] if users else []),
-        "results": [b[:1500] for b in bots[:-1]][:6] if len(bots) > 1 else [b[:1500] for b in bots],
-        "recommendation": ([f"사용자 결론: {note}"] if note else [])
-                          + ([p.strip() for p in bots[-1].split("\n\n") if p.strip()][:10] if bots else []),
-        "minutes": minutes[:40],
+        "background": [f"심의 주제: {question}"] + ([f"질문 전문:\n{users[0]}"] if users else []),
+        "results": _results[:_RA_PARAS_MAX],
+        "recommendation": ([f"사용자 결론: {note}"] if note else []) + _rec[:_RA_PARAS_MAX],
+        "minutes": minutes[:_RA_MINUTES_MAX],
     }
     if _tidy:
         yield _sse("status", {"step": "대화를 보고서로 재구성 중(LLM)", "tool": None})
-        _md = await _tidy_markdown(app, groups, history, note, user, user_pat)
+        _tidy_cut: list = []
+        _md = await _tidy_markdown(app, groups, history, note, user, user_pat, cut=_tidy_cut)
         if not _md:
             yield _sse("result", {"type": "text", "content":
                 "정리본 생성에 실패했습니다 — LLM 응답이 없습니다. "
@@ -5752,8 +5778,11 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
             "results": [x for x in [_sec.get("결론과 근거"), _sec.get("상세")] if x],
             "recommendation": ([f"사용자 결론: {note}"] if note else [])
                               + [x for x in [_sec.get("미결·확인 필요")] if x],
-            "minutes": minutes[:40],
+            "minutes": minutes[:_RA_MINUTES_MAX],
         }
+        _cut = [x for x in _cut if x.startswith("회의록")]
+    else:
+        _tidy_cut = []
 
     rid, fail = None, ""
     try:
@@ -5772,6 +5801,10 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
         print(f"[report-save] create_report_draft failed: {exc!r}")
     if rid:
         text = f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
+        if _cut:
+            text += f"\n\n⚠ 보고서 블록 건수 상한 — {' · '.join(_cut)}만 실었습니다(나머지는 대화에 남아 있습니다)."
+        for _t in _tidy_cut:
+            text += f"\n\n⚠ {_t}(가운데는 모델 창이 작아 뺐습니다)."
     elif fail:
         text = f"Report Archive 저장 실패 — {fail} (대화는 서버에 남아 있습니다)"
     else:

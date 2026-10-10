@@ -336,3 +336,82 @@ def test_양보_불가_조항이_목록이면_파이썬_표기가_아니라_항�
                         seat=lambda k: {**_seat_plain(k), "non_negotiable": ["R 은 0.3 이상", "두께 유지"]})
     t = [x for x in _turns(events) if x["round"] == 2][0]
     assert "['" not in t["non_negotiable"] and "R 은 0.3 이상" in t["non_negotiable"], t["non_negotiable"]
+
+
+# ── /보고서 — 원문 보존형은 원문을 남긴다, 정리본은 창이 받는 만큼 이력을 읽는다 ─────────────────────
+def _report(monkeypatch, history, note="", tokens=_BIG, agent=None):
+    _win(tokens)
+    save = _Tool("create_report_draft", '{"report_id": 58}')
+
+    async def _fake_tools(*_a, **_k):
+        return {"create_report_draft": save}
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    if agent is not None:
+        async def _agent_for(*_a, **_k):
+            return agent
+        monkeypatch.setattr(app, "_agent_for", _agent_for)
+
+    async def go():
+        return [delib_jobs._parse_sse(c) async for c in d.run_report_save(None, note, history, [], user="u@x.com")]
+
+    events = asyncio.run(go())
+    return (save.calls[0]["blocks"] if save.calls else None), events
+
+
+def _hist(n_turns=8, size=3000):
+    h = []
+    for i in range(n_turns):
+        h.append({"role": "user", "content": _long(f"질문{i}-끝", size)})
+        h.append({"role": "assistant", "content": "\n\n".join(_long(f"답{i}-{k}", 200) for k in range(12))
+                  + "\n\n" + _long(f"답{i}-끝", size)})
+    return h
+
+
+def test_원문_보존형_보고서는_발언을_400자_40건에서_끊지_않는다(monkeypatch):
+    h = _hist(n_turns=25)
+    blocks, _ev = _report(monkeypatch, h)
+    minutes = "\n".join(blocks["minutes"])
+    assert "[질문24-끝]" in minutes and "[답24-끝]" in minutes, "회의록이 발언당 400자·40건에서 끊겼다"
+    assert "[질문0-끝]" in "\n".join(blocks["background"]), "질문 전문이 1,200자에서 끊겼다"
+    results = "\n".join(blocks["results"])
+    assert "[답0-끝]" in results and "[답23-끝]" in results, "결과 칸이 답 6건 × 1,500자였다"
+    rec = "\n".join(blocks["recommendation"])
+    assert "[답24-11]" in rec and "[답24-끝]" in rec, "권고 칸이 마지막 답의 앞 10문단이었다"
+    assert all(len(x) <= d._RA_ITEM_MAX for v in blocks.values() for x in v), "RA 항목 상한은 나눠 지킨다"
+
+
+def test_원문_보존형_보고서가_건수_상한에_걸리면_결과_문구에_적는다(monkeypatch):
+    monkeypatch.setattr(d, "_RA_MINUTES_MAX", 5)
+    _blocks, events = _report(monkeypatch, _hist(n_turns=4, size=100))
+    text = next(data["content"] for ev, data in events if ev == "result")
+    assert "#58" in text and "회의록" in text and "8건 중 앞 5건" in text, text
+
+
+class _Agent:
+    def __init__(self):
+        self.seen = []
+
+    async def ainvoke(self, inp):
+        self.seen.append(inp["messages"][0][1])
+        return {"messages": [SimpleNamespace(content="# 제목\n## 요약\n요약\n## 결론과 근거\n결론")]}
+
+
+def test_16K_창의_정리본은_종전대로_이력_60000자를_읽는다(monkeypatch):
+    ag = _Agent()
+    _report(monkeypatch, _hist(n_turns=12, size=4000), note="정리", tokens=16384, agent=ag)
+    body = ag.seen[0].split("대화 이력:\n", 1)[1]
+    assert "중간 생략" in body and len(body) < 60200, len(body)
+
+
+def test_넓은_창의_정리본은_이력을_가운데서_덜지_않는다(monkeypatch):
+    ag = _Agent()
+    _blocks, events = _report(monkeypatch, _hist(n_turns=12, size=4000), note="정리", agent=ag)
+    body = ag.seen[0].split("대화 이력:\n", 1)[1]
+    assert "중간 생략" not in body and "[답5-끝]" in body, len(body)
+
+
+def test_16K_창의_정리본이_이력을_덜었으면_결과_문구에_적는다(monkeypatch):
+    _blocks, events = _report(monkeypatch, _hist(n_turns=12, size=4000), note="정리", tokens=16384, agent=_Agent())
+    text = next(data["content"] for ev, data in events if ev == "result")
+    assert "#58" in text and "정리본은 대화 이력" in text, text
