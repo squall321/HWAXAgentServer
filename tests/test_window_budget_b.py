@@ -475,3 +475,45 @@ def test_넓은_창의_이미_조회된_것_목록은_1200자에서_끊지_않�
     seen, _ev = _gather_run(monkeypatch, _BIG, pool_calls=calls, rounds=3)
     prior = [p for _k, _c, p in seen if p]
     assert prior and "생략" not in prior[-1] and '"id": 0' in prior[-1], prior[-1][-300:]
+
+
+# ── 좌석 지식카드 — 좁은 창은 종전 3,500자, 넓은 창은 창에서 유도, 뺀 수를 남긴다 ─────────────────────
+def _kn_hits(n=10, size=600):
+    return json.dumps({"hits": [{"title": f"카드{i}", "record_id": f"r{i}",
+                                 "snippet": "가" * size + f" [카드끝{i}]"} for i in range(n)]}, ensure_ascii=False)
+
+
+def _kn_run(monkeypatch, tokens):
+    events, llm = _run(monkeypatch, tokens, persona_knowledge=1,
+                       tools={"agent_search": _Tool("agent_search", _kn_hits())})
+    seat = next(h for s, h in llm.prompts if "당신은 'mech-a' 전문가" in s)
+    return events, seat
+
+
+@pytest.mark.parametrize("tokens", _SMALL)
+def test_좁은_창의_좌석_지식카드는_종전대로_3500자다(monkeypatch, tokens):
+    _events, seat = _kn_run(monkeypatch, tokens)
+    got = [i for i in range(10) if f"[카드끝{i}]" in seat]
+    assert got == [0, 1, 2, 3, 4], got
+
+
+def test_넓은_창의_좌석_지식카드는_3500자에서_끊지_않는다(monkeypatch):
+    _events, seat = _kn_run(monkeypatch, _BIG)
+    got = [i for i in range(10) if f"[카드끝{i}]" in seat]
+    assert got == list(range(10)), f"1백만 토큰 창에서도 지식카드를 {len(got)}장만 실었다"
+
+
+def test_좌석_지식카드를_예산에서_빼면_수를_남긴다(monkeypatch):
+    """받은 수·뺀 수가 어디에도 없어 '카드가 5장뿐' 과 '10장 중 5장만 실었다' 가 같았다."""
+    events, _seat = _kn_run(monkeypatch, 128000)
+    step = next(s for s in _steps(events) if s.startswith("지식카드 ") and "mech-a" in s)
+    assert "10건 중 5건" in step, step
+    cards = [c for c in _cards(events, included=False) if c["source"] == "지식카드 예산 초과"]
+    assert cards and "mech-a" in cards[0]["text"] and "DELIB_KNOWLEDGE_BUDGET" in (cards[0].get("knob") or ""), cards
+
+
+def test_지식카드_집계_프레임의_키는_그대로다(monkeypatch):
+    events, _seat = _kn_run(monkeypatch, 128000)
+    kn = [data["knowledge"] for ev, data in events if ev == "status" and "knowledge" in data]
+    assert kn and all(set(k) == {"persona", "hits", "degraded", "query"} for k in kn), kn
+    assert {k["persona"]: k["hits"] for k in kn} == {"mech-a": 5, "rel-b": 5}

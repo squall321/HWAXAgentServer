@@ -220,8 +220,8 @@ _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천�
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
 #   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.
 #   실측: 천장 160,000자(≈152,000토큰) + _SEAT_CTX 48,000자(≈45,700토큰) = 198,000토큰.
-#   1,048,576 토큰 창의 유도값은 430,356자라 이 천장에 걸리지 않는다 — 직전 라운드·조회 결과·지정 도구·이어하기
-#   요약·사람 의견의 몫(_ROOM_SHARE)을 창에서 먼저 뗀다.
+#   1,048,576 토큰 창의 유도값은 416,787자라 이 천장에 걸리지 않는다 — 직전 라운드·조회 결과·지정 도구·이어하기
+#   요약·사람 의견·지식카드의 몫(_ROOM_SHARE)을 창에서 먼저 뗀다.
 _EVID_KO_CPT = 1.05          # 한국어 최악 기준 자/토큰 — 과대평가하면 400 이 난다
 # 시스템·페르소나·**도구 스키마**·출력 몫(토큰). 좌석은 자유 조회가 기본 켜짐이라
 # (DELIB_FREE_TOOLS=1) 도구가 바인딩된다 — 스키마 예산(기본 40,000)을 안 빼면 넘친다.
@@ -234,8 +234,8 @@ _SPEAK_SLACK = min(_env_int("TOOL_SCHEMA_BUDGET", 40000), _EVID_RESERVE)
 # 종전엔 16K·128K 시절에 박은 상한(직전 라운드 48,000자, 자기 조회 3,500자, 지정 도구 5,000자, 이어하기 요약
 # 8,000자)이 1백만 토큰 창에서도 걸려 글자가 잘렸다(사용자 지침 2026-10-10 — GLM-5.2 창 1,048,576 토큰을 가정한다).
 # 직전 라운드 몫을 뺀 나머지 넷의 합에서 스키마 빈자리를 넘는 만큼은 사전 컨텍스트(_pre_budget)에서 뗀다 — 그래야
-# 몫을 전부 채워도 좌석 발언 턴이 창 안에 든다(tests/test_window_budget). 지식카드(DELIB_KNOWLEDGE_BUDGET)는 아직
-# 이 표 밖이다 — 늘리려면 여기에 몫을 더한다.
+# 몫을 전부 채워도 좌석 발언 턴이 창 안에 든다(tests/test_window_budget). 좌석 지식카드(_knowledge_budget)도 이 표의
+# 한 자리다.
 _ROOM_SHARE = {
     "seat_ctx": 0.20,   # 직전 라운드(_seat_ctx) — 바닥 _SEAT_CTX_FLOOR
     "lookup": 0.08,     # 좌석이 직접 조회한 결과(_lookup_budget) — 바닥 3,500자
@@ -243,6 +243,7 @@ _ROOM_SHARE = {
     "tool": 0.04,       # 지정 도구 결과(_tool_inject_caps) — 바닥 도구당 2,000자·합 5,000자
     "summary": 0.03,    # 이어하기 요약(_summary_max) — 바닥 8,000자
     "note": 0.01,       # 사람 의견(_human_note_max) — 바닥 HUMAN_NOTE_MAX
+    "knowledge": 0.02,  # 좌석 지식카드 발췌(_knowledge_budget) — 바닥 3,500자
 }
 _evid_cache: dict = {}
 
@@ -336,6 +337,25 @@ def _human_note_max() -> int:
     if HUMAN_NOTE_MAX <= 0 or _HUMAN_NOTE_MAX_SET:
         return max(0, HUMAN_NOTE_MAX)
     return _room("note", HUMAN_NOTE_MAX)
+
+
+_KNOWLEDGE_BUDGET_FLOOR = 3500
+
+
+def _knowledge_budget() -> int:
+    """좌석 하나에 싣는 지식카드 발췌 합의 상한(자) — 좁은 창은 종전 3,500자, 넓은 창은 창에서 유도(1백만 토큰 창
+    약 19,000자 — 전문가 설정 top_k 10건이 다 든다). 명시값(DELIB_KNOWLEDGE_BUDGET)은 좁은 창에서는 그 값이고
+    넓은 창에서는 낮추기만 한다. 종전엔 1백만 토큰 창에서도 3,500자라 10건 중 뒤 몇 건이 말없이 빠졌다.
+    환경변수는 부를 때 읽는다(종전처럼 스트림이 돌 때의 값)."""
+    raw = os.environ.get("DELIB_KNOWLEDGE_BUDGET", "")
+    try:
+        forced = int(raw) if raw.strip() else None
+    except ValueError:
+        forced = None
+    got = _room("knowledge", _KNOWLEDGE_BUDGET_FLOOR)
+    if forced is None:
+        return got
+    return min(forced, got) if _wide() else forced
 
 
 def _pre_budget() -> int:
@@ -4522,7 +4542,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (카드 전문을 통째로 넣으면 인원수 × 라운드로 곱해져 컨텍스트가 폭발한다).
     knowledge_by_key: dict = {}
     if opts.persona_knowledge and "agent_search" in tools:
-        _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
+        _kb_budget = _knowledge_budget()
 
         # 챗과 같은 포맷 — 출처·인과상태가 함께 간다. 한 줄은 이 좌석의 예산까지 받는다(종전엔 줄마다 700자에서 끊었다).
         _hit_line = lambda h: knowledge_line(h, limit=_kb_budget)   # noqa: E731
@@ -4552,16 +4572,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             async with _kn_sem:
                 hits, note = await _agent_search_hits(tools, p["key"], _q)
             if not hits:
-                return p["key"], "", note, 0, _qsrc
-            lines, total, seen = [], 0, set()
-            for h in hits:
+                return p["key"], "", note, 0, _qsrc, 0
+            lines, total, seen, dropped = [], 0, set(), 0
+            for i, h in enumerate(hits):
                 ln = _hit_line(h)
                 if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
                     continue
                 if total + len(ln) > _kb_budget:
+                    # 예산에서 뺀 수를 센다(중복은 빼고) — 종전엔 '확보' 로만 적혀 몇 건을 뺐는지 어디에도 없었다.
+                    dropped = len({_hit_line(x) for x in hits[i:]} - seen)
                     break
                 seen.add(ln); lines.append(ln); total += len(ln)
-            return p["key"], "\n".join(lines), note, len(lines), _qsrc
+            return p["key"], "\n".join(lines), note, len(lines), _qsrc, dropped
 
         # 호출자가 검색어를 줬을 때만 꼬리를 붙인다 — 안 줬으면 종전 글 그대로다.
         _kq = opts.knowledge_query
@@ -4590,6 +4612,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
         _kn_done = 0
+        _kn_cut: list = []      # [(좌석, 실은 수, 받은 수)] — 예산에서 카드를 뺀 좌석
         _kn_tasks = [asyncio.ensure_future(_kn_one(p)) for p in _kn_seats]
         # ⚠ try/finally 로 감싼다(_round_live·자유 조회와 같은 처리). 이 루프는 yield 를 하고 조회를
         # 기다린다 — 심의가 접히면(잡 취소 · 브라우저 닫힘) 거기서 끊기는데, 남은 조회는 아무도 기다리지
@@ -4597,8 +4620,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 한 번에 도는 수(_KN_CONC)가 깨진다.
         try:
             for _fut in asyncio.as_completed(_kn_tasks):
-                _k, _blk, _note, _n, _qsrc = await _fut
+                _k, _blk, _note, _n, _qsrc, _kd = await _fut
                 _kn_done += 1
+                if _kd:
+                    _kn_cut.append((_k, _n, _n + _kd))
                 if _blk:
                     knowledge_by_key[_k] = _blk
                     ev_count["knowledge"] += 1
@@ -4608,7 +4633,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     print(f"[deliberation] 지식카드 강등({_k}): {_note}")
                 yield _sse("status", {
                     "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
-                            + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
+                            + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음"))
+                            + (f"({_n + _kd}건 중 {_n}건 — 예산 {_kb_budget:,}자)" if _kd else ""),
                     "tool": None,
                     # 리스크 앱이 좌석별 적중 수를 세는 원천이다(HWAXRisk engine_client.collect_stream).
                     # 키 넷의 이름을 바꾸면 그쪽 집계가 말없이 비고, tests/test_risk_app_contract_anchors 가 잡는다.
@@ -4624,6 +4650,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     _t.cancel()
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(_kn_seats)}명 "
                                       f"관련 지식 확보", "tool": None})
+        if _kn_cut:
+            # 좌석마다 내면 원장의 자리를 먼저 채운다 — 한 장으로 모은다. 좌석에 주지 않은 카드다(included=False).
+            yield _delib("evidence", source="지식카드 예산 초과", included=False, knob="DELIB_KNOWLEDGE_BUDGET",
+                         text=f"좌석 지식카드 발췌를 좌석당 {_kb_budget:,}자(모델 창에서 유도)에 맞추느라 뒤쪽 카드를 "
+                              "뺐다 — " + " / ".join(f"{k} {tot}건 중 {n}건" for k, n, tot in _kn_cut)
+                              + ". 뺀 카드는 그 좌석이 보지 못했다(검색 순위가 낮은 쪽이다).")
         if _kn_notes:
             # 무음 강등 금지 — 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
             _kn_knob = {"knob": "KNOWLEDGE_TIMEOUT_S"} if any("초 초과" in x for x in _kn_notes) else {}

@@ -138,7 +138,7 @@ def _worst_seat_chars():
     """좌석 발언 턴 하나에 실릴 수 있는 가변부의 최악 합(자) — 근거·챗 맥락·직전 라운드·덧붙는 몫 전부."""
     return (d._evid_budget() + d._chat_ctx_budget() + d._seat_ctx() + d._lookup_budget()
             + max(d._share_budget(r) for r in range(1, 9)) + d._tool_inject_caps()[1] + d._summary_max()
-            + d._human_note_max())
+            + d._human_note_max() + d._knowledge_budget())
 
 
 def test_넓은_창은_직전_라운드_몫이_창에서_는다():
