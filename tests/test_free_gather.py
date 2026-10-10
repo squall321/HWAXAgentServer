@@ -107,3 +107,70 @@ def test_중단은_AI_머리말이_있어도_보고된다():
     # ③ 정상 완주는 사유가 비어 있어야 한다 — 아무 때나 경고하면 경고가 소음이 된다
     _k3, _c3, _b3, err3 = _run([_Msg("ai", "조회 요약: 끝")])
     assert err3 == ""
+
+
+# ── 조회 단계의 지침(lookup_hint) — 리스크 심사 좌석에게만, 역할 뒤에 한 번 ─────────────────────
+# 리스크 심사 좌석 계약의 '필수 도구' 줄은 역할 접미로 붙는데, 조회 단계는 역할의 앞 280자만 봐서 그 줄이
+# 도구를 쥔 단계에 닿지 않았다(설계 R-28). 지침이 없는 좌석은 글이 한 글자도 바뀌지 않아야 한다.
+import hashlib  # noqa: E402
+
+
+class _Recorder(_Agent):
+    """받은 프롬프트(시스템·사람 글)를 적어 두는 가짜."""
+
+    def __init__(self):
+        super().__init__([])
+        self.seen = []
+
+    async def astream(self, inp, config=None, stream_mode=None):
+        self.seen.append(inp["messages"])
+        yield {"messages": []}
+
+
+def _prompts(persona, question="질문 diff_id=3f2a"):
+    rec = _Recorder()
+    asyncio.run(d._free_gather_one(rec, persona, question, "맥락", 3))
+    (msgs,) = rec.seen
+    return msgs[0][1], msgs[1][1]
+
+
+_RISK_SEAT = {"key": "mech-housing-structure",
+              "role": "원본 역할\n" + d._RISK_SEAT_CONTRACT["_common"] + "\n" + d._RISK_SEAT_CONTRACT["mech"]}
+
+
+def test_조회_지침이_없는_좌석의_시스템_글은_종전과_한_글자도_다르지_않다():
+    """특성화 — 해시는 지침을 넣기 전 코드에서 뜬 값이다. 다른 의장 틀·합성 지정석·발굴된 좌석이 이 길이다."""
+    for persona, want in ((PERSONA, "dd52a224c163a55b5311a4d081c6fcaa17d6c8621e92241aa83caf4bfeb7f33d"),
+                          (_RISK_SEAT, "1e04c375fb1d0208112aabd102a634f8c16f4a22e3ce3af4ad7791a7d6ba7a77")):
+        sysmsg, _human = _prompts(persona)
+        assert hashlib.sha256(sysmsg.encode()).hexdigest() == want, (persona["key"], sysmsg)
+
+
+def test_조회_지침은_역할_뒤에_한_번_실린다():
+    hint = d._risk_lookup_hint("mech", "질문 diff_id=3f2a")
+    sysmsg, _human = _prompts({**_RISK_SEAT, "lookup_hint": hint})
+    assert sysmsg.count(f"[이 심의의 조회 지침] {hint} ") == 1, sysmsg
+    assert sysmsg.index("[이 심의의 조회 지침]") > sysmsg.index("전문가("), "역할보다 앞에 왔다"
+    assert sysmsg.index("[이 심의의 조회 지침]") < sysmsg.index("지금은 심의 발언 전의 데이터 조회 단계다")
+
+
+def test_조회_프롬프트에_diff_id_값이_실제로_들어_있다():
+    """안내는 '심의 주제에 diff_id= 가 있으면' 이라고 말한다 — 조회 단계가 받는 글에 그 값이 실제로 있어야 따를 수
+    있다(설계 P-06). 질문 글은 엔진의 표식 형식을 보는 것이라 손으로 적는다 — 리스크 앱이 실제로 만든 질문으로
+    보는 것은 세 리포 사슬 시험(EX1)의 몫이다."""
+    q = "[리스크 심사] 힌지 브래킷 변경 — diff_id=3f2a9c 기준 변경 18건"
+    hint = d._risk_lookup_hint("mech", q)
+    sysmsg, human = _prompts({**_RISK_SEAT, "lookup_hint": hint}, question=q)
+    assert hint.startswith(d._RISK_LOOKUP_NOTE)
+    assert "diff_id=3f2a9c" in sysmsg + human
+
+
+def test_모든_도메인의_조회_지침이_자르지_않고_실린다():
+    """조회 지침에는 글자 상한을 두지 않는다 — 엔진 상수로만 만든 글이라 길이는 계약 줄이 정하고, 잘리면 계약 줄의
+    뒤쪽('산출:')이 말없이 빠진다(사용자 지침 — 1백만 토큰 창을 가정하고 조용히 자르지 않는다)."""
+    doms = [k for k in d._RISK_SEAT_CONTRACT if k != "_common"]
+    assert len(doms) == 15
+    for dom in doms:
+        hint = d._risk_lookup_hint(dom, "질문 diff_id=3f2a")
+        sysmsg, _human = _prompts({"key": f"{dom}-seat", "role": "역할", "lookup_hint": hint})
+        assert f"[이 심의의 조회 지침] {d._RISK_LOOKUP_NOTE} {d._RISK_SEAT_CONTRACT[dom]} " in sysmsg, dom

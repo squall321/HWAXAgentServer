@@ -64,3 +64,11 @@ def test_리스크_앱이_귀속에_쓰는_근거_source_글자열이_그대로�
     assert "mech-a · 지식카드" in srcs, sorted(srcs)
     assert "rel-b · 자유 조회 실패" in srcs, sorted(srcs)
     assert "챗 정리 · 변경 비교 요약" in srcs, sorted(srcs)
+
+
+# ── 변경 비교 표식과 고정 도구 — 리스크 앱 runner.panel_question 이 질문에 `diff_id=<id>` 를 싣는다 ─────────────
+def test_변경_비교_표식과_고정_도구가_그대로다():
+    """엔진은 질문에 이 낱말이 있는지만 보고 변경 원장 도구를 앞에 세우고 조회 안내를 붙인다. 한쪽만 글자를 바꾸면
+    고정과 안내가 말없이 꺼진다 — 리스크 앱의 시험은 이 상수를 읽어 제 질문과 견준다."""
+    assert d._RISK_DIFF_MARK == "diff_id="
+    assert d._RISK_PIN_TOOLS == ("risk_get_diff",)

@@ -748,7 +748,29 @@ _RISK_KEEP_TOOLS = ("search_objects", "get_object", "get_subgraph", "search_repo
                     "predict_sed", "check_design_rules", "pcb_warpage_surrogate",
                     "get_reference_cases",
                     "get_top_issues", "query_voc", "search_voc", "get_voc_summary",
-                    "get_kg_relations", "search_scholar", "search_web")
+                    "get_kg_relations", "search_scholar", "search_web",
+                    # 변경 원장 — 러너의 apps 세 칸은 어댑터 앱이 채우므로(앱키 heax-hwax_risk 가 없다) 이 목록이
+                    # 리스크 심사 좌석 자신이 변경 전체와 스냅샷에 닿는 유일한 통로다. 등록부 둘(risk_get_registry ·
+                    # risk_claims_for_ref)은 일부러 넣지 않는다 — 같은 과제의 앞 패널 판정을 읽고 같은 말을 하면
+                    # 지지 수가 독립 근거 없이 오른다(사용자 결정 — HWAXPortal docs/risk-review-redesign D-18).
+                    "risk_get_snapshot", "risk_get_diff")
+
+# 리스크 앱이 패널 질문에 싣는 변경 비교 표식(HWAXRisk runner.panel_question — `diff_id=<id>`). 이 낱말이 질문에 있을 때만
+# 아래 고정과 안내가 붙는다. 스냅샷 타깃 · 그 도구를 못 쓰는 자격 · 옛 앱의 질문에는 없다. 글자를 바꾸려면 그 리포와 같이 바꾼다.
+_RISK_DIFF_MARK = "diff_id="
+# 좌석별 도구 추림에서 맨 앞에 서는 도구 — 예산을 더 쓰지 않고 순위만 올린다(_tools_for_seat 의 pin).
+_RISK_PIN_TOOLS = ("risk_get_diff",)
+_RISK_LOOKUP_NOTE = ("심의 주제에 diff_id= 가 있으면 risk_get_diff(diff_id, part='lines') 로 변경 전체를 본다. "
+                     "종류로 좁히려면 change_kind 를 주고 offset 은 0 부터다.")
+
+
+def _risk_lookup_hint(dom: str, question: str) -> str:
+    """리스크 심사 좌석의 조회 단계 지침 — (변경 전체 보기 안내 +) 그 도메인의 계약 줄. 계약표에 없는 도메인은 빈 문자열.
+    안내를 앞에 둔다. 자르지 않는다 — 엔진 상수로만 만든 글이라 길이가 계약 줄로 정해진다(지금 가장 긴 것이 390자)."""
+    line = _RISK_SEAT_CONTRACT.get(dom) if dom and dom != "_common" else None
+    if not line:
+        return ""
+    return ((_RISK_LOOKUP_NOTE + " ") if _RISK_DIFF_MARK in (question or "") else "") + line
 
 
 # ── 봉인 실행(sealed) ────────────────────────────────────────────────────────────
@@ -3026,13 +3048,15 @@ def _seat_tool_prefer(names, persona: dict, question: str, n: int) -> list[str]:
     return ranked[:n]
 
 
-def _tools_for_seat(g: dict, persona: dict, question: str, budget: int) -> dict:
+def _tools_for_seat(g: dict, persona: dict, question: str, budget: int, pin: tuple = ()) -> dict:
     """이 좌석이 쓸 도구 — **자기 분야를 앞에** 두고 예산 안에서 남긴다.
 
     좌석 전원에게 같은 목록을 주면 물성 전문가도 적층 전문가도 똑같은 77종을 받는다.
+    pin 은 맨 앞에 세울 도구다(후보에 있는 것만). 얹지 않는다 — 예산 계산은 같고 뒤 순위가 그만큼 밀려 나간다.
     """
     kept, used = {}, 0
-    for name in _seat_tool_rank(list(g), persona, question):
+    _pinned = [n for n in pin if n in g]
+    for name in _pinned + [n for n in _seat_tool_rank(list(g), persona, question) if n not in _pinned]:
         tool = g[name]
         c = _tool_cost(tool)
         if kept and used + c > budget:
@@ -3047,8 +3071,12 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록, 실패사유) 반환.
     발언(JSON 계약)과 분리된 이유: 도구 호출 모델은 왕복 후 스키마 계약을 곧잘 어긴다(실측) —
     조회는 여기서, 발언은 종전대로 도구 없는 텍스트 턴에서."""
+    # 조회 지침 — 리스크 심사 좌석에만 있다(_rr_one 이 단다). 역할은 앞 280자만 실려 계약의 '필수 도구' 줄이 이
+    # 단계에 닿지 않았다. 지침이 없는 좌석은 글이 한 글자도 바뀌지 않는다.
+    _hint = str(persona.get("lookup_hint") or "")
     sysmsg = (f"당신은 '{persona['key']}' 전문가({str(persona.get('role', ''))[:280]}). "
-              f"지금은 심의 발언 전의 데이터 조회 단계다. 필요한 조회를 도구로 직접 수행하라. "
+              + (f"[이 심의의 조회 지침] {_hint} " if _hint else "")
+              + f"지금은 심의 발언 전의 데이터 조회 단계다. 필요한 조회를 도구로 직접 수행하라. "
               f"규칙: 최대 {budget}회. 대상을 이름으로 찾을 땐 목록·검색 도구 먼저 — 식별자"
               f"(id·test_id)를 추측해 넣지 마라(차단된다). "
               # 물성은 기억으로 말하면 안 된다. 도구를 붙여 놔도 모델은 '아는 값'이라고 여기면
@@ -4033,6 +4061,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if _dom in _RISK_SEAT_CONTRACT:
                     p["role"] = ((p["role"] or "") + "\n" + _RISK_SEAT_CONTRACT["_common"]
                                  + "\n" + _RISK_SEAT_CONTRACT[_dom])
+                    # 조회 단계는 역할의 앞 280자만 봐서 위 계약 줄이 닿지 않는다 — 따로 싣는다(_free_gather_one).
+                    p["lookup_hint"] = _risk_lookup_hint(_dom, question)
             return p["key"]
 
         yield _sse("status", {"step": f"지정 전문가 소집 — {len(personas)}명의 역할 원문 확인(한 번에 {_rr_par}명)",
@@ -4549,8 +4579,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은 못 고르고 큰 모델도
             # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
             _seat_agents, _seat_n = {}, {}
+            # 변경 원장 도구 고정 — 리스크 심사이고 질문에 변경 비교 표식이 있을 때만. 얹지 않고 순위만 올린다.
+            _pin = _RISK_PIN_TOOLS if (opts.chair_template == "risk-review" and _RISK_DIFF_MARK in question) else ()
             for p in personas:
-                _st = _tools_for_seat(free_pool, p, question, _free_tool_tokens()) if free_pool else {}
+                _st = _tools_for_seat(free_pool, p, question, _free_tool_tokens(), pin=_pin) if free_pool else {}
                 _seat_agents[p["key"]] = create_react_agent(llm, list(_st.values())) if _st else g_agent
                 _seat_n[p["key"]] = len(_st)
             if _seat_n and rnd == 1:

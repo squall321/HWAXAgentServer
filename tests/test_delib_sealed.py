@@ -70,12 +70,16 @@ class _Tripwire(dict):
 
     def items(self):
         """자유 조회 준비가 훑는 목록. 뒤엣것은 리스크 심사 의장일 때만 열리는 도구다(_RISK_KEEP_TOOLS —
-        읽기 접두사에 안 걸려 그 조건이 유일한 통로다)."""
-        return [(n, self.get(n)) for n in ("list_materials", "pcb_warpage_surrogate")]
+        읽기 접두사에 안 걸려 그 조건이 유일한 통로다). risk_get_diff 는 변경 원장 도구다(앱키가 러너의 apps 밖)."""
+        return [(n, self.get(n)) for n in ("list_materials", "pcb_warpage_surrogate", "risk_get_diff")]
 
 
-def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, **start_kw):
+def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, question="힌지 크랙 원인",
+         seat_tools=None, **start_kw):
     """**실제 MCP 도구 함수**(deliberate_start)로 열어 **실제 엔진**을 끝까지 돌린다.
+
+    question 은 화두, seat_tools 는 좌석별 도구 추림(_tools_for_seat) 자리에 끼울 대역이다(기본은 빈 사전 —
+    좌석은 공용 후보로 돈다).
 
     반환: SimpleNamespace(job=잡 원장, tools=부른 도구 이름들, chair=의장이 받은 프롬프트,
                           free=자유 조회를 돈 좌석들, bound=자유 조회에 묶인 도구 이름들,
@@ -105,7 +109,7 @@ def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, *
     monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
     monkeypatch.setattr(d, "_llm_text", _fake_llm)
     monkeypatch.setattr(d, "_free_gather_one", _fake_gather)
-    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(d, "_tools_for_seat", seat_tools or (lambda *_a, **_k: {}))
     monkeypatch.setattr(d, "_app_of_tools", lambda: {})            # 게이트웨이 /tools-map 을 타지 않게
     monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent",
@@ -117,7 +121,7 @@ def _run(monkeypatch, tmp_path, *, job=SEALED, personas=_SEATS, advanced=None, *
     monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)))
 
     async def go():
-        out = await m.deliberate_start("힌지 크랙 원인", job=job, rounds=2, personas=personas,
+        out = await m.deliberate_start(question, job=job, rounds=2, personas=personas,
                                        advanced=advanced, **start_kw)
         await delib_jobs._TASKS[out["job_id"]]
         return delib_jobs._JOBS[out["job_id"]]
@@ -219,6 +223,7 @@ def test_봉인하지_않은_리스크_심사는_바깥_자료를_가져온다(m
         assert name in r.tools, f"{path} 경로가 하네스에서 안 돈다 — {name} 을 부르지 않았다"
     assert "mech-a" in r.free and "list_materials" in r.bound, "자유 조회 경로가 하네스에서 안 돈다"
     assert "pcb_warpage_surrogate" in r.bound, "리스크 심사가 더 여는 조회 도구 경로가 하네스에서 안 돈다"
+    assert "risk_get_diff" in r.bound, "리스크 심사 좌석이 변경 원장 도구를 받지 못한다"
     assert delib_jobs.summary(r.job)["sealed"] is False
     assert "봉인" not in (r.job["decision"] or "") and "봉인" not in r.chair
     assert not any(s.startswith("봉인") for s in r.steps)
@@ -523,3 +528,20 @@ def test_이어하기_설명이_무엇을_이어받는지와_봉인은_못_푼�
     for want in ("이어받는다", "advanced", "풀 수 없다"):
         assert want in tool.description, want
     assert "advanced" in tool.inputSchema["properties"], "설명은 advanced 로 바꾸라는데 인자가 없다"
+
+
+# ── 변경 원장 도구 고정 — 리스크 심사이고 화두에 변경 비교 표식(diff_id=)이 있을 때만 ──────────────────────
+@pytest.mark.parametrize("job,question,want", [
+    ("risk-review", "힌지 크랙 원인 — diff_id=3f2a 기준 변경 18건", ("risk_get_diff",)),
+    ("risk-review", "힌지 크랙 원인", ()),                                   # 스냅샷 타깃 · 옛 앱의 질문
+    ("diagnosis", "힌지 크랙 원인 — diff_id=3f2a 기준 변경 18건", ()),         # 다른 Job
+], ids=["risk-review·mark", "risk-review·no-mark", "diagnosis·mark"])
+def test_변경_원장_도구는_조건이_맞을_때만_고정한다(monkeypatch, tmp_path, job, question, want):
+    pins = []
+
+    def _seat_tools(*_a, pin=(), **_k):
+        pins.append(tuple(pin))
+        return {}
+
+    _run(monkeypatch, tmp_path, job=job, question=question, seat_tools=_seat_tools)
+    assert pins and set(pins) == {want}, pins

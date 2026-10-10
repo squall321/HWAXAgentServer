@@ -443,16 +443,18 @@ def test_읽기_도구는_앱_조건부이고_쓰기_도구가_없다():
         assert n not in write and not n.startswith("upload_"), n
 
 
-def test_유지_도구는_15종이고_계약표_rel_std_행과_맞는다():
-    """계획 §6.5.2 keep 15종 — RA·laminate·열충격 8 + rel 필드 이력·std 문헌 7.
-    이 7종이 빠지면 계약표 rel·std 행이 시키는 조회가 앱 제한에서 사라진다."""
+def test_유지_도구는_17종이고_계약표_rel_std_행과_변경_원장_도구를_담는다():
+    """계획 §6.5.2 keep 15종 — RA·laminate·열충격 8 + rel 필드 이력·std 문헌 7 — 에 변경 원장 2종(M1 E3).
+    rel·std 7종이 빠지면 계약표 rel·std 행이 시키는 조회가 앱 제한에서 사라진다. 변경 원장 2종은 러너의 apps 가
+    어댑터 앱으로 차서 이 목록이 좌석이 변경 전체에 닿는 유일한 통로다."""
     assert set(d._RISK_KEEP_TOOLS) == {
         "search_objects", "get_object", "get_subgraph", "search_reports", "predict_sed",
         "check_design_rules", "pcb_warpage_surrogate", "get_reference_cases",
         "get_top_issues", "query_voc", "search_voc", "get_voc_summary",
         "get_kg_relations", "search_scholar", "search_web",
+        "risk_get_snapshot", "risk_get_diff",
     }
-    assert len(d._RISK_KEEP_TOOLS) == len(set(d._RISK_KEEP_TOOLS)) == 15
+    assert len(d._RISK_KEEP_TOOLS) == len(set(d._RISK_KEEP_TOOLS)) == 17
     for n in ("get_top_issues", "query_voc"):
         assert n in d._RISK_SEAT_CONTRACT["rel"], n
     for n in ("search_scholar", "search_web"):
@@ -501,6 +503,47 @@ def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():
         assert _eval_gate(gate, n, chair="risk-review", apps=apps, amap=amap), n
 
 
+# 러너가 실제로 보내는 apps — 어댑터 앱 둘(HWAXRisk runner._delib_apps · adapters/registry.ADAPTERS). 리스크 앱
+# 자신(heax-hwax_risk)은 없다. 그래서 _RISK_READ_TOOLS["heax-hwax_risk"] 의 앱 조건 통로로는 열리지 않는다.
+_RUNNER_APPS = ("heax-step_forge", "heax-kooremapper_mcp")
+_RISK_AMAP = {"risk_get_diff": "heax-hwax_risk", "risk_get_snapshot": "heax-hwax_risk",
+              "risk_get_registry": "heax-hwax_risk", "risk_claims_for_ref": "heax-hwax_risk"}
+
+
+def test_리스크_심사_좌석은_변경_원장_도구를_받는다():
+    """소스의 _g 조건식과 _narrow 조건식을 실제로 돌린다 — 러너가 보내는 apps 로 리스크 심사에서만 열린다."""
+    g_gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
+    narrow = _dictcomp_cond("_MATERIAL_TOOLS", "_FREE_DENY")
+    for n in ("risk_get_diff", "risk_get_snapshot"):
+        assert not d._free_tool_ok(n), f"{n} 이 접두사 화이트리스트에 걸린다 — 시험 전제가 바뀌었다"
+        for gate in (g_gate, narrow):
+            assert _eval_gate(gate, n, chair="risk-review", apps=_RUNNER_APPS, amap=_RISK_AMAP), n
+            assert not _eval_gate(gate, n, chair="diagnosis", apps=_RUNNER_APPS, amap=_RISK_AMAP), n
+
+
+def test_등록부_도구는_리스크_심사_좌석에게_열리지_않는다():
+    """사용자 결정(D-18) — 같은 과제의 앞 패널 판정을 읽고 같은 말을 하면 지지 수가 독립 근거 없이 오른다.
+    등록부도 열기로 하면 _RISK_KEEP_TOOLS 에 둘을 더하고 이 단언을 뒤집는다."""
+    g_gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
+    narrow = _dictcomp_cond("_MATERIAL_TOOLS", "_FREE_DENY")
+    for n in ("risk_get_registry", "risk_claims_for_ref"):
+        assert n not in d._RISK_KEEP_TOOLS, n
+        for gate in (g_gate, narrow):
+            assert not _eval_gate(gate, n, chair="risk-review", apps=_RUNNER_APPS, amap=_RISK_AMAP), n
+
+
+def test_조회_지침은_표식이_있을_때만_변경_안내로_시작한다():
+    with_mark = d._risk_lookup_hint("mech", "힌지 크랙 원인 — diff_id=3f2a 기준")
+    assert with_mark.startswith(d._RISK_LOOKUP_NOTE) and with_mark.endswith(d._RISK_SEAT_CONTRACT["mech"])
+    assert d._risk_lookup_hint("mech", "힌지 크랙 원인") == d._RISK_SEAT_CONTRACT["mech"]
+    assert d._risk_lookup_hint("mech", None) == d._RISK_SEAT_CONTRACT["mech"]
+    for dom in ("delib", "_common", ""):
+        assert d._risk_lookup_hint(dom, "diff_id=3f2a") == "", dom
+    # 안내는 좌석이 볼 수 없는 자리(브리프)를 가리키지 않고, 건너뛰기 수가 0 부터라고 말한다(설계 P-06).
+    assert "브리프" not in d._RISK_LOOKUP_NOTE and "offset 은 0 부터" in d._RISK_LOOKUP_NOTE
+    assert "part='lines'" in d._RISK_LOOKUP_NOTE
+
+
 def _contract_suffix_stmt():
     """계약 접미 if 문을 소스에서 뽑는다 — _restore_role 복원 **뒤**에 있어야 유실되지 않는다."""
     for node in _ast.walk(_SRC):
@@ -517,10 +560,14 @@ def test_좌석_계약_접미가_복원된_역할_뒤에_붙는다():
     _ast.fix_missing_locations(mod)
     code = compile(mod, "<suffix>", "exec")
 
+    seats = []
+
     def run(chair, key, role):
         p = {"key": key, "role": role}
+        seats.append(p)
         ns = {"opts": _types.SimpleNamespace(chair_template=chair), "p": p,
-              "_dom_of": d._dom_of, "_RISK_SEAT_CONTRACT": d._RISK_SEAT_CONTRACT}
+              "_dom_of": d._dom_of, "_RISK_SEAT_CONTRACT": d._RISK_SEAT_CONTRACT,
+              "_risk_lookup_hint": d._risk_lookup_hint, "question": ""}
         exec(code, ns)  # noqa: S102 — 소스에서 뽑은 우리 코드다
         return p["role"]
 
@@ -528,10 +575,13 @@ def test_좌석_계약_접미가_복원된_역할_뒤에_붙는다():
     assert out.startswith("원본 역할\n")                      # 원본이 앞, 계약은 뒤
     assert d._RISK_SEAT_CONTRACT["_common"] in out
     assert d._RISK_SEAT_CONTRACT["mech"] in out
+    assert seats[-1]["lookup_hint"] == d._RISK_SEAT_CONTRACT["mech"]   # 조회 단계 지침(표식 없는 질문)
     # 다른 심의는 1바이트도 안 바뀐다.
     assert run("diagnosis", "mech-housing-structure", "원본 역할") == "원본 역할"
+    assert "lookup_hint" not in seats[-1]
     # 합성 지정석·계약표 밖 도메인은 미부착.
     assert run("risk-review", "delib-baseline-defender", "지정석 역할") == "지정석 역할"
+    assert "lookup_hint" not in seats[-1]
 
 
 def test_계약_접미는_역할_복원_다음에_온다():
