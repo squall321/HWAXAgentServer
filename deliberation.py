@@ -326,6 +326,12 @@ def _transcript_clip() -> int:
     return 0 if _wide() else _TRANSCRIPT_CLIP
 
 
+def _narrow_cap(n: int) -> int:
+    """좁은 창에서만 거는 글자 상한 — 넓은 창(1백만 토큰)은 0(자르지 않는다). 작은 보조 프롬프트(좌석 축 명명·VOC
+    환기·근거 선주입)의 고정 상한이 16K·128K 시절 값이라, 넓은 창에서는 _cut_mark(s, _narrow_cap(n)) 로 푼다."""
+    return 0 if _wide() else n
+
+
 def _clip_to(s: str, n: int) -> str:
     """n 자에서 끊는다(0=무절단) — 표식은 호출부가 따로 싣는다(say_full_chars 처럼)."""
     return s[:n] if n > 0 else s
@@ -3625,7 +3631,8 @@ async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: i
         raw = await _llm_text(
             llm,
             "당신은 심의체 좌석 구성을 검토하는 조정자입니다. 짧고 건조하게 답하세요.",
-            f"[질문]\n{question[:1500]}\n\n[이미 착석한 전문가]\n{', '.join(sorted(seated_keys))}\n\n"
+            # 화두 — 좁은 창은 종전 앞 1,500자(표식), 넓은 창은 전부. 리스크 심사 화두는 브리프 전체라 1,500자를 넘는다.
+            f"[질문]\n{_cut_mark(question, _narrow_cap(1500))}\n\n[이미 착석한 전문가]\n{', '.join(sorted(seated_keys))}\n\n"
             "이 전문가들의 담당 범위로는 보이지 않는 원인 축을 3개 제시하라. "
             "각 축을 전문가 검색에 쓸 짧은 명사구 한 줄로만 쓰고(8단어 이내), 설명·번호·기호 없이 "
             "줄바꿈으로 구분하라. 이미 착석한 분야를 다시 쓰지 마라.")
@@ -3670,6 +3677,9 @@ def _cont_block(summary: str, non_negotiables: list, human_note: str) -> str:
 # 이것이 '날조 인용 0%'의 구조적 근거다. 다만 **잘못된 문장을 고르는 것은 막지 못한다** —
 # 번호가 실재한다는 것과 그 문장이 그 주장을 뒷받침한다는 것은 다른 문제다.
 _WEB_CITE = re.compile(r"\[W:(d_[0-9a-f]{12})#(\d+)\]")
+# 결정문 하나에서 원장과 대조하는 인용 수(get_quote 를 인용마다 한 번씩 부른다 — 호출 수 상한). 넘친 인용은 대조하지
+# 않으며, 그 수를 결정문에 적는다(_deliberation_stream). 종전엔 41번째부터 대조도 안 하고 어디에도 안 남았다.
+_WEB_CITE_MAX = 40
 
 
 async def _verify_web_citations(app, groups: list, text: str,
@@ -3686,7 +3696,7 @@ async def _verify_web_citations(app, groups: list, text: str,
     cites = _WEB_CITE.findall(text or "")
     if not cites:
         return 0, 0, [], []
-    tags = [f"[W:{doc_id}#{idx}]" for doc_id, idx in cites[:40]]
+    tags = [f"[W:{doc_id}#{idx}]" for doc_id, idx in cites[:_WEB_CITE_MAX]]
     try:
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
     except Exception:  # noqa: BLE001 — 도구를 못 받았다. 하나도 대조하지 못한 것이다
@@ -3694,7 +3704,7 @@ async def _verify_web_citations(app, groups: list, text: str,
     if "get_quote" not in tools:
         return 0, 0, [], []
     ok_n, bad, unknown = 0, [], []
-    for (doc_id, idx), tag in zip(cites[:40], tags):
+    for (doc_id, idx), tag in zip(cites[:_WEB_CITE_MAX], tags):
         try:
             raw = await _call(tools, "get_quote", {"doc_id": doc_id, "index": int(idx)})
         except Exception:  # noqa: BLE001
@@ -3767,7 +3777,7 @@ async def _defect_briefing(tools: dict, llm, question: str, history=None):
     alerts = _first_dict(_parse_json(raw_alert))
     summary = alerts.get("summary")
     if summary and _tool_text_ok(str(summary)):
-        parts.append(f"경보 요약: {str(summary)[:300]}")
+        parts.append(f"경보 요약: {_cut_mark(summary, _narrow_cap(300))}")
     products = _sf_products(alerts)[:2]
 
     if products:  # 경보 제품별 이슈 카테고리
@@ -3788,7 +3798,7 @@ async def _defect_briefing(tools: dict, llm, question: str, history=None):
         used.append("daily_briefing")
         brief = await _call(tools, "daily_briefing", {})
         if isinstance(brief, str) and _tool_text_ok(brief):
-            parts.append(f"데일리 브리핑: {brief.strip()[:400]}")
+            parts.append(f"데일리 브리핑: {_cut_mark(brief.strip(), _narrow_cap(400))}")
         elif isinstance(brief, str):
             degraded = True
 
@@ -3806,7 +3816,8 @@ async def _defect_briefing(tools: dict, llm, question: str, history=None):
         voc_items = voc_items[0].get("results") or voc_items[0].get("data")   # 래핑 응답 형태도 받는다
     for i, v in enumerate(voc_items[:5], 1):
         v = _first_dict(v)
-        txt = (v.get("content_translated") or v.get("content") or "")[:200]
+        # VOC 본문 — 좁은 창은 종전 앞 200자(원문 길이 표식), 넓은 창은 전부(고객 글은 짧다).
+        txt = _cut_mark(v.get("content_translated") or v.get("content") or "", _narrow_cap(200))
         if txt and _tool_text_ok(txt):
             parts.append(f"부정 VOC {i}. ({v.get('product') or v.get('product_code') or '-'}"
                          f"/{v.get('sentiment_score', '-')}) {txt}")
@@ -3824,7 +3835,7 @@ async def _defect_briefing(tools: dict, llm, question: str, history=None):
     for _m in (history or [])[-12:]:
         if isinstance(_m, dict) and str(_m.get("content") or "").strip():
             _who = "사용자" if _m.get("role") == "user" else "어시스턴트"
-            _hist_txt += f"{_who}: {str(_m['content'])[:600]}\n"
+            _hist_txt += f"{_who}: {_cut_mark(_m['content'], _narrow_cap(600))}\n"
     verdict = _parse_json(await _llm_text(
         llm,
         "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
@@ -3869,7 +3880,7 @@ async def _evidence_prepass(tools: dict, llm, question: str):
             out = json.dumps(out, ensure_ascii=False) if out else ""
         if out and _tool_text_ok(out):
             used.append(name)
-            chunks.append(f"### {name}\n{out[:2500]}")
+            chunks.append(f"### {name}\n{_cut_mark(out, _narrow_cap(2500))}")
         if len(chunks) >= 3:
             break
     if not chunks:
@@ -3877,13 +3888,13 @@ async def _evidence_prepass(tools: dict, llm, question: str):
     distilled = str(await _llm_text(
         llm,
         "당신은 심의 준비 보조자입니다. 주어진 검색 결과에서만 발췌하고, 결과에 없는 수치를 만들지 마세요.",
-        f"[심의 주제]\n{question}\n\n[도구 검색 결과]\n" + "\n\n".join(chunks)[:8000] + "\n\n"
+        f"[심의 주제]\n{question}\n\n[도구 검색 결과]\n" + _cut_mark("\n\n".join(chunks), _narrow_cap(8000)) + "\n\n"
         "주제와 직접 관련된 정량 수치·표준·사례만 불릿으로 추리세요. 각 불릿 끝에 (출처: 도구명) 표기. "
         "직접 관련된 정보가 없으면 '관련 근거 없음' 한 줄만 출력하세요.")).strip()
     if not distilled or "관련 근거 없음" in distilled[:40]:
         return "", "", used
     inject = (f"[정량 근거 (도구 조회 — 발언에 인용할 것. 여기 없는 수치는 지어내지 말고 "
-              f"(경험칙) 표기)]\n{distilled[:3000]}\n")
+              f"(경험칙) 표기)]\n{_cut_mark(distilled, _narrow_cap(3000))}\n")
     return distilled, inject, used
 
 
@@ -5523,6 +5534,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if opts.search_sources and not _chair_failed:
         _ok_n, _bad_n, _bad, _unk = await _verify_web_citations(app, groups, decision,
                                                                 user, user_pat)
+        _n_cite = len(_WEB_CITE.findall(decision))
+        if _n_cite > _WEB_CITE_MAX:
+            yield _sse("status", {"step": f"웹 인용 대조 상한 — {_n_cite}건 중 앞 {_WEB_CITE_MAX}건만 대조한다",
+                                  "tool": None})
+            decision += (f"\n\n> ⚠ 웹 인용 {_n_cite}건 중 앞 {_WEB_CITE_MAX}건만 원장과 대조했습니다 — 나머지 "
+                         f"{_n_cite - _WEB_CITE_MAX}건은 **대조하지 않았습니다**(확인된 것도 날조로 판정된 것도 아닙니다).")
         if _ok_n or _bad_n or _unk:
             yield _sse("status", {"step": f"웹 인용 대조 — 실재 {_ok_n}건 / 날조 {_bad_n}건"
                                           + (f" / 확인 못 함 {len(_unk)}건(원장 조회 실패)" if _unk else ""),

@@ -517,3 +517,62 @@ def test_지식카드_집계_프레임의_키는_그대로다(monkeypatch):
     kn = [data["knowledge"] for ev, data in events if ev == "status" and "knowledge" in data]
     assert kn and all(set(k) == {"persona", "hits", "degraded", "query"} for k in kn), kn
     assert {k["persona"]: k["hits"] for k in kn} == {"mech-a": 5, "rel-b": 5}
+
+
+# ── 좌석 편성·VOC 환기 프롬프트 — 넓은 창은 화두·VOC 를 끊지 않는다 ─────────────────────────────────
+def _record_llm(monkeypatch, answer):
+    seen = []
+
+    async def _llm(_obj, system, human):
+        seen.append(human)
+        return answer
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    return seen
+
+
+_Q = _long("화두-끝", 6000)
+
+
+def test_16K_창의_반대석_축_명명은_화두_앞_1500자를_받는다(monkeypatch):
+    _win(16384)
+    seen = _record_llm(monkeypatch, "")
+    asyncio.run(d._counter_seats({}, object(), _Q, [{"key": "mech-a"}], 2))
+    assert _Q[:1500] in seen[0] and _Q[:1501] not in seen[0]
+
+
+def test_넓은_창의_반대석_축_명명은_화두_전부를_받는다(monkeypatch):
+    """리스크 심사 화두는 브리프 전체라 1,500자를 훌쩍 넘는다 — 변경 목록을 못 본 채 빈 축을 골랐다."""
+    _win(_BIG)
+    seen = _record_llm(monkeypatch, "")
+    asyncio.run(d._counter_seats({}, object(), _Q, [{"key": "mech-a"}], 2))
+    assert "[화두-끝]" in seen[0]
+
+
+def _voc_tools(text):
+    return {"alert_check": _Tool("alert_check", json.dumps({"summary": "경보", "products": []})),
+            "daily_briefing": _Tool("daily_briefing", "브리핑"),
+            "query_voc": _Tool("query_voc", json.dumps({"content": text, "product": "S26"}, ensure_ascii=False))}
+
+
+@pytest.mark.parametrize("tokens", (16384, _BIG))
+def test_VOC_환기는_좁은_창에서만_본문을_끊고_끊으면_원문_길이를_적는다(monkeypatch, tokens):
+    _win(tokens)
+    voc = "배터리가 부풀어 " + "가" * 800 + " [VOC-끝]"
+    _record_llm(monkeypatch, '{"relevant": true, "reason": "연관"}')
+    _disp, inject, _used = asyncio.run(d._defect_briefing(_voc_tools(voc), object(), "스웰링", []))
+    if tokens == _BIG:
+        assert "[VOC-끝]" in inject, inject
+    else:
+        assert "[VOC-끝]" not in inject and f"{len(voc):,}자 중 앞 200자" in inject, inject
+
+
+def test_웹_인용이_대조_상한을_넘으면_대조하지_않은_수를_적는다(monkeypatch):
+    many = [f"[W:d_{i:012x}#1]" for i in range(45)]
+
+    async def _verify(_app, _g, text, *_a, **_k):
+        return 40, 0, [], []
+
+    monkeypatch.setattr(d, "_verify_web_citations", _verify)
+    events, _llm = _run(monkeypatch, _BIG, chair="결정: " + " ".join(many), search_sources=["web"])
+    final = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
+    assert "45건 중 앞 40건" in final, final[-400:]
