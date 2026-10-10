@@ -1029,6 +1029,16 @@ def _risk_hide_prior_panels(tool, question: str):
     return tool
 
 
+def _risk_not_visible(out) -> bool:
+    """리스크 앱 읽기 도구가 범위 밖이라 막았나 — `{"error": "not_visible", …}`(HWAXRisk mcp_server._guarded). isError 가
+    아니라 게이트웨이 감사에도 성공으로 남는다(risk-entry SEC-3)."""
+    try:
+        v = json.loads(out)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(v, dict) and v.get("error") == "not_visible"
+
+
 # ── 봉인 실행(sealed) ────────────────────────────────────────────────────────────
 # 소급 검증용이다 — '사람이 찾기 전에, 그때 있던 자료만으로 심사가 찾았겠는가' 를 보려면 호출자가
 # 준 것 밖의 정보가 심의 도중 들어올 길이 전부 닫혀 있어야 한다. 손잡이를 하나씩 끄게 두면 하나를
@@ -5023,6 +5033,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     gather_pool: list = []    # [(라운드, 좌석, 도구, 인자, 결과)] — 라운드를 넘어 누적되는 **공용** 조회 결과
     gather_lens: dict = {}    # {(라운드, 좌석, 도구, 인자): 원문 길이} — 풀은 쓸 만큼만 담으므로 표식용 길이를 따로 든다
     seat_lookups: list = []   # 좌석이 받은 자기 조회 블록 — 라운드마다 비워지므로 따로 모은다(결정문 수치 대조의 출처)
+    _nv_told = False          # 리스크 앱 읽기 도구의 not_visible 을 알렸나 — 심의에 한 번(라운드마다 같은 말을 되풀이하지 않는다)
 
     for rnd in range(1, N + 1):
         kind = _kind(rnd)
@@ -5194,6 +5205,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if len(_sigs) > len(_keep):
                 _prior += f"\n(… 그 앞 {len(_sigs) - len(_keep)}건 생략 — 오래된 순)"
             _gcut: list = []      # [(좌석, 건수, 원문 합, 건당 몫)] — 발언 턴 몫에 맞춰 줄인 좌석
+            _nv_round: list = []  # ['좌석·도구'] — 리스크 심사 좌석이 리스크 앱 읽기 도구에서 not_visible 을 받은 것
             _gt = [asyncio.ensure_future(
                 _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
                                  _gctx, opts.tool_budget, _prior)) for p in personas]
@@ -5240,6 +5252,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             gather_pool.append((rnd, _k, _tn, _ap, _out[:max(_SHARE_ITEM_MAX * 2,
                                                                              _room("share", 0) if _wide() else 0)]))
                             gather_lens[(rnd, _k, _tn, _ap)] = len(_out)
+                        if (opts.chair_template == "risk-review" and _tn in _RISK_READ_TOOLS["heax-hwax_risk"]
+                                and _risk_not_visible(_out) and f"{_k}·{_tn}" not in _nv_round):
+                            _nv_round.append(f"{_k}·{_tn}")
                     _gathered[_k] = _blk
                     if _blk:
                         seat_lookups.append(_blk)
@@ -5252,6 +5267,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 for _t in _gt:
                     if not _t.done():
                         _t.cancel()
+            # 리스크 앱이 좌석의 읽기를 not_visible 로 막았으면 알린다(risk-entry SEC-3). 그 응답은 isError 가 아닌 정상 JSON
+            # 이라 게이트웨이 감사에는 성공으로 남고, 엔진은 좌석마다 ok:false 상태줄 한 줄뿐이라 질문의 diff_id 로 앞세운
+            # 변경 전체 보기가 버려진 채 패널이 done 으로 끝났다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
+            # 러너가 패널에 옮겨 적는다. 같은 까닭이 라운드마다 되풀이되므로 심의에 한 번만 낸다.
+            if _nv_round and not _nv_told:
+                _nv_told = True
+                _nv_txt = ", ".join(_nv_round)
+                yield _sse("warning", {"code": "risk_read_not_visible",
+                                       "message": f"리스크 앱이 좌석의 변경 원장 조회를 볼 수 없는 id(not_visible)로 막았습니다 — "
+                                                  f"{_nv_txt}. 그 좌석은 변경 비교·스냅샷을 보지 못하고 발언합니다."})
+                yield _delib("evidence", source="변경 원장 조회 거절", included=False,
+                             text=f"{_dr(rnd)}라운드 좌석의 리스크 앱 읽기 도구 호출이 not_visible 로 막혔다 — {_nv_txt}. 그 "
+                                  "좌석은 질문에 실린 변경 비교·스냅샷을 보지 못하고 발언했다. 좌석은 잡 자격의 사람으로 이 앱을 "
+                                  "부른다 — 게이트웨이가 위임 헤더를 싣지 않는 판이면 그 신원이 게이트웨이 서비스 토큰의 주인(heax 첫 "
+                                  "관리자)으로 접히고, 잡 자격의 사람이 이 과제의 소유자·구성원이 아니어도 막힌다.")
             # 자기 조회 결과를 발언 턴 몫에 맞춰 줄였으면 라운드마다 한 장으로 알린다(좌석마다 내면 원장의 자리를 먼저
             # 채운다). 끊은 줄에는 원문 길이 표식이 있어 좌석도 안다 — 이 카드는 호출자·원장의 몫이다.
             if _gcut:
