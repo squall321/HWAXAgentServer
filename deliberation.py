@@ -917,6 +917,8 @@ _RISK_SEAT_CONTRACT = {
 
 # 리스크 심사 읽기 도구 — _FREE_ALLOW 접두사에 걸리지 않는 읽기 전용 도구를 소스 앱별로 명시한다.
 # 앱 조건부(의장 무관)라, apps 로 그 앱을 고른 다른 심의도 같은 읽기 도구를 얻는다. 쓰기 도구는 없다.
+# 등록부 둘(_RISK_REGISTRY_TOOLS)은 어느 앱 칸에도 넣지 않는다 — 종전엔 리스크 앱 칸에 있어, apps 로 리스크 앱을 직접
+# 고른 리스크 심사(MCP deliberate_start)의 좌석이 앞 패널 판정을 읽었다(D-18 위반 — engine-contract A-D18-apps).
 _RISK_READ_TOOLS = {
     "heax-step_forge": ("project_tree", "interface_graph", "inspect_report", "mass_estimate",
                         "mesh_report", "part_mesh_map"),
@@ -926,9 +928,13 @@ _RISK_READ_TOOLS = {
                              "report_corpus", "section_contact_usage", "operation_usage",
                              "corpus_summary"),
     # 앱키는 게이트웨이 registry 발견값(heax-<매니페스트 id>)이다.
-    "heax-hwax_risk": ("risk_get_snapshot", "risk_get_diff", "risk_get_registry",
-                       "risk_claims_for_ref"),
+    "heax-hwax_risk": ("risk_get_snapshot", "risk_get_diff"),
 }
+
+# 등록부 도구 — 같은 과제의 앞 패널 판정이다. 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 —
+# HWAXPortal docs/risk-review-redesign D-18). 앞 판정을 읽고 같은 말을 하면 원장(D-23)의 지지 수가 독립 근거 없이 오른다.
+# 자유 조회 후보(_RISK_READ_TOOLS·_RISK_KEEP_TOOLS)에 없고, 리스크 심사에 지정 도구(tools)로 와도 부르지 않는다.
+_RISK_REGISTRY_TOOLS = ("risk_get_registry", "risk_claims_for_ref")
 
 # 리스크 심사 유지 도구 — apps 밖 앱(RA·물성·열충격·VoC·문헌) 소속이라 앱 제한에서 잘려 나가는
 # 읽기 도구를 chair_template == 'risk-review' 일 때만 남긴다. 다른 심의 영향 0.
@@ -940,10 +946,9 @@ _RISK_KEEP_TOOLS = ("search_objects", "get_object", "get_subgraph", "search_repo
                     "get_reference_cases",
                     "get_top_issues", "query_voc", "search_voc", "get_voc_summary",
                     "get_kg_relations", "search_scholar", "search_web",
-                    # 변경 원장 — 러너의 apps 세 칸은 어댑터 앱이 채우므로(앱키 heax-hwax_risk 가 없다) 이 목록이
-                    # 리스크 심사 좌석 자신이 변경 전체와 스냅샷에 닿는 유일한 통로다. 등록부 둘(risk_get_registry ·
-                    # risk_claims_for_ref)은 일부러 넣지 않는다 — 같은 과제의 앞 패널 판정을 읽고 같은 말을 하면
-                    # 지지 수가 독립 근거 없이 오른다(사용자 결정 — HWAXPortal docs/risk-review-redesign D-18).
+                    # 변경 원장 — 러너의 apps 세 칸은 어댑터 앱이 채우므로(앱키 heax-hwax_risk 가 없다) 러너 패널의
+                    # 좌석에게는 이 목록이 변경 전체와 스냅샷에 닿는 통로다(apps 로 리스크 앱을 직접 고른 심의는
+                    # _RISK_READ_TOOLS 로도 닿는다). 등록부 둘(_RISK_REGISTRY_TOOLS)은 어느 목록에도 넣지 않는다 — D-18.
                     "risk_get_snapshot", "risk_get_diff")
 
 # 리스크 앱이 패널 질문에 싣는 변경 비교 표식(HWAXRisk runner.panel_question — `diff_id=<id>`). 이 낱말이 질문에 있을 때만
@@ -4414,12 +4419,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if opts.delib_tools:
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
+        _tool_refused = []                    # 리스크 심사에 지정된 등록부 도구 — 부르지 않는다(D-18)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
         _ordered = sorted(opts.delib_tools,
                           key=lambda n: 0 if n.startswith(("list_", "search_", "find_")) else 1)
         for _tn in _ordered:
+            if opts.chair_template == "risk-review" and _tn in _RISK_REGISTRY_TOOLS:
+                # 지정 도구 결과는 전 좌석 프롬프트에 실린다 — 등록부를 부르면 좌석이 앞 패널 판정을 읽는다.
+                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — 리스크 심사 좌석은 같은 과제의 등록부(앞 패널 "
+                                              "판정)를 보지 않는다", "tool": _tn})
+                _tool_refused.append(_tn)
+                continue
             _t = tools.get(_tn)
             if _t is None:
                 yield _sse("status", {"step": f"지정 도구 없음: {_tn} — 건너뜀", "tool": _tn})
@@ -4484,13 +4496,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _tool_fail.append(_tn)
         # 돌지 않은 지정 도구 — 상태줄은 원장의 창 밖으로 밀려나고, 잡 기록에는 지정한 도구가 걸린 것처럼
         # 적혀 있다. 도구마다 한 장씩 내지 않는다(원장은 30건까지다) — 한 장에 모은다.
-        if _tool_miss or _tool_fail:
+        if _tool_miss or _tool_fail or _tool_refused:
             yield _delib("evidence", source="지정 도구 미실행", included=False,
-                         text=f"지정 도구 {len(_ordered)}개 중 {len(_tool_miss) + len(_tool_fail)}개는 결과를 "
-                              "좌석에 주지 못했다 — "
+                         text=f"지정 도구 {len(_ordered)}개 중 "
+                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused)}개는 결과를 좌석에 주지 못했다 — "
                               + " · ".join(x for x in (
                                   f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
                                   f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
+                                  (f"리스크 심사라 부르지 않은 등록부 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 "
+                                   "판정을 좌석이 보지 않는다 — D-18)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에

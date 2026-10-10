@@ -504,7 +504,8 @@ def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():
 
 
 # 러너가 실제로 보내는 apps — 어댑터 앱 둘(HWAXRisk runner._delib_apps · adapters/registry.ADAPTERS). 리스크 앱
-# 자신(heax-hwax_risk)은 없다. 그래서 _RISK_READ_TOOLS["heax-hwax_risk"] 의 앱 조건 통로로는 열리지 않는다.
+# 자신(heax-hwax_risk)은 없다. 러너 패널의 좌석은 _RISK_KEEP_TOOLS(의장 조건부)로 변경·스냅샷에 닿는다. apps 로 리스크
+# 앱을 직접 고른 심의(MCP deliberate_start)는 _RISK_READ_TOOLS["heax-hwax_risk"] 로도 닿는다 — 거기에도 등록부는 없다.
 _RUNNER_APPS = ("heax-step_forge", "heax-kooremapper_mcp")
 _RISK_AMAP = {"risk_get_diff": "heax-hwax_risk", "risk_get_snapshot": "heax-hwax_risk",
               "risk_get_registry": "heax-hwax_risk", "risk_claims_for_ref": "heax-hwax_risk"}
@@ -523,13 +524,25 @@ def test_리스크_심사_좌석은_변경_원장_도구를_받는다():
 
 def test_등록부_도구는_리스크_심사_좌석에게_열리지_않는다():
     """사용자 결정(D-18) — 같은 과제의 앞 패널 판정을 읽고 같은 말을 하면 지지 수가 독립 근거 없이 오른다.
-    등록부도 열기로 하면 _RISK_KEEP_TOOLS 에 둘을 더하고 이 단언을 뒤집는다."""
+    어떤 apps 를 주든, 어떤 의장이든 좌석의 자유 조회 후보에 들지 않는다. 종전엔 러너 apps 만 봤다 — apps 로 리스크
+    앱을 직접 고르면 _RISK_READ_TOOLS["heax-hwax_risk"] 로 두 도구가 그대로 열렸다(engine-contract A-D18-apps).
+
+    _narrow 는 _g 의 부분집합이라 좌석에게 가는 것은 둘의 합성이다(apps 가 비면 _g 그대로) — 두 식을 따로 not 으로
+    단언하면 _g 만 닫은 올바른 수리가 떨어진다. 등록부도 열기로 하면 이 단언을 뒤집는다."""
     g_gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
     narrow = _dictcomp_cond("_MATERIAL_TOOLS", "_FREE_DENY")
-    for n in ("risk_get_registry", "risk_claims_for_ref"):
+    for n in d._RISK_REGISTRY_TOOLS:
         assert n not in d._RISK_KEEP_TOOLS, n
-        for gate in (g_gate, narrow):
-            assert not _eval_gate(gate, n, chair="risk-review", apps=_RUNNER_APPS, amap=_RISK_AMAP), n
+        assert all(n not in v for v in d._RISK_READ_TOOLS.values()), n
+        for apps in ((), _RUNNER_APPS, ("heax-hwax_risk",), ("heax-step_forge", "heax-hwax_risk")):
+            for chair in ("risk-review", "default", "diagnosis"):
+                opened = (_eval_gate(g_gate, n, chair=chair, apps=apps, amap=_RISK_AMAP)
+                          and (not apps or _eval_gate(narrow, n, chair=chair, apps=apps, amap=_RISK_AMAP)))
+                assert not opened, (n, apps, chair)
+    # 같은 apps 로 변경·스냅샷은 그대로 열린다 — 닫은 것이 등록부 둘뿐인지 본다.
+    for n in ("risk_get_diff", "risk_get_snapshot"):
+        assert _eval_gate(g_gate, n, chair="default", apps=("heax-hwax_risk",), amap=_RISK_AMAP), n
+        assert _eval_gate(narrow, n, chair="default", apps=("heax-hwax_risk",), amap=_RISK_AMAP), n
 
 
 def test_조회_지침은_표식이_있을_때만_변경_안내로_시작한다():
