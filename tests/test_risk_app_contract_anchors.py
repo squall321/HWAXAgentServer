@@ -14,6 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import deliberation as d  # noqa: E402
 
 # 스트림을 돌리는 닻은 같은 하네스를 쓴다(_pin_context 는 이 파일에도 걸리게 이름째 가져온다).
@@ -72,6 +74,19 @@ def test_변경_비교_표식과_고정_도구가_그대로다():
     고정과 안내가 말없이 꺼진다 — 리스크 앱의 시험은 이 상수를 읽어 제 질문과 견준다."""
     assert d._RISK_DIFF_MARK == "diff_id="
     assert d._RISK_PIN_TOOLS == ("risk_get_diff",)
+
+
+# ── 패널 질문 머리 — 리스크 앱 runner.panel_question 이 `[리스크심사 <과제코드> <target_key>]` 로 시작한다 ─────────────
+def test_패널_질문_머리와_심의_보고서_제목이_그대로다():
+    """엔진은 이 머리의 과제 코드로 리스크 심사 좌석의 보고서 검색에서 같은 과제의 앞 패널 심의 보고서를 거른다(D-18).
+    그 보고서의 제목이 '심의 — ' + 질문 앞 50자다. 어느 한쪽이 글자를 바꾸면 거름이 말없이 꺼진다."""
+    m = d._RISK_Q_HEAD_RE.search("[리스크심사 S26U-H T-9f3a] 기준 S26U 대비 변경이 각 도메인에서")
+    assert m and m.group(1) == "S26U-H", m
+    assert d._ra_report_title("[리스크심사 S26U-H T-9f3a] 기준") == "심의 — [리스크심사 S26U-H T-9f3a] 기준"
+    src = ROOT.parent / "HWAXRisk" / "backend" / "app" / "runner.py"
+    if not src.is_file():
+        pytest.skip(f"리스크 앱 소스 없음: {src}")
+    assert "f\"[리스크심사 {code_of(target['project_id'])} {target_key}] " in src.read_text(encoding="utf-8")
 
 
 # ── /health 의 근거 예산 — 리스크 앱 engine_client.health() 가 읽는다 ─────────────────────────────────

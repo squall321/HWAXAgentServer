@@ -969,6 +969,66 @@ def _risk_lookup_hint(dom: str, question: str) -> str:
     return ((_RISK_LOOKUP_NOTE + " ") if _RISK_DIFF_MARK in (question or "") else "") + line
 
 
+def _ra_report_title(question: str) -> str:
+    """심의가 Report Archive 에 남기는 보고서 제목. 리스크 앱 러너의 패널 질문은 '[리스크심사 <과제코드> <target_key>]' 로
+    시작하므로 리스크 심사 패널의 보고서 제목 앞머리에 과제 코드가 실린다 — _risk_hide_prior_panels 가 그것으로 거른다."""
+    return f"심의 — {question[:50]}"
+
+
+# 리스크 앱 runner.panel_question 의 질문 머리 — 과제 코드(group 1)와 target_key. 글자를 바꾸려면 그 리포와 같이 바꾼다.
+_RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 (\S+) \S+\]")
+_RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서 {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 "
+                        "읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+
+
+def _risk_hide_prior_panels(tool, question: str):
+    """리스크 심사 좌석의 search_reports 결과에서 같은 과제의 앞 패널 심의 보고서를 뺀다(사용자 결정 D-18 — 좌석은 같은 과제의
+    앞 패널 판정을 보지 않는다).
+
+    엔진은 패널마다 결정문이 든 RA 초안을 남기고(러너가 save_report 를 보내지 않는다 — 리스크 앱이 그 번호를 패널에 적는다),
+    RA 는 소유한 초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다. 그래서 같은 잡 자격으로 도는 다음 패널 좌석이
+    '힌지 리스크' 만 찾아도 앞 패널의 판정이 걸렸다(engine-contract A-D18-ra-reports). 같은 과제는 질문 머리의 과제 코드로
+    가린다 — 머리가 없는 자유 질문이면 가릴 수 없어 감싸지 않는다. 다른 과제의 보고서는 선례라 남긴다.
+
+    응답은 풀어서(json) 제목으로 가린다 — 글자열로만 대조하면 한글이 \\uXXXX 로 온 응답에서 샌다. 풀지 못한 응답에 그 과제의
+    머리가 보이면 결과를 통째로 주지 않는다(행을 가려낼 수 없다)."""
+    m = _RISK_Q_HEAD_RE.search(question or "")
+    orig = getattr(tool, "coroutine", None)
+    if not m or orig is None:
+        return tool
+    code = m.group(1)
+    mark = f"[리스크심사 {code} "
+
+    def _hide(text):
+        if not isinstance(text, str):
+            return text
+        try:
+            got = json.loads(text)
+        except ValueError:
+            got = None
+        rows = got.get("reports") if isinstance(got, dict) else None
+        if not isinstance(rows, list):
+            if mark in text or json.dumps(mark)[1:-1] in text:
+                return (f"검색 결과를 줄 수 없다 — 같은 과제({code})의 앞 패널 심의 보고서가 섞여 있는데 응답을 풀지 못해 "
+                        "가려낼 수 없다. 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 다시 찾아라.")
+            return text
+        keep = [r for r in rows if not (isinstance(r, dict) and mark in str(r.get("title") or ""))]
+        if len(keep) == len(rows):
+            return text
+        return json.dumps({**got, "reports": keep, "count": len(keep),
+                           "withheld": _RISK_PRIOR_WITHHELD.format(code=code, n=len(rows) - len(keep))},
+                          ensure_ascii=False)
+
+    async def hidden(*a, **kw):
+        out = await orig(*a, **kw)
+        if isinstance(out, tuple) and len(out) == 2:       # (content, artifact) 형식 보존
+            return (_hide(out[0]), out[1])
+        return _hide(out)
+
+    tool.coroutine = hidden
+    return tool
+
+
 # ── 봉인 실행(sealed) ────────────────────────────────────────────────────────────
 # 소급 검증용이다 — '사람이 찾기 전에, 그때 있던 자료만으로 심사가 찾았겠는가' 를 보려면 호출자가
 # 준 것 밖의 정보가 심의 도중 들어올 길이 전부 닫혀 있어야 한다. 손잡이를 하나씩 끄게 두면 하나를
@@ -4307,6 +4367,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
+            # 리스크 심사 좌석의 보고서 검색에서 같은 과제의 앞 패널 심의 보고서를 뺀다(D-18 — _risk_hide_prior_panels).
+            if _risk_chair and "search_reports" in _g:
+                _risk_hide_prior_panels(_g["search_reports"], question)
             # 웹 리서치 소스 토글 — 켜지 않은 소스의 도구는 목록에서 뺀다. 모델에게 금지를
             # 지키게 하는 것과 도구가 존재하지 않는 것은 다르다.
             if opts.search_sources is not None:
@@ -5683,7 +5746,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
                                    else "보고서 저장 건너뜀(save_report=0)"),
                           "tool": "create_report_draft" if _do_save else None,
-                          "detail": f"심의 — {question[:50]}"})
+                          "detail": _ra_report_title(question)})
     try:
         # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
         transcript = []
@@ -5734,7 +5797,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         else:
             _raw_made = await _call(tools, "create_report_draft", {
                 "template_id": "deliberation", "template_version": 1,
-                "title": f"심의 — {question[:50]}", "blocks": _ra_blocks(blocks),
+                "title": _ra_report_title(question), "blocks": _ra_blocks(blocks),
                 "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
         # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
@@ -5763,7 +5826,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     elif out is not None:
         out["chair_failed"] = (_chair_failed, _chair_knob)
     yield _delib("decision", text=decision + report_note, **({"chair_failed": True} if _chair_failed else {}))
-    yield _delib("outcome", report_id=rid, title=f"심의 — {question[:50]}",
+    yield _delib("outcome", report_id=rid, title=_ra_report_title(question),
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
                  # 그대로 좌석 유실까지 막는다(응답 못 한 좌석은 abstain 으로 들어간다).
