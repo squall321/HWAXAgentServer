@@ -407,3 +407,38 @@ def test_요구_키가_빠져도_원문을_전부_보존한다(monkeypatch):
     import json
     say = _persona_say(monkeypatch, json.dumps({"say": "나" * 5000}, ensure_ascii=False))
     assert say.startswith("(요구 키 누락 — 원문 보존) ") and say.endswith("나" * 5000)
+
+
+# ── 지식카드 한 줄 — 700자(표식 없음) ─────────────────────────────────────────────────────
+_HIT = {"title": "힌지 피로", "record_id": "R-1", "section_id": "s3", "snippet": "".join(
+    f"<{i:02d}>" + "가" * 96 for i in range(20)) + "<끝>"}                       # 2,003자
+
+
+def test_지식카드_줄을_잘랐으면_원문_길이를_남긴다():
+    full = d.knowledge_line(_HIT, limit=0)
+    assert full.endswith("<끝>") and "(출처: R-1 §s3)" in full
+    cut = d.knowledge_line(_HIT)                                  # 챗·띵킹이 쓰는 기본 — 종전 700자
+    assert cut.startswith(full[:700]) and cut.endswith(f" …[{len(full):,}자 중 앞 700자]"), cut[-40:]
+
+
+def test_심의_좌석은_지식카드_줄을_자기_예산까지_받는다(monkeypatch):
+    """줄마다 700자에서 말없이 끊겨, 예산(좌석당 합)이 남아도 카드 한 장의 뒤쪽이 좌석에 안 갔다."""
+    import json
+    import re
+
+    from test_delib_silent_drops import _Tool
+    seen = []
+
+    async def _llm(_obj, system, human):
+        if re.search(r"당신은 '[^']+' 전문가", system):
+            seen.append(human)
+        return json.dumps({"lens": "관점", "reads": [], "recommendation": "권장", "concerns": ["a", "b"],
+                           "position_short": "입장"}, ensure_ascii=False)
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    _win(128000)
+    _stream(monkeypatch, {"rounds": 2, "persona_knowledge": 1},
+            tools={"agent_search": _Tool("agent_search", answer=json.dumps({"hits": [_HIT]}, ensure_ascii=False))},
+            until=lambda ev, data: ev == "delib" and data.get("kind") == "stage" and str(data.get("stage")) == "r2")
+    kb = [h for h in seen if "[당신의 지식카드에서" in h]
+    assert kb and all("<끝>" in h for h in kb), "지식카드 한 장의 뒤쪽이 좌석에 안 갔다 — 줄당 700자에서 끊었다"

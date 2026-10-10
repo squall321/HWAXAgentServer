@@ -2539,8 +2539,11 @@ def _grade_notes(h: dict) -> list[str]:
     return out
 
 
-def knowledge_line(h) -> str:
+def knowledge_line(h, limit: int = 700) -> str:
     """agent_search hit 한 건 → 한 줄. 챗·심의·띵킹이 **같은 함수**를 쓴다.
+
+    limit — 한 줄의 상한(자), 0=자르지 않는다. 넘으면 앞부분만 남기고 원문 길이를 표식으로 붙인다(종전엔 700자에서
+    말없이 끊어, 줄 끝이 카드의 끝처럼 읽혔다). 챗·띵킹은 종전 700자, 심의 좌석은 자기 지식카드 예산까지 받는다.
 
     실측 형태(2026-08-05): {record_id, section_id, title, section_title, snippet, score,
     tags, causal_status, …} — 본문은 snippet 에 있다.
@@ -2552,19 +2555,19 @@ def knowledge_line(h) -> str:
     미검증 관측이 검증된 사실과 똑같은 모습으로 결론에 들어간다.
     """
     if not isinstance(h, dict):
-        return str(h)[:300]
+        return _cut_mark(str(h), min(300, limit) if limit > 0 else 0)
     title = h.get("title") or ""
     sec = h.get("section_title") or ""
     body = h.get("snippet") or h.get("text") or h.get("excerpt") or h.get("summary") or ""
     head = title + (f" › {sec}" if sec else "")
     if not (head or body):
-        return json.dumps(h, ensure_ascii=False, default=str)[:300]
+        return _cut_mark(json.dumps(h, ensure_ascii=False, default=str), min(300, limit) if limit > 0 else 0)
     rid = str(h.get("record_id") or h.get("id") or "")[:60]
     sid = str(h.get("section_id") or "")[:40]
     src = f" (출처: {rid}{f' §{sid}' if sid else ''})" if rid else ""
     gr = _grade_notes(h)
     tag = f" [{' · '.join(gr)}]" if gr else ""
-    return f"• [{head}]{src}{tag} {str(body).strip()}"[:700]
+    return _cut_mark(f"• [{head}]{src}{tag} {str(body).strip()}", limit)
 
 
 def _knowledge_q_for(kq, seat_key: str, question: str) -> tuple[str, str]:
@@ -4298,7 +4301,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if opts.persona_knowledge and "agent_search" in tools:
         _kb_budget = _env_int("DELIB_KNOWLEDGE_BUDGET", 3500)
 
-        _hit_line = knowledge_line      # 챗과 같은 포맷 — 출처·인과상태가 함께 간다
+        # 챗과 같은 포맷 — 출처·인과상태가 함께 간다. 한 줄은 이 좌석의 예산까지 받는다(종전엔 줄마다 700자에서 끊었다).
+        _hit_line = lambda h: knowledge_line(h, limit=_kb_budget)   # noqa: E731
         # 합성 지정석(_CHAIR_ADVERSARY)은 레지스트리에 없는 키라 물으면 **매번 404** 다. 폴백까지
         # 돌아 좌석 하나에 최대 2 × KNOWLEDGE_TIMEOUT_S 를 쓰고(실사용 로그에서 74회), 그 404 가
         # '지식카드 강등' 으로 떠서 진짜 강등과 섞였다. 묻지 않은 좌석은 인원수에서도 뺀다 —
