@@ -196,3 +196,86 @@ def test_원장은_요청_값을_전문으로_남기고_응답은_표식을_달�
     job = {"id": "t-o", "status": "done", "question": "q", "opts": echo}
     shown = delib_jobs.summary(job, full=True)["applied_opts"]["human_note"]
     assert len(shown) < 300 and f"{len(note):,}자" in shown, shown
+
+
+# ── 후처리 — 핵심 요약·쉬운 설명은 결정문 전부를 읽는다(좁은 창은 종전 앞 6,000·7,000자) ─────────────────
+_DECISION = _long("결정문-끝", 30000)
+
+
+def _other(llm, needle):
+    return next(h for s, h in llm.others if needle in s)
+
+
+def test_16K_창의_핵심_요약과_쉬운_설명은_종전대로_앞부분만_읽는다(monkeypatch):
+    _events, llm = _run(monkeypatch, 16384, chair=_DECISION)
+    summ = _other(llm, "군더더기 없이")
+    assert summ.endswith(_DECISION[:6000]) and _DECISION[:6001] not in summ
+    plain = _other(llm, "비전문가에게")
+    assert "[결정문-끝]" not in plain and len(plain) < 7600, len(plain)
+
+
+@pytest.mark.parametrize("tokens", (128000, _BIG))
+def test_핵심_요약과_쉬운_설명은_결정문_전부를_읽는다(monkeypatch, tokens):
+    """결정문 뒤쪽(소수의견·판정·risk_spec)을 못 본 요약이 보고서 맨 앞에 붙고 이어하기 요약의 머리가 됐다."""
+    _events, llm = _run(monkeypatch, tokens, chair=_DECISION)
+    assert "[결정문-끝]" in _other(llm, "군더더기 없이"), "핵심 요약이 결정문 앞 6,000자만 읽었다"
+    assert "[결정문-끝]" in _other(llm, "비전문가에게"), "쉬운 설명이 결정문 앞 7,000자만 읽었다"
+
+
+def test_16K_창에서_요약이_결정문을_줄여_읽으면_알린다(monkeypatch):
+    events, _llm = _run(monkeypatch, 16384, chair=_DECISION)
+    cards = [c for c in _cards(events, included=False) if c["source"] == "후처리 입력 상한 초과"]
+    assert cards and "핵심 요약" in cards[0]["text"] and f"{len(_DECISION):,}자" in cards[0]["text"], cards
+
+
+def test_넓은_창에서는_후처리_상한_카드가_없다(monkeypatch):
+    events, _llm = _run(monkeypatch, _BIG, chair=_DECISION)
+    assert not [c for c in _cards(events) if c["source"] == "후처리 입력 상한 초과"]
+
+
+def test_best_of_심판은_넓은_창에서_후보_전문을_본다(monkeypatch):
+    cands = iter([_long("후보1-끝", 9000), _long("후보2-끝", 9000)])
+
+    class _Bo(_Llm):
+        async def text(self, _obj, system, human):
+            if "엔지니어링 톤" in system:
+                return next(cands, "결정")
+            return await super().text(_obj, system, human)
+
+    _win(_BIG)
+    llm = _Bo(_seat_plain, "")
+    monkeypatch.setattr(d, "_llm_text", llm.text)
+
+    async def _fake_tools(*_a, **_k):
+        return {"agent_search": _Tool("agent_search")}
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    stub = SimpleNamespace(state=SimpleNamespace(llm=llm, delib_llm=None))
+    opts = {"personas": _SEATS, "rounds": 2, "free_tools": 0, "voc": "off", "rescreen": 0,
+            "persona_knowledge": 0, "save_report": 0, "chair_bestof": 2}
+
+    async def go():
+        return [c async for c in d.run_deliberation(stub, "q", [], opts)]
+
+    asyncio.run(go())
+    judge = _other(llm, "심의 기록 심사자")
+    assert "[후보1-끝]" in judge and "[후보2-끝]" in judge, "심판이 후보 앞 4,000자만 봤다"
+
+
+def test_의장_결정문이_출력_상한에서_끊기면_경고한다(monkeypatch):
+    """결정문 꼬리의 표식 한 줄뿐이라 deliberate_status 의 warnings 에 안 떴다."""
+    events, _llm = _run(monkeypatch, _BIG, chair="결정: 진행" + "\n" + d._OUT_CUT_MARK)
+    w = [data for ev, data in events if ev == "warning" and data.get("code") == "chair_output_cut"]
+    assert w and "DELIB_MAX_TOKENS" in (w[0].get("knob") or ""), w
+
+
+def test_날조_가능_웹_인용은_8건을_넘으면_총_건수를_적는다(monkeypatch):
+    bad = [f"[W:d_{i:012x}#1]" for i in range(11)]
+
+    async def _verify(*_a, **_k):
+        return 0, len(bad), bad, []
+
+    monkeypatch.setattr(d, "_verify_web_citations", _verify)
+    events, _llm = _run(monkeypatch, _BIG, chair="결정: " + " ".join(bad), search_sources=["web"])
+    final = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
+    assert "외 3건" in final, final[-400:]

@@ -1920,6 +1920,10 @@ def _parse_json(text: str):
     return found
 
 
+# 출력 상한(max_tokens)에서 끊긴 응답 꼬리에 붙이는 표식 — 의장 결정문에서 보이면 스트림이 경고로도 알린다.
+_OUT_CUT_MARK = "…[출력 상한(max_tokens) 절단 — 이 응답은 불완전하다]"
+
+
 async def _llm_text(llm, system: str, human: str) -> str:
     r = await llm.ainvoke([("system", system), ("human", human)])
     text = r.content if hasattr(r, "content") else str(r)
@@ -1931,7 +1935,7 @@ async def _llm_text(llm, system: str, human: str) -> str:
         fin = meta.get("finish_reason") or (getattr(r, "additional_kwargs", None) or {}).get("finish_reason")
         if fin == "length":
             print(f"[deliberation] ⚠ LLM 출력이 max_tokens 에서 절단됨 (len={len(str(text))})")
-            text = str(text) + "\n…[출력 상한(max_tokens) 절단 — 이 응답은 불완전하다]"
+            text = str(text) + "\n" + _OUT_CUT_MARK
     except Exception:  # noqa: BLE001 — 검출 실패가 본 호출을 죽이면 안 된다
         pass
     return text
@@ -2115,6 +2119,16 @@ def _decision_ctx(fixed: int, n_rounds: int, out_tokens: int = 0) -> int:
         ctx = 128000
     avail = ctx - max(_CHAIR_RESERVE, out_tokens) - int(fixed / _EVID_KO_CPT)
     return max(_DECISION_CTX_MIN, int(avail * _EVID_KO_CPT * _PRE_SAFETY) // max(1, n_rounds))
+
+
+def _text_turn_room(fixed: int, floor: int, out_tokens: int = 0, n: int = 1) -> int:
+    """의장 뒤 텍스트 턴(핵심 요약·쉬운 설명·best-of 심판)이 결정문을 읽는 길이(자) — 결정문 n 편이 나눠 쓴다.
+
+    그 턴에는 결정문과 짧은 지시(fixed 자)만 실린다 — 의장 전사(_decision_ctx)와 같은 환산으로 창에서 유도하고,
+    바닥은 종전 고정값(floor)이다(dev 16K 는 종전대로). 종전엔 1백만 토큰 창에서도 핵심 요약이 결정문 앞 6,000자,
+    쉬운 설명이 7,000자만 읽어, 결정문 뒤쪽(소수의견·판정·risk_spec)을 못 본 요약이 보고서 맨 앞에 붙었다."""
+    avail = _ctx_tokens() - max(_CHAIR_RESERVE, out_tokens) - int(fixed / _EVID_KO_CPT)
+    return max(floor, int(avail * _EVID_KO_CPT * _PRE_SAFETY) // max(1, n))
 
 
 def _chair_rows(lst: list, ser, cap: int) -> tuple:
@@ -5252,6 +5266,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # best-of-n(DELIB_CHAIR_BESTOF≥2) — temp>0 분산의 상위 꼬리를 심판이 회수. 의장 1곳 한정이
     # 체감 대비 최저 비용(GLM 리뷰 §5). temp 0 에선 후보가 동일해 무의미 — env kit 주석 참조.
     n_cand = max(1, opts.chair_bestof)
+    _mt = getattr(llm, "max_tokens", None) or 0     # 후처리 텍스트 턴의 출력 몫(_text_turn_room)
 
     async def _chair_once() -> str:
         if n_cand == 1:
@@ -5266,9 +5281,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                    or RuntimeError("의장 의사결정문 합성 실패(후보 전멸)"))
         if len(cands) == 1:
             return cands[0]
+        # 후보마다 같은 몫 — 넓은 창은 후보 전문, 좁은 창은 종전 앞 4,000자(_text_turn_room).
+        _cmax = _text_turn_room(400, 4000, _mt, len(cands))
         pick = _parse_json(await _llm_text(
             llm, "당신은 심의 기록 심사자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-            "\n\n".join(f"[후보 {i + 1}]\n{c[:4000]}" for i, c in enumerate(cands)) +
+            "\n\n".join(f"[후보 {i + 1}]\n{c[:_cmax]}" for i, c in enumerate(cands)) +
             "\n\n위 의사결정문 후보 중 (a) 판정 수치가 구체적이고 (b) 라운드 발언에 접지되며 "
             "(c) 소수의견이 보존되고 (d) 실행 가능한 것 하나를 고르세요. "
             'JSON {"best": 후보번호} 로만.')) or {}
@@ -5302,6 +5319,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                     f"{_dr(N)}R {_rtag(N)}")
         yield _sse("status", {"step": "⚠ 의장 결정문 없음 — 좌석별 마지막 입장과 회의록을 보존한다",
                               "tool": None})
+    elif _OUT_CUT_MARK in decision:
+        # 결정문이 출력 상한에서 끊겼다 — 꼬리 표식 한 줄뿐이면 결정문을 끝까지 읽은 사람만 안다. 원장에 경고로 남긴다.
+        yield _sse("status", {"step": "⚠ 의장 결정문이 출력 상한(max_tokens)에서 끊겼다 — 뒤쪽 항목이 빠졌을 수 있다",
+                              "tool": None})
+        yield _sse("warning", {"code": "chair_output_cut",
+                               "message": f"의장 결정문({len(decision):,}자)이 모델 출력 상한에서 끊겼다 — 결정문 뒤쪽 "
+                                          "항목이 빠졌을 수 있다. 이어하기로 다시 수렴시키거나 출력 상한을 올린다.",
+                               "knob": "DELIB_MAX_TOKENS · LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
 
     # 4a-2) 인용 후검증(결정적, LLM 아님) — JS 파이프라인 citationAudit 파리티(감사 원장 (3)).
     #        결정문의 유의미 수치를 근거·발언 원문과 대조한다. unmatched 는 의장 신규 산술일 수도
@@ -5335,14 +5360,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
     _summary = ""
+    # 후처리 텍스트 턴이 결정문을 읽는 길이 — 창에서 유도하고 바닥은 종전 값(_text_turn_room). 줄였으면 카드로 알린다.
+    _post_cut = []
     if not _chair_failed:
         yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
+        _smax = _text_turn_room(400, 6000, _mt)
+        if len(decision) > _smax:
+            _post_cut.append(f"핵심 요약은 결정문 {len(decision):,}자 중 앞 {_smax:,}자만")
         try:
             _summary = (await _llm_text(
                 llm, "당신은 심의체 의장입니다. 군더더기 없이 핵심만.",
                 "다음 의사결정문을 3~5줄 핵심 요약으로 압축하라 — 각 줄 '- '로 시작하는 한 문장 불릿. "
                 "① 최종 결론 한 줄 ② 핵심 근거 1~2개(가능하면 수치) ③ 소수의견/합의 여부. "
-                f"머리말·제목 없이 불릿만.\n\n{decision[:6000]}")).strip()
+                f"머리말·제목 없이 불릿만.\n\n{decision[:_smax]}")).strip()
         except Exception as exc:  # noqa: BLE001 — 요약 실패해도 의사결정문은 그대로 저장
             for _c in _skip_notice("summary_skipped", "핵심 요약을 만들지 못했다", exc=exc, llm=llm,
                                    after="결정문은 그대로입니다."):
@@ -5361,6 +5391,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if not _chair_failed:
         yield _delib("stage", stage="explain")
         yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
+        _pmax = _text_turn_room(600, 7000, _mt)
+        if len(decision) > _pmax:
+            _post_cut.append(f"쉬운 설명은 (핵심 요약이 붙은) 결정문 {len(decision):,}자 중 앞 {_pmax:,}자만")
         try:
             _plain = (await _llm_text(
                 llm, "당신은 어려운 기술 결정을 비전문가에게 설명하는 사람입니다. 쉬운 말로, 과장 없이.",
@@ -5369,7 +5402,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "### 왜 그런가\n(핵심 근거 2~3개 — 수치가 있으면 쉬운 말로 풀어서)\n"
                 "### 당장 할 일 / 다음에 할 일 / 하지 말 것\n(각 2~4개 불릿, 전문용어는 괄호로 풀어쓰기)\n"
                 "새로운 내용을 지어내지 말고 원문에 있는 것만 쉽게 바꿔라.\n\n"
-                f"{decision[:7000]}")).strip()
+                f"{decision[:_pmax]}")).strip()
         except Exception as exc:  # noqa: BLE001 — 실패해도 의사결정문은 그대로
             for _c in _skip_notice("plain_skipped", "쉬운 설명을 만들지 못했다", exc=exc, llm=llm,
                                    after="결정문은 그대로입니다."):
@@ -5378,6 +5411,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         decision = f"{decision}\n\n---\n\n■ 쉬운 설명\n{_plain}"
         # 별도 이벤트로도 내보내 프론트가 결정문과 분리된 카드로 렌더할 수 있게 한다.
         yield _delib("plain", text=_plain)
+    if _post_cut:
+        # 좁은 창에서만 난다(넓은 창은 결정문 전부를 읽는다). 결정문 자체는 줄이지 않았다 — 요약·설명의 입력이다.
+        yield _delib("evidence", source="후처리 입력 상한 초과", included=False, notice=True,
+                     text=" · ".join(_post_cut) + " 읽고 썼다 — 결정문 뒤쪽은 요약·쉬운 설명에 반영되지 않았을 수 "
+                          "있다(결정문 전문은 그대로다). 모델 창이 작아서다.")
 
     # 아래 두 대조(웹 인용 · 수치)는 **보고서를 저장하기 전에** 한다. 종전엔 저장한 뒤에 경고를 붙여서,
     # 화면의 결정문에는 '이 수치는 확인되지 않았다' 가 있는데 Report Archive 에 남는 보고서에는 없었다 —
@@ -5406,6 +5444,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if _bad_n:
                 decision += ("\n\n> ⚠ 아래 인용은 원장에서 확인되지 않았습니다(날조 가능) — "
                              + ", ".join(_bad[:8])
+                             + (f" 외 {len(_bad) - 8}건" if len(_bad) > 8 else "")
                              + "\n> 이 항목의 근거는 신뢰하지 마세요.")
             elif _ok_n and not _unk:
                 decision += (f"\n\n> 웹 인용 {_ok_n}건이 원장 원문과 대조되었습니다. "
