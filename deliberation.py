@@ -719,6 +719,34 @@ _CHAT_BOT_MAX = _env_int("DELIB_CHAT_BOT_MAX", 2500)       # 챗 답변 하나�
 _CHAT_ITEMS_MAX, _CHAT_ITEMS_MAX_WIDE = 60, 2000           # 대화에서 읽는 발화 수(최근부터) — 좁은 창·넓은 창
 _CHAT_CTX_SHARE = _env_float("DELIB_CHAT_CTX_SHARE", 0.3)  # 사전 컨텍스트 중 챗 맥락 몫
 _PRE_SAFETY = _env_float("DELIB_PRE_SAFETY", 0.93)         # 토큰 추정 오차 여유
+_CUT_MARK_ROOM = 48     # _cut_mark 표식(' …[N자 중 앞 M자]') 몫 — 줄여 실은 줄도 예산 안에 들게 미리 뗀다
+_CHAT_CUT_FLOOR = 200   # 남은 예산이 이보다 작으면 발화를 줄여 싣지 않고 멈춘다(토막은 근거가 못 된다)
+
+
+def _fit_recent(items: list, budget: int, cap: int, tag: str) -> tuple[list, int, int]:
+    """발화 목록(시간순)을 **최근부터** 예산 안에 담아 (시간순 줄들, 남은 예산, 뺀 오래된 발화 수)를 돌려준다.
+    줄은 '· [tag:원래 순번] 글' 이다. 남은 예산보다 긴 발화는 버리지 않고 남은 예산까지 줄여(원문 길이 표식) 싣고
+    멈춘다. 종전엔 오래된 것부터 담다가 처음 넘치는 줄에서 멈춰, 앞쪽의 긴 붙여넣기 하나가 뒤의 최근 조건을 통째로
+    밀어냈다(넓은 창은 발화 상한이 없어 더 쉽게). cap 은 발화 하나의 상한(0=무절단)이다."""
+    picked: list[str] = []
+    omitted = 0
+    for i in range(len(items), 0, -1):
+        head = f"· [{tag}:{i}] "
+        line = head + _cut_mark(items[i - 1], cap)
+        if len(line) > budget:
+            room = budget - len(head) - _CUT_MARK_ROOM
+            if room >= _CHAT_CUT_FLOOR:
+                line = head + _cut_mark(items[i - 1], room)
+                picked.append(line)
+                budget -= len(line)
+                omitted = i - 1
+            else:
+                omitted = i
+            break
+        picked.append(line)
+        budget -= len(line)
+    picked.reverse()
+    return picked, budget, omitted
 
 
 def _chat_context_note(history) -> str:
@@ -759,29 +787,26 @@ def _chat_context_note(history) -> str:
            "'대화에서 언급된 바와 같이' 로 뭉뚱그리면 나중에 누구 말인지 되짚을 수 없다]"]
     if older:
         out.append(f"(앞선 발화 {older}건은 넣지 않았다 — 오래된 순으로 뺐다)")
+    # 사람 몫을 먼저 쓰고 남으면 챗 몫을 쓴다. 둘 다 **최근부터** 담는다(_fit_recent) — 심의를 부른 것은 최근 맥락이다.
     if users:
         out.append("[인간의 전제·의중] 사람이 챗에서 한 말이다. 무엇을 원하고 무엇을 제약으로 "
                    "두는지가 여기 있다. 심의는 이 전제 자체가 옳은지도 함께 따져라 — "
                    "틀렸다고 판단하면 근거를 대고 그렇게 말하라.")
-        for i, t in enumerate(users, start=1):
-            # [c:N] — 도구 근거의 [e:N] 과 같은 역할. 없으면 좌석이 "사람이 말한 전제" 를
-            # 가리킬 수가 없어 "대화에서 언급된 바와 같이" 같은 뭉뚱그린 말로 흐른다.
-            line = f"· [c:{i}] {_cut_mark(t, turn_max)}"
-            if budget - len(line) < 0:
-                out.append(f"· (이하 사람 발화 {len(users) - i + 1}건 생략 — 예산)")
-                break
-            out.append(line)
-            budget -= len(line)
+        # [c:N] — 도구 근거의 [e:N] 과 같은 역할. 없으면 좌석이 "사람이 말한 전제" 를
+        # 가리킬 수가 없어 "대화에서 언급된 바와 같이" 같은 뭉뚱그린 말로 흐른다.
+        lines, budget, gone = _fit_recent(users, budget, turn_max, "c")
+        if gone:
+            out.append(f"· (앞선 사람 발화 {gone}건 생략 — 예산, 오래된 순으로 뺐다)")
+        out.extend(lines)
     if bots and budget > 400:
         out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
                    "근거가 없거나 틀렸으면 반박하라.")
-        for i, t in enumerate(bots, start=1):
-            line = f"· [a:{i}] {_cut_mark(t, bot_max)}"
-            if budget - len(line) < 0:
-                out.append(f"· (이하 챗 답변 {len(bots) - i + 1}건 생략 — 예산)")
-                break
-            out.append(line)
-            budget -= len(line)
+        lines, budget, gone = _fit_recent(bots, budget, bot_max, "a")
+        if gone:
+            out.append(f"· (앞선 챗 답변 {gone}건 생략 — 예산, 오래된 순으로 뺐다)")
+        out.extend(lines)
+    elif bots:
+        out.append(f"· (챗 답변 {len(bots)}건 생략 — 예산을 사람 발화에 먼저 썼다)")
     return "\n".join(out)
 
 

@@ -543,6 +543,75 @@ def test_긴_대화는_최근_발화부터_남긴다(tokens):
         assert "<000>" not in note and "앞선 발화 10건" in note, note[:400]
 
 
+def _ctx_lines(note):
+    """챗 맥락 블록에서 발화 줄(· [c:N]·· [a:N])만 — 예산이 깎는 것은 이 줄들의 길이다."""
+    return [ln for ln in note.split("\n") if ln.startswith("· [c:") or ln.startswith("· [a:")]
+
+
+def test_넓은_창은_앞쪽_긴_붙여넣기가_최근_사람_조건을_밀어내지_않는다():
+    """발화 상한을 풀고도 오래된 것부터 담아, 앞쪽 20만 자 사양 하나가 예산을 넘으면 뒤의 사람 발화가 전부 빠졌다
+    (심의를 부른 최근 조건이 좌석에 안 갔다). 최근부터 담고, 남은 예산보다 긴 발화는 원문 길이를 적고 줄여 싣는다."""
+    _win(_BIG)
+    spec = "가" * 200000 + "<사양-끝>"
+    note = d._chat_context_note([{"role": "user", "content": spec},
+                                 {"role": "assistant", "content": "읽었습니다."},
+                                 {"role": "user", "content": "낙하 1.5m, 힌지만 본다. <최근-조건>"}])
+    assert "<최근-조건>" in note, note[-400:]
+    assert "· [c:2] 낙하 1.5m" in note, "원래 순번이 아니다"
+    assert "[c:1] " in note and f"{len(spec):,}자 중 앞" in note, "앞쪽 사양을 통째로 버렸거나 줄인 표식이 없다"
+    assert sum(len(ln) for ln in _ctx_lines(note)) <= d._chat_ctx_budget()
+
+
+def test_넓은_창은_긴_사양_넷_뒤의_사람_조건을_싣는다():
+    """포털 한도 안의 현실적인 꼴 — 60,000자 사양 넷을 앞에 붙이고 뒤에 조건을 정했다. 사람이 마지막에 정한 조건은
+    빠지고 챗의 잠정 답만 좌석에 갔다(셋이면 종전에도 SPEC2 부터 빠졌다)."""
+    _win(_BIG)
+    hist = []
+    for k in range(4):
+        hist += [{"role": "user", "content": f"<SPEC{k}>" + "가" * 60000},
+                 {"role": "assistant", "content": f"사양 {k} 확인"}]
+    hist += [{"role": "user", "content": "<최근Q1> 온도 조건은 -20도로 하자"},
+             {"role": "assistant", "content": "<최근A1> 알겠습니다"},
+             {"role": "user", "content": "<최근Q2> 힌지만 본다"}]
+    note = d._chat_context_note(hist)
+    assert "<최근Q1>" in note and "<최근Q2>" in note, note[-600:]
+    assert "앞선 사람 발화 1건 생략" in note and "<SPEC0>" not in note, "뺀 사람 발화 수를 적지 않았다"
+    assert "<SPEC1>" in note and "60,007자 중 앞" in note, "남은 예산에 줄여 실을 수 있는 사양을 버렸다"
+    assert sum(len(ln) for ln in _ctx_lines(note)) <= d._chat_ctx_budget()
+
+
+def test_넓은_창의_긴_대화는_최근_답을_먼저_싣는다():
+    """25왕복(답 9,000자) — 오래된 답 0~18 이 실리고 최근 답이 '(이하 챗 답변 N건 생략)' 으로 빠졌다."""
+    _win(_BIG)
+    hist = []
+    for k in range(1, 26):
+        hist += [{"role": "user", "content": f"질문 {k}"},
+                 {"role": "assistant", "content": f"<답{k:02d}>" + "나" * 9000}]
+    note = d._chat_context_note(hist)
+    assert "· [a:25] <답25>" in note, "가장 최근 답이 빠졌다"
+    assert "앞선 챗 답변" in note, "뺀 답 수를 적지 않았다"
+    assert sum(len(ln) for ln in _ctx_lines(note)) <= d._chat_ctx_budget()
+
+
+def test_좁은_창도_긴_첫_발화가_최근_조건을_밀어내지_않는다():
+    """16K(챗 몫 1,000자) — 첫 사람 발화가 1,000자를 넘으면 그 뒤 사람 발화가 전부 빠졌다(종전부터). 발화당 상한은 그대로다."""
+    _win(16384)
+    note = d._chat_context_note([{"role": "user", "content": "가" * 5000},
+                                 {"role": "assistant", "content": "확인"},
+                                 {"role": "user", "content": "힌지만 본다 <최근-조건>"}])
+    assert "<최근-조건>" in note, note[-300:]
+    assert sum(len(ln) for ln in _ctx_lines(note)) <= d._chat_ctx_budget()
+
+
+def test_사람_발화가_예산을_다_쓰면_뺀_챗_답변_수를_적는다():
+    """사람 몫을 먼저 쓰고 남은 예산이 400자 이하면 챗 답변 블록을 통째로 건너뛰었다 — 몇 건을 뺐는지 아무 데도 없었다."""
+    _win(_BIG)
+    note = d._chat_context_note([{"role": "user", "content": "가" * 400000},
+                                 {"role": "assistant", "content": "답 하나"},
+                                 {"role": "assistant", "content": "답 둘"}])
+    assert "챗 답변 2건" in note and "생략" in note, note[-300:]
+
+
 # ── 사람 의견(human_note) — 2,000자 ───────────────────────────────────────────────────────
 def test_넓은_창은_사람_의견을_창에서_유도한_길이까지_싣는다():
     """포털은 이 칸에 8,000자까지 받고 MCP 호출자는 더 보낸다 — 1백만 토큰 창에서도 앞 2,000자만 좌석에 갔다."""
