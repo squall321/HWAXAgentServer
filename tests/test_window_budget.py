@@ -137,7 +137,8 @@ def test_좁은_창의_자기_조회_블록은_3500자를_넘지_않는다(token
 def _worst_seat_chars():
     """좌석 발언 턴 하나에 실릴 수 있는 가변부의 최악 합(자) — 근거·챗 맥락·직전 라운드·덧붙는 몫 전부."""
     return (d._evid_budget() + d._chat_ctx_budget() + d._seat_ctx() + d._lookup_budget()
-            + max(d._share_budget(r) for r in range(1, 9)) + d._tool_inject_caps()[1] + d._summary_max())
+            + max(d._share_budget(r) for r in range(1, 9)) + d._tool_inject_caps()[1] + d._summary_max()
+            + d._human_note_max())
 
 
 def test_넓은_창은_직전_라운드_몫이_창에서_는다():
@@ -540,3 +541,29 @@ def test_긴_대화는_최근_발화부터_남긴다(tokens):
         assert "<000>" in note
     else:
         assert "<000>" not in note and "앞선 발화 10건" in note, note[:400]
+
+
+# ── 사람 의견(human_note) — 2,000자 ───────────────────────────────────────────────────────
+def test_넓은_창은_사람_의견을_창에서_유도한_길이까지_싣는다():
+    """포털은 이 칸에 8,000자까지 받고 MCP 호출자는 더 보낸다 — 1백만 토큰 창에서도 앞 2,000자만 좌석에 갔다."""
+    _win(_BIG)
+    assert d._human_note_max() >= 8000
+    o = d._resolve_opts({"human_note": "가" * 8000})
+    assert o.human_note == "가" * 8000 and not o.human_note_cut
+    for t in _SMALL:
+        _win(t)
+        assert d._human_note_max() == d.HUMAN_NOTE_MAX == 2000
+
+
+def test_넓은_창에서도_명시한_사람_의견_상한은_그대로다(monkeypatch):
+    monkeypatch.setattr(d, "HUMAN_NOTE_MAX", 1500)
+    monkeypatch.setattr(d, "_HUMAN_NOTE_MAX_SET", True)
+    _win(_BIG)
+    assert d._human_note_max() == 1500
+
+
+def test_넓은_창의_메뉴가_지금_걸리는_사람_의견_상한을_알린다():
+    import mcp_server as m
+    _win(_BIG)
+    menu = asyncio.run(m.deliberate_jobs())
+    assert menu["limits"]["human_note_chars"] == d._human_note_max() > 2000

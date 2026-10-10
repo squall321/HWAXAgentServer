@@ -349,7 +349,7 @@ async def deliberate_start(
         tools: 심의 시작 전 실제로 호출해 정량 근거로 깔 도구 이름. 상한은 deliberation._TOOLS_MAX
                (지금 값은 deliberate_jobs 의 limits) — 넘친 것은 빼고 evidence_omitted 로 알린다.
         apps: 좌석 자유 조회 범위를 이 앱들로 좁힌다. 상한은 deliberation._APPS_MAX(위와 같다).
-        human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation.HUMAN_NOTE_MAX
+        human_note: 사람 의견 주입 — 매 라운드 좌석에 전달된다. 상한은 deliberation._human_note_max()(모델 창에서 유도)
                     (지금 값은 deliberate_jobs 의 limits) — 넘으면 앞부분만 싣고 evidence_omitted 로 알린다.
                     sim-plan·build-plan 은 1단에만 싣는다(2단부터는 1단 결정문이 그 방향을 넘긴다).
                     test-plan 은 엔진이 까는 지시문 뒤에 이어 싣는다.
@@ -657,7 +657,7 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
             "save_report": "False 면 RA 저장을 건너뛴다(탐색적 심의)",
             "advanced": _ADV_DESC,
         },
-        "limits": {**_evid_limits(), "human_note_chars": _engine.HUMAN_NOTE_MAX,
+        "limits": {**_evid_limits(), "human_note_chars": _engine._human_note_max(),
                    "seats": _engine.MAX_REQ_SEATS, "tools": _engine._TOOLS_MAX,
                    "apps": _engine._APPS_MAX, "options": _engine._OPTIONS_MAX,
                    # LLM 호출 1회 한도(초) — 요청이 청할 수 있는 최대값과, 안 주면 걸리는 서버 기본값(0=무제한).

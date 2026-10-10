@@ -98,6 +98,8 @@ if MAX_REQ_SEATS < 2:
 # ⚠ 이 **기본값**은 포털 DelibOpts.human_note(max_length) 이하여야 한다(포털 계약 시험이 이 줄을 읽어
 #   대조한다 — HWAXPortal docs/delib-engine-feedback D-7). 포털 상한 위로 올리려면 포털도 같이 올린다.
 HUMAN_NOTE_MAX = _env_int("DELIB_HUMAN_NOTE_MAX", 2000)
+# 위 값은 좁은 창의 상한이다. 안 적었으면 넓은 창(1백만 토큰)은 창에서 유도한다(_human_note_max — 회계는 _ROOM_SHARE).
+_HUMAN_NOTE_MAX_SET = bool(os.environ.get("DELIB_HUMAN_NOTE_MAX"))
 # 요청에 실린 나머지 값들의 상한 — 지정 도구·앱·후보안의 건수, 이전 요약·조항·후보안·좌석 역할의 길이.
 # 넘으면 앞에서부터 남기고 **줄였다는 것을 적어 둔다**(_resolve_opts 의 req_cut — 스트림이 카드로 알린다).
 # 종전엔 숫자가 _resolve_opts 안에 흩어져 있었고 말없이 잘랐다 — 도구 8개를 보낸 호출자는 6개만 돌았다는
@@ -232,6 +234,7 @@ _ROOM_SHARE = {
     "share": 0.06,      # 다른 좌석·앞 라운드의 조회 결과(_share_budget) — 좁은 창은 종전 식
     "tool": 0.04,       # 지정 도구 결과(_tool_inject_caps) — 바닥 도구당 2,000자·합 5,000자
     "summary": 0.03,    # 이어하기 요약(_summary_max) — 바닥 8,000자
+    "note": 0.01,       # 사람 의견(_human_note_max) — 바닥 HUMAN_NOTE_MAX
 }
 _evid_cache: dict = {}
 
@@ -303,6 +306,14 @@ def _tool_inject_caps() -> tuple[int, int]:
 def _summary_max() -> int:
     """이어하기 요약(이전 결정문)을 받는 길이(자) — 좁은 창은 종전 8,000자. 매 라운드 전 좌석에 실린다."""
     return _room("summary", _SUMMARY_MAX)
+
+
+def _human_note_max() -> int:
+    """사람 의견을 좌석에 싣는 상한(자), 0=무제한. 명시값(DELIB_HUMAN_NOTE_MAX)이 있으면 그 값이고, 없으면 좁은 창은 종전
+    2,000자, 넓은 창은 창에서 유도한다(1백만 토큰 창 9,692자 — 포털이 받는 8,000자를 다 싣는다). 매 라운드 전 좌석에 실린다."""
+    if HUMAN_NOTE_MAX <= 0 or _HUMAN_NOTE_MAX_SET:
+        return max(0, HUMAN_NOTE_MAX)
+    return _room("note", HUMAN_NOTE_MAX)
 
 
 def _pre_budget() -> int:
@@ -1094,7 +1105,8 @@ def _resolve_opts(req_opts):
             o.req_unread["voc"] = f"voc={_delib_preview(_voc, 40)}(대신 {o.voc} 로 돈다 — auto|off|always)"
         hn = req_opts.get("human_note")
         if isinstance(hn, str):
-            o.human_note = hn[:HUMAN_NOTE_MAX] if HUMAN_NOTE_MAX > 0 else hn
+            _hmax = _human_note_max()
+            o.human_note = hn[:_hmax] if _hmax > 0 else hn
             if len(o.human_note) < len(hn):
                 o.human_note_cut = (len(hn), o.human_note)
         # 좌석 지식카드 검색어 — 문자열(전 좌석 공통) 또는 좌석별 사전. 못 읽는 값·항목은 그 좌석이 화두로 찾고
@@ -4459,7 +4471,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      knob="human_note · DELIB_HUMAN_NOTE_MAX",
                      text=f"사람 의견 {_hn_full:,}자 중 앞 {_hn_kept:,}자만 좌석에 "
                           f"실었다 — 뒤 {_hn_full - _hn_kept:,}자는 좌석이 보지 못한다"
-                          f"(상한 {HUMAN_NOTE_MAX:,}자).")
+                          f"(상한 {_human_note_max():,}자).")
     # 키가 없어 앉히지 못한 지정 좌석 — 지정 좌석 갈래(위 `if opts.continue_personas`) **밖**에서 알린다.
     # 전부 걸러지면 그 갈래에 아예 안 들어가 발굴이 대신 앉힌다 — 지정하지 않은 패널로 끝까지 도는 가장
     # 나쁜 경우에 가장 조용했다(본문 없는 근거와 같은 모양이다).

@@ -50,12 +50,15 @@ def test_상한은_환경변수로_바꾸고_0_이면_자르지_않는다():
 
     def run(value):
         env = {k: v for k, v in os.environ.items() if k != "DELIB_HUMAN_NOTE_MAX"}
+        # 기본값은 모델 창을 따른다(넓은 창은 창에서 유도) — 박스에 떠 있는 모델과 무관하게 128K 로 고정한다
+        # (닫힌 포트로 창 조회를 실패시키면 LLM_CONTEXT_TOKENS 를 가정한다).
+        env.update(VLLM_BASE_URL="http://127.0.0.1:9/v1", LLM_CONTEXT_TOKENS="128000")
         if value is not None:
             env["DELIB_HUMAN_NOTE_MAX"] = value
         r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
                            timeout=120, env={**env, "PYTHONDONTWRITEBYTECODE": "1"})
         assert r.returncode == 0, r.stderr[-600:]
-        return r.stdout.split()
+        return r.stdout.strip().splitlines()[-1].split()      # 앞줄은 창 조회 실패 안내다
 
     assert run(None) == ["2000", "2000", "True"]          # 기본값 — 종전 그대로 2,000자
     assert run("6000") == ["6000", "6000", "True"]
