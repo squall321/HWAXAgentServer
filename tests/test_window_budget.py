@@ -609,3 +609,29 @@ def test_형식_밖_근거_키는_버리되_알린다():
     assert [e["key"] for e in o.evidence] == ["", "E4"]
     note = " ".join(o.req_unread.values())
     assert "1건" in note and "E 3]" in note, o.req_unread
+
+
+# ── 기록용 발언(say_full) — 필드를 골라 합성해 해석(reads)·우려·양보 불가 조항이 빠졌다 ───────────────────
+# say_full 은 잡 원장 → deliberate_transcript(full=true) → Claude 가 리스크 앱에 내는 패널 결과로 간다. 리스크 심사 좌석은
+# 지적을 해석(reads)에 적는데, 1라운드 say_full 은 관점·권장 둘뿐이었다(글자 상한이 아니라 필드를 골라서 빠졌다).
+_R1 = {"lens": "관점 문장.", "reads": ["해석 하나 [e:1]", {"claim": "해석 둘", "cite": "c:2"}, "해석 셋"],
+       "recommendation": "권장 문장.", "concerns": ["우려 A", "우려 B"], "position_short": "요약"}
+_R2 = {"concede": ["수용"], "rebut": [{"target": "rel-b", "quote": "인용 문구가 여기에 있다 " * 8, "counter": "반박",
+                                     "basis": "근거"}], "deepen": "심화"}
+_R3 = {"final_position": "최종 입장.", "non_negotiable": "양보 불가 조항", "vote": "진행", "stance": "조건부 동의"}
+
+
+def test_화면_버블은_종전_그대로다():
+    """특성화 — 구현 전 코드에서 뜬 해시(앞 16자리)."""
+    got = [hashlib.sha256(d._say_of(r, o).encode()).hexdigest()[:16] for r, o in ((1, _R1), (2, _R2), (3, _R3))]
+    assert got == ["8234c6d0f8ec953b", "a6ae4ad0022370ed", "d1ad40a2952a4dd6"], got
+
+
+def test_기록용_발언은_라운드가_요구한_필드를_전부_싣는다():
+    full1 = d._say_of(1, _R1, full=True)
+    for want in ("관점 문장.", "권장 문장.", "해석 하나 [e:1]", "해석 둘", "c:2", "해석 셋", "우려 A", "우려 B"):
+        assert want in full1, (want, full1)
+    full3 = d._say_of(3, _R3, full=True)
+    assert "양보 불가 조항" in full3 and "진행" in full3, full3          # 스탠스는 턴에 따로 실린다
+    full2 = d._say_of(2, _R2, full=True)
+    assert _R2["rebut"][0]["quote"].strip() in full2, "기록용 발언에서 반박 인용이 80자에서 끊겼다"

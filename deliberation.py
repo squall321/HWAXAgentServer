@@ -2358,9 +2358,10 @@ def _rebut_items(o: dict) -> list:
     return out
 
 
-def _item_text(x) -> str:
+def _item_text(x, quote_max: int = 80) -> str:
     """배열 항목 → 대화체 문구. 인용 반박 계약의 dict({target,quote,counter,basis})는
-    '누구의 어떤 발언에 대한 반박인지'가 읽히게 합성하고, 그 외 dict 는 key: value 나열."""
+    '누구의 어떤 발언에 대한 반박인지'가 읽히게 합성하고, 그 외 dict 는 key: value 나열.
+    quote_max — 인용을 앞 몇 자까지 보이나(회의 버블 80자, 0=전부 — 기록용 발언)."""
     if not isinstance(x, dict):
         return str(x or "")
     if x.get("counter") or x.get("quote"):
@@ -2368,7 +2369,7 @@ def _item_text(x) -> str:
         q = _norm_ws(x.get("quote"))
         c = str(x.get("counter") or "").strip()
         b = str(x.get("basis") or "").strip()
-        head = (f"{tgt}의 " if tgt else "") + (f"'{q[:80]}' 에 대해 —" if q else "")
+        head = (f"{tgt}의 " if tgt else "") + (f"'{q[:quote_max] if quote_max > 0 else q}' 에 대해 —" if q else "")
         parts = [p for p in (head.strip(), c, f"(근거: {b})" if b else "") if p]
         return " ".join(parts)
     return "; ".join(f"{k}: {v}" for k, v in x.items() if v)
@@ -2400,22 +2401,36 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
     """라운드별 구조화 발언 → 대화체 합성(회의 chat 렌더와 동일한 연결어).
     배열 필드는 전 항목을 잇는다 — 종전 first() 는 수용/반박의 첫 항목만 남기고 나머지를 버렸다.
     full=False(회의 버블): DELIB_CLIP_SCALE 배율 절단(_c). full=True(RA 회의록 등 기록):
-    무절단 합성 — 기록은 온전해야 하고, 저장 상한은 호출부(_TRANSCRIPT_CLIP)가 여유값으로 건다."""
+    무절단 합성 — 기록은 온전해야 하고, 저장 상한은 호출부(_TRANSCRIPT_CLIP)가 여유값으로 건다.
+    기록용은 그 라운드가 요구한 필드를 **전부** 싣는다(1R 해석·우려, 3R 양보 불가 조항, 반박 인용 전문). 종전엔
+    버블과 같은 필드만 골라, 리스크 심사 좌석이 지적을 적는 해석(reads)이 잡 원장·deliberate_transcript(full)·회의록
+    어디에도 없었다 — 글자 상한이 아니라 필드를 골라서 빠졌다. 버블(full=False)은 종전 그대로다."""
     BIG = 10 ** 9   # _clip_sent 의 공백 정규화는 유지하되 사실상 무절단
 
     def clip(v, n):
         return _clip_sent(v, BIG if full else _c(n))
 
     def joined(v):
+        qmax = 0 if full else 80
         if isinstance(v, list):
-            return "; ".join(_item_text(x) for x in v if x)
-        return _item_text(v) if v else ""
+            return "; ".join(_item_text(x, qmax) for x in v if x)
+        return _item_text(v, qmax) if v else ""
+
+    def listed(v):
+        """기록용 목록 — 항목마다 한 줄."""
+        items = v if isinstance(v, list) else ([v] if v else [])
+        return "\n".join(f"- {_item_text(x, 0)}" for x in items if x)
     # 부분 발언(관점/권장, 수용/반박/심화)은 빈 줄로 구분 — 버블·회의록에서 문단으로 보인다.
     if rnd == 1:
         say = clip(d.get("lens"), 260)
         rec = clip(d.get("recommendation"), 300)
         if rec:
             say = (say + f"\n\n저는 이렇게 봅니다 — {rec}").strip()
+        if full:
+            for label, key in (("해석", "reads"), ("우려", "concerns")):
+                body = listed(d.get(key))
+                if body:
+                    say = (say + f"\n\n{label} —\n{body}").strip()
     elif rnd == 2:
         parts = []
         con = clip(joined(d.get("concede")), 200)
@@ -2433,6 +2448,10 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
         vote = clip(d.get("vote"), 160)
         if vote:
             say = (say + f"\n\n최종 권장 — {vote}").strip()
+        if full:
+            body = clip(joined(d.get("non_negotiable")), 0)     # 스탠스는 턴에 따로 실린다(stance)
+            if body:
+                say = (say + f"\n\n양보 불가 — {body}").strip()
     return say or clip(d.get("say"), 400) or "(발언 파싱 실패)"
 
 
