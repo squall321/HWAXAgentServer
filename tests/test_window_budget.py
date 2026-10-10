@@ -635,3 +635,22 @@ def test_기록용_발언은_라운드가_요구한_필드를_전부_싣는다()
     assert "양보 불가 조항" in full3 and "진행" in full3, full3          # 스탠스는 턴에 따로 실린다
     full2 = d._say_of(2, _R2, full=True)
     assert _R2["rebut"][0]["quote"].strip() in full2, "기록용 발언에서 반박 인용이 80자에서 끊겼다"
+
+
+# ── 요청 값의 항목 길이 — 양보 불가 조항 1,200자·후보안 400자·지정 좌석 역할 2,000자 ─────────────────────
+def test_넓은_창은_요청_값의_항목을_길이로_자르지_않는다():
+    _win(_BIG)
+    o = d._resolve_opts({"non_negotiables": ["조" * 3000], "options": ["안" * 1000, "B안"],
+                         "personas": [{"key": "mech-a", "role": "역" * 5000}]})
+    assert o.continue_non_negotiables == ["조" * 3000] and o.options[0] == "안" * 1000
+    assert o.continue_personas[0]["role"] == "역" * 5000
+    assert not o.req_cut, o.req_cut
+
+
+def test_좁은_창은_요청_값의_항목을_종전대로_자르고_알린다():
+    _win(128000)
+    o = d._resolve_opts({"non_negotiables": ["조" * 3000], "options": ["안" * 1000, "B안"],
+                         "personas": [{"key": "mech-a", "role": "역" * 5000}]})
+    assert len(o.continue_non_negotiables[0]) == d._NN_ITEM_MAX and len(o.options[0]) == d._OPTION_ITEM_MAX
+    assert len(o.continue_personas[0]["role"]) == d._ROLE_REQ_MAX
+    assert {"non_negotiables", "options", "personas"} <= set(o.req_cut), o.req_cut

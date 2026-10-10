@@ -1148,11 +1148,16 @@ def _resolve_opts(req_opts):
                 o.req_cut["continue_summary"] = (f"이전 심의 요약(continue_summary) {len(cs):,}자 중 "
                                                  f"앞 {_smax:,}자만")
         # 이전 심의의 양보 불가 조항(F11) — 요약 문자열에 섞으면 소실되므로 별도 필드로 받는다.
+        # 항목 길이 상한(조항·후보안·지정 좌석 역할)은 좁은 창의 값이다 — 넓은 창(_wide)은 항목 하나를 이어하기 요약이
+        # 받는 길이(_summary_max — 1백만 토큰 창 29,077자)까지 받는다(건수 상한은 그대로다 — 표결 목록·동시 호출 수라는
+        # 설계 값이다). 넘으면 종전대로 카드가 알린다.
+        _nn_item, _opt_item, _role_item = ((_summary_max(),) * 3 if _wide()
+                                           else (_NN_ITEM_MAX, _OPTION_ITEM_MAX, _ROLE_REQ_MAX))
         nn = req_opts.get("non_negotiables") or req_opts.get("continue_non_negotiables")
         if isinstance(nn, list):
             _nn = [str(x) for x in nn if str(x).strip()]
-            o.continue_non_negotiables = [x[:_NN_ITEM_MAX] for x in _nn][:_NN_MAX]
-            _cut = _cut_note("양보 불가 조항(non_negotiables)", _nn, _NN_MAX, _NN_ITEM_MAX)
+            o.continue_non_negotiables = [x[:_nn_item] if _nn_item else x for x in _nn][:_NN_MAX]
+            _cut = _cut_note("양보 불가 조항(non_negotiables)", _nn, _NN_MAX, _nn_item)
             if _cut:
                 o.req_cut["non_negotiables"] = _cut
         cp = req_opts.get("personas")
@@ -1172,7 +1177,8 @@ def _resolve_opts(req_opts):
                                   if isinstance(_bad, dict) else f"객체가 아님({type(_bad).__name__})")
             _cp_ok = [p for p in _keyed if _seat_key(p) != _adv_key]
             o.continue_personas = [{"key": _seat_key(p)[:120],
-                                    "role": str(p.get("role") or "")[:_ROLE_REQ_MAX],
+                                    "role": (str(p.get("role") or "")[:_role_item] if _role_item
+                                             else str(p.get("role") or "")),
                                     "origin": (p["origin"] if p.get("origin") in _ORIGIN_KINDS
                                                else "carry")}
                                    for p in _cp_ok[:MAX_REQ_SEATS]]
@@ -1181,7 +1187,7 @@ def _resolve_opts(req_opts):
             o.seats_clamped = [_seat_key(p) for p in _cp_ok[MAX_REQ_SEATS:]]
             # 상태줄은 잡 원장의 최근 30줄 창 밖으로 밀려난다 — MCP 호출자가 보게 카드에도 싣는다.
             _cut = _cut_note("좌석(personas)", [str(p.get("role") or "") for p in _cp_ok], MAX_REQ_SEATS,
-                             _ROLE_REQ_MAX, unit="석", item="역할", dropped=o.seats_clamped,
+                             _role_item, unit="석", item="역할", dropped=o.seats_clamped,
                              knob="DELIB_MAX_SEATS")
             if _cut:
                 o.req_cut["personas"] = _cut
@@ -1190,8 +1196,9 @@ def _resolve_opts(req_opts):
         if isinstance(op, str):
             op = [x.strip() for x in re.split(r"\s*\|\s*|\n+", op) if x.strip()]
         if isinstance(op, list):
-            o.options = [str(x).strip()[:_OPTION_ITEM_MAX] for x in op[:_OPTIONS_MAX] if str(x).strip()]
-            _cut = _cut_note("후보안(options)", [str(x).strip() for x in op], _OPTIONS_MAX, _OPTION_ITEM_MAX)
+            o.options = [(str(x).strip()[:_opt_item] if _opt_item else str(x).strip())
+                         for x in op[:_OPTIONS_MAX] if str(x).strip()]
+            _cut = _cut_note("후보안(options)", [str(x).strip() for x in op], _OPTIONS_MAX, _opt_item)
             if _cut:
                 o.req_cut["options"] = _cut
         tl = req_opts.get("tools")
