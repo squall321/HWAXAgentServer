@@ -361,3 +361,25 @@ def test_좁은_창은_인자_스키마를_종전대로_줄이되_말한다():
     brief = d._tool_schema_brief(_SchemaTool())
     assert all(f"- a{i:02d}" in brief for i in range(12)) and "- a12" not in brief
     assert "인자 20개 중 앞 12개" in brief
+
+
+# ── 이어하기 요약(이전 결정문) — 8,000자 ─────────────────────────────────────────────────
+def test_넓은_창은_이어하기_요약을_창에서_유도한_길이까지_받는다():
+    """리스크 심사 결정문은 산문 뒤에 risk_spec JSON 이 붙어 8,000자를 쉽게 넘는다 — 뒤의 risk_spec 이 잘렸다."""
+    _win(_BIG)
+    cap = d._summary_max()
+    assert cap > 8000
+    o = d._resolve_opts({"continue_summary": "가" * (cap - 1) + "끝"})
+    assert o.continue_summary.endswith("끝") and not o.req_cut
+    o = d._resolve_opts({"continue_summary": "가" * (cap + 5)})
+    assert len(o.continue_summary) == cap and f"{cap + 5:,}자 중" in o.req_cut["continue_summary"], o.req_cut
+
+
+def test_넓은_창은_의장_실패_결정문_자리도_이어하기가_받는_만큼_싣는다():
+    rows = [(f"seat{i:02d}", "가" * 2000 + f"<끝{i}>") for i in range(10)]
+    _win(_BIG)
+    text = d._chair_fail_text("시간 초과", 2, "좌석 10석", rows, "3R 최종")
+    assert all(f"<끝{i}>" in text for i in range(10)) and len(text) <= d._summary_max()
+    _win(128000)
+    text = d._chair_fail_text("시간 초과", 2, "좌석 10석", rows, "3R 최종")
+    assert len(text) <= 8000 and "<끝0>" not in text

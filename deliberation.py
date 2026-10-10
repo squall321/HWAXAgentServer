@@ -1113,10 +1113,13 @@ def _resolve_opts(req_opts):
                                               f"(대신 {o.chair_template} 로 돈다)")
         cs = req_opts.get("continue_summary")
         if isinstance(cs, str):
-            o.continue_summary = cs[:_SUMMARY_MAX]
-            if len(cs) > _SUMMARY_MAX:
+            # 받는 길이는 창에서 유도한다(_summary_max — 좁은 창 8,000자, 1백만 토큰 창 29,077자). 이 글은 매 라운드
+            # 전 좌석에 실린다. 종전엔 1백만 토큰 창에서도 8,000자라 결정문 뒤의 risk_spec·sim_spec 이 잘렸다.
+            _smax = _summary_max()
+            o.continue_summary = cs[:_smax]
+            if len(cs) > _smax:
                 o.req_cut["continue_summary"] = (f"이전 심의 요약(continue_summary) {len(cs):,}자 중 "
-                                                 f"앞 {_SUMMARY_MAX:,}자만")
+                                                 f"앞 {_smax:,}자만")
         # 이전 심의의 양보 불가 조항(F11) — 요약 문자열에 섞으면 소실되므로 별도 필드로 받는다.
         nn = req_opts.get("non_negotiables") or req_opts.get("continue_non_negotiables")
         if isinstance(nn, list):
@@ -1928,13 +1931,13 @@ def _chair_fail_text(why: str, tries: int, seat_note: str, rows: list, label: st
 
     rows 는 [(좌석 키, 마지막 라운드 발언 직렬화)], label 은 그 라운드의 이름이다. 결정이 아니라는 것을 맨 앞에
     적는다 — 이 글이 보고서의 권고 칸과 잡 원장의 결정문 칸에 들어가고, 이어하기는 이 글을 이전 요약으로 싣는다.
-    그래서 이어하기가 받는 길이(_SUMMARY_MAX) 안에 들게 좌석마다 같은 몫으로 줄인다 — 앞 좌석만 온전하고 뒤
+    그래서 이어하기가 받는 길이(_summary_max — 창에서 유도) 안에 들게 좌석마다 같은 몫으로 줄인다 — 앞 좌석만 온전하고 뒤
     좌석이 통째로 잘리면, 다시 수렴시킬 재료에서 그 도메인이 빠진다. 발언 전문은 회의록·전사에 있다."""
     head = (f"■ 의장 결정문 없음 — 의장이 결정문을 내지 못했다({why} · 의장 호출 {tries}번).\n"
             "아래는 결정이 아니라 **좌석별 마지막 입장 그대로**다(의장이 종합하지 못했다). 라운드 발언 전문은 "
             "보고서 회의록과 심의 전사에 남아 있다. 호출당 타임아웃을 늘려 이어하기로 다시 수렴시키면 결정문을 "
             f"받는다.\n\n[{seat_note}]\n\n[{label} — 좌석별 입장]\n")
-    room = _SUMMARY_MAX - len(head) - sum(len(k) + 30 for k, _t in rows)      # 줄 머리·절단 표식 몫을 먼저 뗀다
+    room = _summary_max() - len(head) - sum(len(k) + 30 for k, _t in rows)    # 줄 머리·절단 표식 몫을 먼저 뗀다
     fit, _share = _fit_rows(rows, max(room, 1), floor=200)
     return head + "\n".join(f"• {k}: {t}" for k, t in fit)
 
