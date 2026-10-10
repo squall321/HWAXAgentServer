@@ -150,6 +150,29 @@ def test_좁은_창에서_이력_항목을_끊으면_원문_길이를_적는다(
     assert f"{len(_ITEM):,}자" in body, body[-80:]
 
 
+@pytest.mark.parametrize("tokens", (16384, _BIG))
+def test_가장_최근_이력_항목도_예산을_넘으면_원문_길이를_적고_줄인다(tokens):
+    """kept 가 비어 있으면 첫(가장 최근) 항목을 예산과 상관없이 통째로 넣었다. 포털은 항목을 4,194,304자까지 받으므로
+    창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음 턴의 최신 이력이 되어 이후 턴과 자동
+    재시도까지 같은 400 으로 끝났다(새 대화를 열기 전까지)."""
+    _win(tokens)
+    big = "가" * 1_500_000 + "[항목-끝]"
+    st: dict = {}
+    msgs = app._history_messages([{"role": "user", "content": "질문"}, {"role": "user", "content": big}], st)
+    total = sum(len(c) for _, c in msgs)
+    assert total <= st["budget"], f"{total:,}자가 이력 예산 {st['budget']:,}자를 넘었다"
+    assert app._est_tokens("".join(c for _, c in msgs)) < tokens
+    assert f"{len(big):,}자 중 앞" in msgs[-1][1], msgs[-1][1][-80:]
+    assert st.get("cut") == len(big), st
+
+
+def test_가장_최근_이력_항목을_줄였으면_챗이_경고로_알린다():
+    src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    i = src.index("_hist_msgs = _history_messages(req.history, _hstat")
+    blk = src[i:i + 1500]
+    assert '_hstat.get("cut")' in blk and '"history_item_cut"' in blk, blk
+
+
 def test_자동_재시도와_강제_재시도도_문서가_있는_턴의_이력_몫을_쓴다():
     """문서가 시스템 프롬프트에 실렸는데 재시도만 이력을 문서 없는 몫(0.85)으로 다시 만들어 창을 넘겼다."""
     src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")

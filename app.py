@@ -52,6 +52,7 @@ from deliberation import (
     N_PERSONAS,
     _EVID_ITEM_MAX,
     _cut_mark,
+    _CUT_MARK_ROOM,
     _narrow_cap,
     _wide,
     _PHANTOM_ID_MARK,
@@ -2005,9 +2006,11 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     HIST_MAX_ITEMS. 전체는 최신 것 우선으로 예산 안에 담고, **밀려난 오래된 턴은 버리지 않고
     압축본 한 덩어리로** 맨 앞에 넣는다(_compact_turns).
 
-    stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다.
+    stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다. 가장 최근 항목 하나가
+    원문 몫(verbatim)을 넘어 줄였으면 "cut"(그 항목의 원문 길이)도 채운다.
     """
     items: list[tuple[str, str]] = []
+    raws: list[str] = []                    # 항목 상한 전의 원문 — 최근 항목을 다시 줄일 때 원문 길이를 적는다
     # 항목 하나의 상한 — 좁은 창은 HIST_ITEM_MAX(종전 24,000자), 넓은 창은 그 턴의 이력 예산이 지킨다(항목 상한 없음).
     # 포털은 항목을 창 하나까지 받는데(HWAXPortal ee24499) 종전엔 1백만 토큰 창에서도 24,000자에서 '…' 로 끊어, 이력의
     # 결정문 뒤쪽이 빠졌다. 끊으면 원문 길이를 적는다.
@@ -2019,17 +2022,25 @@ def _history_messages(history: list[dict], stats: dict | None = None,
         if role not in ("user", "assistant") or not isinstance(content, str) or not content:
             continue
         items.append((role, _cut_mark(content, _item_cap)))
-    items = items[-HIST_MAX_ITEMS:]
+        raws.append(content)
+    items, raws = items[-HIST_MAX_ITEMS:], raws[-HIST_MAX_ITEMS:]
 
     budget = _hist_budget_chars("".join(c for _, c in items[-6:]), has_docs)
     verbatim_budget = int(budget * (1.0 - HIST_COMPACT_SHARE))
     kept: list[tuple[str, str]] = []
     used = 0
     cut = len(items)                        # 이 앞의 것들이 압축 대상
+    item_cut = 0
     for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
         role, content = items[idx]
-        if used + len(content) > verbatim_budget and kept:
-            break
+        if used + len(content) > verbatim_budget:
+            if kept:
+                break
+            # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
+            # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
+            # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
+            content = _cut_mark(raws[idx], max(1, verbatim_budget - _CUT_MARK_ROOM))
+            item_cut = len(raws[idx])
         kept.append((role, content))
         used += len(content)
         cut = idx
@@ -2040,6 +2051,8 @@ def _history_messages(history: list[dict], stats: dict | None = None,
         kept.insert(0, ("user", digest))
     if stats is not None:
         stats.update(kept=len(items) - cut, compacted=cut, budget=budget)
+        if item_cut:
+            stats["cut"] = item_cut
     return kept
 
 
@@ -2952,6 +2965,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             yield _sse("status", {"step": f"이전 대화 {_hstat['compacted']}턴은 길이 때문에 "
                                           f"발췌로 압축해 넣었습니다(최근 {_hstat['kept']}턴은 원문)",
                                   "tool": None})
+        if _hstat.get("cut"):
+            yield _sse("warning", {"code": "history_item_cut",
+                                   "message": f"가장 최근 대화 항목이 {_hstat['cut']:,}자라 이력 예산"
+                                              f"({_hstat['budget']:,}자)을 넘어 앞부분만 실었습니다 — 뒷부분이 "
+                                              "필요하면 나눠서 다시 보내 주세요.",
+                                   "knob": "HIST_CTX_SHARE_SOLO·HIST_CTX_SHARE(이력 몫)"})
         _hist_tokens = _est_tokens("".join(c for _, c in _hist_msgs))
         _docs = _doc_block(req.documents, _hist_tokens)
         if _docs:
