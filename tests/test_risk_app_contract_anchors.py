@@ -52,3 +52,15 @@ def test_지식카드_집계의_키와_카드_근거의_꼬리가_그대로다(m
     cards = [data["source"] for ev, data in events if ev == "delib" and data.get("kind") == "evidence"
              and str(data.get("source", "")).endswith(_KN_SOURCE_TAIL)]
     assert sorted(cards) == ["mech-a · 지식카드", "rel-b · 지식카드"], cards
+
+
+# ── 근거 프레임 source 의 글자열 — 리스크 앱이 근거를 좌석·원천에 귀속하는 규칙이 이 셋을 본다 ─────────────────
+def test_리스크_앱이_귀속에_쓰는_근거_source_글자열이_그대로다(monkeypatch, tmp_path):
+    """지식카드(`<키> · 지식카드`)·자유 조회 실패(`<키> · 자유 조회 실패`)·호출자 근거 되울림(`챗 정리 · <원천>`).
+    예제 파일(tests/fixtures/risk_contract/panel_frames.jsonl)을 뜨는 실행과 같은 실행으로 본다."""
+    from test_risk_contract_frames import _panel_frames
+    srcs = {str(data.get("source", "")) for ev, data in _panel_frames(monkeypatch, tmp_path)
+            if ev == "delib" and data.get("kind") == "evidence"}
+    assert "mech-a · 지식카드" in srcs, sorted(srcs)
+    assert "rel-b · 자유 조회 실패" in srcs, sorted(srcs)
+    assert "챗 정리 · 변경 비교 요약" in srcs, sorted(srcs)
