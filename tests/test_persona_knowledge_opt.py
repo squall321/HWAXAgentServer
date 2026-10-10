@@ -163,3 +163,61 @@ def test_잡_기록에는_보낸_값이_아니라_걸린_값이_남는다(monkey
     assert "agent_search" not in r.tools, "off 로 껐는데 지식카드를 조회했다"
     card = next(x for x in r.job["evidence_omitted"] if x.get("source") == _UNREAD)
     assert "free_tools=끔" in card["text"] and "voc=0" in card["text"], card
+
+
+# ── 물은 좌석마다 상태줄에 지식카드 집계(knowledge)를 싣는다 — 리스크 앱이 좌석별 적중 수를 세는 원천이다 ──────────
+# 수는 상태줄 글(`지식카드 1/3 — mech-a 확보`)에만 있고 필드가 없어, 리스크 앱의 knowledge_hits_n 이 늘 비었다(R-43).
+_KN_SEATS = [{"key": "mech-a", "role": "기구"}, {"key": "rel-b", "role": "신뢰성"},
+             {"key": "therm-c", "role": "열"}]
+_TWO_HITS = ('{"hits": [{"record_id": "R-1", "section_id": "S1", "title": "카드 A", "snippet": "본문 A"}, '
+             '{"record_id": "R-2", "section_id": "S2", "title": "카드 B", "snippet": "본문 B"}]}')
+
+
+class _BySeat(_Tool):
+    """좌석마다 다른 답을 주는 agent_search — mech-a 적중 2건 · rel-b 0건 · 그 밖은 오류(폴백도 오류)."""
+
+    def __init__(self):
+        super().__init__("agent_search")
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        return {"mech-a": _TWO_HITS, "rel-b": '{"hits": []}'}.get(
+            args["agent_type"], "(tool agent_search error: 연결 거절)")
+
+
+def _kn_frames(events):
+    return {data["knowledge"]["persona"]: data["knowledge"] for ev, data in events
+            if ev == "status" and isinstance(data.get("knowledge"), dict)}
+
+
+def test_물은_좌석마다_상태줄에_지식카드_집계가_실린다(monkeypatch):
+    events = _stream(monkeypatch, {"personas": _KN_SEATS}, tools={"agent_search": _BySeat()})
+    got = _kn_frames(events)
+    assert got == {
+        "mech-a": {"persona": "mech-a", "hits": 2, "degraded": False, "query": "question"},
+        "rel-b": {"persona": "rel-b", "hits": 0, "degraded": False, "query": "question"},
+        "therm-c": {"persona": "therm-c", "hits": 0, "degraded": True, "query": "question"},
+    }, got
+    # 종전 글은 그대로다 — 필드만 더했다.
+    line = next(data for ev, data in events if ev == "status" and (data.get("knowledge") or {}).get("persona") == "mech-a")
+    assert line["step"].endswith("— mech-a 확보") and line["tool"] is None, line
+
+
+def test_호출자_검색어로_찾은_좌석은_query_가_caller_다(monkeypatch):
+    events = _stream(monkeypatch, {"personas": _KN_SEATS, "knowledge_query": {"rel-b": "신뢰성 검색어"}},
+                     tools={"agent_search": _BySeat()})
+    assert {k: v["query"] for k, v in _kn_frames(events).items()} == {
+        "mech-a": "question", "rel-b": "caller", "therm-c": "question"}
+
+
+def test_묻지_않은_합성_지정석에는_집계가_없다(monkeypatch):
+    events = _stream(monkeypatch, {"chair_template": "risk-review"}, tools={"agent_search": _BySeat()})
+    seated = next(data["personas"] for ev, data in events if ev == "status" and data.get("personas"))
+    assert "delib-baseline-defender" in seated, "지정석이 앉지 않았다 — 시험 전제가 깨졌다"
+    assert set(_kn_frames(events)) == {"mech-a", "rel-b"}, _kn_frames(events)
+
+
+def test_지식카드를_끄면_집계_프레임도_없다(monkeypatch):
+    events = _stream(monkeypatch, {"personas": _KN_SEATS, "persona_knowledge": 0},
+                     tools={"agent_search": _BySeat()})
+    assert _kn_frames(events) == {}

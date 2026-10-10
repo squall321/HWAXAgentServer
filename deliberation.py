@@ -4199,6 +4199,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
                             + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음")),
                     "tool": None,
+                    # 리스크 앱이 좌석별 적중 수를 세는 원천이다(HWAXRisk engine_client.collect_stream).
+                    # 키 넷의 이름을 바꾸면 그쪽 집계가 말없이 비고, tests/test_risk_app_contract_anchors 가 잡는다.
+                    # hits 는 검색 건수가 아니라 좌석 프롬프트에 실은 줄 수다(중복 제거·글자 예산 뒤). degraded 는
+                    # 강등 사유가 있을 때 참이고, 폴백으로 되물어 줄을 받은 좌석은 hits > 0 과 같이 온다.
+                    "knowledge": {"persona": _k, "hits": _n, "degraded": bool(_note), "query": _qsrc},
                     # 시간 한도에 걸린 강등이면 그 한도의 설정 이름을 싣는다(잡 원장이 붙인다). 사유 문구는
                     # _agent_search_hits 가 만든다 — 시간 초과는 '…초 초과' 로 적힌다.
                     **({"knob": "KNOWLEDGE_TIMEOUT_S"} if "초 초과" in _note else {})})
