@@ -1785,6 +1785,35 @@ def _first_dict(x):
     return {}
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?[ \t]*```", re.S)
+
+
+def _last_top_object(s: str):
+    """s 에서 마지막 최상위 균형 {…} 구간 (시작, 끝) — 한 번 훑는다(선형). 객체 밖의 따옴표는 세지 않는다(산문의 따옴표에
+    안 흔들리게). 객체 안에서는 문자열 속 중괄호를 건너뛴다. 없으면 None."""
+    depth, in_str, esc, start, last = 0, False, False, -1, None
+    for i, ch in enumerate(s):
+        if depth:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    last = (start, i + 1)
+        elif ch == "{":
+            depth, start = 1, i
+    return last
+
+
 def _parse_json(text: str):
     """LLM 출력에서 JSON 객체를 관대하게 추출. 최상위 균형 객체들을 앞에서부터 스캔해
     마지막 것을 취한다 — 산문 선행 출력(DELIB_PROSE_FIRST)의 '마지막에 JSON' 계약과 맞고,
@@ -1797,10 +1826,30 @@ def _parse_json(text: str):
         return json.loads(s)  # 배열/객체 전체가 유효 JSON 이면 그대로
     except Exception:
         pass
+    # 선형으로 끝나는 길을 먼저 본다 — 마지막 최상위 {…} 구간, 그다음 마지막 펜스(```json … ```) 블록. 아래 폴백 스캔은
+    # 길이 상한이 있어(종전엔 앞 100,000자) 긴 산문 뒤의 JSON('마지막에 JSON' 계약)과 100,000자를 넘는 JSON 을 못 찾고
+    # 구조화 실패로 떨어졌다(1백만 토큰 창의 긴 발언이 그렇게 강등됐다).
+    span = _last_top_object(s)
+    if span:
+        try:
+            obj = json.loads(s[span[0]:span[1]])
+            if isinstance(obj, dict) and not s[span[1]:].strip(" \t\r\n`"):
+                return obj
+        except Exception:
+            pass
+    for m in reversed(list(_JSON_FENCE_RE.finditer(s))):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
     # 병리 입력(미종결 문자열 반복 등)에서 스캔이 O(n²) — 유효 JSON 전체는 위 快경로가 이미
-    # 처리했으므로 폴백 스캔에만 상한을 건다(96KB→168ms, 300KB→1.6s 실측).
+    # 처리했으므로 폴백 스캔에만 상한을 건다(96KB→168ms, 300KB→1.6s 실측). '마지막 JSON' 을 찾는 스캔이라
+    # **뒤쪽** 100,000자를 훑는다(종전엔 앞을 남겼다).
     if len(s) > 100_000:
-        s = s[:100_000]
+        print(f"[deliberation] JSON 폴백 스캔 — 출력 {len(s):,}자 중 뒤 100,000자만 훑는다")
+        s = s[-100_000:]
     dec = json.JSONDecoder()
     found = None
     i = s.find("{")

@@ -567,3 +567,30 @@ def test_넓은_창의_메뉴가_지금_걸리는_사람_의견_상한을_알린
     _win(_BIG)
     menu = asyncio.run(m.deliberate_jobs())
     assert menu["limits"]["human_note_chars"] == d._human_note_max() > 2000
+
+
+# ── 좌석 출력의 JSON 찾기 — 앞 100,000자만 훑었다 ──────────────────────────────────────────
+_BIGJ = {"lens": "관점", "reads": [f"<{i:05d}> " + "해석" * 40 for i in range(1500)], "recommendation": "권장"}
+
+
+def test_펜스_안의_긴_JSON_도_읽는다():
+    import json
+    txt = "산문 " * 100 + "\n```json\n" + json.dumps(_BIGJ, ensure_ascii=False) + "\n```"
+    assert len(txt) > 100000
+    got = d._parse_json(txt)
+    assert isinstance(got, dict) and len(got.get("reads") or []) == 1500, type(got)
+
+
+def test_긴_산문_뒤의_JSON_도_읽는다():
+    import json
+    txt = "긴 산문 논증. " * 15000 + json.dumps({"lens": "끝의 관점", "recommendation": "권장"}, ensure_ascii=False)
+    assert len(txt) > 100000
+    assert (d._parse_json(txt) or {}).get("lens") == "끝의 관점"
+
+
+def test_산문_뒤의_긴_JSON_은_안쪽_객체가_아니라_바깥_객체다():
+    import json
+    txt = "산문 논증. " * 100 + json.dumps({**_BIGJ, "reads": [{"r": i, "t": "가" * 80} for i in range(1500)]},
+                                         ensure_ascii=False)
+    got = d._parse_json(txt)
+    assert isinstance(got, dict) and got.get("lens") == "관점" and len(got["reads"]) == 1500
