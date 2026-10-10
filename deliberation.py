@@ -3691,7 +3691,39 @@ def _gather_block(good: list) -> tuple[str, int]:
     heads = [f"- {n}({ap}): " for n, ap, _b in good]
     room = _lookup_budget() - sum(len(h) + 31 for h in heads)          # 머리줄·절단 표식·줄바꿈 몫을 먼저 뗀다
     rows, share = _fit_rows([(h, b) for h, (_n, _a, b) in zip(heads, good)], max(room, 1), floor=200)
-    return "\n".join(h + t for h, t in rows), share
+    out = []
+    for (h, t), (_n, _a, b) in zip(rows, good):
+        cap = _capped_at(b)
+        if cap and t != b:
+            # 조회 턴에서 이미 잘린 결과를 다시 줄였다 — 원문 길이는 꼬리 경고에만 있어 함께 잘려 나갔다. 표식에 도구가 낸
+            # 원문 길이를 적는다(종전엔 잘린 글의 길이 — 1백만 토큰 창에서 60만 자 결과가 '200,1xx자 중' 으로 읽혔다).
+            kept = min(share, cap[1])
+            t = b[:kept].rstrip() + f" …[{cap[0]:,}자 중 앞 {kept:,}자]"
+        out.append(h + t)
+    return "\n".join(out), share
+
+
+# 조회 턴 도구 래퍼(app._cap)가 자른 글의 꼬리 — app._CAP_MARK 와 그 뒤 문구다(app 은 늦게 import 해서 글자로 둔다 —
+# tests/test_lookup_orig_len 이 app._cap 의 실제 출력으로 맞춰 본다).
+_CAP_TAIL_RE = re.compile(r"\n…\[경고: 도구 출력이 ([\d,]+)자였고 ([\d,]+)자에서 잘렸습니다\.")
+
+
+def _capped_at(out) -> tuple | None:
+    """조회 턴 래퍼(app._cap)가 자른 결과면 (도구 원문 길이, 자른 자리), 아니면 None. 원문 길이는 꼬리의 경고에만 남는다 —
+    발언 턴이 앞을 남기며 다시 줄이면 그 경고가 잘려 나가므로 먼저 읽는다(engine-budget A23-6). 경고는 자른 자리 바로
+    뒤에서 시작해야 그 래퍼의 것이다(본문 속 같은 글자열에 속지 않는다)."""
+    s = out if isinstance(out, str) else str(out or "")
+    m = _CAP_TAIL_RE.search(s, max(0, len(s) - 400))
+    if not m:
+        return None
+    full, lim = int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
+    return (full, lim) if m.start() == lim and full > lim else None
+
+
+def _orig_len(out) -> int:
+    """좌석 조회 결과의 원문 길이 — 조회 턴에서 잘렸으면 도구가 낸 길이, 아니면 글 길이."""
+    cap = _capped_at(out)
+    return cap[0] if cap else len(out if isinstance(out, str) else str(out or ""))
 
 def _dom_of(key: str) -> str:
     """페르소나 키의 도메인 접두사 — disp-burnin → disp. 커버리지 판정의 단위다."""
@@ -5251,7 +5283,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             #   몫 전체). 원문을 담으면 20석 6라운드 심의 하나가 17MB~218MB 를 심의 내내 붙잡는다.
                             gather_pool.append((rnd, _k, _tn, _ap, _out[:max(_SHARE_ITEM_MAX * 2,
                                                                              _room("share", 0) if _wide() else 0)]))
-                            gather_lens[(rnd, _k, _tn, _ap)] = len(_out)
+                            gather_lens[(rnd, _k, _tn, _ap)] = _orig_len(_out)     # 조회 턴에서 잘렸으면 도구 원문 길이
                         if (opts.chair_template == "risk-review" and _tn in _RISK_READ_TOOLS["heax-hwax_risk"]
                                 and _risk_not_visible(_out) and f"{_k}·{_tn}" not in _nv_round):
                             _nv_round.append(f"{_k}·{_tn}")
@@ -5262,7 +5294,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         _gd = _gather_good(_calls)
                         _gsh = _gather_block(_gd)[1]
                         if _gsh:
-                            _gcut.append((_k, len(_gd), sum(len(b) for _n, _a, b in _gd), _gsh))
+                            _gcut.append((_k, len(_gd), sum(_orig_len(b) for _n, _a, b in _gd), _gsh))
             finally:  # 클라이언트 중단 시 잔여 자유조회 정리 — _round_live 와 같은 처리
                 for _t in _gt:
                     if not _t.done():
