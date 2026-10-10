@@ -333,8 +333,11 @@ def _evid_budget() -> int:
 
 
 def _chat_ctx_budget() -> int:
-    """챗 맥락 몫. 같은 통에서 나눠 쓰므로 근거와 합쳐도 컨텍스트를 안 넘는다."""
-    return min(CHAT_CONTEXT_BUDGET, max(1000, int(_pre_budget() * _CHAT_CTX_SHARE)))
+    """챗 맥락 몫. 같은 통에서 나눠 쓰므로 근거와 합쳐도 컨텍스트를 안 넘는다.
+    천장(DELIB_CHAT_CONTEXT_BUDGET)은 명시했을 때만 건다 — 기본 150,000자가 1백만 토큰 창에서만 걸려, 사전 컨텍스트의
+    챗 몫(약 187,000자)이 남아도 긴 대화의 뒤쪽이 빠졌다. 좁은 창에서는 유도값이 늘 그보다 작다(종전과 같다)."""
+    n = max(1000, int(_pre_budget() * _CHAT_CTX_SHARE))
+    return min(CHAT_CONTEXT_BUDGET, n) if _CHAT_CONTEXT_BUDGET_SET else n
 _EVID_SHOW = _env_int("DELIB_EVID_SHOW", 4000)            # 화면 근거 카드 표시 상한(자)
 
 # 깊이 회복 손잡이(GLM 리뷰 §5 검증 통과분) — 전부 기본 0(종전 동작). GLM급은 다중 제약
@@ -649,8 +652,12 @@ _ALLOWED_MODIFIERS = set(_MODIFIER_BLOCKS)
 # 종전 6,000자는 1M 창의 0.6% 라, 긴 대화를 넘겨도 좌석에는 몇 턴만 닿았다. 사용자가
 # "문장 하나만 넘기는 것처럼 보인다" 고 한 게 이것이다.
 CHAT_CONTEXT_BUDGET = _env_int("DELIB_CHAT_CONTEXT_BUDGET", 150000)
+_CHAT_CONTEXT_BUDGET_SET = bool(os.environ.get("DELIB_CHAT_CONTEXT_BUDGET"))
+# 발화 하나당 상한 — 좁은 창의 값이다. 넓은 창(_wide)은 발화마다 끊지 않고 챗 몫(_chat_ctx_budget) 하나로만 지킨다
+# (포털은 메시지를 65,536자까지 받는다 — 사람이 붙여 넣은 긴 사양이 앞 4,000자만 갔다). 끊으면 원문 길이를 적는다.
 _CHAT_TURN_MAX = _env_int("DELIB_CHAT_TURN_MAX", 4000)     # 사람 발화 하나당 상한(종전 1,200)
 _CHAT_BOT_MAX = _env_int("DELIB_CHAT_BOT_MAX", 2500)       # 챗 답변 하나당 상한(종전 900)
+_CHAT_ITEMS_MAX, _CHAT_ITEMS_MAX_WIDE = 60, 2000           # 대화에서 읽는 발화 수(최근부터) — 좁은 창·넓은 창
 _CHAT_CTX_SHARE = _env_float("DELIB_CHAT_CTX_SHARE", 0.3)  # 사전 컨텍스트 중 챗 맥락 몫
 _PRE_SAFETY = _env_float("DELIB_PRE_SAFETY", 0.93)         # 토큰 추정 오차 여유
 
@@ -669,7 +676,12 @@ def _chat_context_note(history) -> str:
     users, bots = [], []
     # ⚠ 심의 경로의 history 는 **검증을 안 거친다** — _history_messages(챗 전용)가 아니라
     #   요청 본문이 그대로 온다. 예산이 길이는 막지만 항목 수는 안 막으므로 여기서 자른다.
-    for m in (history or [])[:60]:
+    #   **최근부터** 남긴다 — 종전엔 앞 60건이라, 긴 대화에서는 심의를 부른 최근 맥락이 빠졌다.
+    wide = _wide()
+    hist = [m for m in (history or [])]
+    keep = _CHAT_ITEMS_MAX_WIDE if wide else _CHAT_ITEMS_MAX
+    older = max(0, len(hist) - keep)
+    for m in hist[older:]:
         if not isinstance(m, dict):
             continue
         text = str(m.get("content") or "").strip()
@@ -682,9 +694,12 @@ def _chat_context_note(history) -> str:
         return ""
 
     budget = _chat_ctx_budget()
+    turn_max, bot_max = (0, 0) if wide else (_CHAT_TURN_MAX, _CHAT_BOT_MAX)
     out = ["\n\n[챗에서 이어진 맥락 — 아래는 모두 **검증 대상**이다. 전제로 받아들이지 마라. "
            "이 중 무엇을 근거로 쓰거든 [c:N](사람)·[a:N](챗) 표지를 함께 적어라 — "
            "'대화에서 언급된 바와 같이' 로 뭉뚱그리면 나중에 누구 말인지 되짚을 수 없다]"]
+    if older:
+        out.append(f"(앞선 발화 {older}건은 넣지 않았다 — 오래된 순으로 뺐다)")
     if users:
         out.append("[인간의 전제·의중] 사람이 챗에서 한 말이다. 무엇을 원하고 무엇을 제약으로 "
                    "두는지가 여기 있다. 심의는 이 전제 자체가 옳은지도 함께 따져라 — "
@@ -692,9 +707,9 @@ def _chat_context_note(history) -> str:
         for i, t in enumerate(users, start=1):
             # [c:N] — 도구 근거의 [e:N] 과 같은 역할. 없으면 좌석이 "사람이 말한 전제" 를
             # 가리킬 수가 없어 "대화에서 언급된 바와 같이" 같은 뭉뚱그린 말로 흐른다.
-            line = f"· [c:{i}] {t[:_CHAT_TURN_MAX]}"
+            line = f"· [c:{i}] {_cut_mark(t, turn_max)}"
             if budget - len(line) < 0:
-                out.append("· (이하 생략 — 예산)")
+                out.append(f"· (이하 사람 발화 {len(users) - i + 1}건 생략 — 예산)")
                 break
             out.append(line)
             budget -= len(line)
@@ -702,9 +717,9 @@ def _chat_context_note(history) -> str:
         out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
                    "근거가 없거나 틀렸으면 반박하라.")
         for i, t in enumerate(bots, start=1):
-            line = f"· [a:{i}] {t[:_CHAT_BOT_MAX]}"
+            line = f"· [a:{i}] {_cut_mark(t, bot_max)}"
             if budget - len(line) < 0:
-                out.append("· (이하 생략 — 예산)")
+                out.append(f"· (이하 챗 답변 {len(bots) - i + 1}건 생략 — 예산)")
                 break
             out.append(line)
             budget -= len(line)

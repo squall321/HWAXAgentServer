@@ -509,3 +509,34 @@ def test_좁은_창의_공용_조회_결과는_종전대로_항목당_420자다(
     got = _share_prompts(monkeypatch, 128000, 5000)
     line = next(ln for ln in got[0].splitlines() if "get_probe" in ln and "mech-a" in ln)
     assert "</mech-a>" not in line and "앞 420자만" in line, line[-80:]
+
+
+# ── 챗에서 이어진 맥락(포털 웹 챗 → 심의) — 천장 150,000자·발화당 4,000/2,500자·앞 60건 ────────────────
+def test_넓은_창의_챗_맥락은_천장에_걸리지_않는다():
+    _win(_BIG)
+    assert d._chat_ctx_budget() == int(d._pre_budget() * d._CHAT_CTX_SHARE) > d.CHAT_CONTEXT_BUDGET
+
+
+def test_넓은_창은_긴_사람_발화를_통째로_싣는다():
+    _win(_BIG)
+    note = d._chat_context_note([{"role": "user", "content": "가" * 10000 + "<끝>"}])
+    assert "<끝>" in note
+
+
+def test_좁은_창은_발화를_종전_길이에서_끊되_말한다():
+    _win(128000)
+    note = d._chat_context_note([{"role": "user", "content": "가" * 10000 + "<끝>"}])
+    assert "<끝>" not in note and "10,003자 중 앞 4,000자" in note, note[-80:]
+
+
+@pytest.mark.parametrize("tokens", (128000, _BIG))
+def test_긴_대화는_최근_발화부터_남긴다(tokens):
+    """앞에서 60건을 잘라, 긴 대화에서는 정작 최근 발화(심의를 부른 맥락)가 빠졌다."""
+    _win(tokens)
+    hist = [{"role": "user", "content": f"<{i:03d}> 발화"} for i in range(70)]
+    note = d._chat_context_note(hist)
+    assert "<069>" in note, "가장 최근 발화가 빠졌다"
+    if tokens == _BIG:
+        assert "<000>" in note
+    else:
+        assert "<000>" not in note and "앞선 발화 10건" in note, note[:400]

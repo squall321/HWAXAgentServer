@@ -235,7 +235,7 @@ def test_좌석_프롬프트가_컨텍스트를_넘지_않는다():
     for ctx in (128000, 200000, 1000000):
         app._ctx_cache["n"] = ctx
         d._evid_cache.clear()
-        worst = d._evid_budget() + d._chat_ctx_budget() + d._SEAT_CTX
+        worst = d._evid_budget() + d._chat_ctx_budget() + d._seat_ctx()
         assert app._est_tokens("가" * worst) < ctx, (
             f"컨텍스트 {ctx:,}토큰인데 좌석 프롬프트만 "
             f"{app._est_tokens('가' * worst):,}토큰이다 — 라운드가 통째로 400 이 난다"
@@ -459,7 +459,7 @@ def test_좌석_프롬프트가_구조적으로_딱_맞지_않는다():
     for ctx in (128000, 200000, 1000000):
         app._ctx_cache["n"] = ctx
         d._evid_cache.clear()
-        worst = app._est_tokens("가" * (d._evid_budget() + d._chat_ctx_budget() + d._SEAT_CTX))
+        worst = app._est_tokens("가" * (d._evid_budget() + d._chat_ctx_budget() + d._seat_ctx()))
         worst += d._EVID_RESERVE
         assert worst < ctx, f"컨텍스트 {ctx:,} 에서 좌석 최악 {worst:,}토큰 — 넘는다"
         assert worst <= ctx * 0.99, (
