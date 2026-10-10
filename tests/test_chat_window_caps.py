@@ -458,3 +458,12 @@ def test_최근_항목을_줄일_때도_줄인_글_자체의_토큰으로_맞춘
     msgs = app._history_messages(hist, st)
     assert st.get("cut") == 2_600_000, st
     assert _tok_oracle("".join(c for _, c in msgs)) <= app._hist_budget_tokens(), st
+
+
+def test_문서_예산에서_빼는_이력_토큰도_글_전체로_잰다():
+    """문서 예산은 '창 − 예비분 − 실린 이력' 인데 실린 이력을 앞 20,000자 표본으로 쟀다 — 압축본이나 오래된 영문 로그가
+    머리에 있으면 한국어 이력을 3분의 1 로 세어, 문서가 그만큼 더 실려 창을 넘었다."""
+    mixed = "x" * 30000 + "가" * 300000
+    assert app._est_tokens_all(mixed) == _tok_oracle(mixed) > app._est_tokens(mixed) * 3
+    src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    assert '_hist_tokens = _est_tokens_all("".join(c for _, c in _hist_msgs))' in src

@@ -3043,7 +3043,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                               f"({_hstat['budget']:,}자)을 넘어 앞부분만 실었습니다 — 뒷부분이 "
                                               "필요하면 나눠서 다시 보내 주세요.",
                                    "knob": "HIST_CTX_SHARE_SOLO·HIST_CTX_SHARE(이력 몫)"})
-        _hist_tokens = _est_tokens("".join(c for _, c in _hist_msgs))
+        # 글 전체로 잰다 — 앞 20,000자 표본(_est_tokens)은 압축본·영문 로그가 머리인 한국어 이력을 3분의 1 로 센다.
+        _hist_tokens = _est_tokens_all("".join(c for _, c in _hist_msgs))
         _docs = _doc_block(req.documents, _hist_tokens)
         if _docs:
             sys_prompt += _docs
