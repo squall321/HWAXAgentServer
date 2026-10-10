@@ -306,3 +306,58 @@ def test_넓은_창에서_다_실었으면_알리지_않는다(monkeypatch):
     events = _stream_gather(monkeypatch, _BIG, 5000)
     assert [c for c in _cards(events, included=True) if c["source"].startswith("mech-a · tool")], "시험 전제 — 조회가 돌았다"
     assert not [c for c in _cards(events, included=False) if c["source"] == "자기 조회 결과 상한 초과"]
+
+
+# ── 지정 도구 결과 — 도구당 2,000자·합 5,000자 ───────────────────────────────────────────
+def test_넓은_창은_지정_도구_결과를_온전히_싣는다():
+    _win(_BIG)
+    text, share = d._fit_tool_results(_tool_got(), d._tool_inject_caps()[1])
+    assert share == 0 and all(f"</t{i}>" in text for i in range(3)) and " …[" not in text
+
+
+def test_넓은_창에서_도구_하나가_몫을_넘으면_원문_길이를_남긴다():
+    _win(_BIG)
+    total = d._tool_inject_caps()[1]
+    text, share = d._fit_tool_results([("[지정 도구 t0]\n", "가" * 300000)], total)
+    assert len(text) <= total and "300,000자 중 " in text and share > 0, (len(text), text[-40:])
+
+
+def test_좁은_창에서_도구_하나만_길어도_줄였다고_원장에_남긴다(monkeypatch):
+    """종전엔 합이 상한 안이면 도구 하나의 상한(2,000자)에서 끊어도 글의 표식뿐이라 호출자·원장은 몰랐다."""
+    from test_tool_inject_fit import _CARD, _run as _tool_run
+    _win(128000)
+    _names, events, block = _tool_run(monkeypatch, [50000])
+    assert "자 중 2,000자]" in block
+    (card,) = [c for c in _cards(events, included=False) if c["source"] == _CARD]
+    assert "get_probe_1" in card["text"] and "2,000자" in card["text"], card["text"]
+
+
+def test_넓은_창에서는_긴_지정_도구_결과가_좌석에_온전히_간다(monkeypatch):
+    from test_tool_inject_fit import _CARD, _run as _tool_run
+    _win(_BIG)
+    _names, events, block = _tool_run(monkeypatch, [15000, 15000])        # 합 30,070자 — 좁은 창이면 도구당 2,000자
+    assert block.count("x") == 30000 and " …[" not in block, block[-200:]
+    assert not [c for c in _cards(events, included=False) if c["source"] == _CARD]
+
+
+class _SchemaTool:
+    name = "get_probe"
+    description = "설" * 500
+    args_schema = {"type": "object", "required": ["a00"],
+                   "properties": {f"a{i:02d}": {"type": "string", "description": f"<d{i}>" + "명" * 150,
+                                                **({"enum": ["x", "y"]} if i == 15 else {})}
+                                  for i in range(20)}}
+
+
+def test_넓은_창은_인자_스키마를_자르지_않는다():
+    _win(_BIG)
+    brief = d._tool_schema_brief(_SchemaTool())
+    assert all(f"- a{i:02d}" in brief for i in range(20)) and "명" * 150 in brief
+    assert "x" in brief.split("- a15")[1].split("\n")[0], "선택지(enum)가 계획자에게 안 갔다"
+
+
+def test_좁은_창은_인자_스키마를_종전대로_줄이되_말한다():
+    _win(128000)
+    brief = d._tool_schema_brief(_SchemaTool())
+    assert all(f"- a{i:02d}" in brief for i in range(12)) and "- a12" not in brief
+    assert "인자 20개 중 앞 12개" in brief

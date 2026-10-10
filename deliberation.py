@@ -1942,12 +1942,14 @@ def _chair_fail_text(why: str, tries: int, seat_note: str, rows: list, label: st
 def _fit_tool_results(got: list, cap: int) -> tuple:
     """지정 도구 결과 [(머리줄, 결과 원문)] 을 합이 cap 자를 넘지 않게 **도구마다 같은 몫**으로 줄여 이어 붙인다.
 
-    반환 (글, 몫) — 몫은 줄였을 때 도구 하나에 돌아간 길이, 안 줄였으면 0(도구당 상한 _TOOL_CHUNK_MAX 만 걸린다).
+    반환 (글, 몫) — 몫은 줄였을 때 도구 하나에 돌아간 길이, 안 줄였으면 0(도구 하나의 상한 _tool_inject_caps()[0] 만
+    걸린다 — 좁은 창 2,000자, 넓은 창은 합의 상한과 같다).
     줄인 결과에는 원문 길이와 실은 길이를 표식으로 붙인다. 좌석에 싣는 블록과, 다음 도구의 인자를 정하는 계획자에게
     주는 '앞서 조회한 결과' 가 같이 쓴다 — 이어 붙인 글을 앞에서 자르면 뒤쪽 도구가 통째로 안 보인다."""
+    chunk = _tool_inject_caps()[0]
     room = cap - sum(len(h) + 30 for h, _g in got)          # 머리줄·절단 표식 몫을 먼저 뗀다
-    _rows, share = _fit_rows([(h, g[:_TOOL_CHUNK_MAX]) for h, g in got], max(room, 1), floor=200)
-    tcap = share or _TOOL_CHUNK_MAX
+    _rows, share = _fit_rows([(h, g[:chunk]) for h, g in got], max(room, 1), floor=200)
+    tcap = share or chunk
     return "\n\n".join(h + g[:tcap] + (f" …[{len(g):,}자 중 {tcap:,}자]" if len(g) > tcap else "")
                          for h, g in got), share
 
@@ -2749,17 +2751,27 @@ def envelope_failed(s) -> bool:
 
 def _tool_schema_brief(t) -> str:
     """도구 args 스키마를 LLM 인자 구성 프롬프트용 요약으로 — MCP 어댑터의 JSON 스키마 dict 만
-    (pydantic 모델이면 빈 문자열 — 설명만으로 구성 시도). 필드 12개·설명 100자 캡."""
+    (pydantic 모델이면 빈 문자열 — 설명만으로 구성 시도).
+    넓은 창(_wide)은 필드 전부·설명 전문·선택지(enum)를 싣는다 — 선택지가 설명 100자 밖에 있으면 계획자가 값을 지어냈다.
+    좁은 창은 종전대로 필드 12개·설명 100자이되, 줄였으면 그렇다고 적는다(종전엔 말없이 뺐다)."""
     schema = getattr(t, "args_schema", None)
     if not isinstance(schema, dict):
         return ""
     props = schema.get("properties", {})
     req = set(schema.get("required", []) or [])
+    wide = _wide()
+    items = list(props.items())
+    keep = items if wide else items[:12]
     lines = []
-    for k, v in list(props.items())[:12]:
+    for k, v in keep:
         if isinstance(v, dict):
+            enum = v.get("enum") if wide else None
+            desc = str(v.get("description", ""))
             lines.append(f"- {k}{'(필수)' if k in req else ''}: {v.get('type', 'any')}"
-                         f" — {str(v.get('description', ''))[:100]}")
+                         + (f" ∈ {json.dumps(enum, ensure_ascii=False, default=str)}" if isinstance(enum, list) else "")
+                         + f" — {desc if wide else _cut_mark(desc, 100)}")
+    if len(keep) < len(items):
+        lines.append(f"(인자 {len(items)}개 중 앞 {len(keep)}개만 — 나머지 인자는 이 요약에 없다)")
     return "\n".join(lines)
 
 
@@ -4088,7 +4100,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 준 id 는 계획자에게 없었다 — 상세 도구가 식별자를 지어내거나 건너뛰었다. 좌석에 싣는 것과 같은
             # 상한·같은 몫으로 준다(_fit_tool_results): 전부 조금씩 보이는 쪽이 낫다. 줄였으면 글에 표식이 붙고
             # (계획자가 잘린 뒤쪽의 id 를 아는 척하지 않게) 상태줄이 그렇다고 말한다.
-            _prev_ctx, _prev_share = _fit_tool_results(_got, _TOOL_INJECT_MAX) if _got else ("", 0)
+            _prev_ctx, _prev_share = _fit_tool_results(_got, _tool_inject_caps()[1]) if _got else ("", 0)
             for _attempt in (1, 2):
                 yield _sse("status", {"step": f"지정 도구 인자 구성: {_tn}"
                                               + (" (재시도)" if _attempt == 2 else "")
@@ -4097,7 +4109,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 try:
                     _argd = _parse_json(await _llm_text(
                         llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-                        f"[심의 주제]\n{question}\n\n[도구]\n{_tn}: {(getattr(_t, 'description', '') or '')[:300]}\n"
+                        f"[심의 주제]\n{question}\n\n[도구]\n{_tn}: "
+                        f"{_cut_mark(getattr(_t, 'description', '') or '', 0 if _wide() else 300)}\n"
                         + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
                         # 앞서 성공한 도구 결과를 같이 준다 — id·test_id 를 지어내지 않고 여기서
                         # 가져다 쓰라는 뜻이다. 이게 없으면 각 도구가 서로를 모른 채 호출돼
@@ -4149,16 +4162,23 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 넷째부터는 좌석에 아예 안 갔는데, 도구마다 '심의에 포함' 카드가 뜨고 의장의 근거 프로파일은
             # '도구 조회 6건' 이었다. 목록·검색 도구를 먼저 돌리므로 빠지는 쪽은 늘 수치가 든 상세 도구였다.
             # 통째로 빼지 않고 몫을 나누는 까닭도 그것이다 — 전부 조금씩 보이는 쪽이 낫다.
-            _tblock, _tshare = _fit_tool_results(_got, _TOOL_INJECT_MAX)
+            # 상한은 창에서 유도한다(_tool_inject_caps — 좁은 창 도구당 2,000자·합 5,000자, 1백만 토큰 창 합 38,770자).
+            _tchunk, _ttotal = _tool_inject_caps()
+            _tblock, _tshare = _fit_tool_results(_got, _ttotal)
             tool_inject = ("[사용자 지정 도구 정량 결과 (실호출 — 발언에 인용할 것. 여기 없는 수치는 "
                            "지어내지 말 것)]\n" + _tblock + "\n")
-            if _tshare:
+            # 합이 넘어 같은 몫으로 줄였거나, 합은 안 넘었어도 도구 하나가 그 상한에서 끊겼으면 알린다 — 종전엔 뒤쪽은
+            # 글의 표식뿐이라 좌석만 알고 호출자·원장은 몰랐다.
+            _tlim = _tshare or _tchunk
+            _tcut = [f"{_n}({len(_g):,}자)" for _n, (_h, _g) in zip(_used, _got) if len(_g) > _tlim]
+            if _tcut:
                 # 상태줄이 아니라 카드로 — 잡 원장은 좌석에 주지 않은 카드만 적는다(MCP 호출자가 보는 것은 그쪽이다).
                 yield _delib("evidence", source="지정 도구 근거 상한 초과", included=False,
-                             text=f"지정 도구 결과 {len(_got)}건의 합이 상한({_TOOL_INJECT_MAX:,}자)을 넘어 "
-                                  f"도구마다 앞 {_tshare:,}자까지만 좌석에 실었다 — 줄인 것: "
-                                  + ", ".join(_n for _n, (_h, _g) in zip(_used, _got) if len(_g) > _tshare)
-                                  + ". 뒷부분의 수치는 좌석이 보지 못했다.")
+                             text=(f"지정 도구 결과 {len(_got)}건의 합이 상한({_ttotal:,}자)을 넘어 "
+                                   f"도구마다 앞 {_tshare:,}자까지만 좌석에 실었다" if _tshare else
+                                   f"지정 도구 결과 {len(_tcut)}건이 도구 하나의 상한({_tchunk:,}자)을 넘어 "
+                                   f"앞 {_tchunk:,}자까지만 좌석에 실었다")
+                                  + " — 줄인 것: " + ", ".join(_tcut) + ". 뒷부분의 수치는 좌석이 보지 못했다.")
             yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
                                   "tools_used": _used})
 

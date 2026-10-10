@@ -68,10 +68,13 @@ def test_도구_여섯이_다_길어도_전부_좌석에_닿는다(monkeypatch):
 
 
 def test_합계_상한_안이면_종전_그대로다(monkeypatch):
+    """좌석이 받는 글은 종전 그대로다. 도구 하나의 상한에서 끊은 것은 이제 카드로도 남긴다 — 종전엔 글의 표식뿐이라
+    좌석만 알고 호출자·원장은 몰랐다(사용자 지침 2026-10-10 — 남는 절단은 조용하지 않게)."""
     _names, events, block = _run(monkeypatch, [2500, 2500])
     assert block.count(" …[") == 2 and f"자 중 {d._TOOL_CHUNK_MAX:,}자]" in block, block[-200:]
     assert block.count("x") == 2 * (d._TOOL_CHUNK_MAX - len('{"head": "MARK-1-HEAD", "body": "')), "도구당 상한이 달라졌다"
-    assert not [c for c in _cards(events, included=False) if c["source"] == _CARD]
+    (card,) = [c for c in _cards(events, included=False) if c["source"] == _CARD]
+    assert f"도구 하나의 상한({d._TOOL_CHUNK_MAX:,}자)" in card["text"] and "get_probe_2(2,535자)" in card["text"], card
 
 
 def test_짧은_결과는_그대로_싣고_남는_몫을_긴_결과에_돌린다(monkeypatch):
