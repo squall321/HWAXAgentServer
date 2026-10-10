@@ -1611,6 +1611,21 @@ async def _call(tools: dict, name: str, args: dict):
 _ASSET_SNAP_MAX = _env_int("DELIB_ASSET_SNAP_MAX", 24000)
 
 
+def _snap_blk(x, n: int) -> str:
+    """스냅샷 블록 하나 — 좁은 창은 종전 블록 상한 n 자에서 끊되 원문 길이를 적고(종전엔 말없이 끊었다), 넓은 창(_wide)은
+    블록마다 끊지 않는다(전체 상한 _ASSET_SNAP_MAX 하나만 건다 — 블록 상한은 그보다 한참 작아 1백만 토큰 창에서도
+    목록의 뒤쪽을 잘랐다)."""
+    return str(x) if _wide() else _cut_mark(str(x), n)
+
+
+def _snap_fit(full: str, n_blocks: int) -> str:
+    """스냅샷 전체를 _ASSET_SNAP_MAX 에 맞춘다 — 넘으면 끊은 자리에 원문 길이를 적는다(종전엔 서버 로그에만 남았다)."""
+    if len(full) <= _ASSET_SNAP_MAX:
+        return full
+    return (full[:_ASSET_SNAP_MAX].rstrip() + f"\n…[스냅샷 {len(full):,}자 중 앞 {_ASSET_SNAP_MAX:,}자 — 블록 "
+            f"{n_blocks}개 가운데 뒤쪽이 빠졌다. 여기 없다고 미보유가 아니다 — 필요하면 직접 조회하라]")
+
+
 async def _asset_snapshot(tools: dict, question: str) -> str:
     """물성·도구 보유 현황을 조회해 2단 근거로 쓸 텍스트를 만든다.
 
@@ -1626,7 +1641,7 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
     _apps = await _call(tools, "list_tool_apps", {"include_tools": False})
     if _apps:
         parts.append("[연결된 도구 앱 — 이 목록 밖의 도구는 이 심의에서 쓸 수 없다]\n"
-                     + str(_apps)[:1400])
+                     + _snap_blk(_apps, 1400))
 
     # 물성 — 질문에 등장한 재료를 먼저 찾고, 없으면 카탈로그 전반 현황으로 대신한다.
     if "search_catalog_property" in tools or "database_summary" in tools:
@@ -1642,37 +1657,37 @@ async def _asset_snapshot(tools: dict, question: str) -> str:
     if "list_materials" in tools:
         _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
         if _m:
-            parts.append(f"[질문 관련 재료 후보]\n{str(_m)[:700]}")
+            parts.append(f"[질문 관련 재료 후보]\n{_snap_blk(_m, 700)}")
 
     # 해석 도구 — 전처리 오퍼레이션과 계산 자원.
     if "list_operations" in tools:
         _op = await _call(tools, "list_operations", {})
         if _op:
-            parts.append(f"[보유 전처리 오퍼레이션(DynaForge)]\n{str(_op)[:800]}")
+            parts.append(f"[보유 전처리 오퍼레이션(DynaForge)]\n{_snap_blk(_op, 800)}")
     # 관행 — 카탈로그는 '무엇이 있나'만 말한다. 조직이 실제로 무엇을 쓰는지는 별개이고,
     # 해석 설계에서 더 강한 근거다(가능한 것 ≠ 하던 것). 개인 식별 없는 전사 집계.
     if "operation_usage" in tools:
         _ou = await _call(tools, "operation_usage", {})
         if _ou:
-            parts.append(f"[실제 사용 관행 — 오퍼레이션 실행 이력(전사 집계)]\n{str(_ou)[:700]}")
+            parts.append(f"[실제 사용 관행 — 오퍼레이션 실행 이력(전사 집계)]\n{_snap_blk(_ou, 700)}")
     if "section_contact_usage" in tools:
         _sc = await _call(tools, "section_contact_usage", {})
         if _sc:
-            parts.append(f"[요소 정식·접촉 카드 사용 분포(전사 집계)]\n{str(_sc)[:700]}")
+            parts.append(f"[요소 정식·접촉 카드 사용 분포(전사 집계)]\n{_snap_blk(_sc, 700)}")
     if "corpus_summary" in tools:
         _cs = await _call(tools, "corpus_summary", {})
         if _cs:
-            parts.append(f"[모델 규모 감각 — 이 조직이 다루는 메시 크기(전사 집계)]\n{str(_cs)[:600]}")
+            parts.append(f"[모델 규모 감각 — 이 조직이 다루는 메시 크기(전사 집계)]\n{_snap_blk(_cs, 600)}")
     if "slurm_list_templates" in tools:
         _t = await _call(tools, "slurm_list_templates", {})
         if _t:
-            parts.append(f"[제출 가능한 잡 템플릿(전사 디지털 트윈 서버)]\n{str(_t)[:500]}")
+            parts.append(f"[제출 가능한 잡 템플릿(전사 디지털 트윈 서버)]\n{_snap_blk(_t, 500)}")
 
     if not parts:
         return ("[사내 자산 현황] 조회하지 못했습니다(도구 미연결). 보유 여부를 단정하지 말고, "
                 "필요한 물성·도구를 '확인 필요' 로 명시하십시오.")
     _full = "\n\n".join(parts)
-    body = _full[:_ASSET_SNAP_MAX]
+    body = _snap_fit(_full, len(parts))
     if len(_full) > _ASSET_SNAP_MAX:
         print(f"[asset-snapshot] {len(_full)}자 → {_ASSET_SNAP_MAX}자로 절단 "
               f"({len(parts)}개 항목 중 뒤쪽 근거가 잘렸다)")
@@ -1703,7 +1718,7 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
     # 질문에 걸리는 재료의 현재 보유 물성 — 중복 측정 방지의 근거.
     _m = await _call(tools, "list_materials", {"query": question[:80], "limit": 5})
     if _m:
-        parts.append(f"[질문 관련 재료와 보유 물성]\n{str(_m)[:800]}")
+        parts.append(f"[질문 관련 재료와 보유 물성]\n{_snap_blk(_m, 800)}")
     # 실사용 빈도 — 우선순위를 '민감도 추정' 이 아니라 '실제로 몇 개 해석 모델이 이 물성을
     # 쓰는가' 로 잡는다. 추정과 조회는 근거의 급이 다르다.
     _mu = await _call(tools, "material_usage", {})
@@ -1724,9 +1739,10 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
     _pdef = await _call(tools, "list_property_definitions", {})
     if _pdef:
         _t = str(_pdef)
-        parts.append(f"[정의된 물성 항목]\n{_t[:2500]}"
-                     + ("\n※ 목록이 길어 앞부분만 실었다 — 여기 없다고 미정의가 아니다. "
-                        "필요하면 list_property_definitions 를 직접 조회하라." if len(_t) > 2500 else ""))
+        _pcap = _ASSET_SNAP_MAX if _wide() else 2500        # 넓은 창은 전체 상한(_snap_fit) 하나만 건다
+        parts.append(f"[정의된 물성 항목]\n{_t[:_pcap]}"
+                     + (f"\n※ 목록이 길어({len(_t):,}자) 앞 {_pcap:,}자만 실었다 — 여기 없다고 미정의가 아니다. "
+                        "필요하면 list_property_definitions 를 직접 조회하라." if len(_t) > _pcap else ""))
     # ── 측정 수단 ─────────────────────────────────────────────────────────────
     # 시험 계획이 '무엇을 먼저 잴 것인가' 를 정하는데, 정작 **잴 수 있는지** 를 모르면
     # 계획이 실행 불가능한 항목을 1순위로 올린다. 물성 공백과 측정 수단은 같이 봐야 한다.
@@ -1753,7 +1769,7 @@ async def _material_evidence_snapshot(tools: dict, question: str) -> str:
     if len(_full) > _ASSET_SNAP_MAX:
         print(f"[material-snapshot] {len(_full)}자 → {_ASSET_SNAP_MAX}자로 절단 "
               f"(블록 {len(parts)}개, 뒤쪽 근거가 잘렸다 — DELIB_ASSET_SNAP_MAX 를 올려라)")
-    return ("[물성 근거 현황 — 실제 조회 결과]\n" + _full[:_ASSET_SNAP_MAX] +
+    return ("[물성 근거 현황 — 실제 조회 결과]\n" + _snap_fit(_full, len(parts)) +
             "\n\n※ 이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마십시오. "
             "위에 없는 항목은 미보유로 보되, 조회되지 않은 것과 실제로 없는 것을 구분해 쓰십시오.")
 

@@ -654,3 +654,30 @@ def test_좁은_창은_요청_값의_항목을_종전대로_자르고_알린다(
     assert len(o.continue_non_negotiables[0]) == d._NN_ITEM_MAX and len(o.options[0]) == d._OPTION_ITEM_MAX
     assert len(o.continue_personas[0]["role"]) == d._ROLE_REQ_MAX
     assert {"non_negotiables", "options", "personas"} <= set(o.req_cut), o.req_cut
+
+
+# ── 자산·물성 스냅샷(해석 설계·시험 설계 2단) — 블록마다 500~1,400자에서 말없이 끊었다 ───────────────────
+def _snap_tools(size):
+    from test_delib_silent_drops import _Tool
+    names = ("list_tool_apps", "list_materials", "list_operations", "operation_usage", "section_contact_usage",
+             "corpus_summary", "slurm_list_templates")
+    return {n: _Tool(n, answer=f"<{n}>" + "값" * size + f"</{n}>") for n in names}
+
+
+def test_넓은_창의_자산_스냅샷은_블록을_자르지_않는다():
+    _win(_BIG)
+    snap = asyncio.run(d._asset_snapshot(_snap_tools(2000), "힌지"))
+    for n in _snap_tools(1):
+        assert f"</{n}>" in snap, f"{n} 블록의 끝이 안 실렸다"
+
+
+def test_좁은_창의_자산_스냅샷은_블록을_끊되_말한다():
+    _win(128000)
+    snap = asyncio.run(d._asset_snapshot(_snap_tools(2000), "힌지"))
+    assert "</list_materials>" not in snap and "자 중 앞 700자]" in snap, snap[:300]
+
+
+def test_스냅샷_전체_상한에서_끊으면_말한다():
+    _win(_BIG)
+    snap = asyncio.run(d._asset_snapshot(_snap_tools(6000), "힌지"))
+    assert f"앞 {d._ASSET_SNAP_MAX:,}자" in snap and "</slurm_list_templates>" not in snap, snap[-300:]
