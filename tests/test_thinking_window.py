@@ -56,8 +56,10 @@ def _screen(tokens):
 
 @pytest.mark.parametrize("tokens", (16384, 128000, 200000))
 def test_좁은_창의_띵킹_지식카드는_종전대로_2500자다(tokens):
+    """예산은 종전 2,500자 그대로다. 같은 몫(바닥 300자)으로 514자 줄 10장 중 7장을 싣는다 — 종전엔 앞 4장(GA-3)."""
     r = _screen(tokens)
-    assert [i for i in range(10) if f"[카드끝{i}]" in r["knowledge"]] == [0, 1, 2, 3]
+    assert len(r["knowledge"]) <= 2500 < len(r["knowledge"]) + 400, len(r["knowledge"])
+    assert [i for i in range(10) if f"[t{i}]" in r["knowledge"]] == list(range(7))
 
 
 def test_넓은_창의_띵킹_지식카드는_2500자에서_끊지_않는다():
@@ -67,7 +69,7 @@ def test_넓은_창의_띵킹_지식카드는_2500자에서_끊지_않는다():
 
 def test_띵킹_지식카드를_예산에서_빼면_예심_사유에_적는다():
     r = _screen(128000)
-    assert "10건 중 4건" in r["reason"], r["reason"]
+    assert "10건 중 7건 실음(7건은 앞부분만 · 예산 2,500자)" in r["reason"], r["reason"]
 
 
 def test_띵킹이_앞선_대화를_싣지_않으면_그렇게_말한다(monkeypatch):

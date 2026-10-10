@@ -2759,7 +2759,8 @@ def knowledge_line(h, limit: int = 700) -> str:
     """agent_search hit 한 건 → 한 줄. 챗·심의·띵킹이 **같은 함수**를 쓴다.
 
     limit — 한 줄의 상한(자), 0=자르지 않는다. 넘으면 앞부분만 남기고 원문 길이를 표식으로 붙인다(종전엔 700자에서
-    말없이 끊어, 줄 끝이 카드의 끝처럼 읽혔다). 챗·띵킹은 종전 700자, 심의 좌석은 자기 지식카드 예산까지 받는다.
+    말없이 끊어, 줄 끝이 카드의 끝처럼 읽혔다). 챗은 종전 700자, 심의 좌석·띵킹 예심은 fit_knowledge_lines 가 전문을
+    받아 예산에 같은 몫으로 담는다.
 
     실측 형태(2026-08-05): {record_id, section_id, title, section_title, snippet, score,
     tags, causal_status, …} — 본문은 snippet 에 있다.
@@ -2784,6 +2785,51 @@ def knowledge_line(h, limit: int = 700) -> str:
     gr = _grade_notes(h)
     tag = f" [{' · '.join(gr)}]" if gr else ""
     return _cut_mark(f"• [{head}]{src}{tag} {str(body).strip()}", limit)
+
+
+_KN_MARK = 32           # 줄인 줄 끝의 ' …[N자 중 앞 M자]' 표식 몫(자) — 표식은 원문 1억 자 미만이면 27자를 넘지 않는다
+_KN_LINE_FLOOR = 300    # 줄인 카드가 남기는 앞부분의 바닥(자) — 몫이 이보다 작아지면 순위가 낮은 카드부터 뺀다(머리만 남지 않게)
+
+
+def fit_knowledge_lines(hits, budget: int) -> tuple:
+    """agent_search 히트 → 좌석에 실을 줄들(검색 순위 순). 심의 좌석과 띵킹 예심이 **같은 함수**를 쓴다.
+
+    반환 (lines, dropped, trimmed) — dropped 는 뺀 카드 수, trimmed 는 앞부분만 실은 카드 수(둘 다 중복 줄을 빼고 센다).
+    줄들을 줄바꿈으로 이은 글은 budget(자) 안에 든다. budget<=0 은 싣지 않는다(종전 루프와 같은 뜻이다).
+
+    합이 budget 을 넘으면 _fit_rows 의 **같은 몫**으로 담는다 — 몫보다 짧은 카드는 온전히 싣고, 그들이 안 쓴 몫을
+    긴 카드들이 나눠 앞부분과 원문 길이 표식을 싣는다. 몫을 표식까지 넣은 줄 길이로 잡으므로 몫보다 조금 긴 줄은
+    줄여도 짧아지지 않아 온전히 둔다. 몫이 바닥(_KN_LINE_FLOOR + 표식)보다 작아질 만큼 히트가 많을 때만 순위가
+    낮은 카드를 빼고, 1위 카드는 예산이 아무리 작아도(표식이 들 자리만 있으면) 줄여서 싣는다.
+
+    종전(38f04d0)엔 한 줄을 예산까지 받고(표식이 붙어 예산보다 길다) 처음 넘는 줄에서 멈췄다 — 절 전문이 된 첫 히트가
+    예산보다 길면 좌석이 카드 0장으로 '관련 지식 없음' 이라 발언했고, 큰 카드 뒤의 작은 카드도 다 빠졌다(물성 카드
+    한 절이 2만~6만 자다 — AIDataHub 가 snippet 을 절 전문으로 준다). 넘는 카드를 건너뛰기만 하면 검색 1위 카드가
+    통째로 빠지고, 좁은 창은 10건이 몇 건으로 줄었다(GA-3)."""
+    rows, seen = [], set()
+    for h in hits:
+        ln = knowledge_line(h, limit=0)
+        if ln not in seen:      # 같은 레코드의 유사 섹션 반복 방지
+            seen.add(ln)
+            rows.append(ln)
+    if budget <= 0:
+        return [], len(rows), 0
+    for k in range(len(rows), 0, -1):
+        part = rows[:k]
+        room = budget - (k - 1)                     # 줄바꿈 몫을 먼저 뗀다
+        if room < 1:
+            continue
+        _fit, cap = _fit_rows(list(enumerate(part)), room, floor=1)
+        if not cap:                                 # 다 든다
+            return part, len(rows) - k, 0
+        cut = cap - _KN_MARK                        # 줄인 줄 = 앞 cut 자 + 표식 — cap 을 넘지 않는다
+        if cut < _KN_LINE_FLOOR and k > 1:
+            continue
+        if cut < 1:
+            break
+        return ([t if len(t) <= cap else _cut_mark(t, cut) for t in part],
+                len(rows) - k, sum(len(t) > cap for t in part))
+    return [], len(rows), 0
 
 
 def _knowledge_q_for(kq, seat_key: str, question: str) -> tuple[str, str]:
@@ -4582,8 +4628,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if opts.persona_knowledge and "agent_search" in tools:
         _kb_budget = _knowledge_budget()
 
-        # 챗과 같은 포맷 — 출처·인과상태가 함께 간다. 한 줄은 이 좌석의 예산까지 받는다(종전엔 줄마다 700자에서 끊었다).
-        _hit_line = lambda h: knowledge_line(h, limit=_kb_budget)   # noqa: E731
+        # 챗과 같은 포맷 — 출처·인과상태가 함께 간다. 예산에 담는 방식은 fit_knowledge_lines(띵킹과 같은 함수)다.
         # 합성 지정석(_CHAIR_ADVERSARY)은 레지스트리에 없는 키라 물으면 **매번 404** 다. 폴백까지
         # 돌아 좌석 하나에 최대 2 × KNOWLEDGE_TIMEOUT_S 를 쓰고(실사용 로그에서 74회), 그 404 가
         # '지식카드 강등' 으로 떠서 진짜 강등과 섞였다. 묻지 않은 좌석은 인원수에서도 뺀다 —
@@ -4610,18 +4655,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             async with _kn_sem:
                 hits, note = await _agent_search_hits(tools, p["key"], _q)
             if not hits:
-                return p["key"], "", note, 0, _qsrc, 0
-            lines, total, seen, dropped = [], 0, set(), 0
-            for i, h in enumerate(hits):
-                ln = _hit_line(h)
-                if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
-                    continue
-                if total + len(ln) > _kb_budget:
-                    # 예산에서 뺀 수를 센다(중복은 빼고) — 종전엔 '확보' 로만 적혀 몇 건을 뺐는지 어디에도 없었다.
-                    dropped = len({_hit_line(x) for x in hits[i:]} - seen)
-                    break
-                seen.add(ln); lines.append(ln); total += len(ln)
-            return p["key"], "\n".join(lines), note, len(lines), _qsrc, dropped
+                return p["key"], "", note, 0, _qsrc, 0, 0
+            # 뺀 수·줄인 수를 센다(중복은 빼고) — 종전엔 '확보' 로만 적혀 몇 건을 뺐는지 어디에도 없었다.
+            lines, dropped, trimmed = fit_knowledge_lines(hits, _kb_budget)
+            return p["key"], "\n".join(lines), note, len(lines), _qsrc, dropped, trimmed
 
         # 호출자가 검색어를 줬을 때만 꼬리를 붙인다 — 안 줬으면 종전 글 그대로다.
         _kq = opts.knowledge_query
@@ -4650,7 +4687,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # ⚠ gather 로 한꺼번에 기다리면 **전부 끝날 때까지 화면이 조용하다.** 느린 좌석 하나가
         # 있으면 사용자는 멈춘 줄 안다. 끝나는 대로 한 줄씩 알린다(병렬은 그대로다).
         _kn_done = 0
-        _kn_cut: list = []      # [(좌석, 실은 수, 받은 수)] — 예산에서 카드를 뺀 좌석
+        _kn_cut: list = []      # [(좌석, 실은 수, 받은 수, 앞부분만 실은 수)] — 예산에 맞추느라 카드를 빼거나 줄인 좌석
         _kn_tasks = [asyncio.ensure_future(_kn_one(p)) for p in _kn_seats]
         # ⚠ try/finally 로 감싼다(_round_live·자유 조회와 같은 처리). 이 루프는 yield 를 하고 조회를
         # 기다린다 — 심의가 접히면(잡 취소 · 브라우저 닫힘) 거기서 끊기는데, 남은 조회는 아무도 기다리지
@@ -4658,10 +4695,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 한 번에 도는 수(_KN_CONC)가 깨진다.
         try:
             for _fut in asyncio.as_completed(_kn_tasks):
-                _k, _blk, _note, _n, _qsrc, _kd = await _fut
+                _k, _blk, _note, _n, _qsrc, _kd, _kt = await _fut
                 _kn_done += 1
-                if _kd:
-                    _kn_cut.append((_k, _n, _n + _kd))
+                if _kd or _kt:
+                    _kn_cut.append((_k, _n, _n + _kd, _kt))
                 if _blk:
                     knowledge_by_key[_k] = _blk
                     ev_count["knowledge"] += 1
@@ -4672,7 +4709,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {
                     "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
                             + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음"))
-                            + (f"({_n + _kd}건 중 {_n}건 — 예산 {_kb_budget:,}자)" if _kd else ""),
+                            + (f"({_n + _kd}건 중 {_n}건" + (f" · {_kt}건은 앞부분만" if _kt else "")
+                               + f" — 예산 {_kb_budget:,}자)" if _kd or _kt else ""),
                     "tool": None,
                     # 리스크 앱이 좌석별 적중 수를 세는 원천이다(HWAXRisk engine_client.collect_stream).
                     # 키 넷의 이름을 바꾸면 그쪽 집계가 말없이 비고, tests/test_risk_app_contract_anchors 가 잡는다.
@@ -4691,9 +4729,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _kn_cut:
             # 좌석마다 내면 원장의 자리를 먼저 채운다 — 한 장으로 모은다. 좌석에 주지 않은 카드다(included=False).
             yield _delib("evidence", source="지식카드 예산 초과", included=False, knob="DELIB_KNOWLEDGE_BUDGET",
-                         text=f"좌석 지식카드 발췌를 좌석당 {_kb_budget:,}자(모델 창에서 유도)에 맞추느라 뒤쪽 카드를 "
-                              "뺐다 — " + " / ".join(f"{k} {tot}건 중 {n}건" for k, n, tot in _kn_cut)
-                              + ". 뺀 카드는 그 좌석이 보지 못했다(검색 순위가 낮은 쪽이다).")
+                         text=f"좌석 지식카드 발췌를 좌석당 {_kb_budget:,}자(모델 창에서 유도)에 맞추느라 긴 카드는 "
+                              "같은 몫으로 앞부분만 싣고, 그래도 넘치면 뒤쪽 카드를 뺐다 — "
+                              + " / ".join(f"{k} {tot}건 중 {n}건" + (f"({t}건은 앞부분만)" if t else "")
+                                           for k, n, tot, t in _kn_cut)
+                              + ". 앞부분만 실은 카드는 줄 끝에 원문 길이를 적었고, 뺀 카드는 그 좌석이 보지 못했다"
+                                "(검색 순위가 낮은 쪽이다).")
         if _kn_notes:
             # 무음 강등 금지 — 지식 없이 돈 심의를 지식 위에서 돈 심의와 같은 모습으로 내보내지 않는다.
             _kn_knob = {"knob": "KNOWLEDGE_TIMEOUT_S"} if any("초 초과" in x for x in _kn_notes) else {}

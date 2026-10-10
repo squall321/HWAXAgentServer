@@ -479,22 +479,30 @@ def test_넓은_창의_이미_조회된_것_목록은_1200자에서_끊지_않�
 
 # ── 좌석 지식카드 — 좁은 창은 종전 3,500자, 넓은 창은 창에서 유도, 뺀 수를 남긴다 ─────────────────────
 def _kn_hits(n=10, size=600):
-    return json.dumps({"hits": [{"title": f"카드{i}", "record_id": f"r{i}",
+    return json.dumps({"hits": [{"title": f"카드{i}", "record_id": f"r{i:02d}",
                                  "snippet": "가" * size + f" [카드끝{i}]"} for i in range(n)]}, ensure_ascii=False)
 
 
-def _kn_run(monkeypatch, tokens):
+def _kn_run(monkeypatch, tokens, n=10):
     events, llm = _run(monkeypatch, tokens, persona_knowledge=1,
-                       tools={"agent_search": _Tool("agent_search", _kn_hits())})
+                       tools={"agent_search": _Tool("agent_search", _kn_hits(n))})
     seat = next(h for s, h in llm.prompts if "당신은 'mech-a' 전문가" in s)
     return events, seat
 
 
+def _kn_block(seat):
+    return seat.split("[당신의 지식카드에서", 1)[1].split("\n", 1)[1].split("\n\n[", 1)[0]
+
+
 @pytest.mark.parametrize("tokens", _SMALL)
 def test_좁은_창의_좌석_지식카드는_종전대로_3500자다(monkeypatch, tokens):
+    """예산은 종전 3,500자 그대로다. 담는 방식만 같은 몫이다 — 절 전문이 된 625자 줄 10장을 349자 몫으로 줄여
+    전부 싣는다(종전엔 앞 5장만 온전히 싣고 뒤 5장을 뺐다 — GA-3)."""
     _events, seat = _kn_run(monkeypatch, tokens)
-    got = [i for i in range(10) if f"[카드끝{i}]" in seat]
-    assert got == [0, 1, 2, 3, 4], got
+    blk = _kn_block(seat)
+    assert len(blk) <= 3500 < len(blk) + 400, len(blk)
+    assert [i for i in range(10) if f"(출처: r{i:02d})" in blk] == list(range(10))
+    assert not [i for i in range(10) if f"[카드끝{i}]" in blk], "몫보다 긴 카드를 온전히 실었다 — 3,500자를 넘는다"
 
 
 def test_넓은_창의_좌석_지식카드는_3500자에서_끊지_않는다(monkeypatch):
@@ -504,19 +512,20 @@ def test_넓은_창의_좌석_지식카드는_3500자에서_끊지_않는다(mon
 
 
 def test_좌석_지식카드를_예산에서_빼면_수를_남긴다(monkeypatch):
-    """받은 수·뺀 수가 어디에도 없어 '카드가 5장뿐' 과 '10장 중 5장만 실었다' 가 같았다."""
-    events, _seat = _kn_run(monkeypatch, 128000)
+    """받은 수·뺀 수가 어디에도 없어 '카드가 5장뿐' 과 '10장 중 5장만 실었다' 가 같았다. 20장이면 같은 몫이 바닥
+    (300자) 밑으로 내려가 순위가 낮은 10장을 뺀다."""
+    events, _seat = _kn_run(monkeypatch, 128000, n=20)
     step = next(s for s in _steps(events) if s.startswith("지식카드 ") and "mech-a" in s)
-    assert "10건 중 5건" in step, step
+    assert "20건 중 10건 · 10건은 앞부분만" in step, step
     cards = [c for c in _cards(events, included=False) if c["source"] == "지식카드 예산 초과"]
-    assert cards and "mech-a" in cards[0]["text"] and "DELIB_KNOWLEDGE_BUDGET" in (cards[0].get("knob") or ""), cards
+    assert cards and "mech-a 20건 중 10건" in cards[0]["text"] and "DELIB_KNOWLEDGE_BUDGET" in (cards[0].get("knob") or ""), cards
 
 
 def test_지식카드_집계_프레임의_키는_그대로다(monkeypatch):
     events, _seat = _kn_run(monkeypatch, 128000)
     kn = [data["knowledge"] for ev, data in events if ev == "status" and "knowledge" in data]
     assert kn and all(set(k) == {"persona", "hits", "degraded", "query"} for k in kn), kn
-    assert {k["persona"]: k["hits"] for k in kn} == {"mech-a": 5, "rel-b": 5}
+    assert {k["persona"]: k["hits"] for k in kn} == {"mech-a": 10, "rel-b": 10}
 
 
 # ── 좌석 편성·VOC 환기 프롬프트 — 넓은 창은 화두·VOC 를 끊지 않는다 ─────────────────────────────────

@@ -32,6 +32,7 @@ from deliberation import (
     _restore_role,
     _sse,
     _tools_by_name,
+    fit_knowledge_lines,
     is_operator,
     knowledge_line,
 )
@@ -178,21 +179,14 @@ async def _screen_one(tools: dict, seat: dict, q: str) -> dict:
         + (f" · 검색 강등({note})" if note else "")
         + ("" if passed else " — 근거도 어휘도 없음"))
 
-    lines, total, seen, dropped = [], 0, set(), 0
+    # 심의 좌석과 같은 함수로 담는다 — 긴 카드는 같은 몫으로 앞부분만, 몫이 바닥보다 작아지면 순위가 낮은 쪽을 뺀다.
+    # 종전엔 줄마다 700자에서 끊고 처음 넘는 줄에서 멈춰, 절 전문이 된 히트로 좁은 창에서 10건 중 3~4건만 실었다.
     _kb = _knowledge_budget()
-    for i, h in enumerate(hits):
-        ln = _hit_line(h)
-        if ln in seen:
-            continue
-        if total + len(ln) > _kb:
-            # 뺀 수를 예심 사유에 적는다 — 종전엔 '근거 10건' 이라 적고 4건만 실어, 좌석이 본 것과 화면이 달랐다.
-            dropped = len({_hit_line(x) for x in hits[i:]} - seen)
-            break
-        seen.add(ln)
-        lines.append(ln)
-        total += len(ln)
-    if dropped:
-        reason += f" · 지식카드 {len(lines) + dropped}건 중 {len(lines)}건만 실음(예산 {_kb:,}자)"
+    lines, dropped, trimmed = fit_knowledge_lines(hits, _kb)
+    if dropped or trimmed:
+        # 뺀 수·줄인 수를 예심 사유에 적는다 — 종전엔 '근거 10건' 이라 적고 4건만 실어, 좌석이 본 것과 화면이 달랐다.
+        reason += (f" · 지식카드 {len(lines) + dropped}건 중 {len(lines)}건 실음("
+                   + (f"{trimmed}건은 앞부분만 · " if trimmed else "") + f"예산 {_kb:,}자)")
     return {**seat, "hits": n, "top": top, "search_note": note,
             "passed": passed, "reason": reason, "knowledge": "\n".join(lines)}
 
