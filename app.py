@@ -2197,7 +2197,7 @@ def _fit_tokens(build, cap: int, tokens: int, floor: int) -> tuple[str, int]:
         t = _est_tokens_all(body)
         if t <= tokens or cap <= floor:
             break
-        cap = max(floor, int(cap * tokens / t * 0.98))
+        cap = max(floor, int(cap * tokens / t * 0.995))
         body = build(cap)
     return body, cap
 
