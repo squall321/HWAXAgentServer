@@ -3285,9 +3285,12 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # ⚠ `except` 로는 못 잡는다 — `_call` 이 예외를 문자열로 삼켜 돌려준다.
                 # 문자열을 봐야 실패를 안다(그래서 위 try 에서 _ok 를 정하지 않는다).
                 _ok = _result_ok(_out)
+                _prev3, _hand3 = _tool_preview(_out), _handoff_text(_out)
                 yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn,
                                       "call": _cid, "ok": _ok,
-                                      "result_preview": _tool_preview(_out)})
+                                      "result_preview": _prev3,
+                                      # 핸드오프용 날것 — 종전엔 이 경로만 미리보기 220자뿐이었다
+                                      **({"result_full": _hand3} if len(_hand3) > len(_prev3) else {})})
                 try:
                     _final = (await _llm_text(
                         app.state.llm,
@@ -3803,7 +3806,7 @@ async def _voc_keywords(llm, message: str) -> list[str]:
     try:
         raw = await _llm_text(
             llm, "당신은 검색어 추출기입니다. 반드시 유효한 JSON 하나만 출력하세요.",
-            f"[화두]\n{message[:1500]}\n\n위 화두와 관련된 **고객 불만**을 글로벌 사용자 커뮤니티(VOC)에서 찾을 "
+            f"[화두]\n{_cut_mark(message, _narrow_cap(1500))}\n\n위 화두와 관련된 **고객 불만**을 글로벌 사용자 커뮤니티(VOC)에서 찾을 "
             "영어 검색어를 2~4개 뽑아라. 엔지니어 용어가 아니라 **소비자가 쓰는 말**로, 부품·증상 위주로 "
             "짧게(1~3 단어). 예: hinge crack, battery swelling, overheating, screen flicker. "
             'JSON {"keywords": ["...", "..."]} 로만.')

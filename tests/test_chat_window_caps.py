@@ -280,3 +280,10 @@ def test_문서를_줄이지_않으면_상태줄은_종전_그대로다():
     _win(_BIG)
     block = app._doc_block([{"name": "memo.txt", "text": "가" * 2000}], 0)
     assert app._doc_status(block, 1, 0) == "붙인 문서 1건을 읽습니다"
+
+
+def test_직접_실행_경로도_핸드오프용_날것을_싣는다():
+    """확정 종결의 직접 실행 결과는 220자 미리보기뿐이라 챗→심의 근거로 한 토막만 갔다."""
+    src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    blk = src[src.index('f"도구 직접 실행: {_tn}"'):][:2200]
+    assert "_handoff_text(_out)" in blk and '"result_full": _hand3' in blk, blk
