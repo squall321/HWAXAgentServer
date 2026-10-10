@@ -166,6 +166,25 @@ def test_가장_최근_이력_항목도_예산을_넘으면_원문_길이를_적
     assert st.get("cut") == len(big), st
 
 
+@pytest.mark.parametrize("tokens,chars", ((16384, 1500), (128000, 64260), (200000, 128520)))
+def test_좁은_창의_이력_예산은_종전_값_그대로다(monkeypatch, tokens, chars):
+    """특성화 — 구현 전 코드에서 뜬 값이다. 좁은 박스는 .env 로 TOOL_RESULT_MAX 를 낮춘다(도구 결과 몫을 떼지 않는다)."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(tokens)
+    assert app._hist_budget_chars("가") == chars
+
+
+def test_넓은_창의_이력_몫은_도구_결과_하나가_들어갈_자리를_남긴다(monkeypatch):
+    """1M 챗 루프는 이력에 (창 − 예비분)의 85% 를 줘 남는 몫이 약 149K 토큰인데, 도구 결과 하나가 TOOL_RESULT_MAX
+    200,000자(≈190K 토큰)까지 온다 — 이력이 찬 대화에서 큰 조회 한 번이면 루프 안에서 창을 넘었다(400). 자동 재시도도
+    같은 이력으로 다시 돌아 같은 결과였다. 문서가 있는 턴의 몫은 바꾸지 않는다(문서가 나머지를 쓴다)."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    hist_tok = app._est_tokens("가" * app._hist_budget_chars("가"))
+    tool_tok = app._est_tokens("가" * app.TOOL_RESULT_MAX)
+    assert hist_tok + app.DOC_RESERVE_TOKENS + tool_tok <= _BIG, (hist_tok, tool_tok)
+
+
 def test_가장_최근_이력_항목을_줄였으면_챗이_경고로_알린다():
     src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
     i = src.index("_hist_msgs = _history_messages(req.history, _hstat")

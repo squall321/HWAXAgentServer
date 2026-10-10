@@ -156,7 +156,11 @@ def test_문서가_없으면_이력이_창을_더_쓴다(monkeypatch):
     app._ctx_cache["n"] = 1000000
     solo = app._hist_budget_chars(has_docs=False)
     with_docs = app._hist_budget_chars(has_docs=True)
-    assert solo > with_docs * 1.8, f"문서 없을 때 {solo:,}자 / 있을 때 {with_docs:,}자"
+    # 문서 없는 턴은 도구 결과 하나의 몫(_loop_room_tokens)을 먼저 뗀다 — 그래서 비율은 0.85/0.40 보다 작다(1.70배).
+    # 창을 놀리지 않는다는 뜻은 이력 + 도구 결과 몫 + 예비분이 창 대부분을 쓰는 것으로 본다.
+    assert solo > with_docs * 1.6, f"문서 없을 때 {solo:,}자 / 있을 때 {with_docs:,}자"
+    used = app._est_tokens("가" * solo) + app._loop_room_tokens() + app.DOC_RESERVE_TOKENS
+    assert used >= 1000000 * 0.85, f"문서 없는 턴이 창의 {used / 1000000:.0%} 만 쓴다"
 
 
 # ── 긴 문서 맞추기(fit_document) — 앞에서 자르면 결론이 날아간다 ────────────────────

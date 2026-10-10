@@ -1954,15 +1954,28 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     return cache[key]
 
 
+def _loop_room_tokens() -> int:
+    """문서 없는 챗 턴에서 이력 밖에 남겨 둘 도구 결과 몫(토큰) — 넓은 창에서만 뗀다. 결과 하나의 상한(TOOL_RESULT_MAX)을
+    최악 환산(한글 1.05자/토큰)으로 바꾼 값이고, (창 − 예비분)의 절반을 넘지 않는다. 종전엔 1백만 토큰 창에서 이력이
+    (창 − 예비분)의 85% 를 다 쓰면 남는 몫(약 149K 토큰)이 도구 결과 하나(약 190K 토큰)보다 작아, 큰 조회 한 번에 ReAct
+    루프가 창을 넘었다. 좁은 창은 0(종전 — 작은 박스는 .env 로 TOOL_RESULT_MAX 를 낮춘다), 무제한(0)도 뗄 값을 몰라 0."""
+    if not _wide() or TOOL_RESULT_MAX <= 0:
+        return 0
+    return min(int(TOOL_RESULT_MAX / 1.05) + 1, max(0, _model_context_tokens() - DOC_RESERVE_TOKENS) // 2)
+
+
 def _hist_budget_chars(sample: str = "", has_docs: bool = False) -> int:
     """이력에 줄 글자 예산.
 
     env HIST_BUDGET 은 **낮추기만** 한다. 올리는 쪽으로 두면 낡은 .env 한 줄이 컨텍스트를
     조용히 넘겨 400 을 만든다(실측: dev .env 의 HIST_BUDGET=16000 이 16,384 창을 넘겼다).
     탐지가 틀려 창을 크게 잡아야 하면 그건 LLM_CONTEXT_TOKENS 로 고칠 일이다.
+    문서 없는 턴은 도구 결과 몫(_loop_room_tokens)을 먼저 떼고 나눈다. 문서가 있는 턴은 문서가 나머지를 쓴다
+    (_doc_budget_tokens — 그 길의 도구 결과 몫은 따로 없다).
     """
     share = HIST_CTX_SHARE if has_docs else HIST_CTX_SHARE_SOLO
-    tokens = int((_model_context_tokens() - DOC_RESERVE_TOKENS) * share)
+    reserve = DOC_RESERVE_TOKENS + (0 if has_docs else _loop_room_tokens())
+    tokens = int((_model_context_tokens() - reserve) * share)
     derived = max(1500, _chars_for_tokens(sample or "가나다라", max(1200, tokens)))
     forced = os.environ.get("HIST_BUDGET")
     return min(derived, max(1500, int(forced))) if forced else derived
