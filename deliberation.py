@@ -1223,6 +1223,7 @@ def _resolve_opts(req_opts):
         ev = req_opts.get("evidence")
         if isinstance(ev, list):
             o.evidence = []
+            _bad_keys: list = []      # 형식 밖이라 버린 근거 키 — 표지에 못 찍는다(호출자가 제 원장과 못 맞춘다)
             # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
             # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
             for it in ev:
@@ -1238,17 +1239,27 @@ def _resolve_opts(req_opts):
                     o.evidence_shadowed.append((len(o.evidence) + 1, _used, len(res),
                                                 [(k, len(b)) for k, b in _cands[1:]]))
                 _key = it.get("key")
+                _key_ok = isinstance(_key, str) and bool(_EVID_KEY_RE.fullmatch(_key))
+                if _key not in (None, "") and not _key_ok:
+                    _bad_keys.append(_delib_preview(_key, 30))
                 _body, _cutinfo = _fit_ev(res)
                 o.evidence.append({
-                    "key": _key if isinstance(_key, str) and _EVID_KEY_RE.fullmatch(_key) else "",
-                    "source": str(it.get("source") or it.get("source_app") or "챗")[:200],
-                    "tool": str(it.get("tool") or "")[:80],
-                    "args": str(it.get("args") or "")[:_EVID_ARGS_MAX],
+                    "key": _key if _key_ok else "",
+                    # 곁 필드는 상한에서 끊되 원문 길이를 남긴다 — 종전엔 말없이 끊었다(근거 줄·카드에 그대로 보인다).
+                    "source": _cut_mark(str(it.get("source") or it.get("source_app") or "챗"), 200),
+                    "tool": _cut_mark(str(it.get("tool") or ""), 80),
+                    "args": _cut_mark(str(it.get("args") or ""), _EVID_ARGS_MAX),
                     # 앞에서 자르지 않는다 — 발표자료·보고서는 결론이 뒤에 있다.
                     # 낱장 표지가 있으면 경계에서 가운데를 덜어내고 무엇이 빠졌는지 밝힌다.
                     # cut — 줄였으면 (원문 길이, 무엇을 뺐는지). 항목에 달아 둔다(스트림이 **실린** 항목만 알린다).
                     "result": _body, "cut": _cutinfo,
                 })
+            if _bad_keys:
+                # 말없이 빈 값으로 두면 표지가 [e:N] 만 남아 호출자가 제 번호와 못 맞춘다 — 형식을 함께 적는다.
+                o.req_unread["evidence.key"] = (f"근거 {len(_bad_keys)}건의 key({', '.join(_bad_keys[:5])}"
+                                                + (f" 외 {len(_bad_keys) - 5}건" if len(_bad_keys) > 5 else "")
+                                                + f")는 형식(영숫자·_.- {_EVID_KEY_MAX}자 이내) 밖이라 표지에 "
+                                                  "싣지 않았다 — 그 항목은 [e:N] 번호로만 가리킨다")
         srcs = req_opts.get("search_sources")
         if isinstance(srcs, list):
             o.search_sources = [str(x).strip()[:20] for x in srcs[:4]

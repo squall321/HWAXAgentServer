@@ -594,3 +594,18 @@ def test_산문_뒤의_긴_JSON_은_안쪽_객체가_아니라_바깥_객체다(
                                          ensure_ascii=False)
     got = d._parse_json(txt)
     assert isinstance(got, dict) and got.get("lens") == "관점" and len(got["reads"]) == 1500
+
+
+# ── 근거 항목의 곁 필드 — 출처 200·도구 80·인자 1,200자와 형식 밖 키를 말없이 버렸다 ─────────────────────
+def test_근거_항목의_곁_필드를_잘랐으면_원문_길이를_남긴다():
+    o = d._resolve_opts({"evidence": [{"source": "출" * 300, "tool": "t" * 100, "args": "a" * 2000, "result": "본문"}]})
+    e = o.evidence[0]
+    assert "300자 중 앞 200자" in e["source"] and "100자 중 앞 80자" in e["tool"], e
+    assert f"2,000자 중 앞 {d._EVID_ARGS_MAX:,}자" in e["args"], e["args"][-40:]
+
+
+def test_형식_밖_근거_키는_버리되_알린다():
+    o = d._resolve_opts({"evidence": [{"key": "E 3]", "result": "본문"}, {"key": "E4", "result": "본문"}]})
+    assert [e["key"] for e in o.evidence] == ["", "E4"]
+    note = " ".join(o.req_unread.values())
+    assert "1건" in note and "E 3]" in note, o.req_unread
