@@ -309,3 +309,46 @@ def test_health_가_도는_심의와_줄_선_심의를_센다(monkeypatch):
     assert asyncio.run(with_web_delib()) == (2, 1), "웹 경로의 심의를 세지 않았다"
     src = (ROOT / "start.sh").read_text(encoding="utf-8")
     assert '"delib_active"' in src and '"delib_queued"' in src, "start.sh 가 다른 이름을 읽는다"
+
+
+# ── /health 가 좌석 근거 예산(evid_budget)을 준다 — 리스크 앱이 박스의 창에 맞춰 브리프 크기를 잡는 값이다 ──────────
+import json  # noqa: E402
+import re  # noqa: E402
+
+import deliberation as d  # noqa: E402
+
+
+def _health_at(monkeypatch, ctx):
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: ctx)     # 엔진의 예산도 같은 이름을 늦게 읽는다
+    d._evid_cache.clear()
+    return a.health()
+
+
+def test_health_가_근거_예산을_싣는다(monkeypatch):
+    """값은 창에서 유도하고 **요청 때** 잰다 — 모듈을 읽을 때 재면 창 조회가 실패한 가정값이 굳는다."""
+    try:
+        assert _health_at(monkeypatch, 128000)["evid_budget"] == 17967
+        assert _health_at(monkeypatch, 16384)["evid_budget"] == 2000          # 바닥값(작은 창)
+        # 운영 창(1,048,576 — GLM-5.2) — 창에서 유도한 값이 더 크고, 설정 천장(DELIB_EVID_BUDGET)에 걸린다.
+        big = _health_at(monkeypatch, 1048576)["evid_budget"]
+        assert big == d._EVID_BUDGET and big > 17967, big
+    finally:
+        d._evid_cache.clear()
+
+
+def test_근거_예산을_실어도_start_sh_가_심의_수를_같은_식으로_읽는다(monkeypatch):
+    """start.sh 는 /health 본문을 grep 두 줄로 읽는다 — 필드를 더해도 같은 수가 나와야 한다(실제 grep 으로 본다)."""
+    monkeypatch.setattr(delib_jobs, "_JOBS", {"가": {"id": "가", "status": "running"}})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {"다": (None, None)})
+    monkeypatch.setattr(a, "_DETACHED_TASKS", set())
+    try:
+        body = json.dumps(_health_at(monkeypatch, 128000))
+    finally:
+        d._evid_cache.clear()
+    src = (ROOT / "start.sh").read_text(encoding="utf-8")
+    for name, want in (("delib_active", "1"), ("delib_queued", "1")):
+        pat = re.search(rf"grep -oE '(\"{name}\": \*\[0-9\]\+)'", src)
+        assert pat, f"start.sh 가 {name} 을 읽는 식을 못 찾았다 — 모양이 바뀌었으면 이 시험도 고쳐라"
+        got = subprocess.run(["bash", "-c", f"grep -oE '{pat.group(1)}' | grep -oE '[0-9]+$'"],
+                             input=body, capture_output=True, text=True, timeout=10).stdout.strip()
+        assert got == want, (name, got, body[:200])

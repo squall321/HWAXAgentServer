@@ -55,6 +55,7 @@ from deliberation import (
     envelope_failed,
     _call,
     _agent_search_hits,
+    _evid_budget,
     _tool_schema_brief,
     _seat_tool_prefer,
     knowledge_line,
@@ -4288,6 +4289,9 @@ def health() -> dict:
         "tool_max": TOOL_MAX,   # 0=무제한. >0 이고 게이트웨이 도구수보다 작으면 챗에 일부 도구 미바인딩
         # 예산은 이제 모델 컨텍스트에서 유도한다 — 원격 진단에서 실제 값이 보여야 한다.
         "context_tokens": _model_context_tokens(),
+        # 좌석 프롬프트에 실을 수 있는 원천 근거의 글자 수(창에서 유도한다 — 요청 때 잰다). 리스크 앱이 이 값으로
+        # 브리프 예산을 잡는다 — 이름을 바꾸면 그쪽이 옛 한도로 떨어진다(tests/test_risk_app_contract_anchors).
+        "evid_budget": _evid_budget(),
         "hist_budget": _hist_budget_chars(),                  # 문서 없이 대화만 할 때
         "hist_budget_with_docs": _hist_budget_chars(has_docs=True),
         "doc_budget": _doc_total_chars(),

@@ -72,3 +72,16 @@ def test_변경_비교_표식과_고정_도구가_그대로다():
     고정과 안내가 말없이 꺼진다 — 리스크 앱의 시험은 이 상수를 읽어 제 질문과 견준다."""
     assert d._RISK_DIFF_MARK == "diff_id="
     assert d._RISK_PIN_TOOLS == ("risk_get_diff",)
+
+
+# ── /health 의 근거 예산 — 리스크 앱 engine_client.health() 가 읽는다 ─────────────────────────────────
+def test_health_의_근거_예산_필드가_그대로다(monkeypatch):
+    """이름을 바꾸면 리스크 앱이 옛 한도로 떨어진다."""
+    import app as a
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 128000)
+    d._evid_cache.clear()
+    try:
+        h = a.health()
+    finally:
+        d._evid_cache.clear()
+    assert "evid_budget" in h and isinstance(h["evid_budget"], int), h.get("evid_budget")
