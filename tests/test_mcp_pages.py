@@ -286,9 +286,11 @@ def test_뒤로_보낸_칸은_마지막에_오고_첫_쪽에는_작은_칸이_�
 
 
 def test_도는_전사에_턴이_붙어도_앞_쪽의_경계는_그대로다(monkeypatch):
-    """쪽 경계는 되풀이 칸(total·note …)의 실제 값이 아니라 상한으로 잡는다 — 뒤에 붙는 턴이 앞 쪽을 흔들지 않는다."""
+    """쪽 경계는 되풀이 숫자 칸(total·next_offset …)의 실제 값이 아니라 상한으로 잡고, 글·null 을 오가는 note 는 턴 뒤로
+    보낸다 — 뒤에 붙는 턴이 앞 쪽을 흔들지 않는다."""
     monkeypatch.setattr(mcp_pages, "PAGE_CHARS", 8_000)
-    turns = [{"round": 1, "persona": f"s{i}", "say": _para(f"s{i}", 2_500 + 700 * i)} for i in range(6)]
+    # 9턴 → 10턴: total 의 자릿수가 바뀐다 — 경계를 실제 값으로 잡으면 뒤 쪽의 자르는 자리가 한 글자씩 밀린다.
+    turns = [{"round": 1, "persona": f"s{i}", "say": _para(f"s{i}", 2_500 + 700 * i)} for i in range(9)]
 
     def pages_of(ts, note):
         out = {"job_id": "j", "total": len(ts), "offset": 0, "limit": 40, "next_offset": None, "remaining": 0,

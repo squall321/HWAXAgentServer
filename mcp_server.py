@@ -634,7 +634,7 @@ async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
 
 
 # 쪽마다 되풀이하는 칸 — 어느 쪽을 받든 어느 잡의 어느 묶음인지, 다음 묶음이 있는지 보인다. note 는 글과 null 을 오가
-# 쪽 경계를 흔들므로(mcp_pages._ID_STR) 되풀이하지 않고 턴 뒤로 보낸다 — 줄인 턴은 행마다 say_clipped 가 따로 붙는다.
+# 쪽 경계를 흔들므로(mcp_pages._NUM 의 주석) 되풀이하지 않고 턴 뒤로 보낸다 — 줄인 턴은 행마다 say_clipped 가 따로 붙는다.
 _TRANSCRIPT_IDS = ("job_id", "total", "offset", "limit", "next_offset", "remaining")
 
 

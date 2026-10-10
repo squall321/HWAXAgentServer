@@ -11,8 +11,8 @@
 넘긴다)로 잰다. PAGE_CHARS 안이면 손대지 않는다. 넘으면 칸을 순서대로 채워 쪽을 만든다 — 글은 글자 경계에서, 목록은 항목 경계에서
 나누고, 일부만 실린 칸은 그 쪽의 page.pieces 에 적는다(path · from · to · of). 다음 쪽은 page.next 의 인자로 같은 도구를 부른다.
 쪽은 부를 때마다 처음부터 같은 규칙으로 다시 나눈다 — 끝난 심의는 내용이 바뀌지 않으므로 쪽 번호가 곧 위치다. 쪽 경계는 쪽마다
-되풀이하는 칸(ids)과 쪽 안내(page)의 실제 값이 아니라 그 상한으로 잡는다 — 뒤에만 붙는 응답(도는 심의의 전사)은 앞 쪽들의 경계가
-바뀌지 않는다.
+되풀이하는 숫자 칸(ids)과 쪽 안내(page)의 실제 값이 아니라 그 상한으로 잡는다 — 뒤에만 붙는 응답(도는 심의의 전사)은 앞 쪽들의
+경계가 바뀌지 않는다.
 """
 from __future__ import annotations
 
@@ -34,10 +34,9 @@ if PAGE_CHARS < PAGE_FLOOR:
     log.warning("env DELIB_MCP_PAGE_CHARS=%d 는 바닥 %d 미만 — %d 로 읽는다", PAGE_CHARS, PAGE_FLOOR, PAGE_FLOOR)
     PAGE_CHARS = PAGE_FLOOR
 
-# 쪽마다 되풀이하는 칸(ids)의 자리 — 쪽 경계를 실제 값이 아니라 이 길이로 잡는다. 글 칸은 64자(또는 그보다 긴 실제 길이 —
-# 잡 id 처럼 바뀌지 않는 글이어야 한다), 숫자·null 칸은 9자리다. 상태(running → done)처럼 값이 바뀌어도 앞 쪽들의 경계가
-# 그대로이게 한다. 글과 null 을 오가는 칸(전사의 note)은 ids 에 넣지 말고 tail 로 맨 뒤에 둔다.
-_ID_STR = 64
+# 쪽마다 되풀이하는 숫자·null 칸(ids)의 자리 — 쪽 경계를 실제 값이 아니라 9자리로 잡는다. 도는 전사의 total·next_offset 이
+# 늘어 자릿수가 바뀌어도 앞 쪽들의 경계가 그대로이게 한다. 글 칸은 실제 값으로 잡는다 — 되풀이하는 글 칸은 잡 id 처럼 쪽을
+# 받는 동안 바뀌지 않는 것만 둔다(글과 null 을 오가는 전사의 note 는 ids 에 넣지 않고 tail 로 맨 뒤에 둔다).
 _NUM = 999_999_999
 _PART = 99_999
 # 쪽에 이미 실린 것이 있으면 이보다 짧은 글 조각으로 쪽을 끝내지 않는다(다음 쪽에 통째로 넘긴다).
@@ -117,9 +116,7 @@ class _Layout:
 
 
 def _placeholder(v):
-    """되풀이 칸의 자리값 — 실제 값 이상의 글 길이를 갖되, 값이 조금 바뀌어도 길이가 같다."""
-    if isinstance(v, str):
-        return "x" * max(_ID_STR, _jlen(v) - 2)
+    """되풀이 칸의 자리값 — 숫자·null 은 9자리(실제 값 이상의 길이), 그 밖은 실제 값 그대로."""
     if v is None or isinstance(v, (bool, int, float)):
         return _NUM
     return v
