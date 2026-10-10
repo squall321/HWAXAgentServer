@@ -22,6 +22,8 @@ import os
 
 from deliberation import (
     _KN_CONC,
+    _room,
+    _wide,
     _agent_search_hits,
     _call,
     _first_dict,
@@ -47,8 +49,17 @@ HOPS = int(os.environ.get("THINK_HOPS", "1"))
 DESC_FLOOR = float(os.environ.get("THINK_DESC_FLOOR", "0.15"))
 # 동시 LLM 호출 상한. 심의 엔진에는 이 제한이 없어 좌석 수만큼 무제한 팬아웃한다.
 CONCURRENCY = int(os.environ.get("THINK_CONCURRENCY", "4"))
-# 좌석당 지식카드 주입 문자 예산.
+# 좌석당 지식카드 주입 문자 예산 — 좁은 창의 값이다. 넓은 창(1백만 토큰)은 심의 좌석과 같은 창 몫에서 유도한다
+# (_knowledge_budget — 약 19,000자, top_k 10건이 다 든다). 명시하면(THINK_KNOWLEDGE_BUDGET) 넓은 창에서는 낮추기만 한다.
 KNOWLEDGE_BUDGET = int(os.environ.get("THINK_KNOWLEDGE_BUDGET", "2500"))
+_KNOWLEDGE_BUDGET_SET = bool(os.environ.get("THINK_KNOWLEDGE_BUDGET"))
+
+
+def _knowledge_budget() -> int:
+    if not _wide():
+        return KNOWLEDGE_BUDGET
+    got = _room("knowledge", KNOWLEDGE_BUDGET)
+    return min(KNOWLEDGE_BUDGET, got) if _KNOWLEDGE_BUDGET_SET else got
 # 좌석 1콜 상한(초). 넘으면 그 좌석만 빠지고 나머지는 진행한다.
 # 180 → 600 (2026-10-08). 심의와 같은 공유 LLM 을 쓴다 — 20석 넘는 심의가 LLM 을 차지한 동안에는 띵킹 좌석
 # 호출이 큐에서 180초를 넘겨 전 좌석이 '초과' 로 빠졌다. 챗 LLM 의 호출 한도(LLM_TIMEOUT_S 900초)보다 짧은
@@ -167,16 +178,21 @@ async def _screen_one(tools: dict, seat: dict, q: str) -> dict:
         + (f" · 검색 강등({note})" if note else "")
         + ("" if passed else " — 근거도 어휘도 없음"))
 
-    lines, total, seen = [], 0, set()
-    for h in hits:
+    lines, total, seen, dropped = [], 0, set(), 0
+    _kb = _knowledge_budget()
+    for i, h in enumerate(hits):
         ln = _hit_line(h)
         if ln in seen:
             continue
-        if total + len(ln) > KNOWLEDGE_BUDGET:
+        if total + len(ln) > _kb:
+            # 뺀 수를 예심 사유에 적는다 — 종전엔 '근거 10건' 이라 적고 4건만 실어, 좌석이 본 것과 화면이 달랐다.
+            dropped = len({_hit_line(x) for x in hits[i:]} - seen)
             break
         seen.add(ln)
         lines.append(ln)
         total += len(ln)
+    if dropped:
+        reason += f" · 지식카드 {len(lines) + dropped}건 중 {len(lines)}건만 실음(예산 {_kb:,}자)"
     return {**seat, "hits": n, "top": top, "search_note": note,
             "passed": passed, "reason": reason, "knowledge": "\n".join(lines)}
 
@@ -343,6 +359,12 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
         from app import _doc_block, _doc_budget_tokens  # noqa: PLC0415
         _docs = _doc_block(documents,
                            budget_tokens=max(2000, int(_doc_budget_tokens(0) * THINK_DOC_SHARE)))
+    # 앞선 대화는 좌석에 싣지 않는다(좌석은 질문 하나로 자기판정한다). 말없이 버리면 사용자는 앞 대화가 반영된 줄
+    # 안다 — 그렇다고 한 줄 남긴다.
+    _hn = sum(1 for m in (history or []) if isinstance(m, dict) and str(m.get("content") or "").strip())
+    if _hn:
+        yield _sse("status", {"step": f"띵킹은 질문만 좌석에 준다 — 앞선 대화 {_hn}건은 싣지 않는다"
+                                      "(필요한 맥락은 질문에 적어 주세요)", "tool": None})
     yield _sse("status", {"step": "전문가 소집", "tool": "recommend_agents"})
     tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, user=user, user_pat=user_pat)
     if not tools or "recommend_agents" not in tools:
