@@ -205,6 +205,8 @@ _ADV_DESC = (
     "(delib-*)은 전문가 레지스트리에 없는 키라 묻지 않는다 — 등록해 두었으면 서버 설정 "
     "DELIB_KNOWLEDGE_SYNTHETIC_SEATS 에 그 키를 적어야 조회한다(지금 적힌 키: "
     f"{', '.join(sorted(_engine._KN_SYNTH)) or '없음'})) · "
+    "knowledge_query(좌석 지식카드 검색어: 문자열 하나 또는 {좌석 키: 검색어, \"*\": 기본}. 안 주면 화두로 찾는다. "
+    f"값마다 {_engine._KNOWLEDGE_Q_MAX}자까지이고 넘으면 앞부분만 쓰고 evidence_omitted 로 알린다) · "
     f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
     "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다) · "
     "sealed(봉인: 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다 — "

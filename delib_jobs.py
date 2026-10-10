@@ -535,8 +535,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
     # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
+    # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
     applied = {**applied, **{k: getattr(_read, k) for k in applied
-                             if k in _INT_KEYS or k in ("voc", "timeout_s")}}
+                             if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
@@ -581,7 +582,10 @@ def _opts_echo(opts: dict) -> dict:
     """무엇이 실제로 걸렸는지 잡에 남긴다 — 부피 큰 값(evidence 본문)은 개수만."""
     out = {}
     for k, v in (opts or {}).items():
-        if isinstance(v, list):
+        if k == "knowledge_query" and isinstance(v, dict):
+            # 좌석별 검색어 사전은 항목 수만 — 진행 조회(applied_opts)가 좌석 수 × 600자를 매번 실어 나르지 않게.
+            out[k] = {"seats": len(v)}
+        elif isinstance(v, list):
             out[k] = len(v) if k in ("evidence", "personas") else v
         elif isinstance(v, str) and len(v) > 120:
             out[k] = v[:117] + "…"

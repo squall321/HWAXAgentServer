@@ -103,6 +103,12 @@ HUMAN_NOTE_MAX = _env_int("DELIB_HUMAN_NOTE_MAX", 2000)
 # 종전엔 숫자가 _resolve_opts 안에 흩어져 있었고 말없이 잘랐다 — 도구 8개를 보낸 호출자는 6개만 돌았다는
 # 것을, 이어하기를 부른 사람은 이전 결정문이 앞 8,000자만 실렸다는 것을 알 길이 없었다.
 _TOOLS_MAX, _APPS_MAX, _OPTIONS_MAX, _NN_MAX = 6, 3, 8, 12
+# 좌석 지식카드 검색어(knowledge_query) — 한 건의 상한(자)과, 좌석별 사전으로 줄 때의 항목 수 상한.
+# ⚠ 포털 DelibOpts.knowledge_query 와 같은 수여야 한다(HWAXPortal backend/tests/test_delib_opts_contract 가
+#   이 두 줄을 `이름 = 수` 꼴로 읽어 대조한다 — 줄 끝에 주석을 달거나 식으로 바꾸지 않는다). 포털은 넘는 값을
+#   요청째 422 로 거절하고, 엔진은 MCP 호출자의 넘는 값을 앞부분만 쓰고 카드로 알린다.
+_KNOWLEDGE_Q_MAX = 600
+_KNOWLEDGE_Q_KEYS_MAX = 64
 # 지정 도구 결과 — 도구 하나의 상한과, 좌석 프롬프트에 싣는 합의 상한(자). 합은 매 라운드 전 좌석에 실리는데
 # 컨텍스트 회계(_pre_budget) 밖이라 넉넉히 올리지 않는다(사람 의견 상한과 같은 까닭). 넘으면 도구마다 같은
 # 몫으로 줄인다 — 이어 붙여 자르면 뒤쪽 도구가 통째로 빠진다(스트림의 0.7 단계).
@@ -915,6 +921,10 @@ def _resolve_opts(req_opts):
         # 끄려면 서버를 다시 띄워야 했고, 그건 그 시각 심의 중인 전원에게 걸린다. 그 시점 자료만으로
         # 다시 심사하는 소급 검증은 지식카드를 빼야 한다 — 카드는 오늘의 카드다(S26U 피드백 1-5).
         persona_knowledge=_env_int("DELIB_PERSONA_KNOWLEDGE", 1),
+        # 좌석 지식카드 검색어. 문자열이면 전 좌석 공통, 사전이면 {좌석 키: 검색어, "*": 기본}. 비면 화두로 찾는다.
+        # 봉인은 이 값을 닫지 않는다(_SEALED_CLOSE 밖) — 자료를 가져오는 손잡이가 아니라 지식카드 조회의 인자이고,
+        # 그 조회는 persona_knowledge 로 닫힌다.
+        knowledge_query="",
         # 봉인 실행(소급 검증) 여부와, 봉인이 닫은 손잡이 중 호출자가 열려던 것(스트림이 카드로 알린다).
         sealed=0, sealed_reopen=[],
         # 상한에서 줄인 요청 값 — 요청 키 → 무엇을 얼마나 줄였는지. 스트림이 카드 하나로 알린다.
@@ -958,6 +968,29 @@ def _resolve_opts(req_opts):
             o.human_note = hn[:HUMAN_NOTE_MAX] if HUMAN_NOTE_MAX > 0 else hn
             if len(o.human_note) < len(hn):
                 o.human_note_cut = (len(hn), o.human_note)
+        # 좌석 지식카드 검색어 — 문자열(전 좌석 공통) 또는 좌석별 사전. 못 읽는 값·항목은 그 좌석이 화두로 찾고
+        # 그렇다고 알린다. ⚠ 읽는 식(req_opts.get("knowledge_query"))은 포털 계약 시험이 글자 그대로 찾는다.
+        kq = req_opts.get("knowledge_query")
+        if isinstance(kq, str):
+            _s = kq.strip()
+            if _s:
+                o.knowledge_query = _s[:_KNOWLEDGE_Q_MAX]
+                if len(_s) > _KNOWLEDGE_Q_MAX:
+                    o.req_cut["knowledge_query"] = (f"지식카드 검색어(knowledge_query) {len(_s):,}자 중 "
+                                                    f"앞 {_KNOWLEDGE_Q_MAX:,}자만")
+        elif isinstance(kq, dict):
+            _pairs = [(k.strip()[:120], v.strip()) for k, v in kq.items()
+                      if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()]
+            o.knowledge_query = {k: v[:_KNOWLEDGE_Q_MAX] for k, v in _pairs[:_KNOWLEDGE_Q_KEYS_MAX]}
+            _cut = _cut_note("지식카드 검색어(knowledge_query)", [v for _k, v in _pairs],
+                             _KNOWLEDGE_Q_KEYS_MAX, _KNOWLEDGE_Q_MAX, unit="석", item="검색어")
+            if _cut:
+                o.req_cut["knowledge_query"] = _cut
+            if len(_pairs) < len(kq):
+                o.req_unread["knowledge_query"] = (f"knowledge_query 의 {len(kq) - len(_pairs)}개 항목(키나 값이 문자열이 "
+                                                   "아니거나 비었다 — 그 좌석은 대신 심의 주제로 찾는다)")
+        elif kq not in (None, ""):
+            o.req_unread["knowledge_query"] = f"knowledge_query={_delib_preview(kq, 40)}(대신 심의 주제로 찾는다)"
         ct = req_opts.get("chair_template")
         if isinstance(ct, str) and ct in _CHAIR_ITEMS:
             o.chair_template = ct
@@ -2402,6 +2435,17 @@ def knowledge_line(h) -> str:
     gr = _grade_notes(h)
     tag = f" [{' · '.join(gr)}]" if gr else ""
     return f"• [{head}]{src}{tag} {str(body).strip()}"[:700]
+
+
+def _knowledge_q_for(kq, seat_key: str, question: str) -> tuple[str, str]:
+    """이 좌석의 지식카드 검색어와 그 출처 — ('caller' = 호출자가 준 것 | 'question' = 심의 주제)."""
+    if isinstance(kq, str) and kq:
+        return kq, "caller"
+    if isinstance(kq, dict):
+        v = kq.get(seat_key) or kq.get("*") or ""
+        if v:
+            return v, "caller"
+    return question, "question"
 
 
 async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
@@ -4091,10 +4135,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # '지식이 없는 전문가' 와 '못 물어본 전문가' 가 구분되지 않는다.
             # 자리를 잡은 **뒤에** 묻는다 — 제한시간이 줄 선 시간까지 세면 뒤쪽 좌석이 조회를 시작도
             # 못 하고 '시간 초과' 로 강등된다.
+            # 검색어는 호출자가 준 것(knowledge_query)이 있으면 그것, 없으면 화두다. 돌려주는 값에 실은 줄 수와
+            # 검색어 출처를 같이 싣는다 — 받는 자리(아래 as_completed 루프)와 폭이 같아야 한다.
+            _q, _qsrc = _knowledge_q_for(opts.knowledge_query, p["key"], question)
             async with _kn_sem:
-                hits, note = await _agent_search_hits(tools, p["key"], question)
+                hits, note = await _agent_search_hits(tools, p["key"], _q)
             if not hits:
-                return p["key"], "", note
+                return p["key"], "", note, 0, _qsrc
             lines, total, seen = [], 0, set()
             for h in hits:
                 ln = _hit_line(h)
@@ -4103,10 +4150,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if total + len(ln) > _kb_budget:
                     break
                 seen.add(ln); lines.append(ln); total += len(ln)
-            return p["key"], "\n".join(lines), note
+            return p["key"], "\n".join(lines), note, len(lines), _qsrc
 
+        # 호출자가 검색어를 줬을 때만 꼬리를 붙인다 — 안 줬으면 종전 글 그대로다.
+        _kq = opts.knowledge_query
+        _kq_tail = ""
+        if isinstance(_kq, str) and _kq:
+            _kq_tail = f" · 검색어: 호출자 지정 {len(_kq)}자"
+        elif isinstance(_kq, dict) and _kq:
+            _kq_tail = (f" · 검색어: 호출자 지정(좌석별 {sum(1 for k in _kq if k != '*')}석"
+                        + (" · 기본 있음" if "*" in _kq else "") + ")")
         yield _sse("status", {"step": f"페르소나별 지식카드 검색 — {len(_kn_seats)}명 "
-                                      f"(한 번에 {_kn_par}명 · 건당 최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)",
+                                      f"(한 번에 {_kn_par}명 · 건당 최대 {KNOWLEDGE_TIMEOUT_S:.0f}초)" + _kq_tail,
                               "tool": "agent_search"})
         # 묻지 않은 좌석은 그렇다고 한 줄로 말한다. 인원수에서 빼기만 하면 '주입 — 2/2명 확보' 가 전원에게
         # 물은 것으로 읽힌다 — 반대석을 등록하고 설정에 적는 것을 잊은 박스에서는 그 한 석이 빠졌다는 것을
@@ -4131,7 +4186,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 한 번에 도는 수(_KN_CONC)가 깨진다.
         try:
             for _fut in asyncio.as_completed(_kn_tasks):
-                _k, _blk, _note = await _fut
+                _k, _blk, _note, _n, _qsrc = await _fut
                 _kn_done += 1
                 if _blk:
                     knowledge_by_key[_k] = _blk
