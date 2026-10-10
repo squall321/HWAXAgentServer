@@ -50,6 +50,8 @@ from evidence import (fit_document, sig_numbers as _sig_numbers,
                       unsourced_numbers as _unsourced_numbers)
 from deliberation import (
     N_PERSONAS,
+    _EVID_ITEM_MAX,
+    _wide,
     _PHANTOM_ID_MARK,
     _AUTH_REJECT_MARK,
     envelope_failed,
@@ -602,8 +604,10 @@ def _detach_stream(gen, label: str):
 # 불필요하게 잘린다 → 기본을 32000 으로 올리고, 소형 모델 박스만 .env 로 낮춘다.
 # 0 이면 무제한(권장 안 함 — 안전밸브 해제).
 # 32000 도 부족했다: recommend_agents(top_k=40) 한 번이 53KB 다(실측). prod 는 GLM(대형 컨텍스트)
-# 이므로 기본을 120000(≈35K 토큰)까지 올린다 — 소형 모델 박스만 .env 로 낮춘다.
+# 이므로 기본을 200000(≈190K 토큰, 1백만 토큰 창의 약 1/5)으로 둔다 — 소형 모델 박스만 .env 로 낮춘다.
 TOOL_RESULT_MAX = int(os.environ.get("TOOL_RESULT_MAX", "200000"))
+# 도구 결과를 _cap 이 잘랐다는 표지 — 모델에게 가는 글이고, 챗 스트림은 이 표지를 보고 상태줄로도 알린다.
+_CAP_MARK = "…[경고: 도구 출력이"
 
 # 도구 호출이 **실패했다**는 기계 표지. 예외는 _cap_tool 이 문자열로 바꿔 돌려주므로
 # (그래야 LLM 이 스키마를 보고 교정한다) 스트림에서는 성공과 구분이 안 됐다. 이 표지가
@@ -632,13 +636,14 @@ HIST_COMPACT_SHARE = float(os.environ.get("HIST_COMPACT_SHARE", "0.20"))
 
 
 def _cap(text, limit=None):
-    limit = limit or TOOL_RESULT_MAX
+    limit = TOOL_RESULT_MAX if limit is None else limit
     s = text if isinstance(text, str) else str(text)
-    if len(s) <= limit:
+    # 0 이면 무제한이다(위 주석의 약속). 종전엔 `limit or TOOL_RESULT_MAX` 라 0 이 0자 절단 + 경고가 됐다.
+    if limit <= 0 or len(s) <= limit:
         return s
     # 잘린 사실과 대처를 모델이 오해 없이 알도록 명시 — '이게 전부'로 착각해 잘못 답하는 것 방지.
     return s[:limit] + (
-        f"\n…[경고: 도구 출력이 {len(s)}자였고 {limit}자에서 잘렸습니다. 이건 전체가 아닙니다. "
+        f"\n{_CAP_MARK} {len(s):,}자였고 {limit:,}자에서 잘렸습니다. 이건 전체가 아닙니다. "
         f"전체 목록을 나열하지 말고, limit/필터/기간으로 좁혀 다시 조회하거나 집계 도구를 쓰세요.]")
 
 
@@ -725,12 +730,19 @@ def _int_tokens(text) -> set:
     return {int(m) for m in _INT_TOK_RE.findall(s)}
 
 
+def _turn_ids_max() -> int:
+    """출처 정수 집합의 상한 — 좁은 창은 종전 2,000개, 넓은 창은 창의 토큰 수(한 턴이 볼 수 있는 정수가 그보다 많을
+    수 없다). 종전엔 1백만 토큰 창에서도 2,000개라, 긴 이력의 씨앗만으로 차서 그 턴에 도구가 돌려준 ID 를 못 배웠다 —
+    다음 호출이 그 ID 를 쓰면 게이트가 '출처 없다' 로 막았다."""
+    return max(_TURN_IDS_MAX, _model_context_tokens()) if _wide() else _TURN_IDS_MAX
+
+
 def _learn_ids(text) -> None:
     """도구 결과에 실린 정수를 이번 턴의 '출처 있는 값'으로 등록한다 — list_materials 가 준
     id 로 다음 호출이 통과되게 하는 경로다. ⚠ 부모(on_tool_end)가 아니라 자식(도구 코루틴)
     쪽에서 넣는다. 부모에 두면 병렬 호출 시 순서 경합으로 정상 ID 가 차단될 수 있다."""
     src = _turn_ids.get()
-    if src is None or len(src) >= _TURN_IDS_MAX:
+    if src is None or len(src) >= _turn_ids_max():
         return
     src |= _int_tokens(text)
 
@@ -1980,7 +1992,36 @@ def _history_messages(history: list[dict], stats: dict | None = None,
 # 예산이 비어 있었다). 표시용을 늘리면 패널도 브라우저 localStorage 도 같이 무거워지므로
 # 필드를 나눈다. 심의 예산이 60KB 로 올라갔으므로(deliberation._EVID_BUDGET) 여기도 같이
 # 올린다 — 4000자×40건이면 예산을 채운다. 안 올리면 예산만 크고 실제로 실리는 건 그대로다.
+# 이 값은 좁은 창의 길이다 — 넓은 창(1백만 토큰)은 심의가 근거 항목 하나로 받는 길이(_EVID_ITEM_MAX 150,000자)까지
+# 싣는다(_handoff_chars). 종전엔 1백만 토큰 창에서도 4,000자라 큰 표·목록의 앞 몇 줄만 심의에 갔다(사용자 지침
+# 2026-10-10). 명시하면(HANDOFF_RESULT_CHARS) 넓은 창에서는 낮추기만 한다. 포털은 받은 것을 서버 대화에 그대로 남긴다.
 HANDOFF_RESULT_CHARS = int(os.environ.get("HANDOFF_RESULT_CHARS", "4000"))
+_HANDOFF_SET = bool(os.environ.get("HANDOFF_RESULT_CHARS"))
+
+
+def _handoff_chars() -> int:
+    """챗→심의 핸드오프(result_full·detail_full) 길이(자) — 좁은 창 HANDOFF_RESULT_CHARS, 넓은 창 _EVID_ITEM_MAX."""
+    if not _wide():
+        return HANDOFF_RESULT_CHARS
+    got = max(HANDOFF_RESULT_CHARS, _EVID_ITEM_MAX)
+    return min(HANDOFF_RESULT_CHARS, got) if _HANDOFF_SET else got
+
+
+def _handoff_text(v) -> str:
+    """도구 입출력의 핸드오프용 날것 — 미리보기(_tool_preview)와 같은 규약(공백 압축·지문 표식)에 길이만 다르다."""
+    return _tool_preview(v, _handoff_chars())
+
+
+def _turn_out_add(turn_out: list, txt: str) -> None:
+    """결정문·답변 수치 대조의 원문(turn_out)에 도구 결과를 싣는다. 좁은 창은 종전대로 결과마다 앞 120,000자·합
+    400,000자, 넓은 창은 결과를 자르지 않고(모델이 본 그대로 — _cap 이 이미 TOOL_RESULT_MAX 로 묶었다) 합은 창이
+    담는 글자 수까지다. 종전엔 모델이 200,000자까지 본 결과의 뒤쪽 수치가 '출처 없음' 으로 찍혔다."""
+    if _wide():
+        item, total = 0, max(400_000, int(_model_context_tokens() * 1.05))
+    else:
+        item, total = 120_000, 400_000
+    if sum(len(x) for x in turn_out) < total:
+        turn_out.append(txt[:item] if item else txt)
 
 # 붙인 문서(추출문) 주입 예산. 원본 파일은 오지 않는다 — DRM 문서는 그 PC 에서만 복호화되므로
 # 추출은 사용자 PC 의 Office COM 에서 끝난다(HWAXPortal docs/doc-deliberate).
@@ -2896,7 +2937,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 절차 도출용 날것 — 220자 미리보기로 만든 절차는 **인자가 손상돼 있다**
                 # (적층 정의·시나리오 같은 큰 인자는 통째로 잘린다). 결과에 result_full 을
                 # 두는 것과 같은 이유이고 같은 상한을 쓴다. 표시용보다 길 때만 싣는다.
-                _args_full = _tool_preview(_in, HANDOFF_RESULT_CHARS)
+                _args_full = _handoff_text(_in)
                 turn_calls.append((_tname or "?", args or ""))
                 # `run_id` 는 **같은 호출의 시작·완료에 같은 값**으로 온다. 이게 없어서
                 # 인자와 결과를 짝지을 수 없었고, 화면은 도구 **이름**으로 묶어 같은 도구
@@ -2913,10 +2954,16 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 _raw = event.get("data", {}).get("output")
                 _txt = getattr(_raw, "content", _raw)
                 if isinstance(_txt, str):
-                    # 수치 대조용 원문 적재 — 총량을 묶어 두지 않으면 대용량 조회 한 번에
-                    # 메모리가 튄다. 앞부분만 남겨도 수치는 대개 초반에 실린다.
-                    if sum(len(x) for x in turn_out) < 400_000:
-                        turn_out.append(_txt[:120_000])
+                    # 수치 대조용 원문 적재 — 좁은 창은 앞부분·총량을 묶고, 넓은 창은 모델이 본 그대로 싣는다(_turn_out_add).
+                    _turn_out_add(turn_out, _txt)
+                    # 도구 결과를 상한(TOOL_RESULT_MAX)에서 잘랐으면 화면·대화 기록에도 남긴다 — 종전엔 모델만 알았다.
+                    if _CAP_MARK in _txt:
+                        _cm = re.search(r"출력이 ([\d,]+)자였고 ([\d,]+)자에서", _txt)
+                        yield _sse("status", {"step": f"도구 결과 상한 — {event.get('name')} 결과 "
+                                                      + (f"{_cm.group(1)}자 중 앞 {_cm.group(2)}자만"
+                                                         if _cm else "일부만")
+                                                      + " 모델에 실었다(조건을 좁혀 다시 조회하게 했다)",
+                                              "tool": event.get("name"), "knob": "TOOL_RESULT_MAX"})
                     for _u in re.findall(r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]*", _txt):
                         if _u not in turn_imgs:
                             turn_imgs.append(_u)
@@ -2929,7 +2976,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 # 심의 핸드오프용 날것 — 표시용보다 길 때만 싣는다(짧은 결과에 중복 페이로드 금지).
                 # ⚠ 변수명 주의 — `full` 은 1701행의 **토큰 누적 리스트**다. 처음에 `full =` 로
                 #   덮어썼다가 다음 토큰의 full.append 가 AttributeError 로 챗을 죽였다(감사 C35).
-                _hand = _tool_preview(_raw, HANDOFF_RESULT_CHARS)
+                _hand = _handoff_text(_raw)
                 _post_tool_chars = 0   # 이 결과 뒤에 모델이 말을 했는지만 본다
                 _ok = _result_ok(_txt)
                 # 짝이 맞으려면 완료도 **같은 이름**이어야 한다 — 한쪽만 안쪽 이름이면
