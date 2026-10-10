@@ -304,3 +304,82 @@ def test_도는_전사에_턴이_붙어도_앞_쪽의_경계는_그대로다(mon
 
     for b, a in zip(before[:-1], after):
         assert b["turns"] == a["turns"] and cuts(b) == cuts(a), "앞 쪽의 경계가 움직였다"
+
+
+# ── 다른 deliberate_* 도구 — 결과·진행·목록·시작·이어하기도 한 응답이 상한 안이고, 쪽을 이으면 원래 응답이다 ─────────────
+def _paged_whole(name: str, args: dict, want: dict) -> list:
+    """쪽을 따라가며 상한을 보고, 이은 응답이 원래 응답(want)과 같은지 본다."""
+    pages = _follow(name, args)
+    sizes = [len(t) for t, _r in pages]
+    assert max(sizes) <= CLAUDE_MCP_RESULT_CHARS, f"{name}: 한 쪽이 {max(sizes):,}자다(쪽 크기 {sizes[:6]})"
+    got = _reassemble(pages)
+    assert got == want, f"{name}: 쪽을 이은 응답이 원래 응답과 다르다 — 다른 칸: " + str(
+        sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k)))
+    return pages
+
+
+def test_결과_회수가_상한을_넘지_않고_쪽을_이으면_결정문_전문이다(monkeypatch, tmp_path):
+    """넓은 창의 리스크 심사 결정문은 2만~6만 자다 — 한 응답에 다 실으면 상한을 넘어 결정문 뒤가 파일로 간다."""
+    job = _job(monkeypatch, tmp_path, seats=6, rounds=2, chair="결정: " + _para("결정문", 60_000))
+    want = delib_jobs.summary(job, full=True)
+    assert len(want["decision"]) > 50_000, "결정문이 짧다 — 시험 전제가 깨졌다"
+    pages = _paged_whole("deliberate_result", {"job_id": job["id"]}, want)
+    assert pages[0][1]["status"] == "done" and pages[0][1]["decision"], "첫 쪽에 상태와 결정문 머리가 실린다"
+
+
+def test_진행_조회는_화두가_커도_상한_안이고_첫_쪽에_상태가_다_실린다(monkeypatch, tmp_path):
+    """화두에 변경 요지를 통째로 넣은 심사는 화두만 수만 자다 — 매번 부르는 진행 조회가 상한을 넘으면 상태를 못 본다."""
+    job = _job(monkeypatch, tmp_path, seats=3, rounds=2, question="[리스크심사 P1 T1] " + _para("변경 요지", 40_000))
+    pages = _follow("deliberate_status", {"job_id": job["id"]})
+    first = pages[0][1]
+    assert all(k in first for k in ("status", "stage", "round", "total_rounds", "turn_count", "warnings",
+                                    "evidence_omitted")), f"첫 쪽에 상태 칸이 없다: {sorted(first)}"
+    whole = delib_jobs.summary(job)          # 원래 응답 — 끝난 잡이라 시각에 따라 변하는 칸(idle_s)이 없다
+    whole.update(evidence_omitted=job.get("evidence_omitted") or [], warnings=job.get("warnings") or [],
+                 warnings_total=int(job.get("warnings_total") or len(job.get("warnings") or [])))
+    _paged_whole("deliberate_status", {"job_id": job["id"]}, whole)
+
+
+def test_목록이_화두가_긴_잡이_많아도_상한_안이고_쪽을_이으면_전부다(monkeypatch, tmp_path):
+    base = _job(monkeypatch, tmp_path, seats=3, rounds=2, question="[리스크심사 P1 T1] " + _para("변경 요지", 3_000))
+    for k in range(19):
+        delib_jobs._persist({**base, "id": f"risk-review-2026101{k % 10}-0000{k:02d}-x{k:05d}",
+                             "started_at": base["started_at"] - 60 * (k + 1)})
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    want = {"jobs": delib_jobs.list_jobs(20), "running": 0, "queued": 0, "running_max": delib_jobs.MAX_RUNNING,
+            "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER, "queue_max": delib_jobs.QUEUE_MAX}
+    assert len(want["jobs"]) == 20
+    _paged_whole("deliberate_list", {"limit": 20}, want)
+
+
+async def _quick_entry(_app, q, _groups, _opts, _user, _pat, _x):
+    yield d._sse("delib", {"kind": "decision", "text": "결정: 진행한다"})
+    yield d._sse("done", {})
+
+
+def test_시작과_이어하기의_응답은_화두가_커도_상한_안이고_전문은_진행_조회로_받는다(monkeypatch, tmp_path):
+    """시작 응답은 화두를 되돌려 보인다 — 받은 화두가 수만 자면 그 메아리만으로 상한을 넘는다. 시작 도구는 다시 부르면 심의가
+    또 열리므로 쪽을 나눠 '다음 쪽' 으로 다시 부르게 할 수 없다 — 머리만 보이고 전문은 진행 조회(쪽)로 받게 한다."""
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(d, "run_deliberation", _quick_entry)
+    monkeypatch.setattr(m, "_APP", object())
+    q = "[리스크심사 P1 T1] " + _para("변경 요지", 40_000)
+
+    async def go():
+        started = await m.mcp.call_tool("deliberate_start", {"question": q})
+        await asyncio.wait(list(delib_jobs._TASKS.values()))
+        jid = json.loads("".join(b.text for b in (started if isinstance(started, list) else started[0])))["job_id"]
+        cont = await m.mcp.call_tool("deliberate_continue", {"previous_job_id": jid, "human_note": "더 본다"})
+        await asyncio.wait(list(delib_jobs._TASKS.values()))
+        return [("".join(b.text for b in (r if isinstance(r, list) else r[0]))) for r in (started, cont)]
+
+    for text in asyncio.run(go()):
+        res = json.loads(text)
+        assert len(text) <= CLAUDE_MCP_RESULT_CHARS, f"시작·이어하기 응답이 {len(text):,}자다"
+        assert res["question_chars"] == len(q) and q.startswith(res["question"]), "화두 머리와 전체 길이를 보인다"
+        assert "deliberate_status" in res["note"], res["note"]
+        whole = _reassemble(_follow("deliberate_status", {"job_id": res["job_id"]}))
+        assert whole["question"] == q, "진행 조회로 화두 전문을 받지 못했다"

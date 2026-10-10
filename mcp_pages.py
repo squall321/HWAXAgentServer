@@ -279,6 +279,32 @@ def _render(leaves: list, lists: dict, taken: list) -> tuple[dict, list]:
     return _plain(body), [x for _k, x in pieces]
 
 
+def echo_head(out: dict, key: str, where: str) -> dict:
+    """되돌려 보이는 글 칸(key) 때문에 응답이 쪽 크기를 넘으면, 그 칸은 머리만 싣고 전체 길이(key_chars)와 전문을 받는 곳을 note 에 적는다.
+
+    다시 부르면 일이 또 일어나는 도구(심의 시작·이어하기)의 응답용이다 — 쪽을 나눠 '다음 쪽' 으로 다시 부르게 할 수 없다.
+    그 칸은 호출자가 보낸 글의 메아리이고, 받은 글은 전부 쓰였다 — 전문은 where 가 쪽으로 나눠 준다."""
+    if len(wire(out)) <= PAGE_CHARS:
+        return out
+    full = out[key]
+
+    def with_note(n: int) -> str:
+        add = (f"{key} 가 {len(full):,}자라 응답이 쪽 크기({PAGE_CHARS:,}자)를 넘어, 여기에는 앞 {n:,}자만 되돌려 보인다 — "
+               f"받은 글은 전부 그대로 쓰였다(잘린 것이 아니다). 전문은 {where} 로 받는다.")
+        return f"{out['note']} {add}" if out.get("note") else add
+
+    base = {**out, key: "", f"{key}_chars": len(full), "note": with_note(len(full))}   # 머리 길이 숫자의 자리를 가장 길게 잡는다
+    room = PAGE_CHARS - len(wire(base))
+    lo, hi, n = 1, min(len(full), max(0, room)), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _jlen(full[:mid]) - 2 <= room:
+            n, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    return {**base, key: full[:n], "note": with_note(n)}
+
+
 def paged(out: dict, *, part: int = 1, again: dict, ids: tuple = (), tail: tuple = ()) -> dict:
     """out 이 쪽 크기(PAGE_CHARS) 안이면 그대로 돌려준다(part 1). 넘으면 part 번째 쪽이다.
 

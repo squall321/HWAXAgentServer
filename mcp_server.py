@@ -257,6 +257,20 @@ _SEAT_DESC = (
     "유임한다). 비우면 서버가 발굴한다."
 )
 
+# 쪽 안내 — 응답이 Claude Code 의 MCP 결과 상한을 넘으면 쪽으로 나눈다(mcp_pages). 쪽 크기는 상수에서 읽는다(손으로 적은
+# 숫자는 낡는다 — 위 _EVID_DESC 의 주석). 종전 전사 설명은 '길어지니 limit 을 줄여라' 뿐이라, 넓은 창의 full 전사 한 쪽(21석
+# 3라운드 15만 자)이 상한을 넘어 파일 저장 안내로 바뀌었고, 끝까지 읽지 않으면 뒤쪽 턴이 빠진 채 원장에 갔다(A-transcript-size).
+# 결과 회수(결정문 수만 자)·진행 조회(변경 요지를 통째로 실은 화두)·목록(화두 × 행)도 같은 상한을 넘었다 — 같은 글을 쓴다.
+_PAGE_DESC = (
+    f"**쪽** — 응답 하나는 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한 MAX_MCP_OUTPUT_TOKENS 기본 25,000토큰을 "
+    "1자≈1토큰으로 잡은 값) 안이다. 넘으면 응답에 page 가 붙는다 — page.next 의 인자로 같은 도구를 다시 불러(part 만 바뀐다) "
+    "마지막 쪽(next 가 null)까지 받고, page.pieces 에 적힌 칸을 쪽 순서대로 이어 붙인다. 잘라 버린 것은 없다 — 끝까지 받기 전에 "
+    "'이것이 전부' 로 쓰지 마라."
+)
+# 시작·이어하기 응답의 화두 메아리 — 두 도구는 다시 부르면 심의가 또 열리므로 쪽을 나눠 '다음 쪽' 으로 부르게 할 수 없다.
+# 넘으면 머리만 보이고 전문은 진행 조회(쪽을 나눈다)로 받게 한다(mcp_pages.echo_head).
+_Q_ECHO_WHERE = "deliberate_status(job_id) 의 question(길면 쪽으로 나눠 준다)"
+
 _START_DESC = (
     "HWAX 전문가 심의를 시작한다. 사용자가 '심의해줘'·'원인 규명'·'불량 원인'·'안 선택'·"
     "'트레이드오프'·'신뢰 판정'·'리스크 심사'·'위험 도출'·'해석 설계'·'시뮬레이션 심의'·"
@@ -265,7 +279,9 @@ _START_DESC = (
     "결정 문서를 만든다. **즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다**(동시 실행 상한이 차 "
     "있으면 줄을 섰다가 돈다 — 아래 status) — "
     "결과는 deliberate_status / deliberate_result 로 받는다. 응답을 붙잡고 기다리지 마라. "
-    "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다.\n\n"
+    "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다. "
+    f"응답의 question 은 받은 화두를 되돌려 보인 것이다 — 응답이 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한)를 "
+    "넘으면 머리만 싣고 question_chars(전체 길이)와 note 로 전문 받는 곳을 말한다(받은 화두는 전부 쓰인다).\n\n"
     "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
 
@@ -393,7 +409,7 @@ async def deliberate_start(
                    "진행 조회의 idle_s(마지막 이벤트 뒤 경과)가 quiet_ok_s 안이면 멈춘 것이 아니라 LLM 을 "
                    "기다리는 중이다. 넘었다고 멈춘 것은 아니다 — 도는 잡은 스스로 끝난다. 다시 시작하지 마라"
                    "(그만두려면 deliberate_cancel).")
-    return out
+    return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
 def _carry_seats(prev: dict) -> list:
@@ -430,7 +446,8 @@ _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_pre
                  "(그 보고서에 이어 붙는다), 다단 심의(sim-plan·test-plan·build-plan)로는 이어받지 않는다. "
                  "봉인 없이 돈 심의를 봉인으로 이어받지도 않는다. 열어서 다시 보려면 새 심의를 시작한다. "
                  "이전 회차의 근거(evidence) 본문은 원장에 건수만 남아 **이어지지 않는다** — 좌석이 다시 봐야 하면 "
-                 "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한)."),
+                 "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한). 응답의 question 이 길어 "
+                 "Claude Code 의 MCP 결과 상한을 넘으면 deliberate_start 처럼 머리만 싣는다(question_chars·note)."),
 )
 async def deliberate_continue(
     previous_job_id: str,
@@ -532,16 +549,23 @@ async def deliberate_continue(
         if foreign and append_report else [])
     if notes:
         out["note"] = " ".join(notes)
-    return out
+    return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
+
+
+# 진행 조회·결과 회수가 쪽마다 되풀이하는 칸, 쪽을 나눌 때 맨 뒤로 보내는 칸 — 화두가 크면 첫 쪽에 상태 칸이 다 실리게 한다.
+_JOB_IDS = ("job_id", "status")
+_JOB_TAIL = ("question",)
 
 
 @mcp.tool(title="심의 진행 상황",
           description="HWAX 심의가 어디까지 갔는지 본다 — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지. "
-                      + _STATE_DESC)
-async def deliberate_status(job_id: str) -> dict:
+                      + _STATE_DESC + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
+                      "칸이 다 실린다.")
+async def deliberate_status(job_id: str, part: int = 1) -> dict:
     """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다.
 
-    queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다."""
+    queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다.
+    part — 응답이 쪽으로 나뉘었을 때 받을 쪽(1부터, page.next 가 알려 준다)."""
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
@@ -556,14 +580,15 @@ async def deliberate_status(job_id: str) -> dict:
     if "idle_s" in out:
         # idle_s 를 무엇과 견줄지 — 좌석 발언 하나가 조용할 수 있는 최장 시간(무제한이면 None).
         out["quiet_ok_s"] = _quiet_ok_s(job)
-    return out
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, again={"job_id": job_id})
 
 
 @mcp.tool(title="심의 결과(결정 문서) 회수",
           description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중(running)이면 현재 단계만, "
-                      "줄을 선 채(queued)면 순번만 돌려준다.")
-async def deliberate_result(job_id: str) -> dict:
-    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id."""
+                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
+                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
+async def deliberate_result(job_id: str, part: int = 1) -> dict:
+    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
@@ -572,26 +597,30 @@ async def deliberate_result(job_id: str) -> dict:
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
     elif out.get("queue"):
         out["note"] = "아직 시작 전이다 — " + _queued_note(out["queue"])
-    return out
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, again={"job_id": job_id})
 
 
 @mcp.tool(title="심의 목록",
           description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다. 내가 시작한 "
                       "심의만 실린다(행의 mine 이 참이다 — 주인이 안 적힌 옛 잡은 mine 이 거짓인 채로 함께 "
-                      "실린다). running·queued 는 전체 수다 — 남의 심의는 수로만 보인다.")
-async def deliberate_list(limit: int = 20, ctx: Context | None = None) -> dict:
+                      "실린다). running·queued 는 전체 수다 — 남의 심의는 수로만 보인다. " + _PAGE_DESC)
+async def deliberate_list(limit: int = 20, part: int = 1, ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
     신원 있는 호출자에게는 제 잡(과 주인이 안 적힌 잡)만 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는
-    길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다."""
+    길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
     user, _groups = _caller(ctx)
-    rows = delib_jobs.list_jobs(max(1, min(100, int(limit or 20))), viewer=user)
+    lim = max(1, min(100, int(limit or 20)))
+    rows = delib_jobs.list_jobs(lim, viewer=user)
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
-    return {"jobs": rows, "running": delib_jobs.running_count(),
-            "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
-            "running_max": delib_jobs.MAX_RUNNING,
-            "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
-            "queue_max": delib_jobs.QUEUE_MAX}
+    out = {"jobs": rows, "running": delib_jobs.running_count(),
+           "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
+           "running_max": delib_jobs.MAX_RUNNING,
+           "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
+           "queue_max": delib_jobs.QUEUE_MAX}
+    # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
+    return mcp_pages.paged(out, part=part, again={"limit": lim},
+                           ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
 
 
 @mcp.tool(title="심의 취소",
@@ -604,15 +633,6 @@ async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
     return delib_jobs.cancel(job_id, by=user)
 
 
-# 쪽 안내 — 응답이 Claude Code 의 MCP 결과 상한을 넘으면 쪽으로 나눈다(mcp_pages). 쪽 크기는 상수에서 읽는다(손으로 적은
-# 숫자는 낡는다 — 위 _EVID_DESC 의 주석). 종전 전사 설명은 '길어지니 limit 을 줄여라' 뿐이라, 넓은 창의 full 전사 한 쪽(21석
-# 3라운드 15만 자)이 상한을 넘어 파일 저장 안내로 바뀌었고, 끝까지 읽지 않으면 뒤쪽 턴이 빠진 채 원장에 갔다(A-transcript-size).
-_PAGE_DESC = (
-    f"**쪽** — 응답 하나는 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한 MAX_MCP_OUTPUT_TOKENS 기본 25,000토큰을 "
-    "1자≈1토큰으로 잡은 값) 안이다. 넘으면 응답에 page 가 붙는다 — page.next 의 인자로 같은 도구를 다시 불러(part 만 바뀐다) "
-    "마지막 쪽(next 가 null)까지 받고, page.pieces 에 적힌 칸을 쪽 순서대로 이어 붙인다. 잘라 버린 것은 없다 — 끝까지 받기 전에 "
-    "'이것이 전부' 로 쓰지 마라."
-)
 # 쪽마다 되풀이하는 칸 — 어느 쪽을 받든 어느 잡의 어느 묶음인지, 다음 묶음이 있는지 보인다. note 는 글과 null 을 오가
 # 쪽 경계를 흔들므로(mcp_pages._ID_STR) 되풀이하지 않고 턴 뒤로 보낸다 — 줄인 턴은 행마다 say_clipped 가 따로 붙는다.
 _TRANSCRIPT_IDS = ("job_id", "total", "offset", "limit", "next_offset", "remaining")
