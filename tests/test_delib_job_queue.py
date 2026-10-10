@@ -353,7 +353,8 @@ def test_줄까지_차면_그렇다고_말하고_거절한다(eng, monkeypatch):
         assert "전역 1건" in msg, msg
         assert b["id"] in msg and "내 대기 1건" in msg and "내 진행 중 0건" in msg, msg
         assert "deliberate_cancel" in msg
-        assert len(delib_jobs._JOBS) == 3 and len(list(delib_jobs.JOB_DIR.iterdir())) == 3, "거절했는데 잡이 생겼다"
+        # 원장 파일(*.json)을 센다 — 원장 옆 하위 폴더(목록 색인 list/)는 잡이 아니다.
+        assert len(delib_jobs._JOBS) == 3 and len(list(delib_jobs.JOB_DIR.glob("*.json"))) == 3, "거절했는데 잡이 생겼다"
         delib_jobs.cancel(b["id"])                # 내 것을 접으면 줄에 자리가 난다
         d2 = _start("라", ME)
         assert _st(d2) == "queued" and delib_jobs.summary(d2)["queue"]["position"] == 2

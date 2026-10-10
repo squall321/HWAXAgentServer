@@ -194,13 +194,54 @@ def _path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
 
+# 목록 색인 — 목록 한 행(summary)과 목록·재기동 정리가 고르는 데 쓰는 칸만 담은 작은 파일. 원장 파일은 넓은 창에서 턴마다
+# say·say_full 을 함께 적어 수백 KB~수 MB 가 된다 — 목록 한 번이 남의 잡을 지나가며 그 파일을 최대 LIST_SCAN_MAX 개 통째로
+# 읽었고(300 × 2~6MB), 재기동 정리는 전부 읽었다(검토 A-ledger-growth). 원장과 같은 걸음에서 쓰고(_persist), 색인에 적은 원장의
+# (mtime_ns, 크기)가 지금 원장과 다르거나 색인이 없으면(옛 원장·쓰기 실패·다른 판이 원장만 고쳐 씀) 원장을 읽고 다시 쓴다
+# (_list_load). 시각을 견주지 않는다 — 다른 박스에서 옮겨 온 원장처럼 mtime 이 앞서 있으면 '색인이 더 새것' 이 영영 안 선다.
+# 원장 옆 하위 폴더라 원장의 glob("*.json") 에 걸리지 않는다.
+_LIST_DIR = "list"
+_LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
+              "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
+              "last_step")
+
+
+def _list_path(job_id: str) -> Path:
+    return JOB_DIR / _LIST_DIR / f"{job_id}.json"
+
+
+def _list_rec(job: dict) -> dict:
+    """목록 한 행에 쓰는 칸만 — summary() 가 원장 대신 이것을 받아도 같은 행이 나온다(턴은 수, 좌석은 키, 체크포인트는 유무)."""
+    rec = {k: job[k] for k in _LIST_KEYS if k in job}
+    rec["opts"] = {"sealed": (job.get("opts") or {}).get("sealed")}
+    rec["seats"] = [{"key": s.get("key")} for s in (job.get("seats") or [])]
+    rec["turn_count"] = len(job.get("turns") or [])
+    rec["checkpoint"] = bool(job.get("checkpoint"))
+    return rec
+
+
+def _stamp(st: os.stat_result) -> list:
+    """원장 파일의 도장 — 색인이 어느 원장에서 나왔는지(_list_load 가 지금 원장과 견준다)."""
+    return [st.st_mtime_ns, st.st_size]
+
+
+def _write_list(job: dict, st: os.stat_result) -> None:
+    (JOB_DIR / _LIST_DIR).mkdir(parents=True, exist_ok=True)
+    tmp = _list_path(job["id"]).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({**_list_rec(job), "src": _stamp(st)}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(_list_path(job["id"]))
+
+
 def _persist(job: dict) -> None:
-    """재기동 뒤에도 결과를 회수할 수 있게 파일로 남긴다. 실패해도 심의는 계속 간다."""
+    """재기동 뒤에도 결과를 회수할 수 있게 파일로 남긴다. 실패해도 심의는 계속 간다.
+
+    원장을 쓴 다음 그 원장의 도장을 담아 목록 색인을 쓴다(_list_load)."""
     try:
         JOB_DIR.mkdir(parents=True, exist_ok=True)
         tmp = _path(job["id"]).with_suffix(".json.tmp")
         tmp.write_text(json.dumps(job, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(_path(job["id"]))
+        _write_list(job, _path(job["id"]).stat())
     except OSError as exc:
         log.warning("잡 기록 실패 %s: %r", job.get("id"), exc)
 
@@ -210,6 +251,28 @@ def _load(job_id: str) -> dict | None:
         return json.loads(_path(job_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def _list_load(f: Path) -> dict | None:
+    """목록·재기동 정리가 읽는 잡 — 색인의 도장이 지금 원장 파일과 같으면 색인을, 아니면 원장 전부를 읽고 색인을 다시
+    쓴다(색인 이전의 옛 원장은 처음 한 번만 통째로 읽는다). 행은 summary() 로 만든다 — 색인에 없는 칸은 쓰지 않는다."""
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    try:
+        rec = json.loads(_list_path(f.stem).read_text(encoding="utf-8"))
+        if isinstance(rec, dict) and rec.get("src") == _stamp(st):
+            return rec
+    except (OSError, ValueError):
+        pass
+    j = _load(f.stem)
+    if j:
+        try:
+            _write_list(j, st)
+        except OSError as exc:
+            log.debug("목록 색인 쓰기 실패 %s: %r", f.stem, exc)
+    return j
 
 
 def get(job_id: str) -> dict | None:
@@ -646,6 +709,10 @@ def reap_orphans() -> int:
     n = 0
     try:
         for f in JOB_DIR.glob("*.json"):
+            # 상태는 목록 색인에서 본다 — 끝난 잡의 원장(수 MB)까지 통째로 읽지 않는다. 고칠 잡만 원장 전부를 읽는다.
+            rec = _list_load(f)
+            if not (rec and rec.get("status") in ("running", "queued") and rec["id"] not in _JOBS):
+                continue
             j = _load(f.stem)
             if j and j.get("status") in ("running", "queued") and j["id"] not in _JOBS:
                 j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다. "
@@ -677,7 +744,8 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "seats": [s.get("key") for s in (job.get("seats") or [])],
         "elapsed_s": round(elapsed, 1),
         "report_id": job.get("report_id"),
-        "turn_count": len(job.get("turns") or []),
+        # 목록 색인(_list_rec)은 턴 대신 수만 담는다.
+        "turn_count": len(job["turns"] or []) if "turns" in job else int(job.get("turn_count") or 0),
         "checkpoint": bool(job.get("checkpoint")),
         "error": job.get("error"),
     }
@@ -787,7 +855,7 @@ def list_jobs(limit: int = 20, *, viewer: str = "") -> list[dict]:
                         reverse=True)[:max(limit * 3, LIST_SCAN_MAX)]:
             if kept >= limit * 3:
                 break
-            j = _load(f.stem)
+            j = _list_load(f)        # 목록 색인 — 원장 파일(수 MB)을 통째로 읽지 않는다
             if not j or _foreign(j, viewer):
                 continue
             kept += 1
