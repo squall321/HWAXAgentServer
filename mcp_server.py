@@ -23,6 +23,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 import delib_jobs
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
+import mcp_pages
 
 log = logging.getLogger("agent.mcp")
 
@@ -603,21 +604,37 @@ async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
     return delib_jobs.cancel(job_id, by=user)
 
 
+# 쪽 안내 — 응답이 Claude Code 의 MCP 결과 상한을 넘으면 쪽으로 나눈다(mcp_pages). 쪽 크기는 상수에서 읽는다(손으로 적은
+# 숫자는 낡는다 — 위 _EVID_DESC 의 주석). 종전 전사 설명은 '길어지니 limit 을 줄여라' 뿐이라, 넓은 창의 full 전사 한 쪽(21석
+# 3라운드 15만 자)이 상한을 넘어 파일 저장 안내로 바뀌었고, 끝까지 읽지 않으면 뒤쪽 턴이 빠진 채 원장에 갔다(A-transcript-size).
+_PAGE_DESC = (
+    f"**쪽** — 응답 하나는 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한 MAX_MCP_OUTPUT_TOKENS 기본 25,000토큰을 "
+    "1자≈1토큰으로 잡은 값) 안이다. 넘으면 응답에 page 가 붙는다 — page.next 의 인자로 같은 도구를 다시 불러(part 만 바뀐다) "
+    "마지막 쪽(next 가 null)까지 받고, page.pieces 에 적힌 칸을 쪽 순서대로 이어 붙인다. 잘라 버린 것은 없다 — 끝까지 받기 전에 "
+    "'이것이 전부' 로 쓰지 마라."
+)
+# 쪽마다 되풀이하는 칸 — 어느 쪽을 받든 어느 잡의 어느 묶음인지, 다음 묶음이 있는지 보인다. note 는 글과 null 을 오가
+# 쪽 경계를 흔들므로(mcp_pages._ID_STR) 되풀이하지 않고 턴 뒤로 보낸다 — 줄인 턴은 행마다 say_clipped 가 따로 붙는다.
+_TRANSCRIPT_IDS = ("job_id", "total", "offset", "limit", "next_offset", "remaining")
+
+
 @mcp.tool(
     title="심의 전사 — 좌석별 라운드 발언",
     # '원문을 본다' 고 적어 두었는데 내주는 것은 회의 버블용으로 줄인 글이었다 — 그 글을 믿고 리스크 원장에
     # 제출하면 잘린 뒤쪽의 인용이 사라진다. 기본이 줄인 글이라는 것과 줄이지 않은 글을 받는 법을 적는다.
-    # 길이 숫자는 적지 않는다(엔진 설정을 따라간다 — 낡는다).
+    # 발언 길이 숫자는 적지 않는다(엔진 설정을 따라간다 — 낡는다).
     description=("HWAX 심의에서 어느 좌석이 몇 라운드에 무엇을 말했는지 본다. 기본은 **화면에 뜨는 줄인 "
                  "발언**이다 — 줄인 턴에는 say_clipped 와 온전한 길이(say_full_chars)가 붙는다. full=true 면 "
-                 "줄이지 않은 발언을 준다(길어지니 limit 을 줄여라). 발언은 라운드에 따라 관점·권장 / "
+                 "줄이지 않은 발언을 준다. 발언은 라운드에 따라 관점·권장 / "
                  "수용·반박·심화 / 최종 입장·표결을 이어 붙인 글이고, full=true 는 해석 목록·우려·양보 불가 "
                  "조항까지 싣는다. "
-                 "결정문만으로 부족할 때 쓰고, 리스크 원장에 패널 결과를 제출할 때는 full=true 로 받는다."),
+                 "결정문만으로 부족할 때 쓰고, 리스크 원장에 패널 결과를 제출할 때는 full=true 로 받는다. "
+                 "턴은 offset 부터 limit 턴씩 묶음으로 준다 — 한 묶음을 다 받은 뒤 next_offset 이 null 이 아니면 "
+                 "offset=next_offset 으로 다음 묶음을 받는다(remaining 은 그 뒤에 남은 턴 수). " + _PAGE_DESC),
 )
 async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
-                                offset: int = 0, limit: int = 40, full: bool = False) -> dict:
-    """좌석 발언 전사를 페이지로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 준다.
+                                offset: int = 0, limit: int = 40, full: bool = False, part: int = 1) -> dict:
+    """좌석 발언 전사를 묶음으로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 주고, 묶음이 MCP 결과 상한보다 크면 쪽으로 나눈다.
 
     Args:
         job_id: 심의 잡 id.
@@ -625,9 +642,13 @@ async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
         seat: 특정 좌석 키가 포함된 발언만.
         offset: 건너뛸 턴 수 · limit: 가져올 턴 수(≤200).
         full: True 면 화면용으로 줄이지 않은 발언을 준다(기본은 줄인 글 + say_clipped 표식).
+        part: 묶음이 쪽으로 나뉘었을 때 받을 쪽(1부터). page.next 가 알려 준다.
     """
-    return delib_jobs.transcript(job_id, rnd=(round or None), seat=seat,
-                                 offset=offset, limit=limit, full=full)
+    out = delib_jobs.transcript(job_id, rnd=(round or None), seat=seat,
+                                offset=offset, limit=limit, full=full)
+    return mcp_pages.paged(out, part=part, ids=_TRANSCRIPT_IDS, tail=("note",),
+                           again={"job_id": job_id, "round": round, "seat": seat,
+                                  "offset": out["offset"], "limit": out["limit"], "full": full})
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",

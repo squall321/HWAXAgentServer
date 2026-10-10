@@ -735,10 +735,12 @@ def _turn_view(t: dict, full: bool) -> dict:
 
 def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
                offset: int = 0, limit: int = 40, full: bool = False) -> dict:
-    """좌석 발언 전사를 페이지로 돌려준다. 전량은 클라이언트 컨텍스트를 터뜨린다.
+    """좌석 발언 전사를 묶음(offset 부터 limit 턴)으로 돌려준다. 전량은 클라이언트 컨텍스트를 터뜨린다.
 
-    기본은 화면에 뜨는 줄인 발언이다(줄인 턴은 say_clipped). full 이면 줄이지 않은 발언을 준다 — 한 쪽이
-    몇 배로 커지므로 기본으로 주지 않는다(40턴 쪽은 줄인 글 기준으로 잡은 크기다)."""
+    기본은 화면에 뜨는 줄인 발언이다(줄인 턴은 say_clipped). full 이면 줄이지 않은 발언을 준다 — 한 묶음이
+    몇 배로 커지므로 기본으로 주지 않는다. 묶음이 MCP 결과 상한보다 크면 도구(mcp_server)가 쪽으로 나눈다(mcp_pages).
+    next_offset 은 다음 묶음의 시작(없으면 None), remaining 은 그 뒤에 남은 턴 수다 — 종전엔 total·offset·limit 만 줘서
+    호출자가 다음 묶음을 셈해야 했다."""
     job = get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id}")
@@ -753,13 +755,15 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
     page = [_turn_view(t, full) for t in rows[off:off + lim]]
     clipped = sum(1 for t in page if t.get("say_clipped"))
     return {"job_id": job_id, "total": total, "offset": off, "limit": lim,
+            "next_offset": off + lim if off + lim < total else None,
+            "remaining": max(0, total - off - lim),
             "turns": page,
             "note": ("전사가 없다 — 이 잡은 전사 보존 이전에 돌았거나 아직 라운드에 못 갔다"
                      if not total else
-                     f"이 쪽의 {clipped}턴은 say 가 화면용으로 줄인 글이다(say_clipped · 온전한 길이는 "
-                     "say_full_chars). 줄이지 않은 발언은 full=true 로 받는다 — 길어지니 limit 을 줄여라."
+                     f"이 묶음의 {clipped}턴은 say 가 화면용으로 줄인 글이다(say_clipped · 온전한 길이는 "
+                     "say_full_chars). 줄이지 않은 발언은 full=true 로 받는다."
                      if clipped and not full else
-                     f"이 쪽의 {clipped}턴은 저장 상한에서 잘린 발언이다(say_clipped · 온전한 길이는 "
+                     f"이 묶음의 {clipped}턴은 저장 상한에서 잘린 발언이다(say_clipped · 온전한 길이는 "
                      "say_full_chars)." if clipped else None)}
 
 
