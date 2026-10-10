@@ -49,9 +49,10 @@ class _Llm:
     max_tokens = None
 
     def __init__(self, seat, chair):
-        self.seat, self.chair, self.others = seat, chair, []
+        self.seat, self.chair, self.others, self.prompts = seat, chair, [], []
 
     async def text(self, _obj, system, human):
+        self.prompts.append((system, human))
         m_ = d.re.search(r"당신은 '([^']+)' 전문가", system)
         if m_:
             return json.dumps(self.seat(m_.group(1)), ensure_ascii=False)
@@ -279,3 +280,59 @@ def test_날조_가능_웹_인용은_8건을_넘으면_총_건수를_적는다(m
     events, _llm = _run(monkeypatch, _BIG, chair="결정: " + " ".join(bad), search_sources=["web"])
     final = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
     assert "외 3건" in final, final[-400:]
+
+
+# ── 다단 승계 — 1단 결정문을 2단에, 2단 결정문을 3단에 넘길 때 ─────────────────────────────────────
+_CONT = "[이전 심의 요약 — 이어서 논의]"
+
+
+def _carried(llm):
+    """다음 단 좌석·의장이 받은 '이전 심의 요약' 블록들."""
+    return [h.split(_CONT, 1)[1] for _s, h in llm.prompts if _CONT in h]
+
+
+def test_16K_창의_1단_결정문_승계는_종전대로_8000자다(monkeypatch):
+    _events, llm = _run(monkeypatch, 16384, chair=_long("1단-끝", 20000), entry=d.run_sim_deliberation)
+    got = _carried(llm)
+    assert got and all("[1단-끝]" not in x for x in got), "시험 전제 — 16K 는 앞 8,000자만 넘긴다"
+
+
+def test_넓은_창의_1단_결정문은_잘리지_않고_2단에_간다(monkeypatch):
+    events, llm = _run(monkeypatch, _BIG, chair=_long("1단-끝", 20000), entry=d.run_sim_deliberation)
+    got = _carried(llm)
+    assert got and all("[1단-끝]" in x for x in got), "1백만 토큰 창에서도 1단 결정문을 앞 8,000자만 넘겼다"
+    assert not [c for c in _cards(events) if c["source"] == "다단 승계 상한 초과"]
+
+
+def test_다단_승계에서_줄이면_카드로_알린다(monkeypatch):
+    events, _llm = _run(monkeypatch, 16384, chair=_long("1단-끝", 20000), entry=d.run_sim_deliberation)
+    cards = [c for c in _cards(events, included=False) if c["source"] == "다단 승계 상한 초과"]
+    assert cards and "1단 결정문" in cards[0]["text"] and "8,000자" in cards[0]["text"], cards
+
+
+def test_넓은_창의_2단_결정문은_3단에_20000자보다_길게_간다(monkeypatch):
+    _events, llm = _run(monkeypatch, _BIG, chair=_long("단-끝", 25000), entry=d.run_sim_deliberation,
+                        build_plan=1)
+    got = _carried(llm)
+    assert len(got) >= 2 and all("[단-끝]" in x for x in got), "2단 결정문을 3단에 앞 20,000자만 넘겼다"
+
+
+def test_넓은_창의_양보_불가_조항은_1200자에서_끊기지_않는다(monkeypatch):
+    nn = _long("조항-끝", 3000)
+    events, _llm = _run(monkeypatch, _BIG, rounds=2, seat=lambda k: {**_seat_plain(k), "non_negotiable": nn})
+    t = [x for x in _turns(events) if x["round"] == 2]
+    assert t and all(x["non_negotiable"] == nn for x in t), [len(x.get("non_negotiable", "")) for x in t]
+
+
+def test_좁은_창의_양보_불가_조항은_종전대로_1200자이고_원래_길이를_남긴다(monkeypatch):
+    nn = _long("조항-끝", 3000)
+    events, _llm = _run(monkeypatch, 128000, rounds=2, seat=lambda k: {**_seat_plain(k), "non_negotiable": nn})
+    t = [x for x in _turns(events) if x["round"] == 2]
+    assert t and all(x["non_negotiable"] == nn[:1200] and x["non_negotiable_chars"] == len(nn) for x in t), t[0]
+
+
+def test_양보_불가_조항이_목록이면_파이썬_표기가_아니라_항목으로_잇는다(monkeypatch):
+    events, _llm = _run(monkeypatch, _BIG, rounds=2,
+                        seat=lambda k: {**_seat_plain(k), "non_negotiable": ["R 은 0.3 이상", "두께 유지"]})
+    t = [x for x in _turns(events) if x["round"] == 2][0]
+    assert "['" not in t["non_negotiable"] and "R 은 0.3 이상" in t["non_negotiable"], t["non_negotiable"]

@@ -3840,6 +3840,20 @@ async def _evidence_prepass(tools: dict, llm, question: str):
     return distilled, inject, used
 
 
+def _carry_cut_cards(what: str, text: str, cap: int, to: str, nn: list | None = None) -> list:
+    """다단 심의의 단 사이 승계를 줄였으면 카드로 알린다 — 종전엔 말없이 끊었다(결정문의 뒤쪽이 다음 단에 안 갔다)."""
+    cut = []
+    if len(text) > cap:
+        cut.append(f"{what} {len(text):,}자 중 앞 {cap:,}자만")
+    if nn and len(nn) > _NN_MAX:
+        cut.append(f"양보 불가 조항 {len(nn)}건 중 앞 {_NN_MAX}건만")
+    if not cut:
+        return []
+    return [_delib("evidence", source="다단 승계 상한 초과", included=False,
+                   text=" · ".join(cut) + f" {to} 좌석에게 넘겼다 — 뒤쪽은 {to}에서 보지 못한다(결정문 전문은 "
+                        "앞 단의 결과에 그대로 있다).")]
+
+
 async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
                                user_pat: str = "", history: list | None = None):
     """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
@@ -3915,8 +3929,13 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         opts_b.seats_no_key = None      # 키 없는 지정 좌석도 같다 — 지정 좌석은 1단에 앉았다
         opts_b.timeout_clamped = None   # 죈 호출당 한도도 같다 — 값은 단마다 그대로 걸리고 알림은 1단이 냈다
         opts_b.chair_template = "sim-plan"
-        opts_b.continue_summary = decision_a[:8000]
-        opts_b.continue_non_negotiables = nn_a[:12]
+        # 넘기는 길이는 이어하기 요약과 같다(_summary_max — 좁은 창 8,000자, 1백만 토큰 창 29,077자). 종전엔 1백만 토큰
+        # 창에서도 앞 8,000자라, 결정문 뒤쪽(양보 불가 조항·검증 계획)이 2단 좌석에게 안 갔다. 줄이면 카드로 알린다.
+        _smax = _summary_max()
+        opts_b.continue_summary = decision_a[:_smax]
+        opts_b.continue_non_negotiables = nn_a[:_NN_MAX]
+        for _c in _carry_cut_cards("1단 결정문", decision_a, _smax, "2단", nn_a):
+            yield _c
         opts_b.continue_personas = sim_seats
         # 호출자의 사람 의견·지정 좌석은 **1단의 입력**이다(hwax-sim-deliberate.js 의 humanNote 도 '1단에 주입할
         # 사람 의견' 이다). 여기서는 이어 붙이지 않는다 — 1단 좌석 전원이 그 의견을 받았고, 그 방향은 1단
@@ -3951,7 +3970,11 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             opts_c.seats_no_key = None
             opts_c.timeout_clamped = None
             opts_c.chair_template = "build-plan"
-            opts_c.continue_summary = decision_b[:20000]
+            # 2단 결정문(sim_spec 포함) — 종전 20,000자가 바닥이고 넓은 창은 이어하기 요약 몫까지(_summary_max).
+            _smax_c = max(20000, _summary_max())
+            opts_c.continue_summary = decision_b[:_smax_c]
+            for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
+                yield _c
             opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
                                         for s in sim_seats]
             opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
@@ -5099,9 +5122,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 # non_negotiable 을 턴에 실어 보내는 이유 — 프론트가 이어하기 호출에 조항을 승계해야
                 # 이전 결정이 소리 없이 되돌아가는 것을 막는다(F11). say 는 표시용으로 절단되므로
                 # 승계용 원문을 따로 준다.
+                # 조항 하나의 길이는 이어하기가 받는 길이와 같다(좁은 창 _NN_ITEM_MAX 1,200자, 넓은 창 _summary_max) —
+                # 종전엔 1백만 토큰 창에서도 1,200자에서 표식 없이 끊겨 이어하기·다단 승계에 갔다. 끊었으면 원래 길이를
+                # 남긴다. 목록으로 오면 항목을 잇는다(종전엔 파이썬 표기 "['…']" 가 그대로 조항이 됐다).
+                _nn_raw = o.get("non_negotiable")
+                _nn_full = ("; ".join(str(x).strip() for x in _nn_raw if str(x).strip())
+                            if isinstance(_nn_raw, list) else str(_nn_raw or ""))
+                _nn_cap = _summary_max() if _wide() else _NN_ITEM_MAX
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
                          "stance": _norm_stance(o.get("stance")),
-                         "non_negotiable": str(o.get("non_negotiable") or "")[:1200]}
+                         "non_negotiable": _nn_full[:_nn_cap]}
+                if len(_nn_full) > _nn_cap:
+                    extra["non_negotiable_chars"] = len(_nn_full)
             # 반박 관계는 라운드 성격과 무관하게 **있으면** 싣는다. 심화 라운드가 주 무대지만
             # 수렴 라운드에서도 나온다 — 여기서 render 로 가르면 그만큼 그래프가 비게 된다.
             _reb = _rebut_items(o)
