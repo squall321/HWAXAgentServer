@@ -2080,9 +2080,10 @@ def _history_messages(history: list[dict], stats: dict | None = None,
             # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
             # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
             # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
-            n = min(verbatim_budget, int(verbatim_tok * len(content) / max(1, tok))) - _CUT_MARK_ROOM
-            content = _cut_mark(raws[idx], max(1, n))
-            item_cut = len(raws[idx])
+            raw = raws[idx]
+            content = _fit_tokens(lambda c: _cut_mark(raw, c), max(1, verbatim_budget - _CUT_MARK_ROOM),
+                                  verbatim_tok, 1)[0]
+            item_cut = len(raw)
             tok = _est_tokens_all(content)
         kept.append((role, content))
         used += len(content)

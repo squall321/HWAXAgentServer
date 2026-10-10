@@ -445,3 +445,16 @@ def test_챗_이력도_영문_머리_항목_뒤의_한국어_이력으로_창을
     msgs = app._history_messages(hist, st)
     assert _tok_oracle("".join(c for _, c in msgs)) <= _hist_tok_room(), st
     assert "<4>" in msgs[-1][1], "가장 최근 항목이 빠졌다"
+
+
+def test_최근_항목을_줄일_때도_줄인_글_자체의_토큰으로_맞춘다(monkeypatch):
+    """줄일 길이를 항목 전체의 평균 밀도로 정하면, 앞이 한국어이고 뒤가 영문인 항목은 앞부분만 남긴 글이 몫을 넘는다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    hist = [{"role": "user", "content": "log " + "x" * 25000}] + [
+        {"role": "assistant", "content": f"짧은 답 {k}"} for k in range(4)] + [
+        {"role": "user", "content": "가" * 600000 + "x" * 2_000_000}]
+    st: dict = {}
+    msgs = app._history_messages(hist, st)
+    assert st.get("cut") == 2_600_000, st
+    assert _tok_oracle("".join(c for _, c in msgs)) <= app._hist_budget_tokens(), st
