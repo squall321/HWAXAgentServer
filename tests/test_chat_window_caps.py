@@ -7,6 +7,7 @@
 # 앞의 **특성화** 시험은 구현 전 코드에서 초록인 것을 먼저 본 것이다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_chat_window_caps.py -q
+import re
 import sys
 from pathlib import Path
 
@@ -389,3 +390,58 @@ def test_도구_설명_상한_0_은_무제한이다(monkeypatch):
     monkeypatch.setattr(app, "TOOL_DESC_MAX", 2400)
     assert app._cap_desc("가" * 5000, 0) == "가" * 5000
     assert app._cap_desc("가" * 5000) == "가" * 2400 + "…", "기본 동작(바인딩 보호 2,400자)은 그대로다"
+
+
+# ── 글자 구성 표본 — 앞 20,000자만 보고 글 전체의 토큰을 재지 않는다 ──────────────────────────
+def _tok_oracle(s: str) -> int:
+    """시험용 토큰 수 — 엔진 환산(한글 1.05자/토큰·그 밖 3.6자/토큰)을 글 **전체**에 독립으로 적용한다."""
+    ko = len(re.sub(r"[^가-힯一-鿿぀-ヿ㄰-㆏]", "", s))
+    return int(ko / 1.05 + (len(s) - ko) / 3.6)
+
+
+def _hist_tok_room():
+    """문서 없는 챗 턴에서 이력(또는 그 자리에 싣는 글)이 쓸 수 있는 토큰 — 창 − 예비분 − 도구 결과 몫."""
+    return app._model_context_tokens() - app.DOC_RESERVE_TOKENS - app._loop_room_tokens()
+
+
+def test_보고서_정리본은_영문_머리_대화에서도_창을_넘기지_않는다(monkeypatch):
+    """대화 앞 20,000자(로그·코드)의 밀도(3.6자/토큰)로 예산을 환산해, 뒤가 한국어인 긴 대화에서 창의 세 배를 싣고 400 으로
+    정리본이 빈 문자열(실패)이 됐다."""
+    import asyncio
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    seen = []
+
+    class _Agent:
+        async def ainvoke(self, inp, config=None):
+            seen.append(inp["messages"][0][1])
+            return {"messages": []}
+
+    async def _agent_for(*_a, **_k):
+        return _Agent()
+    monkeypatch.setattr(app, "_agent_for", _agent_for)
+    hist = [{"role": "user", "content": "log " + "x" * 30000}] + [
+        {"role": "assistant" if k % 2 else "user", "content": "가" * 300000} for k in range(10)]
+    cut: list = []
+    asyncio.run(d._tidy_markdown(app.app, [], hist, "", "u", cut=cut))
+    assert seen and _tok_oracle(seen[0]) <= _hist_tok_room(), f"{_tok_oracle(seen[0]):,}토큰 — 창을 넘는다"
+    assert cut and "중 앞" in cut[0], cut
+
+
+def test_빈_응답_구제_발췌도_JSON_머리_결과에서_창을_넘기지_않는다():
+    _win(_BIG)
+    got = app._rescue_excerpt(['{"rows": "' + "x" * 30000 + '"}', "가" * 2_500_000])
+    assert _tok_oracle(got) <= _hist_tok_room(), f"{_tok_oracle(got):,}토큰"
+    assert len(got) >= 12000
+
+
+def test_챗_이력도_영문_머리_항목_뒤의_한국어_이력으로_창을_넘기지_않는다(monkeypatch):
+    """이력 예산을 최근 6항목의 앞 20,000자로 환산한다 — 여섯째 항목이 영문 로그면 한국어 이력이 창의 몇 배로 실렸다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    hist = [{"role": "user", "content": "log " + "x" * 25000}] + [
+        {"role": "assistant" if k % 2 == 0 else "user", "content": f"<{k}>" + "가" * 400000} for k in range(5)]
+    st: dict = {}
+    msgs = app._history_messages(hist, st)
+    assert _tok_oracle("".join(c for _, c in msgs)) <= _hist_tok_room(), st
+    assert "<4>" in msgs[-1][1], "가장 최근 항목이 빠졌다"

@@ -817,10 +817,14 @@ def _resume_part(part: str) -> str:
 
 def _rescue_excerpt(turn_out: list) -> str:
     """빈 응답 구제에 주는 도구 결과 발췌 — 좁은 창은 종전 앞 12,000자, 넓은 창은 챗 이력 예산(창에서 유도)까지.
-    종전엔 1백만 토큰 창에서도 12,000자라, 큰 조회 뒤의 구제 답이 결과의 앞 한 토막만 보고 쓰였다."""
+    종전엔 1백만 토큰 창에서도 12,000자라, 큰 조회 뒤의 구제 답이 결과의 앞 한 토막만 보고 쓰였다. 넓은 창의 길이는
+    실제로 싣는 발췌 전체로 다시 잰다(_fit_tokens) — 앞 20,000자(JSON 머리)의 밀도로만 환산해 뒤가 한국어인 결과에서
+    창의 세 배를 실을 수 있었다."""
     joined = "\n".join(turn_out)
-    cap = max(12000, _hist_budget_chars(joined[:20000])) if _wide() else 12000
-    return joined[:cap].strip()
+    if not _wide():
+        return joined[:12000].strip()
+    cap = max(12000, _hist_budget_chars(joined[:20000]))
+    return _fit_tokens(lambda c: joined[:c], cap, _hist_budget_tokens(), 12000)[0].strip()
 
 
 # 보조 호출(화두 뽑기·되묻기·좌석 축)이 읽는 대화 몫 — 넓은 창에서 창의 이 비율(1백만 토큰 창 약 55,000자). 이 호출들은
@@ -1978,6 +1982,14 @@ def _loop_room_tokens() -> int:
     return min(int(TOOL_RESULT_MAX / 1.05) + 1, max(0, _model_context_tokens() - DOC_RESERVE_TOKENS) // 2)
 
 
+def _hist_budget_tokens(has_docs: bool = False) -> int:
+    """이력에 줄 **토큰** 예산 — (창 − 예비분 [− 도구 결과 몫]) × 몫. 글자 예산(_hist_budget_chars)은 이것을 표본의 밀도로
+    바꾼 값이라, 표본과 실제로 싣는 글의 구성이 다르면 이 값으로 다시 잰다(_fit_tokens·_history_messages)."""
+    share = HIST_CTX_SHARE if has_docs else HIST_CTX_SHARE_SOLO
+    reserve = DOC_RESERVE_TOKENS + (0 if has_docs else _loop_room_tokens())
+    return max(1200, int((_model_context_tokens() - reserve) * share))
+
+
 def _hist_budget_chars(sample: str = "", has_docs: bool = False) -> int:
     """이력에 줄 글자 예산.
 
@@ -1987,10 +1999,7 @@ def _hist_budget_chars(sample: str = "", has_docs: bool = False) -> int:
     문서 없는 턴은 도구 결과 몫(_loop_room_tokens)을 먼저 떼고 나눈다. 문서가 있는 턴은 문서가 나머지를 쓴다
     (_doc_budget_tokens — 그 길의 도구 결과 몫은 따로 없다).
     """
-    share = HIST_CTX_SHARE if has_docs else HIST_CTX_SHARE_SOLO
-    reserve = DOC_RESERVE_TOKENS + (0 if has_docs else _loop_room_tokens())
-    tokens = int((_model_context_tokens() - reserve) * share)
-    derived = max(1500, _chars_for_tokens(sample or "가나다라", max(1200, tokens)))
+    derived = max(1500, _chars_for_tokens(sample or "가나다라", _hist_budget_tokens(has_docs)))
     forced = os.environ.get("HIST_BUDGET")
     return min(derived, max(1500, int(forced))) if forced else derived
 
@@ -2054,26 +2063,36 @@ def _history_messages(history: list[dict], stats: dict | None = None,
 
     budget = _hist_budget_chars("".join(c for _, c in items[-6:]), has_docs)
     verbatim_budget = int(budget * (1.0 - HIST_COMPACT_SHARE))
+    # 글자 예산은 최근 6항목의 앞 20,000자 밀도로 환산한 값이다 — 여섯째 항목이 영문 로그면 한국어 이력이 창의 몇 배로
+    # 실렸다. 항목마다 글 전체로 잰 토큰(_est_tokens_all)으로도 지킨다(둘 중 먼저 차는 쪽에서 멈춘다).
+    tok_budget = _hist_budget_tokens(has_docs)
+    verbatim_tok = int(tok_budget * (1.0 - HIST_COMPACT_SHARE))
     kept: list[tuple[str, str]] = []
-    used = 0
+    used = used_tok = 0
     cut = len(items)                        # 이 앞의 것들이 압축 대상
     item_cut = 0
     for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
         role, content = items[idx]
-        if used + len(content) > verbatim_budget:
+        tok = _est_tokens_all(content)
+        if used + len(content) > verbatim_budget or used_tok + tok > verbatim_tok:
             if kept:
                 break
             # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
             # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
             # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
-            content = _cut_mark(raws[idx], max(1, verbatim_budget - _CUT_MARK_ROOM))
+            n = min(verbatim_budget, int(verbatim_tok * len(content) / max(1, tok))) - _CUT_MARK_ROOM
+            content = _cut_mark(raws[idx], max(1, n))
             item_cut = len(raws[idx])
+            tok = _est_tokens_all(content)
         kept.append((role, content))
         used += len(content)
+        used_tok += tok
         cut = idx
     kept.reverse()
 
-    digest = _compact_turns(items[:cut], int(budget * HIST_COMPACT_SHARE))
+    # 압축본도 토큰으로 지킨다 — 글자 몫이 영문 표본으로 부풀었으면 한국어 압축본이 창을 넘는다.
+    digest = (_fit_tokens(lambda c: _compact_turns(items[:cut], c), int(budget * HIST_COMPACT_SHARE),
+                          int(tok_budget * HIST_COMPACT_SHARE), 200)[0] if cut else "")
     if digest:
         kept.insert(0, ("user", digest))
     if stats is not None:
@@ -2156,6 +2175,31 @@ def _tokens_per_char(text: str) -> float:
 def _est_tokens(text: str) -> int:
     """대략의 토큰 수."""
     return max(1, int(len(text) * _tokens_per_char(text))) if text else 0
+
+
+_CJK_RUN = re.compile("[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in _CJK_RANGES) + "]+")
+
+
+def _est_tokens_all(text: str) -> int:
+    """글 **전체**의 글자 구성으로 잰 토큰 수(환산은 _tokens_per_char 와 같다). _est_tokens 는 앞 20,000자만 표본으로 봐서,
+    머리가 영문(로그·코드·JSON)이고 뒤가 한국어인 글을 세 배 넘게 적게 센다. 정규식으로 세어 수백만 자도 수십 ms 다."""
+    if not text:
+        return 0
+    cjk = len(text) - len(_CJK_RUN.sub("", text))
+    return max(1, int(cjk / 1.05 + (len(text) - cjk) / 3.6))
+
+
+def _fit_tokens(build, cap: int, tokens: int, floor: int) -> tuple[str, int]:
+    """build(cap) 이 만든 글이 글 전체로 잰 토큰 수(_est_tokens_all) tokens 안에 들 때까지 cap(자)을 줄인다(바닥 floor) —
+    (글, cap). 글자 예산을 앞 20,000자 표본의 밀도로 환산한 자리(정리본·빈 응답 구제)가 실제로 싣는 글로 다시 잰다."""
+    body = build(cap)
+    for _ in range(8):
+        t = _est_tokens_all(body)
+        if t <= tokens or cap <= floor:
+            break
+        cap = max(floor, int(cap * tokens / t * 0.98))
+        body = build(cap)
+    return body, cap
 
 
 def _chars_for_tokens(text: str, tokens: int) -> int:

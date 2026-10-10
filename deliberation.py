@@ -5758,11 +5758,21 @@ _TIDY_PROMPT = """다음은 엔지니어링 포털에서 오간 대화 이력이
 _TIDY_FLOOR = 60000
 
 
+def _tidy_cut(joined: str, cap: int) -> str:
+    """정리본에 싣는 이력 — cap(자)을 넘으면 앞 1/4 + 뒤 3/4 를 남기고 가운데를 덜어 낸 자리를 적는다."""
+    if len(joined) <= cap:
+        return joined
+    return joined[:cap // 4] + f"\n\n…[이력 {len(joined):,}자 중 중간 생략]…\n\n" + joined[-(cap - cap // 4):]
+
+
 def _tidy_budget(joined: str) -> int:
-    """'/보고서 정리' 가 LLM 에 주는 이력의 길이(자) — 챗 이력 예산(창에서 유도), 바닥 종전 60,000자."""
+    """'/보고서 정리' 가 LLM 에 주는 이력의 길이(자) — 챗 이력 예산(창에서 유도), 바닥 종전 60,000자. 대화 앞 20,000자의
+    밀도로 환산한 길이를 실제로 싣는 글(_tidy_cut) 전체로 다시 재어 이력 토큰 예산 안으로 줄인다 — 종전엔 앞이 영문
+    (로그·코드)이고 뒤가 한국어인 긴 대화에서 창의 세 배를 싣고 400 으로 정리본이 실패했다(128K 박스도 같은 꼴)."""
     try:
-        from app import _hist_budget_chars  # noqa: PLC0415 — 순환 import 회피
-        return max(_TIDY_FLOOR, _hist_budget_chars(joined[:20000]))
+        from app import _fit_tokens, _hist_budget_chars, _hist_budget_tokens  # noqa: PLC0415 — 순환 import 회피
+        cap = max(_TIDY_FLOOR, _hist_budget_chars(joined[:20000]))
+        return _fit_tokens(lambda c: _tidy_cut(joined, c), cap, _hist_budget_tokens(), _TIDY_FLOOR)[1]
     except Exception:  # noqa: BLE001
         return _TIDY_FLOOR
 
@@ -5782,8 +5792,7 @@ async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
     # 읽는 길이는 챗 이력 예산(app._hist_budget_chars — 창에서 유도)이고 바닥은 종전 60,000자다(dev 16K 는 종전대로).
     # 종전엔 1백만 토큰 창에서도 60,000자라 긴 대화의 가운데가 정리본에서 빠졌다. 넘으면 앞 1/4 + 뒤 3/4 를 남긴다.
     cap = _tidy_budget(_joined)
-    body = _joined if len(_joined) <= cap else (
-        _joined[:cap // 4] + f"\n\n…[이력 {len(_joined):,}자 중 중간 생략]…\n\n" + _joined[-(cap - cap // 4):])
+    body = _tidy_cut(_joined, cap)
     if cut is not None and len(_joined) > cap:
         cut.append(f"정리본은 대화 이력 {len(_joined):,}자 중 앞 {cap // 4:,}자와 뒤 {cap - cap // 4:,}자만 읽고 썼습니다")
     if note:
