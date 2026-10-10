@@ -53,6 +53,7 @@ from deliberation import (
     _EVID_ITEM_MAX,
     _cut_mark,
     _CUT_MARK_ROOM,
+    _fit_recent,
     _narrow_cap,
     _wide,
     _PHANTOM_ID_MARK,
@@ -822,31 +823,44 @@ def _rescue_excerpt(turn_out: list) -> str:
     return joined[:cap].strip()
 
 
+# 보조 호출(화두 뽑기·되묻기·좌석 축)이 읽는 대화 몫 — 넓은 창에서 창의 이 비율(1백만 토큰 창 약 55,000자). 이 호출들은
+# 대화 뒷부분의 쟁점만 보면 되는데 종전엔 챗 이력 예산 전부(약 88만 자)를 받아, 긴 대화에서 '심의로 넘기기' 한 번에 세
+# 호출이 각각 수십만 토큰을 프리필했다 — 심의가 같은 LLM 을 쓰는 동안이면 포털의 600초 한도에 걸려 화두가 기본값,
+# 되묻기가 '묻지 않음', 축이 [] 로 내려앉는다. 좁은 창은 종전 고정값(floor)이다.
+_AUX_CTX_SHARE = 0.05
+
+
 def _aux_budget(floor: int, sample: str = "") -> int:
     """대화를 읽는 보조 LLM 호출(화두 뽑기·되묻기·좌석 축)의 대화 몫(자) — 좁은 창은 종전 고정값(floor), 넓은 창은
-    챗 이력 예산(창에서 유도)."""
-    return max(floor, _hist_budget_chars(sample)) if _wide() else floor
+    창의 _AUX_CTX_SHARE(챗 이력 예산을 넘지 않고, 바닥 floor). 뺀 것은 호출부가 프롬프트에 적는다(_aux_omit_note)."""
+    if not _wide():
+        return floor
+    share = _chars_for_tokens(sample or "가", int(_model_context_tokens() * _AUX_CTX_SHARE))
+    return max(floor, min(_hist_budget_chars(sample), share))
 
 
-def _recent_lines(history: list, budget: int, line_cap: int, fmt) -> list[str]:
+def _recent_lines(history: list, budget: int, line_cap: int, fmt, stats: dict | None = None) -> list[str]:
     """대화를 **최근부터** 예산 안에 담아 시간 순으로 돌려준다. 종전 셋(화두·되묻기·좌석 축)은 오래된 쪽부터 예산을
     깎아, 긴 답 하나가 앞에 있으면 그 뒤(진짜 쟁점이 있는 자리)가 통째로 빠졌다. line_cap 은 줄 하나의 상한(0=무제한,
-    끊으면 원문 길이 표식)이고 예산은 실은 길이로 깎는다. fmt(m, 글) 이 한 줄을 만든다."""
-    out: list[str] = []
-    for m in reversed(history or []):
-        if not isinstance(m, dict):
-            continue
-        t = str(m.get("content") or "").strip()
-        if not t:
-            continue
-        line = fmt(m, _cut_mark(t, line_cap))
-        if out and len(line) > budget:
-            break
-        out.append(line)
-        budget -= len(line)
-        if budget <= 0:
-            break
-    return list(reversed(out))
+    끊으면 원문 길이 표식)이고 예산은 실은 길이로 깎는다. fmt(m, 글) 이 한 줄을 만든다. 남은 예산보다 긴 줄은 원문
+    길이를 적고 남은 예산까지 줄여 싣는다(deliberation._fit_recent) — 종전엔 첫 줄(가장 최근)이면 예산과 상관없이 통째로
+    실렸고 아니면 버려졌다. stats 를 주면 {"omitted": 싣지 않은 오래된 발화 수} 를 채운다."""
+    msgs = [m for m in (history or []) if isinstance(m, dict) and str(m.get("content") or "").strip()]
+    lines, _left, omitted = _fit_recent([str(m.get("content")).strip() for m in msgs], budget, line_cap,
+                                        lambda i, t: fmt(msgs[i - 1], t))
+    if stats is not None:
+        stats["omitted"] = omitted
+    return lines
+
+
+def _aux_omit_note(tag: str, skipped: int, stats: dict, budget: int) -> str:
+    """보조 호출 프롬프트에 붙이는 '뺀 대화' 한 줄 — 건수 창(최근 N건) 밖 skipped 와 예산 밖 stats["omitted"] 의 합.
+    서버 로그에도 남긴다. 뺀 것이 없으면 빈 문자열."""
+    n = max(0, skipped) + int(stats.get("omitted") or 0)
+    if not n:
+        return ""
+    print(f"[{tag}] 앞선 대화 {n}건을 싣지 않았다(보조 호출 몫 {budget:,}자)")
+    return f"(앞선 대화 {n}건은 싣지 않았다 — 최근 대화만 읽는다, 몫 {budget:,}자)"
 
 
 # ── 근거 표기 ───────────────────────────────────────────────────────────────
@@ -3603,11 +3617,17 @@ async def _seat_axes(llm, tools: dict, message: str, history: list) -> list[dict
     if not roster:
         return []
     # 최근 60건을 최근부터 담는다(_recent_lines). 종전엔 **앞에서부터** 60건·5,000자라 긴 대화의 뒤쪽(쟁점이 옮겨 간
-    # 자리)이 축 추출에 안 갔다. 좁은 창은 종전 예산 5,000자·줄 800자, 넓은 창은 챗 이력 예산·줄 무절단.
-    lines = _recent_lines(history[-60:], _aux_budget(_AXIS_CTX_BUDGET), _narrow_cap(800),
-                          lambda m, t: f"[{'사람' if m.get('role') == 'user' else 'AI'}] {t}")
+    # 자리)이 축 추출에 안 갔다. 좁은 창은 종전 예산 5,000자·줄 800자, 넓은 창은 보조 호출 몫(_aux_budget — 창의 5%)·줄
+    # 무절단(몫을 넘는 줄은 원문 길이를 적고 줄인다). 뺀 대화 수는 프롬프트에 적는다.
+    _st: dict = {}
+    _ab = _aux_budget(_AXIS_CTX_BUDGET)
+    lines = _recent_lines(history[-60:], _ab, _narrow_cap(800),
+                          lambda m, t: f"[{'사람' if m.get('role') == 'user' else 'AI'}] {t}", _st)
     if not lines:
         return []
+    _omit = _aux_omit_note("experts", len(history) - len(history[-60:]), _st, _ab)
+    if _omit:
+        lines.insert(0, _omit)
     roster_txt = ", ".join(f"{r['domain']}({r['agents']}명)" for r in roster)
     try:
         raw = await _llm_text(
@@ -4063,13 +4083,18 @@ async def _derive_topic(history: list, fallback: str = "") -> dict:
     두 곳이 다른 프롬프트를 쓰면 같은 대화에서 다른 화두가 나오고, 사용자는 어느 쪽이
     진짜인지 알 수 없다."""
     fb = (fallback or "").strip()
-    # 최근 40건을 **최근부터** 예산 안에 담는다(_recent_lines). 좁은 창은 종전 예산 12,000자·줄 2,000자, 넓은 창은 챗 이력
-    # 예산(창에서 유도)·줄 무절단. 종전엔 오래된 쪽부터 원문 길이로 예산을 깎아, 앞의 긴 답 하나가 뒤의 물음을 밀어냈다.
+    # 최근 40건을 **최근부터** 예산 안에 담는다(_recent_lines). 좁은 창은 종전 예산 12,000자·줄 2,000자, 넓은 창은 보조 호출
+    # 몫(_aux_budget — 창의 5%)·줄 무절단. 종전엔 오래된 쪽부터 원문 길이로 예산을 깎아, 앞의 긴 답 하나가 뒤의 물음을 밀어냈다.
     _h = (history or [])[-40:]
-    hist = _recent_lines(_h, _aux_budget(12000), _narrow_cap(2000),
-                         lambda m, t: f"{'사용자' if m.get('role') == 'user' else '어시스턴트'}: {t}")
+    _st: dict = {}
+    _ab = _aux_budget(12000)
+    hist = _recent_lines(_h, _ab, _narrow_cap(2000),
+                         lambda m, t: f"{'사용자' if m.get('role') == 'user' else '어시스턴트'}: {t}", _st)
     if not hist:
         return {"topic": fb, "why": "", "options": [], "error": "no_history"}
+    _omit = _aux_omit_note("topic", len(history or []) - len(_h), _st, _ab)
+    if _omit:
+        hist.insert(0, _omit)
 
     try:
         raw = await _llm_text(
@@ -4125,16 +4150,20 @@ async def deliberate_clarify(req: ClarifyRequest) -> dict:
     칸이 응답에서 빠지면 그 칸은 묻지 않는다(괴롭히지 않는 쪽으로 틀린다)."""
     slots = _CLARIFY_SLOTS[_JOB_SLOTSET.get(req.job, "mechanism")]
     # 최근 20건을 최근부터 담는다(_recent_lines — 화두 뽑기와 같은 결함이 있었다). 좁은 창 종전 예산 3,000자.
-    hist: list[str] = _recent_lines(req.history[-20:], _aux_budget(3000), _narrow_cap(3000),
-                                    lambda m, t: f"{m.get('role', 'user')}: {t}")
+    _st: dict = {}
+    _ab = _aux_budget(3000)
+    hist: list[str] = _recent_lines(req.history[-20:], _ab, _narrow_cap(3000),
+                                    lambda m, t: f"{m.get('role', 'user')}: {t}", _st)
     if not _clarify_applicable(req.job, req.message + "\n" + "\n".join(hist)):
         return {"applicable": False, "slots": [], "ask": []}   # LLM 을 부르지도 않는다
     spec = "\n".join(f"- {k}: {label} — {hint}" for k, label, hint, _o in slots)
+    # 뺀 대화 수는 프롬프트에만 싣는다 — hist 는 '있음' 판정의 원문(source)이기도 하다.
+    _omit = _aux_omit_note("clarify", len(req.history) - len(req.history[-20:]), _st, _ab) if hist else ""
     try:
         raw = await _llm_text(
             app.state.llm, "당신은 심의 준비 보조자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
             f"[화두]\n{_cut_mark(req.message, _narrow_cap(3000))}\n"
-            + (f"\n[앞선 대화]\n" + "\n".join(hist) + "\n" if hist else "")
+            + (f"\n[앞선 대화]\n" + "\n".join(([_omit] if _omit else []) + hist) + "\n" if hist else "")
             + f"\n아래는 이 심의에 필요한 최소 정보 칸이다.\n{spec}\n\n"
             "화두·대화에 **이미 적힌 것만** present=true 로 하고 value 에 짧게 옮겨라. 추측으로 채우지 마라. "
             "비어 있으면 present=false, question 에 질문자에게 물을 한 문장(존댓말), 흔한 답 후보가 있으면 "

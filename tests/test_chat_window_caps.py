@@ -285,6 +285,56 @@ def test_좌석_축_추출은_오래된_60건이_아니라_최근_대화를_본�
     assert "[최근-쟁점]" in seen[0], seen[0][-300:]
 
 
+def _run_aux(monkeypatch, which, hist):
+    """화두 뽑기·되묻기·좌석 축 하나를 돌려 LLM 에 간 프롬프트를 돌려준다."""
+    import asyncio
+    if which == "topic":
+        seen = _capture_llm(monkeypatch, '{"topic": "물음", "why": "", "options": []}')
+        asyncio.run(app._derive_topic(hist, "fb"))
+    elif which == "clarify":
+        seen = _capture_llm(monkeypatch, '{"slots": {}}')
+        monkeypatch.setattr(app, "_clarify_applicable", lambda *_a: True)
+        asyncio.run(app.deliberate_clarify(app.ClarifyRequest(message="원인", job="diagnosis", history=hist)))
+    else:
+        seen = _capture_llm(monkeypatch, "")
+
+        async def _roster(_tools):
+            return [{"domain": "mech", "agents": 3}]
+        monkeypatch.setattr(app, "_domain_roster", _roster)
+        asyncio.run(app._seat_axes(object(), {}, "화두", hist))
+    return seen[0]
+
+
+_AUX = ("topic", "clarify", "axes")
+
+
+@pytest.mark.parametrize("which", _AUX)
+def test_넓은_창의_보조_호출은_이력_예산_전부를_싣지_않고_뺀_것을_적는다(monkeypatch, which):
+    """화두 뽑기·되묻기·좌석 축은 대화 뒷부분의 쟁점만 보면 되는데 1백만 토큰 창에서 챗 이력 예산 전부(약 88만 자)를
+    받았다 — 긴 대화에서 '심의로 넘기기' 한 번에 세 호출이 각각 수십만 토큰을 프리필해, 심의와 같은 LLM 을 쓰면 포털의
+    600초 한도에 걸려 화두·되묻기·축이 기본값으로 내려앉았다. 필요한 만큼(창의 몇 %)만 싣고, 뺀 수를 프롬프트에 적는다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    hist = [{"role": "user" if k % 2 else "assistant", "content": f"<턴{k:02d}>" + "가" * 30000}
+            for k in range(19)] + [{"role": "user", "content": "<턴19> 힌지만 본다 [최근-쟁점]"}]
+    prompt = _run_aux(monkeypatch, which, hist)
+    assert "[최근-쟁점]" in prompt
+    assert len(prompt) <= app._aux_budget(12000) + 3000, f"{len(prompt):,}자 — 보조 호출이 이력 예산을 다 썼다"
+    assert len(prompt) < app._hist_budget_chars() // 4, len(prompt)
+    assert "앞선 대화" in prompt and "싣지 않았다" in prompt, "뺀 대화 수를 프롬프트에 적지 않았다"
+
+
+@pytest.mark.parametrize("which", _AUX)
+def test_보조_호출의_가장_최근_발화가_몫을_넘으면_원문_길이를_적고_줄인다(monkeypatch, which):
+    """첫 줄(가장 최근 발화)은 예산과 상관없이 통째로 실렸다 — 넓은 창은 줄 상한도 없어 붙여넣기 한 번이 그대로 갔다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(_BIG)
+    big = "가" * 1_000_000 + "[끝]"
+    prompt = _run_aux(monkeypatch, which, [{"role": "user", "content": big}])
+    assert len(prompt) <= app._aux_budget(12000) + 3000, len(prompt)
+    assert f"{len(big):,}자 중 앞" in prompt
+
+
 # ── VOC 미리보기·페르소나 역할 ────────────────────────────────────────────────────────
 @pytest.mark.parametrize("tokens", (16384, _BIG))
 def test_VOC_한_건은_좁은_창에서만_600자에서_끊는다(tokens):

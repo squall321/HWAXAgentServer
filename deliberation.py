@@ -723,20 +723,20 @@ _CUT_MARK_ROOM = 48     # _cut_mark 표식(' …[N자 중 앞 M자]') 몫 — �
 _CHAT_CUT_FLOOR = 200   # 남은 예산이 이보다 작으면 발화를 줄여 싣지 않고 멈춘다(토막은 근거가 못 된다)
 
 
-def _fit_recent(items: list, budget: int, cap: int, tag: str) -> tuple[list, int, int]:
-    """발화 목록(시간순)을 **최근부터** 예산 안에 담아 (시간순 줄들, 남은 예산, 뺀 오래된 발화 수)를 돌려준다.
-    줄은 '· [tag:원래 순번] 글' 이다. 남은 예산보다 긴 발화는 버리지 않고 남은 예산까지 줄여(원문 길이 표식) 싣고
+def _fit_recent(items: list, budget: int, cap: int, fmt) -> tuple[list, int, int]:
+    """발화 목록(시간순 글)을 **최근부터** 예산 안에 담아 (시간순 줄들, 남은 예산, 뺀 오래된 발화 수)를 돌려준다.
+    줄은 fmt(원래 순번(1부터), 글) 이다. 남은 예산보다 긴 발화는 버리지 않고 남은 예산까지 줄여(원문 길이 표식) 싣고
     멈춘다. 종전엔 오래된 것부터 담다가 처음 넘치는 줄에서 멈춰, 앞쪽의 긴 붙여넣기 하나가 뒤의 최근 조건을 통째로
-    밀어냈다(넓은 창은 발화 상한이 없어 더 쉽게). cap 은 발화 하나의 상한(0=무절단)이다."""
+    밀어냈다(넓은 창은 발화 상한이 없어 더 쉽게). cap 은 발화 하나의 상한(0=무절단)이다. 챗→심의 맥락과 챗의 보조
+    호출(app._recent_lines — 화두 뽑기·되묻기·좌석 축)이 같이 쓴다."""
     picked: list[str] = []
     omitted = 0
     for i in range(len(items), 0, -1):
-        head = f"· [{tag}:{i}] "
-        line = head + _cut_mark(items[i - 1], cap)
+        line = fmt(i, _cut_mark(items[i - 1], cap))
         if len(line) > budget:
-            room = budget - len(head) - _CUT_MARK_ROOM
+            room = budget - len(fmt(i, "")) - _CUT_MARK_ROOM
             if room >= _CHAT_CUT_FLOOR:
-                line = head + _cut_mark(items[i - 1], room)
+                line = fmt(i, _cut_mark(items[i - 1], room))
                 picked.append(line)
                 budget -= len(line)
                 omitted = i - 1
@@ -794,14 +794,14 @@ def _chat_context_note(history) -> str:
                    "틀렸다고 판단하면 근거를 대고 그렇게 말하라.")
         # [c:N] — 도구 근거의 [e:N] 과 같은 역할. 없으면 좌석이 "사람이 말한 전제" 를
         # 가리킬 수가 없어 "대화에서 언급된 바와 같이" 같은 뭉뚱그린 말로 흐른다.
-        lines, budget, gone = _fit_recent(users, budget, turn_max, "c")
+        lines, budget, gone = _fit_recent(users, budget, turn_max, lambda i, t: f"· [c:{i}] {t}")
         if gone:
             out.append(f"· (앞선 사람 발화 {gone}건 생략 — 예산, 오래된 순으로 뺐다)")
         out.extend(lines)
     if bots and budget > 400:
         out.append("[챗 단계의 잠정 해석] 챗이 낸 중간 답이다. **결론이 아니며 승계 금지** — "
                    "근거가 없거나 틀렸으면 반박하라.")
-        lines, budget, gone = _fit_recent(bots, budget, bot_max, "a")
+        lines, budget, gone = _fit_recent(bots, budget, bot_max, lambda i, t: f"· [a:{i}] {t}")
         if gone:
             out.append(f"· (앞선 챗 답변 {gone}건 생략 — 예산, 오래된 순으로 뺐다)")
         out.extend(lines)
