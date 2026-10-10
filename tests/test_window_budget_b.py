@@ -664,3 +664,38 @@ def test_넓은_창의_지정_도구_재시도는_오류를_500자에서_끊지_
     err = json.dumps({"ok": False, "error": "가" * 700 + " [오류-끝]"}, ensure_ascii=False)
     llm, _seat = _designated(monkeypatch, _BIG, [err, '{"rows": [1]}'])
     assert len(llm.plans) == 2 and "[오류-끝]" in llm.plans[1], llm.plans[-1][-300:]
+
+
+# ── 원장의 좌석 역할 — 이어하기가 되넘기는 길이는 엔진이 받는 길이와 같다 ─────────────────────────────
+def _started_roles(monkeypatch, tmp_path, tokens):
+    _win(tokens)
+    role = _long("역할-끝", 5000)
+
+    async def _entry(*_a, **_k):
+        yield d._sse("done", {})
+
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(d, "run_deliberation", _entry)
+
+    async def go():
+        rec = delib_jobs.start(object(), "default", "q", delib_opts={"personas": [{"key": "cust-x", "role": role}]})
+        await delib_jobs._TASKS[rec["id"]]
+        return rec
+
+    return asyncio.run(go())["seat_roles"]["cust-x"], role
+
+
+@pytest.mark.parametrize("tokens", (128000,))
+def test_좁은_창의_원장_좌석_역할은_종전대로_2000자다(monkeypatch, tmp_path, tokens):
+    got, role = _started_roles(monkeypatch, tmp_path, tokens)
+    assert got == role[:2000]
+
+
+def test_넓은_창의_원장_좌석_역할은_엔진이_받는_길이까지_남는다(monkeypatch, tmp_path):
+    """엔진은 넓은 창에서 지정 좌석 역할을 이어하기 요약 길이까지 받는데(dcb1551) 원장은 2,000자로 적어, 이어하기가
+    호출자가 지어 준 좌석의 역할을 2,000자로 되넘겼다."""
+    got, role = _started_roles(monkeypatch, tmp_path, _BIG)
+    assert got == role

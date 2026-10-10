@@ -521,7 +521,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
                else "줄이 빠진 뒤 다시 하라."))
 
     from deliberation import (_INT_KEYS, _ROLE_REQ_MAX, _SEALED_UNSUPPORTED, _resolve_opts,  # noqa: PLC0415
-                              _seal, _seat_key, run_deliberation, run_sim_deliberation, run_test_plan)
+                              _seal, _seat_key, _summary_max, _wide, run_deliberation, run_sim_deliberation,
+                              run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
 
@@ -554,7 +555,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         # 오는데 그 역할은 소개 카드용 앞 280자뿐이다. 이어하기는 좌석을 여기서 되넘기므로, 레지스트리에 없는
         # 좌석(호출자가 지어 준 키 — 엔진이 원본을 다시 읽어 올 데가 없다)은 그 280자가 역할이 됐다.
         # seats 는 화면·목록이 읽는 모양이라 그대로 두고 역할 전문만 따로 적는다(mcp_server._carry_seats).
-        "seat_roles": {_seat_key(p): str(p["role"])[:_ROLE_REQ_MAX] for p in (opts.get("personas") or [])
+        # 길이는 엔진이 받는 것과 같다(_resolve_opts — 좁은 창 _ROLE_REQ_MAX 2,000자, 넓은 창 _summary_max). 종전엔 넓은
+        # 창에서도 2,000자로 적어, 엔진은 전문을 받았는데 이어하기는 2,000자로 되넘겼다.
+        "seat_roles": {_seat_key(p): str(p["role"])[:(_summary_max() if _wide() else _ROLE_REQ_MAX)]
+                       for p in (opts.get("personas") or [])
                        if _seat_key(p) and isinstance(p.get("role"), str) and p["role"]},
         "decision": None, "result_text": None, "report_id": None, "plain": None,
         "turns": [], "checkpoint": None,
