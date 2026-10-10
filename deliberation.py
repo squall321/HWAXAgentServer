@@ -143,10 +143,13 @@ _RA_ITEM_MAX = _env_int("DELIB_RA_ITEM_MAX", 1900)   # 서버 상한 2000 에 �
 _CLIP_SCALE = max(0.5, _env_float("DELIB_CLIP_SCALE", 1.0))  # 회의 버블 절단 상한 배율
 # 라운드 직렬화(r1t 등)는 모델 입력이지만 다인원 합산이라 무제한이면 좁은 컨텍스트(dev 16K)를
 # 밀어낸다 — 값당 여유 상한만 걸고(0=무절단), 의장 프롬프트는 라운드당 별도 상한을 둔다.
-# 이 값은 **다음 라운드 좌석**에게 그대로 걸린다(좌석 프롬프트 예산 _SEAT_CTX 는 창에서 유도하지 않는다 —
-# 풀면 좁은 창에서 좌석이 400 으로 유실된다). **의장**에게는 라운드 상한이 받는 데까지 늘려 싣는다
-# (_chair_rows). 어느 쪽이든 끊었으면 스트림이 알린다.
+# 이 값은 **좁은 창의 다음 라운드 좌석**에게 걸린다. 직전 라운드 몫(_seat_ctx)이 창에서 바닥(48,000자) 위로
+# 크는 넓은 창(1백만 토큰)에서는 값마다 끊지 않는다 — 그 라운드는 직전 라운드 몫이 좌석마다 같은 몫으로 지킨다
+# (_ser_clip). 종전엔 1백만 토큰 창에서도 관점·해석 목록이 값마다 700자에서 끊겨 다음 라운드로 갔다(사용자 지침
+# 2026-10-10). 명시하면(DELIB_SER_CLIP) 어느 창에서나 그 값이다. **의장**에게는 라운드 상한이 받는 데까지 늘려
+# 싣는다(_chair_rows — 이 값이 거기서는 늘리기 시작하는 바닥이다). 어느 쪽이든 끊었으면 스트림이 알린다.
 _SER_CLIP = _env_int("DELIB_SER_CLIP", 700)          # 직렬화 값당 상한(자), 0=무절단
+_SER_CLIP_SET = bool(os.environ.get("DELIB_SER_CLIP"))
 # 의장 프롬프트 라운드당 상한(자), 0=무제한. **명시하면 그 값**이고(종전 의미 그대로), 안 주면(None)
 # 모델 컨텍스트에서 유도한다(_decision_ctx). 종전 기본값 6,000 은 dev 16K 창의 방어값인데 운영 창
 # (128K)에서도 그대로였다 — 실사용 라운드는 37,000자였고 의장은 그 1/6 로 결정문을 썼다(S26U
@@ -169,7 +172,12 @@ _CHAIR_RETRIES = max(0, _env_int("DELIB_CHAIR_RETRIES", 1))
 # (실측 15석 수렴 직전 라운드 164,854자 × 15석). 넘치면 400 이지 절단이 아니라서 좌석이 유실된다
 # (docs/GLM-DELIB-TUNING-REVIEW.md §7). 48K 는 평범한 라운드를 건드리지 않는 선이다 —
 # 발언 중앙값 2,000자 × 20석 = 40K. 줄일 때는 좌석마다 같은 몫이다(_fit_rows).
+# 이 값은 바닥이다 — 실제 몫은 창에서 유도한다(_seat_ctx). 1백만 토큰 창에서도 48,000자였어서 22석 라운드가
+# 좌석당 2,000자 남짓으로 줄어 다음 라운드에 갔다. 명시하면(DELIB_SEAT_CTX) 유도값을 넘지 않게 낮추기만 하고,
+# 0 은 종전대로 무제한이다.
 _SEAT_CTX = _env_int("DELIB_SEAT_CTX", 48000)
+_SEAT_CTX_SET = bool(os.environ.get("DELIB_SEAT_CTX"))
+_SEAT_CTX_FLOOR = 48000
 # 사전 컨텍스트(챗 핸드오프 원천 근거·업로드 문서) 예산 — 좌석 프롬프트에 통째로 실린다.
 # 종전 값(항목 2,000자 · 합계 11,000자)은 챗 도구결과 몇 건을 나르려고 잡은 것이라, 발표자료나
 # 보고서 한 건(추출하면 보통 30,000~80,000자)을 실으면 **첫 항목에서 잘려** 심의가 표지만 보고
@@ -202,25 +210,109 @@ _EVID_BUDGET = _env_int("DELIB_EVID_BUDGET", 500000)      # 주입 합계 **천�
 #   시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + 근거 + 도구 스키마다. 근거만 크게 잡으면
 #   라운드가 통째로 400 이 나고, 심의는 좌석이 동시에 도니 **전원이 같이 죽는다**.
 #   실측: 천장 160,000자(≈152,000토큰) + _SEAT_CTX 48,000자(≈45,700토큰) = 198,000토큰.
+#   1,048,576 토큰 창의 유도값은 437,141자라 이 천장에 걸리지 않는다 — 직전 라운드·조회 결과·지정 도구·이어하기
+#   요약의 몫(_ROOM_SHARE)을 창에서 먼저 뗀다.
 _EVID_KO_CPT = 1.05          # 한국어 최악 기준 자/토큰 — 과대평가하면 400 이 난다
 # 시스템·페르소나·**도구 스키마**·출력 몫(토큰). 좌석은 자유 조회가 기본 켜짐이라
 # (DELIB_FREE_TOOLS=1) 도구가 바인딩된다 — 스키마 예산(기본 40,000)을 안 빼면 넘친다.
 _EVID_RESERVE = _env_int("DELIB_EVID_RESERVE", _env_int("TOOL_SCHEMA_BUDGET", 40000) + 16000)
+# 발언 턴은 도구를 묶지 않는다(_round_live 는 텍스트 턴) — 위 예비분 가운데 스키마 몫(토큰)이 그 턴에서는 빈다.
+# 좌석이 조회한 결과·지정 도구 결과·이어하기 요약처럼 사전 컨텍스트 회계 밖에서 덧붙는 글이 종전엔 이 빈자리에 들었다.
+_SPEAK_SLACK = min(_env_int("TOOL_SCHEMA_BUDGET", 40000), _EVID_RESERVE)
+# 좌석 발언 턴의 가변부를 창에서 나눠 갖는 몫 — _seat_room() 에 대한 비율이다. 넓은 창(직전 라운드 몫이 바닥
+# 48,000자 위로 크는 창 — 약 30만 토큰부터)에서만 쓰고, 좁은 창(dev 16K·128K·200K)은 각 자리의 종전 값 그대로다.
+# 종전엔 16K·128K 시절에 박은 상한(직전 라운드 48,000자, 자기 조회 3,500자, 지정 도구 5,000자, 이어하기 요약
+# 8,000자)이 1백만 토큰 창에서도 걸려 글자가 잘렸다(사용자 지침 2026-10-10 — GLM-5.2 창 1,048,576 토큰을 가정한다).
+# 직전 라운드 몫을 뺀 나머지 넷의 합에서 스키마 빈자리를 넘는 만큼은 사전 컨텍스트(_pre_budget)에서 뗀다 — 그래야
+# 몫을 전부 채워도 좌석 발언 턴이 창 안에 든다(tests/test_window_budget). 지식카드(DELIB_KNOWLEDGE_BUDGET)는 아직
+# 이 표 밖이다 — 늘리려면 여기에 몫을 더한다.
+_ROOM_SHARE = {
+    "seat_ctx": 0.20,   # 직전 라운드(_seat_ctx) — 바닥 _SEAT_CTX_FLOOR
+    "lookup": 0.08,     # 좌석이 직접 조회한 결과(_lookup_budget) — 바닥 3,500자
+    "share": 0.06,      # 다른 좌석·앞 라운드의 조회 결과(_share_budget) — 좁은 창은 종전 식
+    "tool": 0.04,       # 지정 도구 결과(_tool_inject_caps) — 바닥 도구당 2,000자·합 5,000자
+    "summary": 0.03,    # 이어하기 요약(_summary_max) — 바닥 8,000자
+}
 _evid_cache: dict = {}
+
+
+def _ctx_tokens() -> int:
+    try:
+        from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
+        return _model_context_tokens()
+    except Exception:  # noqa: BLE001
+        return 128000
+
+
+def _seat_room() -> int:
+    """좌석 발언 턴의 가변부(근거·챗 맥락·직전 라운드·조회 결과·지정 도구 결과·이어하기 요약)가 나눠 쓰는 창(자).
+    예비분(시스템·페르소나·스키마·출력)을 뺀 나머지를 최악 환산(_EVID_KO_CPT)과 안전 계수로 글자로 바꾼다."""
+    return max(0, int((_ctx_tokens() - _EVID_RESERVE) * _EVID_KO_CPT * _PRE_SAFETY))
+
+
+def _wide() -> bool:
+    """직전 라운드 몫이 창에서 바닥(48,000자) 위로 크는 넓은 창인가 — 좁은 창의 종전 값은 이 밖에서만 바뀐다."""
+    return int(_seat_room() * _ROOM_SHARE["seat_ctx"]) > _SEAT_CTX_FLOOR
+
+
+def _room(name: str, floor: int) -> int:
+    """_ROOM_SHARE 의 한 자리(자). 좁은 창은 floor(종전 값) 그대로, 넓은 창은 창에서 유도한 몫(floor 이상)."""
+    return max(floor, int(_seat_room() * _ROOM_SHARE[name])) if _wide() else floor
+
+
+def _room_extra() -> int:
+    """덧붙는 몫(직전 라운드 몫 밖의 넷) 가운데 발언 턴의 스키마 빈자리를 넘는 양(자) — 사전 컨텍스트에서 뗀다."""
+    if not _wide():
+        return 0
+    share = sum(v for k, v in _ROOM_SHARE.items() if k != "seat_ctx")
+    return max(0, int(_seat_room() * share) - int(_SPEAK_SLACK * _EVID_KO_CPT * _PRE_SAFETY))
+
+
+def _seat_ctx() -> int:
+    """좌석에게 싣는 직전 라운드의 상한(자), 0=무제한. 창에서 유도하고(바닥 _SEAT_CTX_FLOOR), 명시값
+    (DELIB_SEAT_CTX)은 유도값을 넘지 않게 **낮추기만** 한다 — 올리면 좌석 프롬프트가 창 밖으로 밀린다.
+    명시값 0 은 종전대로 무제한이다."""
+    got = _room("seat_ctx", _SEAT_CTX_FLOOR)
+    if _SEAT_CTX_SET:
+        return _SEAT_CTX if _SEAT_CTX <= 0 else min(_SEAT_CTX, got)
+    return got
+
+
+def _ser_clip() -> int:
+    """다음 라운드 좌석에게 줄 직렬화 값당 상한(자), 0=무절단. 명시값(DELIB_SER_CLIP)이 있으면 어느 창에서나 그 값이다.
+    없으면 좁은 창은 종전 값(700), 넓은 창은 0 — 그 라운드는 _seat_ctx() 가 좌석마다 같은 몫으로 지킨다."""
+    if _SER_CLIP <= 0 or _SER_CLIP_SET:
+        return max(0, _SER_CLIP)
+    return 0 if _wide() else _SER_CLIP
+
+
+def _lookup_budget() -> int:
+    """좌석이 직접 조회한 결과를 그 좌석의 발언 턴에 싣는 합의 상한(자) — 좁은 창은 종전 3,500자."""
+    return _room("lookup", 3500)
+
+
+def _tool_inject_caps() -> tuple[int, int]:
+    """지정 도구 결과를 좌석 프롬프트에 싣는 (도구 하나의 상한, 합의 상한)(자). 좁은 창은 종전 값(_TOOL_CHUNK_MAX·
+    _TOOL_INJECT_MAX), 넓은 창은 합을 창에서 유도하고 도구 하나도 그 합까지 쓸 수 있다(여럿이면 같은 몫으로 나눈다)."""
+    if not _wide():
+        return _TOOL_CHUNK_MAX, _TOOL_INJECT_MAX
+    t = _room("tool", _TOOL_INJECT_MAX)
+    return t, t
+
+
+def _summary_max() -> int:
+    """이어하기 요약(이전 결정문)을 받는 길이(자) — 좁은 창은 종전 8,000자. 매 라운드 전 좌석에 실린다."""
+    return _room("summary", _SUMMARY_MAX)
 
 
 def _pre_budget() -> int:
     """사전 컨텍스트 **전체** 예산(자) — 원천 근거 + 챗 맥락이 나눠 쓴다.
 
     둘을 따로 잡으면 각각은 맞는데 **합치면 컨텍스트를 넘는다.** 좌석 프롬프트 하나는
-    시스템 + 페르소나 + 직전 라운드(_SEAT_CTX) + **여기** + 도구 스키마이고, 심의는 좌석이
+    시스템 + 페르소나 + 직전 라운드(_seat_ctx) + **여기** + 덧붙는 몫(_room_extra) + 도구 스키마이고, 심의는 좌석이
     동시에 돌아 넘치면 라운드가 통째로 죽는다.
     """
-    try:
-        from app import _model_context_tokens     # noqa: PLC0415 — 순환 방지용 늦은 import
-        ctx = _model_context_tokens()
-    except Exception:
-        ctx = 128000
+    ctx = _ctx_tokens()
     # 어느 창에서 유도했는지 함께 적어 두고, 창이 같을 때만 꺼내 쓴다. 창 조회가 실패하면 기본값을 잠깐
     # 가정하다가 다시 묻는데(app._model_context_tokens), 여기가 그 가정값으로 굳어 있으면 창이 바로잡혀도
     # 좌석 예산은 내내 틀린 창 기준이다.
@@ -228,8 +320,8 @@ def _pre_budget() -> int:
         return _evid_cache["pre"]
     # 안전 계수 — 이 계산은 구조상 **정확히 컨텍스트에 딱 맞게** 떨어진다(실측 128,000/128,000).
     # 여유 0 이면 토큰 추정 오차 한 번에 넘치고, 심의는 좌석이 동시에 죽는다. 조금 손해 본다.
-    avail = ctx - int(_SEAT_CTX / _EVID_KO_CPT) - _EVID_RESERVE
-    n = max(2000, int(avail * _EVID_KO_CPT * _PRE_SAFETY))
+    avail = ctx - int(_seat_ctx() / _EVID_KO_CPT) - _EVID_RESERVE
+    n = max(2000, int(avail * _EVID_KO_CPT * _PRE_SAFETY) - _room_extra())
     _evid_cache["pre"], _evid_cache["pre_ctx"] = n, ctx
     return n
 
@@ -1764,10 +1856,10 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
 
 
 def _ser_val(v, clip: int | None = None) -> str:
-    """직렬화 값 정규화 — 배열은 이어 붙이고, DELIB_SER_CLIP 여유 상한만 건다(0=무절단).
+    """직렬화 값 정규화 — 배열은 이어 붙이고, 값당 여유 상한(_ser_clip — 넓은 창은 0)만 건다(0=무절단).
     dict 항목(인용 반박 계약 등 구조화 출력)은 Python repr 로 새지 않게 JSON 으로 직렬화.
-    clip 을 주면 그 값으로 끊는다(None=DELIB_SER_CLIP) — 의장 전사가 상한을 늘려 싣는 데 쓴다."""
-    clip = _SER_CLIP if clip is None else clip
+    clip 을 주면 그 값으로 끊는다(None=_ser_clip()) — 의장 전사가 상한을 늘려 싣는 데 쓴다."""
+    clip = _ser_clip() if clip is None else clip
     if isinstance(v, dict):
         v = json.dumps(v, ensure_ascii=False)
     if isinstance(v, list):
@@ -2812,6 +2904,7 @@ def _free_result_chars(tool_budget: int) -> int:
 # 고정이라 20석이 되어도 프롬프트가 선형으로 커지지 않는다. 1라운드 값이고 라운드에 비례해 는다
 # (_share_budget) — 풀이 라운드마다 쌓이기 때문이다.
 _SHARE_BUDGET = _env_int("DELIB_SHARE_BUDGET", 8000)
+_SHARE_BUDGET_SET = bool(os.environ.get("DELIB_SHARE_BUDGET"))
 _SHARE_ITEM_MAX = _env_int("DELIB_SHARE_ITEM_MAX", 420)   # 공용 항목 1건당 글자
 _PRIOR_BUDGET = _env_int("DELIB_PRIOR_BUDGET", 1200)      # '이미 조회된 것' 호출 서명 목록(자)
 # 자유 조회 근거 카드의 화면 표시 상한. 종전에는 여기만 500 을 박아 다른 근거(_EVID_SHOW
@@ -2829,8 +2922,16 @@ def _share_budget(rnd: int = 1) -> int:
     고정이라 라운드가 갈수록 빠지는 비율이 커졌다(S26U 피드백 1-13 — 6석이 라운드마다 3건씩 조회하는
     시험으로 재면 0.20 → 0.55 → 0.65).
     ⚠ 컨텍스트 쪽 상한(_pre_budget 의 15%)은 그대로다. 창이 좁으면 1라운드부터 그 상한이 걸려 있어
-    늘지 않는다(128K 에서 3,850자) — 거기서 더 주려면 이 상한의 근거부터 다시 재야 한다."""
-    return min(_SHARE_BUDGET * max(1, rnd), max(600, int(_pre_budget() * 0.15)))
+    늘지 않는다(128K 에서 3,850자) — 거기서 더 주려면 이 상한의 근거부터 다시 재야 한다.
+
+    넓은 창(_wide)은 몫을 창에서 유도한다(_ROOM_SHARE['share'] — 사전 컨텍스트에서 미리 떼어 둔 자리다). 라운드마다
+    그 몫의 1/3 씩 늘어 3라운드에 몫을 다 쓴다. 종전엔 1백만 토큰 창에서도 1라운드 8,000자였다(사용자 지침 2026-10-10).
+    명시한 DELIB_SHARE_BUDGET 은 라운드당 늘어나는 양을 낮추기만 한다."""
+    if not _wide():
+        return min(_SHARE_BUDGET * max(1, rnd), max(600, int(_pre_budget() * 0.15)))
+    cap = _room("share", 0)
+    step = min(_SHARE_BUDGET, cap // 3) if _SHARE_BUDGET_SET else max(_SHARE_BUDGET, cap // 3)
+    return min(cap, step * max(1, rnd))
 
 
 def _share_block(pool: list, key: str, budget: int, *,
@@ -4458,18 +4559,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         kind = _kind(rnd)
         prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
         prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")
-        # 좌석에게 보여 줄 직전 라운드 — prev_t 와 같은 모양이되 _SEAT_CTX 를 넘으면 좌석마다
-        # 같은 몫으로 줄인다. prev_t(원본)는 인용 검증·자유조회·의장용으로 그대로 둔다.
-        _srows, _sshare = _fit_rows([(o["persona"], _ser_kind(o, prev_kind)) for o in prev_list], _SEAT_CTX)
+        # 좌석에게 보여 줄 직전 라운드 — prev_t 와 같은 모양이되 직전 라운드 몫(_seat_ctx — 창에서 유도)을 넘으면
+        # 좌석마다 같은 몫으로 줄인다. prev_t(원본)는 인용 검증·자유조회·의장용으로 그대로 둔다.
+        _sctx = _seat_ctx()
+        _srows, _sshare = _fit_rows([(o["persona"], _ser_kind(o, prev_kind)) for o in prev_list], _sctx)
         prev_seat_t = ((f"[직전 라운드 {len(prev_t):,}자 — 좌석당 {_sshare:,}자로 줄임. 잘린 부분을 "
                         "아는 척하지 마라]\n") if _sshare else "") + "\n".join(f"• {k}: {t}" for k, t in _srows)
         if _sshare:
             yield _sse("status", {"step": f"직전 라운드 {len(prev_t):,}자 — 좌석 프롬프트 상한 "
-                                          f"{_SEAT_CTX:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
+                                          f"{_sctx:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
             # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다).
             yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
                          text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
-                              f"({_SEAT_CTX:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
+                              f"({_sctx:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
                               "잘린 것은 긴 발언의 뒷부분이다.")
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
@@ -4534,7 +4636,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 # 배정이 없는 좌석(신규 착석 등)은 자기 아닌 첫 좌석으로 폴백한다.
                 tkeys = _tg.get(p["key"]) or [k for k in _pk if k != p["key"]][:1]
                 # 표적 원본도 상한 안에서 — DELIB_CROSS_TARGETS 를 올리면 표적 합이 커진다.
-                _trows, _ = _fit_rows([(tk, _ser_kind(_pbk[tk], _pkind)) for tk in tkeys], _SEAT_CTX)
+                _trows, _ = _fit_rows([(tk, _ser_kind(_pbk[tk], _pkind)) for tk in tkeys], _seat_ctx())
                 blocks = "\n\n".join(f"— {tk} —\n{t}" for tk, t in _trows)
                 others = "\n".join(
                     f"• {o['persona']}: {_clip_sent(o.get('position_short') or o.get('deepen') or o.get('lens'), 160)}"
@@ -4775,20 +4877,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             r1_by_key = {o["persona"]: o for o in cur}
         ct = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)
         rounds_data.append((cur, ct))
-        # 다음 라운드 좌석은 이 전사를 받는다 — 값마다 DELIB_SER_CLIP 에서 끊은 판이다(좌석 쪽은 풀지 않는다 —
-        # _SER_CLIP 주석). 끊었으면 알린다. 종전엔 값 끝의 '…' 한 글자가 유일한 흔적이라, 긴 관점·해석 목록의
-        # 뒤쪽이 다음 라운드에 안 갔다는 것을 좌석도 호출자도 몰랐다. 마지막 라운드는 좌석에게 안 간다(의장
-        # 몫은 의장 전사 카드가 말한다).
-        if rnd < N and _SER_CLIP > 0:
+        # 다음 라운드 좌석은 이 전사를 받는다 — 좁은 창에서는 값마다 _ser_clip() 에서 끊은 판이다(넓은 창은 끊지
+        # 않고 직전 라운드 몫이 지킨다 — _SER_CLIP 주석). 끊었으면 알린다. 종전엔 값 끝의 '…' 한 글자가 유일한
+        # 흔적이라, 긴 관점·해석 목록의 뒤쪽이 다음 라운드에 안 갔다는 것을 좌석도 호출자도 몰랐다. 마지막 라운드는
+        # 좌석에게 안 간다(의장 몫은 의장 전사 카드가 말한다).
+        _vclip = _ser_clip()
+        if rnd < N and _vclip > 0:
             _ct_full = "\n".join(f"• {o['persona']}: {_ser_kind(o, kind, clip=0)}" for o in cur)
             if _ct_full != ct:
                 yield _sse("status", {"step": f"직렬화 값 상한 — {_dr(rnd)}라운드 발언 {len(_ct_full):,}자를 다음 "
-                                              f"라운드 좌석에게는 항목마다 앞 {_SER_CLIP:,}자까지만 실어 "
+                                              f"라운드 좌석에게는 항목마다 앞 {_vclip:,}자까지만 실어 "
                                               f"{len(ct):,}자로 준다", "tool": None})
                 yield _delib("evidence", source="직렬화 값 상한 초과", included=False,
                              knob="DELIB_SER_CLIP — 0 이면 끊지 않는다(넓은 창에서만)",
                              text=f"{_dr(rnd)}라운드 발언({len(cur)}석 · {len(_ct_full):,}자)을 다음 라운드 "
-                                  f"좌석에게 줄 때 발언의 항목(관점·해석·권장 등)마다 앞 {_SER_CLIP:,}자까지만 "
+                                  f"좌석에게 줄 때 발언의 항목(관점·해석·권장 등)마다 앞 {_vclip:,}자까지만 "
                                   f"실었다({len(ct):,}자) — 긴 항목의 뒷부분은 다음 라운드 좌석이 보지 못한다. "
                                   "의장에게는 창이 받는 만큼 더 싣는다.")
         # 좌석 유실 판정 — _round_live 는 한 명의 실패를 continue 로 삼킨다(라운드는 살리되).

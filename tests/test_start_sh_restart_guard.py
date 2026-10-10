@@ -329,9 +329,10 @@ def test_health_가_근거_예산을_싣는다(monkeypatch):
     try:
         assert _health_at(monkeypatch, 128000)["evid_budget"] == 17967
         assert _health_at(monkeypatch, 16384)["evid_budget"] == 2000          # 바닥값(작은 창)
-        # 운영 창(1,048,576 — GLM-5.2) — 창에서 유도한 값이 더 크고, 설정 천장(DELIB_EVID_BUDGET)에 걸린다.
+        # 운영 창(1,048,576 — GLM-5.2) — 창에서 유도한 값이다. 직전 라운드·조회 결과·지정 도구·이어하기 요약의 몫을
+        # 창에서 먼저 떼므로(tests/test_window_budget) 설정 천장(DELIB_EVID_BUDGET)에는 걸리지 않는다.
         big = _health_at(monkeypatch, 1048576)["evid_budget"]
-        assert big == d._EVID_BUDGET and big > 17967, big
+        assert 17967 < big < d._EVID_BUDGET and big == int(d._pre_budget() * (1.0 - d._CHAT_CTX_SHARE)), big
     finally:
         d._evid_cache.clear()
 

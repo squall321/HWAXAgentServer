@@ -36,12 +36,24 @@ def _bound():
 
 
 # ── 예산 ─────────────────────────────────────────────────────────────────────
-def test_넓은_창에서는_라운드마다_는다():
+def test_넓은_창에서는_라운드마다_늘다가_창에서_떼어_둔_몫에서_멈춘다():
+    """넓은 창은 몫을 창에서 유도한다(사용자 지침 2026-10-10 — 종전엔 1백만 토큰 창에서도 1라운드 8,000자였다).
+    라운드마다 몫의 1/3 씩 늘고, 사전 컨텍스트에서 미리 떼어 둔 몫(_room('share'))을 넘지 않는다."""
     _ctx(1000000)
     got = [d._share_budget(r) for r in range(1, 9)]
-    assert got == sorted(set(got)), f"라운드가 가도 늘지 않는다 — {got}"
-    assert got[0] == d._SHARE_BUDGET, "1라운드는 종전 값 그대로여야 한다"
+    cap = d._room("share", 0)
+    assert got[:3] == sorted(set(got[:3])), f"라운드가 가도 늘지 않는다 — {got}"
+    assert got[2:] == [cap] * 6, f"떼어 둔 몫({cap:,}자)에서 멈추지 않았다 — {got}"
+    assert got[0] > d._SHARE_BUDGET, "1라운드가 종전 값(8,000자)보다 작다 — 창에서 유도하지 않았다"
     assert d._share_budget() == got[0], "라운드를 안 준 호출은 1라운드 값이다"
+
+
+def test_넓은_창에서_명시한_천장은_라운드당_늘어나는_양을_낮추기만_한다(monkeypatch):
+    """DELIB_SHARE_BUDGET 을 적은 박스는 그 값씩 는다(종전과 같은 모양) — 떼어 둔 몫은 넘지 않는다."""
+    _ctx(1000000)
+    monkeypatch.setattr(d, "_SHARE_BUDGET_SET", True)
+    got = [d._share_budget(r) for r in range(1, 9)]
+    assert got == [min(d._room("share", 0), d._SHARE_BUDGET * r) for r in range(1, 9)], got
 
 
 @pytest.mark.parametrize("tokens", [16384, 128000, 200000, 1000000])
@@ -100,6 +112,9 @@ def _run(monkeypatch, tokens, rounds=4):
 
 
 def test_넓은_창에서는_라운드가_가도_빠지는_비율이_커지지_않는다(monkeypatch):
+    # 라운드당 8,000자씩 느는 모양을 본다 — 창에서 유도한 몫이면 이 하네스(6석)는 1라운드부터 다 실려 빠지는 것이
+    # 없다. 그래서 천장을 명시한 박스로 돈다(그 값씩 는다).
+    monkeypatch.setattr(d, "_SHARE_BUDGET_SET", True)
     rows = _run(monkeypatch, 1000000)
     budgets = [b for _n, _d, b in rows]
     assert budgets == [d._SHARE_BUDGET * r for r in (1, 2, 3, 4)], f"호출부가 라운드를 안 넘긴다 — {budgets}"
