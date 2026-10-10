@@ -4399,9 +4399,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 if _out and _delib_tool_result_ok(_out):
                     _good = _out
                     break
-                _err_note = (_out or "(빈 응답)")[:500]
+                # 재시도 계획자에게 주는 오류 — 좁은 창은 종전 앞 500자(원문 길이 표식), 넓은 창은 전부(교정 단서가 뒤에 있다).
+                _err_note = _cut_mark(_out or "(빈 응답)", _narrow_cap(500))
             if _good:
-                _head = f"### {_tn} ← {json.dumps(_argd, ensure_ascii=False)[:160]}\n"
+                # 머리줄의 인자 — 좌석이 어떤 인자로 조회한 값인지 보는 자리다. 좁은 창만 종전 160자(표식).
+                _head = f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
                 _got.append((_head, _good))
                 _used.append(_tn)
                 ev_count["tool"] += 1

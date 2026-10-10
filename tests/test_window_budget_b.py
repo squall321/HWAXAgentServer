@@ -605,3 +605,62 @@ def test_이어하기는_근거를_다시_받는다(monkeypatch, tmp_path):
     assert got.get("evidence") == ev, got
     desc = next(t.description for t in asyncio.run(m.mcp.list_tools()) if t.name == "deliberate_continue")
     assert "evidence" in desc, desc
+
+
+# ── 지정 도구 — 머리줄의 인자·재시도 오류를 넓은 창에서는 끊지 않는다 ─────────────────────────────
+class _Planner(_Llm):
+    def __init__(self, args, *a):
+        super().__init__(*a)
+        self.args, self.plans = args, []
+
+    async def text(self, _obj, system, human):
+        if "도구 호출 계획자" in system:
+            self.plans.append(human)
+            return json.dumps(self.args, ensure_ascii=False)
+        return await super().text(_obj, system, human)
+
+
+def _designated(monkeypatch, tokens, answers):
+    _win(tokens)
+    args = {"q": "가" * 400 + " [인자-끝]"}
+    llm = _Planner(args, _seat_plain, "결정")
+    seq = iter(answers)
+
+    class _T(_Tool):
+        async def ainvoke(self, a):
+            self.calls.append(a)
+            return next(seq)
+
+    tools = {"agent_search": _Tool("agent_search"), "list_things": _T("list_things")}
+
+    async def _fake_tools(*_a, **_k):
+        return tools
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    monkeypatch.setattr(d, "_llm_text", llm.text)
+    stub = SimpleNamespace(state=SimpleNamespace(llm=llm, delib_llm=None))
+    opts = {"personas": _SEATS, "rounds": 2, "free_tools": 0, "voc": "off", "rescreen": 0,
+            "persona_knowledge": 0, "save_report": 0, "tools": ["list_things"]}
+
+    async def go():
+        return [c async for c in d.run_deliberation(stub, "힌지 크랙 원인", [], opts)]
+
+    asyncio.run(go())
+    seat = next(h for s, h in llm.prompts if "당신은 'mech-a' 전문가" in s)
+    return llm, seat
+
+
+def test_넓은_창의_지정_도구_머리줄은_인자를_160자에서_끊지_않는다(monkeypatch):
+    _llm, seat = _designated(monkeypatch, _BIG, ['{"rows": [1, 2, 3]}'])
+    assert "[인자-끝]" in seat, "좌석이 어떤 인자로 조회한 값인지 보는 머리줄이 160자에서 끊겼다"
+
+
+def test_좁은_창의_지정_도구_머리줄은_160자에서_끊고_원문_길이를_적는다(monkeypatch):
+    _llm, seat = _designated(monkeypatch, 128000, ['{"rows": [1, 2, 3]}'])
+    assert "[인자-끝]" not in seat and "자 중 앞 160자" in seat
+
+
+def test_넓은_창의_지정_도구_재시도는_오류를_500자에서_끊지_않는다(monkeypatch):
+    err = json.dumps({"ok": False, "error": "가" * 700 + " [오류-끝]"}, ensure_ascii=False)
+    llm, _seat = _designated(monkeypatch, _BIG, [err, '{"rows": [1]}'])
+    assert len(llm.plans) == 2 and "[오류-끝]" in llm.plans[1], llm.plans[-1][-300:]
