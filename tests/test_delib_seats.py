@@ -355,6 +355,7 @@ def _eval_gate(code, name, *, chair, apps=(), amap=None):
         "_MATERIAL_TOOLS": d._MATERIAL_TOOLS, "_RISK_READ_TOOLS": d._RISK_READ_TOOLS,
         "_RISK_KEEP_TOOLS": d._RISK_KEEP_TOOLS, "_amap": amap or {}, "_apps": set(apps),
         "_risk_chair": chair == "risk-review",
+        "_RISK_RA_REPORT_TOOLS": d._RISK_RA_REPORT_TOOLS,
     }
     return bool(eval(code, ns))  # noqa: S307 — 소스에서 뽑은 우리 코드다
 
@@ -546,6 +547,29 @@ def test_등록부_도구는_리스크_심사_좌석에게_열리지_않는다()
     for n in ("risk_get_diff", "risk_get_snapshot"):
         assert _eval_gate(g_gate, n, chair="default", apps=("heax-hwax_risk",), amap=_RISK_AMAP), n
         assert _eval_gate(narrow, n, chair="default", apps=("heax-hwax_risk",), amap=_RISK_AMAP), n
+
+
+def test_RA_보고서_읽기_도구는_apps_없는_리스크_심사에서도_좌석에게_열리지_않는다():
+    """D-18 — 실사용 팀은 apps 없이 deliberate_start(job='risk-review')를 부른다(HWAXPortal docs/risk-review-redesign D-20·D-21).
+    _narrow 는 apps 가 있을 때만 걸려 그 길의 좌석이 접두사 화이트리스트로 RA 보고서 읽기 도구를 다 받았다 — 잡 주인이 남긴
+    앞 패널 '심의 — …' 초안을 목록에서 보고 본문을 읽었다. 러너 패널과 같은 시야(RA 는 유지 도구로만)로 맞춘다.
+    이름은 RA mcp_server/server.py 의 search·collab 묶음에서 보고서 본문·제목·요약을 내주는 읽기 도구다(2026-10-11 대조)."""
+    g_gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
+    narrow = _dictcomp_cond("_MATERIAL_TOOLS", "_FREE_DENY")
+    readers = ("get_report", "get_report_outline", "get_reports_digest", "list_my_reports", "list_reports",
+               "list_related_reports", "list_comments", "get_composite", "list_composites")
+    amap = {n: "reportarchive" for n in readers + ("search_reports",)}
+    for n in readers:
+        assert d._free_tool_ok(n), f"{n} 이 접두사 화이트리스트에 안 걸린다 — 시험 전제가 바뀌었다"
+        assert n not in d._RISK_KEEP_TOOLS, n
+        for apps in ((), _RUNNER_APPS, ("reportarchive",)):
+            opened = (_eval_gate(g_gate, n, chair="risk-review", apps=apps, amap=amap)
+                      and (not apps or _eval_gate(narrow, n, chair="risk-review", apps=apps, amap=amap)))
+            assert not opened, (n, apps)
+        # 다른 심의는 종전대로다 — apps 가 없으면 접두사로 열린다.
+        assert _eval_gate(g_gate, n, chair="default", apps=(), amap=amap), n
+    # 같은 과제 거름으로 감싸는 보고서 검색은 남는다(러너 패널과 같다).
+    assert _eval_gate(g_gate, "search_reports", chair="risk-review", apps=(), amap=amap)
 
 
 def test_조회_지침은_표식이_있을_때만_변경_안내로_시작한다():

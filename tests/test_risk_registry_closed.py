@@ -10,6 +10,7 @@
 # (3) 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입) — 결과가 전 좌석 프롬프트에 실린다.
 # (4) 앞 패널 기록 도구(패널 목록 · 패널 전사)를 리스크 심사에 지정한 길.
 # (5) 공백·한글이 든 과제 코드 — 질문 머리를 읽지 못하면 (2)·(3) 의 거름이 알림 없이 꺼졌다. 못 읽으면 알린다.
+# (6) apps 없이 손수 돈 리스크 심사 — 좌석이 RA 보고서 읽기 도구로 앞 패널 초안을 읽었다. 이름으로 뺀다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -101,9 +102,9 @@ class _CoTool:
         return await self.coroutine(**args)
 
 
-def _seat_pool(monkeypatch, chair, question, answer, apps=("heax-step_forge",)):
-    """심의를 좌석 발굴 문턱까지 실제로 돌려, 자유 조회 준비가 좌석 에이전트에게 준 도구들을 받는다. apps 기본값은 러너처럼
-    어댑터 앱이다(RA 도구는 리스크 심사 유지 도구로만 남는다)."""
+def _seat_given(monkeypatch, chair, question, answer, apps=("heax-step_forge",), extra=None):
+    """심의를 좌석 발굴 문턱까지 실제로 돌려, 자유 조회 준비가 좌석 에이전트에게 준 도구들({이름: 도구})을 받는다. apps 기본값은
+    러너처럼 어댑터 앱이다(RA 도구는 리스크 심사 유지 도구로만 남는다). extra 는 {도구 이름: 소속 앱} — 게이트웨이에 더 있는 도구."""
     import langgraph.prebuilt
 
     given = []
@@ -113,8 +114,10 @@ def _seat_pool(monkeypatch, chair, question, answer, apps=("heax-step_forge",)):
         return SimpleNamespace()
 
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", _fake_agent)
-    monkeypatch.setattr(d, "_app_of_tools", lambda: {"search_reports": "reportarchive"})
-    tools = {"agent_search": _Tool("agent_search"), "search_reports": _CoTool("search_reports", answer)}
+    extra = extra or {}
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {"search_reports": "reportarchive", **extra})
+    tools = {"agent_search": _Tool("agent_search"), "search_reports": _CoTool("search_reports", answer),
+             **{n: _CoTool(n, "{}") for n in extra}}
 
     async def _fake_tools(*_a, **_k):
         return tools
@@ -136,7 +139,12 @@ def _seat_pool(monkeypatch, chair, question, answer, apps=("heax-step_forge",)):
 
     asyncio.run(go())
     assert given and "search_reports" in given[0], "시험 전제 — 좌석 자유 조회 후보에 search_reports 가 없다"
-    return given[0]["search_reports"]
+    return given[0]
+
+
+def _seat_pool(monkeypatch, chair, question, answer, apps=("heax-step_forge",)):
+    """좌석 에이전트에게 간 search_reports(_seat_given)."""
+    return _seat_given(monkeypatch, chair, question, answer, apps)["search_reports"]
 
 
 def _search(tool):
@@ -343,3 +351,31 @@ def test_리스크심사_머리를_읽지_못하면_조용히_넘기지_않고_�
 def test_머리를_읽었거나_머리가_없거나_리스크_심사가_아니면_알리지_않는다(monkeypatch, chair, question):
     warn, cards = _head_notices(_events_for(monkeypatch, question, chair))
     assert not warn and not cards, (warn, cards)
+
+
+# ── (6) apps 없이 손수 돈 리스크 심사 — RA 보고서 읽기 도구를 이름으로 뺀다 ───────────────────────────────────────────
+# 실사용 팀은 리스크 앱을 거치지 않고 Claude 에서 deliberate_start(job='risk-review')를 apps 없이 부른다(HWAXPortal
+# docs/risk-review-redesign D-20·D-21). 앱 제한(_narrow)은 apps 가 있을 때만 걸려, 이 길의 좌석은 접두사 화이트리스트 전체를
+# 받았다 — RA 의 get_report·list_my_reports·get_reports_digest 가 열려 잡 주인이 남긴 앞 패널 '심의 — …' 초안을 목록에서 보고
+# 본문을 읽었다. 러너 패널(apps = 어댑터 앱)의 좌석은 RA 를 유지 도구(search_reports 등)로만 본다 — 같은 시야로 맞춘다.
+# 이름은 RA mcp_server/server.py 의 search·collab 묶음에서 보고서 본문·제목·요약을 내주는 읽기 도구다(2026-10-11 대조).
+_RA_READERS = ("get_report", "get_report_outline", "get_reports_digest", "list_my_reports", "list_reports",
+               "list_related_reports", "list_comments", "get_composite", "list_composites")
+_OTHER_APP = {"describe_part": "heax-step_forge"}      # 리스크 심사와 무관한 앱의 읽기 도구 — 그대로 남아야 한다
+
+
+def test_apps_없는_리스크_심사의_좌석은_RA_보고서_읽기_도구를_받지_않는다(monkeypatch):
+    extra = {**{n: "reportarchive" for n in _RA_READERS}, **_OTHER_APP}
+    given = _seat_given(monkeypatch, "risk-review", "힌지 크랙이 각 도메인에서 어떤 리스크를 낳는가",
+                        json.dumps(_ra_hits(), ensure_ascii=False), apps=(), extra=extra)
+    assert not [n for n in _RA_READERS if n in given], sorted(given)
+    # 좁히지 않는다 — 앞 패널 판정에 닿는 이름만 뺀다(리스크 심사 유지 도구와 다른 앱의 읽기 도구는 그대로다).
+    assert "search_reports" in given and "describe_part" in given and "agent_search" in given, sorted(given)
+
+
+@pytest.mark.parametrize("chair", ("default", "diagnosis"))
+def test_리스크_심사가_아니면_RA_보고서_읽기_도구를_종전대로_받는다(monkeypatch, chair):
+    extra = {n: "reportarchive" for n in _RA_READERS}
+    given = _seat_given(monkeypatch, chair, "힌지 크랙 원인", json.dumps(_ra_hits(), ensure_ascii=False),
+                        apps=(), extra=extra)
+    assert all(n in given for n in _RA_READERS), sorted(given)

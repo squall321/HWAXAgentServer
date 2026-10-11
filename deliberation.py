@@ -959,6 +959,16 @@ _RISK_REGISTRY_TOOLS = ("risk_get_registry", "risk_claims_for_ref")
 # 리스크 심사에 지정 도구로 와도 등록부와 함께 부르지 않는다 — 등록부 둘만 거절하던 동안 이 둘을 지정하면 좌석이 앞 패널
 # 판정을 통째로 읽었다(D-18 — 여는 것은 변경 전체와 스냅샷뿐이다).
 _RISK_PRIOR_TOOLS = _RISK_REGISTRY_TOOLS + ("risk_list_panels", "risk_get_panel_transcript")
+# RA 보고서 읽기 도구 — 보고서 본문·제목·요약을 내준다(RA mcp_server/server.py 의 search·collab 묶음, 2026-10-11 대조 — RA 에
+# 이런 읽기 도구가 새로 생기면 여기에 더한다). 엔진은 패널마다 결정문이 든 RA 초안('심의 — …')을 잡 주인 이름으로 남기므로,
+# 리스크 심사 좌석이 이것으로 앞 패널 판정을 읽는다(D-18). 러너 패널은 apps(어댑터 앱)로 좁혀 RA 를 유지 도구(search_reports —
+# 같은 과제 거름으로 감싼다 · 온톨로지 셋)로만 보는데, apps 없이 손수 돈 리스크 심사(실사용 팀의 길 — HWAXPortal
+# docs/risk-review-redesign D-20·D-21)는 _narrow 가 걸리지 않아 접두사 화이트리스트로 이것들을 다 받았다. 리스크 심사에서는
+# 이름으로 뺀다. apps 가 없을 때 러너와 같은 범위로 좁히는 길도 있었지만 그쪽이 더 크다 — 리스크 심사와 상관없는 앱(StepForge·
+# KooRemapper …)의 읽기 도구까지 손수 심사에서 다 빠진다. 이름으로 빼면 앞 패널 판정에 닿는 길만 닫힌다. 러너 패널은 _narrow 가
+# 이미 이것들을 빼므로 바뀌는 것은 도구-앱 매핑을 못 받아 전체 범위로 도는 때뿐이다(m1 2차 AF2-D18-manual-path-reason).
+_RISK_RA_REPORT_TOOLS = ("get_report", "get_report_outline", "get_reports_digest", "list_my_reports", "list_reports",
+                         "list_related_reports", "list_comments", "get_composite", "list_composites")
 
 # 리스크 심사 유지 도구 — apps 밖 앱(RA·물성·열충격·VoC·문헌) 소속이라 앱 제한에서 잘려 나가는
 # 읽기 도구를 chair_template == 'risk-review' 일 때만 남긴다. 다른 심의 영향 0.
@@ -4477,7 +4487,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 조건부(_RISK_READ_TOOLS)·의장 조건부(_RISK_KEEP_TOOLS)로만 더 연다. 검문은 여기
             # 조립식이어야 한다 — 아래 _narrow 에만 넣으면 그 도구는 _g 에 애초에 없어 무효다.
             # _FREE_DENY 는 어느 경로보다 우선한다. 앱 지정도 risk-review 도 아니면 도구-앱
-            # 매핑을 조회하지 않으므로 기존 심의의 동작·호출 수가 그대로다.
+            # 매핑을 조회하지 않으므로 기존 심의의 동작·호출 수가 그대로다. 리스크 심사는 RA 보고서
+            # 읽기 도구(_RISK_RA_REPORT_TOOLS)를 apps 와 상관없이 뺀다(D-18 — 앞 패널 초안).
             _risk_chair = opts.chair_template == "risk-review"
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
@@ -4485,7 +4496,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _g = {n: _wrap_cached(t, _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat)).items()
-                  if n.lower() not in _FREE_DENY and (
+                  if n.lower() not in _FREE_DENY
+                  and not (_risk_chair and n in _RISK_RA_REPORT_TOOLS) and (
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
