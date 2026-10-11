@@ -84,6 +84,25 @@ Nothing is cut on this value. It matters to the outer idle limits only when the 
 | `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. A value that is not a plain number (trailing comment or space, a unit) is read as the default, with a warning. |
 | `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. A value that is not a plain number is read as the default, with a warning — it no longer turns the guard off. |
 
+### MCP result pages
+
+Claude Code takes an MCP tool result only up to `MAX_MCP_OUTPUT_TOKENS` (default 25,000 tokens); past it
+the client saves the result to a file instead of showing it. A wide-window transcript batch, decision or
+job list is far larger, so `deliberate_transcript`, `deliberate_result`, `deliberate_status` and
+`deliberate_list` split a large response into pages (`page.part` / `page.next` / `page.pieces`,
+`mcp_pages.py`) and never cut it. `deliberate_start` / `deliberate_continue` echo only the head of a long
+question (`question_chars`, full text via `deliberate_status`). Pages are re-cut on every call, so a page
+that does not join the previous one (`from` off) means the job changed in between — fetch again from part 1.
+
+| var | default | meaning |
+|---|---|---|
+| `DELIB_MCP_PAGE_CHARS` | `25000` | Page size in characters (1 char ≈ 1 token against the client limit). Lower it together with a lower `MAX_MCP_OUTPUT_TOKENS` on the client. Floor 4000. |
+
+`deliberate_list` and the restart sweep read a small per-job list index (`<DELIB_JOB_DIR>/list/<id>.json`,
+written next to every ledger write) instead of the full ledger, which grows to MBs in a wide window. The
+index carries the ledger's mtime and size; a stale or missing index is rebuilt from the ledger on the next
+read, so the `list/` folder is derived data and may be deleted.
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the
