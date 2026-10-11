@@ -553,6 +553,7 @@ async def deliberate_continue(
 
 
 # 진행 조회·결과 회수가 쪽마다 되풀이하는 칸, 쪽을 나눌 때 맨 뒤로 보내는 칸 — 화두가 크면 첫 쪽에 상태 칸이 다 실리게 한다.
+# 화두는 새 쪽에서 시작한다(tail_page) — 시작·이어하기가 화두 전문을 받으라고 보내는 곳이 도는 심의의 진행 조회다.
 _JOB_IDS = ("job_id", "status")
 _JOB_TAIL = ("question",)
 
@@ -580,7 +581,7 @@ async def deliberate_status(job_id: str, part: int = 1) -> dict:
     if "idle_s" in out:
         # idle_s 를 무엇과 견줄지 — 좌석 발언 하나가 조용할 수 있는 최장 시간(무제한이면 None).
         out["quiet_ok_s"] = _quiet_ok_s(job)
-    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, again={"job_id": job_id})
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
 
 
 @mcp.tool(title="심의 결과(결정 문서) 회수",
@@ -597,7 +598,7 @@ async def deliberate_result(job_id: str, part: int = 1) -> dict:
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
     elif out.get("queue"):
         out["note"] = "아직 시작 전이다 — " + _queued_note(out["queue"])
-    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, again={"job_id": job_id})
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
 
 
 @mcp.tool(title="심의 목록",

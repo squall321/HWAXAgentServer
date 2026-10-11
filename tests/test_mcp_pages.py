@@ -220,11 +220,11 @@ def _rand_value(rng, depth: int = 0):
     return {f"k{i}_{rng.randint(0, 9)}": _rand_value(rng, depth + 1) for i in range(rng.randint(1, 6))}
 
 
-def _all_pages(out, ids, again, tail=()):
-    first = mcp_pages.paged(out, part=1, again=again, ids=ids, tail=tail)
+def _all_pages(out, ids, again, tail=(), tail_page=False):
+    first = mcp_pages.paged(out, part=1, again=again, ids=ids, tail=tail, tail_page=tail_page)
     if "page" not in first:
         return [first]
-    pages = [first] + [mcp_pages.paged(out, part=k, again=again, ids=ids, tail=tail)
+    pages = [first] + [mcp_pages.paged(out, part=k, again=again, ids=ids, tail=tail, tail_page=tail_page)
                        for k in range(2, first["page"]["parts"] + 1)]
     for k, p in enumerate(pages, 1):
         assert p["page"]["part"] == k and p["page"]["next"] == ({**again, "part": k + 1} if k < len(pages) else None)
@@ -239,14 +239,21 @@ def test_아무_모양의_응답도_쪽마다_상한_안이고_이으면_원래_
     out = {"job_id": f"j-{seed}", "status": rng.choice(("running", "done", "interrupted")),
            **{f"f{i}": _rand_value(rng) for i in range(rng.randint(1, 9))}}
     ids = ("job_id", "status")
-    pages = _all_pages(out, ids, {"job_id": out["job_id"]})
+    # 뒤로 보낼 칸 하나 — 절반은 새 쪽에서 시작한다(진행 조회·결과의 화두처럼).
+    tail = (rng.choice([k for k in out if k not in ids]),)
+    tail_page = rng.random() < 0.5
+    pages = _all_pages(out, ids, {"job_id": out["job_id"]}, tail, tail_page)
     for p in pages:
         assert len(mcp_pages.wire(p)) <= budget, (seed, len(mcp_pages.wire(p)), budget)
         assert all(p[k] == out[k] for k in ids), "되풀이 칸이 쪽마다 있어야 한다"
     got = _reassemble([(mcp_pages.wire(p), p) for p in pages]) if len(pages) > 1 else pages[0]
     assert got == out, f"seed {seed}: 쪽을 이은 응답이 원래 응답과 다르다"
+    if tail_page and len(pages) > 1 and len(out) > len(ids) + 1:
+        # 새 쪽에서 시작한 칸은 앞 칸과 한 쪽에 같이 실리지 않는다.
+        starts = [k for k, p in enumerate(pages) if tail[0] in p]
+        assert all(set(pages[k]) - set(ids) - {"page"} == {tail[0]} for k in starts), f"seed {seed}: 뒤로 보낸 칸이 앞 칸과 섞였다"
     # 결정적이다 — 같은 내용이면 몇 번을 불러도 같은 쪽이다(쪽 번호가 곧 위치다).
-    assert pages == _all_pages(out, ids, {"job_id": out["job_id"]})
+    assert pages == _all_pages(out, ids, {"job_id": out["job_id"]}, tail, tail_page)
 
 
 @pytest.mark.parametrize("seed", range(40))
@@ -385,3 +392,76 @@ def test_시작과_이어하기의_응답은_화두가_커도_상한_안이고_�
         assert "deliberate_status" in res["note"], res["note"]
         whole = _reassemble(_follow("deliberate_status", {"job_id": res["job_id"]}))
         assert whole["question"] == q, "진행 조회로 화두 전문을 받지 못했다"
+
+
+# ── 도는 심의의 쪽 — 쪽을 받는 사이에 상태 칸이 바뀌어도 뒤로 보낸 화두의 쪽 경계는 그대로다 ──────────────────────────
+def _text(r) -> str:
+    return "".join(b.text for b in (r if isinstance(r, list) else r[0]))
+
+
+@pytest.mark.parametrize("finish_after", [None, 2])
+def test_도는_심의의_진행_조회를_쪽으로_따라가도_화두_전문이_원문_그대로다(monkeypatch, tmp_path, finish_after):
+    """시작 응답은 긴 화두를 머리만 보이고 전문은 deliberate_status 로 받으라고 한다 — 그때 심의는 돌고 있다. 쪽을 하나 받을
+    때마다 엔진이 한 걸음 나아가 상태 칸(상태·단계·마지막 일·좌석·경과)이 바뀐다. 쪽마다 처음부터 다시 나누므로, 화두 앞의 칸
+    길이가 바뀌면 화두를 자르는 자리가 밀려 이은 화두에 글이 겹치거나 빠졌다(쪽 안내는 '잘라 버린 것은 없다' 고 말한다).
+    finish_after — 그 쪽을 받은 뒤 심의가 끝난다: 쪽마다 되풀이하는 상태 이름이 running 에서 done 으로 짧아진다."""
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(m, "_APP", object())
+    q = "[리스크심사 P1 T1] " + _para("변경 요지", 60_000)
+    # 엔진이 실제로 내는 이벤트 — 좌석 발굴·좌석 목록·라운드 전환·좌석 발언(delib_jobs._apply 가 상태 칸으로 옮긴다).
+    progress = [d._sse("status", {"step": "좌석 발굴"}),
+                d._sse("delib", {"kind": "personas", "totalRounds": 3,
+                                 "personas": [{"key": f"dom{i:02d}-structure-seat", "role": "역할"} for i in range(12)]}),
+                d._sse("delib", {"kind": "stage", "stage": "r1"}),
+                d._sse("status", {"step": "1라운드 — 좌석 12명이 관점과 권장을 낸다(근거 해석 포함)"}),
+                d._sse("delib", {"kind": "turn", "persona": "dom00-structure-seat", "round": 1, "say": "관점"}),
+                d._sse("delib", {"kind": "stage", "stage": "r2"})]
+    gate: dict = {}
+
+    async def engine(_app, _q, _groups, _opts, _user, _pat, _x):
+        for ev in progress:
+            if not gate["end"].is_set():          # 쪽을 다 받았으면 남은 걸음은 기다리지 않는다
+                await gate["step"].wait()
+                gate["step"].clear()
+            yield ev
+        await gate["end"].wait()
+        yield d._sse("delib", {"kind": "decision", "text": "결정: 진행한다"})
+        yield d._sse("done", {})
+
+    monkeypatch.setattr(d, "run_deliberation", engine)
+
+    async def go():
+        gate["step"], gate["end"] = asyncio.Event(), asyncio.Event()
+        jid = json.loads(_text(await m.mcp.call_tool("deliberate_start", {"question": q})))["job_id"]
+        pages, call = [], {"job_id": jid}
+        for _ in range(40):
+            text = _text(await m.mcp.call_tool("deliberate_status", call))
+            res = json.loads(text)
+            pages.append((text, res))
+            if len(pages) == finish_after:      # 다음 쪽을 받기 전에 심의가 끝난다
+                gate["end"].set()
+                gate["step"].set()
+                await asyncio.wait(list(delib_jobs._TASKS.values()))
+            gate["step"].set()            # 다음 쪽을 받기 전에 심의가 한 걸음 나아간다
+            await asyncio.sleep(0.01)
+            call = (res.get("page") or {}).get("next")
+            if not call:
+                break
+        gate["end"].set()
+        gate["step"].set()
+        if delib_jobs._TASKS:
+            await asyncio.wait(list(delib_jobs._TASKS.values()))
+        return pages
+
+    pages = asyncio.run(go())
+    states = [r["status"] for _t, r in pages]
+    assert len(pages) >= 3, "시험 전제 — 여러 쪽을 받는다"
+    assert states == ["running"] * len(pages) if finish_after is None else (
+        states[:finish_after] == ["running"] * finish_after and states[-1] == "done"), states
+    assert max(len(t) for t, _r in pages) <= CLAUDE_MCP_RESULT_CHARS
+    cuts = [(p["from"], p["to"]) for _t, r in pages for p in r["page"]["pieces"] if p["path"] == "question"]
+    assert all(a[1] == b[0] for a, b in zip(cuts, cuts[1:])), f"화두 조각이 이어지지 않는다(겹침·빠짐): {cuts}"
+    assert _reassemble(pages)["question"] == q

@@ -12,7 +12,9 @@
 나누고, 일부만 실린 칸은 그 쪽의 page.pieces 에 적는다(path · from · to · of). 다음 쪽은 page.next 의 인자로 같은 도구를 부른다.
 쪽은 부를 때마다 처음부터 같은 규칙으로 다시 나눈다 — 끝난 심의는 내용이 바뀌지 않으므로 쪽 번호가 곧 위치다. 쪽 경계는 쪽마다
 되풀이하는 숫자 칸(ids)과 쪽 안내(page)의 실제 값이 아니라 그 상한으로 잡는다 — 뒤에만 붙는 응답(도는 심의의 전사)은 앞 쪽들의
-경계가 바뀌지 않는다.
+경계가 바뀌지 않는다. 도는 심의의 진행 조회·결과는 바뀌지 않는 화두를 새 쪽에서 시작해(tail_page), 쪽을 받는 사이에 앞 칸이
+바뀌어도 화두 조각이 어긋나지 않는다. 그래도 남는 어긋남(도는 잡의 행이 바뀌는 목록, 여러 쪽에 걸친 머리)은 쪽 안내가 시키는
+이음 확인(from 이 앞 쪽까지 받은 것과 맞는가)으로 받는 쪽이 알아채고 1쪽부터 다시 받는다.
 """
 from __future__ import annotations
 
@@ -35,10 +37,12 @@ if PAGE_CHARS < PAGE_FLOOR:
     PAGE_CHARS = PAGE_FLOOR
 
 # 쪽마다 되풀이하는 숫자·null 칸(ids)의 자리 — 쪽 경계를 실제 값이 아니라 9자리로 잡는다. 도는 전사의 total·next_offset 이
-# 늘어 자릿수가 바뀌어도 앞 쪽들의 경계가 그대로이게 한다. 글 칸은 실제 값으로 잡는다 — 되풀이하는 글 칸은 잡 id 처럼 쪽을
-# 받는 동안 바뀌지 않는 것만 둔다(글과 null 을 오가는 전사의 note 는 ids 에 넣지 않고 tail 로 맨 뒤에 둔다).
+# 늘어 자릿수가 바뀌어도 앞 쪽들의 경계가 그대로이게 한다. 글 칸은 실제 값으로 잡되 _STR 자보다 짧으면 _STR 자로 잡는다 —
+# 상태 이름(queued·running·done·interrupted …)은 쪽을 받는 사이에 바뀐다(긴 글 칸은 잡 id 처럼 바뀌지 않는 것만 둔다 — 글과
+# null 을 오가는 전사의 note 는 ids 에 넣지 않고 tail 로 맨 뒤에 둔다).
 _NUM = 999_999_999
 _PART = 99_999
+_STR = 16
 # 쪽에 이미 실린 것이 있으면 이보다 짧은 글 조각으로 쪽을 끝내지 않는다(다음 쪽에 통째로 넘긴다).
 _MIN_SLICE = 200
 
@@ -116,9 +120,11 @@ class _Layout:
 
 
 def _placeholder(v):
-    """되풀이 칸의 자리값 — 숫자·null 은 9자리(실제 값 이상의 길이), 그 밖은 실제 값 그대로."""
+    """되풀이 칸의 자리값 — 숫자·null 은 9자리(실제 값 이상의 길이), 짧은 글은 _STR 자, 그 밖은 실제 값 그대로."""
     if v is None or isinstance(v, (bool, int, float)):
         return _NUM
+    if isinstance(v, str) and len(v) < _STR:
+        return v.ljust(_STR)
     return v
 
 
@@ -132,12 +138,17 @@ def _note(part: int, parts: int, ids: tuple) -> str:
             "인자로 같은 도구를 다시 부른다(next 가 null 이면 마지막 쪽이다). pieces 는 이 쪽에 일부만 실린 칸이다 — 글은 from~to 자"
             "(of 는 전체 길이), 목록은 from~to 번 항목이다. 쪽 순서대로 이으면 원래 응답이 된다 — 글은 이어 쓰고, 목록 항목은 그 번호 "
             "자리에 넣되 앞 쪽과 번호가 겹치는 항목은 한 항목을 나눠 실은 것이니 합친다." + rep + " 심의가 도는 중이면 내용이 늘어 "
-            "쪽 수가 바뀔 수 있다 — 끝난 뒤 받은 쪽이 확정본이다. 쪽 크기는 Claude Code 의 MCP 결과 상한(MAX_MCP_OUTPUT_TOKENS "
+            "쪽 수가 바뀔 수 있다 — 끝난 뒤 받은 쪽이 확정본이다. 이을 때 글 조각의 from 은 앞 쪽까지 받은 그 칸의 길이와, 목록의 "
+            "from 은 앞 쪽 그 목록의 to 나 to-1 과 같아야 한다 — 다르면 쪽을 받는 사이에 내용이 바뀐 것이니(도는 심의) 1쪽부터 다시 "
+            "받는다. 쪽 크기는 Claude Code 의 MCP 결과 상한(MAX_MCP_OUTPUT_TOKENS "
             "기본 25,000토큰)을 1자≈1토큰으로 잡은 값이다(설정 DELIB_MCP_PAGE_CHARS).")
 
 
-def _cut(leaves: list, lists: dict, ids_ph: dict, again: dict, ids: tuple, budget: int) -> list:
-    """쪽 경계를 끝까지 센다 — 쪽마다 [(잎 번호, 글 시작, 글 끝)] (글이 아닌 잎은 시작·끝이 None)."""
+def _cut(leaves: list, lists: dict, ids_ph: dict, again: dict, ids: tuple, budget: int,
+         fresh_at: int | None = None) -> list:
+    """쪽 경계를 끝까지 센다 — 쪽마다 [(잎 번호, 글 시작, 글 끝)] (글이 아닌 잎은 시작·끝이 None).
+
+    fresh_at — 이 번호의 잎은 새 쪽에서 시작한다(앞 칸의 길이가 바뀌어도 그 뒤 쪽들의 경계가 그대로이게)."""
     env_cache: dict = {}
 
     def envelope(paths: tuple) -> int:
@@ -170,6 +181,8 @@ def _cut(leaves: list, lists: dict, ids_ph: dict, again: dict, ids: tuple, budge
         lay, taken = _Layout(), []
         first, first_cont = leaves[i][0], off > 0
         while i < len(leaves):
+            if i == fresh_at and taken:
+                break
             at, v = leaves[i]
             is_str = isinstance(v, str)
             room = budget - bound(first, first_cont, at, is_str) - lay.size     # 이 잎이 쓸 수 있는 자리
@@ -302,12 +315,14 @@ def echo_head(out: dict, key: str, where: str) -> dict:
     return {**base, key: full[:n], "note": with_note(n)}
 
 
-def paged(out: dict, *, part: int = 1, again: dict, ids: tuple = (), tail: tuple = ()) -> dict:
+def paged(out: dict, *, part: int = 1, again: dict, ids: tuple = (), tail: tuple = (), tail_page: bool = False) -> dict:
     """out 이 쪽 크기(PAGE_CHARS) 안이면 그대로 돌려준다(part 1). 넘으면 part 번째 쪽이다.
 
     again — 다음 쪽을 부를 인자(page.next 는 여기에 part 만 바꿔 싣는다). ids — 쪽마다 되풀이하는 칸(작은 것만 — 잡 id 처럼
     어느 쪽을 받든 있어야 하는 것). tail — 쪽을 나눌 때 뒤로 보내는 칸(크고 덜 급한 것 — 진행 조회의 화두처럼, 첫 쪽에 상태가
-    다 실리게 한다)."""
+    다 실리게 한다). tail_page — tail 을 새 쪽에서 시작한다. 도는 심의는 쪽을 받는 사이에 앞 칸(단계·마지막 일·좌석·경과)의
+    길이가 바뀐다 — 쪽은 부를 때마다 처음부터 다시 나누므로, tail 이 앞 칸 뒤에 이어 실리면 tail 을 자르는 자리가 밀려 이은 글이
+    겹치거나 빠졌다. 바뀌지 않는 tail(화두)을 새 쪽에서 시작하면 그 쪽들의 경계는 tail 자신과 쪽 안내로만 정해진다."""
     try:
         part = int(part or 1)
     except (TypeError, ValueError):
@@ -322,7 +337,8 @@ def paged(out: dict, *, part: int = 1, again: dict, ids: tuple = (), tail: tuple
     order = [k for k in out if k not in idv and k not in tail] + [k for k in tail if k in out and k not in idv]
     body = {k: out[k] for k in order}
     leaves, lists = _flatten(body)
-    specs = _cut(leaves, lists, {k: _placeholder(v) for k, v in idv.items()}, again, tuple(idv), PAGE_CHARS)
+    fresh_at = next((n for n, (at, _v) in enumerate(leaves) if at[0] in tail), None) if tail_page else None
+    specs = _cut(leaves, lists, {k: _placeholder(v) for k, v in idv.items()}, again, tuple(idv), PAGE_CHARS, fresh_at)
     parts = len(specs)
     if part > parts:
         raise ValueError(f"part={part} 는 없다 — 이 응답은 {parts}쪽이다(1~{parts}).")
