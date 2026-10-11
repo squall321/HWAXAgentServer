@@ -999,10 +999,31 @@ def _ra_report_title(question: str) -> str:
     return f"심의 — {question[:50]}"
 
 
-# 리스크 앱 runner.panel_question 의 질문 머리 — 과제 코드(group 1)와 target_key. 글자를 바꾸려면 그 리포와 같이 바꾼다.
-_RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 (\S+) \S+\]")
+# 리스크 앱 runner.panel_question 의 질문 머리 — 과제 코드(group 1)와 target_key(group 2). 글자를 바꾸려면 그 리포와 같이 바꾼다.
+# 마지막 토막이 target_key 다('<kind>:<ref_id>' — 공백이 없다). 과제 코드는 자유 형식이라(HWAXRisk ProjectBody 의 code 는
+# 40자 상한뿐이고 형식 검사가 없다) 공백·한글이 든다 — 종전 식 (\S+) \S+ 는 'S26 Ultra' 같은 코드의 머리를 읽지 못해 거름이
+# 알림 없이 꺼졌다(m1 2차 AF2-D18-code-space). 코드에는 ']' 가 없다고 둔다 — 머리 뒤 본문의 대괄호까지 코드로 삼키지 않게.
+_RISK_Q_MARK = "[리스크심사"
+_RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 ([^\]]+) ([^\s\]]+)\]")
 _RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서 {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 "
                         "읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+
+
+def _risk_q_code(question: str) -> str | None:
+    """리스크 앱 러너 질문 머리의 과제 코드 — 머리가 없거나 읽지 못하면 None."""
+    m = _RISK_Q_HEAD_RE.search(question or "")
+    return m.group(1) if m else None
+
+
+def _risk_head_unread(question: str) -> str:
+    """질문에 리스크 심사 머리('[리스크심사')가 보이는데 과제 코드를 읽지 못했으면 그 머리 부분(알림에 그대로 싣는다), 아니면
+    빈 글. 읽지 못하면 같은 과제를 가릴 수 없어 앞 패널 보고서 거름이 꺼진다 — 조용히 넘기지 않고 알리는 데 쓴다."""
+    q = question or ""
+    i = q.find(_RISK_Q_MARK)
+    if i < 0 or _risk_q_code(q) is not None:
+        return ""
+    j = q.find("]", i, i + 80)
+    return q[i:j + 1] if j >= 0 else q[i:i + 60] + "…"
 
 
 def _risk_hide_prior_panels(tool, question: str):
@@ -1012,15 +1033,15 @@ def _risk_hide_prior_panels(tool, question: str):
     엔진은 패널마다 결정문이 든 RA 초안을 남기고(러너가 save_report 를 보내지 않는다 — 리스크 앱이 그 번호를 패널에 적는다),
     RA 는 소유한 초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다. 그래서 같은 잡 자격으로 도는 다음 패널 좌석이
     '힌지 리스크' 만 찾아도 앞 패널의 판정이 걸렸다(engine-contract A-D18-ra-reports). 같은 과제는 질문 머리의 과제 코드로
-    가린다 — 머리가 없는 자유 질문이면 가릴 수 없어 감싸지 않는다. 다른 과제의 보고서는 선례라 남긴다.
+    가린다 — 머리가 없는 자유 질문이면 가릴 수 없어 감싸지 않는다(머리가 보이는데 못 읽었으면 심의가 경고와 카드로 알린다 —
+    _risk_head_unread). 다른 과제의 보고서는 선례라 남긴다.
 
     응답은 풀어서(json) 제목으로 가린다 — 글자열로만 대조하면 한글이 \\uXXXX 로 온 응답에서 샌다. 풀지 못한 응답에 그 과제의
     머리가 보이면 결과를 통째로 주지 않는다(행을 가려낼 수 없다)."""
-    m = _RISK_Q_HEAD_RE.search(question or "")
+    code = _risk_q_code(question)
     orig = getattr(tool, "coroutine", None)
-    if not m or orig is None:
+    if code is None or orig is None:
         return tool
-    code = m.group(1)
     mark = f"[리스크심사 {code} "
 
     def _hide(text):
@@ -4417,6 +4438,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
     if opts.chair_template == "risk-review" and tools.get("search_reports") is not None:
         _risk_hide_prior_panels(tools.get("search_reports"), question)
+    # 질문에 리스크 심사 머리가 보이는데 읽지 못했으면 위 거름(과 자유 조회의 거름)이 꺼진 채 돈다 — 조용히 넘기지 않는다.
+    # 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱 러너가 패널에 옮겨 적는다(m1 2차 AF2-D18-code-space).
+    _unread = _risk_head_unread(question) if opts.chair_template == "risk-review" else ""
+    if _unread:
+        yield _sse("warning", {"code": "risk_head_unread",
+                               "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해, 같은 과제의 앞 패널 "
+                                          "심의 보고서를 좌석의 보고서 검색에서 빼지 못합니다(D-18). 머리 꼴은 "
+                                          "'[리스크심사 <과제코드> <target_key>]' 입니다."})
+        yield _delib("evidence", source="앞 패널 보고서 거름 꺼짐", included=False, notice=True,
+                     text=f"질문 머리 {_unread} 에서 과제 코드와 target_key 를 읽지 못했다(머리 꼴은 '[리스크심사 <과제코드> "
+                          "<target_key>]'). 그래서 같은 과제의 앞 패널 심의 보고서를 보고서 검색(좌석 자유 조회·지정 도구·정량 "
+                          "근거 선주입)에서 빼지 못했다 — 좌석이 앞 패널 판정을 읽었을 수 있다(D-18).")
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
     # 결정문 헤더(_evidence_note)에도 남지만, 심의가 도는 동안 보는 사람이 먼저 알아야 한다.

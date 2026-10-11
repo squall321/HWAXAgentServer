@@ -9,6 +9,7 @@
 #     초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다). engine-contract A-D18-ra-reports.
 # (3) 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입) — 결과가 전 좌석 프롬프트에 실린다.
 # (4) 앞 패널 기록 도구(패널 목록 · 패널 전사)를 리스크 심사에 지정한 길.
+# (5) 공백·한글이 든 과제 코드 — 질문 머리를 읽지 못하면 (2)·(3) 의 거름이 알림 없이 꺼졌다. 못 읽으면 알린다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -265,3 +266,80 @@ def test_리스크_심사는_지정한_앞_패널_기록_도구를_부르지_않
 def test_리스크_심사가_아니면_앞_패널_기록_도구를_그대로_부른다(monkeypatch):
     _events, tools = _run_prior(monkeypatch, "default")
     assert all(tools[n].calls for n in _PRIOR), {n: tools[n].calls for n in _PRIOR}
+
+
+# ── (5) 과제 코드는 자유 형식이다 — 공백·한글이 든 코드에서도 같은 과제의 앞 패널 보고서를 뺀다 ──────────────────────────
+# 리스크 앱은 과제 코드에 형식 검사를 하지 않는다(HWAXRisk routes.ProjectBody — code: str, max_length=40 · 화면은 trim 만).
+# 러너 질문 머리는 '[리스크심사 <과제코드> <target_key>]' 이고 target_key 는 '<kind>:<ref_id>' 라 공백이 없다. 종전 머리 식
+# r"\[리스크심사 (\S+) \S+\]" 은 'S26 Ultra' 같은 코드의 머리를 읽지 못해, 거름이 카드도 경고도 없이 꺼졌다 — 다음 패널
+# 좌석의 보고서 검색에 앞 패널 결정문이 든 초안이 그대로 실렸다(m1 2차 AF2-D18-code-space).
+def _hits_for(code):
+    prev = f"[리스크심사 {code} snap:old] 현황이 각 도메인에서 어떤 리스크와 개선을 낳는가를 도구 근거로 판정하라."
+    return {"reports": [
+        {"report_id": 7, "title": d._ra_report_title(prev), "snippet": "힌지 FAIL — 판정 근거 …", "boards": []},
+        {"report_id": 8, "title": d._ra_report_title(_Q_OTHER), "snippet": "다른 과제의 판정", "boards": []},
+        {"report_id": 9, "title": "힌지 낙하 시험 보고서", "snippet": "1.5m 낙하 …", "boards": []},
+    ], "count": 3, "limit": 8}
+
+
+@pytest.mark.parametrize("code", ("S26 Ultra", "힌지 개선 2차"))
+def test_공백_한글이_든_과제_코드도_같은_과제의_앞_패널_보고서를_뺀다(monkeypatch, code):
+    q = f"[리스크심사 {code} diff:new] 기준 P0 대비 변경이 각 도메인에서 어떤 리스크와 개선을 낳는가를 도구 근거로 판정하라."
+    got = _search(_seat_pool(monkeypatch, "risk-review", q, json.dumps(_hits_for(code), ensure_ascii=False)))
+    assert [r["report_id"] for r in got["reports"]] == [8, 9], got
+    assert "1건" in got.get("withheld", "") and code in got["withheld"], got
+
+
+@pytest.mark.parametrize("code", ("S26 Ultra", "힌지 개선 2차", "P1", "-"))
+def test_질문_머리는_마지막_토막을_target_key_로_읽는다(code):
+    assert d._risk_q_code(f"[리스크심사 {code} diff:3f2a] 기준 대비 변경이 …") == code
+
+
+def _events_for(monkeypatch, question, chair="risk-review"):
+    """심의를 좌석 발굴 문턱까지 돌려 이벤트를 받는다(도구는 agent_search 하나 — 거름이 걸릴 자리와 상관없이 알림을 본다)."""
+    async def _fake_tools(*_a, **_k):
+        return {"agent_search": _Tool("agent_search")}
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    opts = {"personas": [{"key": "mech-a", "role": "기구"}], "chair_template": chair, "free_tools": 0,
+            "voc": "off", "rescreen": 0, "persona_knowledge": 0}
+
+    async def go():
+        out = []
+        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), question, [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                assert ev != "error", data
+                out.append((ev, data))
+                if _after_tools(ev, data):
+                    break
+        finally:
+            await gen.aclose()
+        return out
+
+    return asyncio.run(go())
+
+
+def _head_notices(events):
+    warn = [data for ev, data in events if ev == "warning" and data.get("code") == "risk_head_unread"]
+    cards = [c for c in _cards(events, included=False) if c.get("source") == "앞 패널 보고서 거름 꺼짐"]
+    return warn, cards
+
+
+def test_리스크심사_머리를_읽지_못하면_조용히_넘기지_않고_알린다(monkeypatch):
+    """질문에 '[리스크심사' 가 있는데 과제 코드를 못 읽으면 같은 과제를 가릴 수 없다 — 거름이 꺼진 채 도는 것을 경고와 카드로
+    남긴다(카드는 좌석에 주지 않은 것이라 러너가 패널에 옮겨 적는다)."""
+    warn, cards = _head_notices(_events_for(monkeypatch, "[리스크심사 S26U] 힌지 크랙이 각 도메인에서 어떤 리스크를 낳는가"))
+    assert len(warn) == 1 and len(cards) == 1, (warn, cards)
+    assert "D-18" in cards[0]["text"] and "[리스크심사 S26U]" in cards[0]["text"], cards[0]
+
+
+@pytest.mark.parametrize("chair,question", [
+    ("risk-review", "[리스크심사 S26 Ultra diff:new] 기준 대비 변경이 …"),     # 읽힌다
+    ("risk-review", "힌지 크랙 원인"),                                       # 머리가 없는 손수 질문 — 알릴 머리가 없다
+    ("default", "[리스크심사 S26U] 힌지 크랙"),                               # 리스크 심사가 아니다
+])
+def test_머리를_읽었거나_머리가_없거나_리스크_심사가_아니면_알리지_않는다(monkeypatch, chair, question):
+    warn, cards = _head_notices(_events_for(monkeypatch, question, chair))
+    assert not warn and not cards, (warn, cards)
