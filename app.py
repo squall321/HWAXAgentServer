@@ -43,6 +43,8 @@ from datetime import timedelta
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from langchain_core.callbacks.manager import adispatch_custom_event
+from langchain_core.messages import ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
@@ -1931,7 +1933,8 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         if not load_failed:
             # 성공했으면 이 그룹셋의 과거 오류를 지운다(다른 그룹셋 상태는 건드리지 않는다).
             app.state.tool_load_error.pop(frozenset(groups), None)
-        agent = create_react_agent(app.state.llm, tools)
+        # 모델 호출마다 쌓인 메시지를 재어 창을 넘으면 오래된 도구 결과부터 줄인다(_loop_fit_hook — 넓은 창).
+        agent = create_react_agent(app.state.llm, tools, pre_model_hook=_loop_fit_hook)
         # 실제로 묶인 도구 이름을 달아 둔다. 호출부가 "N종 우선 바인딩" 같은 말을 하려면
         # **묶인 것**을 알아야 하는데, prefer 는 그룹 필터 없는 /tools-map(465종)에서 뽑은
         # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
@@ -1980,6 +1983,74 @@ def _loop_room_tokens() -> int:
     if not _wide() or TOOL_RESULT_MAX <= 0:
         return 0
     return min(int(TOOL_RESULT_MAX / 1.05) + 1, max(0, _model_context_tokens() - DOC_RESERVE_TOKENS) // 2)
+
+
+# 챗 ReAct 루프의 모델 호출 전 훅 — 한 턴에 큰 도구 결과를 여럿 받아도 창을 넘기지 않는다. 위 몫(_loop_room_tokens)은 결과 **한 건**
+# 분이라, 이력이 찬 긴 대화에서 큰 조회를 두 번 하거나(TOOL_RESULT_MAX 200,000자 둘) 12만 자급을 세 번 하면 루프 안에서 창을 넘어
+# 400 으로 턴이 통째로 실패했고, 자동 재시도 둘도 같은 이력으로 같은 400 이었다(m1 2차 AF1-loop-room-single). 운영 창은
+# 1,048,576 토큰이고 지침은 '자르지 않는다' 라 평소엔 아무것도 건드리지 않는다 — 쌓인 메시지의 추정 토큰이 창 − 예비분
+# (DOC_RESERVE_TOKENS — 도구 스키마·출력 몫)을 넘을 때만 **오래된 도구 결과부터** 원문 길이 표식을 달고 넘는 만큼 줄인다.
+# 대화 상태는 그대로 두고 모델에 가는 글(llm_input_messages)만 바꾸므로, 호출마다 원문에서 다시 잰다. 줄였으면 사건
+# (hwax_loop_fit)을 내고 챗 스트림이 경고(loop_results_cut)로 바꾼다. 좁은 창은 종전대로 손대지 않는다 — 작은 박스는
+# .env 로 TOOL_RESULT_MAX 를 낮추고(_loop_room_tokens 와 같은 약속), 예비분이 창보다 큰 박스(dev 16K)는 이 문턱이 음수다.
+_LOOP_FIT_EVENT = "hwax_loop_fit"
+_LOOP_FIT_FLOOR = 1000      # 줄여도 남기는 도구 결과의 앞부분(자) — 무엇을 조회했는지는 보이게
+
+
+def _msg_tokens(m) -> int:
+    """메시지 하나의 추정 토큰 — 본문(글 전체로 잰다)과 도구 호출 인자."""
+    c = getattr(m, "content", "")
+    text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False, default=str)
+    calls = getattr(m, "tool_calls", None)
+    return _est_tokens_all(text) + (_est_tokens_all(json.dumps(calls, ensure_ascii=False, default=str)) if calls else 0)
+
+
+def _fit_loop_messages(msgs: list) -> tuple[list, dict | None]:
+    """루프가 모델에 보낼 메시지 — 창 − 예비분을 넘으면 오래된 도구 결과부터 넘는 만큼 줄인 사본과 {n(줄인 건수), chars(그
+    결과들의 원문 합), before·after(추정 토큰), limit}, 넘지 않으면 (받은 그대로, None)."""
+    if not _wide():
+        return msgs, None
+    limit = _model_context_tokens() - DOC_RESERVE_TOKENS
+    toks = [_msg_tokens(m) for m in msgs]
+    before = sum(toks)
+    excess = before - limit
+    if limit <= 0 or excess <= 0:
+        return msgs, None
+    out, n, chars = list(msgs), 0, 0
+    for i, m in enumerate(msgs):
+        if excess <= 0:
+            break
+        if not isinstance(m, ToolMessage) or not isinstance(m.content, str) or len(m.content) <= _LOOP_FIT_FLOOR:
+            continue
+        text, target = m.content, max(1, toks[i] - excess)
+
+        def build(c, text=text):
+            if c >= len(text):
+                return text
+            return (text[:c].rstrip() + f"\n…[창이 차서 이 도구 결과 {len(text):,}자 중 앞 {c:,}자만 실었다 — 뒷부분이 "
+                    "필요하면 조건을 좁혀 다시 조회하라]")
+
+        body = _fit_tokens(build, max(_LOOP_FIT_FLOOR, _chars_for_tokens(text, target)), target, _LOOP_FIT_FLOOR)[0]
+        t = _est_tokens_all(body)
+        if t >= toks[i]:
+            continue
+        out[i] = m.model_copy(update={"content": body})
+        excess -= toks[i] - t
+        n, chars = n + 1, chars + len(text)
+    if not n:
+        return msgs, None
+    return out, {"n": n, "chars": chars, "before": before, "after": limit + excess, "limit": limit}
+
+
+async def _loop_fit_hook(state, config):
+    """create_react_agent 의 pre_model_hook — _fit_loop_messages 를 모델 입력에만 건다. 줄였으면 사건을 낸다(챗이 경고로 바꾼다).
+    config 를 넘긴다 — 파이썬 3.10 은 비동기 사건에 실행 맥락이 저절로 따라가지 않는다."""
+    fitted, info = _fit_loop_messages(state["messages"])
+    if info:
+        print(f"[agent] 루프 메시지 {info['before']:,}토큰이 창 몫 {info['limit']:,}토큰을 넘어 오래된 도구 결과 "
+              f"{info['n']}건을 줄였다(→ {info['after']:,}토큰)")
+        await adispatch_custom_event(_LOOP_FIT_EVENT, info, config=config)
+    return {"llm_input_messages": fitted}
 
 
 def _hist_budget_tokens(has_docs: bool = False) -> int:
@@ -3075,6 +3146,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
         # blocked: 유령 ID 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
+        _loop_fit_told = 0      # 루프 훅이 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
         async for event in agent.astream_events(inputs, version="v2", config=_cfg):
             kind = event["event"]
@@ -3105,6 +3177,17 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                         full.append(content)
                         _post_tool_chars += len(content)
                         yield _sse("token", {"delta": content})
+            elif kind == "on_custom_event" and event.get("name") == _LOOP_FIT_EVENT:
+                # 루프 훅(_loop_fit_hook)이 창을 넘는 도구 결과를 줄였다 — 모델만 알고 화면·대화 기록엔 없던 일이다.
+                _fit = event.get("data") or {}
+                if _fit.get("n", 0) > _loop_fit_told:
+                    _loop_fit_told = _fit["n"]
+                    yield _sse("warning", {"code": "loop_results_cut",
+                                           "message": f"이번 턴에 받은 도구 결과가 모델 창을 넘어, 결과 {_fit['n']}건"
+                                                      f"(오래된 것부터 · 원문 {_fit.get('chars', 0):,}자)을 앞부분만 남기고 줄여 모델에 "
+                                                      "실었습니다 — 그 결과의 뒷부분은 모델이 보지 못했습니다. 조건을 좁혀 "
+                                                      "나눠 조회하면 다 볼 수 있습니다.",
+                                           "knob": "TOOL_RESULT_MAX"})
             elif kind == "on_tool_start":
                 _budget["calls"] += 1
                 _fp = f"{event.get('name')}|{json.dumps(event.get('data', {}).get('input'), sort_keys=True, ensure_ascii=False, default=str)[:400]}"
