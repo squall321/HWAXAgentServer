@@ -85,7 +85,10 @@ def test_묻지_않은_합성_지정석을_한_줄로_밝힌다(monkeypatch):
     assert not step.startswith("지식카드 "), "좌석별 진행 줄(지식카드 N/M — 키)과 같은 머리를 쓰면 물어본 것으로 읽힌다"
     # 설정 이름은 화면 글에 넣지 않고 따로 싣는다 — 잡 원장이 붙여 MCP 호출자와 운영자가 본다(아래 시험).
     assert _KNOB not in step and lines[0].get("knob") == _KNOB, lines[0]
-    assert not [data for ev, data in events if ev == "warning"], "설계된 건너뛰기를 강등 경고로 냈다"
+    # 하네스 질문에는 리스크 심사 머리가 없어 앞 패널 보고서 거름이 넓어졌다는 경고(risk_head_missing)가 따로 나간다 — 이 건너뛰기와
+    # 상관없는 경고라 뺀다(tests/test_risk_registry_closed (7)).
+    assert not [data for ev, data in events if ev == "warning" and data.get("code") != "risk_head_missing"], \
+        "설계된 건너뛰기를 강등 경고로 냈다"
     steps = _steps(events)
     assert any(s.startswith("지식카드 주입 — 2/2명") for s in steps), "인원수는 물어본 좌석만 센다"
 

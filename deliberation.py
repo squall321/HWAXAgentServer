@@ -1003,10 +1003,15 @@ def _risk_lookup_hint(dom: str, question: str) -> str:
     return ((_RISK_LOOKUP_NOTE + " ") if _RISK_DIFF_MARK in (question or "") else "") + line
 
 
+# 엔진이 Report Archive 에 남기는 심의 보고서 제목의 머리 — 과제 머리가 없는 리스크 심사는 이것으로 심의 보고서를 전부 거른다
+# (_risk_hide_prior_panels). 챗 /보고서(run_report_save)도 같은 머리를 쓴다.
+_RA_TITLE_HEAD = "심의 — "
+
+
 def _ra_report_title(question: str) -> str:
     """심의가 Report Archive 에 남기는 보고서 제목. 리스크 앱 러너의 패널 질문은 '[리스크심사 <과제코드> <target_key>]' 로
     시작하므로 리스크 심사 패널의 보고서 제목 앞머리에 과제 코드가 실린다 — _risk_hide_prior_panels 가 그것으로 거른다."""
-    return f"심의 — {question[:50]}"
+    return f"{_RA_TITLE_HEAD}{question[:50]}"
 
 
 # 리스크 앱 runner.panel_question 의 질문 머리 — 과제 코드(group 1)와 target_key(group 2). 글자를 바꾸려면 그 리포와 같이 바꾼다.
@@ -1017,6 +1022,10 @@ _RISK_Q_MARK = "[리스크심사"
 _RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 ([^\]]+) ([^\s\]]+)\]")
 _RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서 {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 "
                         "읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+# 과제 코드를 모르는 리스크 심사(머리 없는 손수 길 · 머리를 읽지 못한 길) — 같은 과제를 가릴 수 없어 심의 보고서를 전부 뺀다.
+_RISK_PRIOR_WITHHELD_ALL = (f"엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…') {{n}}건은 리스크 심사 좌석에게 보이지 않는다 — 질문에서 "
+                            "과제를 읽지 못해 같은 과제의 앞 패널 판정을 가릴 수 없어 심의 보고서를 전부 뺐다(다른 과제의 선례도 "
+                            "함께 빠졌다). 이 심사는 앞 패널의 판정 없이 독립으로 판단한다.")
 
 
 def _risk_q_code(question: str) -> str | None:
@@ -1027,7 +1036,8 @@ def _risk_q_code(question: str) -> str | None:
 
 def _risk_head_unread(question: str) -> str:
     """질문에 리스크 심사 머리('[리스크심사')가 보이는데 과제 코드를 읽지 못했으면 그 머리 부분(알림에 그대로 싣는다), 아니면
-    빈 글. 읽지 못하면 같은 과제를 가릴 수 없어 앞 패널 보고서 거름이 꺼진다 — 조용히 넘기지 않고 알리는 데 쓴다."""
+    빈 글. 읽지 못하면 같은 과제를 가릴 수 없어 앞 패널 보고서 거름이 심의 보고서 전부로 넓어진다 — 조용히 넘기지 않고 알리는
+    데 쓴다."""
     q = question or ""
     i = q.find(_RISK_Q_MARK)
     if i < 0 or _risk_q_code(q) is not None:
@@ -1043,16 +1053,38 @@ def _risk_hide_prior_panels(tool, question: str):
     엔진은 패널마다 결정문이 든 RA 초안을 남기고(러너가 save_report 를 보내지 않는다 — 리스크 앱이 그 번호를 패널에 적는다),
     RA 는 소유한 초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다. 그래서 같은 잡 자격으로 도는 다음 패널 좌석이
     '힌지 리스크' 만 찾아도 앞 패널의 판정이 걸렸다(engine-contract A-D18-ra-reports). 같은 과제는 질문 머리의 과제 코드로
-    가린다 — 머리가 없는 자유 질문이면 가릴 수 없어 감싸지 않는다(머리가 보이는데 못 읽었으면 심의가 경고와 카드로 알린다 —
-    _risk_head_unread). 다른 과제의 보고서는 선례라 남긴다.
+    가리고, 다른 과제의 보고서는 선례라 남긴다. 과제 코드를 읽지 못하면(머리 없는 손수 길 — 실사용 팀이 Claude 에서
+    deliberate_start(job='risk-review')를 머리 없이 부른다 · 머리가 보이는데 못 읽은 길) 같은 과제를 가릴 수 없어 엔진이 남긴
+    심의 보고서(제목 _RA_TITLE_HEAD)를 전부 뺀다 — 종전엔 감싸지 않아 앞 패널 초안이 스니펫째 좌석에 갔다(m1 3차 발견 5). 심의는
+    그 사실을 경고와 카드로 알린다(_risk_head_unread · risk_head_missing).
 
-    응답은 풀어서(json) 제목으로 가린다 — 글자열로만 대조하면 한글이 \\uXXXX 로 온 응답에서 샌다. 풀지 못한 응답에 그 과제의
+    응답은 풀어서(json) 제목으로 가린다 — 글자열로만 대조하면 한글이 \\uXXXX 로 온 응답에서 샌다. 풀지 못한 응답에 거를
     머리가 보이면 결과를 통째로 주지 않는다(행을 가려낼 수 없다)."""
     code = _risk_q_code(question)
     orig = getattr(tool, "coroutine", None)
-    if code is None or orig is None:
+    if orig is None:
         return tool
-    mark = f"[리스크심사 {code} "
+    if code is not None:
+        mark = f"[리스크심사 {code} "
+
+        def _prior(title: str) -> bool:
+            return mark in title
+
+        def _withheld(n: int) -> str:
+            return _RISK_PRIOR_WITHHELD.format(code=code, n=n)
+        _opaque = (f"검색 결과를 줄 수 없다 — 같은 과제({code})의 앞 패널 심의 보고서가 섞여 있는데 응답을 풀지 못해 "
+                   "가려낼 수 없다. 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 다시 찾아라.")
+    else:
+        mark = _RA_TITLE_HEAD
+
+        def _prior(title: str) -> bool:
+            return title.lstrip().startswith(mark)
+
+        def _withheld(n: int) -> str:
+            return _RISK_PRIOR_WITHHELD_ALL.format(n=n)
+        _opaque = ("검색 결과를 줄 수 없다 — 엔진이 남긴 심의 보고서가 섞여 있는데 응답을 풀지 못해 가려낼 수 없다(질문에서 "
+                   "과제를 읽지 못해 심의 보고서를 전부 뺀다). 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 "
+                   "다시 찾아라.")
 
     def _hide(text):
         if not isinstance(text, str):
@@ -1064,14 +1096,12 @@ def _risk_hide_prior_panels(tool, question: str):
         rows = got.get("reports") if isinstance(got, dict) else None
         if not isinstance(rows, list):
             if mark in text or json.dumps(mark)[1:-1] in text:
-                return (f"검색 결과를 줄 수 없다 — 같은 과제({code})의 앞 패널 심의 보고서가 섞여 있는데 응답을 풀지 못해 "
-                        "가려낼 수 없다. 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 다시 찾아라.")
+                return _opaque
             return text
-        keep = [r for r in rows if not (isinstance(r, dict) and mark in str(r.get("title") or ""))]
+        keep = [r for r in rows if not (isinstance(r, dict) and _prior(str(r.get("title") or "")))]
         if len(keep) == len(rows):
             return text
-        return json.dumps({**got, "reports": keep, "count": len(keep),
-                           "withheld": _RISK_PRIOR_WITHHELD.format(code=code, n=len(rows) - len(keep))},
+        return json.dumps({**got, "reports": keep, "count": len(keep), "withheld": _withheld(len(rows) - len(keep))},
                           ensure_ascii=False)
 
     async def hidden(*a, **kw):
@@ -4448,18 +4478,34 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
     if opts.chair_template == "risk-review" and tools.get("search_reports") is not None:
         _risk_hide_prior_panels(tools.get("search_reports"), question)
-    # 질문에 리스크 심사 머리가 보이는데 읽지 못했으면 위 거름(과 자유 조회의 거름)이 꺼진 채 돈다 — 조용히 넘기지 않는다.
-    # 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱 러너가 패널에 옮겨 적는다(m1 2차 AF2-D18-code-space).
-    _unread = _risk_head_unread(question) if opts.chair_template == "risk-review" else ""
+    # 리스크 심사인데 과제 코드를 읽지 못했으면 위 거름(과 자유 조회의 거름)이 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서를
+    # 전부 뺀다 — 다른 과제의 선례도 함께 빠지므로 조용히 넘기지 않는다. 머리가 보이는데 못 읽은 길(m1 2차 AF2-D18-code-space)과
+    # 머리 없이 손수 부른 길(m1 3차 발견 5 — 실사용 팀의 길)을 가른다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
+    # 러너가 패널에 옮겨 적는다.
+    _risk_chair0 = opts.chair_template == "risk-review"
+    _unread = _risk_head_unread(question) if _risk_chair0 else ""
+    _where = "보고서 검색(좌석 자유 조회·지정 도구·정량 근거 선주입)"
     if _unread:
         yield _sse("warning", {"code": "risk_head_unread",
-                               "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해, 같은 과제의 앞 패널 "
-                                          "심의 보고서를 좌석의 보고서 검색에서 빼지 못합니다(D-18). 머리 꼴은 "
+                               "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해 같은 과제를 가릴 수 "
+                                          f"없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 전부 "
+                                          "뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). 머리 꼴은 "
                                           "'[리스크심사 <과제코드> <target_key>]' 입니다."})
-        yield _delib("evidence", source="앞 패널 보고서 거름 꺼짐", included=False, notice=True,
+        yield _delib("evidence", source="앞 패널 보고서 거름 — 머리를 읽지 못해 심의 초안 전부를 뺐다", included=False,
+                     notice=True,
                      text=f"질문 머리 {_unread} 에서 과제 코드와 target_key 를 읽지 못했다(머리 꼴은 '[리스크심사 <과제코드> "
-                          "<target_key>]'). 그래서 같은 과제의 앞 패널 심의 보고서를 보고서 검색(좌석 자유 조회·지정 도구·정량 "
-                          "근거 선주입)에서 빼지 못했다 — 좌석이 앞 패널 판정을 읽었을 수 있다(D-18).")
+                          f"<target_key>]'). 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 "
+                          f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).")
+    elif _risk_chair0 and _risk_q_code(question) is None:
+        yield _sse("warning", {"code": "risk_head_missing",
+                               "message": "질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제를 "
+                                          f"가릴 수 없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 "
+                                          "전부 뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다)."})
+        yield _delib("evidence", source="앞 패널 보고서 거름 — 머리 없는 손수 길이라 심의 초안 전부를 뺐다", included=False,
+                     notice=True,
+                     text="질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제의 앞 패널 보고서를 "
+                          f"가릴 수 없었다. 그래서 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 {_where}에서 전부 "
+                          "뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18). 과제를 밝혀 거름을 좁히려면 질문 머리를 붙여 부른다.")
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
     # 결정문 헤더(_evidence_note)에도 남지만, 심의가 도는 동안 보는 사람이 먼저 알아야 한다.

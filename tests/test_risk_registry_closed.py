@@ -11,6 +11,8 @@
 # (4) 앞 패널 기록 도구(패널 목록 · 패널 전사)를 리스크 심사에 지정한 길.
 # (5) 공백·한글이 든 과제 코드 — 질문 머리를 읽지 못하면 (2)·(3) 의 거름이 알림 없이 꺼졌다. 못 읽으면 알린다.
 # (6) apps 없이 손수 돈 리스크 심사 — 좌석이 RA 보고서 읽기 도구로 앞 패널 초안을 읽었다. 이름으로 뺀다.
+# (7) 질문 머리 없이(또는 머리를 읽지 못한 채) 돈 리스크 심사 — 같은 과제를 가릴 수 없어 search_reports 거름이 없었다. 엔진이
+#     남긴 심의 보고서('심의 — …')를 전부 빼고 알린다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -170,9 +172,10 @@ def test_읽지_못한_응답에_같은_과제의_보고서가_보이면_통째�
     assert "[리스크심사 P1 " not in out and "같은 과제" in out, out
 
 
-@pytest.mark.parametrize("chair,question", [("default", _Q_NOW), ("risk-review", "힌지 크랙 원인")])
-def test_리스크_심사가_아니거나_과제를_모르면_종전대로_준다(monkeypatch, chair, question):
-    """머리 없는 자유 질문은 같은 과제를 가릴 수 없다 — 그대로 준다(남는 길은 열린 문제로 적었다)."""
+@pytest.mark.parametrize("chair,question", [("default", _Q_NOW), ("diagnosis", "힌지 크랙 원인")])
+def test_리스크_심사가_아니면_종전대로_준다(monkeypatch, chair, question):
+    """D-18 은 리스크 심사 좌석의 결정이다 — 다른 심의의 보고서 검색은 머리가 있든 없든 거르지 않는다. 머리 없는 리스크 심사는
+    (7) 이 본다."""
     got = _search(_seat_pool(monkeypatch, chair, question, json.dumps(_ra_hits(), ensure_ascii=False), apps=()))
     assert [r["report_id"] for r in got["reports"]] == [7, 8, 9], got
 
@@ -189,7 +192,7 @@ def test_엔진이_남기는_보고서_제목에_과제_머리가_실린다():
 _PRIOR_SNIPPET = "힌지 FAIL — 판정 근거"
 
 
-def _engine_search(monkeypatch, chair, req):
+def _engine_search(monkeypatch, chair, req, question=_Q_NOW):
     """심의를 좌석 발굴 문턱까지 돌려, 엔진 LLM 이 받은 글(인자 계획·근거 증류)과 이벤트를 받는다."""
     seen = []
 
@@ -210,7 +213,7 @@ def _engine_search(monkeypatch, chair, req):
 
     async def go():
         out = []
-        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), _Q_NOW, [], opts)
+        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), question, [], opts)
         try:
             async for chunk in gen:
                 ev, data = delib_jobs._parse_sse(chunk)
@@ -329,28 +332,37 @@ def _events_for(monkeypatch, question, chair="risk-review"):
     return asyncio.run(go())
 
 
-def _head_notices(events):
-    warn = [data for ev, data in events if ev == "warning" and data.get("code") == "risk_head_unread"]
-    cards = [c for c in _cards(events, included=False) if c.get("source") == "앞 패널 보고서 거름 꺼짐"]
+_HEAD_CODES = ("risk_head_unread", "risk_head_missing")
+
+
+def _head_notices(events, code="risk_head_unread"):
+    """과제를 가릴 수 없다는 알림 — 경고(code)와 좌석에 주지 않은 카드('앞 패널 보고서 거름 …')."""
+    warn = [data for ev, data in events if ev == "warning" and data.get("code") == code]
+    cards = [c for c in _cards(events, included=False) if str(c.get("source", "")).startswith("앞 패널 보고서 거름")]
     return warn, cards
 
 
 def test_리스크심사_머리를_읽지_못하면_조용히_넘기지_않고_알린다(monkeypatch):
-    """질문에 '[리스크심사' 가 있는데 과제 코드를 못 읽으면 같은 과제를 가릴 수 없다 — 거름이 꺼진 채 도는 것을 경고와 카드로
-    남긴다(카드는 좌석에 주지 않은 것이라 러너가 패널에 옮겨 적는다)."""
+    """질문에 '[리스크심사' 가 있는데 과제 코드를 못 읽으면 같은 과제를 가릴 수 없다 — 심의 보고서를 전부 빼고 그것을 경고와
+    카드로 남긴다(카드는 좌석에 주지 않은 것이라 러너가 패널에 옮겨 적는다)."""
     warn, cards = _head_notices(_events_for(monkeypatch, "[리스크심사 S26U] 힌지 크랙이 각 도메인에서 어떤 리스크를 낳는가"))
     assert len(warn) == 1 and len(cards) == 1, (warn, cards)
     assert "D-18" in cards[0]["text"] and "[리스크심사 S26U]" in cards[0]["text"], cards[0]
+    # 거름이 꺼진 것이 아니라 넓어졌다 — 알림이 그렇게 말해야 한다(종전 문구는 '빼지 못했다' 였다).
+    assert "전부" in cards[0]["source"] and "전부" in warn[0]["message"], (cards[0], warn[0])
+    assert "빼지 못" not in cards[0]["text"] and "빼지 못" not in warn[0]["message"], (cards[0], warn[0])
 
 
 @pytest.mark.parametrize("chair,question", [
     ("risk-review", "[리스크심사 S26 Ultra diff:new] 기준 대비 변경이 …"),     # 읽힌다
-    ("risk-review", "힌지 크랙 원인"),                                       # 머리가 없는 손수 질문 — 알릴 머리가 없다
     ("default", "[리스크심사 S26U] 힌지 크랙"),                               # 리스크 심사가 아니다
+    ("default", "힌지 크랙 원인"),                                           # 리스크 심사가 아니다(머리도 없다)
 ])
-def test_머리를_읽었거나_머리가_없거나_리스크_심사가_아니면_알리지_않는다(monkeypatch, chair, question):
-    warn, cards = _head_notices(_events_for(monkeypatch, question, chair))
-    assert not warn and not cards, (warn, cards)
+def test_머리를_읽었거나_리스크_심사가_아니면_알리지_않는다(monkeypatch, chair, question):
+    events = _events_for(monkeypatch, question, chair)
+    for code in _HEAD_CODES:
+        warn, cards = _head_notices(events, code)
+        assert not warn and not cards, (code, warn, cards)
 
 
 # ── (6) apps 없이 손수 돈 리스크 심사 — RA 보고서 읽기 도구를 이름으로 뺀다 ───────────────────────────────────────────
@@ -379,3 +391,49 @@ def test_리스크_심사가_아니면_RA_보고서_읽기_도구를_종전대�
     given = _seat_given(monkeypatch, chair, "힌지 크랙 원인", json.dumps(_ra_hits(), ensure_ascii=False),
                         apps=(), extra=extra)
     assert all(n in given for n in _RA_READERS), sorted(given)
+
+
+# ── (7) 머리 없는 손수 리스크 심사 — 같은 과제를 가릴 수 없으니 엔진이 남긴 심의 보고서를 전부 뺀다 ────────────────────────────
+# 실사용 팀은 apps 도 질문 머리('[리스크심사 …]')도 없이 deliberate_start(job='risk-review')를 부른다. 이 길에서 거름은 과제
+# 코드를 못 읽어 감싸지 않았고, 좌석의 search_reports 가 잡 주인의 앞 패널 초안('심의 — …' — 엔진의 _ra_report_title 이 붙이는
+# 머리)을 스니펫과 함께 돌려줬다(m1 3차 발견 5 — 사용자 결정 D-18). 머리를 읽지 못한 길도 같다. 같은 과제를 가릴 수 없으니
+# 엔진이 남긴 심의 보고서를 전부 뺀다 — 다른 과제의 선례도 빠지지만, 앞 패널 판정을 따라 말하는 쪽보다 낫다.
+_Q_MANUAL = "힌지 크랙이 각 도메인에서 어떤 리스크와 개선을 낳는가를 도구 근거로 판정하라."
+_Q_UNREAD = "[리스크심사 S26U] 힌지 크랙이 각 도메인에서 어떤 리스크를 낳는가"
+
+
+@pytest.mark.parametrize("ascii_", (False, True), ids=("utf8", "escaped"))
+@pytest.mark.parametrize("question", (_Q_MANUAL, _Q_UNREAD), ids=("headless", "unread"))
+def test_과제를_모르는_리스크_심사_좌석의_보고서_검색은_심의_보고서를_전부_뺀다(monkeypatch, question, ascii_):
+    got = _search(_seat_pool(monkeypatch, "risk-review", question, json.dumps(_ra_hits(), ensure_ascii=ascii_), apps=()))
+    assert [r["report_id"] for r in got["reports"]] == [9], got
+    assert got["count"] == 1 and "2건" in got.get("withheld", "") and "D-18" not in got["withheld"], got
+    assert "가릴 수 없어" in got["withheld"], got
+
+
+def test_머리_없는_리스크_심사도_읽지_못한_응답에_심의_보고서가_보이면_통째로_막는다(monkeypatch):
+    raw = json.dumps(_ra_hits(), ensure_ascii=False)[:-40]      # 잘린 JSON — 행을 가려낼 수 없다
+    out = asyncio.run(_seat_pool(monkeypatch, "risk-review", _Q_MANUAL, raw, apps=()).coroutine(query="힌지"))
+    assert _PRIOR_SNIPPET not in out and "가려낼 수 없다" in out, out
+
+
+def test_머리_없는_리스크_심사의_지정_도구_보고서_검색도_심의_보고서를_뺀다(monkeypatch):
+    """엔진이 직접 부르는 길(지정 도구) — 결과가 전 좌석 프롬프트에 실린다."""
+    events, _seen = _engine_search(monkeypatch, "risk-review", {"tools": ["search_reports"]}, question=_Q_MANUAL)
+    card = next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")
+    assert _PRIOR_SNIPPET not in card["text"] and "다른 과제의 판정" not in card["text"], card["text"]
+    assert "1.5m 낙하" in card["text"], card["text"]
+
+
+def test_머리_없는_리스크_심사는_심의_보고서를_전부_뺐다고_경고와_카드로_알린다(monkeypatch):
+    warn, cards = _head_notices(_events_for(monkeypatch, _Q_MANUAL), "risk_head_missing")
+    assert len(warn) == 1 and len(cards) == 1, (warn, cards)
+    assert cards[0]["source"] == "앞 패널 보고서 거름 — 머리 없는 손수 길이라 심의 초안 전부를 뺐다", cards[0]
+    assert "D-18" in cards[0]["text"] and "심의 — " in cards[0]["text"], cards[0]
+    assert not _head_notices(_events_for(monkeypatch, _Q_MANUAL), "risk_head_unread")[0], "머리가 없는데 '못 읽었다' 고 했다"
+
+
+def test_리스크_심사가_아니면_머리가_없어도_보고서_검색을_거르지_않는다(monkeypatch):
+    events, _seen = _engine_search(monkeypatch, "default", {"tools": ["search_reports"]}, question=_Q_MANUAL)
+    card = next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")
+    assert _PRIOR_SNIPPET in card["text"], card["text"]
