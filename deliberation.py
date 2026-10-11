@@ -954,6 +954,11 @@ _RISK_READ_TOOLS = {
 # HWAXPortal docs/risk-review-redesign D-18). 앞 판정을 읽고 같은 말을 하면 원장(D-23)의 지지 수가 독립 근거 없이 오른다.
 # 자유 조회 후보(_RISK_READ_TOOLS·_RISK_KEEP_TOOLS)에 없고, 리스크 심사에 지정 도구(tools)로 와도 부르지 않는다.
 _RISK_REGISTRY_TOOLS = ("risk_get_registry", "risk_claims_for_ref")
+# 앞 패널 기록 — 패널 한 건의 결정문·risk_spec(risk_get_panel_transcript)과 그 id 의 출처인 패널 목록(risk_list_panels).
+# 등록부와 같은 까닭으로 리스크 심사 좌석에게 열지 않는다. 접두사 risk_ 는 _FREE_ALLOW 에 없어 자유 조회 후보에 들지 않고,
+# 리스크 심사에 지정 도구로 와도 등록부와 함께 부르지 않는다 — 등록부 둘만 거절하던 동안 이 둘을 지정하면 좌석이 앞 패널
+# 판정을 통째로 읽었다(D-18 — 여는 것은 변경 전체와 스냅샷뿐이다).
+_RISK_PRIOR_TOOLS = _RISK_REGISTRY_TOOLS + ("risk_list_panels", "risk_get_panel_transcript")
 
 # 리스크 심사 유지 도구 — apps 밖 앱(RA·물성·열충격·VoC·문헌) 소속이라 앱 제한에서 잘려 나가는
 # 읽기 도구를 chair_template == 'risk-review' 일 때만 남긴다. 다른 심의 영향 0.
@@ -4407,6 +4412,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("error", {"code": "gateway_unavailable",
                              "message": f"게이트웨이 MCP 도구를 불러오지 못했습니다({_why} — 게이트웨이 확인)."})
         yield _sse("done", {}); return
+    # 리스크 심사는 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입)에서도 같은 과제의 앞 패널 보고서를 뺀다(D-18).
+    # 둘 다 결과를 전 좌석 프롬프트에 싣는다 — 좌석 자유 조회만 거르던 동안 search_reports 를 지정하거나 선주입을 켠 리스크
+    # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
+    if opts.chair_template == "risk-review" and tools.get("search_reports") is not None:
+        _risk_hide_prior_panels(tools.get("search_reports"), question)
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
     # 결정문 헤더(_evidence_note)에도 남지만, 심의가 도는 동안 보는 사람이 먼저 알아야 한다.
@@ -4561,17 +4571,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if opts.delib_tools:
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
-        _tool_refused = []                    # 리스크 심사에 지정된 등록부 도구 — 부르지 않는다(D-18)
+        _tool_refused = []                    # 리스크 심사에 지정된 등록부·앞 패널 기록 도구 — 부르지 않는다(D-18)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
         _ordered = sorted(opts.delib_tools,
                           key=lambda n: 0 if n.startswith(("list_", "search_", "find_")) else 1)
         for _tn in _ordered:
-            if opts.chair_template == "risk-review" and _tn in _RISK_REGISTRY_TOOLS:
-                # 지정 도구 결과는 전 좌석 프롬프트에 실린다 — 등록부를 부르면 좌석이 앞 패널 판정을 읽는다.
-                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — 리스크 심사 좌석은 같은 과제의 등록부(앞 패널 "
-                                              "판정)를 보지 않는다", "tool": _tn})
+            if opts.chair_template == "risk-review" and _tn in _RISK_PRIOR_TOOLS:
+                # 지정 도구 결과는 전 좌석 프롬프트에 실린다 — 등록부·앞 패널 기록을 부르면 좌석이 앞 패널 판정을 읽는다.
+                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — 리스크 심사 좌석은 같은 과제의 등록부·앞 패널 "
+                                              "기록(앞 패널 판정)을 보지 않는다", "tool": _tn})
                 _tool_refused.append(_tn)
                 continue
             _t = tools.get(_tn)
@@ -4645,7 +4655,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                               + " · ".join(x for x in (
                                   f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
                                   f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
-                                  (f"리스크 심사라 부르지 않은 등록부 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 "
+                                  (f"리스크 심사라 부르지 않은 등록부·앞 패널 기록 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 "
                                    "판정을 좌석이 보지 않는다 — D-18)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:

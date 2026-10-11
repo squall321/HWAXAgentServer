@@ -1,12 +1,14 @@
 # 리스크 심사 좌석에게 같은 과제의 앞 패널 판정이 닿지 않는다 — 사용자 결정 D-18 의 지정 도구 길과 RA 보고서 검색 길
 #
-# 자유 조회 후보는 tests/test_delib_seats.py 의 등록부 가드가 본다. 이 파일은 그 밖의 두 길이다.
+# 자유 조회 후보는 tests/test_delib_seats.py 의 등록부 가드가 본다. 이 파일은 그 밖의 길이다.
 # (1) 호출자가 고르는 지정 도구(delib_opts.tools) — 엔진이 그 도구를 주제 기반 인자로 불러 결과를 **전 좌석 프롬프트에**
 #     싣는다. 리스크 심사에 risk_get_registry 를 지정하면 좌석이 앞 패널 판정을 읽고 같은 말을 해, 원장(D-23)의 지지 수가
 #     독립 근거 없이 오른다.
 # (2) 엔진이 패널마다 Report Archive 에 남기는 심의 보고서 — 러너가 save_report 를 보내지 않아 패널마다 결정문(판정)이 든
 #     초안이 생기고, 같은 잡 자격으로 도는 다음 패널 좌석의 search_reports(리스크 심사 유지 도구)에 걸린다(RA 는 소유한
 #     초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다). engine-contract A-D18-ra-reports.
+# (3) 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입) — 결과가 전 좌석 프롬프트에 실린다.
+# (4) 앞 패널 기록 도구(패널 목록 · 패널 전사)를 리스크 심사에 지정한 길.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -169,3 +171,97 @@ def test_리스크_심사가_아니거나_과제를_모르면_종전대로_준�
 def test_엔진이_남기는_보고서_제목에_과제_머리가_실린다():
     """거르는 열쇠가 이 제목이다 — 제목 앞 50자 안에 '[리스크심사 <과제코드> ' 가 들어야 한다."""
     assert d._ra_report_title(_Q_PREV).startswith("심의 — [리스크심사 P1 ")
+
+
+# ── (3) 엔진 자신이 부르는 보고서 검색 — 지정 도구·정량 근거 선주입도 같은 과제의 앞 패널 보고서를 뺀다 ─────────────────
+# 자유 조회 후보만 거르면 엔진이 직접 부르는 두 길이 남는다. 둘 다 결과를 **전 좌석 프롬프트에** 싣는다 — 호출자가
+# search_reports 를 지정 도구로 고른 리스크 심사, 그리고 정량 근거 선주입(evidence_prepass — 박스 설정이나 MCP 인자로 켠다)이
+# 질문 그대로 보고서를 찾는 것. 리스크 심사의 질문 머리에는 과제 코드가 실려 앞 패널 보고서 제목과 바로 겹친다.
+_PRIOR_SNIPPET = "힌지 FAIL — 판정 근거"
+
+
+def _engine_search(monkeypatch, chair, req):
+    """심의를 좌석 발굴 문턱까지 돌려, 엔진 LLM 이 받은 글(인자 계획·근거 증류)과 이벤트를 받는다."""
+    seen = []
+
+    async def _llm(_llm, _system, human):
+        seen.append(human)
+        return '{"q": "힌지 리스크", "limit": 3}'
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    ra = _CoTool("search_reports", json.dumps(_ra_hits(), ensure_ascii=False))
+    tools = {"agent_search": _Tool("agent_search"), "search_reports": ra}
+
+    async def _fake_tools(*_a, **_k):
+        return tools
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    opts = {"personas": [{"key": "mech-a", "role": "기구"}], "chair_template": chair, "free_tools": 0,
+            "voc": "off", "rescreen": 0, "persona_knowledge": 0, **req}
+
+    async def go():
+        out = []
+        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), _Q_NOW, [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                assert ev != "error", data
+                out.append((ev, data))
+                if _after_tools(ev, data):
+                    break
+        finally:
+            await gen.aclose()
+        return out
+
+    events = asyncio.run(go())
+    assert ra.calls, "시험 전제 — 엔진이 search_reports 를 부르지 않았다"
+    return events, seen
+
+
+def test_리스크_심사의_지정_도구_보고서_검색은_같은_과제의_앞_패널_보고서를_뺀다(monkeypatch):
+    events, _seen = _engine_search(monkeypatch, "risk-review", {"tools": ["search_reports"]})
+    card = next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")
+    assert _PRIOR_SNIPPET not in card["text"] and "1.5m 낙하" in card["text"], card["text"]
+    assert "withheld" in card["text"], card["text"]
+
+
+def test_리스크_심사의_정량_근거_선주입은_같은_과제의_앞_패널_보고서를_보지_않는다(monkeypatch):
+    _events, seen = _engine_search(monkeypatch, "risk-review", {"evidence_prepass": 1})
+    distill = [h for h in seen if "[도구 검색 결과]" in h]
+    assert distill and all(_PRIOR_SNIPPET not in h for h in distill), distill
+    assert "1.5m 낙하" in distill[0], distill[0][:400]
+
+
+def test_리스크_심사가_아니면_지정_도구_보고서_검색은_종전대로다(monkeypatch):
+    events, _seen = _engine_search(monkeypatch, "default", {"tools": ["search_reports"]})
+    card = next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")
+    assert _PRIOR_SNIPPET in card["text"], card["text"]
+
+
+# ── (4) 앞 패널 기록 도구 — 패널 목록·패널 전사도 리스크 심사의 지정 도구로 부르지 않는다 ────────────────────────────────
+# risk_get_panel_transcript 는 패널 한 건의 결정문·risk_spec 이고 risk_list_panels 는 그 id 의 출처다(HWAXRisk mcp_server).
+# 등록부 둘만 거절하면 이 둘을 지정한 리스크 심사의 좌석이 앞 패널 판정을 통째로 읽는다(D-18 — 여는 것은 변경·스냅샷뿐).
+_PRIOR = ("risk_list_panels", "risk_get_panel_transcript")
+
+
+def _run_prior(monkeypatch, chair):
+    async def _planner(_llm, _system, _human):
+        return '{"target_key": "T-1", "panel_id": "p-1"}'
+
+    monkeypatch.setattr(d, "_llm_text", _planner)
+    tools = {n: _Tool(n, '{"decision_text": "힌지 FAIL", "risk_spec": {"verdict": "FAIL"}}') for n in _PRIOR}
+    tools["agent_search"] = _Tool("agent_search")
+    events = _stream(monkeypatch, {"chair_template": chair, "tools": list(_PRIOR)}, tools=tools, until=_after_tools)
+    return events, tools
+
+
+def test_리스크_심사는_지정한_앞_패널_기록_도구를_부르지_않는다(monkeypatch):
+    events, tools = _run_prior(monkeypatch, "risk-review")
+    assert all(not tools[n].calls for n in _PRIOR), {n: tools[n].calls for n in _PRIOR}
+    card = next(c for c in _cards(events, included=False) if c["source"] == "지정 도구 미실행")
+    assert all(n in card["text"] for n in _PRIOR) and "D-18" in card["text"], card
+
+
+def test_리스크_심사가_아니면_앞_패널_기록_도구를_그대로_부른다(monkeypatch):
+    _events, tools = _run_prior(monkeypatch, "default")
+    assert all(tools[n].calls for n in _PRIOR), {n: tools[n].calls for n in _PRIOR}

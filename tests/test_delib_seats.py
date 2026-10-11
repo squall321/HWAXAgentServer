@@ -508,7 +508,8 @@ def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():
 # 앱을 직접 고른 심의(MCP deliberate_start)는 _RISK_READ_TOOLS["heax-hwax_risk"] 로도 닿는다 — 거기에도 등록부는 없다.
 _RUNNER_APPS = ("heax-step_forge", "heax-kooremapper_mcp")
 _RISK_AMAP = {"risk_get_diff": "heax-hwax_risk", "risk_get_snapshot": "heax-hwax_risk",
-              "risk_get_registry": "heax-hwax_risk", "risk_claims_for_ref": "heax-hwax_risk"}
+              "risk_get_registry": "heax-hwax_risk", "risk_claims_for_ref": "heax-hwax_risk",
+              "risk_list_panels": "heax-hwax_risk", "risk_get_panel_transcript": "heax-hwax_risk"}
 
 
 def test_리스크_심사_좌석은_변경_원장_도구를_받는다():
@@ -528,10 +529,12 @@ def test_등록부_도구는_리스크_심사_좌석에게_열리지_않는다()
     앱을 직접 고르면 _RISK_READ_TOOLS["heax-hwax_risk"] 로 두 도구가 그대로 열렸다(engine-contract A-D18-apps).
 
     _narrow 는 _g 의 부분집합이라 좌석에게 가는 것은 둘의 합성이다(apps 가 비면 _g 그대로) — 두 식을 따로 not 으로
-    단언하면 _g 만 닫은 올바른 수리가 떨어진다. 등록부도 열기로 하면 이 단언을 뒤집는다."""
+    단언하면 _g 만 닫은 올바른 수리가 떨어진다. 앞 패널 기록 둘(패널 목록·패널 전사)도 같은 까닭으로 함께 본다.
+    등록부도 열기로 하면 이 단언을 뒤집는다."""
     g_gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
     narrow = _dictcomp_cond("_MATERIAL_TOOLS", "_FREE_DENY")
-    for n in d._RISK_REGISTRY_TOOLS:
+    assert set(d._RISK_REGISTRY_TOOLS) <= set(d._RISK_PRIOR_TOOLS)
+    for n in d._RISK_PRIOR_TOOLS:
         assert n not in d._RISK_KEEP_TOOLS, n
         assert all(n not in v for v in d._RISK_READ_TOOLS.values()), n
         for apps in ((), _RUNNER_APPS, ("heax-hwax_risk",), ("heax-step_forge", "heax-hwax_risk")):
