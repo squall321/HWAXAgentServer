@@ -7,7 +7,10 @@
 # 앞의 **특성화** 시험은 구현 전 코드에서 초록인 것을 먼저 본 것이다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_chat_window_caps.py -q
+import asyncio
+import json
 import re
+import types
 import sys
 from pathlib import Path
 
@@ -151,11 +154,12 @@ def test_좁은_창에서_이력_항목을_끊으면_원문_길이를_적는다(
     assert f"{len(_ITEM):,}자" in body, body[-80:]
 
 
-@pytest.mark.parametrize("tokens", (16384, _BIG))
+@pytest.mark.parametrize("tokens", (_BIG,))
 def test_가장_최근_이력_항목도_예산을_넘으면_원문_길이를_적고_줄인다(tokens):
     """kept 가 비어 있으면 첫(가장 최근) 항목을 예산과 상관없이 통째로 넣었다. 포털은 항목을 4,194,304자까지 받으므로
     창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음 턴의 최신 이력이 되어 이후 턴과 자동
-    재시도까지 같은 400 으로 끝났다(새 대화를 열기 전까지)."""
+    재시도까지 같은 400 으로 끝났다(새 대화를 열기 전까지). 좁은 창(16K)은 이력 예산이 아니라 창을 실제로 넘길 때 줄인다 —
+    아래 test_좁은_창도_가장_최근_항목이_창을_넘기면_원문_길이를_적고_줄인다(m1 2차 AF1-dev-hist-cut)."""
     _win(tokens)
     big = "가" * 1_500_000 + "[항목-끝]"
     st: dict = {}
@@ -467,3 +471,79 @@ def test_문서_예산에서_빼는_이력_토큰도_글_전체로_잰다():
     assert app._est_tokens_all(mixed) == _tok_oracle(mixed) > app._est_tokens(mixed) * 3
     src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
     assert '_hist_tokens = _est_tokens_all("".join(c for _, c in _hist_msgs))' in src
+
+
+# ── 좁은 창의 가장 최근 이력 항목 — 창을 실제로 넘길 때만 줄인다(m1 2차 AF1-dev-hist-cut) ─────────────────────────────
+# dev 박스는 창이 16,384토큰이고 .env 의 TOOL_SCHEMA_BUDGET=12000 이라 예비분(DOC_RESERVE_TOKENS 28,000)이 창보다 크다 — 이력 몫이
+# 바닥(1,200토큰·원문 몫 960토큰)이다. 가장 최근 항목을 그 몫에 맞춰 줄이자 3,000자 남짓한 보통 답이 매 턴 약 1,000자로 잘리고
+# '나눠서 다시 보내 주세요' 경고가 떴다(모델의 답인데 사용자에게 다시 보내라고 했다). 종전(968fba2 전)엔 항목 상한까지 실렸다.
+def _dev_box(monkeypatch):
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    monkeypatch.setattr(app, "DOC_RESERVE_TOKENS", 28000)
+    monkeypatch.setattr(app, "HIST_ITEM_MAX", 4000)
+    _win(16384)
+
+
+_ANSWER = "답변 " * 998 + "[답-끝]"        # 2,999자 — 보통 답 하나
+
+
+def test_좁은_창의_가장_최근_항목은_창을_넘기지_않으면_통째로_싣는다(monkeypatch):
+    _dev_box(monkeypatch)
+    st: dict = {}
+    msgs = app._history_messages([{"role": "user", "content": "질문"}, {"role": "assistant", "content": _ANSWER}], st)
+    assert msgs[-1] == ("assistant", _ANSWER), msgs[-1][1][-80:]
+    assert "cut" not in st, st
+
+
+def test_좁은_창도_가장_최근_항목이_창을_넘기면_원문_길이를_적고_줄인다(monkeypatch):
+    """항목 상한(HIST_ITEM_MAX 기본 24,000자)이 16K 창보다 큰 박스 — 한국어 24,000자는 약 22,900토큰이다. 그대로 실으면 그 턴과
+    다음 턴들이 400 으로 끝난다(968fba2 의 시나리오). 좁은 창에서도 이것은 줄이고 원문 길이를 적는다."""
+    monkeypatch.delenv("HIST_BUDGET", raising=False)
+    _win(16384)
+    big = "가" * 1_500_000 + "[항목-끝]"
+    st: dict = {}
+    msgs = app._history_messages([{"role": "user", "content": "질문"}, {"role": "user", "content": big}], st)
+    assert _tok_oracle("".join(c for _, c in msgs)) < 16384 // 2 + 1000, st
+    assert f"{len(big):,}자 중 앞" in msgs[-1][1], msgs[-1][1][-80:]
+    assert st.get("cut") == len(big) and st.get("cut_role") == "user", st
+
+
+class _QuietAgent:
+    async def astream_events(self, inputs, version=None, config=None):
+        yield {"event": "on_chat_model_stream", "data": {"chunk": types.SimpleNamespace(content="네.")}}
+
+    async def ainvoke(self, payload, config=None):
+        return {"messages": [types.SimpleNamespace(type="ai", content="네.")]}
+
+
+def _chat_warnings(monkeypatch, history):
+    async def _fake_agent_for(*_a, **_k):
+        return _QuietAgent()
+
+    monkeypatch.setattr(app, "_agent_for", _fake_agent_for)
+    req = app.ChatRequest(message="이어서", groups=["portal-admin"], history=history)
+
+    async def run():
+        return [c.decode() if isinstance(c, bytes) else str(c) async for c in app._agent_stream(app.app, req)]
+
+    out = []
+    for chunk in asyncio.run(run()):
+        if chunk.startswith("event: warning\n"):
+            out.append(json.loads(chunk.split("data: ", 1)[1]))
+    return [w for w in out if w.get("code") == "history_item_cut"]
+
+
+def test_직전_답을_줄였으면_경고는_직전_답의_앞부분만_실었다고_말한다(monkeypatch):
+    """줄인 것이 모델의 답이면 '나눠서 다시 보내 주세요' 는 틀린 말이다 — 사용자가 보낸 글이 아니다."""
+    _win(_BIG)
+    big = "가" * 1_500_000 + "[답-끝]"
+    warn = _chat_warnings(monkeypatch, [{"role": "user", "content": "질문"}, {"role": "assistant", "content": big}])
+    assert len(warn) == 1, warn
+    assert "직전 답의 앞부분만 이력에 실었" in warn[0]["message"] and "다시 보내" not in warn[0]["message"], warn
+
+
+def test_사용자_글을_줄였으면_경고는_종전_문구다(monkeypatch):
+    _win(_BIG)
+    big = "가" * 1_500_000 + "[글-끝]"
+    warn = _chat_warnings(monkeypatch, [{"role": "user", "content": big}])
+    assert len(warn) == 1 and "나눠서 다시 보내 주세요" in warn[0]["message"], warn

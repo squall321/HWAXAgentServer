@@ -2042,8 +2042,8 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     HIST_MAX_ITEMS. 전체는 최신 것 우선으로 예산 안에 담고, **밀려난 오래된 턴은 버리지 않고
     압축본 한 덩어리로** 맨 앞에 넣는다(_compact_turns).
 
-    stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다. 가장 최근 항목 하나가
-    원문 몫(verbatim)을 넘어 줄였으면 "cut"(그 항목의 원문 길이)도 채운다.
+    stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다. 가장 최근 항목 하나를
+    줄였으면 "cut"(그 항목의 원문 길이)과 "cut_role"(user·assistant — 경고 문구를 가른다)도 채운다.
     """
     items: list[tuple[str, str]] = []
     raws: list[str] = []                    # 항목 상한 전의 원문 — 최근 항목을 다시 줄일 때 원문 길이를 적는다
@@ -2070,7 +2070,7 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     kept: list[tuple[str, str]] = []
     used = used_tok = 0
     cut = len(items)                        # 이 앞의 것들이 압축 대상
-    item_cut = 0
+    item_cut, item_role = 0, ""
     for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
         role, content = items[idx]
         tok = _est_tokens_all(content)
@@ -2080,11 +2080,16 @@ def _history_messages(history: list[dict], stats: dict | None = None,
             # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
             # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
             # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
-            raw = raws[idx]
-            content = _fit_tokens(lambda c: _cut_mark(raw, c), max(1, verbatim_budget - _CUT_MARK_ROOM),
-                                  verbatim_tok, 1)[0]
-            item_cut = len(raw)
-            tok = _est_tokens_all(content)
+            # 좁은 창은 항목 상한(HIST_ITEM_MAX)이 이미 묶으므로 그 항목이 창을 실제로 넘길 때만(_hist_item_room_tokens)
+            # 그 문턱까지 줄인다 — 원문 몫에 맞추면 예비분이 창보다 큰 dev 16K 에서 몫이 바닥(960토큰)이라, 보통 답 하나가
+            # 매 턴 약 1,000자로 잘렸다(m1 2차 AF1-dev-hist-cut).
+            room = verbatim_tok if _wide() else _hist_item_room_tokens(verbatim_tok)
+            if _wide() or tok > room:
+                raw = raws[idx]
+                chars = verbatim_budget if _wide() else _chars_for_tokens(raw, room)
+                content = _fit_tokens(lambda c: _cut_mark(raw, c), max(1, chars - _CUT_MARK_ROOM), room, 1)[0]
+                item_cut, item_role = len(raw), role
+                tok = _est_tokens_all(content)
         kept.append((role, content))
         used += len(content)
         used_tok += tok
@@ -2099,8 +2104,17 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     if stats is not None:
         stats.update(kept=len(items) - cut, compacted=cut, budget=budget)
         if item_cut:
-            stats["cut"] = item_cut
+            stats["cut"], stats["cut_role"] = item_cut, item_role
     return kept
+
+
+def _hist_item_room_tokens(verbatim_tok: int) -> int:
+    """좁은 창에서 가장 최근 이력 항목 하나를 줄이는 문턱(토큰) — 그 항목 하나로 창을 넘길 때다. 창 − 예비분이고, 예비분은
+    창의 절반까지만 본다. 예비분(DOC_RESERVE_TOKENS)은 도구 스키마 예산에서 유도한 위쪽 어림이라 좁은 박스에서 창보다 클 수
+    있다(dev 16K 는 TOOL_SCHEMA_BUDGET=12000 이라 28,000) — 그대로 빼면 문턱이 음수가 되어 모든 항목을 줄인다. 원문 몫보다 작아지지
+    않는다(넓은 창은 이 문턱을 쓰지 않는다)."""
+    ctx = _model_context_tokens()
+    return max(verbatim_tok, ctx - min(DOC_RESERVE_TOKENS, ctx // 2))
 
 
 # 핸드오프(챗→심의)용 도구 결과 길이. 화면 미리보기(220)와 **일부러 분리한다** —
@@ -3038,10 +3052,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                           f"발췌로 압축해 넣었습니다(최근 {_hstat['kept']}턴은 원문)",
                                   "tool": None})
         if _hstat.get("cut"):
+            # 줄인 것이 모델의 답이면 '나눠서 다시 보내 주세요' 는 틀린 말이다 — 사용자가 보낸 글이 아니다.
             yield _sse("warning", {"code": "history_item_cut",
-                                   "message": f"가장 최근 대화 항목이 {_hstat['cut']:,}자라 이력 예산"
-                                              f"({_hstat['budget']:,}자)을 넘어 앞부분만 실었습니다 — 뒷부분이 "
-                                              "필요하면 나눠서 다시 보내 주세요.",
+                                   "message": (f"직전 답이 {_hstat['cut']:,}자라 모델 창에 맞추느라 직전 답의 앞부분만 "
+                                               "이력에 실었습니다 — 그 답의 뒷부분은 이번 턴의 모델이 보지 못합니다."
+                                               if _hstat.get("cut_role") == "assistant" else
+                                               f"가장 최근 대화 항목이 {_hstat['cut']:,}자라 이력 예산"
+                                               f"({_hstat['budget']:,}자)을 넘어 앞부분만 실었습니다 — 뒷부분이 "
+                                               "필요하면 나눠서 다시 보내 주세요."),
                                    "knob": "HIST_CTX_SHARE_SOLO·HIST_CTX_SHARE(이력 몫)"})
         # 글 전체로 잰다 — 앞 20,000자 표본(_est_tokens)은 압축본·영문 로그가 머리인 한국어 이력을 3분의 1 로 센다.
         _hist_tokens = _est_tokens_all("".join(c for _, c in _hist_msgs))
