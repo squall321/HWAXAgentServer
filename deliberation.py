@@ -2887,7 +2887,7 @@ def knowledge_line(h, limit: int = 700) -> str:
     return _cut_mark(f"• [{head}]{src}{tag} {str(body).strip()}", limit)
 
 
-_KN_MARK = 32           # 줄인 줄 끝의 ' …[N자 중 앞 M자]' 표식 몫(자) — 표식은 원문 1억 자 미만이면 27자를 넘지 않는다
+_KN_MARK = 32           # 줄인 줄 끝의 ' …[N자 중 앞 M자]' 표식 몫(자) — 표식은 원문 1억 자 미만이면 31자를 넘지 않는다
 _KN_LINE_FLOOR = 300    # 줄인 카드가 남기는 앞부분의 바닥(자) — 몫이 이보다 작아지면 순위가 낮은 카드부터 뺀다(머리만 남지 않게)
 
 
