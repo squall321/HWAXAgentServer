@@ -95,6 +95,7 @@ from deliberation import (
     strip_test_plan_trigger,
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
+from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
@@ -1205,7 +1206,9 @@ def _prep_tool(tool, result_max=None, desc_max=None):
 # 명시적으로 TOOL_MAX=0 을 주면 종전처럼 전체 바인딩(탈출구 유지).
 TOOL_MAX = int(os.environ.get("TOOL_MAX", "200"))
 # 그래프 재귀 한도 — 미설정 시 LangGraph 기본(25)에 걸려 턴 전체가 폐기된다. 넉넉히 두되
-# 무한은 아니게. 도구 왕복 1회가 노드 2~3개를 쓴다.
+# 무한은 아니게. 도구 왕복 1회가 노드 둘(agent·tools)을 쓴다 — 80 이면 연속 왕복 39회가 끝까지 돌고, 40번째 호출은
+# langgraph 가 'need more steps' 로 막아 턴이 정상으로 끝난다. ⚠ 그래프에 노드를 더 끼우지 마라(pre_model_hook 등) —
+# 왕복마다 한 단계를 더 써 25회로 줄고, agent 노드의 잔여 단계 검사를 비켜 GraphRecursionError 로 턴이 죽는다(m1 3차).
 AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "80"))
 # 같은 도구·같은 인자 반복 호출 경고 임계 — 작은 모델의 루프를 사용자에게 드러낸다.
 TOOL_REPEAT_WARN = int(os.environ.get("TOOL_REPEAT_WARN", "3"))
@@ -1933,8 +1936,9 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         if not load_failed:
             # 성공했으면 이 그룹셋의 과거 오류를 지운다(다른 그룹셋 상태는 건드리지 않는다).
             app.state.tool_load_error.pop(frozenset(groups), None)
-        # 모델 호출마다 쌓인 메시지를 재어 창을 넘으면 오래된 도구 결과부터 줄인다(_loop_fit_hook — 넓은 창).
-        agent = create_react_agent(app.state.llm, tools, pre_model_hook=_loop_fit_hook)
+        # 모델 호출마다 쌓인 메시지를 재어 창을 넘으면 오래된 도구 결과부터 줄인다(_loop_fit_prompt — 넓은 창). agent 노드
+        # 안에서 줄인다 — pre_model_hook 은 별도 노드라 왕복마다 그래프 단계를 하나 더 쓴다(AGENT_RECURSION_LIMIT 주석).
+        agent = create_react_agent(app.state.llm, tools, prompt=_loop_fit_prompt)
         # 실제로 묶인 도구 이름을 달아 둔다. 호출부가 "N종 우선 바인딩" 같은 말을 하려면
         # **묶인 것**을 알아야 하는데, prefer 는 그룹 필터 없는 /tools-map(465종)에서 뽑은
         # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
@@ -1985,12 +1989,12 @@ def _loop_room_tokens() -> int:
     return min(int(TOOL_RESULT_MAX / 1.05) + 1, max(0, _model_context_tokens() - DOC_RESERVE_TOKENS) // 2)
 
 
-# 챗 ReAct 루프의 모델 호출 전 훅 — 한 턴에 큰 도구 결과를 여럿 받아도 창을 넘기지 않는다. 위 몫(_loop_room_tokens)은 결과 **한 건**
+# 챗 ReAct 루프의 모델 입력 맞추기 — 한 턴에 큰 도구 결과를 여럿 받아도 창을 넘기지 않는다. 위 몫(_loop_room_tokens)은 결과 **한 건**
 # 분이라, 이력이 찬 긴 대화에서 큰 조회를 두 번 하거나(TOOL_RESULT_MAX 200,000자 둘) 12만 자급을 세 번 하면 루프 안에서 창을 넘어
 # 400 으로 턴이 통째로 실패했고, 자동 재시도 둘도 같은 이력으로 같은 400 이었다(m1 2차 AF1-loop-room-single). 운영 창은
 # 1,048,576 토큰이고 지침은 '자르지 않는다' 라 평소엔 아무것도 건드리지 않는다 — 쌓인 메시지의 추정 토큰이 창 − 예비분
 # (DOC_RESERVE_TOKENS — 도구 스키마·출력 몫)을 넘을 때만 **오래된 도구 결과부터** 원문 길이 표식을 달고 넘는 만큼 줄인다.
-# 대화 상태는 그대로 두고 모델에 가는 글(llm_input_messages)만 바꾸므로, 호출마다 원문에서 다시 잰다. 줄였으면 사건
+# 대화 상태는 그대로 두고 모델에 가는 글(agent 노드의 prompt 가 돌려주는 메시지)만 바꾸므로, 호출마다 원문에서 다시 잰다. 줄였으면 사건
 # (hwax_loop_fit)을 내고 챗 스트림이 경고(loop_results_cut)로 바꾼다. 좁은 창은 종전대로 손대지 않는다 — 작은 박스는
 # .env 로 TOOL_RESULT_MAX 를 낮추고(_loop_room_tokens 와 같은 약속), 예비분이 창보다 큰 박스(dev 16K)는 이 문턱이 음수다.
 _LOOP_FIT_EVENT = "hwax_loop_fit"
@@ -2042,15 +2046,17 @@ def _fit_loop_messages(msgs: list) -> tuple[list, dict | None]:
     return out, {"n": n, "chars": chars, "before": before, "after": limit + excess, "limit": limit}
 
 
-async def _loop_fit_hook(state, config):
-    """create_react_agent 의 pre_model_hook — _fit_loop_messages 를 모델 입력에만 건다. 줄였으면 사건을 낸다(챗이 경고로 바꾼다).
+async def _loop_fit_prompt(state, config):
+    """create_react_agent 의 prompt — agent 노드 안에서 모델 직전에 돌아 _fit_loop_messages 를 모델 입력에만 건다(돌려준
+    메시지는 모델에만 가고 대화 상태에는 응답만 더해진다). 줄였으면 사건을 낸다(챗이 경고로 바꾼다).
+    ⚠ pre_model_hook 으로 달지 마라 — 별도 노드라 왕복마다 그래프 단계를 하나 더 써 연속 왕복이 39회 → 25회로 준다.
     config 를 넘긴다 — 파이썬 3.10 은 비동기 사건에 실행 맥락이 저절로 따라가지 않는다."""
     fitted, info = _fit_loop_messages(state["messages"])
     if info:
         print(f"[agent] 루프 메시지 {info['before']:,}토큰이 창 몫 {info['limit']:,}토큰을 넘어 오래된 도구 결과 "
               f"{info['n']}건을 줄였다(→ {info['after']:,}토큰)")
         await adispatch_custom_event(_LOOP_FIT_EVENT, info, config=config)
-    return {"llm_input_messages": fitted}
+    return fitted
 
 
 def _hist_budget_tokens(has_docs: bool = False) -> int:
@@ -3146,7 +3152,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
         # blocked: 유령 ID 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
-        _loop_fit_told = 0      # 루프 훅이 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
+        _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
         async for event in agent.astream_events(inputs, version="v2", config=_cfg):
             kind = event["event"]
@@ -3178,7 +3184,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                         _post_tool_chars += len(content)
                         yield _sse("token", {"delta": content})
             elif kind == "on_custom_event" and event.get("name") == _LOOP_FIT_EVENT:
-                # 루프 훅(_loop_fit_hook)이 창을 넘는 도구 결과를 줄였다 — 모델만 알고 화면·대화 기록엔 없던 일이다.
+                # 루프 입력 맞추기(_loop_fit_prompt)가 창을 넘는 도구 결과를 줄였다 — 모델만 알고 화면·대화 기록엔 없던 일이다.
                 _fit = event.get("data") or {}
                 if _fit.get("n", 0) > _loop_fit_told:
                     _loop_fit_told = _fit["n"]
@@ -3300,13 +3306,23 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         # 스트리밍 청크 한도에 걸린 것이면 '내부 오류' 가 아니라 그 한도를 말한다 — 곧바로 다시 보내면 밀린 LLM 에
         # 한 건을 더 얹을 뿐이다. '응답이 여기서 중단되었습니다' 는 그대로 둔다(_INTERRUPTED_RE 가 끊긴 턴을 이 글로 안다).
         _chunk_why = _stream_chunk_limit_note(exc)
+        # 그래프 재귀 한도 — 일시 장애가 아니다. 같은 한도로 다시 부르면 같은 도구를 처음부터 다시 실행하고(부작용 있는 도구도)
+        # 같은 자리에서 또 걸린다. 그래서 자동 재시도하지 않고, 끊긴 턴 표지(_INTERRUPTED_RE)도 달지 않는다 — '계속' 재촉이
+        # 원래 질문을 처음부터 다시 돌려 같은 도구를 또 실행한다(m1 3차).
+        _loop_cap = (f"한 턴의 도구 왕복 상한(AGENT_RECURSION_LIMIT={AGENT_RECURSION_LIMIT} — 연속 왕복 약 "
+                     f"{max(0, (AGENT_RECURSION_LIMIT - 1) // 2)}회)에 걸려 답을 끝내지 못했습니다{detail}. 같은 질문을 그대로 "
+                     "다시 보내면 같은 도구를 처음부터 다시 실행합니다 — 범위를 나눠 물어 주세요."
+                     if isinstance(exc, GraphRecursionError) else "")
         if _partial:
-            _note = ((f"\n\n⚠ {_chunk_why}. 응답이 여기서 중단되었습니다{detail}. "
+            _note = (f"\n\n⚠ {_loop_cap}" if _loop_cap else
+                     (f"\n\n⚠ {_chunk_why}. 응답이 여기서 중단되었습니다{detail}. "
                       "잠시 후 같은 질문을 다시 보내 주세요 — 질문을 바꿔도 해결되지 않습니다.") if _chunk_why else
                      ("\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다"
                       f"{detail}. 같은 질문을 다시 보내면 재시도합니다."))
             yield _sse("token", {"delta": _note})
             yield _sse("result", {"type": "text", "content": _partial + _note})
+        elif _loop_cap:
+            yield _sse("error", {"code": "tool_loop_limit", "message": _loop_cap})
         else:
             # 부분 응답조차 없으면 사용자는 오류 한 줄만 받는다. 일시적 실패(스트림 끊김·
             # 상류 5xx·파서 오류)가 대부분이라 한 번은 자동으로 다시 해 본다 — 사용자가
