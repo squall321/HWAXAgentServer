@@ -103,6 +103,48 @@ written next to every ledger write) instead of the full ledger, which grows to M
 index carries the ledger's mtime and size; a stale or missing index is rebuilt from the ledger on the next
 read, so the `list/` folder is derived data and may be deleted.
 
+### Card review
+
+`card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review
+redesign M2, `HWAXPortal/docs/risk-review-redesign/M2.md` §4 is the contract). The risk app calls it through
+the portal relay `/agent/card-review/*`, which overwrites the four identity fields (`groups`, `user_email`,
+`user_pat`, `entitlements`). Not a meeting: no tools, no seats, one LLM call per request (plus repairs).
+
+| route | what |
+|---|---|
+| `GET /card-review/limits` | Budgets derived from the context window (`ctx_source` = `server` · `env` · `fallback`, `ctx_retrying`), `runnable{}` and `ctx_too_small` when the window is too small (units are never re-split), versions (`prompt_rev`, `norm_rev`, `limits_rev`) and `gate{limit, limit_reason, active}`. |
+| `POST /card-review/pack` | `{agent_key}` → all of the expert's cards, normalised (`pack_hash`). User PAT only — a rejected PAT stops with `credential_*`, it never falls back to the service account. |
+| `POST /card-review/plan` | `{cards[{alias, record_id, checkable, chars}], units[{unit_id, manifest_chars, body_chars}]}` → verdict decks, sweep decks, manifest pages, `oversize`, `soft_over`, planned against the current `limits_rev`. |
+| `POST /card-review/run` | One call (`kind` = `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`). SSE: `status{step:"attempt", n}` · `ping{idle_s, ts}` · `result` · `error{code, message, infra, retryable, knob?}` · `done`. No `hello` frame. |
+
+Request models are `extra="forbid"`: an undeclared field is a 422 `unknown_fields` naming it, not silently
+dropped. Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
+`unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,
+409 `rev_mismatch` (the request's `expect{prompt_rev, limits_rev}` differs), 403 `denied` (no
+`feat:deliberation`). Engine error codes in the stream: `review_busy`, `llm_unreachable`, `llm_timeout`,
+`llm_error`, `llm_misconfigured`, `llm_rejected`, `context_overflow`, `truncated_empty`, `no_rows`.
+
+There is **no queue**: when the gate is full the stream answers `error{review_busy, retry_after_s}` → `done`
+at once and the caller retries later without counting it. Card-review calls are **not** counted in
+`delib_active` / `delib_queued` and do not hold a restart back (a cut call is re-issued by the risk app);
+`/health` reports them separately as `review_active`, `capabilities: ["card_review"]` and
+`card_review{limit, limit_reason, active, timeout_s, tries, attempts_max, request_worst_s, prompt_rev, totals, last_error}`.
+Closing the stream cancels the running LLM call and frees the slot.
+
+It uses the deliberation LLM (`DELIB_*`) as is. Worst case of one request = (1 + `CARD_REVIEW_PARSE_RETRIES`)
+× ((1 + `DELIB_LLM_MAX_RETRIES`) × `DELIB_TIMEOUT_S` + 8) = 10824 s by default (`request_worst_s`); the risk
+app's per-call wall clock must stay above it. These knobs are deliberately not in the *Time limits* table yet
+(the portal's env kit test reads that table; merging the chains is M3 `WP5a P3`).
+
+| var | default | meaning |
+|---|---|---|
+| `CARD_REVIEW_K` | `8` | Most cards in one verdict call (also capped by the output budget, `verdict.k_out`). |
+| `CARD_REVIEW_SHARE_VERDICT` · `_SWEEP` · `_OFFCARD` | `0.25` · `0.50` · `0.30` | Share of the window each kind aims for. Going over is flagged (`soft_over`), not refused; the hard refusal is the window itself (`p_hard`). |
+| `CARD_REVIEW_CONCURRENCY` | `4` | Card-review calls running at once in this process. |
+| `CARD_REVIEW_CONCURRENCY_WITH_DELIB` | `2` | The same while a deliberation is running (clamped to the value above). |
+| `CARD_REVIEW_RETRY_AFTER_S` | `30` | `retry_after_s` in a `review_busy` answer. |
+| `CARD_REVIEW_PARSE_RETRIES` | `2` | Repair calls for missing rows, unreadable lines, out-of-vocabulary values and failed quotes. A failure during a repair ends with `result` and `quality.repair_error` (rows already received are kept). |
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the

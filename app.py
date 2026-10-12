@@ -378,6 +378,8 @@ async def lifespan(app: FastAPI):
     app.state.delib_timeout_s = d_to
     app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff, _r=d_rt: _mk_llm(_t, _m, _e, ts, _r))
     app.state.llm_nostream = disable_stream
+    if _card_review is not None:
+        _card_review.gate_of(app)    # 카드 대조 관문 — 평소 CARD_REVIEW_CONCURRENCY, 심의가 돌면 _WITH_DELIB(수만 센다)
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
@@ -444,6 +446,16 @@ except Exception as _exc:  # noqa: BLE001
 app = FastAPI(title="HWAX Agent Server", version="0.3.0", lifespan=lifespan)
 if _DELIB_MCP is not None:
     app.mount("/mcp", _DELIB_MCP, name="delib-mcp")
+# 카드 대조(리스크 심사 재설계 M2 — /card-review/{limits,pack,plan,run}). import 가 실패해도 기동은 계속하고 /health 의
+# capabilities 에서 빠지며 사유를 싣는다(X2-15) — 챗·심의는 이 모듈과 무관하다. 리스크 앱은 capabilities 를 보고 판을 가른다.
+try:
+    import card_review as _card_review
+    app.include_router(_card_review.router)
+    _CARD_REVIEW_ERR = ""
+except Exception as _exc:  # noqa: BLE001
+    logging.getLogger("agent").warning("[agent] 카드 대조 비활성 — %r", _exc)
+    _card_review = None
+    _CARD_REVIEW_ERR = f"{type(_exc).__name__}: {_exc}"[:300]
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
@@ -4630,6 +4642,18 @@ def _delib_load() -> tuple[int, int]:
         return active, 0
 
 
+def _card_review_health() -> dict:
+    """/health 의 카드 대조 칸 — review_active · capabilities · card_review{…}. 모듈을 못 붙였거나 셈이 실패하면 capabilities 를
+    비우고 사유를 싣는다(/health 는 늘 답한다)."""
+    if _card_review is None:
+        return {"review_active": 0, "capabilities": [], "card_review": {"error": _CARD_REVIEW_ERR}}
+    try:
+        fields = _card_review.health_fields(app)
+    except Exception as exc:  # noqa: BLE001
+        return {"review_active": 0, "capabilities": [], "card_review": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
+    return {"review_active": fields["active"], "capabilities": ["card_review"], "card_review": fields}
+
+
 @app.get("/health")
 def health() -> dict:
     _active, _queued = _delib_load()
@@ -4639,6 +4663,8 @@ def health() -> dict:
         # 재기동을 건너뛴다(강행은 AGENT_RESTART_FORCE=1). 이름을 바꾸면 그쪽이 '모름' 으로 읽고 그대로 내린다.
         "delib_active": _active,
         "delib_queued": _queued,
+        # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
+        **_card_review_health(),
         "model": VLLM_MODEL,
         "vllm": VLLM_BASE_URL,
         "mcp": list(getattr(app.state, "connections", {})),

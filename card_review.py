@@ -20,6 +20,11 @@ import json
 import os
 import re
 import time
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from deliberation import (
     _CHAIR_RESERVE,
@@ -32,6 +37,8 @@ from deliberation import (
     _call,
     _dom_of,
     _first_dict,
+    _llm_fail_note,
+    _llm_limit,
     _norm_ws,
     _parse_json,
     _tools_by_name,
@@ -479,8 +486,7 @@ def _str(v) -> str:
 def build_ctx(req: dict, lim: dict) -> dict:
     """요청 하나 → 별칭 표(ctx). 계약에 안 맞으면 RequestError(bad_request·unsupported_kind·unsupported_unit_kind·
     empty_unit·deck_too_large). 카드는 팩의 별칭(K01…)을 그대로 쓰고, 줄은 변경 → 문맥 → 근거 순으로 L01… 을 잇는다."""
-    if not isinstance(req, dict):
-        raise RequestError("bad_request", "요청 본문이 객체가 아니다")
+    check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
         raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다")
@@ -1744,11 +1750,11 @@ def gate_of(app):
 
 
 def prepare(req: dict, lim: dict) -> dict:
-    """스트림을 열기 전의 거절을 한 자리에서 — 종류(unsupported_kind)·판(409 rev_mismatch)·창(ctx_too_small)·요청과 조립
-    (build_prompt 의 422 — over_budget 포함). 지나면 run() 이 받는 준비물 {req, lim, system, human, ctx} 다.
+    """스트림을 열기 전의 거절을 한 자리에서 — 모양(unknown_fields·bad_request)·종류(unsupported_kind)·판(409 rev_mismatch)·
+    창(ctx_too_small)·요청과 조립(build_prompt 의 422 — over_budget 포함). 지나면 run() 이 받는 준비물
+    {req, lim, system, human, ctx} 다.
     요청의 expect{prompt_rev, limits_rev} 는 준 것만 견준다(안 주면 견주지 않는다)."""
-    if not isinstance(req, dict):
-        raise RequestError("bad_request", "요청 본문이 객체가 아니다")
+    check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
         raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다")
@@ -1785,8 +1791,6 @@ def classify(exc: BaseException, llm, *, est_tokens: int, lim: dict) -> dict:
     """LLM 호출 실패 → error 프레임 칸 {code, message, infra, retryable, knob?, status?, …}. 부류는 상태 코드와 예외
     사슬로 가르고 문구는 엔진의 _llm_fail_note 를 쓴다(P-13). 400·413·422 는 문구와 무관하게 infra 가 아니다 — 그 가운데
     추정 토큰 + 출력 몫이 창의 85% 이상이면 context_overflow(다시 쪼개지 않는다 — D-22), 아니면 llm_rejected 다."""
-    from deliberation import _llm_fail_note  # noqa: PLC0415
-
     status = _http_status(exc)
     raw = f"{type(exc).__name__}: {exc}"[:200]
     extra: dict = {}
@@ -2030,3 +2034,240 @@ async def run(app, prep: dict):
         # 호출당 한 줄 — 본문(카드·변경 줄)은 찍지 않는다.
         print(f"[card_review] {tag} chars={ctx['prompt_chars']:,} attempts={len(per)} "
               f"{time.monotonic() - t0:.1f}s → {st['outcome']}")
+
+
+
+# ── 요청 모델·검증 ───────────────────────────────────────────────────────────
+# 선언하지 않은 칸은 조용히 버리지 않고 422 unknown_fields 로 거절한다 — 앱이 칸 이름을 바꾸거나(extra → extras) 새 칸을 실었는데
+# 서버가 모르는 판이면, 그 칸이 프롬프트에서 말없이 빠진 채 '검토함' 이 된다(포털 ChatRequest 의 칸 유실 사고와 같은 뿌리).
+# 모델은 모양만 본다 — 프롬프트는 보낸 사전 그대로로 만든다(model_dump 를 거치지 않아 기본값이 끼거나 칸이 빠지지 않는다).
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _Ident(_Strict):
+    """포털이 검증된 주체로 덮어쓰는 신원 칸 넷(호출자가 보낸 값은 포털이 버린다). entitlements 가 None 이면 옛 호출이다."""
+    groups: list[str] | None = None
+    user_email: str | None = None
+    user_pat: str | None = None
+    entitlements: list[str] | None = None
+
+
+class RunExpert(_Strict):
+    key: str
+    name: str = ""
+    domain: str = ""
+    role: str = ""
+
+
+class RunLine(_Strict):
+    ref: str
+    text: str
+    owner_unit: str = ""
+
+
+class RunUnit(_Strict):
+    """리스크 앱 units.review_payload 의 출력 그대로(M2.md 4.3, m2-wp2 걸음 5). 해시·상태 칸은 프롬프트에 쓰지 않고 input_sha 에만 든다."""
+    unit_id: str
+    kind: str = ""
+    title: str = ""
+    summary: str = ""
+    notes: str = ""
+    lines: list[RunLine] = []
+    context: list[RunLine] = []
+    evidence: list[RunLine] = []
+    missing: list[dict] = []
+    unit_hash: Any = None
+    summary_sha: Any = None
+    evidence_sha: Any = None
+    evidence_status: Any = None
+    input_gaps: Any = None
+
+
+class RunManifestItem(_Strict):
+    unit_id: str
+    kind: str = ""
+    title: str = ""
+    text: str = ""
+
+
+class RunExtra(_Strict):
+    domains: list[dict] = []
+    mechanisms: list[dict] = []
+    known: list[dict] = []
+
+
+class Expect(_Strict):
+    prompt_rev: str | None = None
+    limits_rev: str | None = None
+
+
+class RunRequest(_Ident):
+    kind: str
+    variant: str | None = None
+    target_key: str = ""
+    expert: RunExpert
+    cards: list[dict] = []
+    digest: list[dict] = []
+    unit: RunUnit | None = None
+    manifest: list[RunManifestItem] = []
+    extra: RunExtra | None = None
+    expect: Expect | None = None
+
+
+class PackRequest(_Ident):
+    agent_key: str
+
+
+class PlanCard(_Strict):
+    alias: str
+    record_id: str = ""
+    checkable: bool
+    chars: int
+
+
+class PlanUnit(_Strict):
+    unit_id: str
+    manifest_chars: int = 0
+    body_chars: int = 0
+
+
+class PlanRequest(_Ident):
+    cards: list[PlanCard] = []
+    units: list[PlanUnit] = []
+    expect: Expect | None = None
+
+
+def check_shape(model, body) -> None:
+    """요청 모양 — 선언 밖 칸이 있으면 unknown_fields, 그 밖에 틀리면 bad_request(둘 다 422)."""
+    if not isinstance(body, dict):
+        raise RequestError("bad_request", "요청 본문이 JSON 객체가 아니다")
+    try:
+        model.model_validate(body)
+    except ValidationError as exc:
+        errs = [{"loc": ".".join(str(x) for x in e["loc"]), "type": e["type"], "msg": e["msg"]}
+                for e in exc.errors(include_url=False)]
+        extra = [e["loc"] for e in errs if e["type"] == "extra_forbidden"]
+        if extra:
+            raise RequestError("unknown_fields", f"선언하지 않은 칸 {len(extra)}개({', '.join(extra[:20])}) — 조용히 버리지 "
+                               "않고 거절한다. 앱과 에이전트 서버의 판이 섞였는지 본다", fields=extra, errors=errs[:20]) from None
+        raise RequestError("bad_request", f"요청 모양이 계약과 다르다 — {errs[0]['loc']}: {errs[0]['msg']}",
+                           errors=errs[:20]) from None
+
+
+def validate_run_request(body, lim: dict | None = None) -> list:
+    """app 없이 부를 수 있는 run 요청 검증 — 문제 목록([{status, code, message, …}], 비면 통과). lim(limits() 의 응답)을
+    주면 판·창·조립(over_budget)까지 본다. 리스크 앱 시험이 형제 리포 경로에서 서브프로세스로 부른다(WP5b 3.5)."""
+    try:
+        if lim is None:
+            check_shape(RunRequest, body)
+        else:
+            prepare(body, lim)
+    except RequestError as exc:
+        return [{"status": exc.status, **exc.body()}]
+    return []
+
+
+# ── 라우트 ───────────────────────────────────────────────────────────────────
+# GET /limits · POST /pack · POST /plan · POST /run(SSE). 앱(app.py)이 include_router 한 줄로 붙인다. 스트림을 열기 전의
+# 거절은 상태 코드와 JSON {code, message, …}(422·409·403), 연 뒤의 실패는 error 프레임이다.
+router = APIRouter(prefix="/card-review", tags=["card-review"])
+FEATURE = "feat:deliberation"
+
+
+async def limits_now(app) -> dict:
+    """이 박스의 지금 예산 — 창은 app._model_context_state()(동기 httpx 라 스레드에서 — P-10), 출력 상한은 delib_llm 의
+    max_tokens(DELIB_MAX_TOKENS), 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다)."""
+    import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+
+    state = await asyncio.to_thread(_a._model_context_state)
+    mt = getattr(getattr(app.state, "delib_llm", None), "max_tokens", None)
+    lim = limits(state["tokens"], state["source"], mt if isinstance(mt, int) and not isinstance(mt, bool) else 0,
+                 retrying=state["retrying"], model=_a.VLLM_MODEL)
+    snap = gate_of(app).snapshot()
+    lim["gate"] = {k: snap[k] for k in ("limit", "limit_reason", "active")}
+    return lim
+
+
+def _reject(exc, where: str) -> JSONResponse:
+    print(f"[card_review] {where} 거절 {exc.status} {exc.code}")
+    return JSONResponse(exc.body(), status_code=exc.status)
+
+
+async def _read(request: Request, model) -> dict:
+    """본문 → 사전. JSON 이 아니면 bad_request, 권한(entitlements 에 feat:deliberation 이 없음)은 403 denied — 모양보다 먼저
+    본다(entitlements 가 None 이면 옛 호출이라 통과 — app._denied_feature 와 같은 규칙). 그다음 모양(422)."""
+    raw = await request.body()
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError as exc:
+        raise RequestError("bad_request", f"본문이 JSON 이 아니다 — {exc}") from None
+    ent = body.get("entitlements") if isinstance(body, dict) else None
+    if isinstance(ent, list) and FEATURE not in ent:
+        raise RequestError("denied", f"카드 대조에는 '{FEATURE}'(전문가 심의) 권한이 있어야 한다", status=403, need=FEATURE)
+    check_shape(model, body)
+    return body
+
+
+@router.get("/limits")
+async def get_limits(request: Request):
+    return JSONResponse(await limits_now(request.app))
+
+
+@router.post("/pack")
+async def post_pack(request: Request):
+    try:
+        body = await _read(request, PackRequest)
+        pack = await make_pack(request.app, body["agent_key"], groups=body.get("groups") or [],
+                               user_email=body.get("user_email") or "", user_pat=body.get("user_pat") or "")
+    except (RequestError, PackError) as exc:
+        return _reject(exc, "pack")
+    print(f"[card_review] pack {pack['agent_key']} cards={pack['cards_total']} unrenderable={len(pack['unrenderable'])}")
+    return JSONResponse(pack)
+
+
+@router.post("/plan")
+async def post_plan(request: Request):
+    try:
+        body = await _read(request, PlanRequest)
+        lim = await limits_now(request.app)
+        want = (body.get("expect") or {}).get("limits_rev")
+        if want not in (None, lim["limits_rev"]):
+            raise RequestError("rev_mismatch", f"요청이 기대한 limits_rev({want})가 이 서버의 판({lim['limits_rev']})과 "
+                               "다르다 — limits 를 다시 받고 계획을 다시 짠다", status=409, limits_rev=lim["limits_rev"],
+                               expect=body.get("expect"))
+    except RequestError as exc:
+        return _reject(exc, "plan")
+    out = plan(body.get("cards") or [], body.get("units") or [], lim)
+    if lim.get("ctx_too_small"):
+        out["ctx_too_small"] = lim["ctx_too_small"]
+    return JSONResponse(out)
+
+
+@router.post("/run")
+async def post_run(request: Request):
+    app = request.app
+    try:
+        body = await _read(request, RunRequest)
+        prep = prepare(body, await limits_now(app))
+    except RequestError as exc:
+        if exc.code == "over_budget":
+            gate_of(app).note("over_budget")
+        return _reject(exc, "run")
+    from app import SSE_HEADERS  # noqa: PLC0415
+
+    return StreamingResponse(run(app, prep), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+def health_fields(app) -> dict:
+    """/health.card_review — 관문(상한·사유·도는 수), 이 박스에 실제로 걸린 LLM 한도로 셈한 요청 최악(초), 판, 끝의 셈.
+    request_worst_s = (1 + CARD_REVIEW_PARSE_RETRIES) × (시도 수 × DELIB_TIMEOUT_S + 8) 이고 한도가 꺼진 박스는 None 이다
+    (리스크 앱의 호출 벽시계가 이보다 커야 구체적인 사유가 먼저 온다)."""
+    snap = gate_of(app).snapshot()
+    read, tries = _llm_limit(getattr(app.state, "delib_llm", None))
+    attempts = 1 + _parse_retries()
+    return {"rev": API_REV, "kinds": list(KINDS), "limit": snap["limit"], "limit_reason": snap["limit_reason"],
+            "active": snap["active"], "retry_after_s": snap["retry_after_s"],
+            "timeout_s": read or None, "tries": tries or None, "attempts_max": attempts,
+            "request_worst_s": round(attempts * (tries * read + 8)) if read > 0 and tries > 0 else None,
+            "prompt_rev": dict(PROMPT_REV), "totals": snap["totals"], "last_error": snap["last_error"]}
