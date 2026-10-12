@@ -52,5 +52,16 @@
    "code": "credential_rejected",
    "message": "게이트웨이가 사용자 토큰을 거절했다(만료·폐기) — 서비스 계정으로 내려가지 않는다. 포털에서 토큰을 다시 등록하라"
   }
+ },
+ "review_busy": {
+  "status": 429,
+  "body": {
+   "code": "review_busy",
+   "message": "팩을 지을 자리가 없다(동시 2건이 0.05초 넘게 찼다) — 30초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
+   "retry_after_s": 30,
+   "limit": 2,
+   "infra": true,
+   "retryable": true
+  }
  }
 }

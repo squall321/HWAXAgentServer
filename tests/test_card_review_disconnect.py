@@ -54,6 +54,48 @@ def server(monkeypatch):
     th.join(timeout=10)
 
 
+def test_팩을_청한_호출자가_떠나면_빌드를_접고_자리를_돌려준다(server, monkeypatch):
+    """RB-8 — 팩은 비스트리밍이라 바깥(포털 단발 한도)이 포기해도 엔진은 몰랐고, 버려진 팩을 끝까지 지으며 자리를 쥐었다.
+    카드 한 장에 2초씩 걸리게 하고(첫 묶음 6장이 도는 중) 호출자가 0.8초에 떠나면, 엔진이 끊김을 보고 빌드를 취소한다 —
+    도는 조회가 접히고 둘째 묶음은 나가지 않으며 팩 관문 자리가 돌아온다."""
+    import asyncio
+
+    from test_card_review_pack import Hub, KEY, _tools
+
+    base, _llm = server
+    hub = Hub()
+    hub.get_sleep = 2.0
+    calls, orig = [], hub.get_record
+
+    async def get_record(args):
+        calls.append(args["record_id"])
+        return await orig(args)
+
+    hub.get_record = get_record
+
+    async def fake_load(_app, groups, *, user_email, user_pat):
+        return _tools(hub)
+
+    monkeypatch.setattr(cr, "load_pack_tools", fake_load)
+    monkeypatch.setattr(cr, "PACK_POLL_S", 0.1)
+    monkeypatch.setattr(a.app.state, "card_review_pack_sem", None, raising=False)
+    assert len(hub.records) > cr._KN_CONC
+    with httpx.Client(timeout=httpx.Timeout(5.0, read=0.8), trust_env=False) as c:
+        with pytest.raises(httpx.ReadTimeout):
+            c.post(f"{base}/card-review/pack", json={"agent_key": KEY, "user_pat": "pat"})
+    for _ in range(60):
+        sem = getattr(a.app.state, "card_review_pack_sem", None)
+        if hub.active == 0 and sem is not None and sem._value == cr.PACK_CONC:
+            break
+        time.sleep(0.05)
+    assert hub.active == 0, "호출자가 떠났는데 조회가 돈다"
+    assert a.app.state.card_review_pack_sem._value == cr.PACK_CONC, "팩 관문 자리가 돌아오지 않았다"
+    n = len(calls)
+    time.sleep(hub.get_sleep + 0.5)
+    assert len(calls) == n == cr._KN_CONC, f"버려진 팩의 조회가 더 나갔다({n} → {len(calls)}, 전체 {len(hub.records)})"
+    assert isinstance(a.app.state.card_review_pack_sem, asyncio.Semaphore)
+
+
 def test_구독을_끊으면_LLM_이_취소되고_자리가_돌아온다(server):
     base, llm = server
     cards = [c for c in PACK if c["checkable"]][:2]

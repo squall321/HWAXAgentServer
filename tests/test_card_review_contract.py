@@ -12,6 +12,7 @@
 #
 #   다시 뜨기:  CARD_REVIEW_CONTRACT_UPDATE=1 .venv/bin/python -m pytest tests/test_card_review_contract.py -q
 #   실행:       .venv/bin/python -m pytest tests/test_card_review_contract.py -q
+import asyncio
 import copy
 import json
 import os
@@ -188,6 +189,13 @@ def produce(monkeypatch) -> dict:
         st, out = pack_with(**kw)
         assert out["code"] == code, (code, out)
         errors[code] = {"status": st, "body": out}
+    # 팩 관문(동시 2)이 PACK_WAIT_S 안에 비지 않으면 429 review_busy(기다림 — 아무것도 세지 않는다). 기다림만 줄여 뜬다.
+    monkeypatch.setattr(cr, "PACK_WAIT_S", 0.05)
+    monkeypatch.setattr(a.app.state, "card_review_pack_sem", asyncio.Semaphore(0), raising=False)
+    st, out = pack_with()
+    assert (st, out["code"]) == (429, "review_busy"), out
+    errors["review_busy"] = {"status": st, "body": out}
+    monkeypatch.setattr(a.app.state, "card_review_pack_sem", None, raising=False)
     files["pack_errors.json"] = _dump(errors)
 
     # plan — 위 팩의 카드와 단위 다섯.

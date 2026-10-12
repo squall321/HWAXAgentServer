@@ -13,6 +13,7 @@ import json
 import random
 import socket
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -287,6 +288,29 @@ def test_pack_은_사용자_자격으로만_만든다(client, monkeypatch):
     assert r.status_code == 404 and r.json()["code"] == "agent_not_found"
     r = client.post("/card-review/pack", json={**body, "agents": ["x"]})
     assert r.status_code == 422 and r.json()["code"] == "unknown_fields"
+
+
+def test_팩_자리를_기한까지만_기다리고_429_review_busy(client, monkeypatch):
+    """RB-8 — 팩 관문(동시 2)의 줄 기다림에 기한이 없어 셋째부터의 기다림이 포털 단발 한도(600초)에 들었다. 자리가 PACK_WAIT_S
+    안에 나지 않으면 429 review_busy{retry_after_s}(기다림 부류 — 아무것도 세지 않는다)다."""
+    hub = Hub()
+
+    async def fake_load(_app, groups, *, user_email, user_pat):
+        return _tools(hub)
+
+    monkeypatch.setattr(cr, "load_pack_tools", fake_load)
+    monkeypatch.setattr(cr, "PACK_WAIT_S", 0.2)
+    monkeypatch.setattr(a.app.state, "card_review_pack_sem", asyncio.Semaphore(0), raising=False)   # 두 자리가 다 찼다
+    body = {"agent_key": "mech-test-seal", "user_pat": "pat"}
+    t0 = time.monotonic()
+    r = client.post("/card-review/pack", json=body)
+    out = r.json()
+    assert r.status_code == 429 and out["code"] == "review_busy" and time.monotonic() - t0 < 5
+    assert out["retry_after_s"] == cr.gate_of(a.app).retry_after_s and out["limit"] == cr.PACK_CONC
+    assert (out["infra"], out["retryable"]) == (True, True) and hub.active == 0
+    monkeypatch.setattr(a.app.state, "card_review_pack_sem", asyncio.Semaphore(cr.PACK_CONC), raising=False)
+    r = client.post("/card-review/pack", json=body)
+    assert r.status_code == 200 and a.app.state.card_review_pack_sem._value == cr.PACK_CONC, "자리를 돌려주지 않았다"
 
 
 # ── /health ──────────────────────────────────────────────────────────────────

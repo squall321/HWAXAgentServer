@@ -26,7 +26,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from deliberation import (
@@ -1652,6 +1652,11 @@ async def _ask(llm, system: str, human: str) -> tuple[str, dict]:
 # 답한다 — 실패가 정상 응답(빈 팩)과 똑같이 생기면 전 전문가가 '카드 0장' 으로 얼 수 있다(P-03). 일부만 든 팩은 주지 않는다.
 # 검토 경로는 사용자 PAT 만 쓴다 — 자격이 거절되면 서비스 계정으로 내려가지 않고 멈춘다(D-26, PLAN 7절 M2 앞 셋째).
 PACK_CONC = 2                       # 팩 빌드 동시 수(프로세스 전체) — AIDataHub 연결 풀(조회 동시 _KN_CONC × 2)
+# 팩 자리를 기다리는 상한(초). 넘으면 429 review_busy{retry_after_s} 로 답한다(기다림 부류 — 아무것도 세지 않는다). 시간 제한은
+# 안쪽이 먼저 걸린다 — 기다림 30 + 빌드 최악(m2-wp3a 걸음 6: 목록 60 + 35장 ÷ 6 × 60 = 420)이 포털 단발 한도
+# AGENT_UNARY_TIMEOUT_S(600) 안이어야, 포털이 504 agent_timeout(인프라 — 다시 냄)을 내는 사이 엔진이 버려진 팩을 짓지 않는다(RB-8).
+PACK_WAIT_S = 30.0
+PACK_POLL_S = 1.0                   # 팩을 짓는 동안 호출자가 떠났는지 살피는 간격(초) — 떠나면 빌드를 취소한다
 PACK_CALL_TIMEOUT_S = 60.0          # 도구 호출 하나의 기한(목록 쪽·카드 한 장)
 LIST_PAGE = 100                     # AIDataHub list_records 의 limit 상한(1~100)
 PACK_TOOLS = ("get_agent_session", "list_records", "get_record")
@@ -1855,10 +1860,24 @@ async def build_pack(tools: dict, agent_key: str) -> dict:
 
 async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: str) -> dict:
     """`POST /card-review/pack` 의 본체 — 관문(동시 2) 안에서 사용자 자격으로 도구를 받아 팩을 만든다. 실패는 PackError.
-    credential 은 서버가 실제로 쓴 자격이다(언제나 user — 서비스 계정 길이 없다)."""
-    async with pack_gate(app):
+    credential 은 서버가 실제로 쓴 자격이다(언제나 user — 서비스 계정 길이 없다).
+
+    관문 자리는 PACK_WAIT_S 까지만 기다리고, 넘으면 429 review_busy{retry_after_s}(기다림 부류)다 — 기한 없이 기다리면 전문가
+    아홉의 팩을 한꺼번에 청할 때 셋째부터의 줄 기다림이 포털 단발 한도에 들었다(RB-8). 취소되면(호출자가 떠남) 자리를 놓고
+    도는 조회를 접는다(build_pack 이 남은 조회를 취소한다)."""
+    sem = pack_gate(app)
+    try:
+        await asyncio.wait_for(sem.acquire(), PACK_WAIT_S)
+    except asyncio.TimeoutError:
+        retry = gate_of(app).retry_after_s
+        raise PackError("review_busy", 429, f"팩을 지을 자리가 없다(동시 {PACK_CONC}건이 {PACK_WAIT_S:g}초 넘게 찼다) — "
+                        f"{retry}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)", retry_after_s=retry,
+                        limit=PACK_CONC, infra=True, retryable=True) from None
+    try:
         tools = await load_pack_tools(app, groups, user_email=user_email, user_pat=user_pat)
         pack = await build_pack(tools, agent_key)
+    finally:
+        sem.release()
     return {**pack, "credential": "user"}
 
 
@@ -2451,9 +2470,27 @@ async def get_limits(request: Request):
 async def post_pack(request: Request):
     try:
         body = await _read(request, PackRequest)
-        pack = await make_pack(request.app, body["agent_key"], groups=body.get("groups") or [],
-                               user_email=body.get("user_email") or "", user_pat=body.get("user_pat") or "")
-    except (RequestError, PackError) as exc:
+    except RequestError as exc:
+        return _reject(exc, "pack")
+    # 팩은 비스트리밍이라 호출자가 떠나도(포털 단발 한도 504) 엔진이 모른다 — 빌드를 태스크로 돌리며 끊김을 살피고, 떠나면
+    # 취소해 자리를 돌려주고 조회를 접는다(RB-8 — 버려진 팩을 끝까지 지으며 다시 낸 요청과 겹쳤다).
+    task = asyncio.ensure_future(make_pack(request.app, body["agent_key"], groups=body.get("groups") or [],
+                                           user_email=body.get("user_email") or "",
+                                           user_pat=body.get("user_pat") or ""))
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=PACK_POLL_S)
+            if not task.done() and await request.is_disconnected():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                print(f"[card_review] pack {body['agent_key']} — 호출자가 떠나 빌드를 접었다")
+                return Response(status_code=499)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    try:
+        pack = task.result()
+    except PackError as exc:
         return _reject(exc, "pack")
     print(f"[card_review] pack {pack['agent_key']} cards={pack['cards_total']} unrenderable={len(pack['unrenderable'])}")
     return JSONResponse(pack)
