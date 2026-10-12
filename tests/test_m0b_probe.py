@@ -219,6 +219,26 @@ def test_단위_파일은_엔진_계약으로_보고_여럿이면_회차마다_�
         probe.load_units(str(tmp_path / "empty.json"))
 
 
+def test_여러_전문가의_팩은_엔진_별칭으로_다시_묶는다():
+    pack = json.loads(PACK_OK.read_text(encoding="utf-8"))
+    other = {**pack, "agent_key": "mech-other", "role": "다른 역할",
+             "cards": [{**c, "record_id": c["record_id"] + "-o", "card_id": c["card_id"] + "-o"} for c in pack["cards"]]}
+    merged = probe.merge_packs([pack, other, pack])                # 같은 카드는 한 번만
+    n = len(pack["cards"])
+    assert len(merged["cards"]) == 2 * n and merged["merged_from"] == ["mech-test-seal", "mech-other", "mech-test-seal"]
+    assert [c["alias"] for c in merged["cards"]] == [f"K{i:02d}" for i in range(1, 2 * n + 1)]
+    assert merged["cards"] == cr.assign_aliases([{k: v for k, v in c.items() if k not in ("alias", "chars")}
+                                                 for c in pack["cards"] + other["cards"]])
+    assert merged["agent_key"] == "mech-test-seal" and merged["role"] == pack["role"]
+    assert sum(c["checkable"] for c in merged["cards"]) == 2 * sum(c["checkable"] for c in pack["cards"])
+    assert probe.merge_packs([pack]) is pack
+    lim = cr.limits(W1M, "server", 0, env={})
+    items = probe.build_plan(probe.check_pack(merged), probe.load_units(None)[0], lim, reps=1, k_arms=[("k12", 12)],
+                             skip={"sweep", "offcard", "cache", "overflow"}, nonce="n")
+    assert items[0]["k"] == 12 and probe.prepare(items[0], lim)["ctx"]["judge"] == [c["alias"] for c in
+                                                                                    items[0]["req"]["cards"]]
+
+
 def test_카드가_없거나_점검_카드가_없으면_시작하지_않는다():
     pack = json.loads(PACK_OK.read_text(encoding="utf-8"))
     with pytest.raises(probe.ProbeError, match="0장"):
@@ -261,6 +281,22 @@ def test_agent_는_환경변수_PAT_없이는_멈추고_PAT_인자는_없다(fak
     assert "read -rs HWAX_PROBE_PAT" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         _main("--agent", "mech-test-seal", "--pat", SECRET, "--dry-run")
+
+
+def test_agent_여럿은_전문가마다_팩을_받아_합친다(fake_box, monkeypatch, capsys):
+    pack = json.loads(PACK_OK.read_text(encoding="utf-8"))
+    asked = []
+
+    def fetch(portal, key, pat, **_k):
+        asked.append((portal, key, pat))
+        return {**pack, "agent_key": key, "cards": [{**c, "record_id": f"{c['record_id']}-{key}"} for c in pack["cards"]]}
+
+    monkeypatch.setattr(probe, "fetch_pack", fetch)
+    monkeypatch.setenv(probe.PAT_ENV, SECRET)
+    assert _main("--agent", "mech-a, mech-b", "--dry-run", "--env-file", fake_box["env"]) == 0
+    out = capsys.readouterr().out
+    assert asked == [(probe.DEFAULT_PORTAL, "mech-a", SECRET), (probe.DEFAULT_PORTAL, "mech-b", SECRET)]
+    assert "카드 20장(점검 12" in out and "mech-a+mech-b 의 카드를 합쳤다" in out and SECRET not in out
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────

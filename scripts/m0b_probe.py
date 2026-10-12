@@ -24,6 +24,7 @@ M2 가 아직 가정으로 두는 값을 잰다(`reference/m2-wp3a.md` '실측�
 
   .venv/bin/python scripts/m0b_probe.py --agent <전문가 키> --dry-run          (포털 PAT 는 HWAX_PROBE_PAT)
   .venv/bin/python scripts/m0b_probe.py --agent <전문가 키> --out m0b-1012.jsonl
+  .venv/bin/python scripts/m0b_probe.py --agent <키1>,<키2> --out m0b.jsonl     (두 전문가의 카드를 합쳐 K_out 팔을 채운다)
   .venv/bin/python scripts/m0b_probe.py --pack-file pack.json --unit-file unit.json --out m0b.jsonl
   .venv/bin/python scripts/m0b_probe.py --summarize m0b-1012.jsonl             (파일에서 요약만 다시)
 """
@@ -240,6 +241,28 @@ def check_pack(pack) -> dict:
     if not any(c.get("checkable") for c in pack["cards"]):
         raise ProbeError(f"전문가 '{pack['agent_key']}' 의 점검 카드(checkable)가 0장이다 — verdict 를 잴 수 없다. 다른 전문가를 고른다")
     return pack
+
+
+def merge_packs(packs: list) -> dict:
+    """여러 전문가의 팩을 하나로 — 카드를 record_id 로 겹침 없이 모아 엔진의 assign_aliases 로 별칭·길이를 다시 단다(팩의 고정
+    순서 규칙 그대로). 키·이름·역할은 첫 전문가의 것이다. 전문가 한 명의 점검 카드는 13장 안팎이라(dev 코퍼스) K_out(1M 창에서 19)
+    팔을 채우려면 둘을 합친다 — 운영 묶음은 한 전문가 것이지만 K 별 정확도는 장수의 효과를 본다."""
+    if len(packs) == 1:
+        return packs[0]
+    import card_review as cr  # noqa: PLC0415
+
+    seen, cards = set(), []
+    for p in packs:
+        for c in p["cards"]:
+            if c.get("record_id") in seen:
+                continue
+            seen.add(c.get("record_id"))
+            cards.append({k: v for k, v in c.items() if k not in ("alias", "chars")})
+    first = packs[0]
+    merged = cr.assign_aliases(cards)
+    return {**first, "cards": merged, "merged_from": [str(p.get("agent_key")) for p in packs],
+            "unrenderable": [u for p in packs for u in p.get("unrenderable") or []],
+            "pack_hash": cr.pack_hash(str(first["agent_key"]), cr.role_sha(str(first.get("role") or "")), merged)}
 
 
 def load_units(path: str | None) -> tuple[list, str]:
@@ -843,10 +866,16 @@ async def run_probe(args) -> int:
         if not pat:
             raise ProbeError(f"--agent 는 포털 PAT 가 필요하다 — 셸에서 `read -rs {PAT_ENV}; export {PAT_ENV}` 로 넣는다"
                              "(인자로 받지 않는다)")
-        print(f"[팩] 포털 중계 {show_url(args.portal)}/agent/card-review/pack 에서 '{args.agent}' 의 카드를 받는다…", flush=True)
-        t0 = time.monotonic()
-        pack = fetch_pack(args.portal, args.agent, pat)
-        print(f"      {time.monotonic() - t0:.1f}초")
+        packs = []
+        for key in [k.strip() for k in args.agent.split(",") if k.strip()]:
+            print(f"[팩] 포털 중계 {show_url(args.portal)}/agent/card-review/pack 에서 '{key}' 의 카드를 받는다…", flush=True)
+            t0 = time.monotonic()
+            packs.append(check_pack(fetch_pack(args.portal, key, pat)))
+            print(f"      {time.monotonic() - t0:.1f}초 · 카드 {len(packs[-1]['cards'])}장(점검 "
+                  f"{sum(1 for c in packs[-1]['cards'] if c.get('checkable'))})")
+        if not packs:
+            raise ProbeError("--agent 가 비었다")
+        pack = merge_packs(packs)
         pack_src = "portal"
     pack = check_pack(pack)
     units, unit_src = load_units(args.unit_file)
@@ -858,13 +887,16 @@ async def run_probe(args) -> int:
     print(f"[팩] {pack['agent_key']} · 카드 {len(pack['cards'])}장(점검 {check_n}·배경 {len(pack['cards']) - check_n}) · "
           f"{sum(int(c.get('chars') or 0) for c in pack['cards']):,}자 · 역할 {len(str(pack.get('role') or '')):,}자 · "
           f"pack_hash {str(pack.get('pack_hash') or '')[:12] or '없음'} · 출처 {pack_src}")
+    if pack.get("merged_from"):
+        print(f"      {'+'.join(pack['merged_from'])} 의 카드를 합쳤다 — 역할·키는 {pack['agent_key']} 의 것이다")
     if pack.get("unrenderable"):
         print(f"      절이 없어 못 싣는 카드 {len(pack['unrenderable'])}장(팩 밖)")
     print(f"[단위] {len(units)}개 · 출처 {unit_src} · 크기 " + ", ".join(f"{cr.unit_size(u):,}" for u in units[:8])
           + (" …" if len(units) > 8 else ""))
     short = [f"{lab}(K {k} → {check_n})" for lab, k in k_arms if k > check_n]
     if short:
-        print(f"  ⚠ 점검 카드가 {check_n}장이라 K 팔 {', '.join(short)} 는 있는 만큼만 싣는다 — 점검 카드가 많은 전문가가 낫다")
+        print(f"  ⚠ 점검 카드가 {check_n}장이라 K 팔 {', '.join(short)} 는 있는 만큼만 싣는다 — 채우려면 --agent 에 같은 분야 "
+              "전문가 키를 쉼표로 하나 더 준다(카드를 합친다)")
     for lab, prev, k in merged:
         print(f"  ⚠ K 팔 {lab} 은 {prev} 와 같은 묶음(카드 {k}장)이라 뺀다 — 같은 프롬프트를 두 번 재지 않는다")
     beyond = [lab for lab, k in k_arms if k > lim["verdict"]["k_out"]]
@@ -918,7 +950,8 @@ async def run_probe(args) -> int:
             "llm": info, "overflow_llm": llm_info(over_llm),
             "pack": {"agent_key": pack["agent_key"], "source": pack_src, "cards": len(pack["cards"]), "checkable": check_n,
                      "chars": sum(int(c.get("chars") or 0) for c in pack["cards"]), "role_chars": len(str(pack.get("role") or "")),
-                     "pack_hash": pack.get("pack_hash"), "norm_rev": pack.get("norm_rev")},
+                     "pack_hash": pack.get("pack_hash"), "norm_rev": pack.get("norm_rev"),
+                     "merged_from": pack.get("merged_from")},
             "units": [{"unit_sha": _sha(u), "size": cr.unit_size(u), "lines": len(u.get("lines") or []),
                        "context": len(u.get("context") or []), "evidence": len(u.get("evidence") or [])} for u in units],
             "unit_source": unit_src,
@@ -985,7 +1018,8 @@ def main(argv=None) -> int:
         description="M0-b 탐침 — 운영 LLM 에 카드 대조 프롬프트를 직접 보내 호출 초·글자/토큰 비·출력 상한·창 초과 문구·K 별 "
                     "행 누락을 잰다. 에이전트 서버 리포 루트에서 .venv/bin/python 으로 돈다.")
     src = ap.add_mutually_exclusive_group()
-    src.add_argument("--agent", help=f"전문가 키 — 포털 중계로 팩을 받는다(PAT 는 환경변수 {PAT_ENV})")
+    src.add_argument("--agent", help=f"전문가 키 — 포털 중계로 팩을 받는다(PAT 는 환경변수 {PAT_ENV}). 쉼표로 여럿이면 카드를 "
+                                     "합친다(역할은 첫 전문가)")
     src.add_argument("--pack-file", help="팩 JSON(POST /card-review/pack 의 응답)")
     src.add_argument("--summarize", metavar="JSONL", help="이미 쓴 결과 파일에서 요약만 다시 낸다(LLM 을 부르지 않는다)")
     ap.add_argument("--unit-file", help="검토 단위 JSON(리스크 앱 review_payload 의 단위 하나·목록). 없으면 합성 단위")
