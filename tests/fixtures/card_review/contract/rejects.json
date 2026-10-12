@@ -2,6 +2,7 @@
  "_how": {
   "over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
   "ctx_too_small": "창 4,096 에서 req_verdict_one",
+  "ctx_unknown": "창 조회가 실패해 다시 묻는 중(기본값 128,000 가정)에 limits_1m 의 판을 expect 로 실은 req_verdict_one",
   "_else": "req_verdict_one 을 코드 이름대로 한 칸 바꿨다"
  },
  "unknown_fields": {
@@ -103,6 +104,16 @@
    "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,246 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
    "need_ctx_tokens": 11246,
    "ctx_tokens": 4096
+  }
+ },
+ "ctx_unknown": {
+  "status": 503,
+  "body": {
+   "code": "ctx_unknown",
+   "message": "LLM 서버에 창 크기를 묻지 못해 다시 묻는 중이다 — 지금 창(128,000 토큰, fallback)은 가정한 값이라 판(limits_rev)·예산을 셈하지 않는다. 60초 뒤 같은 호출을 다시 낸다(인프라 순단 — 아무것도 세지 않는다)",
+   "retry_after_s": 60,
+   "infra": true,
+   "retryable": true
   }
  }
 }

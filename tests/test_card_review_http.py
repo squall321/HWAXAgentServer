@@ -11,6 +11,7 @@
 import asyncio
 import json
 import random
+import socket
 import sys
 from pathlib import Path
 
@@ -191,6 +192,48 @@ def test_권한이_없으면_403_이고_None_이면_옛_호출로_통과(client,
     if path.endswith("run"):
         assert client.post(path, json={**body, "entitlements": None}).status_code == 200
         assert client.post(path, json={**body, "entitlements": ["feat:deliberation"]}).status_code == 200
+
+
+def test_창을_모르는_동안은_판을_견주지_않고_503_ctx_unknown(client, env, monkeypatch):
+    """RB-3 — 서버가 막 떴는데 LLM 이 잠시 안 닿으면 창 조회가 실패해 기본값(가정한 창)으로 가며 다시 묻는다(ctx_retrying).
+    그 창으로 판을 셈하면 앱이 서버 창으로 짠 계획과 어긋나 409 rev_mismatch(계약 — 자동 재개 없는 잡 보류)가 됐다.
+    실제 app._model_context_state 를 지나고 LLM 주소만 아무도 듣지 않는 포트로 둔다."""
+    planned = client.get("/card-review/limits").json()                 # 앱이 계획을 짤 때 받은 판(서버 창 1M)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+    monkeypatch.setattr(a, "VLLM_BASE_URL", f"http://127.0.0.1:{dead}/v1")
+    monkeypatch.setattr(a, "_ctx_cache", {})
+    monkeypatch.setattr(a, "_CTX_ENV_SET", False)
+    monkeypatch.setattr(a, "_CTX_FALLBACK", 128_000)
+    lim = client.get("/card-review/limits").json()
+    assert (lim["ctx_retrying"], lim["ctx_source"]) == (True, "fallback") and lim["limits_rev"] != planned["limits_rev"]
+    expect = {"prompt_rev": cr.PROMPT_REV["verdict"], "limits_rev": planned["limits_rev"]}
+    cards = [{k: c[k] for k in ("alias", "record_id", "checkable", "chars")} for c in PACK]
+    for path, body in (("/card-review/run", {**_verdict(), "expect": expect}), ("/card-review/run", _verdict()),
+                       ("/card-review/plan", {"cards": cards, "units": [], "expect": {"limits_rev": expect["limits_rev"]}}),
+                       ("/card-review/plan", {"cards": cards, "units": []})):
+        r = client.post(path, json=body)
+        out = r.json()
+        assert r.status_code == 503 and out["code"] == "ctx_unknown", (path, r.status_code, out)
+        assert 1 <= out["retry_after_s"] <= a._CTX_RETRY_S and (out["infra"], out["retryable"]) == (True, True)
+    assert env.calls == []
+    # 창이 돌아오면 같은 요청이 돈다.
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    assert client.post("/card-review/run", json={**_verdict(), "expect": expect}).status_code == 200
+
+
+def test_출처가_굳은_fallback_은_예산을_셈하고_진짜_판_차이만_409(client, env, monkeypatch):
+    """서버가 창 칸 없이 답했다(retrying 거짓) — 그 창이 이 박스의 창이다. 예산을 그대로 셈하고, 다른 창으로 짠 계획은 진짜
+    판 차이(409 rev_mismatch)다."""
+    planned = client.get("/card-review/limits").json()
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 128_000, "src": "fallback"})
+    lim = client.get("/card-review/limits").json()
+    assert (lim["ctx_retrying"], lim["ctx_source"], lim["ctx_tokens"]) == (False, "fallback", 128_000)
+    expect = {"prompt_rev": cr.PROMPT_REV["verdict"], "limits_rev": planned["limits_rev"]}
+    r = client.post("/card-review/run", json={**_verdict(), "expect": expect})
+    assert r.status_code == 409 and r.json()["code"] == "rev_mismatch"
+    assert client.post("/card-review/run", json=_verdict()).status_code == 200
 
 
 # ── plan ─────────────────────────────────────────────────────────────────────

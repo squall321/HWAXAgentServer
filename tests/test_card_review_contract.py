@@ -252,9 +252,19 @@ def produce(monkeypatch) -> dict:
     c = _setup(monkeypatch, 4_096, FakeLLM(["oracle"]))
     r = c.post("/card-review/run", json=one)
     rejects["ctx_too_small"] = {"status": r.status_code, "body": r.json()}
+    # 창을 모른다 — 창 조회가 실패해 다시 묻는 중(기본값 128,000 으로 가정). 1M 창으로 짠 판을 실어도 409 가 아니라 503 이다.
+    c = _setup(monkeypatch, W1M, FakeLLM(["oracle"]))
+    monkeypatch.setattr(a, "_ctx_cache", {"retry_at": float("inf")})
+    monkeypatch.setattr(a, "_CTX_ENV_SET", False)
+    monkeypatch.setattr(a, "_CTX_FALLBACK", 128_000)
+    r = c.post("/card-review/run", json={**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"],
+                                                          "limits_rev": lim["limits_rev"]}})
+    rejects["ctx_unknown"] = {"status": r.status_code, "body": r.json()}
     # over_budget 의 본문에는 요청이 없다(크기만) — 요청은 싣지 않고 어떻게 만들었는지만 적는다.
     files["rejects.json"] = _dump({"_how": {"over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
                                             "ctx_too_small": "창 4,096 에서 req_verdict_one",
+                                            "ctx_unknown": "창 조회가 실패해 다시 묻는 중(기본값 128,000 가정)에 limits_1m 의 "
+                                                           "판을 expect 로 실은 req_verdict_one",
                                             "_else": "req_verdict_one 을 코드 이름대로 한 칸 바꿨다"}, **rejects})
     return files
 
@@ -294,8 +304,9 @@ def test_엔진이_내는_오류_코드마다_예제가_있다():
     rejects = _load("rejects.json")
     assert set(rejects) - {"_how"} == {"unknown_fields", "bad_request", "unsupported_kind", "unsupported_unit_kind",
                                        "empty_unit", "deck_too_large", "over_budget", "rev_mismatch", "denied",
-                                       "ctx_too_small"}
-    assert {rejects[k]["status"] for k in ("rev_mismatch", "denied")} == {409, 403}
+                                       "ctx_too_small", "ctx_unknown"}
+    assert {rejects[k]["status"] for k in ("rev_mismatch", "denied", "ctx_unknown")} == {409, 403, 503}
+    assert rejects["ctx_unknown"]["body"]["retry_after_s"] >= 1 and rejects["ctx_unknown"]["body"]["infra"] is True
 
 
 def test_결과_예제는_계약의_칸을_다_싣는다():

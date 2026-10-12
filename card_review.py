@@ -19,6 +19,7 @@ import bisect
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -2269,7 +2270,7 @@ def validate_run_request(body, lim: dict | None = None) -> list:
 
 # ── 라우트 ───────────────────────────────────────────────────────────────────
 # GET /limits · POST /pack · POST /plan · POST /run(SSE). 앱(app.py)이 include_router 한 줄로 붙인다. 스트림을 열기 전의
-# 거절은 상태 코드와 JSON {code, message, …}(422·409·403), 연 뒤의 실패는 error 프레임이다.
+# 거절은 상태 코드와 JSON {code, message, …}(422·409·403, 창을 모르면 503 ctx_unknown), 연 뒤의 실패는 error 프레임이다.
 router = APIRouter(prefix="/card-review", tags=["card-review"])
 FEATURE = "feat:deliberation"
 
@@ -2286,6 +2287,25 @@ async def limits_now(app) -> dict:
     snap = gate_of(app).snapshot()
     lim["gate"] = {k: snap[k] for k in ("limit", "limit_reason", "active")}
     return lim
+
+
+def refuse_unknown_ctx(lim: dict) -> None:
+    """창을 모르면 거절한다 — 창 조회가 실패해 다시 묻는 중(ctx_retrying)이면 판을 견주지도, 예산을 셈하지도 않고
+    503 ctx_unknown{retry_after_s} 다(RB-3). 가정한 창(기본값)으로 셈한 판은 앱이 서버 창으로 짠 계획과 어긋나 409
+    rev_mismatch(계약 — 자동 재개 없는 잡 보류)가 되거나 over_budget(ctx_too_small 보류)이 된다. LLM 이 잠시 안 닿는 것은
+    인프라 순단이라 기다렸다 같은 호출을 다시 내면 된다. 출처가 굳은 fallback(서버가 창 칸 없이 답했다 — retrying 거짓)은
+    막지 않는다(그 창으로 예산을 셈하고, 오래 이어지면 앱의 ctx_unknown 보류가 맡는다). retry_after_s 는 다음 조회까지
+    남은 시간이다(조회 간격 _CTX_RETRY_S 안)."""
+    if not lim.get("ctx_retrying"):
+        return
+    import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+
+    left = _a._ctx_cache.get("retry_at", 0.0) - time.monotonic()
+    wait = max(1, math.ceil(min(float(_a._CTX_RETRY_S), left)))
+    raise RequestError("ctx_unknown", f"LLM 서버에 창 크기를 묻지 못해 다시 묻는 중이다 — 지금 창({lim['ctx_tokens']:,} 토큰, "
+                       f"{lim['ctx_source']})은 가정한 값이라 판(limits_rev)·예산을 셈하지 않는다. {wait}초 뒤 같은 호출을 다시 "
+                       "낸다(인프라 순단 — 아무것도 세지 않는다)", status=503, retry_after_s=wait, infra=True,
+                       retryable=True)
 
 
 def _reject(exc, where: str) -> JSONResponse:
@@ -2330,6 +2350,7 @@ async def post_plan(request: Request):
     try:
         body = await _read(request, PlanRequest)
         lim = await limits_now(request.app)
+        refuse_unknown_ctx(lim)                    # 창을 모르면 판을 견주지 않는다(503 ctx_unknown — RB-3)
         want = (body.get("expect") or {}).get("limits_rev")
         if want not in (None, lim["limits_rev"]):
             raise RequestError("rev_mismatch", f"요청이 기대한 limits_rev({want})가 이 서버의 판({lim['limits_rev']})과 "
@@ -2348,7 +2369,9 @@ async def post_run(request: Request):
     app = request.app
     try:
         body = await _read(request, RunRequest)
-        prep = prepare(body, await limits_now(app))
+        lim = await limits_now(app)
+        refuse_unknown_ctx(lim)                    # 창을 모르면 판·예산을 셈하지 않는다(503 ctx_unknown — RB-3)
+        prep = prepare(body, lim)
     except RequestError as exc:
         if exc.code == "over_budget":
             gate_of(app).note("over_budget")

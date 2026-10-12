@@ -121,7 +121,11 @@ Request models are `extra="forbid"`: an undeclared field is a 422 `unknown_field
 dropped. Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,
 409 `rev_mismatch` (the request's `expect{prompt_rev, limits_rev}` differs), 403 `denied` (no
-`feat:deliberation`). Engine error codes in the stream: `review_busy`, `llm_unreachable`, `llm_timeout`,
+`feat:deliberation`), and 503 `ctx_unknown{retry_after_s, infra: true, retryable: true}` from `run` and `plan`
+while the window lookup is failing (`ctx_retrying`): budgets on an assumed window are neither computed nor compared
+(that used to surface as a contract-class 409), so the caller retries after `retry_after_s` without counting
+anything. A settled `fallback` (the server answered without a window, `ctx_retrying` false) is budgeted normally.
+Engine error codes in the stream: `review_busy`, `llm_unreachable`, `llm_timeout`,
 `llm_error`, `llm_misconfigured`, `llm_rejected`, `context_overflow`, `truncated_empty`, `no_rows` — and
 `internal_error` for a defect in this module (outside the contract table, so the risk app counts it against the
 cell instead of retrying forever).
