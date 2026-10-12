@@ -299,3 +299,17 @@ def test_검증기는_app_없이_돈다():
     shape, full, bad, app_loaded = json.loads(r.stdout.strip().splitlines()[-1])
     assert shape == [] and full == [] and app_loaded is False
     assert bad[0]["status"] == 422 and bad[0]["code"] == "unknown_fields" and bad[0]["fields"] == ["extras"]
+
+
+def test_포털이_덮어쓰는_신원_칸_넷은_세_POST_가_다_받는다(client, monkeypatch):
+    """포털 중계는 run 만이 아니라 pack·plan 본문에도 신원 칸 넷을 덮어쓴다(D-28). 요청 모델이 extra="forbid" 라 선언이 빠지면
+    포털을 거친 호출이 전부 422 unknown_fields 다."""
+    ident = {"groups": ["g"], "user_email": "u@x.com", "user_pat": "pat", "entitlements": ["feat:deliberation"]}
+
+    async def fake_load(*_a, **_k):
+        return _tools(Hub())
+
+    monkeypatch.setattr(cr, "load_pack_tools", fake_load)
+    assert client.post("/card-review/run", json={**_verdict(1), **ident}).status_code == 200
+    assert client.post("/card-review/pack", json={"agent_key": "mech-test-seal", **ident}).status_code == 200
+    assert client.post("/card-review/plan", json={"cards": [], "units": [], **ident}).status_code == 200
