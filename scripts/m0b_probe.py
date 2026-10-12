@@ -41,6 +41,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import sys
 import time
 from collections import Counter
@@ -1012,6 +1013,10 @@ async def run_probe(args) -> int:
     return 4 if stopped else 0
 
 
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="m0b_probe.py",
@@ -1057,14 +1062,23 @@ def main(argv=None) -> int:
           + (f" · 형식이 아닌 줄 {skipped}개 건너뜀" if skipped else "") + (" · 파일 없음" if not Path(args.env_file).is_file()
                                                                      else ""))
     args.agent_url = f"http://127.0.0.1:{(os.environ.get('AGENT_PORT') or '9009').strip()}"
+    # kill(TERM)·kill -INT 둘 다 Ctrl-C 처럼 — 거기까지의 요약을 쓰고 끝낸다. 비대화 셸이 띄운 백그라운드 작업은 SIGINT 를
+    # 무시한 채 시작해 파이썬이 Ctrl-C 처리기를 달지 않으므로 둘 다 여기서 단다.
+    prev: dict = {}
+    with contextlib.suppress(ValueError):          # 주 스레드가 아니면 달 수 없다
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            prev[sig] = signal.signal(sig, _interrupt)
     try:
         return asyncio.run(run_probe(args))
     except ProbeError as exc:
         print(f"멈춤 — {scrub(str(exc), _hidden())}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("중단했다(Ctrl-C) — 위 요약은 거기까지의 호출이다", file=sys.stderr)
+        print("중단했다(Ctrl-C·kill) — 위 요약은 거기까지의 호출이다", file=sys.stderr)
         return 130
+    finally:
+        for sig, h in prev.items():                # 같은 프로세스에서 main 을 부른 쪽(시험)의 처리기를 되돌린다
+            signal.signal(sig, h if h is not None else signal.SIG_DFL)
 
 
 if __name__ == "__main__":

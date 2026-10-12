@@ -12,6 +12,7 @@ import math
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -398,6 +399,14 @@ def test_Ctrl_C_면_거기까지의_호출과_요약을_남긴다(fake_box, caps
     assert "(중단됨)" in capsys.readouterr().out
 
 
+def test_main_은_신호_처리기를_되돌려_놓는다(fake_box):
+    import signal
+
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    assert _main("--pack-file", PACK_OK, "--dry-run", "--env-file", fake_box["env"]) == 0
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == before
+
+
 # ── 요약 셈 ──────────────────────────────────────────────────────────────────
 def _call(arm, kind="verdict", **kw):
     r = {"rec": "call", "ts": 100.0, "kind": kind, "variant": "fwd", "arm": arm, "k": 1, "rep": 0, "seconds": 1.0,
@@ -506,6 +515,35 @@ def _run_cli(tmp_path, url, *argv):
     return subprocess.run([sys.executable, str(ROOT / "scripts" / "m0b_probe.py"), "--pack-file", str(PACK_OK),
                            "--env-file", str(tmp_path / "probe.env"), *map(str, argv)],
                           cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300)
+
+
+def test_kill_로_끝내도_거기까지의_요약을_쓴다(fake_llm_server, tmp_path):
+    """nohup 으로 띄운 탐침을 kill(TERM) 로 멈춰도 summary 줄이 남는다 — 운영자 절차서(2-5)가 기대는 동작이다."""
+    with httpx.Client(timeout=10, trust_env=False) as c:
+        c.post(f"{fake_llm_server}/_script", json={"script": [{"behavior": "oracle", "delay": 0.5}]})
+    out_file = tmp_path / "killed.jsonl"
+    (tmp_path / "probe.env").write_text(f"VLLM_BASE_URL={fake_llm_server}/v1\nVLLM_MODEL=fake-glm\n"
+                                        f"AGENT_PORT={_free_port()}\n", encoding="utf-8")
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+           "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+    proc = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "m0b_probe.py"), "--pack-file", str(PACK_OK),
+                             "--env-file", str(tmp_path / "probe.env"), "--reps", "6", "--out", str(out_file)],
+                            cwd=str(tmp_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 120:
+            if out_file.exists() and len(out_file.read_text(encoding="utf-8").splitlines()) >= 3:   # meta + 호출 둘
+                break
+            assert proc.poll() is None, proc.stdout.read()
+            time.sleep(0.1)
+        proc.terminate()
+        out, _ = proc.communicate(timeout=60)
+    finally:
+        _stop(proc)
+    assert proc.returncode == 130, out
+    meta, calls, summary = _read(out_file)
+    assert summary["rec"] == "summary" and summary["interrupted"] is True and 2 <= len(calls) < meta["plan"]["calls"]
+    assert "===== M0-b 탐침 요약" in out and "중단했다" in out
 
 
 def test_명령줄_그대로_가짜_LLM_서버에_돌린다(fake_llm_server, tmp_path):
