@@ -173,6 +173,106 @@ def test_plan_이_낸_verdict_묶음과_상한_크기_단위는_넘치지_않는
                 assert not ctx["soft_over"], "몫 안의 묶음이 몫을 넘었다 — 고정 몫 계산이 틀렸다"
 
 
+def _checkable_base() -> list:
+    return [c for c in (_norm(x) for x in _NAMES) if c["checkable"]]
+
+
+def _plan_in(pack, units: dict) -> tuple:
+    cards = [{k: c[k] for k in ("alias", "record_id", "checkable", "chars")} for c in pack]
+    sizes = [{"unit_id": uid, "manifest_chars": 100, "body_chars": cr.unit_size(u)} for uid, u in units.items()]
+    return cards, sizes
+
+
+def _fits(kind, cards, pack, unit, lim, variant="fwd") -> bool:
+    """역할·지적 블록을 몫 끝까지 채운 조립이 창 안인가(OverBudget 이 아닌가)."""
+    kl = lim[kind]
+    req = _req(kind, cards, _digest(pack, [c["alias"] for c in cards]), unit=unit, variant=variant,
+               role="역할 원문 " * (kl["role_max"] // 3))
+    try:
+        cr.build_prompt(req, lim, hint="지적 " * kl["hint_max"])
+    except cr.OverBudget:
+        return False
+    return True
+
+
+def test_plan_은_run_이_넘칠_쌍을_내주지_않는다_128K_보고서_사례():
+    """RB-7 재현 — 128K 창에서 점검형 카드 한 장을 v_room−2,000 자로, 단위를 p_hard−fixed−card_budget−500 자로 키웠다.
+    옛 plan 은 묶음 K01(soft_over)과 단위 u-01(soft_over)을 받아 줬고 run 은 422 over_budget{need 180,796, have 112,367}
+    이었다. 카드 한 장과도 넘는 단위이므로 oversize.units 다(앱은 ctx_too_small 로 멈춘다)."""
+    lim = cr.limits(131_072, "server", 0, env={})
+    v = lim["verdict"]
+    v_room = lim["p_hard"] - v["fixed"] - lim["unit_body_max"]
+    pack = cr.assign_aliases([_grow(_checkable_base()[0], v_room - 2_000, "-big")])
+    unit = _unit(lim["p_hard"] - v["fixed"] - v["card_budget"] - 500)
+    out = cr.plan(*_plan_in(pack, {"u-01": unit}), lim)
+    assert [d["aliases"] for d in out["verdict_decks"]] == [["K01"]] and out["verdict_decks"][0]["soft_over"]
+    assert out["oversize"]["units"] == ["u-01"] and out["soft_over"]["units"] == [] and out["pair_over"] == []
+    with pytest.raises(cr.OverBudget):                     # 받아 줬다면 run 이 이렇게 거절했다
+        cr.prepare(_req("verdict", pack, [], unit=unit, variant="fwd"), lim)
+
+
+def test_plan_은_묶음째로_넘는_쌍을_pair_over_로_알리고_solo_는_든다():
+    lim = cr.limits(131_072, "server", 0, env={})
+    v = lim["verdict"]
+    x = v["card_budget"] // 2 - 400                         # 두 장이 한 묶음에 든다(몫 안)
+    base = _checkable_base()
+    pack = cr.assign_aliases([_grow(base[0], x, "-a"), _grow(base[1], x, "-b")])
+    # 단위는 offcard 홀로 들 만큼(고정 몫이 verdict 보다 크다) — 그래도 카드 한 장과는 들고 두 장 묶음과는 넘는다.
+    unit = _unit(lim["p_hard"] - lim["offcard"]["fixed"] - 50)
+    assert v["fixed"] + cr.unit_size(unit) + max(c["chars"] for c in pack) <= lim["p_hard"]
+    small = _unit(2_000)
+    out = cr.plan(*_plan_in(pack, {"u-big": unit, "u-small": small}), lim)
+    (deck,) = out["verdict_decks"]
+    assert deck["aliases"] == ["K01", "K02"] and not deck["soft_over"] and out["oversize"]["units"] == []
+    (po,) = out["pair_over"]
+    assert (po["deck_id"], po["unit_id"], po["have"]) == (deck["deck_id"], "u-big", lim["p_hard"])
+    assert po["need"] == v["fixed"] + cr.unit_size(unit) + deck["chars"] > lim["p_hard"]
+    assert not _fits("verdict", pack, pack, unit, lim), "pair_over 라 했는데 묶음째로 든다 — 알릴 까닭이 없다"
+    assert all(_fits("verdict", [c], pack, unit, lim, variant="solo") for c in pack), "solo 로도 넘는다"
+    assert _fits("verdict", pack, pack, small, lim)
+
+
+@pytest.mark.parametrize("ctx_tokens", [16_384, 131_072])
+@pytest.mark.parametrize("seed", range(4))
+def test_plan_이_낸_쌍은_전부_run_이_받는다(ctx_tokens, seed):
+    """속성 — plan 이 낸 (verdict 묶음, 단위) 쌍은 묶음째로, pair_over 쌍은 카드 한 장씩(solo) 창 안이고, (sweep 묶음, 목록 쪽)
+    쌍도 창 안이다. 카드에는 혼자 넘는(soft) 것을, 단위에는 상한을 넘는 것과 창 근처의 것을 섞는다."""
+    rng = random.Random(f"pair-{ctx_tokens}-{seed}")
+    lim = cr.limits(ctx_tokens, "server", 0, env={})
+    v, s = lim["verdict"], lim["sweep"]
+    room = lim["p_hard"] - v["fixed"]
+    base = _checkable_base()
+    sizes = [rng.randint(200, max(300, v["card_budget"] // 3)) for _ in range(5)]
+    sizes += [rng.randint(v["card_budget"], max(v["card_budget"] + 1, room - lim["unit_body_max"])) for _ in range(2)]
+    pack = cr.assign_aliases([_grow(base[i % len(base)], n, f"-p{i}") for i, n in enumerate(sizes)] + [_norm("concept")])
+    units = {f"u-{i}": _unit(t) for i, t in enumerate(
+        [rng.randint(300, lim["unit_body_max"]), rng.randint(lim["unit_body_max"], room - 200),
+         room - rng.randint(200, max(201, room // 4))])}
+    out = cr.plan(*_plan_in(pack, units), lim)
+    by = {c["alias"]: c for c in pack}
+    over = {(p["deck_id"], p["unit_id"]) for p in out["pair_over"]}
+    for uid, unit in units.items():
+        if uid in out["oversize"]["units"]:
+            continue
+        for d in out["verdict_decks"]:
+            cards = [by[a] for a in d["aliases"]]
+            if (d["deck_id"], uid) in over:
+                assert all(_fits("verdict", [c], pack, unit, lim, variant="solo") for c in cards), (uid, d)
+            else:
+                assert _fits("verdict", cards, pack, unit, lim), (uid, d)
+    items = {f"m-{i}": {"unit_id": f"m-{i}", "kind": "bundle", "title": "단위", "text": "가" * n}
+             for i, n in enumerate([rng.randint(50, s["manifest_item_max"]), rng.randint(s["manifest_page_max"],
+                                                                                          lim["p_hard"] // 2)])}
+    msizes = [{"unit_id": k, "manifest_chars": len(u["kind"]) + len(u["title"]) + len(u["text"]) + 14, "body_chars": 300}
+              for k, u in items.items()]
+    out = cr.plan([{k: c[k] for k in ("alias", "record_id", "checkable", "chars")} for c in pack], msizes, lim)
+    for page in out["manifest_pages"]:
+        for d in out["sweep_decks"]:
+            req = _req("sweep", [by[a] for a in d["aliases"]], [], manifest=[items[x] for x in page],
+                       extra={"domains": DOMAINS}, role="역할 " * s["role_max"])
+            cr.build_prompt(req, lim, hint="지적 " * s["hint_max"])        # OverBudget 이면 실패
+
+
 @pytest.mark.parametrize("ctx_tokens", [16_384, 128_000])
 def test_plan_이_낸_sweep_쪽과_묶음은_넘치지_않는다(ctx_tokens):
     rng = random.Random(f"s-{ctx_tokens}")

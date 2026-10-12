@@ -69,7 +69,7 @@
   "offcard": "cr-offcard-1"
  },
  "norm_rev": "cr-n1",
- "limits_rev": "4d81bbca",
+ "limits_rev": "21349c51",
  "gate": {
   "limit": 4,
   "limit_reason": "normal",

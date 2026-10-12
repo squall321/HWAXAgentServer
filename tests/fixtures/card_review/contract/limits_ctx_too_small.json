@@ -69,7 +69,7 @@
   "offcard": "cr-offcard-1"
  },
  "norm_rev": "cr-n1",
- "limits_rev": "bfc265a2",
+ "limits_rev": "98f05b34",
  "ctx_too_small": {
   "need_ctx_tokens": 11246,
   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,246 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."

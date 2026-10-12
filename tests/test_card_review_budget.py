@@ -233,11 +233,23 @@ def test_plan_의_불변식(ctx, env, seed):
     for p in out["manifest_pages"]:
         assert 1 <= len(p) <= s["units_per_page_max"]
     uo, us = set(out["oversize"]["units"]), set(out["soft_over"]["units"])
+    # 단위는 이 계획이 실제로 낸 묶음과 견준다(RB-7) — 가장 큰 카드 한 장과도(또는 offcard 홀로) 넘으면 oversize, 묶음째로만
+    # 넘으면 그 쌍이 pair_over 다.
+    card_max = max((by_alias[a]["chars"] for a in seen_v), default=0)
+    pairs = {(p["deck_id"], p["unit_id"]): p for p in out["pair_over"]}
     for u in units:
         n = u["body_chars"]
-        assert (u["unit_id"] in uo) == (v["fixed"] + n + v["card_budget"] > lim["p_hard"]
-                                        or lim["offcard"]["fixed"] + n > lim["p_hard"])
+        assert (u["unit_id"] in uo) == (lim["offcard"]["fixed"] + n > lim["p_hard"]
+                                        or (bool(seen_v) and v["fixed"] + n + card_max > lim["p_hard"]))
         assert (u["unit_id"] in us) == (u["unit_id"] not in uo and n > lim["unit_body_max"])
+        for d in out["verdict_decks"]:
+            need = v["fixed"] + n + d["chars"]
+            assert ((d["deck_id"], u["unit_id"]) in pairs) == (u["unit_id"] not in uo and need > lim["p_hard"])
+    assert all(p["have"] == lim["p_hard"] < p["need"] for p in out["pair_over"])
+    s_cards = max((d["chars"] for d in out["sweep_decks"]), default=len(cr._NO_CARDS))
+    mo = set(out["oversize"]["manifest"])
+    for u in units:
+        assert (u["unit_id"] in mo) == (s["fixed"] + u["manifest_chars"] + s_cards > lim["p_hard"])
 
 
 def test_plan_deck_id_는_묶음의_카드로_정해진다():

@@ -114,7 +114,7 @@ the portal relay `/agent/card-review/*`, which overwrites the four identity fiel
 |---|---|
 | `GET /card-review/limits` | Budgets derived from the context window (`ctx_source` = `server` · `env` · `fallback`, `ctx_retrying`), `runnable{}` and `ctx_too_small` when the window is too small (units are never re-split), versions (`prompt_rev`, `norm_rev`, `limits_rev`) and `gate{limit, limit_reason, active}`. |
 | `POST /card-review/pack` | `{agent_key}` → all of the expert's cards, normalised (`pack_hash`). User PAT only — a rejected PAT stops with `credential_*`, it never falls back to the service account. |
-| `POST /card-review/plan` | `{cards[{alias, record_id, checkable, chars}], units[{unit_id, manifest_chars, body_chars}]}` → verdict decks, sweep decks, manifest pages, `oversize`, `soft_over`, planned against the current `limits_rev`. |
+| `POST /card-review/plan` | `{cards[{alias, record_id, checkable, chars}], units[{unit_id, manifest_chars, body_chars}]}` → verdict decks, sweep decks, manifest pages, `oversize`, `soft_over`, `pair_over[{deck_id, unit_id, need, have}]`, planned against the current `limits_rev`. Every (verdict deck, unit) and (sweep deck, manifest page) pair it hands out fits the window; a pair that only fits card by card is listed in `pair_over` (run those cards for that unit as `solo`), and a unit that does not fit even with its largest card is in `oversize.units`. |
 | `POST /card-review/run` | One call (`kind` = `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`). SSE: `status{step:"attempt", n}` · `ping{idle_s, ts}` · `result` · `error{code, message, infra, retryable, knob?}` · `done`. No `hello` frame. |
 
 Request models are `extra="forbid"` at every level, nested items included: an undeclared field is a 422

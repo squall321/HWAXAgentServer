@@ -197,6 +197,19 @@ def produce(monkeypatch) -> dict:
     assert r.status_code == 200
     files["plan_req.json"] = _dump(plan_req)
     files["plan_ok.json"] = _dump(r.json())
+    # plan — 창 131,072 에서 묶음째로는 창을 넘고 카드 한 장씩(solo)은 드는 (묶음, 단위) 쌍 하나(pair_over).
+    c = _setup(monkeypatch, 131_072, FakeLLM(["oracle"]))
+    l128 = c.get("/card-review/limits").json()
+    x = l128["verdict"]["card_budget"] // 2 - 400
+    po_req = {"cards": [{"alias": "K01", "record_id": "DOC-T-0001", "checkable": True, "chars": x},
+                        {"alias": "K02", "record_id": "DOC-T-0002", "checkable": True, "chars": x}],
+              "units": [{"unit_id": "u-big", "manifest_chars": 300,
+                         "body_chars": l128["p_hard"] - l128["offcard"]["fixed"] - 50},
+                        {"unit_id": "u-small", "manifest_chars": 300, "body_chars": 2_000}]}
+    r = c.post("/card-review/plan", json=po_req)
+    assert r.status_code == 200 and [p["unit_id"] for p in r.json()["pair_over"]] == ["u-big"], r.json()
+    files["plan_pair_over_req.json"] = _dump(po_req)
+    files["plan_pair_over.json"] = _dump(r.json())
 
     # run — 장면마다 요청·프레임 전부·마지막 프레임·대본 원문.
     for name, req in REQUESTS.items():
@@ -335,7 +348,10 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
 def test_limits_예제의_판이_팩_결과와_같다():
     lim, res = _load("limits_1m.json"), _load("result_verdict_ok.json")
     assert res["meta"]["limits_rev"] == lim["limits_rev"] and res["meta"]["prompt_rev"] == lim["prompt_rev"]["verdict"]
-    assert _load("plan_ok.json")["limits_rev"] == lim["limits_rev"]
+    assert _load("plan_ok.json")["limits_rev"] == lim["limits_rev"] and _load("plan_ok.json")["pair_over"] == []
+    po = _load("plan_pair_over.json")
+    assert [(p["deck_id"], p["unit_id"]) for p in po["pair_over"]] == [(po["verdict_decks"][0]["deck_id"], "u-big")]
+    assert all(p["need"] > p["have"] for p in po["pair_over"]) and po["oversize"]["units"] == []
     assert _load("pack_ok.json")["norm_rev"] == lim["norm_rev"] == res["meta"]["norm_rev"]
     assert "ctx_too_small" in _load("limits_ctx_too_small.json")
 

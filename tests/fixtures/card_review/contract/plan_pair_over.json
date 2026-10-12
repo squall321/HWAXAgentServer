@@ -1,0 +1,51 @@
+{
+ "limits_rev": "16e64903",
+ "verdict_decks": [
+  {
+   "deck_id": "v-488278fa",
+   "aliases": [
+    "K01",
+    "K02"
+   ],
+   "chars": 12638,
+   "soft_over": false
+  }
+ ],
+ "sweep_decks": [
+  {
+   "deck_id": "s-12ad674d",
+   "aliases": [
+    "K01",
+    "K02"
+   ],
+   "chars": 12638,
+   "soft_over": false
+  }
+ ],
+ "manifest_pages": [
+  [
+   "u-big",
+   "u-small"
+  ]
+ ],
+ "oversize": {
+  "cards": [],
+  "kinds": {},
+  "units": [],
+  "manifest": []
+ },
+ "soft_over": {
+  "units": [
+   "u-big"
+  ],
+  "manifest": []
+ },
+ "pair_over": [
+  {
+   "deck_id": "v-488278fa",
+   "unit_id": "u-big",
+   "need": 117193,
+   "have": 112367
+  }
+ ]
+}

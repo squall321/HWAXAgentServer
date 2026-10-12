@@ -80,13 +80,13 @@
   "status": 409,
   "body": {
    "code": "rev_mismatch",
-   "message": "요청이 기대한 판(prompt_rev=cr-verdict-1, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-1, limits_rev=4d81bbca)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
+   "message": "요청이 기대한 판(prompt_rev=cr-verdict-1, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-1, limits_rev=21349c51)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
    "expect": {
     "prompt_rev": "cr-verdict-1",
     "limits_rev": "00000000"
    },
    "prompt_rev": "cr-verdict-1",
-   "limits_rev": "4d81bbca"
+   "limits_rev": "21349c51"
   }
  },
  "denied": {

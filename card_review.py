@@ -98,7 +98,7 @@ _NEED_CTX_MAX = 1 << 30           # ctx_too_small 의 need_ctx_tokens 를 찾는
 LIMITS_CONSTANTS = ("LIMITS_FORMULA_REV", "TEMPLATE_ALLOW", "BODY_MIN", "_BLOCK_SHARE", "HINT_SHARE", "HINT_FLOOR",
                     "VERDICT_UNIT_SHARE", "SWEEP_PAGE_SHARE", "OUT_USE", "ROW_CHARS", "SWEEP_OUT_HEAD",
                     "OFFCARD_OUT_HEAD", "MANIFEST_ITEM_FLOOR", "RUN_FLOOR", "UNIT_SIZE", "MANIFEST_ITEM_OVERHEAD",
-                    "_NEED_CTX_MAX", "_EVID_KO_CPT", "_PRE_SAFETY", "_CHAIR_RESERVE")
+                    "_NEED_CTX_MAX", "_NO_CARDS", "_EVID_KO_CPT", "_PRE_SAFETY", "_CHAIR_RESERVE")
 
 
 def _limits_constants() -> list:
@@ -270,7 +270,10 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     `[{unit_id, manifest_chars, body_chars}]`, 그리고 limits() 의 응답이다.
 
     건수 천장을 두지 않는다(verdict 의 K 만 장수로 닫는다). 창(P_hard)을 넘는 것만 oversize 이고, 몫을 넘지만 창 안이면
-    soft_over 다. 같은 입력이면 deck_id 가 같다(묶음 별칭과 record_id 의 해시)."""
+    soft_over 다. 같은 입력이면 deck_id 가 같다(묶음 별칭과 record_id 의 해시).
+    낸 (verdict 묶음, 단위)·(sweep 묶음, 목록 쪽) 쌍은 run 이 over_budget 으로 거절하지 않는다 — 묶음째로는 넘는 쌍은
+    pair_over[{deck_id, unit_id, need, have}] 로 따로 알린다(그 묶음의 카드를 그 단위에 solo 로 돌린다. 카드 한 장과도 넘는
+    단위는 oversize.units 에 있다)."""
     v, s = lim["verdict"], lim["sweep"]
     p_hard, unit_max = lim["p_hard"], lim["unit_body_max"]
     # 묶음 한 장이 창 한도 안에 드는 자리 — 그 종류의 고정 몫과 단위(또는 목록 한 쪽)를 상한까지 실은 나머지다.
@@ -284,23 +287,34 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         for a in aliases:
             kinds_of.setdefault(a, []).append(kind)
 
-    # 단위 — 단위 상한을 넘어도 창 안이면 soft_over, 상한 크기 묶음과 함께(verdict) 또는 홀로(offcard — 배경 카드는 제목으로
-    # 내릴 수 있다) 창을 넘으면 oversize(다시 쪼개지 않는다).
-    u_over, u_soft = [], []
+    # 단위 — 프롬프트의 상계는 (그 종류의 고정 몫 + 단위 + 실은 카드)다. 단위 상한을 넘어도 창 안이면 soft_over 다. 이 계획이
+    # **실제로 낸** 묶음과 견준다(RB-7 — 묶음이 card_budget 이하라고 가정하면 혼자 넘는 카드 묶음과 soft_over 단위의 쌍을 받아
+    # 주고 run 이 over_budget 으로 거절했다). 묶음과 함께는 넘지만 카드 한 장씩(solo)이면 드는 쌍은 pair_over 로 알리고(앱이 그
+    # 카드들을 그 단위에 solo 로 돌린다), 가장 큰 카드 한 장과도 넘거나 홀로(offcard — 배경 카드는 제목으로 내릴 수 있다) 넘으면
+    # 그 단위는 oversize 다(다시 쪼개지 않는다 — 앱은 ctx_too_small 로 멈춘다).
+    u_over, u_soft, pair_over = [], [], []
     o_fixed = lim["offcard"]["fixed"]
+    card_max = max((int(c.get("chars") or 0) for c in checkable if c["alias"] not in v_over), default=0)
     for u in units:
         n = int(u.get("body_chars") or 0)
-        if v["fixed"] + n + v["card_budget"] > p_hard or o_fixed + n > p_hard:
+        if o_fixed + n > p_hard or (verdict_decks and v["fixed"] + n + card_max > p_hard):
             u_over.append(u["unit_id"])
-        elif n > unit_max:
+            continue
+        if n > unit_max:
             u_soft.append(u["unit_id"])
+        for d in verdict_decks:
+            need = v["fixed"] + n + d["chars"]
+            if need > p_hard:
+                pair_over.append({"deck_id": d["deck_id"], "unit_id": u["unit_id"], "need": need, "have": p_hard})
 
-    # 목록 쪽 — 쪽당 단위 수와 글자 합으로 닫는다. 항목 하나가 쪽 몫을 넘으면 혼자 한 쪽, 카드 몫과 함께 창을 넘으면 oversize.
+    # 목록 쪽 — 쪽당 단위 수와 글자 합으로 닫는다. 항목 하나가 쪽 몫을 넘으면 혼자 한 쪽이고, 이 계획의 가장 큰 sweep 묶음과
+    # 함께 창을 넘으면 oversize 다(쪽 몫 안의 쪽은 어느 묶음과도 든다 — 묶음 자리 s_room 이 쪽 몫을 비워 둔다).
     pages, m_over, m_soft, cur, cur_chars = [], [], [], [], 0
     page_max, per_page = s["manifest_page_max"], s["units_per_page_max"]
+    s_cards = max((d["chars"] for d in sweep_decks), default=len(_NO_CARDS))
     for u in units:
         n = int(u.get("manifest_chars") or 0)
-        if s["fixed"] + n + s["card_budget"] > p_hard:
+        if s["fixed"] + n + s_cards > p_hard:
             m_over.append(u["unit_id"])
             continue
         if cur and (len(cur) >= per_page or cur_chars + n > page_max):
@@ -322,6 +336,7 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         "manifest_pages": pages,
         "oversize": {"cards": sorted(kinds_of), "kinds": kinds_of, "units": u_over, "manifest": m_over},
         "soft_over": {"units": u_soft, "manifest": m_soft},
+        "pair_over": pair_over,
     }
 
 
@@ -1309,6 +1324,8 @@ _SYSTEM = (
     '괄호·머리말을 붙이지 않습니다. 문자열 안의 큰따옴표는 \\" 로 적습니다.'
 )
 
+_NO_CARDS = "카드가 없다. 역할만으로 가린다.\n"   # 카드 0장 sweep 의 카드 자리(plan 이 목록 쪽의 짝으로 잰다)
+
 _UNIT_HEADS = {
     "lines": "변경 줄 {n}줄(전부다)\n",
     "context": "문맥 줄 {n}줄(다른 단위가 맡은 변경 — 인용할 수 있다)\n",
@@ -1537,7 +1554,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     if order or kind == "sweep":
         add("frame", card_head)
         add("cards", "".join(render_card(ctx["cards"][a]["card"], a) for a in order) if order
-            else "카드가 없다. 역할만으로 가린다.\n")
+            else _NO_CARDS)
         add("frame", "\n")
 
     if kind == "sweep":
