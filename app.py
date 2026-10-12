@@ -2248,6 +2248,9 @@ DOC_HEAD_RATIO = float(os.environ.get("DOC_HEAD_RATIO", "0.6"))      # 넘칠 �
 DOC_RESERVE_TOKENS = int(os.environ.get("DOC_RESERVE_TOKENS", str(TOOL_SCHEMA_BUDGET + 16000)))
 DOC_SAFETY = float(os.environ.get("DOC_SAFETY", "0.97"))                 # 변환 오차 안전 계수
 _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보기 실패 시
+# 위 값을 사람이 적었나 — 적었으면 그 값은 이 박스의 창이고(출처 env), 안 적었으면 코드 기본값이다(출처 fallback).
+# 둘 다 같은 int 라 _model_context_tokens 만 보면 가를 수 없다(카드 대조의 ctx_source 가 이걸로 셋을 가른다).
+_CTX_ENV_SET = bool((os.environ.get("LLM_CONTEXT_TOKENS") or "").strip())
 _CTX_RETRY_S = 60.0     # 조회가 실패한 뒤 다시 묻기까지(초) — 그동안은 기본값으로 간다
 _ctx_cache: dict = {}
 
@@ -2327,6 +2330,9 @@ def _model_context_tokens() -> int:
         v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
         if isinstance(v, int) and v > 0:
             n = v
+            _ctx_cache["src"] = "server"
+        else:
+            _ctx_cache["src"] = "env" if _CTX_ENV_SET else "fallback"
     except Exception as e:      # 못 물어보면 기본값으로 간다 — 기능을 막지는 않는다
         # ⚠ 이 값은 굳히지 않는다. 첫 호출자는 /health 이고 재기동 직후에는 LLM 이 아직 안 떠 있다 —
         #   그 한 번의 실패로 기본값이 프로세스 수명 내내 남아, 창이 더 작은 박스에서 예산이 전부 실제
@@ -2339,6 +2345,20 @@ def _model_context_tokens() -> int:
     _ctx_cache["n"] = n
     print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰")
     return n
+
+
+def _model_context_state() -> dict:
+    """창 크기와 **그 값이 어디서 왔나** — {"tokens", "source", "retrying"}. 값은 _model_context_tokens 그대로다.
+
+    source 는 셋이다 — server(LLM 서버가 창을 알려 줬다) · env(서버가 창 칸 없이 답했거나 닿지 않았는데
+    LLM_CONTEXT_TOKENS 를 사람이 적었다) · fallback(코드 기본값). retrying 은 방금 묻지 못해 _CTX_RETRY_S 뒤에
+    다시 묻는 중일 때 참이다. 창으로 예산을 짜는 쪽(카드 대조)이 '가정한 창' 위에서 몇 시간짜리 계획을 굳히지
+    않게 가른다 — int 하나만으로는 '서버가 128,000 이라 했다' 와 '못 물어서 128,000 으로 친다' 가 같다."""
+    n = _model_context_tokens()
+    if "n" in _ctx_cache:
+        # 굳힌 값과 출처는 함께 적는다. 출처 없이 굳은 값은 시험이 창을 박아 둔 것뿐이다(그 값이 이 박스의 창이다).
+        return {"tokens": n, "source": _ctx_cache.get("src", "server"), "retrying": False}
+    return {"tokens": n, "source": "env" if _CTX_ENV_SET else "fallback", "retrying": True}
 
 
 def _doc_budget_tokens(history_tokens: int = 0) -> int:
