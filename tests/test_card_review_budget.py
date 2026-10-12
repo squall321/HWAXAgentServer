@@ -144,11 +144,12 @@ def _units(rng, n):
              "body_chars": rng.randint(300, 300_000)} for i in range(n)]
 
 
-@pytest.mark.parametrize("ctx", [1_048_576, 128_000, 16_384])
+@pytest.mark.parametrize("ctx,env", [(1_048_576, {}), (128_000, {}), (16_384, {}),
+                                     (1_048_576, {"CARD_REVIEW_SHARE_OFFCARD": "0.05", "CARD_REVIEW_SHARE_VERDICT": "1"})])
 @pytest.mark.parametrize("seed", range(12))
-def test_plan_의_불변식(ctx, seed):
+def test_plan_의_불변식(ctx, env, seed):
     rng = random.Random(f"plan-{ctx}-{seed}")
-    lim = _lim(ctx)
+    lim = _lim(ctx, env=env)
     cards, units = _cards(rng, rng.randint(0, 120)), _units(rng, rng.randint(0, 150))
     out = cr.plan(cards, units, lim)
     assert out == cr.plan(cards, units, lim), "같은 입력에 다른 계획"
@@ -185,7 +186,8 @@ def test_plan_의_불변식(ctx, seed):
     uo, us = set(out["oversize"]["units"]), set(out["soft_over"]["units"])
     for u in units:
         n = u["body_chars"]
-        assert (u["unit_id"] in uo) == (v["fixed"] + n + v["card_budget"] > lim["p_hard"])
+        assert (u["unit_id"] in uo) == (v["fixed"] + n + v["card_budget"] > lim["p_hard"]
+                                        or lim["offcard"]["fixed"] + n > lim["p_hard"])
         assert (u["unit_id"] in us) == (u["unit_id"] not in uo and n > lim["unit_body_max"])
 
 

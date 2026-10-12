@@ -260,11 +260,13 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         for a in aliases:
             kinds_of.setdefault(a, []).append(kind)
 
-    # 단위 — 단위 상한을 넘어도 창 안이면 soft_over, 상한 크기 묶음과 함께 창을 넘으면 oversize(다시 쪼개지 않는다).
+    # 단위 — 단위 상한을 넘어도 창 안이면 soft_over, 상한 크기 묶음과 함께(verdict) 또는 홀로(offcard — 배경 카드는 제목으로
+    # 내릴 수 있다) 창을 넘으면 oversize(다시 쪼개지 않는다).
     u_over, u_soft = [], []
+    o_fixed = lim["offcard"]["fixed"]
     for u in units:
         n = int(u.get("body_chars") or 0)
-        if v["fixed"] + n + v["card_budget"] > p_hard:
+        if v["fixed"] + n + v["card_budget"] > p_hard or o_fixed + n > p_hard:
             u_over.append(u["unit_id"])
         elif n > unit_max:
             u_soft.append(u["unit_id"])
