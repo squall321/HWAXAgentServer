@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import hashlib
 import json
 import logging
@@ -620,8 +621,8 @@ def _loads_line(t: str):
     return None
 
 
-def _scan_objects(text: str) -> list:
-    """raw_decode 로 훑어 객체를 차례로 꺼낸다 — 여러 줄로 펼친 객체·한 줄에 붙은 배열을 받는다(P-17c)."""
+def _scan_spans(text: str) -> list:
+    """raw_decode 로 훑어 객체를 차례로 꺼낸다 — [(시작, 끝, 객체)]. 여러 줄로 펼친 객체·한 줄에 붙은 배열을 받는다(P-17c)."""
     dec, out, i = json.JSONDecoder(), [], 0
     while i < len(text):
         j = text.find("{", i)
@@ -633,8 +634,53 @@ def _scan_objects(text: str) -> list:
             i = j + 1
             continue
         if isinstance(o, dict):
-            out.append(o)
+            out.append((j, end, o))
         i = end
+    return out
+
+
+# 건지지 못한 조각 안의 원소 경계(`}` 쉼표 `{`) — 한 줄 배열에서 깨진 원소가 둘 붙어 있으면 둘로 센다.
+_PIECE_GAP = re.compile(r"\}\s*,?\s*(?=\{)")
+_ROW_HEAD = re.compile(r'\{\s*"t"\s*:')                 # 행의 머리 — 산문 속 중괄호({t, k})와 가른다
+_WRAPPER = re.compile(r'\{\s*"rows"\s*:\s*\[?\s*$')     # {"rows":[ 감싸개 — 원소가 아니다
+UNREAD_HEAD = 80                                         # 지적 블록에 싣는 읽히지 않은 원소의 머리(자) — 어느 것인지 가리킬 만큼
+
+
+def _unread(lines: list, keep: list, joined: str, spans: list, bad: set) -> list:
+    """건진 구간 사이에 남은 글에서 읽히지 않은 원소를 하나씩 — [{line, at, head, pos}] (line 은 1부터, at 은 그 줄에서 몇
+    번째 원소인지 — 줄에 원소가 하나뿐이면 None, pos 는 이은 글의 자리). 객체 수로 줄 수를 상쇄하지 않는다(RB-2 — 한 줄 배열에서 셋을 건지고 하나가
+    깨지면 옛 셈은 1−3=0 이라 보충이 돌지 않았다). 세는 것은 따로 읽히지 않은 `{` 줄(bad)에서 시작한 조각이거나 행 머리
+    ({"t":)로 시작한 조각이다 — 산문 속 중괄호는 세지 않는다."""
+    starts, pos = [], 0
+    for i in keep:
+        starts.append(pos)
+        pos += len(lines[i]) + 1
+
+    def line_of(p: int) -> int:
+        return keep[max(0, bisect.bisect_right(starts, p) - 1)]
+
+    pieces, prev = [], 0
+    for s, e, _ in spans + [(len(joined), len(joined), None)]:
+        frag = joined[prev:s]
+        j = frag.find("{")
+        if j >= 0:
+            cuts = [j] + [m.end() for m in _PIECE_GAP.finditer(frag, j)]
+            for c, nxt in zip(cuts, cuts[1:] + [len(frag)]):
+                text = frag[c:nxt]
+                ln = line_of(prev + c)
+                if _WRAPPER.match(text.strip()) or not (ln in bad or _ROW_HEAD.match(text)):
+                    continue
+                pieces.append({"line": ln + 1, "pos": prev + c, "head": text})
+        prev = e
+    out = []
+    for p in pieces:
+        line0 = starts[keep.index(p["line"] - 1)]
+        line1 = line0 + len(lines[p["line"] - 1])
+        on_line = sorted([s for s, _e, _o in spans if line0 <= s < line1] +
+                         [q["pos"] for q in pieces if q["line"] == p["line"]])
+        head = re.sub(r"\s+", " ", _unquote_marks(p["head"])).strip()
+        out.append({"line": p["line"], "at": on_line.index(p["pos"]) + 1 if len(on_line) > 1 else None,
+                    "head": head if len(head) <= UNREAD_HEAD else head[:UNREAD_HEAD] + "…", "pos": p["pos"]})
     return out
 
 
@@ -669,11 +715,14 @@ def _coerce(kind: str, row: dict) -> dict:
 
 
 def parse_rows(text, kind: str) -> tuple[list, dict]:
-    """모델 출력 → (행 목록, 통계). 통계는 {bad_lines, tail_broken, foreign, shape} 다.
+    """모델 출력 → (행 목록, 통계). 통계는 {bad_lines, tail_broken, foreign, shape, unread} 다.
 
     `<think>…</think>` 를 먼저 뗀다(추론 속 초안 줄이 행으로 읽힌다). 전체가 배열이거나 `{"rows":[…]}` 면 그 원소를 쓰고,
     아니면 줄마다 읽는다. 줄로 못 읽은 것이 있으면 나머지 글을 raw_decode 로 한 번 더 훑는다. 그 종류에 없는 줄은 버리고
-    센다(foreign). `t` 가 없는데 k·applies 가 있으면 v 로 본다."""
+    센다(foreign). `t` 가 없는데 k·applies 가 있으면 v 로 본다.
+    bad_lines 는 읽히지 않은 **원소** 수다 — 한 줄 배열(또는 한 줄에 붙은 객체들) 안에서 깨진 원소도 하나씩 센다. 기대
+    집합이 없는 offcard f 줄은 이것이 0 이면 사라진 줄을 아무도 모른다(RB-2). unread 는 그 원소마다 {line, at, head, pos} 라
+    보충 지적 블록이 어느 것을 다시 낼지 가리킨다."""
     s = _THINK_RE.sub("", str(text or ""))
     if "</think>" in s:                 # 여는 꼬리표가 빠진 추론 — 그 앞은 초안이다
         s = s.rsplit("</think>", 1)[1]
@@ -681,7 +730,7 @@ def parse_rows(text, kind: str) -> tuple[list, dict]:
         s = s.split("<think>", 1)[0]
     lines = [ln for ln in s.replace("\r\n", "\n").split("\n") if not _FENCE_RE.match(ln)]
     body = "\n".join(lines).strip()
-    stats = {"bad_lines": 0, "tail_broken": False, "foreign": 0, "shape": "lines"}
+    stats = {"bad_lines": 0, "tail_broken": False, "foreign": 0, "shape": "lines", "unread": []}
     objs = None
     if body[:1] in ("[", "{"):
         try:
@@ -707,13 +756,19 @@ def parse_rows(text, kind: str) -> tuple[list, dict]:
             else:
                 bad.append(i)
         if bad or (not objs and "{" in body):
-            rest = _scan_objects("\n".join(ln for i, ln in enumerate(lines) if i not in good))
-            if rest:
-                objs.extend(rest)
+            keep = [i for i in range(len(lines)) if i not in good]
+            joined = "\n".join(lines[i] for i in keep)
+            spans = _scan_spans(joined)
+            if spans:
+                objs.extend(o for _s, _e, o in spans)
                 stats["shape"] = "scan"
-            stats["bad_lines"] = max(0, len(bad) - len(rest))
+            unread = _unread(lines, keep, joined, spans, set(bad))
+            stats["bad_lines"], stats["unread"] = len(unread), unread
             last = max((i for i, ln in enumerate(lines) if ln.strip()), default=-1)
-            stats["tail_broken"] = last in bad and stats["bad_lines"] > 0
+            # 끝이 끊겼다 — 마지막 줄이 깨졌고 읽히지 않은 원소가 건진 마지막 객체 뒤에 있다(한 줄 배열의 가운데만 깨진 것은
+            # 끝 절단이 아니다).
+            tail_from = spans[-1][1] if spans else 0
+            stats["tail_broken"] = last in bad and any(u["line"] == last + 1 and u["pos"] >= tail_from for u in unread)
     rows = []
     for o in objs:
         if not isinstance(o, dict):
@@ -1155,9 +1210,12 @@ _HINT_SAY = {
 }
 
 
-def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0, max_chars: int = 0) -> str:
+def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0, unread: list | None = None,
+                max_chars: int = 0) -> str:
     """보충 호출에 붙이는 지적 블록. 문제를 종류별로 묶어 **대상 별칭을 전부** 적는다('외 n건' 으로 숨기지 않는다 —
     어느 줄을 다시 낼지 모르면 보충이 헛돈다). 시도 번호가 문구에 들어가 매번 달라진다(temperature 0 의 같은 실패 회피).
+    읽히지 않은 원소(parse_rows 의 unread)는 줄 번호·그 줄의 몇 번째인지·머리를 하나씩 싣는다 — '이미 받은 줄은 다시 내지
+    않는다' 만 말하면 모델은 무엇을 다시 낼지 모른다(RB-2). 머리는 모델 출력이라 «» 안에 둔다.
     max_chars 를 주면(limits 의 hint_max) 넘는 꼬리를 원문 길이 표식과 함께 끊는다."""
     groups: dict = {}
     for who, code, what in problems:
@@ -1174,7 +1232,11 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
         if groups.get(code):
             lines.append(f"- {_HINT_SAY[code]} — {', '.join(dict.fromkeys(groups[code]))}")
     if bad_lines:
-        lines.append(f"- 읽히지 않은 줄 {bad_lines}개 — 한 줄에 JSON 객체 하나로 다시 내라.")
+        lines.append(f"- 읽히지 않은 줄 {bad_lines}개 — 한 줄에 JSON 객체 하나로 다시 내라."
+                     + (" 아래 줄은 받지 못했다." if unread else ""))
+        for u in unread or []:
+            where = f"{u['line']}번째 줄" + (f"의 {u['at']}번째 객체" if u.get("at") else "")
+            lines.append(f"  · {where} «{_unquote_marks(u['head'])}»")
     out = "\n".join(lines)
     if max_chars and len(out) > max_chars:
         from deliberation import _cut_mark  # noqa: PLC0415 — 거의 안 걸리는 길
@@ -2022,7 +2084,7 @@ async def run(app, prep: dict):
                 break
             if n < attempts_max:
                 hint = repair_hint(settled["problems"], n + 1, attempts_max, bad_lines=pstats["bad_lines"],
-                                   max_chars=lim[kind]["hint_max"])
+                                   unread=pstats["unread"], max_chars=lim[kind]["hint_max"])
         if not rows:
             st["outcome"] = "no_rows"
             yield frame("error", _err("no_rows", f"{len(per)}번 물어 한 행도 읽지 못했다 — 형식을 지키지 않은 답이다",

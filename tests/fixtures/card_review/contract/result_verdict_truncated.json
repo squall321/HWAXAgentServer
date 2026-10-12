@@ -274,7 +274,7 @@
   "prompt_chars": 5466,
   "usage": {
    "llm_calls": 2,
-   "tokens_in": 5534,
+   "tokens_in": 5588,
    "tokens_out": 738,
    "per_attempt": [
     {
@@ -284,7 +284,7 @@
     },
     {
      "n": 2,
-     "tokens_in": 2801,
+     "tokens_in": 2855,
      "tokens_out": 346
     }
    ]

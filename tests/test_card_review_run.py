@@ -476,6 +476,25 @@ def test_보충을_거쳐도_제목이_빈_카드_밖_줄_둘이_둘_다_남는�
     assert res["quality"]["dup"] == 0 and res["missing"] == []
 
 
+def test_한_줄_배열의_깨진_카드_밖_줄은_보충으로_되찾는다():
+    """RB-2 재현 — 답 한 줄 [f(계면 박리), f(열 변형 — path 안 따옴표가 깨짐), m, more:no]. 옛 실행기는 bad_lines 0 · 보충 없이
+    '열 변형' 을 잃었다. 이제 보충이 돌고 지적 블록이 그 원소(1번째 줄의 2번째 객체, 머리)를 가리킨다."""
+    f = lambda t, p: {"t": "f", "dir": "risk", "title": t, "mech": "free", "mech_free": "x", "path": p,  # noqa: E731
+                      "l": ["L01"], "src": "exp", "q": "", "sev": "중대", "conf": "medium", "check_kind": "test",
+                      "check": "시험"}
+    parts = [json.dumps(r, ensure_ascii=False) for r in
+             (f("계면 박리", "경로 A"), f("열 변형", "경로 B"), {"t": "m", "seen": []}, {"t": "more", "more": "no"})]
+    parts[1] = parts[1].replace('"path": "경로 B"', '"path": "그는 "경로 B" 라 했다"')
+    fixed = json.dumps(f("열 변형", "경로 B"), ensure_ascii=False)
+    fr, llm, _ = _go(_offcard(), [Act(text="[" + ",".join(parts) + "]"), Act(text=fixed)])
+    res = _last(fr)[1]
+    assert len(llm.calls) == 2, "깨진 원소가 있으면 보충이 돌아야 한다"
+    hint = llm.calls[1]["human"].split("(보충 ", 1)[1]
+    assert "읽히지 않은 줄 1개" in hint and "1번째 줄의 2번째 객체 «" in hint and "열 변형" in hint
+    assert [r["title"] for r in res["rows"] if r["t"] == "f"] == ["계면 박리", "열 변형"]
+    assert (res["quality"]["bad_lines"], res["quality"]["tail_broken"]) == (1, False)
+
+
 def test_solo_결과():
     fr, _llm, _ = _go(_verdict(1, variant="solo"), ["oracle"])
     res = _last(fr)[1]

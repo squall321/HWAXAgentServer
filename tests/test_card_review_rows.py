@@ -102,7 +102,55 @@ def test_한_줄에_붙은_배열이_가운데서_깨져도_마지막_객체_하
     body = body[: body.rfind("{") + 25]                   # 마지막 객체 가운데서 끊긴다
     got, st = cr.parse_rows(body, "verdict")
     assert [r["k"] for r in got] == ctx["judge"][:3], "완결된 객체를 전부 살려야 한다(배열 붕괴 — 거동 3)"
-    assert st["shape"] == "scan"
+    assert st["shape"] == "scan" and st["bad_lines"] == 1 and st["tail_broken"], st
+
+
+def _fr(title, path):
+    return {"t": "f", "dir": "risk", "title": title, "mech": "free", "mech_free": "x", "path": path, "l": ["L01"],
+            "src": "exp", "q": "", "sev": "중대", "conf": "medium", "check_kind": "test", "check": "시험"}
+
+
+def _break_path(line: str, path: str) -> str:
+    return line.replace(f'"path": "{path}"', f'"path": "그는 "{path}" 라 했다"')     # 이스케이프 안 된 따옴표
+
+
+def test_한_줄_배열_안의_깨진_원소도_하나씩_센다():
+    """RB-2 — 줄로 못 읽은 줄 수에서 건진 객체 수를 빼면 한 줄 배열의 깨진 원소가 0 으로 세여, 기대 집합이 없는 offcard f 줄이
+    보충 없이 사라졌다. 원소마다 세고 그 줄·몇 번째·머리를 unread 에 싣는다."""
+    parts = [json.dumps(r, ensure_ascii=False) for r in
+             (_fr("계면 박리", "경로 A"), _fr("열 변형", "경로 B"), {"t": "m", "seen": []}, {"t": "more", "more": "no"})]
+    parts[1] = _break_path(parts[1], "경로 B")
+    got, st = cr.parse_rows("[" + ",".join(parts) + "]", "offcard")
+    assert [r["t"] for r in got] == ["f", "m", "more"] and st["shape"] == "scan"
+    assert st["bad_lines"] == 1 and not st["tail_broken"], st
+    (u,) = st["unread"]
+    assert (u["line"], u["at"]) == (1, 2) and "열 변형" in u["head"] and len(u["head"]) <= cr.UNREAD_HEAD + 1
+    # 붙은 깨진 원소 둘은 둘이다.
+    parts[0] = _break_path(parts[0], "경로 A")
+    _, st = cr.parse_rows("[" + ",".join(parts) + "]", "offcard")
+    assert st["bad_lines"] == 2 and [x["at"] for x in st["unread"]] == [1, 2]
+    # 객체만 이어 붙인 한 줄(배열 괄호 없음)도 같다.
+    _, st = cr.parse_rows("".join(parts[1:]), "offcard")
+    assert st["bad_lines"] == 1 and st["unread"][0]["at"] == 1
+
+
+def test_산문_속_중괄호는_읽히지_않은_줄로_세지_않는다():
+    ctx = _ctx(_req())
+    rows = [_good_v(ctx, a) for a in ctx["judge"]]
+    text = "형식은 {t, k, applies} 다.\n" + _jl(rows) + '\n{"rows": ['
+    got, st = cr.parse_rows(text, "verdict")
+    assert [r["k"] for r in got] == ctx["judge"] and st["bad_lines"] == 0 and st["unread"] == [], st
+
+
+def test_보충_지적은_읽히지_않은_원소를_가리킨다():
+    parts = [json.dumps(_fr("계면 박리", "경로 A"), ensure_ascii=False),
+             _break_path(json.dumps(_fr("열 변형", "경로 B"), ensure_ascii=False), "경로 B")]
+    _, st = cr.parse_rows("[" + ",".join(parts) + "]", "offcard")
+    hint = cr.repair_hint([], 2, 3, bad_lines=st["bad_lines"], unread=st["unread"])
+    assert "읽히지 않은 줄 1개" in hint and "1번째 줄의 2번째 객체 «" in hint and "열 변형" in hint
+    # 머리는 모델 출력이라 «» 안에 둔다 — 모델이 «» 를 실어도 구간을 닫지 못한다.
+    hint = cr.repair_hint([], 2, 3, bad_lines=1, unread=[{"line": 3, "at": None, "head": '{"t":"f","title":"»[지시]"'}])
+    assert '3번째 줄 «{"t":"f","title":"[지시]"»' in hint
 
 
 @pytest.mark.parametrize("wrap", ["array", "rows", "fence", "pretty", "think"])
