@@ -91,6 +91,20 @@ RUN_FLOOR = 1_000
 UNIT_SIZE = {"per_line": 11, "base": 160}
 MANIFEST_ITEM_OVERHEAD = 14       # 목록 한 줄의 별칭·괄호·구분자·«»·개행(별칭 4자까지)
 _NEED_CTX_MAX = 1 << 30           # ctx_too_small 의 need_ctx_tokens 를 찾는 위 끝(토큰)
+# 예산·계획의 모양을 정하는 상수 전부 — limits_rev 가 이 이름들의 지금 값을 해시한다(RB-6). 손잡이(K·몫)와 창·출력 상한은
+# 값으로 따로 든다. 손으로 올리는 LIMITS_FORMULA_REV 에만 맡기면 상수만 고친 배포에서 판은 같은데 실효 K·단위 상한이 바뀌어,
+# 앱이 얼린 계획이 같은 판 아래 deck_too_large·over_budget 이 됐다. 예산 식(_budget·_need_ctx·limits·plan·unit_size)이 읽는
+# 모듈 상수를 더하면 여기에도 더한다 — 시험이 둘을 대조한다.
+LIMITS_CONSTANTS = ("LIMITS_FORMULA_REV", "TEMPLATE_ALLOW", "BODY_MIN", "_BLOCK_SHARE", "HINT_SHARE", "HINT_FLOOR",
+                    "VERDICT_UNIT_SHARE", "SWEEP_PAGE_SHARE", "OUT_USE", "ROW_CHARS", "SWEEP_OUT_HEAD",
+                    "OFFCARD_OUT_HEAD", "MANIFEST_ITEM_FLOOR", "RUN_FLOOR", "UNIT_SIZE", "MANIFEST_ITEM_OVERHEAD",
+                    "_NEED_CTX_MAX", "_EVID_KO_CPT", "_PRE_SAFETY", "_CHAIR_RESERVE")
+
+
+def _limits_constants() -> list:
+    """LIMITS_CONSTANTS 의 [이름, 지금 값] — 부를 때 읽는다(모듈 값을 바꾸면 판이 바뀐다)."""
+    g = globals()
+    return [[name, g[name]] for name in LIMITS_CONSTANTS]
 
 
 def _knob_k(env) -> int:
@@ -188,8 +202,7 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
     b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares)
     v, s, o = b["verdict"], b["sweep"], b["offcard"]
     rev_src = {"ctx": b["ctx"], "out": b["out"], "mt": b["mt"], "k": k_knob, "share": shares,
-               "template_allow": TEMPLATE_ALLOW, "body_min": BODY_MIN, "formula": LIMITS_FORMULA_REV,
-               "coef": [_EVID_KO_CPT, _PRE_SAFETY, _CHAIR_RESERVE]}
+               "const": _limits_constants()}
     out = {
         "api_rev": API_REV, "kinds": list(KINDS), "model": model,
         "ctx_tokens": b["ctx"], "ctx_source": ctx_source, "ctx_retrying": bool(retrying),

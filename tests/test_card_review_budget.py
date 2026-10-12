@@ -115,6 +115,55 @@ def test_limits_rev_는_예산_입력에만_따른다():
         "창 출처는 예산이 아니다 — 같은 창이면 같은 판이다")
 
 
+def _bump(v):
+    """상수 하나를 다른 값으로 — 수는 키우고, 글은 덧붙이고, 사전·튜플은 첫 잎을 바꾼다."""
+    if isinstance(v, bool):
+        return not v
+    if isinstance(v, int):
+        return v + 1
+    if isinstance(v, float):
+        return v * 1.01
+    if isinstance(v, str):
+        return v + "-x"
+    if isinstance(v, dict):
+        k = next(iter(v))
+        return {**v, k: _bump(v[k])}
+    raise TypeError(type(v))
+
+
+@pytest.mark.parametrize("name", cr.LIMITS_CONSTANTS)
+def test_limits_rev_는_예산_상수마다_바뀐다(monkeypatch, name):
+    """RB-6 — 판이 손잡이와 계수 셋만 담아, 행 길이 어림·단위 몫 같은 상수만 고친 배포에서 판은 같은데 실효 K·단위 상한이
+    바뀌었다(ROW_CHARS·VERDICT_UNIT_SHARE 를 바꾸자 K 8→4, unit_body_max 105,871→67,577, 판은 그대로)."""
+    before = _lim(1_048_576)["limits_rev"]
+    monkeypatch.setattr(cr, name, _bump(getattr(cr, name)))
+    assert _lim(1_048_576)["limits_rev"] != before, f"{name} 를 바꿨는데 limits_rev 가 같다"
+
+
+def _global_names(fn) -> set:
+    """함수(안쪽 함수 포함)가 읽는 전역 이름."""
+    out, stack = set(), [fn.__code__]
+    while stack:
+        code = stack.pop()
+        out |= set(code.co_names)
+        stack += [c for c in code.co_consts if hasattr(c, "co_names")]
+    return out
+
+
+def test_예산_식이_읽는_모듈_상수는_전부_판에_든다():
+    """새 상수를 예산 식에 더하고 LIMITS_CONSTANTS 에 안 더하면 판이 그 상수를 모른다 — 식의 함수들이 읽는 모듈 상수를 모아
+    대조한다. 손잡이 기본값(K_DEFAULT·SHARE_DEFAULT)은 손잡이 값으로, 다른 판(PROMPT_REV·NORM_REV·API_REV)은 따로 싣는다."""
+    other = {"KINDS", "API_REV", "PROMPT_REV", "NORM_REV", "K_DEFAULT", "SHARE_DEFAULT", "_SHARE_ENV", "LIMITS_CONSTANTS"}
+    read = set()
+    for fn in (cr._budget, cr._need_ctx, cr.limits, cr.plan, cr._pack_decks, cr.unit_size, cr._knob_k,
+               cr._knob_shares, cr._limits_constants):
+        read |= _global_names(fn)
+    consts = {n for n in read if n in vars(cr) and not callable(vars(cr)[n])
+              and type(vars(cr)[n]).__name__ != "module"}
+    assert consts - other <= set(cr.LIMITS_CONSTANTS), f"판에 없는 예산 상수 — {sorted(consts - other - set(cr.LIMITS_CONSTANTS))}"
+    assert set(cr.LIMITS_CONSTANTS) <= consts | {"LIMITS_FORMULA_REV"}, "식이 읽지 않는 이름이 판에 있다"
+
+
 def test_손잡이():
     assert _lim(1_048_576, env={"CARD_REVIEW_K": "3"})["verdict"]["k"] == 3
     assert _lim(1_048_576, env={"CARD_REVIEW_K": "40"})["verdict"]["k"] == 19, "K 는 출력 몫(K_out)을 넘지 않는다"
