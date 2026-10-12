@@ -1,0 +1,232 @@
+{
+ "verdict_ok": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_ok.sse",
+  "final": "result_verdict_ok.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_ok.txt"
+ },
+ "verdict_rev": {
+  "request": "req_verdict_rev.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_rev.sse",
+  "final": "result_verdict_rev.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_rev.txt"
+ },
+ "verdict_solo": {
+  "request": "req_verdict_solo.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_solo.sse",
+  "final": "result_verdict_solo.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_solo.txt"
+ },
+ "verdict_repaired": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "skip_middle",
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_repaired.sse",
+  "final": "result_verdict_repaired.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_repaired.txt"
+ },
+ "verdict_missing": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "skip_middle",
+   "skip_middle",
+   "skip_middle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_missing.sse",
+  "final": "result_verdict_missing.json",
+  "llm_calls": 3,
+  "transcript": "llm_transcript_verdict_missing.txt"
+ },
+ "verdict_truncated": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "truncate",
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_truncated.sse",
+  "final": "result_verdict_truncated.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_truncated.txt"
+ },
+ "verdict_repair_error": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "skip_middle",
+   "timeout"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_repair_error.sse",
+  "final": "result_verdict_repair_error.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_repair_error.txt"
+ },
+ "verdict_flagged": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "all_ok_fakequote",
+   "all_ok_fakequote",
+   "all_ok_fakequote"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_flagged.sse",
+  "final": "result_verdict_flagged.json",
+  "llm_calls": 3,
+  "transcript": "llm_transcript_verdict_flagged.txt"
+ },
+ "sweep_ok": {
+  "request": "req_sweep.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_sweep_ok.sse",
+  "final": "result_sweep_ok.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_sweep_ok.txt"
+ },
+ "sweep_broken_line": {
+  "request": "req_sweep.json",
+  "script": [
+   {
+    "behavior": "broken_line",
+    "at": 16
+   },
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_sweep_broken_line.sse",
+  "final": "result_sweep_broken_line.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_sweep_broken_line.txt"
+ },
+ "offcard_ok": {
+  "request": "req_offcard.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_offcard_ok.sse",
+  "final": "result_offcard_ok.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_offcard_ok.txt"
+ },
+ "review_busy": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_review_busy.sse",
+  "final": "error_review_busy.json",
+  "llm_calls": 0
+ },
+ "llm_timeout": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "timeout"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_llm_timeout.sse",
+  "final": "error_llm_timeout.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_llm_timeout.txt"
+ },
+ "llm_unreachable": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "unreachable"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_llm_unreachable.sse",
+  "final": "error_llm_unreachable.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_llm_unreachable.txt"
+ },
+ "llm_error": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "http_503"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_llm_error.sse",
+  "final": "error_llm_error.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_llm_error.txt"
+ },
+ "llm_misconfigured": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "http_401"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_llm_misconfigured.sse",
+  "final": "error_llm_misconfigured.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_llm_misconfigured.txt"
+ },
+ "llm_rejected": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "http_400"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_llm_rejected.sse",
+  "final": "error_llm_rejected.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_llm_rejected.txt"
+ },
+ "context_overflow": {
+  "request": "req_verdict_near_window_16k.json",
+  "script": [
+   "http_400"
+  ],
+  "ctx_tokens": 16384,
+  "frames": "run_context_overflow.sse",
+  "final": "error_context_overflow.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_context_overflow.txt"
+ },
+ "truncated_empty": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "truncate_empty"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_truncated_empty.sse",
+  "final": "error_truncated_empty.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_truncated_empty.txt"
+ },
+ "no_rows": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "prose_only"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_no_rows.sse",
+  "final": "error_no_rows.json",
+  "llm_calls": 3,
+  "transcript": "llm_transcript_no_rows.txt"
+ }
+}

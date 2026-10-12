@@ -1,0 +1,56 @@
+{
+ "agent_not_found": {
+  "status": 404,
+  "body": {
+   "code": "agent_not_found",
+   "message": "전문가 'no-such-expert' 가 없다",
+   "agent_key": "no-such-expert"
+  }
+ },
+ "tools_unavailable": {
+  "status": 503,
+  "body": {
+   "code": "tools_unavailable",
+   "message": "카드를 받을 도구가 게이트웨이에 없다(AIDataHub 연결·권한을 본다)",
+   "missing": [
+    "get_record"
+   ]
+  }
+ },
+ "card_fetch_failed": {
+  "status": 502,
+  "body": {
+   "code": "card_fetch_failed",
+   "message": "카드 1/11장을 받지 못했다 — 일부만 든 팩은 주지 않는다",
+   "failed": [
+    {
+     "record_id": "DOC-CCT-MECH-2026-0000000101",
+     "why": "연결이 끊겼다"
+    }
+   ]
+  }
+ },
+ "card_list_unstable": {
+  "status": 502,
+  "body": {
+   "code": "card_list_unstable",
+   "message": "모은 카드 11장(중복 11)이 목록의 total 12 과 다르다 — 쪽 넘김 중 카드가 고쳐졌다. 다시 받는다",
+   "total": 12,
+   "got": 11
+  }
+ },
+ "credential_missing": {
+  "status": 401,
+  "body": {
+   "code": "credential_missing",
+   "message": "사용자 토큰이 없다 — 카드 대조는 사용자 자격으로만 조회한다(서비스 계정으로 내려가지 않는다). 포털에서 토큰을 다시 등록하라"
+  }
+ },
+ "credential_rejected": {
+  "status": 401,
+  "body": {
+   "code": "credential_rejected",
+   "message": "게이트웨이가 사용자 토큰을 거절했다(만료·폐기) — 서비스 계정으로 내려가지 않는다. 포털에서 토큰을 다시 등록하라"
+  }
+ }
+}

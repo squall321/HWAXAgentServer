@@ -133,7 +133,7 @@ Closing the stream cancels the running LLM call and frees the slot.
 
 It uses the deliberation LLM (`DELIB_*`) as is. Worst case of one request = (1 + `CARD_REVIEW_PARSE_RETRIES`)
 × ((1 + `DELIB_LLM_MAX_RETRIES`) × `DELIB_TIMEOUT_S` + 8) = 10824 s by default (`request_worst_s`); the risk
-app's per-call wall clock must stay above it. These knobs are deliberately not in the *Time limits* table yet
+app's per-call wall clock must stay above it. These knobs are deliberately not in the Time limits table yet
 (the portal's env kit test reads that table; merging the chains is M3 `WP5a P3`).
 
 | var | default | meaning |
@@ -144,6 +144,11 @@ app's per-call wall clock must stay above it. These knobs are deliberately not i
 | `CARD_REVIEW_CONCURRENCY_WITH_DELIB` | `2` | The same while a deliberation is running (clamped to the value above). |
 | `CARD_REVIEW_RETRY_AFTER_S` | `30` | `retry_after_s` in a `review_busy` answer. |
 | `CARD_REVIEW_PARSE_RETRIES` | `2` | Repair calls for missing rows, unreadable lines, out-of-vocabulary values and failed quotes. A failure during a repair ends with `result` and `quality.repair_error` (rows already received are kept). |
+
+Contract examples the risk app and the portal test against live in `tests/fixtures/card_review/contract/`
+(`index.json` maps each scene to its request, script, window, frames and final frame). They are produced by
+the real routes with the scripted fake LLM (`tests/fakes/llm.py`), times masked, and rewritten only with
+`CARD_REVIEW_CONTRACT_UPDATE=1 .venv/bin/python -m pytest tests/test_card_review_contract.py -q`.
 
 ## Status
 

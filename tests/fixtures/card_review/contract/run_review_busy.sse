@@ -1,0 +1,6 @@
+event: error
+data: {"code": "review_busy", "message": "카드 대조 자리가 없다(지금 4/4 — normal). 30초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)", "infra": true, "retryable": true, "knob": "CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB", "reason": "normal", "retry_after_s": 30, "limit": 4, "active": 4}
+
+event: done
+data: {}
+

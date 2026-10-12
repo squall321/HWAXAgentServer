@@ -1,0 +1,8 @@
+{
+ "code": "llm_timeout",
+ "message": "LLM 호출이 제한 시간 안에 끝나지 않았다(APITimeoutError)",
+ "infra": true,
+ "retryable": true,
+ "knob": "DELIB_TIMEOUT_S · DELIB_LLM_MAX_RETRIES",
+ "attempt": 1
+}

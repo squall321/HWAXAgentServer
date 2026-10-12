@@ -1,0 +1,6 @@
+=== 시도 1 · prose_only · finish_reason=stop ===
+검토해 보니 대체로 문제가 없어 보입니다. 카드의 조건을 하나씩 맞대어 보았습니다.
+=== 시도 2 · prose_only · finish_reason=stop ===
+검토해 보니 대체로 문제가 없어 보입니다. 카드의 조건을 하나씩 맞대어 보았습니다.
+=== 시도 3 · prose_only · finish_reason=stop ===
+검토해 보니 대체로 문제가 없어 보입니다. 카드의 조건을 하나씩 맞대어 보았습니다.

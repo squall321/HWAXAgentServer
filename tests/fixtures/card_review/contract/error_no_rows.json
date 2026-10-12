@@ -1,0 +1,8 @@
+{
+ "code": "no_rows",
+ "message": "3번 물어 한 행도 읽지 못했다 — 형식을 지키지 않은 답이다",
+ "infra": false,
+ "retryable": true,
+ "attempt": 3,
+ "raw_excerpt": "검토해 보니 대체로 문제가 없어 보입니다. 카드의 조건을 하나씩 맞대어 보았습니다."
+}

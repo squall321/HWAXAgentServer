@@ -1,0 +1,2 @@
+=== 시도 1 · truncate_empty · finish_reason=length ===
+{"t": "v", "k": "K01", "applies": "yes", "judgement": "OK", "cq": "정적 접착 실링 부위의 **유효 접

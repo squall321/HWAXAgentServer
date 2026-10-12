@@ -1,0 +1,18 @@
+{
+ "agent_key": "mech-test-seal",
+ "name": "접착 실링 시험",
+ "domain": "mech",
+ "role": "지어낸 역할 — 접착 실링의 폭·코너 R 을 본다.",
+ "role_sha": "5b0ac13b132bf337dc561187eb6da429be45e7cc308eb8ac26da09bf9a020a21",
+ "cards": [],
+ "unrenderable": [],
+ "cards_total": 0,
+ "listed_total": 0,
+ "checkable_n": 0,
+ "chars_total": 0,
+ "pack_hash": "57014fcb8e0b747f552b3cbc39a8deff4ef4968bc882f4babe9ab990b17ecddd",
+ "norm_rev": "cr-n1",
+ "source": "list+get",
+ "fetched_at": 0,
+ "credential": "user"
+}

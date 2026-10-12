@@ -1,0 +1,9 @@
+event: status
+data: {"step": "attempt", "n": 1}
+
+event: error
+data: {"code": "truncated_empty", "message": "첫 시도가 출력 상한에 걸려(finish_reason=length) 읽힌 행이 없다 — 다시 물어도 같다", "infra": false, "retryable": false, "knob": "DELIB_MAX_TOKENS", "attempt": 1}
+
+event: done
+data: {}
+

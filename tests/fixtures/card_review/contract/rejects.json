@@ -1,0 +1,108 @@
+{
+ "_how": {
+  "over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
+  "ctx_too_small": "창 4,096 에서 req_verdict_one",
+  "_else": "req_verdict_one 을 코드 이름대로 한 칸 바꿨다"
+ },
+ "unknown_fields": {
+  "status": 422,
+  "body": {
+   "code": "unknown_fields",
+   "message": "선언하지 않은 칸 1개(extras) — 조용히 버리지 않고 거절한다. 앱과 에이전트 서버의 판이 섞였는지 본다",
+   "fields": [
+    "extras"
+   ],
+   "errors": [
+    {
+     "loc": "extras",
+     "type": "extra_forbidden",
+     "msg": "Extra inputs are not permitted"
+    }
+   ]
+  }
+ },
+ "bad_request": {
+  "status": 422,
+  "body": {
+   "code": "bad_request",
+   "message": "요청 모양이 계약과 다르다 — expert: Field required",
+   "errors": [
+    {
+     "loc": "expert",
+     "type": "missing",
+     "msg": "Field required"
+    }
+   ]
+  }
+ },
+ "unsupported_kind": {
+  "status": 422,
+  "body": {
+   "code": "unsupported_kind",
+   "message": "호출 종류 'cross' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다"
+  }
+ },
+ "unsupported_unit_kind": {
+  "status": 422,
+  "body": {
+   "code": "unsupported_unit_kind",
+   "message": "단위 종류 'snap_unit' 는 이 판에 틀이 없다(M4)"
+  }
+ },
+ "empty_unit": {
+  "status": 422,
+  "body": {
+   "code": "empty_unit",
+   "message": "unit 에 변경 줄도 문맥 줄도 없다 — 대조할 것이 없다"
+  }
+ },
+ "deck_too_large": {
+  "status": 422,
+  "body": {
+   "code": "deck_too_large",
+   "message": "verdict 한 호출의 카드는 8장까지다(이 박스의 K)",
+   "have": 9,
+   "k": 8
+  }
+ },
+ "over_budget": {
+  "status": 422,
+  "body": {
+   "code": "over_budget",
+   "message": "프롬프트 1,011,608자가 이 박스의 창 한도 1,008,310자를 넘는다(가장 큰 조각 unit) — 다시 쪼개지 않는다",
+   "need": 1011608,
+   "have": 1008310,
+   "part": "unit"
+  }
+ },
+ "rev_mismatch": {
+  "status": 409,
+  "body": {
+   "code": "rev_mismatch",
+   "message": "요청이 기대한 판(prompt_rev=cr-verdict-1, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-1, limits_rev=0b3a25b0)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
+   "expect": {
+    "prompt_rev": "cr-verdict-1",
+    "limits_rev": "00000000"
+   },
+   "prompt_rev": "cr-verdict-1",
+   "limits_rev": "0b3a25b0"
+  }
+ },
+ "denied": {
+  "status": 403,
+  "body": {
+   "code": "denied",
+   "message": "카드 대조에는 'feat:deliberation'(전문가 심의) 권한이 있어야 한다",
+   "need": "feat:deliberation"
+  }
+ },
+ "ctx_too_small": {
+  "status": 422,
+  "body": {
+   "code": "ctx_too_small",
+   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,246 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
+   "need_ctx_tokens": 11246,
+   "ctx_tokens": 4096
+  }
+ }
+}

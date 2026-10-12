@@ -1,0 +1,8 @@
+{
+ "code": "llm_unreachable",
+ "message": "LLM 서버에 연결하지 못했다(APIConnectionError) — LLM 서버 주소와 상태를 확인하라",
+ "infra": true,
+ "retryable": true,
+ "knob": "VLLM_BASE_URL · 연결 한도 LLM_CONNECT_TIMEOUT_S",
+ "attempt": 1
+}

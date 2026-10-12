@@ -1,0 +1,8 @@
+{
+ "code": "llm_error",
+ "message": "LLM 서버 오류 503 — InternalServerError: Error code: 503 - fake 503",
+ "infra": true,
+ "retryable": true,
+ "status": 503,
+ "attempt": 1
+}

@@ -1,0 +1,9 @@
+event: status
+data: {"step": "attempt", "n": 1}
+
+event: error
+data: {"code": "llm_misconfigured", "message": "LLM 서버가 401 로 거절했다 — 주소·모델 이름·키 설정이 맞지 않는다(잡을 세울 일이다). 원문: AuthenticationError: Error code: 401 - fake 401", "infra": true, "retryable": false, "knob": "VLLM_BASE_URL · VLLM_MODEL · VLLM_API_KEY", "status": 401, "attempt": 1}
+
+event: done
+data: {}
+

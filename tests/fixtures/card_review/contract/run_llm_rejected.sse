@@ -1,0 +1,9 @@
+event: status
+data: {"step": "attempt", "n": 1}
+
+event: error
+data: {"code": "llm_rejected", "message": "LLM 이 400 로 거절했다(창 초과로 보이지 않는다 — 같은 입력이면 같다). 원문: BadRequestError: Error code: 400 - fake 400", "infra": false, "retryable": false, "est_tokens": 1799, "out_tokens": 16000, "ctx_tokens": 1048576, "status": 400, "attempt": 1}
+
+event: done
+data: {}
+

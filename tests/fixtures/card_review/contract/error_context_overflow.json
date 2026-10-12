@@ -1,0 +1,12 @@
+{
+ "code": "context_overflow",
+ "message": "LLM 이 400 로 거절했다 — 프롬프트 추정 9,936 토큰과 출력 몫 4,096 토큰이 창 16,384 토큰의 85% 이상이라 창 초과로 본다(다시 쪼개지 않는다). 원문: BadRequestError: Error code: 400 - fake 400",
+ "infra": false,
+ "retryable": false,
+ "est_tokens": 9936,
+ "out_tokens": 4096,
+ "ctx_tokens": 16384,
+ "knob": "LLM_CONTEXT_TOKENS",
+ "status": 400,
+ "attempt": 1
+}

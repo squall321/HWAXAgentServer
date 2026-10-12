@@ -1763,7 +1763,9 @@ def prepare(req: dict, lim: dict) -> dict:
     exp = req.get("expect") if isinstance(req.get("expect"), dict) else {}
     cur = {"prompt_rev": PROMPT_REV[kind], "limits_rev": lim["limits_rev"]}
     if any(exp.get(k) not in (None, cur[k]) for k in cur):
-        raise RequestError("rev_mismatch", f"요청이 기대한 판({exp})이 이 서버의 판({cur})과 다르다 — limits 를 다시 받고 "
+        want = ", ".join(f"{k}={exp.get(k)}" for k in cur if exp.get(k) is not None)
+        have = ", ".join(f"{k}={v}" for k, v in cur.items())
+        raise RequestError("rev_mismatch", f"요청이 기대한 판({want})이 이 서버의 판({have})과 다르다 — limits 를 다시 받고 "
                            "계획을 다시 짠다", status=409, expect=exp, **cur)
     if not lim["runnable"][kind]:
         small = lim.get("ctx_too_small") or {}

@@ -1,0 +1,250 @@
+{
+ "kind": "offcard",
+ "variant": null,
+ "target_key": "t-ab12",
+ "expert": {
+  "key": "mech-test-seal",
+  "name": "실링 시험",
+  "domain": "mech",
+  "role": "역할"
+ },
+ "cards": [
+  {
+   "alias": "K11",
+   "record_id": "DOC-CCT-MECH-2026-0000000106",
+   "card_id": "TSL-D-001",
+   "title": "시험용 PSA 테이프 박리 강도 표 데이터",
+   "type": "data",
+   "checkable": false,
+   "tier": "deep",
+   "confidence": "fact",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 1,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "측정값",
+     "text": "| 온도 | 박리 강도 |\n|---|---|\n| 23 ℃ | 12.5 N/cm |\n| 85 ℃ | 7.25 N/cm |"
+    }
+   ],
+   "text_sha": "7b307ebdf00f9f0ca524cb5cc71c5a26e80d70bb03d177243f10743f386b6f26",
+   "chars": 166
+  },
+  {
+   "alias": "K12",
+   "record_id": "DOC-CCT-MECH-2026-0000000104",
+   "card_id": "TSL-C-001",
+   "title": "시험용 실링 아키텍처 세 요소 개념 정리",
+   "type": "concept",
+   "checkable": false,
+   "tier": "deep",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "개념",
+     "text": "실링은 접착·압축·라비린스 세 방식으로 나뉜다."
+    }
+   ],
+   "text_sha": "221c7f2cc3ce1a7cf0468671210a7d7910806d94269aea6e6cbf42b08b36eabb",
+   "chars": 132
+  },
+  {
+   "alias": "K13",
+   "record_id": "DOC-CCT-MECH-2026-0000000105",
+   "card_id": "TSL-Q-001",
+   "title": "시험용 접착 실링 재작업 문답 모음 카드",
+   "type": "faq",
+   "checkable": false,
+   "tier": "deep",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "문답",
+     "text": "재작업은 접착제를 완전히 걷어낸 뒤에만 한다."
+    }
+   ],
+   "text_sha": "1b0f3e33aeae21ae7f2c898ba9631d736715d4afb4db7af89d8fa77c8a7d2393",
+   "chars": 127
+  },
+  {
+   "alias": "K14",
+   "record_id": "DOC-CCT-MECH-2026-0000000107",
+   "card_id": "TSL-O-001",
+   "title": "시험용 저온 낙하 뒤 미세 누수 관측 기록",
+   "type": "open-observation",
+   "checkable": false,
+   "tier": "deep",
+   "confidence": "expert-judgement",
+   "causal_status": "unknown",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "관측",
+     "text": "영하 20 ℃ 낙하 뒤 미세 누수가 두 대에서 보였고 원인은 아직 모른다."
+    }
+   ],
+   "text_sha": "0ef1e897297bdbf7624ce8c63f3c8219b52fdb8d25920cb1932476c3244c215c",
+   "chars": 162
+  }
+ ],
+ "digest": [
+  {
+   "alias": "K01",
+   "type": "design-rule",
+   "title": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다",
+   "record_id": "DOC-CCT-MECH-2026-0000000101"
+  },
+  {
+   "alias": "K02",
+   "type": "design-rule",
+   "title": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다",
+   "record_id": "DOC-CCT-MECH-2026-0000000101-g0"
+  },
+  {
+   "alias": "K03",
+   "type": "design-rule",
+   "title": "시험용 나사 보스 주변 실링 여유 규칙",
+   "record_id": "DOC-CCT-MECH-2026-0000000108"
+  },
+  {
+   "alias": "K04",
+   "type": "design-rule",
+   "title": "시험용 나사 보스 주변 실링 여유 규칙",
+   "record_id": "DOC-CCT-MECH-2026-0000000108-g3"
+  },
+  {
+   "alias": "K05",
+   "type": "design-rule",
+   "title": "시험용 주입 문구가 섞인 카드 본문 규칙",
+   "record_id": "DOC-CCT-MECH-2026-0000000109"
+  },
+  {
+   "alias": "K06",
+   "type": "standard-summary",
+   "title": "시험용 방수 등급 시험 규격 요약 카드",
+   "record_id": "DOC-CCT-MECH-2026-0000000103"
+  },
+  {
+   "alias": "K07",
+   "type": "standard-summary",
+   "title": "시험용 방수 등급 시험 규격 요약 카드",
+   "record_id": "DOC-CCT-MECH-2026-0000000103-g2"
+  },
+  {
+   "alias": "K08",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000110"
+  },
+  {
+   "alias": "K09",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000102"
+  },
+  {
+   "alias": "K10",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000102-g1"
+  }
+ ],
+ "unit": {
+  "unit_id": "u-01",
+  "kind": "bundle",
+  "title": "후면 커버 둘레 실링",
+  "summary": "PSA 폭 1.2 → 0.9 mm",
+  "notes": "penetration_depth 는 하한 추정치다.",
+  "missing": [
+   {
+    "kind": "ecad",
+    "note": "회로 변경 정보가 없다"
+   }
+  ],
+  "lines": [
+   {
+    "ref": "c:ab12cd34ef56",
+    "text": "후면 커버 PSA 폭 1.2 → 0.9 mm "
+   }
+  ],
+  "context": [
+   {
+    "ref": "c:ctx0",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   },
+   {
+    "ref": "c:ctx1",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   }
+  ],
+  "evidence": [
+   {
+    "ref": "tool:call-0",
+    "text": "list_interfaces → touching 3곳"
+   },
+   {
+    "ref": "tool:call-1",
+    "text": "list_interfaces → touching 3곳"
+   }
+  ]
+ },
+ "manifest": [],
+ "extra": {
+  "domains": [
+   {
+    "key": "mech",
+    "label": "기구"
+   },
+   {
+    "key": "rel",
+    "label": "신뢰성"
+   },
+   {
+    "key": "therm",
+    "label": "열"
+   }
+  ],
+  "mechanisms": [
+   {
+    "code": "thermal.cte_mismatch",
+    "label": "열팽창 불일치"
+   },
+   {
+    "code": "interface.seal_loss",
+    "label": "실링 상실"
+   }
+  ],
+  "known": [
+   {
+    "alias": "K01",
+    "judgement": "OK",
+    "why": "접착폭 하한을 지킨다"
+   }
+  ]
+ }
+}
