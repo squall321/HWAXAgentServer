@@ -271,25 +271,25 @@
   "norm_rev": "cr-n1",
   "limits_rev": "0b3a25b0",
   "input_sha": "91d003625a80905ef0289ea27ee64afedb93a84e2742163c019c13fb18386331",
-  "prompt_chars": 5466,
+  "prompt_chars": 5518,
   "usage": {
    "llm_calls": 3,
-   "tokens_in": 8363,
+   "tokens_in": 8441,
    "tokens_out": 1977,
    "per_attempt": [
     {
      "n": 1,
-     "tokens_in": 2733,
+     "tokens_in": 2759,
      "tokens_out": 659
     },
     {
      "n": 2,
-     "tokens_in": 2815,
+     "tokens_in": 2841,
      "tokens_out": 659
     },
     {
      "n": 3,
-     "tokens_in": 2815,
+     "tokens_in": 2841,
      "tokens_out": 659
     }
    ]

@@ -40,7 +40,7 @@
     }
    ],
    "text_sha": "e17b71218f7e7aef25f9e9166693a6f09311d79f143842215db979ab59149e4c",
-   "chars": 345
+   "chars": 355
   },
   {
    "alias": "K02",
@@ -65,7 +65,7 @@
     }
    ],
    "text_sha": "b1b2c1e82b15aa4ea09cf6d5559d7057b02704593d81843721b170e083a98feb",
-   "chars": 184
+   "chars": 188
   },
   {
    "alias": "K03",
@@ -90,7 +90,7 @@
     }
    ],
    "text_sha": "f2fc431714827721fdae33a7b846255b4a367af3d8ad8b7edd8c2ec385e03a8e",
-   "chars": 230
+   "chars": 234
   },
   {
    "alias": "K04",
@@ -122,7 +122,7 @@
     }
    ],
    "text_sha": "434490473b71266d99a1927c956496da37f4796ef182d67894191a95d7550607",
-   "chars": 205
+   "chars": 213
   },
   {
    "alias": "K05",
@@ -152,7 +152,7 @@
     }
    ],
    "text_sha": "5a08978109ad51ee001d9cbcd517fdad6c22a40bb1e43e3f84e6c8c8023410bb",
-   "chars": 203
+   "chars": 207
   },
   {
    "alias": "K06",
@@ -182,7 +182,7 @@
     }
    ],
    "text_sha": "5a08978109ad51ee001d9cbcd517fdad6c22a40bb1e43e3f84e6c8c8023410bb",
-   "chars": 236
+   "chars": 242
   },
   {
    "alias": "K07",
@@ -207,7 +207,7 @@
     }
    ],
    "text_sha": "7b307ebdf00f9f0ca524cb5cc71c5a26e80d70bb03d177243f10743f386b6f26",
-   "chars": 166
+   "chars": 170
   },
   {
    "alias": "K08",
@@ -232,7 +232,7 @@
     }
    ],
    "text_sha": "221c7f2cc3ce1a7cf0468671210a7d7910806d94269aea6e6cbf42b08b36eabb",
-   "chars": 132
+   "chars": 136
   },
   {
    "alias": "K09",
@@ -257,7 +257,7 @@
     }
    ],
    "text_sha": "1b0f3e33aeae21ae7f2c898ba9631d736715d4afb4db7af89d8fa77c8a7d2393",
-   "chars": 127
+   "chars": 131
   },
   {
    "alias": "K10",
@@ -282,7 +282,7 @@
     }
    ],
    "text_sha": "0ef1e897297bdbf7624ce8c63f3c8219b52fdb8d25920cb1932476c3244c215c",
-   "chars": 162
+   "chars": 166
   }
  ],
  "unrenderable": [
@@ -295,7 +295,7 @@
  "cards_total": 10,
  "listed_total": 11,
  "checkable_n": 6,
- "chars_total": 1990,
+ "chars_total": 2042,
  "pack_hash": "dcda70711d6e558c7497414298778f2f9de262fd120294e7240b622b45547181",
  "norm_rev": "cr-n1",
  "source": "list+get",

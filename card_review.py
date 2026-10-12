@@ -329,6 +329,18 @@ def _unquote_marks(s) -> str:
     return str(s or "").replace("«", "").replace("»", "")
 
 
+_FRAME_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+_FRAME_MARKS = re.compile(r"[«»\[\]{}]")
+
+
+def _frame_safe(s) -> str:
+    """«» 데이터 틀 **밖**에 서는 원천 값 한 칸(종류·등급 같은 짧은 표지, 줄 참조, 별칭, 코드) — 지시 블록을 열 수 없게
+    한 줄로 만든다(RB-5). 줄바꿈·제어 문자는 공백으로, «»(데이터 틀)·[](블록 머리 — `[지시]`)·{}(행 모양)는 지우고
+    공백을 한 칸으로 줄인다. 길이는 묶지 않는다(값을 버리지 않는다). 긴 원천 글(제목·본문·검토 상태·규격)은 이것이
+    아니라 «» 안에 싣는다."""
+    return re.sub(r"\s+", " ", _FRAME_MARKS.sub("", _FRAME_CTRL.sub(" ", str(s or "")))).strip()
+
+
 def _section_text(raw, sec_title: str) -> str:
     """절 본문의 정규 글 — CRLF→LF, 줄 끝 공백·앞뒤 빈 줄 떼기, 검색용 머리 줄 떼기, «» 지우기.
 
@@ -408,23 +420,36 @@ def card_text(card: dict) -> str:
 
 
 def card_header(card: dict, alias: str) -> str:
-    """카드 머리 줄 — 종류·등급·인과·검토·규격(빈 칸은 뺀다). 인용 대상이 아니지만 수치 원천에는 든다(P-17f)."""
-    ctype = card.get("type") or "미상"
+    """카드 머리 줄 — 종류·등급·인과·검토·규격(빈 칸은 뺀다). 인용 대상이 아니지만 수치 원천에는 든다(P-17f).
+
+    값은 전부 카드(원천)에서 온다 — 짧은 표지(종류·등급·인과)는 한 줄로 위생하고(_frame_safe), 글인 검토 상태·규격은
+    «» 안에 싣는다. 틀 밖에 그대로 두면 '[지시] …' 를 넣은 카드가 진짜 지시 블록과 같은 모양으로 섰다(RB-5)."""
+    ctype = _frame_safe(card.get("type")) or "미상"
     bits = [f"종류 {ctype}({'점검' if card.get('checkable') else '배경'})"]
-    for label, key in (("등급", "confidence"), ("인과", "causal_status"), ("검토", "review_status")):
-        if card.get(key):
-            bits.append(f"{label} {card[key]}")
-    if card.get("standard_refs"):
-        bits.append("규격 " + ", ".join(card["standard_refs"]))
+    for label, key in (("등급", "confidence"), ("인과", "causal_status")):
+        v = _frame_safe(card.get(key))
+        if v:
+            bits.append(f"{label} {v}")
+    review = _unquote_marks(card.get("review_status")).strip()
+    if review:
+        bits.append(f"검토 «{review}»")
+    refs = [r for r in (_unquote_marks(x).strip() for x in card.get("standard_refs") or []) if r]
+    if refs:
+        bits.append(f"규격 «{', '.join(refs)}»")
     return f"[{alias}] " + " · ".join(bits)
 
 
 def render_card(card: dict, alias: str) -> str:
-    """프롬프트에 싣는 카드 한 장(끝 줄바꿈 포함 — 묶음 글자 수는 이 길이의 합이다)."""
-    out = [card_header(card, alias), f"제목 «{card.get('title', '')}»"]
+    """프롬프트에 싣는 카드 한 장(끝 줄바꿈 포함 — 묶음 글자 수는 이 길이의 합이다). 원천 글(제목·절 제목·본문)은 전부
+    «» 안이고, 틀 밖의 절 번호는 한 줄로 위생한다(RB-5)."""
+    out = [card_header(card, alias), f"제목 «{_unquote_marks(card.get('title'))}»"]
     for s in card.get("sections") or []:
-        out.append(f"§{s['sid']} {s['title']}".rstrip())
-        out.append(f"«{s['text']}»")
+        if not isinstance(s, dict):
+            continue
+        head = f"§{_frame_safe(s.get('sid'))}"
+        title = _unquote_marks(s.get("title")).strip()
+        out.append(f"{head} «{title}»" if title else head)
+        out.append(f"«{_unquote_marks(s.get('text'))}»")
     return "\n".join(out) + "\n"
 
 
@@ -502,8 +527,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
     elif variant not in (None, ""):
         raise RequestError("bad_request", f"{kind} 에는 variant 가 없다(null)")
     expert = req.get("expert") if isinstance(req.get("expert"), dict) else {}
-    if not re.fullmatch(r"[^\s«»{}]{1,120}", _str(expert.get("key"))):
-        raise RequestError("bad_request", "expert.key 는 공백·«»·중괄호 없는 1~120자다(틀에 그대로 든다)")
+    if not re.fullmatch(r"[^\s«»{}\[\]]{1,120}", _str(expert.get("key"))):
+        raise RequestError("bad_request", "expert.key 는 공백·«»·중괄호·대괄호 없는 1~120자다(틀에 그대로 든다)")
 
     cards: dict = {}
     order: list = []
@@ -575,8 +600,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
                                have=len(order), k=k)
     extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
 
-    def codes(items, key):
-        return {_str(x.get(key)) for x in items or [] if isinstance(x, dict) and _str(x.get(key))}
+    def codes(items, key):          # 프롬프트에 렌더한 것과 같은 위생(_code_list) — 모델은 본 코드를 고른다
+        return {_frame_safe(x.get(key)) for x in items or [] if isinstance(x, dict) and _frame_safe(x.get(key))}
 
     return {
         "kind": kind, "variant": variant or None, "expert": expert, "unit_id": unit_id,
@@ -1202,6 +1227,7 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
 
 
 _MISSING_SAY = {"m": "m 줄(따져 본 메커니즘)", "more": "more 줄(더 있나)", "f_or_none": "f 줄(없으면 none 줄)"}
+_HINT_ALIAS = re.compile(r"[KLU]\d{2,}|[a-z]{1,4}")      # 지적 블록에 그대로 쓰는 대상 — 별칭, 줄 종류(f·m·h·need…)
 _HINT_SAY = {
     "missing": "줄이 없다",
     "enum": "열거 밖 값을 적었다",
@@ -1223,6 +1249,8 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
         if code == "missing":
             groups.setdefault("missing", []).append(_MISSING_SAY.get(str(what), str(what)))
         elif code == "enum":
+            # 별칭이 아닌 대상(카드 밖 줄의 제목)은 모델 출력이라 «» 안에 둔다(RB-5).
+            who = str(who) if _HINT_ALIAS.fullmatch(str(who)) else f"«{_unquote_marks(who)}»"
             groups.setdefault("enum", []).append(f"{who}({what})")
         elif code == "quote":
             groups.setdefault(f"quote:{what}", []).append(str(who))
@@ -1379,8 +1407,9 @@ def _cap_lines(lines: list, cap: int, what: str) -> str:
 
 
 def _code_list(items: list, key: str, cap: int) -> str:
-    """코드 목록(메커니즘·영역) — '코드=이름' 이 몫을 넘으면 코드만, 그래도 넘으면 표식과 함께 끊는다."""
-    pairs = [(_unquote_marks(x.get(key)), _unquote_marks(x.get("label"))) for x in items or [] if isinstance(x, dict)]
+    """코드 목록(메커니즘·영역) — '코드=이름' 이 몫을 넘으면 코드만, 그래도 넘으면 표식과 함께 끊는다. 틀 밖에 서므로
+    코드·이름을 한 줄로 위생한다(RB-5). 닫힌 집합(ctx 의 mechs·domains)도 같은 위생을 거친 코드다 — 모델이 본 그대로 고른다."""
+    pairs = [(_frame_safe(x.get(key)), _frame_safe(x.get("label"))) for x in items or [] if isinstance(x, dict)]
     full = " · ".join(f"{c}={lb}" if lb else c for c, lb in pairs if c)
     if len(full) <= cap:
         return full
@@ -1404,7 +1433,7 @@ def _render_missing(unit: dict) -> str:
     ms = [m for m in unit.get("missing") or [] if isinstance(m, dict)]
     if not ms:
         return ""
-    return "[결측]\n" + "".join(f"- {_unquote_marks(m.get('kind'))} — «{_unquote_marks(m.get('note'))}»\n"
+    return "[결측]\n" + "".join(f"- {_frame_safe(m.get('kind'))} — «{_unquote_marks(m.get('note'))}»\n"
                                 for m in ms) + "\n"
 
 
@@ -1418,7 +1447,8 @@ def _render_unit(unit: dict, ctx: dict) -> str:
         rows = [(a, x) for a, x in ctx["lines"].items() if x["part"] == part]
         if rows or part == "line":
             out.append(_UNIT_HEADS[key].format(n=len(rows)))
-        out += [f"{a} [{_unquote_marks(x['ref'])}] «{_unquote_marks(x['text'])}»\n" for a, x in rows]
+        # 참조는 틀 밖 [ ] 안에 선다 — 한 줄로 위생해 괄호를 닫거나 블록을 열지 못하게 한다(결과의 refs 는 원래 값이다).
+        out += [f"{a} [{_frame_safe(x['ref'])}] «{_unquote_marks(x['text'])}»\n" for a, x in rows]
     return "".join(out) + "\n"
 
 
@@ -1485,7 +1515,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         head = ("[배경 카드 — 제목만. 판정 대상이 아니다]\n" if kind == "verdict"
                 else f"[카드 제목 {len(ctx['digest'])}장 — 전문이 실리지 않은 카드]\n")
         add("frame", head)
-        add("digest", _cap_lines([f"{a} {_unquote_marks(d['type']) or '미상'} · «{_unquote_marks(d['title'])}»\n"
+        add("digest", _cap_lines([f"{a} {_frame_safe(d['type']) or '미상'} · «{_unquote_marks(d['title'])}»\n"
                                   for a, d in ctx["digest"].items()], kl["digest_max"], "장"))
         add("frame", "\n")
     card_head = {"verdict": f"[점검 카드 {len(order)}장 — 판정 대상. 실린 순서에는 뜻이 없다]\n",
@@ -1499,7 +1529,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
 
     if kind == "sweep":
         add("frame", f"[검토 단위 목록 {len(ctx['units'])}개 — 이 쪽이 전부가 아닐 수 있다]\n")
-        add("manifest", "".join(f"{a} [{_unquote_marks(u['kind'])}] «{_unquote_marks(u['title'])} — "
+        add("manifest", "".join(f"{a} [{_frame_safe(u['kind'])}] «{_unquote_marks(u['title'])} — "
                                 f"{_unquote_marks(u['text'])}»\n" for a, u in ctx["units"].items()))
         add("frame", "\n")
     else:
@@ -1509,7 +1539,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         known = [k for k in extra.get("known") or [] if isinstance(k, dict)]
         if known:
             add("frame", "[이미 판정한 것 — 되풀이하지 마라]\n")
-            add("known", _cap_lines([f"{_unquote_marks(k.get('alias'))} {_unquote_marks(k.get('judgement'))} — "
+            add("known", _cap_lines([f"{_frame_safe(k.get('alias'))} {_frame_safe(k.get('judgement'))} — "
                                      f"«{_unquote_marks(k.get('why'))}»\n" for k in known], kl["known_max"], "건"))
             add("frame", "\n")
         if extra.get("mechanisms"):

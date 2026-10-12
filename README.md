@@ -124,7 +124,7 @@ text fields accept `null` as empty):
 | field | shape |
 |---|---|
 | `kind` · `variant` · `target_key` | `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`; `variant` is `null` except for verdict |
-| `expert` | `{key, name?, domain?, role?}` — `key` is 1–120 chars without whitespace, `«»` or braces |
+| `expert` | `{key, name?, domain?, role?}` — `key` is 1–120 chars without whitespace, `«»`, braces or brackets |
 | `cards[]` | pack cards exactly as `/pack` returned them (`alias`, `sections[{sid, title, text}]`, …), sent back unchanged |
 | `digest[]` | `{alias, type?, title?, record_id?, card_id?}` — background cards shown by title only (verdict · offcard) |
 | `unit` | `{unit_id, kind?, title?, summary?, notes?, lines[], context[], evidence[], missing[], unit_hash?, summary_sha?, evidence_sha?, evidence_status?, input_gaps?}` for verdict · offcard, `null` for sweep |
@@ -134,6 +134,12 @@ text fields accept `null` as empty):
 | `extra` | `{domains[{key, label?}], mechanisms[{code, label?}], known[{alias, judgement?, why?}]}` — the risk taxonomy's `domain.code` goes in `key` |
 | `expect` | `{prompt_rev?, limits_rev?}` — only the given ones are compared |
 | identity | `groups` · `user_email` · `user_pat` · `entitlements` (overwritten by the portal relay) |
+
+Everything that comes from cards or the risk app is rendered either inside the prompt's `«…»` data frame
+(titles, section titles and bodies, review status, standard refs, unit text, notes, missing notes, known whys) or,
+for short labels that stand outside it (card type/confidence/causal status, section ids, line refs, missing kinds,
+manifest kinds, known alias/judgement, mechanism and domain codes and labels), flattened to one line with `«»`,
+`[]` and `{}` removed — a planted `[지시]` block can never stand outside the frame.
 
 Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,

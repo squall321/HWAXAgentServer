@@ -4,61 +4,61 @@
    "alias": "K01",
    "record_id": "DOC-CCT-MECH-2026-0000000101",
    "checkable": true,
-   "chars": 345
+   "chars": 355
   },
   {
    "alias": "K02",
    "record_id": "DOC-CCT-MECH-2026-0000000108",
    "checkable": true,
-   "chars": 184
+   "chars": 188
   },
   {
    "alias": "K03",
    "record_id": "DOC-CCT-MECH-2026-0000000109",
    "checkable": true,
-   "chars": 230
+   "chars": 234
   },
   {
    "alias": "K04",
    "record_id": "DOC-CCT-MECH-2026-0000000103",
    "checkable": true,
-   "chars": 205
+   "chars": 213
   },
   {
    "alias": "K05",
    "record_id": "DOC-CCT-MECH-2026-0000000110",
    "checkable": true,
-   "chars": 203
+   "chars": 207
   },
   {
    "alias": "K06",
    "record_id": "DOC-CCT-MECH-2026-0000000102",
    "checkable": true,
-   "chars": 236
+   "chars": 242
   },
   {
    "alias": "K07",
    "record_id": "DOC-CCT-MECH-2026-0000000106",
    "checkable": false,
-   "chars": 166
+   "chars": 170
   },
   {
    "alias": "K08",
    "record_id": "DOC-CCT-MECH-2026-0000000104",
    "checkable": false,
-   "chars": 132
+   "chars": 136
   },
   {
    "alias": "K09",
    "record_id": "DOC-CCT-MECH-2026-0000000105",
    "checkable": false,
-   "chars": 127
+   "chars": 131
   },
   {
    "alias": "K10",
    "record_id": "DOC-CCT-MECH-2026-0000000107",
    "checkable": false,
-   "chars": 162
+   "chars": 166
   }
  ],
  "units": [

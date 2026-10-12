@@ -586,15 +586,15 @@
   "norm_rev": "cr-n1",
   "limits_rev": "0b3a25b0",
   "input_sha": "abf9d1fcc46f12df1c20285b79d3ef1b36880c93691d9d6aae273d52df1f5b69",
-  "prompt_chars": 6945,
+  "prompt_chars": 7025,
   "usage": {
    "llm_calls": 1,
-   "tokens_in": 3472,
+   "tokens_in": 3512,
    "tokens_out": 1319,
    "per_attempt": [
     {
      "n": 1,
-     "tokens_in": 3472,
+     "tokens_in": 3512,
      "tokens_out": 1319
     }
    ]

@@ -53,7 +53,8 @@ def act(x) -> Act:
 _CARD_HEAD = re.compile(r"^\[(K\d+)\] 종류 ", re.M)
 _LINE = re.compile(r"^(L\d+) \[[^\]]*\] «", re.M)
 _UNIT = re.compile(r"^(U\d+) \[[^\]]*\] «", re.M)
-_QUOTE = re.compile(r"«([^«»]*)»")
+# 절 본문은 줄 머리에서 여는 «…» 다 — 머리 줄의 검토·규격, 제목 줄, 절 제목 줄(§sid «…»)의 «…» 는 줄 가운데서 연다.
+_BODY = re.compile(r"^«([^«»]*)»", re.M)
 _HINT = "(보충 "
 
 
@@ -67,8 +68,7 @@ def read_prompt(human: str) -> dict:
     for i, m in enumerate(heads):
         end = heads[i + 1].start() if i + 1 < len(heads) else body.find("\n\n[", m.end())
         block = body[m.start(): end if end > 0 else len(body)]
-        quotes = _QUOTE.findall(block)
-        cards[m.group(1)] = quotes[1:]          # 첫 «…» 는 제목이다
+        cards[m.group(1)] = _BODY.findall(block)
     if "[검토 단위 목록" in body:
         kind = "sweep"
     elif "[점검 카드" in body:
