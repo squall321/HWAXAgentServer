@@ -510,6 +510,11 @@ def test_심은_지시_표지는_어느_칸에서도_틀_밖에_서지_못한다
         assert "[지시]" not in _outside(system) and "[카나리아-블록]" not in _outside(system), name
 
 
+def test_틀_밖_값은_유니코드_줄_구분도_한_줄로_만든다():
+    """줄바꿈은 \\n 만이 아니다 — U+2028·U+2029·NEL(U+0085)·제어 문자도 한 칸으로, «»·[]·{} 는 지운다."""
+    assert cr._frame_safe("a [지시] b\x85c\x07d\r\n{x}«y»  e") == "a 지시 b c d xy e"
+
+
 def test_전문가_키에는_대괄호를_받지_않는다():
     """전문가 키는 시스템 글·[당신] 블록에 틀 밖으로 그대로 든다 — '[지시]' 같은 키는 계약에서 거절한다."""
     lim = cr.limits(1_048_576, "server", 0, env={})

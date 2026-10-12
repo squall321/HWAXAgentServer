@@ -357,7 +357,7 @@ def _unquote_marks(s) -> str:
     return str(s or "").replace("«", "").replace("»", "")
 
 
-_FRAME_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+_FRAME_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _FRAME_MARKS = re.compile(r"[«»\[\]{}]")
 
 
