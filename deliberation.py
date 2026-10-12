@@ -1721,9 +1721,12 @@ async def _load_tools(scoped: dict) -> list:
 
 
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
-                         user_pat: str = "") -> dict:
+                         user_pat: str = "", svc_fallback: bool = True) -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
-    결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다."""
+    결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다.
+    svc_fallback=False 면 사용자 토큰이 거절돼도(로드 때·호출 때 모두) 서비스 계정으로 넘어가지 않는다 — 로드 때는 예외를
+    그대로 올리고, 호출 때는 자격 거절 문구(_AUTH_REJECT_MARK)를 그대로 돌려준다. 자격이 만료되면 멈추고 알려야 하는 길
+    (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다."""
     conns = app.state.connections
     if not conns:
         return {}
@@ -1735,7 +1738,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         # 챗(app._agent_for)과 같은 안전망을 여기에도 둔다. 심의가 사용자 PAT 로 갈아탄
         # 뒤로는 게이트웨이가 그 PAT 를 거절하면 /심의·/시뮬심의·/시험계획·/보고서 가
         # 통째로 죽는다 — 챗만 폴백이 있고 심의에는 없던 비대칭이 실제 회귀였다.
-        if not user_pat:
+        if not user_pat or not svc_fallback:
             raise
         print(f"[deliberation] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({_pe!r:.160})")
         # ⚠ app.state.tool_degraded 에는 쓰지 않는다 — 그 칸의 소비자는 챗 SSE(다른 요청)라
@@ -1755,7 +1758,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         tools = [_prep_tool(t, result_max, desc_max) for t in tools]
     except Exception as exc:  # noqa: BLE001 — 래핑 실패해도 심의는 진행
         print(f"[deliberation] _prep_tool 적용 실패: {exc!r}")
-    if via_pat:
+    if via_pat and svc_fallback:
         # 사용자 토큰은 시작할 때 받은 것을 끝까지 쓴다. 심의가 그 수명보다 길면 **도는 중에** 거절된다 —
         # 종전엔 그 뒤의 좌석 조회와 마지막 보고서 저장이 전부 실패했고 사유는 'TaskGroup 오류' 한 줄이었다.
         # 로드 때의 폴백(위)과 같은 처리를 호출 단위로 한다 — 거절되면 서비스 계정 도구로 그 호출을 한 번 더.

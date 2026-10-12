@@ -14,12 +14,28 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
+import time
 
-from deliberation import _CHAIR_RESERVE, _EVID_KO_CPT, _PRE_SAFETY, _SUBSTANTIVE_RE, _first_dict, _norm_ws
+from deliberation import (
+    _CHAIR_RESERVE,
+    _EVID_KO_CPT,
+    _KN_CONC,
+    _PRE_SAFETY,
+    _RA_FAIL_WRAP,
+    _SUBSTANTIVE_RE,
+    _auth_rejected,
+    _call,
+    _dom_of,
+    _first_dict,
+    _norm_ws,
+    _parse_json,
+    _tools_by_name,
+)
 from evidence import _NUM_TOK_RE, sig_numbers
 
 # ── 판 번호 ──────────────────────────────────────────────────────────────────
@@ -1468,3 +1484,202 @@ async def _ask(llm, system: str, human: str) -> tuple[str, dict]:
         if isinstance(um, dict) and (um.get("input_tokens") is not None or um.get("output_tokens") is not None):
             usage = {"tokens_in": um.get("input_tokens"), "tokens_out": um.get("output_tokens")}
     return str(content or ""), {"finish_reason": _finish_reason(msg) or None, "usage": usage}
+
+
+
+# ── 팩 빌더(도구) ────────────────────────────────────────────────────────────
+# 전문가 한 명의 지식카드 전부를 원문으로 받아 정규 팩을 만든다. '카드 0장'·'없는 전문가'·'못 받았다' 를 다른 모양으로
+# 답한다 — 실패가 정상 응답(빈 팩)과 똑같이 생기면 전 전문가가 '카드 0장' 으로 얼 수 있다(P-03). 일부만 든 팩은 주지 않는다.
+# 검토 경로는 사용자 PAT 만 쓴다 — 자격이 거절되면 서비스 계정으로 내려가지 않고 멈춘다(D-26, PLAN 7절 M2 앞 셋째).
+PACK_CONC = 2                       # 팩 빌드 동시 수(프로세스 전체) — AIDataHub 연결 풀(조회 동시 _KN_CONC × 2)
+PACK_CALL_TIMEOUT_S = 60.0          # 도구 호출 하나의 기한(목록 쪽·카드 한 장)
+LIST_PAGE = 100                     # AIDataHub list_records 의 limit 상한(1~100)
+PACK_TOOLS = ("get_agent_session", "list_records", "get_record")
+
+
+class PackError(Exception):
+    """팩을 만들지 못했다 — code·HTTP 상태·사람이 읽는 사유(M2.md 4.4 의 어휘)."""
+
+    def __init__(self, code: str, status: int, message: str, **detail):
+        super().__init__(message)
+        self.code, self.status, self.message, self.detail = code, status, message, detail
+
+    def body(self) -> dict:
+        return {"code": self.code, "message": self.message, **self.detail}
+
+
+def pack_gate(app) -> asyncio.Semaphore:
+    """팩 빌드 동시 2건 관문 — app.state 에 처음 쓸 때 만든다(모듈 전역에 두면 다른 이벤트 루프에서 죽는다 — P-17b)."""
+    sem = getattr(app.state, "card_review_pack_sem", None)
+    if sem is None:
+        sem = asyncio.Semaphore(PACK_CONC)
+        app.state.card_review_pack_sem = sem
+    return sem
+
+
+def _exc_status(exc) -> int | None:
+    """예외 사슬(TaskGroup 묶음·원인 포함)에서 401·403 을 찾는다. 없으면 None."""
+    seen, stack = set(), [exc]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        st = getattr(getattr(e, "response", None), "status_code", None)
+        if st in (401, 403):
+            return st
+        m = re.search(r"\b(401|403)\b", f"{type(e).__name__}: {e}")
+        if m:
+            return int(m.group(1))
+        stack += list(getattr(e, "exceptions", None) or ()) + [e.__cause__, e.__context__]
+    return None
+
+
+def _excerpt(x, n: int = 200) -> str:
+    s = x if isinstance(x, str) else json.dumps(x, ensure_ascii=False, default=str)
+    return s[:n]
+
+
+async def load_pack_tools(app, groups, *, user_email: str, user_pat: str) -> dict:
+    """팩 조회용 도구 — 사용자 PAT 로만 붙는다(svc_fallback=False). 결과 절단은 사실상 끈다(CATALOG_RESULT_MAX).
+    PAT 가 없으면 credential_missing, 게이트웨이가 거절하면 credential_rejected(401)·denied(403), 그 밖의 실패는
+    tools_unavailable 이다. 서비스 계정으로 성공하는 길은 없다."""
+    if not str(user_pat or "").strip():
+        raise PackError("credential_missing", 401, "사용자 토큰이 없다 — 카드 대조는 사용자 자격으로만 조회한다(서비스 계정으로 "
+                        "내려가지 않는다). 포털에서 토큰을 다시 등록하라")
+    from app import CATALOG_RESULT_MAX  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+
+    try:
+        return await _tools_by_name(app, list(groups or []), CATALOG_RESULT_MAX, user=str(user_email or ""),
+                                    user_pat=str(user_pat), svc_fallback=False)
+    except Exception as exc:  # noqa: BLE001 — 분류해서 올린다
+        st = _exc_status(exc)
+        if st == 401:
+            raise PackError("credential_rejected", 401, "게이트웨이가 사용자 토큰을 거절했다(만료·폐기) — 서비스 계정으로 "
+                            "내려가지 않는다. 포털에서 토큰을 다시 등록하라") from exc
+        if st == 403:
+            raise PackError("denied", 403, "게이트웨이가 이 사용자의 도구 조회를 막았다(권한)") from exc
+        raise PackError("tools_unavailable", 503, f"게이트웨이 도구를 받지 못했다 — {type(exc).__name__}: {_excerpt(str(exc))}",
+                        missing=list(PACK_TOOLS)) from exc
+
+
+async def _pack_call(tools: dict, name: str, args: dict) -> tuple[object, str]:
+    """도구 하나를 기한 안에 — (결과, 실패 사유). 실패 사유가 ""가 아니면 결과를 믿지 않는다. 자격 거절이면 곧바로
+    PackError(credential_rejected) — 한 장이라도 거절되면 그 뒤 조회도 같은 자격이라 팩 전체를 멈춘다."""
+    try:
+        out = await asyncio.wait_for(_call(tools, name, args), PACK_CALL_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return None, f"{PACK_CALL_TIMEOUT_S:.0f}초 안에 답하지 않았다"
+    if _auth_rejected(out):
+        raise PackError("credential_rejected", 401, f"{name} 호출 중 게이트웨이가 사용자 토큰을 거절했다(만료·폐기) — 서비스 "
+                        "계정으로 내려가지 않는다. 포털에서 토큰을 다시 등록하라", step=name)
+    if out is None:
+        return None, "도구가 없거나 빈 답"
+    if isinstance(out, str) and _RA_FAIL_WRAP.match(out.lstrip()):
+        return None, _RA_FAIL_WRAP.sub("", out.strip(), count=1)[:300]
+    return out, ""
+
+
+async def build_pack(tools: dict, agent_key: str) -> dict:
+    """전문가 한 명의 카드 전부 → 정규 팩. list_records(쪽 넘김) + get_record × N, 정규화·별칭·해시.
+
+    실패 규칙(P-03) — 필요한 도구가 없으면 503 tools_unavailable{missing}. 역할 조회가 'agent not found' 면 404
+    agent_not_found(빈 팩으로 답하지 않는다). 목록 응답이 사전이 아니거나 items 가 목록이 아니거나 total 이 정수가
+    아니면 502 card_list_failed. 모은 id 수가 total 과 다르면 502 card_list_unstable(AIDataHub 는 updated_at 내림차순이라
+    쪽 넘김 중 수정이 끼면 흔들린다). 카드 한 장이라도 못 받거나 id·doc_type 이 다르면 502 card_fetch_failed{failed}.
+    자격 거절은 credential_rejected. 카드 0장은 정상 팩(cards=[])이다. 절 없는 카드는 unrenderable 로 따로 싣는다."""
+    key = str(agent_key or "").strip()
+    if not key:
+        raise PackError("bad_request", 422, "agent_key 가 비었다")
+    missing = [n for n in PACK_TOOLS if n not in (tools or {})]
+    if missing:
+        raise PackError("tools_unavailable", 503, "카드를 받을 도구가 게이트웨이에 없다(AIDataHub 연결·권한을 본다)",
+                        missing=missing)
+
+    raw, why = await _pack_call(tools, "get_agent_session", {"agent_type": key})
+    if why:
+        if "agent not found" in why.lower():
+            raise PackError("agent_not_found", 404, f"전문가 '{key}' 가 없다", agent_key=key)
+        raise PackError("card_list_failed", 502, f"역할을 받지 못했다 — {why}", step="get_agent_session")
+    sess = _first_dict(_parse_json(raw))
+    sd = _first_dict(sess.get("data", sess)) if sess else {}
+    if not sd:
+        raise PackError("card_list_failed", 502, "역할 응답을 읽지 못했다", step="get_agent_session", got=_excerpt(raw))
+    from app import _role_doc  # noqa: PLC0415
+
+    # 역할은 전문을 싣는다(설계서의 8,000자 천장을 뺀다 — 끊는 것은 프롬프트 조립뿐이고 표식을 단다).
+    role = str(sd.get("description") or "").strip() or _role_doc(str(sd.get("system_prompt") or ""))
+
+    ids: list = []
+    total = None
+    offset = 0
+    while True:
+        args = {"agents": [key], "doc_type": CARD_DOC_TYPE, "limit": LIST_PAGE, "offset": offset}
+        raw, why = await _pack_call(tools, "list_records", args)
+        if why:
+            raise PackError("card_list_failed", 502, f"카드 목록을 받지 못했다 — {why}", step="list_records", offset=offset)
+        d = _parse_json(raw)
+        if (not isinstance(d, dict) or not isinstance(d.get("items"), list) or not isinstance(d.get("total"), int)
+                or isinstance(d.get("total"), bool)):
+            raise PackError("card_list_failed", 502, "카드 목록 응답의 모양이 다르다(items·total)", step="list_records",
+                            offset=offset, got=_excerpt(raw))
+        if total is None:
+            total = d["total"]
+        elif d["total"] != total:
+            raise PackError("card_list_unstable", 502, "쪽을 넘기는 사이 카드 수가 바뀌었다 — 다시 받는다", total=total,
+                            now=d["total"])
+        for it in d["items"]:
+            rid = it.get("id") if isinstance(it, dict) else None
+            if not isinstance(rid, str) or not rid:
+                raise PackError("card_list_failed", 502, "카드 목록 항목에 id 가 없다", step="list_records",
+                                got=_excerpt(it))
+            ids.append(rid)
+        offset += len(d["items"])
+        if not d["items"] or offset >= total:
+            break
+    if len(ids) != len(set(ids)) or len(set(ids)) != total:
+        raise PackError("card_list_unstable", 502, f"모은 카드 {len(set(ids))}장(중복 {len(ids) - len(set(ids))})이 목록의 "
+                        f"total {total} 과 다르다 — 쪽 넘김 중 카드가 고쳐졌다. 다시 받는다", total=total, got=len(set(ids)))
+
+    sem = asyncio.Semaphore(_KN_CONC)
+
+    async def fetch(rid: str):
+        async with sem:
+            out, why = await _pack_call(tools, "get_record", {"record_id": rid})
+        if why:
+            return None, why
+        rec = _first_dict(_parse_json(out))
+        if rec.get("id") != rid:
+            return None, f"다른 기록이 왔다({_excerpt(rec.get('id'), 80)})"
+        if rec.get("doc_type") != CARD_DOC_TYPE:
+            return None, f"지식카드가 아니다(doc_type={_excerpt(rec.get('doc_type'), 60)})"
+        return rec, ""
+
+    got = await asyncio.gather(*(fetch(r) for r in ids))
+    failed = [{"record_id": r, "why": why} for r, (_, why) in zip(ids, got) if why]
+    if failed:
+        raise PackError("card_fetch_failed", 502, f"카드 {len(failed)}/{len(ids)}장을 받지 못했다 — 일부만 든 팩은 주지 "
+                        "않는다", failed=failed)
+
+    cards = [normalize_card(rec) for rec, _ in got]
+    ok = [c for c in cards if c["sections"]]
+    pack = assign_aliases(ok)
+    rsha = role_sha(role)
+    return {
+        "agent_key": key, "name": str(sd.get("name") or key), "domain": _dom_of(key), "role": role, "role_sha": rsha,
+        "cards": pack,
+        "unrenderable": [{"record_id": c["record_id"], "card_id": c["card_id"], "title": c["title"]}
+                         for c in cards if not c["sections"]],
+        "cards_total": len(pack), "listed_total": total, "checkable_n": sum(1 for c in pack if c["checkable"]),
+        "chars_total": sum(c["chars"] for c in pack), "pack_hash": pack_hash(key, rsha, pack),
+        "norm_rev": NORM_REV, "source": "list+get", "fetched_at": int(time.time()),
+    }
+
+
+async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: str) -> dict:
+    """`POST /card-review/pack` 의 본체 — 관문(동시 2) 안에서 사용자 자격으로 도구를 받아 팩을 만든다. 실패는 PackError.
+    credential 은 서버가 실제로 쓴 자격이다(언제나 user — 서비스 계정 길이 없다)."""
+    async with pack_gate(app):
+        tools = await load_pack_tools(app, groups, user_email=user_email, user_pat=user_pat)
+        pack = await build_pack(tools, agent_key)
+    return {**pack, "credential": "user"}
