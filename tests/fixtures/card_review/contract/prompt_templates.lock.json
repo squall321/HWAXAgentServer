@@ -1,11 +1,11 @@
 {
  "sweep": {
   "prompt_rev": "cr-sweep-1",
-  "template_sha": "54a9436ee48a7fcbb227edcc962c77fef101dfcaf6bd6d01c4bdec54871e30f0"
+  "template_sha": "6006b7713aa67738207e233b86d068b706e0ca600b8c7c8e458fd9961cf3743b"
  },
  "verdict": {
   "prompt_rev": "cr-verdict-1",
-  "template_sha": "79df76df0d0126c3c9aaa1b479d1a820a8cfdaa6fe10f529f0f6e10e81d7cf0b"
+  "template_sha": "767c6ffd884cf3d55cf88b98fe47b7a2398eff5b790fae0ae1fcfd44cc5e4bbd"
  },
  "offcard": {
   "prompt_rev": "cr-offcard-1",
