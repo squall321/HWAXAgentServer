@@ -150,6 +150,12 @@ Contract examples the risk app and the portal test against live in `tests/fixtur
 the real routes with the scripted fake LLM (`tests/fakes/llm.py`), times masked, and rewritten only with
 `CARD_REVIEW_CONTRACT_UPDATE=1 .venv/bin/python -m pytest tests/test_card_review_contract.py -q`.
 
+For a wiring rehearsal with a 1,048,576-token window (the dev LLM has 16K), `tests/fakes/llm_server.py` is an
+OpenAI-compatible fake (`/v1/models` reports `--ctx`, `/v1/chat/completions` replays the same scripts). Start it
+and a throwaway agent server on free ports — never 9009, and never with the real `DELIB_JOB_DIR` (startup marks
+that ledger's running jobs as interrupted). `tests/test_card_review_e2e.py` does exactly this and its header has
+the command lines. It is test-only: no production knob points at it.
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the
