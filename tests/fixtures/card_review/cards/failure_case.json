@@ -1,0 +1,52 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000102",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 102,
+ "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+ "summary": "코너 R 을 2.0 에서 1.5 mm 로 줄인 시험 기종에서 고온 고습 500 시간 뒤 코너 접착이 들떴다.",
+ "tags": [
+  "type:failure-case",
+  "confidence:expert-judgement",
+  "tier:failure_mode"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "사례",
+    "content_text": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록 — 사례\n코너 R 을 2.0 에서 1.5 mm 로 줄인 시험 기종에서 고온 고습 500 시간 뒤 코너 접착이 들떴다."
+   },
+   {
+    "section_id": "2",
+    "level": 1,
+    "title": "발생 조건",
+    "content_text": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록 — 발생 조건\n코너 R 이 1.5 mm 이하이고 접착폭이 1.0 mm 미만인 경우에 겹친다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-F-001",
+   "type": "failure-case",
+   "confidence": "expert-judgement",
+   "causal_status": "validated",
+   "tier": "failure_mode",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}

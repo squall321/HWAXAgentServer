@@ -18,7 +18,7 @@ import hashlib
 import json
 import os
 
-from deliberation import _CHAIR_RESERVE, _EVID_KO_CPT, _PRE_SAFETY
+from deliberation import _CHAIR_RESERVE, _EVID_KO_CPT, _PRE_SAFETY, _first_dict
 
 # ── 판 번호 ──────────────────────────────────────────────────────────────────
 API_REV = "cr-1"
@@ -276,3 +276,150 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         "oversize": {"cards": sorted(kinds_of), "kinds": kinds_of, "units": u_over, "manifest": m_over},
         "soft_over": {"units": u_soft, "manifest": m_soft},
     }
+
+
+# ── 카드 정규화·렌더(순수) ────────────────────────────────────────────────────
+# 카드의 정규 글을 만드는 곳은 여기 하나다(C-11). 리스크 앱은 팩 응답을 통째로 얼려 같은 글로 인용을 다시 대조한다 —
+# 두 리포가 글을 따로 만들면 맞는 인용이 불일치가 된다(QP2 벡터가 지킨다).
+NORM_REV = "cr-n1"
+CARD_DOC_TYPE = "expert_knowledge_card"
+# ExpertAgents 의 일곱 종류 가운데 판정 대상(점검형)이 아닌 넷. 이 밖의 종류(모르는 것·빈 값)는 점검형으로 둔다 —
+# 빼는 쪽으로 틀리지 않는다. open-observation(인과 미검증 관측, 코퍼스 0장)은 배경으로 둔다(M2.md 5절 17).
+_BACKGROUND_TYPES = frozenset({"concept", "faq", "data", "open-observation"})
+_TYPE_ORDER = ("design-rule", "standard-summary", "failure-case", "data", "concept", "faq", "open-observation")
+_TAG_FIELDS = ("type", "confidence", "tier", "causal_status")
+
+
+def _unquote_marks(s) -> str:
+    """«·» 를 지운다 — 원천 글이 프롬프트의 인용 구간을 닫지 못하게(설계서 3.10)."""
+    return str(s or "").replace("«", "").replace("»", "")
+
+
+def _section_text(raw, sec_title: str) -> str:
+    """절 본문의 정규 글 — CRLF→LF, 줄 끝 공백·앞뒤 빈 줄 떼기, 검색용 머리 줄 떼기, «» 지우기.
+
+    머리 줄은 ExpertAgents 내보내기가 임베딩 맥락용으로 붙인 '카드 제목 — 절 제목' 줄이다(헤딩 없는 카드는 '카드 제목'
+    한 줄). 인용 원문이 아니므로 뗀다 — 남기면 모델이 제목을 인용해도 통과한다."""
+    lines = [ln.rstrip() for ln in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    head = str(sec_title or "").strip()
+    if lines and head and (lines[0].endswith(f"— {head}") or lines[0].strip() == head):
+        lines.pop(0)
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return _unquote_marks("\n".join(lines)).strip()
+
+
+def _text_sha(sections: list) -> str:
+    return hashlib.sha256("\n".join(f"{s['sid']}\t{s['title']}\n{s['text']}" for s in sections).encode()).hexdigest()
+
+
+def normalize_card(rec) -> dict | None:
+    """get_record 한 건 → 정규 카드(설계서 3.4 필드표 + card_id). 기록이 아니면(사전이 아니거나 id 가 없으면) None.
+
+    값은 `content.card.*` 가 먼저이고 없으면 태그(`type:`·`confidence:`·`tier:`·`causal_status:`)다. 값이 없으면 "" 로 둔다 —
+    `validated` 같은 기본값으로 채우지 않는다. 그릴 절이 하나도 없으면 sections 가 빈 카드를 돌려준다(None 이 아니다 —
+    팩이 그 카드를 unrenderable 로 따로 싣는다. 조용히 빠지지 않게)."""
+    if not isinstance(rec, dict) or not rec.get("id"):
+        return None
+    content = rec.get("content") if isinstance(rec.get("content"), dict) else {}
+    meta = content.get("card") if isinstance(content.get("card"), dict) else {}
+    tags: dict = {}
+    for t in rec.get("tags") or []:
+        k, sep, v = str(t).partition(":")
+        if sep and k in _TAG_FIELDS and k not in tags:
+            tags[k] = v.strip()
+
+    def pick(field: str) -> str:
+        v = meta.get(field)
+        return _unquote_marks(v).strip() if v not in (None, "") else _unquote_marks(tags.get(field, "")).strip()
+
+    sections = []
+    for i, s in enumerate(content.get("sections") or []):
+        s = _first_dict(s)
+        raw_title = str(s.get("title") or "")
+        raw = s.get("content_text") if s.get("content_text") is not None else s.get("text")
+        text = _section_text(raw, raw_title)
+        if text:
+            sections.append({"sid": str(s.get("section_id") or s.get("sid") or i + 1),
+                             "title": _unquote_marks(raw_title).strip(), "text": text})
+    ctype = pick("type")
+    refs = meta.get("standard_refs")
+    srcs = meta.get("sources")
+    return {
+        "record_id": str(rec["id"]),
+        "card_id": str(meta.get("card_id") or ""),
+        "title": _unquote_marks(rec.get("title")).strip(),
+        "type": ctype,
+        "checkable": ctype not in _BACKGROUND_TYPES,
+        "tier": pick("tier"),
+        "confidence": pick("confidence"),
+        "causal_status": pick("causal_status"),
+        "review_status": _unquote_marks(meta.get("review_status")).strip(),
+        "standard_refs": [_unquote_marks(r).strip() for r in refs] if isinstance(refs, list) else [],
+        "sources_n": len(srcs) if isinstance(srcs, list) else 0,
+        "updated": str(meta.get("updated") or ""),
+        "upstream_checksum": str(meta.get("checksum") or ""),
+        "sections": sections,
+        "text_sha": _text_sha(sections),
+    }
+
+
+def card_text(card: dict) -> str:
+    """인용 대조의 원문 — 절 본문을 줄바꿈으로 이은 것. 머리 줄(종류·등급·제목)은 인용 대상이 아니다."""
+    return "\n".join(s["text"] for s in card.get("sections") or [])
+
+
+def card_header(card: dict, alias: str) -> str:
+    """카드 머리 줄 — 종류·등급·인과·검토·규격(빈 칸은 뺀다). 인용 대상이 아니지만 수치 원천에는 든다(P-17f)."""
+    ctype = card.get("type") or "미상"
+    bits = [f"종류 {ctype}({'점검' if card.get('checkable') else '배경'})"]
+    for label, key in (("등급", "confidence"), ("인과", "causal_status"), ("검토", "review_status")):
+        if card.get(key):
+            bits.append(f"{label} {card[key]}")
+    if card.get("standard_refs"):
+        bits.append("규격 " + ", ".join(card["standard_refs"]))
+    return f"[{alias}] " + " · ".join(bits)
+
+
+def render_card(card: dict, alias: str) -> str:
+    """프롬프트에 싣는 카드 한 장(끝 줄바꿈 포함 — 묶음 글자 수는 이 길이의 합이다)."""
+    out = [card_header(card, alias), f"제목 «{card.get('title', '')}»"]
+    for s in card.get("sections") or []:
+        out.append(f"§{s['sid']} {s['title']}".rstrip())
+        out.append(f"«{s['text']}»")
+    return "\n".join(out) + "\n"
+
+
+def alias_width(n: int) -> int:
+    """별칭 숫자 자릿수 — 99장까지 두 자리, 그 위는 세 자리(설계서 3.4)."""
+    return max(2, len(str(n)))
+
+
+def assign_aliases(cards: list) -> list:
+    """정규 카드를 팩의 고정 순서(종류 순 → card_id → record_id)로 세우고 K01… 별칭과 렌더 길이(chars)를 단다.
+    같은 전문가의 모든 호출에서 같은 별칭이 같은 카드다."""
+    order = {t: i for i, t in enumerate(_TYPE_ORDER)}
+    ranked = sorted(cards, key=lambda c: (order.get(c.get("type"), len(order)), c.get("card_id") or "",
+                                          c.get("record_id") or ""))
+    w = alias_width(len(ranked))
+    out = []
+    for i, c in enumerate(ranked, 1):
+        alias = f"K{i:0{w}d}"
+        out.append({"alias": alias, **c, "chars": len(render_card(c, alias))})
+    return out
+
+
+def role_sha(role: str) -> str:
+    return hashlib.sha256(str(role or "").encode()).hexdigest()
+
+
+def pack_hash(agent_key: str, role_hash: str, cards: list) -> str:
+    """팩의 내용 주소 — 전문가·역할·카드마다 렌더에 드는 칸 전부(별칭 순). 같은 입력이면 같다(QP2)."""
+    rows = [[c.get("record_id"), c.get("card_id"), c.get("title"), c.get("type"), c.get("confidence"),
+             c.get("causal_status"), c.get("review_status"), list(c.get("standard_refs") or []), c.get("text_sha")]
+            for c in cards]
+    return hashlib.sha256(json.dumps([agent_key, role_hash, rows], ensure_ascii=False).encode()).hexdigest()

@@ -1,0 +1,67 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000101",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 101,
+ "title": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다",
+ "summary": "정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다. 폭이 줄면 코너 R 도 함께 본다.",
+ "tags": [
+  "type:design-rule",
+  "confidence:heuristic",
+  "tier:core",
+  "ISO 9999-2"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "규칙",
+    "content_text": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다 — 규칙\n정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\r\n폭이 줄면 코너 R 도 함께 본다."
+   },
+   {
+    "section_id": "2",
+    "level": 1,
+    "title": "적용 조건",
+    "content_text": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다 — 적용 조건\n후면 커버와 미들프레임 사이의 «PSA 테이프» 접착 계면에 적용한다. 오링 압축 실링은 대상이 아니다."
+   },
+   {
+    "section_id": "3",
+    "level": 1,
+    "title": "판정 표",
+    "content_text": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다 — 판정 표\n| 항목 | 하한 |\n|---|---|\n| 접착폭 | 0.8 mm |\n| 코너 R | 1.2 mm |"
+   },
+   {
+    "section_id": "4",
+    "level": 1,
+    "title": "빈 절",
+    "content_text": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다 — 빈 절"
+   }
+  ],
+  "card": {
+   "card_id": "TSL-R-001",
+   "type": "design-rule",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "tier": "core",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [
+    "ISO 9999-2"
+   ],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}

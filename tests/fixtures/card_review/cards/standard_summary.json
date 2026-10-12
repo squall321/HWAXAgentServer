@@ -1,0 +1,61 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000103",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 103,
+ "title": "시험용 방수 등급 시험 규격 요약 카드",
+ "summary": "지어낸 규격은 침수 시험을 1.5 m 수심에서 30 분 유지하도록 정한다.",
+ "tags": [
+  "type:standard-summary",
+  "confidence:fact",
+  "tier:checklist",
+  "IEC 0000-529"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "요약",
+    "content_text": "시험용 방수 등급 시험 규격 요약 카드 — 요약\n지어낸 규격은 침수 시험을 1.5 m 수심에서 30 분 유지하도록 정한다."
+   },
+   {
+    "section_id": "2",
+    "level": 1,
+    "title": "적용 범위",
+    "content_text": "시험용 방수 등급 시험 규격 요약 카드 — 적용 범위\n외장 실링이 있는 휴대 기기 전체에 적용한다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-S-001",
+   "type": "standard-summary",
+   "confidence": "fact",
+   "causal_status": "validated",
+   "tier": "checklist",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [
+    "IEC 0000-529"
+   ],
+   "fact_refs": [],
+   "sources": [
+    {
+     "ref": "DOC-TEST-0001",
+     "locator": "p.3 표 2",
+     "note": "지어낸 출처"
+    }
+   ]
+  }
+ }
+}

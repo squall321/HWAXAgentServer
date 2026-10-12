@@ -1,0 +1,46 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000108",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 108,
+ "title": "시험용 나사 보스 주변 실링 여유 규칙",
+ "summary": "나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다. 체결 토크가 커지면 여유를 더 둔다.",
+ "tags": [
+  "type:design-rule",
+  "confidence:heuristic",
+  "tier:checklist"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "시험용 나사 보스 주변 실링 여유 규칙",
+    "content_text": "시험용 나사 보스 주변 실링 여유 규칙\n\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-R-002",
+   "type": "design-rule",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "tier": "checklist",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}

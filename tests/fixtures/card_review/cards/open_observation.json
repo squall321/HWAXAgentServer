@@ -1,0 +1,47 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000107",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 107,
+ "title": "시험용 저온 낙하 뒤 미세 누수 관측 기록",
+ "summary": "영하 20 ℃ 낙하 뒤 미세 누수가 두 대에서 보였고 원인은 아직 모른다.",
+ "tags": [
+  "type:open-observation",
+  "confidence:expert-judgement",
+  "tier:deep",
+  "causal_status:unknown"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "관측",
+    "content_text": "시험용 저온 낙하 뒤 미세 누수 관측 기록 — 관측\n영하 20 ℃ 낙하 뒤 미세 누수가 두 대에서 보였고 원인은 아직 모른다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-O-001",
+   "type": "open-observation",
+   "confidence": "expert-judgement",
+   "causal_status": "unknown",
+   "tier": "deep",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}

@@ -1,0 +1,52 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000106",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 106,
+ "title": "시험용 PSA 테이프 박리 강도 표 데이터",
+ "summary": "| 온도 | 박리 강도 | |---|---| | 23 ℃ | 12.5 N/cm | | 85 ℃ | 7.25 N/cm |",
+ "tags": [
+  "type:data",
+  "confidence:fact",
+  "tier:deep"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "측정값",
+    "content_text": "시험용 PSA 테이프 박리 강도 표 데이터 — 측정값\n| 온도 | 박리 강도 |\n|---|---|\n| 23 ℃ | 12.5 N/cm |\n| 85 ℃ | 7.25 N/cm |"
+   }
+  ],
+  "card": {
+   "card_id": "TSL-D-001",
+   "type": "data",
+   "confidence": "fact",
+   "causal_status": "validated",
+   "tier": "deep",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": [
+    {
+     "ref": "DOC-TEST-0001",
+     "locator": "p.3 표 2",
+     "note": "지어낸 출처"
+    }
+   ]
+  }
+ }
+}

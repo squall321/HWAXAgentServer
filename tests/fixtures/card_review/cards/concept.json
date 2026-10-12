@@ -1,0 +1,46 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000104",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 104,
+ "title": "시험용 실링 아키텍처 세 요소 개념 정리",
+ "summary": "실링은 접착·압축·라비린스 세 방식으로 나뉜다.",
+ "tags": [
+  "type:concept",
+  "confidence:heuristic",
+  "tier:deep"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "개념",
+    "content_text": "시험용 실링 아키텍처 세 요소 개념 정리 — 개념\n실링은 접착·압축·라비린스 세 방식으로 나뉜다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-C-001",
+   "type": "concept",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "tier": "deep",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}

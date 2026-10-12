@@ -1,0 +1,46 @@
+{
+ "id": "DOC-CCT-MECH-2026-0000000105",
+ "data_type": "DOC",
+ "team": "CCT",
+ "group": "MECH",
+ "year": 2026,
+ "seq": 105,
+ "title": "시험용 접착 실링 재작업 문답 모음 카드",
+ "summary": "재작업은 접착제를 완전히 걷어낸 뒤에만 한다.",
+ "tags": [
+  "type:faq",
+  "confidence:heuristic",
+  "tier:deep"
+ ],
+ "agents": [
+  "mech-test-seal"
+ ],
+ "doc_type": "expert_knowledge_card",
+ "content": {
+  "sections": [
+   {
+    "section_id": "1",
+    "level": 1,
+    "title": "문답",
+    "content_text": "시험용 접착 실링 재작업 문답 모음 카드 — 문답\n재작업은 접착제를 완전히 걷어낸 뒤에만 한다."
+   }
+  ],
+  "card": {
+   "card_id": "TSL-Q-001",
+   "type": "faq",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "tier": "deep",
+   "review_status": "fact-checked",
+   "updated": "2026-07-14",
+   "checksum": "",
+   "token_estimate": 0,
+   "expert_id": [
+    "mech-test-seal"
+   ],
+   "standard_refs": [],
+   "fact_refs": [],
+   "sources": []
+  }
+ }
+}
