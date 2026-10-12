@@ -1802,10 +1802,18 @@ async def build_pack(tools: dict, agent_key: str) -> dict:
                         f"total {total} 과 다르다 — 쪽 넘김 중 카드가 고쳐졌다. 다시 받는다", total=total, got=len(set(ids)))
 
     sem = asyncio.Semaphore(_KN_CONC)
+    halted = False                      # 자격이 거절됐다 — 줄 서 있던 조회는 자리를 얻어도 내지 않는다(RB-9)
 
     async def fetch(rid: str):
+        nonlocal halted
         async with sem:
-            out, why = await _pack_call(tools, "get_record", {"record_id": rid})
+            if halted:
+                return None, "자격 거절로 멈췄다"
+            try:
+                out, why = await _pack_call(tools, "get_record", {"record_id": rid})
+            except PackError:
+                halted = True           # 자리를 놓기 전에 — 놓는 순간 깨어나는 다음 조회가 거절된 PAT 로 나가지 않게
+                raise
         if why:
             return None, why
         rec = _first_dict(_parse_json(out))
@@ -1815,7 +1823,16 @@ async def build_pack(tools: dict, agent_key: str) -> dict:
             return None, f"지식카드가 아니다(doc_type={_excerpt(rec.get('doc_type'), 60)})"
         return rec, ""
 
-    got = await asyncio.gather(*(fetch(r) for r in ids))
+    tasks = [asyncio.ensure_future(fetch(r)) for r in ids]
+    try:
+        got = await asyncio.gather(*tasks)
+    except BaseException:
+        # 자격 거절(PackError) 또는 바깥의 취소 — 남은 조회를 곧바로 접고 거둔다. gather 는 예외를 내도 형제를 취소하지 않아
+        # 거절된 PAT 로 나머지 조회가 끝까지 나갔다(RB-9). 자격 거절이 아닌 실패는 (None, 사유)로 돌아와 여기 오지 않는다.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     failed = [{"record_id": r, "why": why} for r, (_, why) in zip(ids, got) if why]
     if failed:
         raise PackError("card_fetch_failed", 502, f"카드 {len(failed)}/{len(ids)}장을 받지 못했다 — 일부만 든 팩은 주지 "

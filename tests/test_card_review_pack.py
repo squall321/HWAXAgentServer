@@ -236,6 +236,37 @@ def test_자격_거절_표식은_credential_rejected_이고_카드_실패가_아
     assert (e.code, e.status) == ("credential_rejected", 401) and e.body()["step"] == "get_record"
 
 
+def test_자격이_거절되면_남은_카드_조회를_곧바로_접는다():
+    """RB-9 — gather 는 첫 PackError 를 곧바로 내지만 형제 태스크를 취소하지 않아, 첫 장이 거절된 뒤에도 남은 조회가 거절된
+    PAT 로 끝까지 나갔다(11장 가운데 11장). 첫 묶음(동시 _KN_CONC)의 첫 장이 곧바로 거절을 돌려주게 하고, 나머지는 1초씩 걸린다."""
+    hub = Hub()
+    hub.get_sleep = 1.0
+    rejected = sorted(hub.records, reverse=True)[0]       # 목록 순서(updated 내림차순 흉내)의 첫 장
+    calls, orig = [], hub.get_record
+
+    async def get_record(args):
+        calls.append(args["record_id"])
+        if args["record_id"] == rejected:
+            return f"✖ 도구 get_record 호출 실패: {d._AUTH_REJECT_MARK} — 사용자 토큰이 만료됐다."
+        return await orig(args)
+
+    hub.get_record = get_record
+    assert len(hub.records) > cr._KN_CONC
+
+    async def go():
+        t0 = time.monotonic()
+        with pytest.raises(cr.PackError) as e:
+            await cr.build_pack(_tools(hub), KEY)
+        took, active, n = time.monotonic() - t0, hub.active, len(calls)
+        await asyncio.sleep(hub.get_sleep * 1.5)
+        return e.value, took, active, n, len(calls)
+
+    err, took, active, n_at, n_after = asyncio.run(go())
+    assert err.code == "credential_rejected" and took < 0.5, "거절을 받고도 도는 조회를 기다렸다"
+    assert active == 0, "거절 뒤에도 조회가 돌고 있다"
+    assert n_at == n_after == cr._KN_CONC, f"거절 뒤에 조회가 더 나갔다({n_at} → {n_after}, 전체 {len(hub.records)})"
+
+
 def test_카드_조회_동시_수는_KN_CONC_를_넘지_않는다():
     recs = []
     base = _records()
