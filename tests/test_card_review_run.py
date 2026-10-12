@@ -374,6 +374,7 @@ def test_구독을_닫으면_LLM_태스크가_취소되고_자리가_돌아온�
     assert llm.cancelled == 1 and llm.active == 0, "닫힌 구독의 LLM 호출이 계속 돈다"
     g = app.state.review_gate
     assert g.active == 0 and g.totals["cancelled"] == 1
+    assert g.totals["tokens_unknown_calls"] == 1, "도중에 접은 LLM 호출의 사용량을 0 토큰으로 셌다"
 
 
 def test_소비자가_취소돼도_LLM_을_접는다(monkeypatch):
@@ -490,3 +491,17 @@ def test_창이_모자라면_ctx_too_small_이고_종류를_먼저_본다():
     with pytest.raises(cr.RequestError) as e:
         cr.prepare({**req, "kind": "cross"}, small)
     assert e.value.code == "unsupported_kind"
+
+
+def test_엔진_내부_오류도_끝_프레임으로_닫는다(monkeypatch, capsys):
+    """파싱·검사 쪽 결함이 스트림을 끝 프레임 없이 끊으면 앱은 그것을 인프라 끊김으로 보고 차감 없이 영영 다시 낸다."""
+    def boom(*_a, **_k):
+        raise KeyError("x")
+
+    monkeypatch.setattr(cr, "check_rows", boom)
+    fr, _llm, app = _go(_verdict(2), ["oracle"])
+    assert _names(fr) == ["status", "error", "done"]
+    err = _last(fr)[1]
+    assert (err["code"], err["infra"], err["retryable"]) == ("internal_error", False, False)
+    g = app.state.review_gate
+    assert g.active == 0 and g.totals["error"] == 1 and g.last_error.startswith("internal_error")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -1904,7 +1905,7 @@ async def run(app, prep: dict):
     attempts_max = 1 + _parse_retries()
     hb = float(DELIB_HEARTBEAT_S)
     system, human0 = prep["system"], prep["human"]
-    st = {"outcome": "cancelled", "truncated": False, "repaired": False}
+    st = {"outcome": "cancelled", "truncated": False, "repaired": False, "launched": 0}
     per: list = []                       # 시도마다 {n, tokens_in, tokens_out} — 실패한 시도는 None 둘
     llm_ms: list = []
     finishes: list = []                  # 끝난 시도의 finish_reason(못 읽으면 None)
@@ -1940,6 +1941,7 @@ async def run(app, prep: dict):
                     break
             yield frame("status", {"step": "attempt", "n": n})
             task = asyncio.ensure_future(_ask(llm, system, human))
+            st["launched"] += 1
             t1 = time.monotonic()
             try:
                 while not task.done():
@@ -2027,12 +2029,20 @@ async def run(app, prep: dict):
         st.update(outcome="ok", truncated=quality["truncated"] is True, repaired=quality["repaired"])
         yield frame("result", result)
         yield frame("done", {})
+    except Exception as exc:  # noqa: BLE001 — 이 모듈의 결함(파싱·검사)이다. 끝 프레임 없이 스트림을 끊지 않는다
+        logging.getLogger("agent").exception("[card_review] %s 내부 오류", tag)
+        st["outcome"] = "internal_error"
+        # 계약 표(ERRORS)에 없는 코드라 앱은 내용 탓으로 센다(차감 2번이면 그 셀이 failed(internal_error) — 무한 재시도가 아니다).
+        yield frame("error", {"code": "internal_error", "message": f"카드 대조 엔진 내부 오류 — {type(exc).__name__}: "
+                              f"{str(exc)[:200]}", "infra": False, "retryable": False})
+        yield frame("done", {})
     finally:
+        # 사용량을 아는 시도만 합에 넣고, 모르는 시도(실패·도중 취소 포함)는 '모름' 으로 센다 — 0 토큰으로 치지 않는다.
         known = [p for p in per if p["tokens_in"] is not None or p["tokens_out"] is not None]
         gate.release(got, st["outcome"],
                      {"tokens_in": sum(p["tokens_in"] or 0 for p in known),
                       "tokens_out": sum(p["tokens_out"] or 0 for p in known)} if known else None,
-                     unknown_calls=len(per) - len(known), truncated=st["truncated"], repaired=st["repaired"])
+                     unknown_calls=st["launched"] - len(known), truncated=st["truncated"], repaired=st["repaired"])
         # 호출당 한 줄 — 본문(카드·변경 줄)은 찍지 않는다.
         print(f"[card_review] {tag} chars={ctx['prompt_chars']:,} attempts={len(per)} "
               f"{time.monotonic() - t0:.1f}s → {st['outcome']}")

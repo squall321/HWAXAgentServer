@@ -122,7 +122,9 @@ dropped. Other refusals before the stream opens: 422 `bad_request` · `unsupport
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,
 409 `rev_mismatch` (the request's `expect{prompt_rev, limits_rev}` differs), 403 `denied` (no
 `feat:deliberation`). Engine error codes in the stream: `review_busy`, `llm_unreachable`, `llm_timeout`,
-`llm_error`, `llm_misconfigured`, `llm_rejected`, `context_overflow`, `truncated_empty`, `no_rows`.
+`llm_error`, `llm_misconfigured`, `llm_rejected`, `context_overflow`, `truncated_empty`, `no_rows` — and
+`internal_error` for a defect in this module (outside the contract table, so the risk app counts it against the
+cell instead of retrying forever).
 
 There is **no queue**: when the gate is full the stream answers `error{review_busy, retry_after_s}` → `done`
 at once and the caller retries later without counting it. Card-review calls are **not** counted in
