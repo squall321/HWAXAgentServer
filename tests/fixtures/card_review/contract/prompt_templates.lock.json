@@ -1,0 +1,14 @@
+{
+ "sweep": {
+  "prompt_rev": "cr-sweep-1",
+  "template_sha": "54a9436ee48a7fcbb227edcc962c77fef101dfcaf6bd6d01c4bdec54871e30f0"
+ },
+ "verdict": {
+  "prompt_rev": "cr-verdict-1",
+  "template_sha": "79df76df0d0126c3c9aaa1b479d1a820a8cfdaa6fe10f529f0f6e10e81d7cf0b"
+ },
+ "offcard": {
+  "prompt_rev": "cr-offcard-1",
+  "template_sha": "11423806f239a36de035d7e7511a53aa4d15af1b288579b5fa1f71c225ca3075"
+ }
+}
