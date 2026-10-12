@@ -37,6 +37,7 @@ from deliberation import (
     _tools_by_name,
 )
 from evidence import _NUM_TOK_RE, sig_numbers
+from review_gate import Busy
 
 # ── 판 번호 ──────────────────────────────────────────────────────────────────
 API_REV = "cr-1"
@@ -1687,3 +1688,345 @@ async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: s
         tools = await load_pack_tools(app, groups, user_email=user_email, user_pat=user_pat)
         pack = await build_pack(tools, agent_key)
     return {**pack, "credential": "user"}
+
+
+
+# ── 실행기(관문·ping·보충·오류 분류) ──────────────────────────────────────────
+# 요청 1건 = (전문가 × 단위 × 묶음 1개)의 논리 호출 1건이다. 줄을 세우지 않고(자리가 없으면 곧바로 review_busy), 끊기면
+# 접고(구독이 닫히면 LLM 태스크를 취소하고 자리를 돌려준다 — 남기는 것이 없다), 빠진 행만 다시 묻는다.
+# 엔진의 _detach_stream 을 쓰지 않는다 — 그 길은 _DETACHED_TASKS 에 들어가 /health.delib_active 를 올리고, 끊겨도 끝까지
+# 돈다(C-25). 카드 대조는 끊기면 앱이 차감 없이 다시 내는 호출이라 끝까지 돌 까닭이 없다.
+PARSE_RETRIES_DEFAULT = 2           # CARD_REVIEW_PARSE_RETRIES — 빠진 행·읽히지 않은 줄을 다시 묻는 횟수
+OVERFLOW_SHARE = 0.85               # 400 이고 추정 토큰 + 출력 몫이 창의 이만큼 이상이면 창 초과로 본다(문구에 기대지 않는다)
+# 엔진이 내는 오류 어휘(M2.md 4.4) — code: (infra, retryable). infra 는 앱이 시도를 **차감하지 않을** 실패, retryable 이
+# 거짓이면 같은 입력으로 다시 내도 같은 실패다. 부류(기다림·인프라·내용 탓·잡 보류)는 앱(review_ops.classify)이 가른다.
+ERRORS = {
+    "review_busy": (True, True),
+    "llm_unreachable": (True, True),
+    "llm_timeout": (True, True),
+    "llm_error": (True, True),
+    "llm_misconfigured": (True, False),
+    "llm_rejected": (False, False),
+    "context_overflow": (False, False),
+    "truncated_empty": (False, False),
+    "no_rows": (False, True),
+}
+
+
+def _parse_retries(env=os.environ) -> int:
+    raw = str(env.get("CARD_REVIEW_PARSE_RETRIES") or "").strip()
+    if not raw:
+        return PARSE_RETRIES_DEFAULT
+    try:
+        v = int(raw)
+    except ValueError:
+        print(f"[card_review] env CARD_REVIEW_PARSE_RETRIES='{raw[:40]}' 정수 파싱 실패 — 기본값 {PARSE_RETRIES_DEFAULT} 사용")
+        return PARSE_RETRIES_DEFAULT
+    if v < 0:
+        print(f"[card_review] env CARD_REVIEW_PARSE_RETRIES={v} 는 음수다 — 기본값 {PARSE_RETRIES_DEFAULT} 사용")
+        return PARSE_RETRIES_DEFAULT
+    return v
+
+
+def gate_of(app):
+    """이 앱의 관문 — 기동 때 만들고(app.lifespan), 없으면 처음 쓸 때 만든다(수만 세므로 이벤트 루프에 묶이지 않는다)."""
+    gate = getattr(app.state, "review_gate", None)
+    if gate is None:
+        import review_gate  # noqa: PLC0415
+
+        def delib_running() -> int:
+            from app import _delib_load  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+            return _delib_load()[0]
+
+        gate = review_gate.from_env(delib_running)
+        app.state.review_gate = gate
+    return gate
+
+
+def prepare(req: dict, lim: dict) -> dict:
+    """스트림을 열기 전의 거절을 한 자리에서 — 종류(unsupported_kind)·판(409 rev_mismatch)·창(ctx_too_small)·요청과 조립
+    (build_prompt 의 422 — over_budget 포함). 지나면 run() 이 받는 준비물 {req, lim, system, human, ctx} 다.
+    요청의 expect{prompt_rev, limits_rev} 는 준 것만 견준다(안 주면 견주지 않는다)."""
+    if not isinstance(req, dict):
+        raise RequestError("bad_request", "요청 본문이 객체가 아니다")
+    kind = req.get("kind")
+    if kind in UNSUPPORTED_KINDS:
+        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다")
+    if kind not in KINDS:
+        raise RequestError("bad_request", f"모르는 호출 종류 '{kind}'")
+    exp = req.get("expect") if isinstance(req.get("expect"), dict) else {}
+    cur = {"prompt_rev": PROMPT_REV[kind], "limits_rev": lim["limits_rev"]}
+    if any(exp.get(k) not in (None, cur[k]) for k in cur):
+        raise RequestError("rev_mismatch", f"요청이 기대한 판({exp})이 이 서버의 판({cur})과 다르다 — limits 를 다시 받고 "
+                           "계획을 다시 짠다", status=409, expect=exp, **cur)
+    if not lim["runnable"][kind]:
+        small = lim.get("ctx_too_small") or {}
+        raise RequestError("ctx_too_small", small.get("message") or f"이 박스의 창으로는 {kind} 를 돌릴 수 없다",
+                           need_ctx_tokens=small.get("need_ctx_tokens"), ctx_tokens=lim["ctx_tokens"])
+    system, human, ctx = build_prompt(req, lim)
+    return {"req": req, "lim": lim, "system": system, "human": human, "ctx": ctx}
+
+
+def _http_status(exc) -> int | None:
+    """예외 사슬에서 HTTP 상태(openai APIStatusError 의 status_code·response)를 찾는다. 없으면 None."""
+    seen, e = set(), exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        st = getattr(e, "status_code", None)
+        if not isinstance(st, int):
+            st = getattr(getattr(e, "response", None), "status_code", None)
+        if isinstance(st, int) and not isinstance(st, bool):
+            return st
+        e = e.__cause__ or e.__context__
+    return None
+
+
+def classify(exc: BaseException, llm, *, est_tokens: int, lim: dict) -> dict:
+    """LLM 호출 실패 → error 프레임 칸 {code, message, infra, retryable, knob?, status?, …}. 부류는 상태 코드와 예외
+    사슬로 가르고 문구는 엔진의 _llm_fail_note 를 쓴다(P-13). 400·413·422 는 문구와 무관하게 infra 가 아니다 — 그 가운데
+    추정 토큰 + 출력 몫이 창의 85% 이상이면 context_overflow(다시 쪼개지 않는다 — D-22), 아니면 llm_rejected 다."""
+    from deliberation import _llm_fail_note  # noqa: PLC0415
+
+    status = _http_status(exc)
+    raw = f"{type(exc).__name__}: {exc}"[:200]
+    extra: dict = {}
+    if status in (401, 403, 404):
+        code, knob = "llm_misconfigured", "VLLM_BASE_URL · VLLM_MODEL · VLLM_API_KEY"
+        msg = f"LLM 서버가 {status} 로 거절했다 — 주소·모델 이름·키 설정이 맞지 않는다(잡을 세울 일이다). 원문: {raw}"
+    elif status in (400, 413, 422):
+        ctx_t, out_t = int(lim["ctx_tokens"]), int(lim["out_tokens"])
+        extra = {"est_tokens": est_tokens, "out_tokens": out_t, "ctx_tokens": ctx_t}
+        if est_tokens + out_t >= OVERFLOW_SHARE * ctx_t:
+            code, knob = "context_overflow", "LLM_CONTEXT_TOKENS"
+            msg = (f"LLM 이 {status} 로 거절했다 — 프롬프트 추정 {est_tokens:,} 토큰과 출력 몫 {out_t:,} 토큰이 창 "
+                   f"{ctx_t:,} 토큰의 {OVERFLOW_SHARE:.0%} 이상이라 창 초과로 본다(다시 쪼개지 않는다). 원문: {raw}")
+        else:
+            code, knob = "llm_rejected", ""
+            msg = f"LLM 이 {status} 로 거절했다(창 초과로 보이지 않는다 — 같은 입력이면 같다). 원문: {raw}"
+    elif status is not None:
+        code, knob = "llm_error", ""
+        msg = f"LLM 서버 오류 {status} — {raw}"
+    else:
+        note, knob = _llm_fail_note(exc, llm)
+        chain, e = [], exc
+        while e is not None and len(chain) < 6:
+            chain.append(type(e).__name__)
+            e = e.__cause__ or e.__context__
+        if any("Connect" in n for n in chain):
+            code = "llm_unreachable"
+        elif any("Timeout" in n for n in chain):
+            code, knob = "llm_timeout", "DELIB_TIMEOUT_S · DELIB_LLM_MAX_RETRIES"
+            note = note.replace(" — 호출당 타임아웃을 늘린다", "")
+        else:
+            code = "llm_error"
+        msg = note
+    infra, retryable = ERRORS[code]
+    out = {"code": code, "message": msg, "infra": infra, "retryable": retryable, **extra}
+    if knob:
+        out["knob"] = knob
+    if status is not None:
+        out["status"] = status
+    return out
+
+
+def _err(code: str, message: str, **kw) -> dict:
+    infra, retryable = ERRORS[code]
+    return {"code": code, "message": message, "infra": infra, "retryable": retryable, **kw}
+
+
+def _cap_findings(rows: list, cap: int) -> tuple[list, int]:
+    """보충으로 합친 뒤 f 줄이 상한을 넘으면 앞의 것(먼저 받은 것)을 남기고 버린 수를 돌려준다(check_rows 와 같은 규칙)."""
+    keep, out, cut = 0, [], 0
+    for r in rows:
+        if r["t"] == "f":
+            if keep >= cap:
+                cut += 1
+                continue
+            keep += 1
+        out.append(r)
+    return out, cut
+
+
+def _truncated(finishes: list):
+    """절단 — 어느 시도든 length 면 참, 아니면 finish_reason 을 못 읽은 시도가 있으면 None(모름 — 0 으로 치지 않는다)."""
+    if any(f == "length" for f in finishes):
+        return True
+    if not finishes or any(not f for f in finishes):
+        return None
+    return False
+
+
+def _usage(per: list) -> dict | None:
+    """시도 합계 — 칸마다 모든 시도의 값을 알 때만 합을 싣고 하나라도 모르면 None. 어느 시도의 값도 모르면 usage 가 None."""
+    if not per or all(p["tokens_in"] is None and p["tokens_out"] is None for p in per):
+        return None
+
+    def total(k):
+        vals = [p[k] for p in per]
+        return None if any(v is None for v in vals) else sum(vals)
+
+    return {"llm_calls": len(per), "tokens_in": total("tokens_in"), "tokens_out": total("tokens_out"),
+            "per_attempt": [dict(p) for p in per]}
+
+
+async def run(app, prep: dict):
+    """`POST /card-review/run` 의 SSE 본체 — prepare() 를 지난 요청만 받는다.
+
+    프레임 — status{step:"attempt", n} · ping{idle_s, ts}(DELIB_HEARTBEAT_S, 0 이하면 끔) · result · error · done. hello 는
+    없다. 자리는 이 제너레이터 **안에서** 잡는다(바깥에서 잡으면 첫 프레임 전에 끊길 때 자리가 샌다). 자리가 없으면
+    error{review_busy} → done 이고 LLM 을 부르지 않는다. 첫 시도의 LLM 실패는 error 다. 보충(n ≥ 2) 중의 실패는 error 가
+    아니라 result 로 끝내고 quality.repair_error 를 싣는다(받은 행을 버리지 않는다 — P-08). 단 그때까지 받은 행이 0 이면
+    살릴 것이 없으므로 error 다. 구독이 닫히면(취소·aclose) LLM 태스크를 취소하고 자리를 돌려준다."""
+    from app import DELIB_HEARTBEAT_S, _est_tokens_all, _sse  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+
+    req, lim, ctx = prep["req"], prep["lim"], prep["ctx"]
+    kind, variant = ctx["kind"], ctx["variant"]
+    gate = gate_of(app)
+    t0 = time.monotonic()
+    tag = f"{kind}/{variant or '-'} {ctx['expert'].get('key', '')} {ctx['unit_id'] or '-'}"
+    got = gate.try_acquire(tag)
+    if isinstance(got, Busy):
+        yield _sse("error", _err("review_busy", f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason}). "
+                                 f"{got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
+                                 knob="CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB",
+                                 reason=got.reason, retry_after_s=got.retry_after_s, limit=got.limit, active=got.active))
+        yield _sse("done", {})
+        print(f"[card_review] {tag} → review_busy ({got.active}/{got.limit} {got.reason})")
+        return
+
+    llm = getattr(app.state, "delib_llm", None)
+    attempts_max = 1 + _parse_retries()
+    hb = float(DELIB_HEARTBEAT_S)
+    system, human0 = prep["system"], prep["human"]
+    st = {"outcome": "cancelled", "truncated": False, "repaired": False}
+    per: list = []                       # 시도마다 {n, tokens_in, tokens_out} — 실패한 시도는 None 둘
+    llm_ms: list = []
+    finishes: list = []                  # 끝난 시도의 finish_reason(못 읽으면 None)
+    rows: list = []
+    inj: list = []
+    tally = {"bad_lines": 0, "dropped_alias": 0, "dup": 0, "over_cap": 0}
+    tail_broken = False
+    repair_error = None
+    settled = None
+    last_text = ""
+    last = time.monotonic()              # 마지막 '진짜' 프레임 시각 — ping 의 idle_s
+
+    def frame(event: str, data: dict) -> bytes:
+        nonlocal last
+        last = time.monotonic()
+        return _sse(event, data)
+
+    try:
+        if llm is None:
+            st["outcome"] = "llm_misconfigured"
+            yield frame("error", _err("llm_misconfigured", "이 서버에 심의 LLM(delib_llm)이 준비되지 않았다",
+                                      knob="VLLM_BASE_URL · VLLM_MODEL"))
+            yield frame("done", {})
+            return
+        hint = ""
+        for n in range(1, attempts_max + 1):
+            human = human0
+            if n > 1:
+                try:
+                    human = build_prompt(req, lim, hint=hint)[1]
+                except RequestError as exc:     # 지적 블록을 붙이니 창을 넘는다 — 보충을 멈추고 가진 것으로 끝낸다
+                    repair_error = {"code": exc.code, "attempt": n, "message": exc.message}
+                    break
+            yield frame("status", {"step": "attempt", "n": n})
+            task = asyncio.ensure_future(_ask(llm, system, human))
+            t1 = time.monotonic()
+            try:
+                while not task.done():
+                    if hb > 0:
+                        # 기다림을 시간으로 끊되 안쪽(LLM 호출)은 취소하지 않는다 — wait 는 만료돼도 태스크를 그대로 둔다.
+                        done, _pending = await asyncio.wait({task}, timeout=hb)
+                        if not done:
+                            yield _sse("ping", {"idle_s": int(time.monotonic() - last), "ts": int(time.time() * 1000)})
+                    else:
+                        await asyncio.wait({task})
+            finally:
+                if not task.done():
+                    task.cancel()       # 구독이 끊겼다(취소·aclose) — 도는 LLM 호출을 접는다
+            llm_ms.append(int((time.monotonic() - t1) * 1000))
+            try:
+                text, meta = task.result()
+            except Exception as exc:  # noqa: BLE001 — 분류해서 프레임으로 낸다
+                per.append({"n": n, "tokens_in": None, "tokens_out": None})
+                err = classify(exc, llm, est_tokens=_est_tokens_all(system + human), lim=lim)
+                print(f"[card_review] {tag} 시도 {n} LLM 실패 → {err['code']}: {exc!r}"[:400])
+                if n == 1 or not rows:
+                    st["outcome"] = err["code"]
+                    yield frame("error", {**err, "attempt": n})
+                    yield frame("done", {})
+                    return
+                repair_error = {"code": err["code"], "attempt": n, "message": err["message"]}
+                break
+            usage = meta.get("usage") or {}
+            per.append({"n": n, "tokens_in": usage.get("tokens_in"), "tokens_out": usage.get("tokens_out")})
+            finishes.append(meta.get("finish_reason"))
+            last_text = text
+            prows, pstats = parse_rows(text, kind)
+            chk = check_rows(kind, variant, prows, ctx, attempt=n)
+            tally["bad_lines"] += pstats["bad_lines"]
+            tail_broken = tail_broken or pstats["tail_broken"]
+            for k in ("dropped_alias", "dup"):
+                tally[k] += chk["stats"][k]
+            tally["over_cap"] += chk["stats"]["dropped_over_cap"]
+            inj += [x for x in chk["extras"]["inj"] if x not in inj]
+            rows = chk["rows"] if n == 1 else merge_rows(kind, rows, chk["rows"], n)
+            if kind == "offcard":
+                rows, cut = _cap_findings(rows, ctx["findings_max"])
+                tally["over_cap"] += cut
+            settled = settle(kind, rows, ctx)
+            if n == 1 and meta.get("finish_reason") == "length" and not rows:
+                # 첫 시도가 출력 상한에 걸려 한 행도 못 읽었다 — 다시 물어도 같다.
+                st.update(outcome="truncated_empty", truncated=True)
+                yield frame("error", _err("truncated_empty", "첫 시도가 출력 상한에 걸려(finish_reason=length) 읽힌 행이 "
+                                          "없다 — 다시 물어도 같다", knob="DELIB_MAX_TOKENS", attempt=n))
+                yield frame("done", {})
+                return
+            if not (settled["repair"] or pstats["bad_lines"]):
+                break
+            if n < attempts_max:
+                hint = repair_hint(settled["problems"], n + 1, attempts_max, bad_lines=pstats["bad_lines"],
+                                   max_chars=lim[kind]["hint_max"])
+        if not rows:
+            st["outcome"] = "no_rows"
+            yield frame("error", _err("no_rows", f"{len(per)}번 물어 한 행도 읽지 못했다 — 형식을 지키지 않은 답이다",
+                                      attempt=len(per), raw_excerpt=last_text[:200]))
+            yield frame("done", {})
+            return
+        quality = {
+            "expected": settled["expected"], "ok": settled["ok"], "flagged": settled["flagged"],
+            "missing": len(settled["missing"]), "bad_lines": tally["bad_lines"], "truncated": _truncated(finishes),
+            "tail_broken": tail_broken, "attempts": len(per), "repaired": len(per) > 1, "stamp": settled["stamp"],
+            "dropped_over_cap": tally["over_cap"], "maybe_more": settled["maybe_more"],
+            "dropped_alias": tally["dropped_alias"], "dup": tally["dup"],
+        }
+        if repair_error:
+            quality["repair_error"] = repair_error
+        extras: dict = {"inj": inj}
+        if kind == "sweep":
+            extras["unmatched_cards"] = settled["unmatched_cards"]
+        result = {
+            "kind": kind, "variant": variant, "rows": rows, "missing": settled["missing"], "extras": extras,
+            "quality": quality,
+            "meta": {"model": lim.get("model", ""), "ctx_tokens": lim["ctx_tokens"], "ctx_source": lim.get("ctx_source"),
+                     "prompt_rev": PROMPT_REV[kind], "norm_rev": NORM_REV, "limits_rev": lim["limits_rev"],
+                     "input_sha": ctx["input_sha"], "prompt_chars": ctx["prompt_chars"], "usage": _usage(per),
+                     "finish_reason": finishes[-1] if finishes else None, "llm_ms": llm_ms,
+                     "soft_over": ctx["soft_over"], "basis": ctx["basis"], "bg_dropped": ctx["bg_dropped"],
+                     "order_effective": ctx["order_effective"], "aliases": ctx["aliases"]},
+        }
+        st.update(outcome="ok", truncated=quality["truncated"] is True, repaired=quality["repaired"])
+        yield frame("result", result)
+        yield frame("done", {})
+    finally:
+        known = [p for p in per if p["tokens_in"] is not None or p["tokens_out"] is not None]
+        gate.release(got, st["outcome"],
+                     {"tokens_in": sum(p["tokens_in"] or 0 for p in known),
+                      "tokens_out": sum(p["tokens_out"] or 0 for p in known)} if known else None,
+                     unknown_calls=len(per) - len(known), truncated=st["truncated"], repaired=st["repaired"])
+        # 호출당 한 줄 — 본문(카드·변경 줄)은 찍지 않는다.
+        print(f"[card_review] {tag} chars={ctx['prompt_chars']:,} attempts={len(per)} "
+              f"{time.monotonic() - t0:.1f}s → {st['outcome']}")
