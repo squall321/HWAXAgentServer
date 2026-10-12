@@ -117,8 +117,25 @@ the portal relay `/agent/card-review/*`, which overwrites the four identity fiel
 | `POST /card-review/plan` | `{cards[{alias, record_id, checkable, chars}], units[{unit_id, manifest_chars, body_chars}]}` → verdict decks, sweep decks, manifest pages, `oversize`, `soft_over`, planned against the current `limits_rev`. |
 | `POST /card-review/run` | One call (`kind` = `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`). SSE: `status{step:"attempt", n}` · `ping{idle_s, ts}` · `result` · `error{code, message, infra, retryable, knob?}` · `done`. No `hello` frame. |
 
-Request models are `extra="forbid"`: an undeclared field is a 422 `unknown_fields` naming it, not silently
-dropped. Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
+Request models are `extra="forbid"` at every level, nested items included: an undeclared field is a 422
+`unknown_fields` naming its path (`extra.known.0.reason`), not silently dropped. The `run` body (`?` = optional,
+text fields accept `null` as empty):
+
+| field | shape |
+|---|---|
+| `kind` · `variant` · `target_key` | `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`; `variant` is `null` except for verdict |
+| `expert` | `{key, name?, domain?, role?}` — `key` is 1–120 chars without whitespace, `«»` or braces |
+| `cards[]` | pack cards exactly as `/pack` returned them (`alias`, `sections[{sid, title, text}]`, …), sent back unchanged |
+| `digest[]` | `{alias, type?, title?, record_id?, card_id?}` — background cards shown by title only (verdict · offcard) |
+| `unit` | `{unit_id, kind?, title?, summary?, notes?, lines[], context[], evidence[], missing[], unit_hash?, summary_sha?, evidence_sha?, evidence_status?, input_gaps?}` for verdict · offcard, `null` for sweep |
+| `unit.lines[]` · `context[]` · `evidence[]` | `{ref, text, owner_unit?}` |
+| `unit.missing[]` | `{kind, note?}` (e.g. `{"kind": "ecad", "note": "회로 변경 정보가 없다"}`) |
+| `manifest[]` | `{unit_id, kind?, title?, text?}` (sweep only) |
+| `extra` | `{domains[{key, label?}], mechanisms[{code, label?}], known[{alias, judgement?, why?}]}` — the risk taxonomy's `domain.code` goes in `key` |
+| `expect` | `{prompt_rev?, limits_rev?}` — only the given ones are compared |
+| identity | `groups` · `user_email` · `user_pat` · `entitlements` (overwritten by the portal relay) |
+
+Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,
 409 `rev_mismatch` (the request's `expect{prompt_rev, limits_rev}` differs), 403 `denied` (no
 `feat:deliberation`), and 503 `ctx_unknown{retry_after_s, infra: true, retryable: true}` from `run` and `plan`

@@ -2166,6 +2166,43 @@ class RunLine(_Strict):
     owner_unit: str = ""
 
 
+# 안쪽 항목도 선언한다(RB-4) — `list[dict]` 는 아무 사전이나 받아, 앱이 칸 이름을 다르게 쓰면(known[].reason·mechanisms[].key·
+# missing[].text) 200 으로 통과하고 블록이 빈 채 실렸다(메커니즘·영역 집합이 비면 모든 f 줄이 free, 모든 h.to 가 unknown).
+# 칸은 build_ctx·build_prompt·unit_size 가 실제로 읽는 것 그대로다. 글 칸은 null 을 빈 값으로 받는다.
+class DigestItem(_Strict):
+    """배경 카드 제목 한 줄(verdict·offcard) — 제목만 실리는 카드. alias 는 팩의 K 별칭."""
+    alias: str
+    type: str | None = None
+    title: str | None = None
+    record_id: str | None = None
+    card_id: str | None = None
+
+
+class KnownItem(_Strict):
+    """offcard 의 이미 낸 판정 한 건 — 되풀이하지 말라고 싣는다."""
+    alias: str
+    judgement: str | None = None
+    why: str | None = None
+
+
+class MechItem(_Strict):
+    """메커니즘 목록 한 항목 — code 는 f 줄의 mech·m 줄의 seen 이 고르는 닫힌 집합이다."""
+    code: str
+    label: str | None = None
+
+
+class DomainItem(_Strict):
+    """영역 코드 한 항목 — key 는 h 줄의 to 가 고르는 닫힌 집합이다(리스크 앱 택소노미의 domain.code 를 key 로 싣는다)."""
+    key: str
+    label: str | None = None
+
+
+class MissingItem(_Strict):
+    """단위의 결측 한 건 — 리스크 앱이 내는 {kind, note}(예: kind=ecad, note=회로 변경 정보가 없다)."""
+    kind: str
+    note: str | None = None
+
+
 class RunUnit(_Strict):
     """리스크 앱 units.review_payload 의 출력 그대로(M2.md 4.3, m2-wp2 걸음 5). 해시·상태 칸은 프롬프트에 쓰지 않고 input_sha 에만 든다."""
     unit_id: str
@@ -2176,7 +2213,7 @@ class RunUnit(_Strict):
     lines: list[RunLine] = []
     context: list[RunLine] = []
     evidence: list[RunLine] = []
-    missing: list[dict] = []
+    missing: list[MissingItem] = []
     unit_hash: Any = None
     summary_sha: Any = None
     evidence_sha: Any = None
@@ -2192,9 +2229,9 @@ class RunManifestItem(_Strict):
 
 
 class RunExtra(_Strict):
-    domains: list[dict] = []
-    mechanisms: list[dict] = []
-    known: list[dict] = []
+    domains: list[DomainItem] = []
+    mechanisms: list[MechItem] = []
+    known: list[KnownItem] = []
 
 
 class Expect(_Strict):
@@ -2207,8 +2244,8 @@ class RunRequest(_Ident):
     variant: str | None = None
     target_key: str = ""
     expert: RunExpert
-    cards: list[dict] = []
-    digest: list[dict] = []
+    cards: list[dict] = []                 # 팩 카드 그대로(앱이 얼려 되보낸다) — 모양은 build_ctx 가 본다
+    digest: list[DigestItem] = []
     unit: RunUnit | None = None
     manifest: list[RunManifestItem] = []
     extra: RunExtra | None = None

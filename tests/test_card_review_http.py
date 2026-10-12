@@ -117,6 +117,15 @@ def test_run_자리가_없으면_error_done(client):
     (lambda b: b.update(extra={"search": {"q": "x"}}), "unknown_fields", "extra.search"),
     (lambda b: b["unit"]["lines"][0].update(kind="x"), "unknown_fields", "unit.lines.0.kind"),
     (lambda b: b["expert"].update(persona="x"), "unknown_fields", "expert.persona"),
+    # 안쪽 항목(RB-4) — 칸 이름이 어긋나면 블록이 말없이 비던 자리.
+    (lambda b: b["digest"][0].update(kind="faq"), "unknown_fields", "digest.0.kind"),
+    (lambda b: b["unit"]["missing"][0].update(text="x"), "unknown_fields", "unit.missing.0.text"),
+    (lambda b: b.update(extra={"known": [{"alias": "K01", "judgement": "OK", "reason": "x"}]}), "unknown_fields",
+     "extra.known.0.reason"),
+    (lambda b: b.update(extra={"mechanisms": [{"code": "m.a", "name": "x"}]}), "unknown_fields",
+     "extra.mechanisms.0.name"),
+    (lambda b: b.update(extra={"domains": [{"key": "mech", "code": "mech"}]}), "unknown_fields",
+     "extra.domains.0.code"),
 ])
 def test_선언하지_않은_칸은_이름을_대고_거절한다(client, env, mutate, code, field):
     body = _verdict(1)
@@ -142,6 +151,9 @@ def test_review_payload_의_곁칸은_받는다(client):
     (lambda b: b["unit"].update(lines=[], context=[]), "empty_unit"),
     (lambda b: b.update(cards=CHECK[:9]), "deck_too_large"),
     (lambda b: b.update(variant="side"), "bad_request"),
+    (lambda b: b["unit"].update(missing=[{"note": "종류가 없는 결측"}]), "bad_request"),
+    (lambda b: b.update(extra={"mechanisms": [{"label": "코드가 없는 메커니즘"}]}), "bad_request"),
+    (lambda b: b.update(digest=["K09"]), "bad_request"),
 ])
 def test_스트림_전_422(client, env, mutate, code):
     body = _verdict(2)

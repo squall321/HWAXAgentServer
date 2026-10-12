@@ -328,6 +328,33 @@ def test_주입_문구는_어느_원천에서도_구간을_닫지_못한다():
         assert _closed(h), kind
 
 
+def test_안쪽_항목의_칸_이름이_어긋나면_블록이_비지_않고_거절한다():
+    """RB-4 재현 — 안쪽 항목이 list[dict] 라 다른 이름(missing[].text·known[].reason·mechanisms[].key·domains[].code·
+    digest[].name)이 통과하고 블록이 빈 채 실렸다(메커니즘·영역 집합이 비어 모든 f 줄이 free, h.to 가 unknown)."""
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    pack = _pack()
+    unit = _unit(0)
+    unit["missing"] = [{"kind": "ecad", "text": "회로 변경 정보가 없다"}]
+    req = _req("offcard", [c for c in pack if not c["checkable"]][:2],
+               [{"alias": "K09", "kind": "faq", "name": "제목"}], unit=unit,
+               extra={"known": [{"alias": "K01", "verdict": "FAIL", "reason": "폭 부족"}],
+                      "mechanisms": [{"key": "thermal.cte_mismatch", "name": "열팽창 불일치"}],
+                      "domains": [{"code": "mech", "label": "기구"}]})
+    (err,) = cr.validate_run_request(req, lim)
+    assert (err["status"], err["code"]) == (422, "unknown_fields")
+    assert {"unit.missing.0.text", "extra.known.0.verdict", "extra.known.0.reason", "extra.mechanisms.0.key",
+            "extra.mechanisms.0.name", "extra.domains.0.code", "digest.0.kind", "digest.0.name"} <= set(err["fields"])
+    # 선언한 모양(README `### Card review`)이면 블록이 찬다.
+    ok = _req("offcard", [c for c in pack if not c["checkable"]][:2], [{"alias": "K09", "type": "faq", "title": "제목"}],
+              unit=_unit(0), extra={"known": [{"alias": "K01", "judgement": "FAIL", "why": "폭 부족"}],
+                                    "mechanisms": [{"code": "thermal.cte_mismatch", "label": "열팽창 불일치"}],
+                                    "domains": [{"key": "mech", "label": "기구"}]})
+    assert cr.validate_run_request(ok, lim) == []
+    _, human, ctx = cr.build_prompt(ok, lim)
+    assert ctx["mechs"] == {"thermal.cte_mismatch"} and ctx["domains"] == {"mech"}
+    assert "K01 FAIL — «폭 부족»" in human and "thermal.cte_mismatch=열팽창 불일치" in human and "mech=기구" in human
+
+
 def test_sweep_에는_k0_줄이_없다():
     lim = cr.limits(1_048_576, "server", 0, env={})
     req = _req("sweep", _pack(), [], manifest=[{"unit_id": "u-1", "kind": "bundle", "title": "t", "text": "x"}])
