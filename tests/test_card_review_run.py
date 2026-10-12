@@ -462,6 +462,20 @@ def test_offcard_결과():
     assert res["meta"]["bg_dropped"] == 0
 
 
+def test_보충을_거쳐도_제목이_빈_카드_밖_줄_둘이_둘_다_남는다():
+    """RB-1 재현 그대로 — 1차 답은 제목이 빈 f 줄 둘(경로 A·B)과 m 줄(more 줄이 빠져 보충이 돈다), 2차 답은 more 줄 하나.
+    옛 실행기는 [('경로 B', 1), ('경로 B', 1)] 을 냈다(앞 행이 사라지고 남은 행이 두 번, dup 0)."""
+    f1 = {"t": "f", "dir": "risk", "title": "", "mech": "free", "mech_free": "A", "path": "경로 A", "l": ["L01"],
+          "src": "exp", "q": "", "sev": "중대", "conf": "medium", "check_kind": "test", "check": "시험 A"}
+    f2 = {**f1, "mech_free": "B", "path": "경로 B", "check": "시험 B"}
+    first = "\n".join(json.dumps(r, ensure_ascii=False) for r in (f1, f2, {"t": "m", "seen": []}))
+    fr, llm, _ = _go(_offcard(), [Act(text=first), Act(text=json.dumps({"t": "more", "more": "no"}))])
+    res = _last(fr)[1]
+    assert len(llm.calls) == 2 and res["quality"]["attempts"] == 2
+    assert [(r["path"], r["from_attempt"]) for r in res["rows"] if r["t"] == "f"] == [("경로 A", 1), ("경로 B", 1)]
+    assert res["quality"]["dup"] == 0 and res["missing"] == []
+
+
 def test_solo_결과():
     fr, _llm, _ = _go(_verdict(1, variant="solo"), ["oracle"])
     res = _last(fr)[1]

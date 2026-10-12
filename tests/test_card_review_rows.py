@@ -434,6 +434,45 @@ def test_offcard_꼭_있어야_하는_줄이_빠지면_보충하고_more_가_없
     assert res["missing"] == [] and not res["repair"]
 
 
+def test_정체가_없는_f_줄은_제목이_같거나_비어도_접지_않는다():
+    """f 줄에는 정해진 정체가 없다(RB-1). 옛 merge_rows 는 열쇠 사전(제목)이라 제목이 빈 f 줄 둘이 보충 한 번에 하나로 접혀
+    [('경로 B', 1), ('경로 B', 1)] — 앞 행이 흔적 없이 사라지고 남은 행이 두 번 나왔다. 완전히 같은 줄만 버리고 dup 에 센다."""
+    ctx = _off_ctx()
+    fa = _f(title="", path="경로 A", mech="free", mech_free="A", l=["L01"], check="시험 A")
+    fb = _f(title="", path="경로 B", mech="free", mech_free="B", l=["L01"], check="시험 B")
+    r1 = cr.check_rows("offcard", None, cr.parse_rows(_jl([fa, fb, {"t": "m", "seen": []}]), "offcard")[0], ctx)
+    assert [r["path"] for r in r1["rows"] if r["t"] == "f"] == ["경로 A", "경로 B"] and r1["stats"]["dup"] == 0
+    # 보충 — more 줄과 함께 앞 시도의 fb 를 글자 그대로 다시 냈다.
+    r2 = cr.check_rows("offcard", None, cr.parse_rows(_jl([{"t": "more", "more": "no"}, fb]), "offcard")[0], ctx,
+                       attempt=2)
+    st = {"dup": 0}
+    merged = cr.merge_rows("offcard", r1["rows"], r2["rows"], 2, stats=st)
+    assert [(r["path"], r["from_attempt"]) for r in merged if r["t"] == "f"] == [("경로 A", 1), ("경로 B", 1)]
+    assert st["dup"] == 1, "앞 시도와 완전히 같은 줄은 하나만 두고 센다"
+    assert cr.settle("offcard", merged, ctx)["missing"] == []
+    # 한 시도 안 — 제목이 같아도 경로가 다르면 다른 리스크다. 완전히 같은 줄만 하나로 둔다.
+    same = [_f(path="경로 A"), _f(path="경로 B"), _f(path="경로 B"), {"t": "m", "seen": []}, {"t": "more", "more": "no"}]
+    res = cr.check_rows("offcard", None, cr.parse_rows(_jl(same), "offcard")[0], ctx)
+    assert [r["path"] for r in res["rows"] if r["t"] == "f"] == ["경로 A", "경로 B"] and res["stats"]["dup"] == 1
+
+
+def test_solo_조건_줄은_문구가_같아도_합칠_때_둘_다_남는다():
+    """옛 merge_rows 는 c 줄을 조건 문구로 열쇠 삼아 note A·B 두 줄이 [('B','no'), ('B','no')] 가 됐다(RB-1)."""
+    card = [c for c in _pack() if c["checkable"]][:1]
+    ctx = _ctx(_req(variant="solo", cards=card))
+    a = ctx["judge"][0]
+    ca = {"t": "c", "cond": "두께 하한", "l": ["L01"], "met": "no", "note": "A"}
+    cb = {**ca, "note": "B"}
+    r1 = cr.check_rows("verdict", "solo", cr.parse_rows(_jl([ca, cb, _good_v(ctx, a, judgement="모름")]),
+                                                        "verdict")[0], ctx)
+    assert r1["repair"]                                   # 열거 밖 판정 — 보충이 돈다
+    r2 = cr.check_rows("verdict", "solo", cr.parse_rows(_jl([cb, _good_v(ctx, a)]), "verdict")[0], ctx, attempt=2)
+    st = {}
+    merged = cr.merge_rows("verdict", r1["rows"], r2["rows"], 2, stats=st)
+    assert [(r["note"], r["met"], r["from_attempt"]) for r in merged if r["t"] == "c"] == [("A", "no", 1), ("B", "no", 1)]
+    assert st["dup"] == 1 and [r["judgement"] for r in merged if r["t"] == "v"] == ["WARNING"]
+
+
 def test_offcard_보충에서_온_f_줄이_none_을_밀어낸다():
     ctx = _off_ctx()
     r1 = cr.check_rows("offcard", None, cr.parse_rows(_jl([{"t": "none", "why": "없다"}, {"t": "m", "seen": []}]),

@@ -981,6 +981,15 @@ def _verdict_of(r: dict):
     return (r.get("applies"), r.get("judgement")) if r["t"] == "v" else (r.get("rel"),) if r["t"] == "u" else None
 
 
+def _identity(r: dict) -> str:
+    """행 내용 그대로의 열쇠 — 시도 번호·검사·뒤집힘 표지를 뺀 칸 전부. 같으면 '완전히 같은 행' 이다.
+
+    정해진 정체가 없는 줄(offcard 의 f·h·need, solo 의 c)은 이것으로만 겹침을 가린다 — 제목·조건 문구가 같아도 경로·참조·
+    메모가 다르면 다른 리스크라 접지 않는다(RB-1: 제목이 빈 f 줄 둘이 하나로 접혀 앞 행이 흔적 없이 사라졌다)."""
+    return json.dumps({k: v for k, v in r.items() if k not in ("from_attempt", "checks", "flipped_from")},
+                      ensure_ascii=False, sort_keys=True, default=str)
+
+
 def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -> dict:
     """parse_rows 가 읽은 행 → 별칭을 되돌리고 행마다 checks 를 싣는다. 실리지 않은 별칭의 행은 버린다(Q5).
 
@@ -1021,8 +1030,8 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
         us, stats["dup"] = _dedupe([r for r in out if r["t"] == "u"], lambda r: r["u"], _verdict_of)
         out = us + [r for r in out if r["t"] != "u"]
     else:
-        fs, stats["dup"] = _dedupe([r for r in out if r["t"] == "f"], lambda r: _nq(r["title"]) or id(r),
-                                   lambda r: None)
+        # f 줄에는 정해진 정체가 없다(제목은 열쇠가 아니다) — 완전히 같은 줄만 하나로 두고 dup 에 센다.
+        fs, stats["dup"] = _dedupe([r for r in out if r["t"] == "f"], _identity, lambda r: None)
         cap = ctx["findings_max"]
         stats["dropped_over_cap"] = max(0, len(fs) - cap)       # 상한을 넘는 f 줄은 버리고 센다(설계서 3.5.3 ⑦)
         side = []
@@ -1083,41 +1092,57 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
     return res
 
 
-def merge_rows(kind: str, old: list, new: list, attempt: int) -> list:
-    """보충 시도의 행을 앞 행에 합친다 — 같은 열쇠면 문제가 적은 쪽을 남기고(같으면 앞 것), 남긴 판정이 앞 시도와
-    다르면 `flipped_from` 을 싣는다(인용만 고치라고 했는데 FAIL 이 OK 로 바뀌는 것을 앱이 본다 — P-08). 새 행은
-    `from_attempt=attempt` 다(check_rows 가 단다)."""
-    def key(r):
-        if r["t"] == "v":
-            return ("v", r["k"])
-        if r["t"] == "u":
-            return ("u", r["u"])
-        if r["t"] == "f":
-            return ("f", _nq(r.get("title")))
-        if r["t"] in ("m", "more", "none"):
-            return (r["t"],)
-        if r["t"] == "c":
-            return ("c", _nq(r.get("cond")))
-        return (r["t"], json.dumps({k: v for k, v in r.items() if k not in ("from_attempt", "checks")},
-                                   ensure_ascii=False, sort_keys=True))
+_SINGLE_ROWS = ("m", "more", "none")      # 한 호출에 한 줄이어야 하는 것 — 보충에서 오면 앞 것을 갈아 끼운다
 
-    merged = {key(r): r for r in old}
-    order = [key(r) for r in old]
+
+def _merge_key(r: dict):
+    """정해진 정체가 있는 줄의 열쇠 — verdict 는 카드 별칭, sweep 은 단위 별칭, 한 줄짜리는 줄 종류. 그 밖(f·c·h·need)은
+    None 이다(정체가 없다 — 완전히 같은 줄만 겹침으로 본다)."""
+    if r["t"] == "v":
+        return ("v", r["k"])
+    if r["t"] == "u":
+        return ("u", r["u"])
+    if r["t"] in _SINGLE_ROWS:
+        return (r["t"],)
+    return None
+
+
+def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None = None) -> list:
+    """보충 시도의 행을 앞 행에 합친다 — 앞 행 목록은 그대로 두고 새 행만 견준다(서로 다른 행을 접지 않는다 — RB-1).
+
+    정해진 정체가 있는 줄(v·u)은 같은 열쇠면 문제가 적은 쪽을 남기고(같으면 앞 것), 남긴 판정이 앞 시도와 다르면
+    `flipped_from` 을 싣는다(인용만 고치라고 했는데 FAIL 이 OK 로 바뀌는 것을 앱이 본다 — P-08). 한 줄짜리(m·more·none)는
+    새 것으로 갈아 끼운다. 정체가 없는 줄(f·c·h·need)은 앞 행과 **완전히 같을 때만** 버리고 stats["dup"] 에 센다 — 제목·조건
+    문구가 같아도 다른 칸이 다르면 둘 다 남긴다. 새 행은 `from_attempt=attempt` 다(check_rows 가 단다)."""
+    out = list(old)
+    at: dict = {}                                  # 정체 열쇠 → out 의 자리
+    for i, r in enumerate(out):
+        if _merge_key(r) is not None:
+            at.setdefault(_merge_key(r), i)
+    seen = {_identity(r) for r in out}
+    dup = 0
     for r in new:
-        k = key(r)
-        if k not in merged:
-            merged[k] = r
-            order.append(k)
+        k = _merge_key(r)
+        if k is not None and k in at:
+            prev = out[at[k]]
+            if r["t"] in _SINGLE_ROWS or row_issues(r) < row_issues(prev):
+                if _verdict_of(r) != _verdict_of(prev):
+                    r = {**r, "flipped_from": {"verdict": _verdict_of(prev), "attempt": prev.get("from_attempt")}}
+                out[at[k]] = r
             continue
-        prev = merged[k]
-        single = r["t"] in ("m", "more", "none")
-        if single or row_issues(r) < row_issues(prev):
-            if _verdict_of(r) != _verdict_of(prev):
-                r = {**r, "flipped_from": {"verdict": _verdict_of(prev), "attempt": prev.get("from_attempt")}}
-            merged[k] = r
-    if kind == "offcard" and any(t == ("none",) for t in order) and any(t[0] == "f" for t in order):
-        order = [t for t in order if t != ("none",)]   # 보충에서 f 가 왔으면 '없음' 줄은 낡았다
-    return [merged[k] for k in order]
+        ident = _identity(r)
+        if k is None and ident in seen:
+            dup += 1                               # 앞 시도의 줄을 그대로 다시 냈다 — 하나만 둔다
+            continue
+        seen.add(ident)
+        if k is not None:
+            at[k] = len(out)
+        out.append(r)
+    if kind == "offcard" and any(r["t"] == "none" for r in out) and any(r["t"] == "f" for r in out):
+        out = [r for r in out if r["t"] != "none"]   # 보충에서 f 가 왔으면 '없음' 줄은 낡았다
+    if stats is not None:
+        stats["dup"] = stats.get("dup", 0) + dup
+    return out
 
 
 _MISSING_SAY = {"m": "m 줄(따져 본 메커니즘)", "more": "more 줄(더 있나)", "f_or_none": "f 줄(없으면 none 줄)"}
@@ -1981,7 +2006,7 @@ async def run(app, prep: dict):
                 tally[k] += chk["stats"][k]
             tally["over_cap"] += chk["stats"]["dropped_over_cap"]
             inj += [x for x in chk["extras"]["inj"] if x not in inj]
-            rows = chk["rows"] if n == 1 else merge_rows(kind, rows, chk["rows"], n)
+            rows = chk["rows"] if n == 1 else merge_rows(kind, rows, chk["rows"], n, stats=tally)
             if kind == "offcard":
                 rows, cut = _cap_findings(rows, ctx["findings_max"])
                 tally["over_cap"] += cut
