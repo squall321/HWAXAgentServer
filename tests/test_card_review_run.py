@@ -303,26 +303,26 @@ def _concurrent(app, n, prep):
     return asyncio.run(go())
 
 
-def test_동시_12건이면_LLM_동시_수는_4_이하이고_나머지는_곧바로_바쁨(monkeypatch):
+def test_동시_12건이면_LLM_동시_수는_8_이하이고_나머지는_곧바로_바쁨(monkeypatch):
     monkeypatch.setattr(a, "_delib_load", lambda: (0, 0))
     llm = FakeLLM([Act("slow", delay=0.2)])
     app = _app(llm)
     outs = _concurrent(app, 12, _verdict(2))
     codes = [_last(f)[1].get("code", "ok") for f in outs]
-    assert llm.peak <= 4 and codes.count("ok") == 4 and codes.count("review_busy") == 8, (llm.peak, codes)
+    assert llm.peak <= 8 and codes.count("ok") == 8 and codes.count("review_busy") == 4, (llm.peak, codes)
     busy = next(_last(f)[1] for f in outs if _last(f)[1].get("code") == "review_busy")
     assert (busy["infra"], busy["retryable"], busy["retry_after_s"], busy["limit"], busy["reason"]) == (
-        True, True, 30, 4, "normal")
-    assert app.state.review_gate.active == 0 and app.state.review_gate.totals["busy"] == 8
+        True, True, 30, 8, "normal")
+    assert app.state.review_gate.active == 0 and app.state.review_gate.totals["busy"] == 4
 
 
-def test_심의가_돌면_동시_수는_2_이하(monkeypatch):
+def test_심의가_돌면_동시_수는_4_이하(monkeypatch):
     monkeypatch.setattr(a, "_delib_load", lambda: (1, 0))
     llm = FakeLLM([Act("slow", delay=0.2)])
     outs = _concurrent(_app(llm), 12, _verdict(2))
-    assert llm.peak <= 2 and sum(1 for f in outs if _last(f)[0] == "result") == 2
+    assert llm.peak <= 4 and sum(1 for f in outs if _last(f)[0] == "result") == 4
     busy = next(_last(f)[1] for f in outs if _last(f)[1].get("code") == "review_busy")
-    assert busy["reason"] == "delib_active" and busy["limit"] == 2
+    assert busy["reason"] == "delib_human" and busy["limit"] == 4
 
 
 def test_자리가_없으면_1초_안에_error_done_이고_LLM_을_부르지_않는다(monkeypatch):
@@ -330,7 +330,7 @@ def test_자리가_없으면_1초_안에_error_done_이고_LLM_을_부르지_않
     llm = FakeLLM(["oracle"])
     app = _app(llm)
     gate = cr.gate_of(app)
-    held = [gate.try_acquire("x") for _ in range(4)]
+    held = [gate.try_acquire("x") for _ in range(8)]
     t0 = time.monotonic()
     fr, _llm, _ = _go(_verdict(2), None, app=app, llm=llm)
     assert time.monotonic() - t0 < 1.0

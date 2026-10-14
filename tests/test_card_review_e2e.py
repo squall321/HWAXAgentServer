@@ -143,7 +143,7 @@ def test_limits_는_가짜_LLM_서버의_창을_서버_출처로_읽는다(stack
     assert (lim["ctx_tokens"], lim["ctx_source"], lim["ctx_retrying"], lim["model"]) == (WINDOW, "server", False,
                                                                                          "fake-glm")
     assert all(lim["runnable"].values()) and "ctx_too_small" not in lim
-    assert lim["verdict"]["k"] == 8 and lim["gate"] == {"limit": 4, "limit_reason": "normal", "active": 0}
+    assert lim["verdict"]["k"] == 8 and lim["gate"] == {"limit": 8, "limit_reason": "normal", "active": 0}
 
 
 def test_run_이_실제_LLM_호출을_지나_끝까지_돈다(stack):

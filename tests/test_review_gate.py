@@ -11,17 +11,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import review_gate as rg  # noqa: E402
 
 
 def test_손잡이_기본값과_잘못된_값():
-    assert rg.knobs({}) == {"concurrency": 4, "with_delib": 2, "retry_after_s": 30}
+    """D-34 — 평소 8, 심의가 돌면 절반(max(1, 평소 // 2)) = 4."""
+    assert rg.knobs({}) == {"concurrency": 8, "with_delib": 4, "retry_after_s": 30}
     bad = {"CARD_REVIEW_CONCURRENCY": "넷", "CARD_REVIEW_CONCURRENCY_WITH_DELIB": "0", "CARD_REVIEW_RETRY_AFTER_S": "-1"}
-    assert rg.knobs(bad) == {"concurrency": 4, "with_delib": 2, "retry_after_s": 30}
+    assert rg.knobs(bad) == {"concurrency": 8, "with_delib": 4, "retry_after_s": 30}
     # 심의 중 상한이 평소보다 크면 평소 값으로 묶는다(심의가 돌 때 더 받는 설정은 뜻이 거꾸로다).
     assert rg.knobs({"CARD_REVIEW_CONCURRENCY": "3", "CARD_REVIEW_CONCURRENCY_WITH_DELIB": "5"})["with_delib"] == 3
-    # 평소 1 이면 심의 중 기본값도 1 이다.
+    # 평소 값을 낮추면 심의 중 기본값(절반)도 따라 내려간다. 평소 1 이면 1 이다.
+    assert rg.knobs({"CARD_REVIEW_CONCURRENCY": "6"})["with_delib"] == 3
     assert rg.knobs({"CARD_REVIEW_CONCURRENCY": "1"})["with_delib"] == 1
+    # 적으면 그 값이다.
+    assert rg.knobs({"CARD_REVIEW_CONCURRENCY_WITH_DELIB": "6"})["with_delib"] == 6
+    # engine-ops E3-7 수용 기준 — WITH_DELIB=6, CONC=4 면 4.
+    assert rg.knobs({"CARD_REVIEW_CONCURRENCY": "4", "CARD_REVIEW_CONCURRENCY_WITH_DELIB": "6"})["with_delib"] == 4
 
 
 def test_상한에서_기다리지_않고_바쁨():
@@ -38,16 +46,16 @@ def test_상한에서_기다리지_않고_바쁨():
 def test_심의가_돌면_상한이_내려가고_도는_호출은_빼앗지_않는다():
     running = {"n": 0}
     g = rg.from_env(lambda: running["n"], env={})
-    held = [g.try_acquire(str(i)) for i in range(4)]
+    held = [g.try_acquire(str(i)) for i in range(8)]
     assert all(isinstance(t, rg.Ticket) for t in held)
-    assert g.snapshot()["limit"] == 4 and g.snapshot()["limit_reason"] == "normal"
+    assert g.snapshot()["limit"] == 8 and g.snapshot()["limit_reason"] == "normal"
     running["n"] = 1
     snap = g.snapshot()
-    assert (snap["limit"], snap["limit_reason"], snap["active"]) == (2, "delib_active", 4)
-    for t in held[:2]:
+    assert (snap["limit"], snap["limit_reason"], snap["active"], snap["delib_human"]) == (4, "delib_human", 8, 1)
+    for t in held[:4]:
         g.release(t, "ok")
-    assert isinstance(g.try_acquire("x"), rg.Busy), "심의 중 상한 2 인데 셋째 자리를 줬다"
-    g.release(held[2], "ok")
+    assert isinstance(g.try_acquire("x"), rg.Busy), "심의 중 상한 4 인데 다섯째 자리를 줬다"
+    g.release(held[4], "ok")
     assert isinstance(g.try_acquire("y"), rg.Ticket)
 
 
@@ -82,3 +90,159 @@ def test_상한을_못_읽으면_가장_좁게_연다():
     assert isinstance(g.try_acquire("a"), rg.Ticket)
     busy = g.try_acquire("b")
     assert isinstance(busy, rg.Busy) and busy.limit == 1 and busy.reason == "limit_error:RuntimeError"
+
+
+# ── M3 — 상한 표(8/4/0)와 비우기 깃발 ─────────────────────────────────────────
+@pytest.mark.parametrize("conc,with_delib,human,scope,want", [
+    (8, 4, 0, None, (8, "normal")),
+    (8, 4, 1, None, (4, "delib_human")),
+    (8, 4, 3, "panels", (4, "delib_human")),
+    (8, 4, 0, "panels", (8, "normal")),          # 비우기 panels 는 카드 대조를 막지 않는다
+    (8, 4, 0, "all", (0, "draining")),
+    (8, 4, 2, "all", (0, "draining")),           # 비우기가 이긴다
+])
+def test_limit_for_표(conc, with_delib, human, scope, want):
+    assert rg.limit_for(conc, with_delib, human, scope) == want
+
+
+def test_관문은_비우기일_때만_0_을_내고_자리_없음의_대기는_60초다(tmp_path):
+    clock = {"t": 1_000.0}
+    d = rg.DrainState(str(tmp_path / "drain.json"), clock=lambda: clock["t"], delib_load=lambda: (0, 0))
+    g = rg.from_env(lambda: 0, env={}, drain=d)
+    held = g.try_acquire("a")
+    d.set_on(scope="all", by="update-all", ttl_s=60)
+    snap = g.snapshot()
+    assert (snap["limit"], snap["limit_reason"], snap["active"]) == (0, "draining", 1), "도는 자리는 빼앗지 않는다"
+    busy = g.try_acquire("b")
+    assert isinstance(busy, rg.Busy) and (busy.limit, busy.reason, busy.retry_after_s) == (0, "draining", 60)
+    g.release(held, "ok")
+    d.set_on(scope="panels", by="update-all", ttl_s=60)
+    assert isinstance(g.try_acquire("c"), rg.Ticket), "비우기 panels 인데 카드 대조를 막았다"
+    clock["t"] += 61
+    assert d.snapshot()["on"] is False and g.snapshot()["limit"] == 8
+    # 손잡이 실수로 상한 함수가 0 을 내도 관문은 닫히지 않는다(0 은 draining 사유일 때만).
+    assert rg.ReviewGate(lambda: (0, "normal")).limit() == (1, "normal")
+
+
+def _drain(tmp_path, delib=(0, 0)):
+    clock = {"t": 10_000.0}
+    load = {"v": delib}
+    d = rg.DrainState(str(tmp_path / "drain.json"), clock=lambda: clock["t"], delib_load=lambda: load["v"])
+    return d, clock, load
+
+
+def test_깃발_수명은_늘리기만_하고_수명_뒤에_풀린다(tmp_path):
+    d, clock, _ = _drain(tmp_path)
+    assert d.snapshot() == rg.OFF
+    s1 = d.set_on(scope="all", by="update-all", reason="§2", ttl_s=1_800)
+    assert (s1["on"], s1["scope"], s1["until"], s1["by"], s1["set_at"]) == (True, "all", 11_800.0, "update-all", 10_000.0)
+    clock["t"] += 100
+    assert d.set_on(scope="all", by="update-all", ttl_s=60)["until"] == 11_800.0, "짧은 ttl 이 수명을 줄였다"
+    assert d.set_on(scope="all", by="update-all", ttl_s=1_800)["until"] == 11_900.0
+    clock["t"] = 11_899
+    assert d.snapshot()["on"] is True
+    clock["t"] = 11_900
+    assert d.snapshot()["on"] is False and not (tmp_path / "drain.json").exists(), "수명 뒤에도 파일이 남았다"
+
+
+def test_사람의_고정은_hold_아닌_요청으로_안_바뀌고_다른_by_의_off_는_409(tmp_path):
+    d, clock, _ = _drain(tmp_path)
+    d.set_on(scope="all", by="human:koo", reason="점검", hold=True)
+    for kw in ({"scope": "all", "by": "update-all", "ttl_s": 1_800},
+               {"scope": "panels", "by": "update-all", "until_idle": {"grace_s": 1_800, "max_s": 46_800}}):
+        with pytest.raises(rg.DrainError) as e:
+            d.set_on(**kw)
+        assert (e.value.status, e.value.code) == (409, "drain_held") and e.value.body()["drain"]["hold"] is True
+    with pytest.raises(rg.DrainError) as e:
+        d.set_off(by="update-all")
+    assert e.value.code == "drain_held"
+    with pytest.raises(rg.DrainError):
+        d.set_off(by="human:koo")                 # 고정은 세운 사람도 force 로만 푼다
+    clock["t"] += 10 ** 7
+    assert d.snapshot()["hold"] is True, "수명 없는 고정이 시간으로 풀렸다"
+    assert d.set_off(by="human:koo", force=True) == rg.OFF and d.snapshot()["on"] is False
+    # 다른 주체가 세운 깃발 — off 는 409, force 는 푼다. 같은 주체면 푼다. 꺼진 깃발의 off 는 멱등.
+    d.set_on(scope="all", by="update-all", ttl_s=60)
+    with pytest.raises(rg.DrainError):
+        d.set_off(by="human:koo")
+    assert d.set_off(by="update-all")["on"] is False
+    assert d.set_off(by="anyone")["on"] is False
+
+
+def test_until_idle_은_심의가_0_이_된_뒤_grace_에_풀리고_다시_서면_시계를_지운다(tmp_path):
+    d, clock, load = _drain(tmp_path, delib=(1, 0))
+    d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 100, "max_s": 10_000})
+    clock["t"] += 50
+    snap = d.snapshot()
+    assert snap["on"] and snap["until_idle"]["idle_since"] is None and snap["until_idle"]["max_until"] == 20_000.0
+    load["v"] = (0, 0)
+    assert d.snapshot()["until_idle"]["idle_since"] == 10_050.0
+    clock["t"] += 60
+    load["v"] = (0, 2)                            # 줄 선 심의도 심의다 — 시계를 지운다
+    assert d.snapshot()["until_idle"]["idle_since"] is None
+    load["v"] = (0, 0)
+    clock["t"] += 10
+    assert d.snapshot()["until_idle"]["idle_since"] == 10_120.0
+    clock["t"] = 10_219
+    assert d.snapshot()["on"] is True
+    clock["t"] = 10_220
+    assert d.snapshot()["on"] is False
+
+
+def test_until_idle_은_max_s_를_넘기지_않는다(tmp_path):
+    d, clock, _ = _drain(tmp_path, delib=(1, 0))
+    d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 1_800, "max_s": 46_800})
+    clock["t"] += 46_799
+    assert d.snapshot()["on"] is True
+    clock["t"] += 1
+    assert d.snapshot()["on"] is False, "심의가 끝나지 않아도 max_s 에서 풀린다"
+
+
+def test_until_idle_은_ttl_수명을_줄이지_않고_scope_는_마지막_요청의_것이다(tmp_path):
+    d, clock, _ = _drain(tmp_path)
+    d.set_on(scope="all", by="update-all", ttl_s=1_800)
+    s = d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 10, "max_s": 100})
+    assert s["scope"] == "panels" and s["until"] == 11_800.0
+    clock["t"] += 500                              # 심의 0 · grace·max 지남 — ttl 이 아직 산다
+    assert d.snapshot()["on"] is True
+    clock["t"] = 11_800
+    assert d.snapshot()["on"] is False
+
+
+def test_깃발은_파일에서_되살아나고_깨진_파일은_꺼짐이다(tmp_path, capsys):
+    d, clock, _ = _drain(tmp_path)
+    d.set_on(scope="all", by="update-all", ttl_s=600)
+    again = rg.DrainState(d.path, clock=lambda: clock["t"], delib_load=lambda: (0, 0))
+    assert again.snapshot()["on"] is True and again.active_scope() == "all"
+    for junk in ("{not json", "[]", '{"scope": "everything"}', '{"scope": "all", "until": "내일"}',
+                 '{"scope": "all", "until_idle": {"grace_s": 1}}'):
+        (tmp_path / "drain.json").write_text(junk, encoding="utf-8")
+        assert again.snapshot() == rg.OFF, junk
+        assert not (tmp_path / "drain.json").exists(), "깨진 파일을 지우지 않았다"
+    assert "깨졌다" in capsys.readouterr().out
+
+
+def test_비우기_요청의_모양(tmp_path):
+    d, _, _ = _drain(tmp_path)
+    for kw in ({"scope": "some", "by": "x", "ttl_s": 1}, {"scope": "all", "by": "", "ttl_s": 1},
+               {"scope": "all", "by": "x"}, {"scope": "all", "by": "x", "ttl_s": 0},
+               {"scope": "all", "by": "x", "ttl_s": 1, "until_idle": {"grace_s": 1, "max_s": 2}},
+               {"scope": "all", "by": "x", "until_idle": {"grace_s": 5, "max_s": 2}},
+               {"scope": "all", "by": "x", "ttl_s": True}):
+        with pytest.raises(rg.DrainError) as e:
+            d.set_on(**kw)
+        assert (e.value.status, e.value.code) == (422, "bad_request"), kw
+    assert d.snapshot()["on"] is False, "거절한 요청이 깃발을 세웠다"
+
+
+def test_깃발_경로는_ARTIFACT_DIR_에서_유도한다():
+    assert rg.drain_state_path({"DRAIN_STATE_PATH": "/x/y.json", "ARTIFACT_DIR": "/a"}) == "/x/y.json"
+    assert rg.drain_state_path({"ARTIFACT_DIR": "/a"}) == "/a/review-drain.json"
+    assert rg.drain_state_path({}).endswith("/artifacts/review-drain.json")
+
+
+def test_사람_심의_수를_못_세면_모름이다():
+    def boom():
+        raise RuntimeError("x")
+
+    assert rg.ReviewGate(lambda: (8, "normal"), delib_human=boom).snapshot()["delib_human"] == -1

@@ -229,7 +229,7 @@ def produce(monkeypatch) -> dict:
         held = []
         if name == "review_busy":
             gate = cr.gate_of(a.app)
-            held = [gate.try_acquire("held") for _ in range(4)]
+            held = [gate.try_acquire("held") for _ in range(8)]
         r = c.post("/card-review/run", json=REQUESTS[req_name])
         assert r.status_code == 200, (name, r.text[:300])
         frames = [delib_jobs._parse_sse(x.encode()) for x in r.text.split("\n\n") if x.strip()]

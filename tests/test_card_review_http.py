@@ -71,7 +71,7 @@ def test_limits_는_계약의_칸을_싣고_관문을_더한다(client):
     assert want <= set(lim) and "ctx_too_small" not in lim
     assert (lim["ctx_tokens"], lim["ctx_source"], lim["ctx_retrying"], lim["model"]) == (1_048_576, "server", False,
                                                                                          "fake-glm")
-    assert lim["gate"] == {"limit": 4, "limit_reason": "normal", "active": 0}
+    assert lim["gate"] == {"limit": 8, "limit_reason": "normal", "active": 0}
     assert {"unit_body_max", "card_budget", "k", "k_out"} <= set(lim["verdict"])
     assert {"manifest_page_max", "card_budget", "units_per_page_max", "manifest_item_max"} <= set(lim["sweep"])
     assert {"p", "findings_max", "known_max"} <= set(lim["offcard"])
@@ -105,7 +105,7 @@ def test_run_프레임_순서(client):
 
 def test_run_자리가_없으면_error_done(client):
     gate = cr.gate_of(a.app)
-    held = [gate.try_acquire("x") for _ in range(4)]
+    held = [gate.try_acquire("x") for _ in range(8)]
     fr = _frames(client.post("/card-review/run", json=_verdict(1)).text)
     assert [e for e, _ in fr] == ["error", "done"] and fr[0][1]["code"] == "review_busy"
     for t in held:
