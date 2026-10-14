@@ -767,7 +767,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
         if not re.fullmatch(r"K\d{2,}", a) or not isinstance(c.get("sections"), list):
             raise RequestError("bad_request", "cards 의 항목은 팩 카드 그대로여야 한다(alias K01…·sections)")
         if a in cards:
-            raise RequestError("bad_request", f"cards 에 같은 별칭 {a} 가 둘이다")
+            raise RequestError("bad_request", f"cards 에 같은 별칭 {_echo(a)} 가 둘이다")
         cards[a] = {"record_id": _str(c.get("record_id")), "card_id": _str(c.get("card_id")),
                     "type": _str(c.get("type")), "title": _str(c.get("title")), "checkable": bool(c.get("checkable")),
                     "text": card_text(c), "sections": [(_str(x.get("sid")), _str(x.get("text")))

@@ -973,3 +973,12 @@ def test_표지만인_검사는_보충_사유를_이기지_못한다():
     assert new["checks"]["nums_unsourced"] == ["1,234", "5,678"] and cr.row_issues(new) > cr.row_issues(r1["rows"][0])
     kept = next(r for r in cr.merge_rows("verdict", r1["rows"], r2["rows"], 2) if r["k"] == a)
     assert (kept["checks"]["quote"], kept["from_attempt"]) == ("ok", 2), "지어낸 인용이 검증된 인용을 이겼다"
+
+
+def test_같은_별칭이_둘인_거절은_별칭을_80자에서_끊는다():
+    """RB3B-16 — 같은 별칭 거절이 호출자의 별칭을 끊지 않고 되비춰 422 본문이 20만 자였다."""
+    pack = _pack()
+    c = dict(next(x for x in pack if x["checkable"]), alias="K" + "1" * 200_000)
+    with pytest.raises(cr.RequestError) as e:
+        cr.build_ctx(_req(cards=[c, c]), LIM)
+    assert e.value.code == "bad_request" and len(json.dumps(e.value.body(), ensure_ascii=False)) < 400
