@@ -220,7 +220,7 @@ def test_M3_새_종류의_몫과_판_1M():
     assert lim["runnable"] == dict.fromkeys(cr.KINDS, True)
     assert lim["search"] == {"timeout_s": 60.0}
     assert lim["prompt_rev"] == {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2",
-                                 "noinput": "cr-noinput-1", "summary": "cr-summary-1"}
+                                 "noinput": "cr-noinput-1", "summary": "cr-summary-2"}
     assert cr.LIMITS_FORMULA_REV == "cr-l2" and cr.UNSUPPORTED_KINDS == ("cross", "hunt")
     # 카드 밖 고정 몫은 M2 그대로다 — 긴 문서 발췌는 본문에서 쓴다(검색하지 않는 전문가의 배경 카드 자리를 줄이지 않는다).
     assert (o["fixed"], o["body"]) == (109_297, 221_004)

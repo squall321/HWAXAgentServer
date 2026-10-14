@@ -101,7 +101,7 @@ def _summary_req():
                         "must_cover": [r["ref"] for r in rows[:6]],
                         "blocks": [{"name": "numbers", "title": "영역 수치",
                                     "text": "전문가 122 · 셀 검토함 2,301 · 거름 1,204 · 입력 결손 0"}]},
-            "expect": {"prompt_rev": "cr-summary-1"}}
+            "expect": {"prompt_rev": "cr-summary-2"}}
 
 
 def _near_window_req():
@@ -550,7 +550,7 @@ def test_M3_limits_예제():
             lim["summary"]["narrative_max"], lim["summary"]["line_max"]) == (15, 18, 54, 2_520, 400)
     assert lim["offcard"]["longdoc_max"] > 0 and lim["verdict"]["mech_max"] > 0 and lim["search"] == {"timeout_s": 60.0}
     assert lim["prompt_rev"] == {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2",
-                                 "noinput": "cr-noinput-1", "summary": "cr-summary-1"}
+                                 "noinput": "cr-noinput-1", "summary": "cr-summary-2"}
     assert lim["gate"] == {"limit": 8, "limit_reason": "normal", "active": 0}
 
 

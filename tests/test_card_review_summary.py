@@ -1,4 +1,4 @@
-# 요약 호출(summary — cr-summary-1)이 행에 R 별칭을 매기고, 꼭 다룰 행이 빠지면 그것만 다시 묻고, 크기를 넘기 전에 거절하며, 앞 단계 글이 틀을 깨지 못하는지 본다
+# 요약 호출(summary — cr-summary-2)이 행에 R 별칭을 매기고, 꼭 다룰 행이 빠지면 그것만 다시 묻고, 크기를 넘기 전에 거절하며, 앞 단계 글이 틀을 깨지 못하는지 본다
 #
 # 영역 요약 15건과 과제 종합 보고서의 서술이다(M3.md 4.4.5). 표·수는 리스크 앱의 코드가 쓰고, 여기서는 행 표지(R 번호)가
 # 달린 서술만 받는다. 조립이 창 한도(p_hard)를 넘으면 LLM 을 부르지 않고 422 over_budget 이고 다시 쪼개지 않는다(D-22).
@@ -41,7 +41,7 @@ def summary_req(n_rows=40, n_cover=6, *, rows=None, blocks=None, scope=None, **o
                        "rows": rows, "must_cover": [r["ref"] for r in rows[:n_cover]],
                        "blocks": blocks if blocks is not None else [
                            {"name": "numbers", "title": "영역 수치", "text": "전문가 122 · 셀 검토함 2,301 · 거름 1,204"}]},
-           "expect": {"prompt_rev": "cr-summary-1"}}
+           "expect": {"prompt_rev": "cr-summary-2"}}
     req.update(over)
     return req
 
@@ -246,7 +246,7 @@ def test_요약_정답은_한_번에_끝나고_판_basis_별칭이_계약대로�
     assert [e for e, _ in fr] == ["status", "result", "done"]
     assert res["kind"] == "summary" and res["variant"] is None and res["missing"] == []
     m = res["meta"]
-    assert (m["prompt_rev"], m["basis"]) == ("cr-summary-1", "rows") and m["aliases"]["rows"]["R001"] == f"reg:{0:012x}"
+    assert (m["prompt_rev"], m["basis"]) == ("cr-summary-2", "rows") and m["aliases"]["rows"]["R001"] == f"reg:{0:012x}"
     heads = [r for r in res["rows"] if r["t"] == "head"]
     risks = {r["r"][0] for r in res["rows"] if r["t"] == "risk"}
     assert len(heads) == 1 and risks == {f"R{i:03d}" for i in range(1, 7)}
@@ -344,3 +344,31 @@ def test_끊은_집계_블록의_표식과_끊긴_수는_수치_원천이_아니
     assert cr.nums_unsourced("값은 123 이다", ctx["num_src"]) == ["123"], "끊긴 수의 앞 조각을 원천으로 받았다"
     whole = cr.build_ctx(summary_req(n_rows=3, n_cover=1, blocks=[{"name": "n", "title": "수", "text": "값 12,345 끝"}]), LIM)
     assert cr.nums_unsourced("값은 12,345 다", whole["num_src"]) == [], "끊지 않은 블록의 수는 원천이다"
+
+
+# ── 적대 검토 5라운드(RB3C) ──────────────────────────────────────────────────────
+def test_줄_하나가_덮는_꼭_다룰_행의_상한을_지시와_지적에_적는다():
+    """RB3C-2 — 줄 하나가 덮는 꼭 다룰 행을 셋까지로 셌는데(RB3B-11) 지시에는 conflict 의 r 상한이 없고, 지적은 'R004 가 r 에
+    없다' 고 했다(틀린 말) — 넷을 단 conflict 를 매번 다시 내 끝나지 않았다. 지시와 지적이 그 상한을 말한다(판 cr-summary-2)."""
+    _, human, _ = cr.build_prompt(summary_req(n_rows=8, n_cover=4), LIM)
+    assert f"줄 하나(risk·conflict)가 덮는 [꼭 다룰 행]도 {cr.SUMMARY_RISK_R_MAX}개까지다" in human
+    assert cr.PROMPT_REV["summary"] == "cr-summary-2"
+    res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
+                  {"t": "conflict", "r": ["R001", "R002", "R003", "R004"], "text": "다툼"},
+                  {"t": "para", "text": "문단", "r": ["R001"]}], summary_req(n_rows=8, n_cover=4))
+    assert res["missing"] == ["R004"]
+    hint = cr.repair_hint(res["problems"], 2, 3)
+    assert f"줄 하나는 꼭 다룰 행을 {cr.SUMMARY_RISK_R_MAX}개까지 덮는다" in hint and hint.rstrip().endswith("— R004")
+
+
+def test_수_뒤의_구두점에서_끊긴_블록의_수는_원천이다():
+    """RB3C-10 — 끊긴 자리가 수 바로 뒤의 ',' · '.' 이면 그 수를 다 봤는데 원천에서 뺐다('값 12.5,' · '1,234,'). 끊긴 자리에서
+    수가 이어질 때만 뺀다."""
+    pre = "- n · «수»\n«"
+    keep = LIM["summary"]["blocks_max"] - cr._MARK_ROOM
+    for tail, num in ((" 값 12.5,", "12.5"), (" 1,234,", "1,234"), (" 값 3.75.", "3.75")):
+        text = "가" * (keep - len(pre) - len(tail) + 1) + tail + " 나머지" + "나" * 70_000
+        ctx = cr.build_ctx(summary_req(n_rows=3, n_cover=1, blocks=[{"name": "n", "title": "수", "text": text}]), LIM)
+        assert ctx["blocks_text"].rsplit(" …[", 1)[0].endswith(num), ctx["blocks_text"][-60:]
+        assert cr.nums_unsourced(f"값은 {num} 이다", ctx["num_src"]) == [], (tail, "다 본 수를 원천에서 뺐다")
+

@@ -1893,8 +1893,9 @@ _HINT_SAY = {
     "quote:not_found": "인용(cq·q)이 그 카드 본문에 없다 — 그 카드의 «…» 안에서 15자 이상을 그대로 복사하라",
     "quote:short": "인용이 짧다 — 15자 이상(숫자·영문·한글 10자 이상)을 그대로 복사하라",
     "quote:empty": "인용이 비었다 — 판정의 근거가 된 카드 문구를 그대로 복사하라",
-    "cover": "꼭 다룰 행이 risk·conflict 줄의 r 에 없다 — 그 행마다 글이 있는 risk(r 3개까지) 또는 conflict(r 둘 이상) "
-             "줄을 낸다",
+    "cover": f"꼭 다룰 행이 덮이지 않았다(r 에 없거나, 꼭 다룰 행을 {SUMMARY_RISK_R_MAX}개 넘게 단 줄이라 넘는 것은 덮지 "
+             f"않았다 — 줄 하나는 꼭 다룰 행을 {SUMMARY_RISK_R_MAX}개까지 덮는다) — 그 행마다 글이 있는 risk(r "
+             f"{SUMMARY_RISK_R_MAX}개까지) 또는 conflict(r 둘 이상) 줄을 낸다",
     "why": "까닭(why)이 비었거나 짧다 — impact=no 인 q1 줄과 item 이 빈 q2 줄은 왜 없는지 한 문장으로 적는다",
 }
 
@@ -1947,9 +1948,10 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
 # 를 잡는 시험에만 쓴다(P-06④). 틀 길이는 TEMPLATE_ALLOW 안이어야 한다(시험이 못박는다 — 예산이 틀을 재지 않으므로).
 # M3 의 판 다섯은 한 판에 모아 올린다(M3.md #37) — 셀 지문이 판을 잇으므로 판 하나를 따로 올리면 도는 셀이 처음부터 돈다.
 #   sweep cr-sweep-2(결측 블록) · verdict cr-verdict-2(메커니즘 mech) · offcard cr-offcard-2(긴 문서 발췌 D) ·
-#   noinput cr-noinput-1(입력 결손 두 질문) · summary cr-summary-1(영역 요약·과제 종합의 서술)
+#   noinput cr-noinput-1(입력 결손 두 질문) · summary cr-summary-2(영역 요약·과제 종합의 서술 — 2 는 줄 하나가 덮는 꼭 다룰
+#   행의 상한(3)을 지시에 적었다(RB3C-2). 요약은 아직 운영에서 부르는 곳이 없어 따로 올렸다)
 PROMPT_REV = {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2", "noinput": "cr-noinput-1",
-              "summary": "cr-summary-1"}
+              "summary": "cr-summary-2"}
 
 _SYSTEM = (
     "당신은 사내 전문가 '{key}' 한 명입니다. 회의가 아니라 단독 검토입니다 — 다른 전문가의 의견을 보지 못하고 도구도 쓸 수 "
@@ -2082,7 +2084,7 @@ _INSTR_NOINPUT = (
 )
 
 
-# 요약(cr-summary-1) — 영역 요약·과제 종합의 서술. 중립 서기라 역할을 싣지 않고 시스템 글도 따로다(M3.md 4.4.5). 표·수는 앱의
+# 요약(cr-summary-2) — 영역 요약·과제 종합의 서술. 중립 서기라 역할을 싣지 않고 시스템 글도 따로다(M3.md 4.4.5). 표·수는 앱의
 # 코드가 쓰고 여기서는 행 표지(R 번호)가 달린 서술만 받는다. 블록 순서는 [집계] → [행] → [꼭 다룰 행] → [지시](같은 영역의
 # 보충 호출이 같은 머리를 쓴다). 행·집계는 앞 단계 LLM 의 글이 섞여 «» 안에 싣고 안쪽 «» 를 지운다(2차 주입 위생).
 _SYSTEM_SUMMARY = (
@@ -2102,7 +2104,8 @@ _SYSTEM_SUMMARY = (
 _INSTR_SUMMARY = (
     '{{"t":"head","text":"한두 문장의 요지","r":["R003"]}} — 정확히 한 줄.\n'
     '{{"t":"risk","r":["R003"],"text":"…"}} — [꼭 다룰 행]의 R 번호는 빠짐없이 risk 또는 conflict 줄의 r 에 나와야 한다. '
-    'risk 줄 하나의 r 은 {risk_r_max}개까지.\n'
+    'risk 줄 하나의 r 은 {risk_r_max}개까지. 줄 하나(risk·conflict)가 덮는 [꼭 다룰 행]도 {risk_r_max}개까지다 — 넘는 꼭 다룰 '
+    '행은 다른 줄에 낸다.\n'
     '{{"t":"conflict","r":["R003","R009"],"text":"…"}} — 행끼리 판정·주장이 부딪치는 곳. r 은 둘 이상.\n'
     '{{"t":"gain","r":["R011"],"text":"…"}} · {{"t":"watch","r":["R020"],"text":"…"}} · '
     '{{"t":"ask","text":"판정에 더 필요한 정보","r":[]}}\n'
@@ -2196,7 +2199,9 @@ def _clip_seen(s: str, cap: int) -> str:
         return s
     n = max(0, cap - _MARK_ROOM)
     head = s[:n]
-    if re.match(r"[\d.,]", s[n:n + 1]):
+    # 끊긴 자리에서 수가 이어지면(숫자, 또는 , · . 뒤에 숫자) 그 수의 앞 조각을 뺀다. 수 뒤의 구두점에서 끊긴 것은 다 본 수다
+    # (RB3C-10 — '값 12.5,' 의 12.5 를 버려 그 수를 인용한 줄이 nums_unsourced 가 됐다).
+    if re.match(r"\d|[.,]\d", s[n:n + 2]) and re.search(r"[\d.,]$", head):
         head = re.sub(r"[\d.,]+$", "", head)
     return head
 
@@ -3418,7 +3423,7 @@ class SummaryBlock(_Strict):
 
 
 class SummaryInput(_Strict):
-    """summary 요청의 본체(cr-summary-1) — 행 전부·꼭 다룰 행(must_cover — rows 의 ref, 최대 cover_hard_max)·집계 블록."""
+    """summary 요청의 본체(cr-summary-2) — 행 전부·꼭 다룰 행(must_cover — rows 의 ref, 최대 cover_hard_max)·집계 블록."""
     scope: SummaryScope
     rows: list[SummaryRow] = []
     must_cover: list[str] = []
