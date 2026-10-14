@@ -4725,6 +4725,13 @@ def _card_review_health() -> dict:
 # review_gate.DrainState(파일 하나 — 재기동을 넘긴다)이고 규칙도 거기 있다. 인증은 없다 — 서버는 루프백에만 묶이고 /chat 도
 # 같은 신뢰 수준이다. 포털은 /drain 을 중계하지 않는다(포털 시험이 라우터에서 뽑아 본다).
 _DRAIN_FIELDS = ("on", "scope", "ttl_s", "until_idle", "hold", "by", "reason", "force")
+_ECHO_MAX = 80                          # 거절이 되비추는 호출자 값 하나의 글자 상한
+
+
+def _echo(v) -> str:
+    """호출자가 보낸 값을 되비출 때 — 80자에서 끊고 원래 길이를 단다(거절 본문·로그가 입력 크기만큼 커지지 않게)."""
+    s = str(v)
+    return s if len(s) <= _ECHO_MAX else f"{s[:_ECHO_MAX]}…({len(s)}자)"
 
 
 def _drain_view(gate) -> dict:
@@ -4755,8 +4762,10 @@ async def post_drain(request: Request):
         return JSONResponse({"code": "bad_request", "message": "본문은 JSON 객체여야 한다"}, status_code=422)
     extra = sorted(set(body) - set(_DRAIN_FIELDS))
     if extra:
-        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {extra} — 조용히 버리지 않고 거절한다",
-                             "fields": extra}, status_code=422)
+        # 호출자가 보낸 칸 이름을 되비춘다 — 이름마다 80자, 20개까지(나머지는 수로만).
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 "
+                             "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
     if not isinstance(body.get("on"), bool):
         return JSONResponse({"code": "bad_request", "message": "on 은 true|false 다"}, status_code=422)
     for k in ("hold", "force"):
@@ -4777,6 +4786,10 @@ async def post_drain(request: Request):
     except DrainError as exc:
         print(f"[drain] 거절 {exc.status} {exc.code} — {exc.message}"[:300])
         return JSONResponse(exc.body(), status_code=exc.status)
+    except OSError as exc:                  # 깃발 파일을 못 쓴다(권한·디스크) — 500 이 아니라 사유를 싣는다
+        print(f"[drain] 깃발 파일을 쓰지 못했다 — {type(exc).__name__}: {exc}"[:300])
+        return JSONResponse({"code": "drain_unavailable", "message": f"비우기 깃발 파일을 쓰지 못했다 — "
+                             f"{type(exc).__name__}(DRAIN_STATE_PATH 의 권한·디스크를 본다)"}, status_code=503)
     return _drain_view(gate)
 
 

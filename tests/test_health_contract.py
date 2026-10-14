@@ -134,6 +134,24 @@ def test_drain_의_모양과_거절(client):
     assert client.post("/drain", content=b"{not json").status_code == 422
 
 
+def test_drain_거절은_호출자_값을_80자_안으로_되비추고_쓰기_실패는_503_이다(client, monkeypatch):
+    """RB3-15 — 모르는 칸 이름을 길이·개수 제한 없이 되비췄다. RB3-8 — 깃발 파일을 못 쓰면 500 이었다."""
+    body = {"on": True, "scope": "all", "ttl_s": 60, "by": "x", **{("칸" * 5_000) + str(i): 1 for i in range(50)}}
+    r = client.post("/drain", json=body)
+    v = r.json()
+    assert r.status_code == 422 and v["code"] == "unknown_fields" and v["fields_n"] == 50, (r.status_code, str(v)[:200])
+    assert len(v["fields"]) == 20 and all(len(f) <= 100 for f in v["fields"]) and len(v["message"]) < 3_000
+    r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 60, "by": "u" * 10_000})
+    assert r.status_code == 200 and len(r.json()["by"]) == 120 and len(client.get("/health").json()["drain"]["by"]) == 120
+
+    def deny(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cr.gate_of(a.app).drain, "_write", deny)
+    r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 600, "by": "u" * 10_000})
+    assert (r.status_code, r.json().get("code")) == (503, "drain_unavailable"), (r.status_code, r.text[:200])
+
+
 def test_사람의_고정은_update_all_이_풀지_못한다(client):
     client.post("/drain", json={"on": True, "scope": "all", "hold": True, "by": "human:koo", "reason": "점검"})
     r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all"})
