@@ -171,6 +171,9 @@ SCENES = {
     "verdict_contested": ("verdict_fwd", ["first_fail_fakequote", "oracle"], W1M),
     "verdict_flipped": ("verdict_fwd", ["all_ok_fakequote", "flag_fail"], W1M),
     "noinput_contested": ("noinput", ["noinput_flawed", "noinput_retract"], W1M),
+    # 적대 검토 6라운드(RB3D · D-42) — 별칭 표의 낱말(checks.alias)과, 표 밖 낱말로 고친 판정이 OK 와 부딪쳐 남긴 다툼(raw).
+    "verdict_alias": ("verdict_fwd", ["alias_words"], W1M),
+    "verdict_coerced_clash": ("verdict_fwd", ["coerced_clash"], W1M),
 }
 # 장면마다 더 하는 준비 — 검색 도구의 답(사용자 PAT 로 붙는 가짜 게이트웨이)·검색 기한·비우기 깃발.
 SEARCH_SCENES = {"offcard_search_ok": ("answer", SEARCH_HITS), "offcard_search_empty_scope": ("answer", SEARCH_EMPTY),
@@ -501,7 +504,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 25
+    assert len(results) == 27
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -648,4 +651,20 @@ def test_RB3B_다툼과_뒤집힘_예제():
     assert ni["quality"]["dup_conflict"] == len(hit) == 1 and hit[0]["impact"] == "yes"
     cb = hit[0].get("contested_by") or {}
     assert (cb.get("verdict"), cb.get("quote")) == (["no"], "ok"), hit[0]
+
+
+def test_RB3D_별칭과_고친_판정의_다툼_예제():
+    """D-42 A — 별칭 표의 낱말은 그 뜻의 값(checks.alias 에 낱말)이고 보충하지 않는다. 표 밖 낱말은 고친 값이고 같은 카드의 OK
+    와 부딪치면 흔적 없이 지지 않는다 — dup_conflict 와 contested_by.raw."""
+    al = _load("result_verdict_alias.json")
+    by = {r["k"]: r for r in al["rows"]}
+    assert (by["K01"]["judgement"], by["K01"]["checks"].get("alias")) == ("FAIL", ["judgement:FAILED"]), by["K01"]
+    assert (by["K02"]["judgement"], by["K02"]["checks"].get("alias")) == ("OK", ["judgement:통과"]), by["K02"]
+    assert al["quality"]["attempts"] == 1 and all(not r["checks"]["coerced"] for r in al["rows"])
+    cl = _load("result_verdict_coerced_clash.json")
+    k01 = next(r for r in cl["rows"] if r["k"] == "K01")
+    cb = k01.get("contested_by") or {}
+    assert (k01["judgement"], k01["checks"].get("dup_conflict"), cb.get("verdict"), cb.get("raw")) == (
+        "OK", True, ["yes", "undetermined"], "보류중"), k01
+    assert (cl["quality"]["dup_conflict"], cl["quality"]["attempts"]) == (1, 1)
 

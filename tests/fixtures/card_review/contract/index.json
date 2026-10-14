@@ -417,5 +417,27 @@
   "final": "result_noinput_contested.json",
   "llm_calls": 2,
   "transcript": "llm_transcript_noinput_contested.txt"
+ },
+ "verdict_alias": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "alias_words"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_alias.sse",
+  "final": "result_verdict_alias.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_alias.txt"
+ },
+ "verdict_coerced_clash": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "coerced_clash"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_coerced_clash.sse",
+  "final": "result_verdict_coerced_clash.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_coerced_clash.txt"
  }
 }
