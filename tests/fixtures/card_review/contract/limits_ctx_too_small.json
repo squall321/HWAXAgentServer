@@ -112,10 +112,18 @@
   "summary": "cr-summary-1"
  },
  "norm_rev": "cr-n1",
- "limits_rev": "2c205915",
+ "limits_rev_by_kind": {
+  "sweep": "8c2c9646",
+  "verdict": "e487b1a6",
+  "offcard": "03ab47d3",
+  "noinput": "a344c27e",
+  "summary": "fad71c01"
+ },
+ "limits_rev": "8d9cb7da",
  "ctx_too_small": {
-  "need_ctx_tokens": 11379,
-  "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,379 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
+  "reason": "window",
+  "need_ctx_tokens": 12700,
+  "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 12,700 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
  },
  "gate": {
   "limit": 8,

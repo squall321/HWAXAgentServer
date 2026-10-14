@@ -27,7 +27,8 @@
     "quote_sid": "1",
     "nums_unsourced": [],
     "coerced": [],
-    "mech": "ok"
+    "mech": "ok",
+    "why": "ok"
    }
   },
   {
@@ -55,7 +56,8 @@
     "quote_sid": "1",
     "nums_unsourced": [],
     "coerced": [],
-    "mech": "ok"
+    "mech": "ok",
+    "why": "ok"
    }
   },
   {
@@ -112,7 +114,7 @@
  },
  "quality": {
   "expected": 3,
-  "ok": 2,
+  "ok": 4,
   "flagged": 0,
   "missing": 0,
   "bad_lines": 0,
@@ -124,7 +126,9 @@
   "dropped_over_cap": 0,
   "maybe_more": false,
   "dropped_alias": 0,
-  "dup": 0
+  "dup": 0,
+  "dup_conflict": 0,
+  "flipped": 0
  },
  "meta": {
   "model": "fake-glm",
@@ -132,7 +136,8 @@
   "ctx_source": "server",
   "prompt_rev": "cr-noinput-1",
   "norm_rev": "cr-n1",
-  "limits_rev": "36c0f10a",
+  "limits_rev": "63611252",
+  "limits_rev_kind": "d417a4af",
   "input_sha": "6120d711ab511f28d2b78b382ede6f6b8cbeceb6dfacf947992b557ade99e312",
   "prompt_chars": 6636,
   "usage": {
@@ -186,6 +191,7 @@
     "L05": "tool:call-1"
    },
    "units": {}
-  }
+  },
+  "clipped": {}
  }
 }

@@ -360,7 +360,8 @@ def produce(monkeypatch) -> dict:
         "empty_unit": {**one, "unit": {**one["unit"], "lines": [], "context": []}},
         "deck_too_large": {**one, "cards": CHECK[:9]},
         "over_budget": big,
-        "rev_mismatch": {**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"], "limits_rev": "00000000"}},
+        # M3 앱은 요청 종류의 판(limits_rev_by_kind[kind])을 limits_rev_kind 로 보낸다(RB3-6 — M2 앱은 limits_rev).
+        "rev_mismatch": {**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"], "limits_rev_kind": "00000000"}},
         "denied": {**one, "entitlements": ["feat:thinking"]},
         # M3 — 앱이 limits.summary.cover_max 를 어겼다(꼭 다룰 행이 cover_hard_max 를 넘는다).
         "cover_too_large": _cover_too_large(lim),
@@ -379,7 +380,7 @@ def produce(monkeypatch) -> dict:
     monkeypatch.setattr(a, "_CTX_ENV_SET", False)
     monkeypatch.setattr(a, "_CTX_FALLBACK", 128_000)
     r = c.post("/card-review/run", json={**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"],
-                                                          "limits_rev": lim["limits_rev"]}})
+                                                          "limits_rev_kind": lim["limits_rev_by_kind"]["verdict"]}})
     rejects["ctx_unknown"] = {"status": r.status_code, "body": r.json()}
     # M3 요약의 크기 거절 둘 — LLM 0회(스트림을 열기 전). 영역을 나눠 부르지 않는다(D-22).
     llm0 = FakeLLM(["oracle"])
@@ -485,9 +486,10 @@ def test_엔진이_내는_오류_코드마다_예제가_있다():
 
 def test_결과_예제는_계약의_칸을_다_싣는다():
     q_keys = {"expected", "ok", "flagged", "missing", "bad_lines", "truncated", "tail_broken", "attempts", "repaired",
-              "stamp", "dropped_over_cap", "maybe_more"}
-    m_keys = {"model", "ctx_tokens", "prompt_rev", "norm_rev", "limits_rev", "input_sha", "prompt_chars", "usage",
-              "finish_reason", "llm_ms", "soft_over", "basis", "bg_dropped", "order_effective", "aliases"}
+              "stamp", "dropped_over_cap", "maybe_more", "dup_conflict", "flipped"}
+    m_keys = {"model", "ctx_tokens", "prompt_rev", "norm_rev", "limits_rev", "limits_rev_kind", "input_sha",
+              "prompt_chars", "usage", "finish_reason", "llm_ms", "soft_over", "basis", "bg_dropped", "order_effective",
+              "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
     assert len(results) == 22
@@ -509,6 +511,10 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
 def test_limits_예제의_판이_팩_결과와_같다():
     lim, res = _load("limits_1m.json"), _load("result_verdict_ok.json")
     assert res["meta"]["limits_rev"] == lim["limits_rev"] and res["meta"]["prompt_rev"] == lim["prompt_rev"]["verdict"]
+    assert res["meta"]["limits_rev_kind"] == lim["limits_rev_by_kind"]["verdict"]
+    assert set(lim["limits_rev_by_kind"]) == set(lim["kinds"])
+    mm = _load("rejects.json")["rev_mismatch"]["body"]
+    assert (mm["limits_rev_kind"], mm["expect"]["limits_rev_kind"]) == (lim["limits_rev_by_kind"]["verdict"], "00000000")
     assert _load("plan_ok.json")["limits_rev"] == lim["limits_rev"] and _load("plan_ok.json")["pair_over"] == []
     po = _load("plan_pair_over.json")
     assert [(p["deck_id"], p["unit_id"]) for p in po["pair_over"]] == [(po["verdict_decks"][0]["deck_id"], "u-big")]

@@ -13,6 +13,7 @@
    "fields": [
     "extras"
    ],
+   "fields_n": 1,
    "errors": [
     {
      "loc": "extras",
@@ -73,13 +74,14 @@
   "status": 409,
   "body": {
    "code": "rev_mismatch",
-   "message": "요청이 기대한 판(prompt_rev=cr-verdict-2, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-2, limits_rev=36c0f10a)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
+   "message": "요청이 기대한 판(prompt_rev=cr-verdict-2, limits_rev_kind=00000000)이 이 서버의 verdict 판(prompt_rev=cr-verdict-2, limits_rev=63611252, limits_rev_kind=b07ee1be)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
    "expect": {
     "prompt_rev": "cr-verdict-2",
-    "limits_rev": "00000000"
+    "limits_rev_kind": "00000000"
    },
    "prompt_rev": "cr-verdict-2",
-   "limits_rev": "36c0f10a"
+   "limits_rev": "63611252",
+   "limits_rev_kind": "b07ee1be"
   }
  },
  "denied": {
@@ -103,9 +105,10 @@
   "status": 422,
   "body": {
    "code": "ctx_too_small",
-   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,379 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
-   "need_ctx_tokens": 11379,
-   "ctx_tokens": 4096
+   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 12,700 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
+   "need_ctx_tokens": 12700,
+   "ctx_tokens": 4096,
+   "reason": "window"
   }
  },
  "ctx_unknown": {
