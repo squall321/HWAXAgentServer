@@ -10,7 +10,8 @@ all_ok_noquote · all_ok_fakequote · fabricate_alias · duplicate_rows · prose
 invented_number · obey_injection · empty · slow · timeout · unreachable · http_400 · http_401 · http_404 · http_413 ·
 http_422 · http_429 · http_500 · http_503. M3 에서 더한 것 — flag_fail(전부 FAIL·첫 메커니즘) · mech_mix(메커니즘 세 갈래) ·
 sweep_no(훑기 전부 무관) · noinput_flawed(more 없음·인용 하나 지어냄) · noinput_many(영향 줄이 상한 + 2) ·
-summary_skip_cover(꼭 다룰 행 둘을 빠뜨림) · summary_skip_one(가리킨 것 가운데 하나를 끝내 빠뜨리고 없는 수를 씀). position_bias · flip_on_solo(계측기 검증, 리스크 앱 품질 수치 몫)는 아직 없다.
+summary_skip_cover(꼭 다룰 행 둘을 빠뜨림) · summary_skip_one(가리킨 것 가운데 하나를 끝내 빠뜨리고 없는 수를 씀).
+카드 대조가 아닌 프롬프트(심의 좌석·의장 등 — 쟁점 패널)는 거동과 상관없이 심의 대본(delib_respond)으로 답한다. position_bias · flip_on_solo(계측기 검증, 리스크 앱 품질 수치 몫)는 아직 없다.
 대본이 다 떨어지면 마지막 거동을 되풀이한다.
 """
 from __future__ import annotations
@@ -189,6 +190,96 @@ def _summary_rows(p: dict) -> list:
     return out
 
 
+# ── 심의 대본(쟁점 패널 — M3.md 3.3 의 4) ─────────────────────────────────────────
+# 리허설은 쟁점 패널을 실제 심의 엔진으로 돌린다. 카드 대조가 아닌 프롬프트(좌석·의장·심사·도구 계획·요약)는 여기서 답한다 —
+# 좌석은 라운드마다 요구하는 키를 다 채운 JSON(반박은 앞 라운드 발언에 실제로 있는 문구를 인용한다 — 모든 좌석이 같은 문장을
+# 말하므로 표적이 누구든 인용이 맞는다), 의장은 결정문 산문 뒤에 risk_spec(판정 FAIL — 리스크 앱 risk_spec.v1 스키마를 지나는
+# 모양)을 낸다. 과제·메커니즘·부품 키는 프롬프트에서 찾는다(diff:<32 hex> · <계열>.<코드> · ck:<12 hex> — 없으면 자리값).
+DELIB_SAY = "보드 고정점 간극이 줄어 낙하 때 고정 보스 둘레의 응력 집중이 커진다"
+_FAMILIES = ("thermal", "mechanical", "interface", "electrical", "material", "process")
+_RISK_DOMAINS = ("xd", "sim", "cam", "rel", "soc", "disp", "mech", "pcb", "rf", "passive", "pwr", "sh", "mem", "std",
+                 "material")
+_FACETS = ("intent", "constraint", "anomaly", "lineage", "vulnerability", "strength", "tradeoff", "unknown")
+
+
+def is_card_review(system: str) -> bool:
+    """카드 대조 엔진의 프롬프트인가 — 시스템 글의 머리로 가른다(card_review._SYSTEM · _SYSTEM_SUMMARY)."""
+    return system.startswith("당신은 사내 전문가 '") or system.startswith("당신은 리스크 심사 결과를 정리하는 서기")
+
+
+def _seat_text(human: str) -> str:
+    targets = re.findall(r"^— (\S+) —$", human, re.M) or re.findall(r"^• (\S+?): ", human, re.M)
+    obj = {"lens": f"{DELIB_SAY}. 낙하 1.5 m 조건에서 이 변경은 걸린다.",
+           "reads": ["(경험칙) 고정 보스 둘레 간극 축소는 응력 집중을 키운다"],
+           "recommendation": "낙하 해석으로 보스 둘레 응력을 확인하고 간극을 되돌린다.",
+           "concerns": ["보스 크랙", "보드 휨"], "position_short": "FAIL — 보스 둘레 응력 집중",
+           "concede": [],
+           "rebut": [{"target": targets[0] if targets else "", "quote": DELIB_SAY,
+                      "counter": "간극 축소의 영향을 가볍게 봤다", "basis": "낙하 응력(경험칙)"}],
+           "deepen": f"{DELIB_SAY}. 보스 둘레 리브가 얇아 하중 경로가 보드로 바로 간다. 그래서 FAIL 로 본다.",
+           "final_position": f"FAIL 로 본다 — {DELIB_SAY}.", "non_negotiable": "낙하 해석 없이 승인하지 않는다",
+           "vote": "간극을 되돌린다", "stance": "동의"}
+    return f"{DELIB_SAY}. 이 변경의 위험을 도메인 관점에서 판단했다.\n" + json.dumps(obj, ensure_ascii=False)
+
+
+def risk_spec_of(human: str) -> dict:
+    """의장 결정문 뒤의 risk_spec — 판정 FAIL 한 건. 프롬프트에서 과제·메커니즘·부품 키·좌석을 찾는다."""
+    tk = (re.findall(r"\b((?:diff|snap):[0-9a-f]{32})\b", human) or ["diff:" + "0" * 32])[0]
+    code = next(iter(re.findall(rf"\b((?:{'|'.join(_FAMILIES)})\.[a-z0-9_]+)\b", human)), "mechanical.drop_stress")
+    ckeys = list(dict.fromkeys(re.findall(r"\b(ck:[0-9a-f]{12})\b", human)))[:2]
+    seats = list(dict.fromkeys(re.findall(r"^• ([a-z][a-z0-9]*-[a-z0-9-]+): \{", human, re.M))) or ["mech-seat"]
+    raisers = [k for k in seats if not k.startswith("delib-")] or seats    # 지정 반대석(기준선 옹호)은 제기자가 아니다
+    dom = next((k.split("-", 1)[0] for k in raisers if k.split("-", 1)[0] in _RISK_DOMAINS), "mech")
+    finding = {"id": "F1", "direction": "risk", "domain": dom, "mechanism": code.split(".", 1)[0],
+               "mechanism_detail": code, "change_kind": "dimension", "subject": {"ckeys": ckeys, "names": []},
+               "trigger_condition": "load.drop", "severity": "치명", "judgement": "FAIL",
+               "detectability": {"level": "sim-detectable", "tool": ""}, "evidence_grade": "경험칙",
+               "precedent": "none", "cites": [], "tool_calls": [], "claim": DELIB_SAY,
+               "warrant": "고정 보스 둘레 간극 축소가 낙하 하중 경로의 응력 집중을 키운다(경험칙).",
+               "resolving_check": {"kind": "sim", "ref": "낙하 해석"}, "owner_domain": dom, "raised_by": raisers,
+               "contested_by": [], "contest_note": "", "status": "open"}
+    return {"schema": "risk_spec", "version": "1.0",
+            "taxonomy_version": (re.findall(r"taxonomy_version[\"']?\s*[:=]\s*[\"']?([0-9]+\.[0-9]+)", human) or ["1.2"])[0],
+            "scope": {"kind": tk.split(":", 1)[0], "target_key": tk, "project_refs": [], "ir_refs": ["ir:fake"],
+                      "diff_ref": None, "ir_hash": ""},
+            "findings": [finding], "gains": [], "cross_domain": [],
+            "character": {"one_liner": "대본 결정 — 보스 둘레 응력 집중",
+                          "facets": [{"facet": f, "statements": [], "na_reason": "대본 — 다루지 않음"} for f in _FACETS]},
+            "open_items": [],
+            "coverage": {"seats": [{"key": k, "domain": (k.split("-", 1)[0] if k.split("-", 1)[0] in _RISK_DOMAINS
+                                                         else "delib"),
+                                    "origin": "adversary" if k.startswith("delib-") else "primary"} for k in seats],
+                         "domains_seated": [dom], "domains_missing": []},
+            "verdict": "no-go", "verdict_conditions": [],
+            "evidence_profile": {"tool": 0, "card": 0, "precedent": {"verified": 0, "dismissed": 0}, "heuristic": 1,
+                                 "measured": 0}}
+
+
+def _chair_text(human: str) -> str:
+    body = (f"## 결정 — FAIL\n(0) 참여 도메인과 커버리지 한계 — 대본 좌석이다.\n{DELIB_SAY}. 좌석 전원이 낙하 해석 "
+            "없이는 승인하지 않는다고 봤다.\n")
+    if "risk_spec" not in human:
+        return body
+    return body + "\n```json\n" + json.dumps(risk_spec_of(human), ensure_ascii=False) + "\n```\n"
+
+
+def delib_respond(system: str, human: str) -> str:
+    """심의 엔진 호출의 대본 답 — 좌석·의장·후보 심사·도구 계획·좌석 축·그 밖(요약·쉬운 설명·준비 판정)."""
+    if system.startswith("당신은 심의체 의장입니다"):
+        return _chair_text(human)
+    if "심의 기록 심사자" in system:
+        return '{"best": 1}'
+    if "도구 호출 계획자" in system:
+        return "{}"
+    if "좌석 구성을 검토하는 조정자" in system:
+        return "보드 고정 구조\n낙하 충격 전달\n접착 계면"
+    if "전문가입니다" in system:
+        return _seat_text(human)
+    if "유효한 JSON 하나만" in system:
+        return "{}"
+    return f"요약 — {DELIB_SAY}. 판정은 FAIL 이다."
+
+
 # ── 거동 ─────────────────────────────────────────────────────────────────────
 def _dump(rows: list) -> list:
     return [json.dumps(r, ensure_ascii=False) for r in rows]
@@ -203,6 +294,8 @@ def respond(a: Act, system: str, human: str, oracle=default_oracle) -> tuple[str
         return "", "stop"
     if b == "prose_only":
         return "검토해 보니 대체로 문제가 없어 보입니다. 카드의 조건을 하나씩 맞대어 보았습니다.", "stop"
+    if not is_card_review(system):
+        return delib_respond(system, human), "stop"         # 심의 엔진(쟁점 패널)·챗의 호출 — 대본 답
     rows = oracle(system, human)
     p = read_prompt(human)
     vs = [r for r in rows if r.get("t") == "v"]
