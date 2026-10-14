@@ -381,5 +381,41 @@
    "scope": "all",
    "by": "update-all"
   }
+ },
+ "verdict_contested": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "first_fail_fakequote",
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_contested.sse",
+  "final": "result_verdict_contested.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_contested.txt"
+ },
+ "verdict_flipped": {
+  "request": "req_verdict_fwd.json",
+  "script": [
+   "all_ok_fakequote",
+   "flag_fail"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_flipped.sse",
+  "final": "result_verdict_flipped.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_flipped.txt"
+ },
+ "noinput_contested": {
+  "request": "req_noinput.json",
+  "script": [
+   "noinput_flawed",
+   "noinput_retract"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_noinput_contested.sse",
+  "final": "result_noinput_contested.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_noinput_contested.txt"
  }
 }

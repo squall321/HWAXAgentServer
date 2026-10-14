@@ -1,0 +1,23 @@
+{
+ "request": {
+  "on": true,
+  "scope": "all",
+  "ttl_s": 1800,
+  "by": "update-all"
+ },
+ "status": 409,
+ "body": {
+  "code": "drain_owned",
+  "message": "다른 주체(by human:운영자)가 세운 비우기 깃발이다(scope all, until 1760407200.0) — 합치지 않는다. 그 주체가 내리거나 수명이 끝난 뒤 다시 세운다",
+  "drain": {
+   "on": true,
+   "scope": "all",
+   "until": 1760407200.0,
+   "until_idle": null,
+   "hold": false,
+   "by": "human:운영자",
+   "reason": "사람의 점검(고정 아님)",
+   "set_at": 1760400000.0
+  }
+ }
+}

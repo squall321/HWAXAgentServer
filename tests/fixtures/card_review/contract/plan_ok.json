@@ -1,5 +1,12 @@
 {
  "limits_rev": "63611252",
+ "limits_rev_by_kind": {
+  "sweep": "b387df4a",
+  "verdict": "b07ee1be",
+  "offcard": "70cf893c",
+  "noinput": "d417a4af",
+  "summary": "17d5f29b"
+ },
  "verdict_decks": [
   {
    "deck_id": "v-7e93a521",

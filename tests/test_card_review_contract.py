@@ -166,6 +166,11 @@ SCENES = {
     "summary_repaired": ("summary_domain", ["summary_skip_cover", "oracle"], W1M),
     "summary_missing": ("summary_domain", ["summary_skip_cover", "summary_skip_one", "summary_skip_one"], W1M),
     "review_busy_draining": ("verdict_one", ["oracle"], W1M),
+    # 적대 검토 4라운드(RB3B) — 앱이 시험할 다툼·뒤집힘의 픽스처. 걸린 줄이 남고 진 줄이 contested_by 로 실린다(dup_conflict),
+    # 보충이 판정을 바꿔 갈아 꼈다(flipped).
+    "verdict_contested": ("verdict_fwd", ["first_fail_fakequote", "oracle"], W1M),
+    "verdict_flipped": ("verdict_fwd", ["all_ok_fakequote", "flag_fail"], W1M),
+    "noinput_contested": ("noinput", ["noinput_flawed", "noinput_retract"], W1M),
 }
 # 장면마다 더 하는 준비 — 검색 도구의 답(사용자 PAT 로 붙는 가짜 게이트웨이)·검색 기한·비우기 깃발.
 SEARCH_SCENES = {"offcard_search_ok": ("answer", SEARCH_HITS), "offcard_search_empty_scope": ("answer", SEARCH_EMPTY),
@@ -422,6 +427,10 @@ def produce(monkeypatch) -> dict:
                                                  "until_idle": {"grace_s": 1800, "max_s": 46800},
                                                  "reason": "update-all 끝 — 재기동 건너뜀 장부"}))
     files["drain_off.json"] = _dump(post({"on": False, "by": "update-all"}))
+    # 주인 아닌 by 의 hold 아닌 요청은 합치지 않고 409 drain_owned 다(RB3B-9 — update-all 은 409 를 무엇이든 '남의 것' 으로 읽는다).
+    post({"on": True, "scope": "all", "ttl_s": 7200, "by": "human:운영자", "reason": "사람의 점검(고정 아님)"})
+    files["drain_owned.json"] = _dump(post({"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all"}))
+    post({"on": False, "by": "human:운영자"})
     post({"on": True, "scope": "all", "hold": True, "by": "human:운영자", "reason": "사람이 고정"})
     files["drain_held.json"] = _dump(post({"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all"}))
     files["drain_get.json"] = _dump(c.get("/drain").json())
@@ -492,7 +501,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 22
+    assert len(results) == 25
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -607,6 +616,9 @@ def test_M3_비우기_예제():
     assert idle["body"]["scope"] == "panels" and idle["body"]["until_idle"]["max_s"] == 46800
     assert off["body"]["on"] is False
     assert (held["status"], held["body"]["code"], held["body"]["drain"]["hold"]) == (409, "drain_held", True)
+    owned = _load("drain_owned.json")
+    assert (owned["status"], owned["body"]["code"], owned["body"]["drain"]["by"], owned["body"]["drain"]["hold"]) == (
+        409, "drain_owned", "human:운영자", False)
     assert set(got) == {"on", "scope", "until", "until_idle", "hold", "by", "reason", "set_at", "review_active",
                         "delib_active", "delib_queued"}
     h = _load("drain_health.json")
@@ -614,3 +626,24 @@ def test_M3_비우기_예제():
     assert h["capabilities"] == ["card_review", "drain"]
     busy = _load("error_review_busy_draining.json")
     assert (busy["code"], busy["reason"], busy["retry_after_s"], busy["limit"]) == ("review_busy", "draining", 60, 0)
+
+
+def test_RB3B_다툼과_뒤집힘_예제():
+    """앱이 dup_conflict·flipped 가 0 이 아닌 셀을 걸림으로 다룬다(M3.md 4.13) — 그 픽스처가 없었다(검토자 지적). 걸린 줄은 남고
+    진 줄이 contested_by{verdict, cq, quote, why, attempt} 로 실리며, 검증된 반대 답이 왔으면 그 인용을 더 묻지 않는다."""
+    con = _load("result_verdict_contested.json")
+    assert (con["quality"]["dup_conflict"], con["quality"]["flipped"], con["quality"]["attempts"]) == (1, 0, 2)
+    k01 = next(r for r in con["rows"] if r["k"] == "K01")
+    assert (k01["judgement"], k01["checks"]["quote"], k01["checks"]["dup_conflict"]) == ("FAIL", "not_found", True)
+    assert set(k01["contested_by"]) == {"verdict", "cq", "quote", "why", "attempt"}
+    assert (k01["contested_by"]["verdict"], k01["contested_by"]["quote"], k01["contested_by"]["attempt"]) == (
+        ["yes", "OK"], "ok", 2)
+    flip = _load("result_verdict_flipped.json")
+    assert flip["quality"]["flipped"] == len(flip["rows"]) == 8 and flip["quality"]["dup_conflict"] == 0
+    assert all(r["judgement"] == "FAIL" and r["flipped_from"] == {"verdict": ["yes", "OK"], "attempt": 1}
+               for r in flip["rows"])
+    ni = _load("result_noinput_contested.json")
+    hit = [r for r in ni["rows"] if r["t"] == "q1" and (r.get("checks") or {}).get("dup_conflict")]
+    assert ni["quality"]["dup_conflict"] == len(hit) == 1 and hit[0]["impact"] == "yes"
+    assert (hit[0]["contested_by"]["verdict"], hit[0]["contested_by"]["quote"]) == (["no"], "ok")
+

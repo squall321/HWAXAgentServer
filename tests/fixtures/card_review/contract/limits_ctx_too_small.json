@@ -122,7 +122,14 @@
  "limits_rev": "8d9cb7da",
  "ctx_too_small": {
   "reason": "window",
+  "reason_by_kind": {
+   "sweep": "window",
+   "verdict": "window",
+   "offcard": "window",
+   "noinput": "window"
+  },
   "need_ctx_tokens": 12700,
+  "need_max_tokens": null,
   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 12,700 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
  },
  "gate": {
