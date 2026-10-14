@@ -384,24 +384,33 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
     }
     if not _cells_runnable(b):
         short = [k for k in CELL_KINDS if not b["runnable"][k]]
-        out_short = [k for k in short if k in b["out_short"]]
-        if out_short and b["mt"]:
-            # 출력 상한이 행 한 줄도 못 낸다 — 창을 키워도 소용없다(행 몫이 출력 상한에서만 나온다).
-            need_mt = math.ceil(_rows_out_need() / (OUT_USE * _EVID_KO_CPT))
-            out["ctx_too_small"] = {
-                "reason": "output_cap", "need_ctx_tokens": None, "need_max_tokens": need_mt,
-                "message": (f"출력 상한 {b['mt']:,} 토큰으로는 카드 대조({'·'.join(out_short)})가 행 한 줄도 못 낸다 — "
-                            f"CARD_REVIEW_MAX_TOKENS(없으면 DELIB_MAX_TOKENS)를 {need_mt:,} 토큰 이상으로 올린다."),
-            }
-        else:
-            need = _need_ctx(b["ctx"], b["mt"], k_knob, shares)
-            out["ctx_too_small"] = {
-                "reason": "window" if need else "output_too_large", "need_ctx_tokens": need,
-                "message": (f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 "
-                            "다시 쪼개지 않는다. " + (f"창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
-                                                if need else "출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 "
-                                                "크다 — 그 값을 줄여라.")),
-            }
+        # 출력 상한이 행 한 줄도 못 내는 종류 — 창을 키워도 소용없다(행 몫이 출력 상한에서만 나온다). 상한이 없으면(0) 창에서
+        # 출력 몫을 잡으므로 창 문제다.
+        out_short = [k for k in short if k in b["out_short"]] if b["mt"] else []
+        need_mt = math.ceil(_rows_out_need() / (OUT_USE * _EVID_KO_CPT)) if out_short else None
+        # 창은 올린 출력 상한으로 잰다 — 출력 상한만 알리고 올린 뒤에야 창이 모자라다고 알리는 두 걸음을 하나로(RB3B-10).
+        need = _need_ctx(b["ctx"], max(b["mt"], need_mt or 0), k_knob, shares)
+        if need is not None and need <= b["ctx"]:
+            need = None                                 # 출력 상한만 올리면 이 창으로 돈다
+        why = []
+        if out_short:
+            why.append(f"출력 상한 {b['mt']:,} 토큰으로는 카드 대조({'·'.join(out_short)})가 행 한 줄도 못 낸다 — "
+                       f"CARD_REVIEW_MAX_TOKENS(없으면 DELIB_MAX_TOKENS)를 {need_mt:,} 토큰 이상으로 올린다.")
+        if need:
+            why.append(f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
+                       f"쪼개지 않는다. 창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL"
+                       + (f" — 출력 상한 {need_mt:,} 토큰 기준" if need_mt else "") + ").")
+        elif not out_short:
+            why.append(f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
+                       "쪼개지 않는다. 출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 크다 — 그 값을 줄여라.")
+        out["ctx_too_small"] = {
+            "reason": "output_cap" if out_short else ("window" if need else "output_too_large"),
+            # 종류마다의 사유 — 출력 상한이 모자란 종류는 output_cap, 나머지는 창(window — 창을 키워도 안 되면
+            # output_too_large). run 의 422 는 그 종류의 사유를 싣는다(RB3B-10 — 창이 모자란 sweep 이 output_cap 을 받았다).
+            "reason_by_kind": {k: "output_cap" if k in out_short else ("window" if need else "output_too_large")
+                               for k in short},
+            "need_ctx_tokens": need, "need_max_tokens": need_mt, "message": " ".join(why),
+        }
     return out
 
 
@@ -505,6 +514,9 @@ def plan(cards: list, units: list, lim: dict) -> dict:
 
     return {
         "limits_rev": lim["limits_rev"],
+        # 계획과 같은 때의 종류별 판(읽기 전용 — expect 의 limits_rev_kind 는 run 만 받는다). 앱이 셀 지문에 쓸 판을 limits 를
+        # 따로 다시 받지 않고 계획과 함께 받는다.
+        "limits_rev_by_kind": dict(lim["limits_rev_by_kind"]),
         "verdict_decks": verdict_decks,
         "sweep_decks": sweep_decks,
         "manifest_pages": pages,
@@ -2898,12 +2910,15 @@ def prepare(req: dict, lim: dict) -> dict:
                            expect={k: _echo(v) for k, v in exp.items() if v is not None}, **cur)
     if not lim["runnable"][kind]:
         small = lim.get("ctx_too_small") or {}
-        msg = small.get("message") if kind in CELL_KINDS else None
+        cell = kind in CELL_KINDS
+        msg = small.get("message") if cell else None
+        # 사유는 이 종류의 것(reason_by_kind)이고, 필요한 창·출력 상한은 셀 일 전체가 돌 값을 함께 싣는다(RB3B-10).
+        reason = ((small.get("reason_by_kind") or {}).get(kind) or small.get("reason")) if cell else None
         raise RequestError("ctx_too_small", msg or f"이 박스의 창·출력 상한으로는 {kind} 를 돌릴 수 없다",
                            need_ctx_tokens=small.get("need_ctx_tokens"), ctx_tokens=lim["ctx_tokens"],
-                           **({"reason": small["reason"]} if small.get("reason") and kind in CELL_KINDS else {}),
+                           **({"reason": reason} if reason else {}),
                            **({"need_max_tokens": small["need_max_tokens"]} if small.get("need_max_tokens")
-                              and kind in CELL_KINDS else {}))
+                              and cell else {}))
     system, human, ctx = build_prompt(req, lim)
     return {"req": req, "lim": lim, "system": system, "human": human, "ctx": ctx}
 

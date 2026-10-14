@@ -596,6 +596,44 @@ def test_출력_상한이_행_한_줄도_못_내면_셀_종류는_돌지_않고_
 def test_창이_모자란_ctx_too_small_은_reason_window_다():
     small = _lim(8_192)["ctx_too_small"]
     assert small["reason"] == "window" and small["need_ctx_tokens"] > 8_192
+    assert small["reason_by_kind"] == dict.fromkeys(cr.CELL_KINDS, "window")
+
+
+def test_ctx_too_small_의_사유는_종류마다이고_필요한_창과_출력_상한을_함께_싣는다():
+    """RB3B-10 — 창 8,192·출력 상한 1,000 이면 출력 상한이 모자란 것은 offcard·noinput 이고 sweep·verdict 는 창이 모자란데,
+    사유 하나(output_cap)를 모든 셀 종류의 422 에 복사했다. 그 값(3,175)으로 올리면 그제야 창이 모자라다(11,710)고 했다 —
+    두 걸음. 사유는 종류마다이고, 창은 올린 출력 상한으로 재 둘을 함께 싣는다."""
+    from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: PLC0415
+
+    lim = _lim(8_192, 1_000)
+    small = lim["ctx_too_small"]
+    assert small["reason_by_kind"] == {"sweep": "window", "verdict": "window", "offcard": "output_cap",
+                                       "noinput": "output_cap"}, small["reason_by_kind"]
+    assert small["reason"] == "output_cap" and small["need_max_tokens"] == 3_175
+    raised = _lim(8_192, small["need_max_tokens"])["ctx_too_small"]
+    assert raised["reason"] == "window" and small["need_ctx_tokens"] == raised["need_ctx_tokens"] > 8_192, (small, raised)
+    assert all(_lim(small["need_ctx_tokens"], small["need_max_tokens"])["runnable"][k] for k in cr.CELL_KINDS)
+    assert "3,175" in small["message"] and f"{small['need_ctx_tokens']:,}" in small["message"]
+    pack = _pack()
+    reqs = {"sweep": _req("sweep", pack, [], manifest=[{"unit_id": "u", "kind": "bundle", "title": "t", "text": "x"}]),
+            "offcard": _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0))}
+    for kind, want in (("sweep", "window"), ("offcard", "output_cap")):
+        errs = cr.validate_run_request(reqs[kind], lim)
+        assert len(errs) == 1 and errs[0]["code"] == "ctx_too_small", errs
+        e = errs[0]
+        assert (e["reason"], e["need_ctx_tokens"], e["need_max_tokens"]) == (want, small["need_ctx_tokens"], 3_175), e
+
+
+def test_plan_은_계획과_같은_때의_종류별_판을_싣는다():
+    """결정(RB3B) — plan 응답은 전역 limits_rev 만 실어, 앱이 계획과 같은 때의 종류별 판을 한 번에 받을 길이 없었다. 읽기
+    전용으로 limits_rev_by_kind 를 더한다(plan 의 expect 는 여전히 limits_rev_kind 를 받지 않는다)."""
+    lim = _lim(1_048_576)
+    out = cr.plan([{"alias": "K01", "record_id": "R1", "checkable": True, "chars": 500}],
+                  [{"unit_id": "u", "manifest_chars": 300, "body_chars": 2_000}], lim)
+    assert out["limits_rev_by_kind"] == lim["limits_rev_by_kind"] and out["limits_rev"] == lim["limits_rev"]
+    with pytest.raises(cr.RequestError) as e:
+        cr.check_shape(cr.PlanRequest, {"cards": [], "units": [], "expect": {"limits_rev_kind": "x"}})
+    assert e.value.code == "unknown_fields"
 
 
 
