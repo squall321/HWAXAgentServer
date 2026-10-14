@@ -159,6 +159,7 @@ def _check(rows, req=None):
 def test_요약_검사_별칭_빈_참조_conflict_수치():
     res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
                   {"t": "risk", "r": ["R001", "R999"], "text": "모르는 별칭 하나"},
+                  {"t": "risk", "r": ["R001"], "text": "R001 을 바로 덮는 줄"},
                   {"t": "risk", "r": ["R002"], "text": "간극 0.35 mm 가 문제다"},
                   {"t": "conflict", "r": ["R003"], "text": "한 행뿐"},
                   {"t": "watch", "r": [], "text": "근거 행이 없다"},
@@ -189,11 +190,41 @@ def test_head_는_한_줄이고_보충의_head_가_갈아_낀다():
             {"t": "risk", "r": ["R001"], "text": "r"}, {"t": "para", "text": "p", "r": ["R001"]}]
     first = cr.check_rows("summary", None, cr.parse_rows("\n".join(json.dumps(r, ensure_ascii=False) for r in rows),
                                                           "summary")[0], ctx)
-    assert [r["text"] for r in first["rows"] if r["t"] == "head"] == ["둘째 요지"]
+    heads = [r for r in first["rows"] if r["t"] == "head"]
+    assert [r["text"] for r in heads] == ["첫 요지"] and heads[0]["checks"]["extra_heads"] == 1, (
+        "여러 head 가운데 말없이 마지막 것을 쓰지 않는다 — 첫 것을 남기고 버린 수를 단다(RB3-3)")
+    assert first["stats"]["dup"] == 1
     again = cr.check_rows("summary", None, cr.parse_rows(json.dumps({"t": "head", "text": "고친 요지", "r": ["R001"]},
                                                                     ensure_ascii=False), "summary")[0], ctx, attempt=2)
-    merged = cr.merge_rows("summary", first["rows"], again["rows"], 2)
-    assert [r["text"] for r in merged if r["t"] == "head"] == ["고친 요지"]
+    assert [r["text"] for r in cr.merge_rows("summary", first["rows"], again["rows"], 2) if r["t"] == "head"] == [
+        "첫 요지"], "멀쩡한 head 는 보충의 head 에 밀려나지 않는다"
+    empty = cr.check_rows("summary", None, cr.parse_rows(json.dumps({"t": "head", "text": "", "r": ["R001"]}),
+                                                         "summary")[0], ctx)
+    assert empty["missing"][:1] == ["head"], "글이 빈 head 는 없는 줄이다"
+    merged = cr.merge_rows("summary", empty["rows"], again["rows"], 2)
+    assert [r["text"] for r in merged if r["t"] == "head"] == ["고친 요지"], "빈 head 는 보충의 head 가 갈아 낀다"
+
+
+@pytest.mark.parametrize("bad,want_missing", [
+    ([{"t": "head", "text": "", "r": ["R001"]}], ["head"]),                                 # 빈 head 는 없는 줄
+    ([{"t": "para", "text": "   ", "r": ["R001"]}], ["para"]),                              # 빈 para — 서술 0자
+    ([{"t": "risk", "r": ["R001"], "text": ""}], ["R001"]),                                # 빈 risk 는 덮지 않는다
+    ([{"t": "conflict", "r": ["R001"], "text": "한 행뿐"}], ["R001"]),                      # 별칭 하나 conflict
+    ([{"t": "risk", "r": ["R001", "R003", "R004", "R005"], "text": "몰아 덮기"}], ["R001"]),  # risk 의 r 은 3개까지
+    ([{"t": "risk", "r": ["R001", "R999"], "text": "모르는 별칭"}], ["R001"]),               # 참조가 틀린 줄
+])
+def test_요약은_글이_있고_참조가_맞는_줄만_꼭_다룰_행을_덮는다(bad, want_missing):
+    """RB3-3 — 글이 빈 head·para·risk 와 별칭 하나짜리 conflict 를 '다 덮었다' 로 받았다. 꼭 다룰 행은 글이 있고 refs=ok 인
+    risk(r 3개까지)·conflict(r 둘 이상)에 나와야 덮이고, 서술 0자는 para 가 없는 것이다 — 그것만 다시 묻는다."""
+    good = {"head": {"t": "head", "text": "요지", "r": ["R001"]}, "para": {"t": "para", "text": "문단", "r": ["R002"]},
+            "R002": {"t": "risk", "r": ["R002"], "text": "둘째 행"}, "R001": {"t": "risk", "r": ["R001"], "text": "첫 행"}}
+    drop = {b["t"] for b in bad} | ({"R001"} if {b["t"] for b in bad} & {"risk", "conflict"} else set())
+    rows = [r for k, r in good.items() if k not in drop] + bad
+    res = _check(rows)
+    assert res["missing"] == want_missing and res["repair"], (res["missing"], res["problems"])
+    if want_missing == ["para"]:
+        assert cr.settle("summary", res["rows"], cr.build_ctx(summary_req(n_rows=6, n_cover=2), LIM))[
+            "narrative_chars"] == 0
 
 
 # ── 실행 ──────────────────────────────────────────────────────────────────────

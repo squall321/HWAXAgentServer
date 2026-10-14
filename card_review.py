@@ -1023,9 +1023,10 @@ CONFS = ("high", "medium", "low")
 QUOTE_MIN, QUOTE_SUBST_MIN, NEED_SUBST_MIN = 15, 10, 6
 _CURLY = str.maketrans({"“": '"', "”": '"', "„": '"', "‟": '"',
                         "‘": "'", "’": "'", "‚": "'", "‛": "'"})
-# 검사 결과 가운데 '문제' 로 세는 것(행 하나의 문제 수 — 같은 별칭이 두 번이면 적은 쪽을 남긴다).
+# 검사 결과 가운데 '문제' 로 세는 것(행 하나의 문제 수 — 같은 별칭이 두 번이면 적은 쪽을 남긴다). 메커니즘(checks.mech·
+# coerced 의 mech:…)은 들지 않는다 — 표지만이다(M3.md 4.4.3). 들면 메커니즘을 비운 FAIL 이 같은 카드의 OK 줄에 졌다(RB3-1).
 _OK = {"quote": ("ok", ""), "refs": ("ok", ""), "need": ("ok", ""), "why": ("ok", ""), "src": ("ok", "exp", ""),
-       "to": ("ok", ""), "mech": ("ok", "free", "no_list", "")}
+       "to": ("ok", ""), "text": ("ok", "")}
 
 
 def _nq(s) -> str:
@@ -1082,11 +1083,44 @@ def nums_unsourced(text: str, sources: str) -> list:
 
 
 def row_issues(row: dict) -> int:
-    """행 하나의 문제 수 — checks 에서 센다(같은 별칭이 두 번이면 적은 쪽을 남기는 기준)."""
+    """행 하나의 문제 수 — checks 에서 센다(같은 별칭이 두 번이면 적은 쪽을 남기는 기준). 메커니즘 표지는 세지 않는다."""
     ch = row.get("checks") or {}
     n = sum(1 for k, oks in _OK.items() if k in ch and ch[k] not in oks)
-    n += len(ch.get("nums_unsourced") or []) + len(ch.get("coerced") or []) + len(ch.get("shape") or {})
+    n += len(ch.get("nums_unsourced") or []) + len(ch.get("shape") or {})
+    n += sum(1 for c in ch.get("coerced") or [] if not str(c).startswith("mech:"))
     return n
+
+
+def _mech_flags(row: dict) -> int:
+    """메커니즘 표지 수 — 걸린 줄이 비웠다(mech=missing)·목록 밖 코드를 free 로 고쳤다(coerced mech:…). 보충 사유도, 같은
+    정체의 줄 가운데 고르는 기준도 아니고 quality.flagged 에만 든다."""
+    ch = row.get("checks") or {}
+    return int(ch.get("mech") == "missing") + sum(1 for c in ch.get("coerced") or [] if str(c).startswith("mech:"))
+
+
+def _hit(r: dict) -> bool:
+    """걸린 줄인가 — v 는 WARNING·FAIL, u 는 rel yes·maybe(포함이 이긴다), q1 은 impact yes·unknown. 걸린 줄은 같은 정체의
+    안 걸린 줄(OK·na·rel no·impact no)에 밀려나지 않는다(RB3-1)."""
+    if r["t"] == "v":
+        return r.get("judgement") in ("WARNING", "FAIL")
+    if r["t"] == "u":
+        return r.get("rel") in ("yes", "maybe")
+    if r["t"] == "q1":
+        return r.get("impact") in ("yes", "unknown")
+    return False
+
+
+def _better(new: dict, old: dict) -> bool:
+    """new 가 old 를 갈아 낄까 — 걸린 줄과 안 걸린 줄이면 걸린 쪽, 아니면 문제가 적은 쪽(같으면 앞 것)."""
+    hn, ho = _hit(new), _hit(old)
+    if hn != ho:
+        return hn
+    return row_issues(new) < row_issues(old)
+
+
+def _conflicted(r: dict) -> dict:
+    """같은 정체의 다른 판정과 부딪쳤다는 표지(checks.dup_conflict)를 단 사본 — 앞 시도의 행 사전을 고치지 않는다."""
+    return {**r, "checks": {**(r.get("checks") or {}), "dup_conflict": True}}
 
 
 def _enum(row: dict, f: str, allowed, fallback: str, checks: dict, *, empty_too: bool = False) -> None:
@@ -1280,6 +1314,8 @@ def _check_q1(row: dict, ctx: dict, attempt: int) -> dict:
                     [ctx["lines"][x]["text"] for x in l])
     checks["nums_unsourced"] = nums_unsourced(row["why"], src)
     checks["mech"] = _check_mech(row, ctx, checks, required=row["impact"] == "yes")
+    # '영향 없음' 에는 까닭이 있어야 한다 — 까닭 없는 q1 no 와 빈 q2 로 끝난 답을 완결로 받지 않는다(RB3-4, 보충 사유).
+    checks["why"] = "short" if row["impact"] == "no" and _subst(row["why"]) < NEED_SUBST_MIN else "ok"
     if "_shape" in row:
         checks["shape"] = row.pop("_shape")
     return {**row, "from_attempt": attempt, "checks": checks}
@@ -1297,11 +1333,18 @@ def _check_q2(row: dict, ctx: dict, attempt: int) -> dict:
     return {**row, "from_attempt": attempt, "checks": checks}
 
 
+SUMMARY_RISK_R_MAX = 3            # risk 줄 하나가 덮을 수 있는 행 수 — 한 줄에 꼭 다룰 행을 몰아 덮었다고 하지 않게(RB3-3)
+_SUMMARY_TEXT_REQ = ("head", "para", "risk", "conflict")   # 글이 비면 없는 줄로 보는 줄
+
+
 def _check_s(row: dict, ctx: dict, attempt: int) -> dict:
     """summary 의 줄 하나(head·risk·conflict·gain·watch·ask·para). 실리지 않은 R 별칭은 지우고 refs=unknown_alias, r 이
-    비면(ask 는 빼고) refs=missing, conflict 의 r 이 둘 미만이면 missing. 수치가 [행]·[집계]에 없으면 nums_unsourced(표지만).
-    되돌린 ref(등록부 키)를 refs 에 싣는다."""
-    checks: dict = {"refs": "ok", "nums_unsourced": [], "coerced": []}
+    비면(ask 는 빼고) refs=missing, conflict 의 r 이 둘 미만이면 missing, risk 의 r 이 SUMMARY_RISK_R_MAX 를 넘으면
+    too_many. head·para·risk·conflict 의 글이 비면 text=empty(없는 줄로 센다). 수치가 [행]·[집계]에 없으면
+    nums_unsourced(표지만). 되돌린 ref(등록부 키)를 refs 에 싣는다."""
+    checks: dict = {"refs": "ok", "text": "ok", "nums_unsourced": [], "coerced": []}
+    if row["t"] in _SUMMARY_TEXT_REQ and not row["text"].strip():
+        checks["text"] = "empty"
     keep = [a for a in row.get("r") or [] if a in ctx["rows"]]
     if len(keep) != len(row.get("r") or []):
         checks["refs"] = "unknown_alias"
@@ -1311,6 +1354,8 @@ def _check_s(row: dict, ctx: dict, attempt: int) -> dict:
         checks["refs"] = "missing"
     elif row["t"] == "conflict" and len(row["r"]) < 2:
         checks["refs"] = "missing"                  # 부딪치는 곳은 행이 둘 이상이다
+    elif row["t"] == "risk" and len(row["r"]) > SUMMARY_RISK_R_MAX:
+        checks["refs"] = "too_many"
     checks["nums_unsourced"] = nums_unsourced(row["text"], ctx["num_src"])
     if "_shape" in row:
         checks["shape"] = row.pop("_shape")
@@ -1343,7 +1388,8 @@ def _check_side(kind: str, row: dict, ctx: dict, attempt: int) -> dict | None:
 
 
 def _dedupe(rows: list, key, verdict_of) -> tuple[list, int]:
-    """같은 열쇠의 행이 둘이면 문제가 적은 쪽을 남기고, 판정이 갈렸으면 dup_conflict 를 단다."""
+    """같은 열쇠의 행이 둘이면 걸린 줄을, 둘 다 같으면 문제가 적은 쪽을 남기고(_better), 판정이 갈렸으면 남긴 줄에
+    checks.dup_conflict 를 단다(앱이 quality.dup_conflict 로 센다)."""
     kept: dict = {}
     order: list = []
     dups = 0
@@ -1355,9 +1401,9 @@ def _dedupe(rows: list, key, verdict_of) -> tuple[list, int]:
             continue
         dups += 1
         old = kept[k]
-        win, lose = (r, old) if row_issues(r) < row_issues(old) else (old, r)
+        win, lose = (r, old) if _better(r, old) else (old, r)
         if verdict_of(win) != verdict_of(lose):
-            win["checks"]["dup_conflict"] = True
+            win = _conflicted(win)
         kept[k] = win
     return [kept[k] for k in order], dups
 
@@ -1425,17 +1471,24 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
         us, stats["dup"] = _dedupe([r for r in out if r["t"] == "u"], lambda r: r["u"], _verdict_of)
         out = us + [r for r in out if r["t"] != "u"]
     elif kind == "noinput":
-        # q1 은 (근거 카드, 제목)이 같으면 같은 영향이다(카드를 대지 않은 줄은 완전히 같을 때만), q2 는 완전히 같을 때만 접는다.
-        q1s, d1 = _dedupe([r for r in out if r["t"] == "q1"], lambda r: _merge_key(r) or _identity(r), _verdict_of)
+        # q1·q2 는 완전히 같을 때만 접는다 — 같은 카드를 댄 다른 영향(제목이 비었거나 같아도 경로·참조가 다르다)을 하나로
+        # 접지 않는다(RB3-2). (카드, 제목) 갈아 끼우기는 보충의 merge_rows 에서만, 앞 줄의 인용이 틀렸을 때만 한다.
+        q1s, d1 = _dedupe([r for r in out if r["t"] == "q1"], _identity, _verdict_of)
         q2s, d2 = _dedupe([r for r in out if r["t"] == "q2"], _identity, lambda r: None)
         stats["dup"] = d1 + d2
         cap = ctx["items_max"]
         stats["dropped_over_cap"] = max(0, len(q1s) - cap)     # 상한을 넘는 q1 은 앞의 것을 남기고 센다(4.4.2)
         out = q1s[:cap] + q2s + [r for r in out if r["t"] == "more"][-1:]
     elif kind == "summary":
-        # head 는 정확히 한 줄 — 여럿이면 마지막 것을 쓴다. 나머지는 완전히 같은 줄만 하나로 둔다.
+        # head 는 정확히 한 줄 — 여럿이면 글이 있는 첫 줄을 남기고(없으면 첫 줄) 나머지는 dup 에 센다. 남긴 줄에
+        # checks.extra_heads(버린 수)를 단다 — 말없이 마지막 것을 쓰지 않는다(RB3-3). 나머지는 완전히 같은 줄만 하나로 둔다.
         rest, stats["dup"] = _dedupe([r for r in out if r["t"] != "head"], _identity, lambda r: None)
-        out = [r for r in out if r["t"] == "head"][-1:] + rest
+        heads = [r for r in out if r["t"] == "head"]
+        if len(heads) > 1:
+            first = next((h for h in heads if h["checks"].get("text") == "ok"), heads[0])
+            stats["dup"] += len(heads) - 1
+            heads = [{**first, "checks": {**first["checks"], "extra_heads": len(heads) - 1}}]
+        out = heads + rest
     else:
         # f 줄에는 정해진 정체가 없다(제목은 열쇠가 아니다) — 완전히 같은 줄만 하나로 두고 dup 에 센다.
         fs, stats["dup"] = _dedupe([r for r in out if r["t"] == "f"], _identity, lambda r: None)
@@ -1468,6 +1521,9 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         if (r["t"] == "q1" and r.get("k") in ctx["cards"] and r.get("impact") in ("yes", "unknown")
                 and ch.get("quote") != "ok"):
             problems.append((r["k"], "quote", ch["quote"]))     # 전문이 실린 카드를 댄 영향 줄의 인용 — 보충 사유
+        if r["t"] in ("q1", "q2") and ch.get("why") == "short":
+            # 까닭 없는 '영향 없음'(q1 no)·'확인할 것 없음'(빈 q2)을 완결로 받지 않는다(RB3-4).
+            problems.append((r.get("title") or r["t"], "why", "short"))
     res: dict = {"stamp": False, "unmatched_cards": [], "maybe_more": None}
     if kind == "verdict":
         main = [r for r in rows if r["t"] == "v"]
@@ -1486,8 +1542,12 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         res["stamp"] = bool(main) and not missing and all(r["rel"] == "no" for r in main) and len(whys) <= 2
     elif kind == "summary":
         main = [r for r in rows if r["t"] in _SUMMARY_ROWS]
-        ts = {r["t"] for r in rows}
-        covered = {a for r in rows if r["t"] in ("risk", "conflict") for a in r.get("r") or []}
+        # 글이 빈 줄은 없는 줄이다. 꼭 다룰 행은 글이 있고 참조가 맞는(refs=ok — conflict 는 둘 이상, risk 는 3개까지)
+        # risk·conflict 줄에 나와야 덮인다(RB3-3 — 빈 head·para·risk 와 별칭 하나짜리 conflict 를 다 덮었다고 받았다).
+        good = [r for r in rows if (r.get("checks") or {}).get("text", "ok") == "ok"]
+        ts = {r["t"] for r in good}
+        covered = {a for r in good if r["t"] in ("risk", "conflict") and (r.get("checks") or {}).get("refs") == "ok"
+                   for a in r.get("r") or []}
         cover_missing = [a for a in ctx["must_cover"] if a not in covered]
         lines_missing = [t for t in ("head", "para") if t not in ts]
         missing = lines_missing + cover_missing      # 결과의 missing — 남은 꼭 다룰 행(R 별칭)도 그대로 싣는다
@@ -1496,12 +1556,12 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         res["narrative_chars"] = sum(len(r.get("text") or "") for r in rows if r["t"] == "para")
         res["long"] = res["narrative_chars"] > ctx["narrative_max"]   # 넘으면 표지만(버리지 않는다)
     elif kind == "noinput":
-        main = [r for r in rows if r["t"] == "q1"]
+        main = [r for r in rows if r["t"] in ("q1", "q2")]       # flagged·ok 는 두 질문의 줄을 다 센다(RB3-4)
         ts = {r["t"] for r in rows}
         missing = [t for t in ("q1", "q2", "more") if t not in ts]
         expected = 3                                   # 꼭 있어야 하는 줄 — q1 · q2 · more
         more = next((r["more"] for r in rows if r["t"] == "more"), None)
-        if len(main) >= ctx["items_max"] or more == "yes":
+        if sum(1 for r in rows if r["t"] == "q1") >= ctx["items_max"] or more == "yes":
             res["maybe_more"] = True                   # 상한까지 냈거나 더 있다고 했다 — 앱이 known 을 실어 더 묻는다
         elif more == "no":
             res["maybe_more"] = False
@@ -1517,7 +1577,7 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         elif more == "no":
             res["maybe_more"] = False                  # more 줄이 없거나 읽히지 않으면 None(모름)이다
     problems = [("", "missing", m) for m in (lines_missing if kind == "summary" else missing)] + problems
-    flagged = sum(1 for r in main if row_issues(r))
+    flagged = sum(1 for r in main if row_issues(r) or _mech_flags(r))
     res.update({"missing": missing, "problems": problems, "repair": bool(problems),
                 "expected": expected, "ok": len(main) - flagged, "flagged": flagged})
     return res
@@ -1533,20 +1593,35 @@ def _merge_key(r: dict):
         return ("v", r["k"])
     if r["t"] == "u":
         return ("u", r["u"])
-    if r["t"] == "q1" and r.get("k"):
-        return ("q1", r["k"], _nq(r.get("title")))      # 카드를 댄 영향 줄 — 보충이 인용을 고쳐 다시 낸 줄이 앞 줄을 갈아 낀다
     if r["t"] in _SINGLE_ROWS:
         return (r["t"],)
+    return None
+
+
+_QUOTE_BAD = ("not_found", "short", "empty")      # 보충 사유가 되는 인용 상태(카드를 댄 줄)
+
+
+def _q1_fix_target(out: list, r: dict) -> int | None:
+    """보충이 인용을 고쳐 다시 낸 q1 이 갈아 낄 앞 줄의 자리 — 같은 카드(k)·같은 제목(비지 않은)이고 앞 줄의 인용이 틀렸을
+    때만이다(RB3-2). 그 밖의 q1 은 완전히 같을 때만 겹침이다."""
+    title = _nq(r.get("title"))
+    if not (r.get("k") and title):
+        return None
+    for i, p in enumerate(out):
+        if (p["t"] == "q1" and p.get("k") == r["k"] and _nq(p.get("title")) == title
+                and (p.get("checks") or {}).get("quote") in _QUOTE_BAD):
+            return i
     return None
 
 
 def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None = None) -> list:
     """보충 시도의 행을 앞 행에 합친다 — 앞 행 목록은 그대로 두고 새 행만 견준다(서로 다른 행을 접지 않는다 — RB-1).
 
-    정해진 정체가 있는 줄(v·u)은 같은 열쇠면 문제가 적은 쪽을 남기고(같으면 앞 것), 남긴 판정이 앞 시도와 다르면
-    `flipped_from` 을 싣는다(인용만 고치라고 했는데 FAIL 이 OK 로 바뀌는 것을 앱이 본다 — P-08). 한 줄짜리(m·more·none)는
-    새 것으로 갈아 끼운다. 정체가 없는 줄(f·c·h·need)은 앞 행과 **완전히 같을 때만** 버리고 stats["dup"] 에 센다 — 제목·조건
-    문구가 같아도 다른 칸이 다르면 둘 다 남긴다. 새 행은 `from_attempt=attempt` 다(check_rows 가 단다)."""
+    정해진 정체가 있는 줄(v·u, 그리고 인용이 틀린 앞 q1 과 같은 카드·제목의 q1)은 _better 로 고른다 — 걸린 줄은 안 걸린
+    줄에 밀려나지 않고(RB3-1), 둘 다 같으면 문제가 적은 쪽(같으면 앞 것)이다. 갈아 낀 판정이 앞 시도와 다르면 `flipped_from`
+    을 싣고(P-08), 갈아 끼지 않았는데 판정이 갈렸으면 남긴 줄에 checks.dup_conflict 를 단다(앱이 둘 다 센다 — quality.flipped·
+    dup_conflict). 한 줄짜리(m·more·none)는 새 것으로 갈아 끼우고, head 는 문제가 적을 때만 갈아 낀다(아니면 dup). 정체가 없는
+    줄(f·c·h·need·q2·나머지 q1)은 앞 행과 **완전히 같을 때만** 버리고 stats["dup"] 에 센다. 새 행은 `from_attempt=attempt` 다."""
     out = list(old)
     at: dict = {}                                  # 정체 열쇠 → out 의 자리
     for i, r in enumerate(out):
@@ -1556,12 +1631,19 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
     dup = 0
     for r in new:
         k = _merge_key(r)
-        if k is not None and k in at:
-            prev = out[at[k]]
-            if r["t"] in _SINGLE_ROWS or row_issues(r) < row_issues(prev):
+        j = at.get(k) if k is not None else (_q1_fix_target(out, r) if r["t"] == "q1" else None)
+        if j is not None:
+            prev = out[j]
+            if r["t"] in _SINGLE_ROWS and r["t"] != "head":
+                out[j] = r
+            elif _better(r, prev):
                 if _verdict_of(r) != _verdict_of(prev):
                     r = {**r, "flipped_from": {"verdict": _verdict_of(prev), "attempt": prev.get("from_attempt")}}
-                out[at[k]] = r
+                out[j] = r
+            elif _verdict_of(r) != _verdict_of(prev):
+                out[j] = _conflicted(prev)         # 걸린 줄을 지켰다 — 갈린 사실은 남긴다
+            else:
+                dup += 1
             continue
         ident = _identity(r)
         if k is None and ident in seen:
@@ -1589,7 +1671,9 @@ _HINT_SAY = {
     "quote:not_found": "인용(cq·q)이 그 카드 본문에 없다 — 그 카드의 «…» 안에서 15자 이상을 그대로 복사하라",
     "quote:short": "인용이 짧다 — 15자 이상(숫자·영문·한글 10자 이상)을 그대로 복사하라",
     "quote:empty": "인용이 비었다 — 판정의 근거가 된 카드 문구를 그대로 복사하라",
-    "cover": "꼭 다룰 행이 risk·conflict 줄의 r 에 없다 — 그 행마다 risk 또는 conflict 줄을 낸다",
+    "cover": "꼭 다룰 행이 risk·conflict 줄의 r 에 없다 — 그 행마다 글이 있는 risk(r 3개까지) 또는 conflict(r 둘 이상) "
+             "줄을 낸다",
+    "why": "까닭(why)이 비었거나 짧다 — impact=no 인 q1 줄과 item 이 빈 q2 줄은 왜 없는지 한 문장으로 적는다",
 }
 
 
@@ -1612,10 +1696,13 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
             groups.setdefault(f"quote:{what}", []).append(str(who))
         elif code == "cover":
             groups.setdefault("cover", []).append(str(what))
+        elif code == "why":
+            who = str(who) if _HINT_ALIAS.fullmatch(str(who)) else f"«{_unquote_marks(who)}»"
+            groups.setdefault("why", []).append(who)
     head = (f"(보충 {attempt}/{total} — 직전 출력에 아래 문제가 있었다. 문제가 있는 줄만 다시 내라. "
             "이미 받은 줄은 다시 내지 않는다.)")
     lines = [head]
-    for code in ("missing", "cover", "enum", "quote:not_found", "quote:short", "quote:empty"):
+    for code in ("missing", "cover", "enum", "why", "quote:not_found", "quote:short", "quote:empty"):
         if groups.get(code):
             lines.append(f"- {_HINT_SAY[code]} — {', '.join(dict.fromkeys(groups[code]))}")
     if bad_lines:
@@ -1792,12 +1879,13 @@ _SYSTEM_SUMMARY = (
 )
 _INSTR_SUMMARY = (
     '{{"t":"head","text":"한두 문장의 요지","r":["R003"]}} — 정확히 한 줄.\n'
-    '{{"t":"risk","r":["R003"],"text":"…"}} — [꼭 다룰 행]의 R 번호는 빠짐없이 risk 또는 conflict 줄의 r 에 나와야 한다.\n'
+    '{{"t":"risk","r":["R003"],"text":"…"}} — [꼭 다룰 행]의 R 번호는 빠짐없이 risk 또는 conflict 줄의 r 에 나와야 한다. '
+    'risk 줄 하나의 r 은 {risk_r_max}개까지.\n'
     '{{"t":"conflict","r":["R003","R009"],"text":"…"}} — 행끼리 판정·주장이 부딪치는 곳. r 은 둘 이상.\n'
     '{{"t":"gain","r":["R011"],"text":"…"}} · {{"t":"watch","r":["R020"],"text":"…"}} · '
     '{{"t":"ask","text":"판정에 더 필요한 정보","r":[]}}\n'
     '{{"t":"para","text":"서술 문단","r":["R003"]}} — 한 줄 이상, 합쳐 {narrative_max}자 이내.\n'
-    "text 는 줄마다 {line_max}자 이내.\n"
+    "text 는 비우지 않고 줄마다 {line_max}자 이내.\n"
 )
 _SUMMARY_HEADS = ("[집계 — 코드가 센 수다. 숫자는 여기와 [행]에 있는 것만 쓴다]\n",
                   "[행 {n}개 — 판정 대상이 아니라 정리할 원천이다. R 번호로만 부른다]\n",
@@ -1829,7 +1917,8 @@ def _summary_prompt(req: dict, lim: dict, ctx: dict, hint: str) -> tuple[str, st
         add("frame", "\n")
     add("frame", _SUMMARY_HEADS[3])
     add("scope", _unquote_marks(re.sub(r"\s+", " ", _str(ctx["scope"].get("label") or ctx["scope"].get("key")))))
-    add("frame", _SUMMARY_HEADS[4] + _INSTR_SUMMARY.format(narrative_max=kl["narrative_max"], line_max=kl["line_max"]))
+    add("frame", _SUMMARY_HEADS[4] + _INSTR_SUMMARY.format(narrative_max=kl["narrative_max"], line_max=kl["line_max"],
+                                                                 risk_r_max=SUMMARY_RISK_R_MAX))
     if hint:
         add("hint", "\n" + _clip(hint, kl["hint_max"] - 1))
     human, sizes = _assemble(_SYSTEM_SUMMARY, segs, lim["p_hard"])
@@ -2854,6 +2943,10 @@ async def run(app, prep: dict):
             "tail_broken": tail_broken, "attempts": len(per), "repaired": len(per) > 1, "stamp": settled["stamp"],
             "dropped_over_cap": tally["over_cap"], "maybe_more": settled["maybe_more"],
             "dropped_alias": tally["dropped_alias"], "dup": tally["dup"],
+            # 같은 정체의 줄이 판정을 달리했다(남긴 줄에 checks.dup_conflict — 걸린 줄을 남긴다) · 보충이 판정을 바꿔 갈아
+            # 끼웠다(flipped_from) — 앱은 이 둘을 세어 사람이 볼 표지로 둔다(RB3-1).
+            "dup_conflict": sum(1 for r in rows if (r.get("checks") or {}).get("dup_conflict")),
+            "flipped": sum(1 for r in rows if r.get("flipped_from")),
         }
         if repair_error:
             quality["repair_error"] = repair_error

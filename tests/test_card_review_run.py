@@ -666,3 +666,25 @@ def test_엔진_내부_오류도_끝_프레임으로_닫는다(monkeypatch, caps
     assert (err["code"], err["infra"], err["retryable"]) == ("internal_error", False, False)
     g = app.state.review_gate
     assert g.active == 0 and g.totals["error"] == 1 and g.last_error.startswith("internal_error")
+
+
+def test_결과의_quality_가_갈린_판정과_뒤집힘을_센다():
+    """RB3-1 — 같은 카드의 판정이 갈렸으면 걸린 줄을 남기고 quality.dup_conflict 로, 보충이 판정을 바꿔 갈아 끼웠으면
+    quality.flipped 로 센다(행의 checks.dup_conflict·flipped_from 의 수). 앱은 이 둘을 사람이 볼 표지로 둔다."""
+    prep = _verdict(2)
+    ctx = prep["ctx"]
+    a, b = ctx["judge"]
+
+    def v(k, judgement, cq=None):
+        return json.dumps({"t": "v", "k": k, "applies": "yes" if judgement != "na" else "no", "judgement": judgement,
+                           "cq": cq or ctx["cards"][k]["text"][:30], "l": ["L01"], "why": "변경 줄과 카드를 맞대었다",
+                           "need": ""}, ensure_ascii=False)
+
+    first = "\n".join([v(a, "FAIL"), v(a, "OK"), v(b, "OK", cq=FAKE_QUOTE)])
+    fr, llm, _app_ = _go(prep, [Act(text=first), Act(text=v(b, "FAIL"))])
+    e, res = _last(fr)
+    assert e == "result" and len(llm.calls) == 2, (e, res)
+    by = {r["k"]: r for r in res["rows"]}
+    assert by[a]["judgement"] == "FAIL" and by[a]["checks"]["dup_conflict"] is True
+    assert by[b]["judgement"] == "FAIL" and tuple(by[b]["flipped_from"]["verdict"]) == ("yes", "OK"), by[b]
+    assert (res["quality"]["dup_conflict"], res["quality"]["flipped"]) == (1, 1), res["quality"]

@@ -635,7 +635,7 @@ def test_입력_결손_정답은_보충_없이_통과하고_카드를_되돌린�
     q1 = [r for r in res["rows"] if r["t"] == "q1"]
     assert [r["checks"]["quote"] for r in q1] == ["ok", "ok"] and q1[0]["record_id"] == ctx["cards"][k]["record_id"]
     assert q1[0]["refs"] == ["c:ab12cd34ef56"] and all(r["checks"]["mech"] == "ok" for r in q1)
-    assert res["ok"] == 2 and res["flagged"] == 0
+    assert res["ok"] == 3 and res["flagged"] == 0, "ok·flagged 는 q1 과 q2 를 다 센다(RB3-4)"
 
 
 def test_입력_결손_꼭_있어야_할_줄이_빠지면_그것만_보충한다():
@@ -678,7 +678,8 @@ def test_입력_결손_표지들():
     assert q["빈 메커니즘"]["checks"]["mech"] == "missing"
     q2 = next(r for r in res["rows"] if r["t"] == "q2")
     assert q2["checks"]["why"] == "short"
-    assert not res["repair"], "어느 것도 보충 사유가 아니다(전문이 실린 카드의 인용만 보충한다)"
+    assert res["problems"] == [("q2", "why", "short")], (
+        "q1 의 표지는 보충 사유가 아니다(전문이 실린 카드의 인용만) — 까닭 없는 빈 q2 만 보충한다(RB3-4)")
 
 
 def test_입력_결손_상한을_넘는_영향은_앞의_것을_남기고_더_있을_수_있다():
@@ -704,3 +705,115 @@ def test_입력_결손_보충은_고친_영향_줄이_앞_줄을_갈아_낀다()
     q1 = [r for r in merged if r["t"] == "q1"]
     assert len(q1) == 1 and q1[0]["checks"]["quote"] == "ok" and q1[0]["from_attempt"] == 2
     assert not cr.settle("noinput", merged, ctx)["repair"]
+
+
+# ── 적대 검토 3라운드 — 걸린 줄은 밀려나지 않는다(RB3-1) · q1 은 완전히 같을 때만 접는다(RB3-2) · 까닭 없는 '없음'(RB3-4) ──
+@pytest.mark.parametrize("fail_first", [True, False])
+def test_메커니즘을_비운_FAIL_이_같은_카드의_OK_중복에_밀려나지_않는다(fail_first):
+    """RB3-1 — mech=missing 이 문제 수에 들어 FAIL 이 문제 0 인 OK 중복에 졌다. 메커니즘은 표지만이고, 걸린 줄은 안 걸린
+    줄에 밀려나지 않는다(판정이 갈린 것은 checks.dup_conflict 로 남는다)."""
+    ctx = _ctx(_req(extra={"mechanisms": MECH_LIST}))
+    a = ctx["judge"][0]
+    fail, ok = _good_v(ctx, a, judgement="FAIL", mech=""), _good_v(ctx, a, judgement="OK", mech="")
+    rows = ([fail, ok] if fail_first else [ok, fail]) + [_good_v(ctx, x, mech="interface.seal_loss")
+                                                        for x in ctx["judge"][1:]]
+    res = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl(rows), "verdict")[0], ctx)
+    kept = next(r for r in res["rows"] if r["k"] == a)
+    assert (kept["judgement"], kept["checks"]["mech"], kept["checks"]["dup_conflict"]) == ("FAIL", "missing", True)
+    assert cr.row_issues(kept) == 0, "메커니즘 표지는 문제 수에 들지 않는다"
+    assert res["flagged"] == 1 and not res["repair"], "표지 행으로는 센다(보충 사유는 아니다)"
+
+
+def test_목록_밖_메커니즘으로_고친_FAIL_도_OK_에_밀려나지_않는다():
+    ctx = _ctx(_req(extra={"mechanisms": MECH_LIST}))
+    a = ctx["judge"][0]
+    rows = [_good_v(ctx, a, judgement="WARNING", mech="thermal.not_listed"), _good_v(ctx, a, judgement="OK", mech="")]
+    res = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl(rows), "verdict")[0], ctx)
+    kept = next(r for r in res["rows"] if r["k"] == a)
+    assert kept["judgement"] == "WARNING" and kept["checks"]["dup_conflict"] is True
+
+
+def test_보충의_OK_재출력이_걸린_FAIL_을_갈아_끼지_않고_갈린_사실을_남긴다():
+    """RB3-1 — 앞 시도의 FAIL(인용이 틀려 보충 대상)을 보충이 인용을 고친 OK 로 다시 내면 문제가 적은 쪽이 이겨 FAIL 이 사라졌다.
+    걸린 줄을 지키고 checks.dup_conflict 를 단다. 거꾸로(OK → FAIL)는 갈아 끼고 flipped_from 을 단다."""
+    ctx = _ctx(_req(extra={"mechanisms": MECH_LIST}))
+    a, b = ctx["judge"][:2]
+    bad = "카드에 없는 문장을 열다섯 자 넘게 지어냈다"
+    r1 = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="FAIL", cq=bad, mech=""),
+                                                             _good_v(ctx, b, judgement="OK", cq=bad)]),
+                                                       "verdict")[0], ctx)
+    r2 = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="OK"),
+                                                             _good_v(ctx, b, judgement="FAIL",
+                                                                     mech="interface.seal_loss")]),
+                                                       "verdict")[0], ctx, attempt=2)
+    merged = {r["k"]: r for r in cr.merge_rows("verdict", r1["rows"], r2["rows"], 2)}
+    assert (merged[a]["judgement"], merged[a]["checks"].get("dup_conflict"), "flipped_from" in merged[a]) == (
+        "FAIL", True, False), "걸린 줄이 보충의 OK 에 밀려났다"
+    assert merged[b]["judgement"] == "FAIL" and merged[b]["flipped_from"] == {"verdict": ("yes", "OK"), "attempt": 1}
+    assert r1["rows"][0]["checks"].get("dup_conflict") is None, "앞 시도의 행 사전을 고쳤다"
+
+
+def test_훑기의_무관_줄이_관련_줄을_밀어내지_않는다():
+    """RB3-1 — 같은 단위의 rel=no 가 rel=yes·maybe 를 밀어내면 그 단위의 셀이 돌지 않는다(포함이 이긴다)."""
+    ctx = _sweep_ctx()
+    k = ctx["card_order"][0]
+    yes = {"t": "u", "u": "U01", "k": [k], "rel": "yes", "why": "x"}
+    no = {"t": "u", "u": "U01", "k": [], "rel": "no", "why": "보스 위치와 상관없는 단위다"}
+    for rows in ([yes, no], [no, yes]):
+        res = cr.check_rows("sweep", None, cr.parse_rows(_jl(rows), "sweep")[0], ctx)
+        kept = next(r for r in res["rows"] if r["u"] == "U01")
+        assert kept["rel"] == "yes" and kept["checks"]["dup_conflict"] is True, rows
+
+
+def test_입력_결손의_영향_줄은_같은_카드를_대도_완전히_같을_때만_접는다():
+    """RB3-2 — q1 의 접기 열쇠가 (카드, 제목)이라 같은 카드를 댄 다른 영향(제목이 비었거나 같고 경로가 다른 줄)이 하나로
+    접혔다. 한 시도 안에서는 완전히 같을 때만 접는다."""
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    rows = [_q1(ctx, k, title="", path="보스 → 보드"), _q1(ctx, k, title="", path="리브 → 커넥터"),
+            _q1(ctx, k, title="같은 제목", path="A"), _q1(ctx, k, title="같은 제목", path="B"),
+            _q1(ctx, k, title="같은 제목", path="B"), _Q2, _MORE]
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl(rows), "noinput")[0], ctx)
+    paths = sorted(r["path"] for r in res["rows"] if r["t"] == "q1")
+    assert paths == ["A", "B", "리브 → 커넥터", "보스 → 보드"] and res["stats"]["dup"] == 1
+
+
+def test_입력_결손_보충은_인용이_틀린_앞_줄만_갈아_끼고_걸린_영향은_지킨다():
+    """RB3-2 — (카드, 제목) 갈아 끼우기는 보충에서만, 앞 줄의 인용이 틀렸고 새 제목이 비지 않았을 때만이다. RB3-1 — 갈아 낄
+    때도 걸린 영향(yes·unknown)은 영향 없음(no)에 밀려나지 않는다."""
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    bad = "지어낸 인용 문장을 열다섯 자 넘게 적었다"
+    first = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx, k, title="고칠 줄", cq=bad),
+                                                             _q1(ctx, k, title="멀쩡한 줄"),
+                                                             _q1(ctx, k, title="걸린 영향", cq=bad, mech=""), _Q2]),
+                                                       "noinput")[0], ctx)
+    again = [_q1(ctx, k, title="고칠 줄"),                                   # 인용을 고쳤다 — 갈아 낀다
+             _q1(ctx, k, title="멀쩡한 줄", path="다른 경로"),               # 앞 줄의 인용이 맞다 — 새 영향으로 붙는다
+             _q1(ctx, k, title="걸린 영향", impact="no", why="영향이 없다고 본다 — 간극이 남는다"),   # 걸린 줄을 지킨다
+             _q1(ctx, k, title="", cq=bad), _MORE]                          # 제목이 빈 줄은 갈아 끼지 않는다
+    fixed = cr.check_rows("noinput", None, cr.parse_rows(_jl(again), "noinput")[0], ctx, attempt=2)
+    merged = cr.merge_rows("noinput", first["rows"], fixed["rows"], 2)
+    q1 = [r for r in merged if r["t"] == "q1"]
+    by = {}
+    for r in q1:
+        by.setdefault(r["title"], []).append(r)
+    assert [r["checks"]["quote"] for r in by["고칠 줄"]] == ["ok"] and by["고칠 줄"][0]["from_attempt"] == 2
+    assert [r["path"] for r in by["멀쩡한 줄"]] == ["보스 → 보드", "다른 경로"]
+    assert [(r["impact"], r["checks"].get("dup_conflict")) for r in by["걸린 영향"]] == [("yes", True)]
+    assert len(by[""]) == 1 and len(q1) == 5
+
+
+def test_입력_결손의_까닭_없는_영향_없음은_보충하고_표지_행으로_센다():
+    """RB3-4 — 까닭 없는 q1 no 와 까닭 없는 빈 q2 로 끝난 답을 완결로 받았다(flagged 는 q1 만 셌다)."""
+    ctx = _ni_ctx()
+    rows = [_q1(ctx, impact="no", title="영향 없음", why="없음", mech=""), {"t": "q2", "item": "", "why": "없다"}, _MORE]
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl(rows), "noinput")[0], ctx)
+    assert res["repair"] and sorted(res["problems"]) == [("q2", "why", "short"), ("영향 없음", "why", "short")]
+    assert res["flagged"] == 2 and res["ok"] == 0
+    hint = cr.repair_hint(res["problems"], 2, 3)
+    assert "까닭(why)" in hint and "«영향 없음»" in hint and "q2" in hint
+    ok = cr.check_rows("noinput", None, cr.parse_rows(_jl([
+        _q1(ctx, impact="no", title="영향 없음", why="보드 고정점이 이 변경과 떨어져 있다", mech=""),
+        {"t": "q2", "item": "", "why": "결측 입력이 와도 이 변경과 겹치는 부품이 없다"}, _MORE]), "noinput")[0], ctx)
+    assert not ok["repair"] and ok["flagged"] == 0
