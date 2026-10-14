@@ -339,6 +339,31 @@ def test_자리가_없으면_1초_안에_error_done_이고_LLM_을_부르지_않
         gate.release(t, "ok")
 
 
+def test_카드_대조만의_출력_상한은_그_호출에만_건다(monkeypatch):
+    """CARD_REVIEW_MAX_TOKENS(M3.md 4.6) — run 이 llm.bind(max_tokens=…) 로 그 호출에만 건다. 심의 LLM 인스턴스의 상한은
+    그대로다(심의 의장·좌석 예산을 움직이지 않는다). 없으면 묶지 않는다."""
+    monkeypatch.setenv("CARD_REVIEW_MAX_TOKENS", "32768")
+    llm = FakeLLM(["oracle"], max_tokens=4_096)
+    fr, llm, _ = _go(_verdict(2), None, llm=llm)
+    assert _last(fr)[0] == "result"
+    assert llm.calls[0]["bound"] == {"max_tokens": 32_768} and llm.max_tokens == 4_096
+    monkeypatch.delenv("CARD_REVIEW_MAX_TOKENS")
+    fr, llm2, _ = _go(_verdict(2), ["oracle"])
+    assert _last(fr)[0] == "result" and "bound" not in llm2.calls[0]
+
+
+@pytest.mark.parametrize("env,delib_mt,want", [({"CARD_REVIEW_MAX_TOKENS": "32768"}, 8_192, (32_768, "card_review")),
+                                               ({}, 8_192, (8_192, "delib")), ({}, None, (None, "none"))])
+def test_limits_now_는_출력_상한의_출처를_싣는다(monkeypatch, env, delib_mt, want):
+    monkeypatch.delenv("CARD_REVIEW_MAX_TOKENS", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(a, "_model_context_state", lambda: {"tokens": 1_048_576, "source": "server", "retrying": False})
+    monkeypatch.setattr(a, "_delib_load", lambda: (0, 0))
+    lim = asyncio.run(cr.limits_now(_app(FakeLLM(["oracle"], max_tokens=delib_mt))))
+    assert (lim["llm_max_tokens"], lim["max_tokens_source"]) == want
+
+
 # ── ping · 취소 ──────────────────────────────────────────────────────────────
 def test_LLM_이_도는_동안_ping_이_흐른다(monkeypatch):
     monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", 0.05)

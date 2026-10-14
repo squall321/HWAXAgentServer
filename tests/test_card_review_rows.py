@@ -542,7 +542,7 @@ def test_줄_별칭은_변경_문맥_근거_순으로_잇는다():
 
 
 @pytest.mark.parametrize("patch,code", [
-    ({"kind": "noinput"}, "unsupported_kind"), ({"kind": "cross"}, "unsupported_kind"),
+    ({"kind": "hunt"}, "unsupported_kind"), ({"kind": "cross"}, "unsupported_kind"),
     ({"kind": "verdict", "variant": None}, "bad_request"), ({"kind": "sweep", "variant": "fwd"}, "bad_request"),
     ({"unit": {**UNIT, "kind": "snap_unit"}}, "unsupported_unit_kind"),
     ({"unit": {**UNIT, "kind": "excluded"}}, "unsupported_unit_kind"),

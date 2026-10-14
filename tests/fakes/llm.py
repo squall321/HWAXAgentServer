@@ -245,12 +245,19 @@ class FakeLLM:
     def next_act(self) -> Act:
         return self.script[min(len(self.calls), len(self.script) - 1)]
 
+    def bind(self, **kwargs):
+        """ChatOpenAI.bind 대역 — 묶은 인자(max_tokens 등)를 호출 기록의 bound 에 남기고 같은 대본으로 답한다."""
+        return _Bound(self, kwargs)
+
     async def ainvoke(self, msgs, *_a, **_k):
         from langchain_core.messages import AIMessage
 
         system, human = _split(msgs)
         a = self.next_act()
-        self.calls.append({"system": system, "human": human, "behavior": a.behavior})
+        call = {"system": system, "human": human, "behavior": a.behavior}
+        if _k:
+            call["bound"] = dict(_k)
+        self.calls.append(call)
         self.active += 1
         self.peak = max(self.peak, self.active)
         try:
@@ -268,3 +275,13 @@ class FakeLLM:
             raise
         finally:
             self.active -= 1
+
+
+class _Bound:
+    """FakeLLM.bind 가 돌려주는 것 — ainvoke 에 묶은 인자를 실어 원래 FakeLLM 에 넘긴다(RunnableBinding 과 같은 꼴)."""
+
+    def __init__(self, llm: FakeLLM, kwargs: dict):
+        self.llm, self.kwargs = llm, kwargs
+
+    async def ainvoke(self, msgs, *a, **k):
+        return await self.llm.ainvoke(msgs, *a, **{**self.kwargs, **k})

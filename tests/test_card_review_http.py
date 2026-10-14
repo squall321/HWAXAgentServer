@@ -147,7 +147,7 @@ def test_review_payload_의_곁칸은_받는다(client):
     (lambda b: b.pop("expert"), "bad_request"),
     (lambda b: b["unit"]["lines"][0].pop("text"), "bad_request"),
     (lambda b: b.update(kind="cross"), "unsupported_kind"),
-    (lambda b: b.update(kind="noinput"), "unsupported_kind"),
+    (lambda b: b.update(kind="hunt"), "unsupported_kind"),
     (lambda b: b["unit"].update(kind="snap_unit"), "unsupported_unit_kind"),
     (lambda b: b["unit"].update(lines=[], context=[]), "empty_unit"),
     (lambda b: b.update(cards=CHECK[:9]), "deck_too_large"),

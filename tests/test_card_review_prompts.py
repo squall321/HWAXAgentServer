@@ -217,8 +217,10 @@ def test_plan_은_묶음째로_넘는_쌍을_pair_over_로_알리고_solo_는_�
     x = v["card_budget"] // 2 - 400                         # 두 장이 한 묶음에 든다(몫 안)
     base = _checkable_base()
     pack = cr.assign_aliases([_grow(base[0], x, "-a"), _grow(base[1], x, "-b")])
-    # 단위는 offcard 홀로 들 만큼(고정 몫이 verdict 보다 크다) — 그래도 카드 한 장과는 들고 두 장 묶음과는 넘는다.
-    unit = _unit(lim["p_hard"] - lim["offcard"]["fixed"] - 50)
+    # 단위는 offcard 홀로 들 만큼(고정 몫이 verdict 보다 크다) — 그래도 카드 한 장과는 들고 두 장 묶음과는 넘는다. M3 에서
+    # verdict 고정 몫에 메커니즘 몫이 들어 두 고정 몫의 틈이 줄었다 — 카드 한 장과 드는 크기로도 묶는다.
+    card_max = max(c["chars"] for c in pack)
+    unit = _unit(min(lim["p_hard"] - lim["offcard"]["fixed"], lim["p_hard"] - v["fixed"] - card_max) - 50)
     assert v["fixed"] + cr.unit_size(unit) + max(c["chars"] for c in pack) <= lim["p_hard"]
     small = _unit(2_000)
     out = cr.plan(*_plan_in(pack, {"u-big": unit, "u-small": small}), lim)
@@ -298,7 +300,7 @@ def test_plan_이_낸_sweep_쪽과_묶음은_넘치지_않는다(ctx_tokens):
 def test_offcard_는_상한_크기_단위와_넘치는_배경_카드를_제목으로_내린다(ctx_tokens):
     lim = cr.limits(ctx_tokens, "server", 0, env={})
     o = lim["offcard"]
-    pack = _pack(random.Random(3), n=20, size=(500, max(600, o["card_budget"] // 4)))
+    pack = _pack(random.Random(3), n=20, size=(500, max(600, o["card_budget"] // 3)))
     bg = [c for c in pack if not c["checkable"]]
     unit = _unit(lim["unit_body_max"])
     known = [{"alias": f"K{i:02d}", "judgement": "OK", "why": "접착폭 여유 있음 " * 20} for i in range(1, 200)]

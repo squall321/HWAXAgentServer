@@ -27,12 +27,16 @@ def _lim(ctx, mt=0, env=_NO_ENV):
 # ── 세 박스의 값 ─────────────────────────────────────────────────────────────
 def test_운영_1M_창_미설정_출력의_값():
     lim = _lim(1_048_576)
-    assert lim["api_rev"] == "cr-1" and lim["kinds"] == ["sweep", "verdict", "offcard"]
+    assert lim["api_rev"] == "cr-1" and lim["kinds"] == ["sweep", "verdict", "offcard", "noinput", "summary"]
+    assert lim["cell_kinds"] == ["sweep", "verdict", "offcard", "noinput"]
     assert lim["out_tokens"] == 16_000 and lim["llm_max_tokens"] is None, "미설정 출력 상한을 0 으로 실었다"
+    assert lim["max_tokens_source"] == "none"
     assert lim["p_hard"] == 1_008_310
     v, s, o = lim["verdict"], lim["sweep"], lim["offcard"]
-    assert (v["unit_body_max"], v["card_budget"], v["k"], v["k_out"]) == (105_871, 119_387, 8, 19)
-    assert (s["units_per_page_max"], s["manifest_item_max"], s["manifest_page_max"]) == (64, 1_420, 90_903)
+    # M3 — verdict 에 메커니즘 몫(P 의 5%)이 고정 몫으로 들어 단위 상한이 105,871 → 99,402 로 줄었다(M2 와 다른 판이다).
+    assert (v["unit_body_max"], v["card_budget"], v["k"], v["k_out"]) == (99_402, 112_093, 8, 19)
+    assert v["mech_max"] == int(v["p"] * 0.05) == 13_762
+    assert (s["units_per_page_max"], s["manifest_item_max"], s["manifest_page_max"]) == (64, 1_403, 89_802)
     assert o["findings_max"] == 14
     assert lim["unit_body_max"] == v["unit_body_max"], "1M 창에서는 verdict 단위 몫이 더 작다"
     assert all(lim["runnable"].values()) and "ctx_too_small" not in lim
@@ -40,18 +44,19 @@ def test_운영_1M_창_미설정_출력의_값():
 
 def test_128K_창_출력_8192_의_값():
     lim = _lim(128_000, 8_192)
-    assert lim["p_hard"] == 109_368 and lim["llm_max_tokens"] == 8_192
+    assert lim["p_hard"] == 109_368 and lim["llm_max_tokens"] == 8_192 and lim["max_tokens_source"] == "delib"
     v, s, o = lim["verdict"], lim["sweep"], lim["offcard"]
     assert (v["k"], v["k_out"]) == (8, 9), "출력 상한 8,192 면 K_out 이 9 다(설계서 3.3)"
     assert s["units_per_page_max"] == 31 and o["findings_max"] == 6
-    assert lim["unit_body_max"] == 11_603 and v["card_budget"] == 13_085
+    assert lim["unit_body_max"] == 10_813 and v["card_budget"] == 12_195
+    assert lim["noinput"]["items_max"] == 7 and lim["summary"]["cover_max"] == 8
 
 
 def test_dev_16K_창의_값():
     lim = _lim(16_384)
     assert lim["p_hard"] == 11_999 and lim["out_tokens"] == 4_096
     v, s, o = lim["verdict"], lim["sweep"], lim["offcard"]
-    assert (v["unit_body_max"], v["card_budget"], v["k"], v["k_out"]) == (3_007, 3_392, 4, 4)
+    assert (v["unit_body_max"], v["card_budget"], v["k"], v["k_out"]) == (2_725, 3_074, 4, 4)
     assert (s["units_per_page_max"], s["manifest_item_max"]) == (14, 800)
     assert o["findings_max"] == 1, "dev 출력 몫(4,096)으로는 카드 밖 리스크를 한 호출에 한 줄씩만 받는다(P-18)"
     assert all(lim["runnable"].values()), "16K 창은 작아도 돈다 — 카드·단위가 몫 안이면"
@@ -79,8 +84,13 @@ def test_창이_커지면_단위_상한이_줄지_않는다(mt):
             assert lim["unit_body_max"] >= prev["unit_body_max"], (ctx, mt)
             for kind in cr.KINDS:
                 assert lim[kind]["body"] >= prev[kind]["body"], (ctx, mt, kind)
+            # 출력 몫에서 유도하는 수는 창이 커져도 줄지 않는다(같은 출력 상한).
+            for kind, key in (("noinput", "items_max"), ("summary", "cover_max"), ("summary", "narrative_max"),
+                              ("offcard", "longdoc_max"), ("verdict", "mech_max")):
+                assert lim[kind][key] >= prev[kind][key], (ctx, mt, kind, key)
         # 단위를 싣는 종류마다 본문이 단위 상한 이상이다(P-02 덧붙임).
-        assert lim["verdict"]["body"] >= lim["unit_body_max"] and lim["offcard"]["body"] >= lim["unit_body_max"]
+        for kind in ("verdict", "offcard", "noinput"):
+            assert lim[kind]["body"] >= lim["unit_body_max"], (ctx, mt, kind)
         prev = lim
 
 
@@ -91,7 +101,7 @@ def test_틀·블록·지적_몫과_본문의_합이_P_를_넘지_않는다():
         for kind in cr.KINDS:
             k = lim[kind]
             blocks = sum(v for n, v in k.items() if n.endswith("_max") and n.split("_")[0] in
-                         ("role", "digest", "domains", "known", "mech", "hint"))
+                         ("role", "digest", "domains", "known", "mech", "hint", "missing", "blocks"))
             assert k["fixed"] + k["body"] == k["p"], (ctx, kind)
             assert k["fixed"] >= cr.TEMPLATE_ALLOW[kind] + blocks, (ctx, kind)
             assert k["p"] <= lim["p_hard"], (ctx, kind)
@@ -153,7 +163,8 @@ def _global_names(fn) -> set:
 def test_예산_식이_읽는_모듈_상수는_전부_판에_든다():
     """새 상수를 예산 식에 더하고 LIMITS_CONSTANTS 에 안 더하면 판이 그 상수를 모른다 — 식의 함수들이 읽는 모듈 상수를 모아
     대조한다. 손잡이 기본값(K_DEFAULT·SHARE_DEFAULT)은 손잡이 값으로, 다른 판(PROMPT_REV·NORM_REV·API_REV)은 따로 싣는다."""
-    other = {"KINDS", "API_REV", "PROMPT_REV", "NORM_REV", "K_DEFAULT", "SHARE_DEFAULT", "_SHARE_ENV", "LIMITS_CONSTANTS"}
+    other = {"KINDS", "CELL_KINDS", "API_REV", "PROMPT_REV", "NORM_REV", "K_DEFAULT", "SHARE_DEFAULT", "_SHARE_ENV",
+             "LIMITS_CONSTANTS"}
     read = set()
     for fn in (cr._budget, cr._need_ctx, cr.limits, cr.plan, cr._pack_decks, cr.unit_size, cr._knob_k,
                cr._knob_shares, cr._limits_constants):
@@ -178,8 +189,95 @@ def test_창이_모자라면_쪼개지_않고_ctx_too_small_과_필요한_창을
     assert not all(lim["runnable"].values())
     need = lim["ctx_too_small"]["need_ctx_tokens"]
     assert need and need > 8_192 and "다시 쪼개지 않는다" in lim["ctx_too_small"]["message"]
-    assert all(_lim(need)["runnable"].values()) and not all(_lim(need - 1)["runnable"].values()), (
-        "need_ctx_tokens 가 돌 수 있는 가장 작은 창이 아니다")
+
+    def cells_ok(lm):
+        return all(lm["runnable"][k] for k in cr.CELL_KINDS)
+
+    assert cells_ok(_lim(need)) and not cells_ok(_lim(need - 1)), "need_ctx_tokens 가 셀 일이 도는 가장 작은 창이 아니다"
+
+
+# ── M3 — 새 종류 둘(noinput·summary)·출력 상한·판 ─────────────────────────────────
+def test_M3_새_종류의_몫과_판_1M():
+    """M3.md 4.3 — 종류 다섯·cell_kinds 넷, 새 종류의 몫은 출력 몫에서 유도한다(items_max 15 · narrative 2,520 · cover 18 ·
+    cover_hard 54 — 1M 창·출력 상한 미설정). 긴 문서 몫은 카드 밖 P 의 25%, 판 다섯은 M3 값이다."""
+    lim = _lim(1_048_576)
+    n, su, o = lim["noinput"], lim["summary"], lim["offcard"]
+    assert set(n) == {"p", "fixed", "body", "role_max", "digest_max", "known_max", "mech_max", "hint_max",
+                      "unit_body_max", "card_budget", "items_max"}
+    assert set(su) == {"p", "fixed", "body", "hint_max", "blocks_max", "line_max", "narrative_max", "cover_max",
+                       "cover_hard_max"}
+    assert n["items_max"] == 15 and n["unit_body_max"] == n["body"] and n["card_budget"] == n["body"] - lim["unit_body_max"]
+    assert (su["line_max"], su["narrative_max"], su["cover_max"], su["cover_hard_max"]) == (400, 2_520, 18, 54)
+    assert o["longdoc_max"] == int(o["p"] * 0.25) == 82_575
+    assert lim["runnable"] == dict.fromkeys(cr.KINDS, True)
+    assert lim["search"] == {"timeout_s": 60.0}
+    assert lim["prompt_rev"] == {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2",
+                                 "noinput": "cr-noinput-1", "summary": "cr-summary-1"}
+    assert cr.LIMITS_FORMULA_REV == "cr-l2" and cr.UNSUPPORTED_KINDS == ("cross", "hunt")
+    # 카드 밖 고정 몫은 M2 그대로다 — 긴 문서 발췌는 본문에서 쓴다(검색하지 않는 전문가의 배경 카드 자리를 줄이지 않는다).
+    assert (o["fixed"], o["body"]) == (109_297, 221_004)
+
+
+@pytest.mark.parametrize("ctx", [16_384, 131_072, 1_048_576])
+def test_새_종류의_식(ctx):
+    """M3.md 4.3 의 식 그대로 — rows_out = OUTCAP × 0.6 × 1.05."""
+    for mt in (0, 4_096, 32_768):
+        lim = _lim(ctx, mt)
+        if not lim["out_tokens"] < ctx:
+            continue
+        rows_out = (mt or lim["out_tokens"]) * cr.OUT_USE * 1.05
+        su = lim["summary"]
+        assert su["narrative_max"] == int(rows_out * 0.25)
+        assert su["cover_max"] == max(1, int((rows_out - su["narrative_max"] - 300) // 400))
+        assert su["cover_hard_max"] == su["cover_max"] * (1 + cr.PARSE_RETRIES_DEFAULT)
+        assert lim["noinput"]["items_max"] == max(1, int((rows_out - 800) // 600))
+
+
+def test_출력_상한_손잡이_CARD_REVIEW_MAX_TOKENS():
+    """카드 대조만의 출력 상한 — 있으면 그것(card_review), 없으면 심의 LLM 의 상한(delib), 둘 다 없으면 none. 32,768 이면
+    k_out 이 19 → 39, cover_max 가 18 → 37(M3.md 4.3 의 식), items_max 가 15 → 33 으로 오른다."""
+    assert cr.resolve_max_tokens(8_192, {"CARD_REVIEW_MAX_TOKENS": "32768"}) == (32_768, "card_review")
+    assert cr.resolve_max_tokens(8_192, {}) == (8_192, "delib")
+    assert cr.resolve_max_tokens(None, {}) == (0, "none")
+    assert cr.resolve_max_tokens(True, {}) == (0, "none"), "bool 은 상한이 아니다"
+    for bad in ("서른", "-5", "0", ""):
+        assert cr.resolve_max_tokens(4_096, {"CARD_REVIEW_MAX_TOKENS": bad}) == (4_096, "delib"), bad
+    mt, src = cr.resolve_max_tokens(None, {"CARD_REVIEW_MAX_TOKENS": "32768"})
+    lim = cr.limits(1_048_576, "server", mt, env={}, max_tokens_source=src)
+    assert (lim["llm_max_tokens"], lim["max_tokens_source"]) == (32_768, "card_review")
+    assert lim["verdict"]["k_out"] == 39 and lim["summary"]["cover_max"] == 37 and lim["noinput"]["items_max"] == 33
+    assert lim["limits_rev"] != _lim(1_048_576)["limits_rev"], "출력 상한은 판에 든다"
+
+
+def test_요약만_못_도는_박스는_ctx_too_small_이_아니다():
+    """출력 상한이 아주 작으면(1,000 토큰) 꼭 다룰 행 줄이 하나도 안 든다 — 요약만 runnable=false 이고 셀 일은 돈다."""
+    lim = _lim(1_048_576, 1_000)
+    assert lim["runnable"]["summary"] is False
+    assert all(lim["runnable"][k] for k in cr.CELL_KINDS) and "ctx_too_small" not in lim
+    assert lim["summary"]["cover_max"] == 1, "보고하는 cover_max 는 1 아래로 내려가지 않는다(식의 max(1, …))"
+
+
+def test_ctx_too_small_은_셀_종류만_말한다():
+    lim = _lim(8_192)
+    assert "ctx_too_small" in lim
+    named = lim["ctx_too_small"]["message"].split("카드 대조(")[1].split(")")[0].split("·")
+    assert set(named) <= set(cr.CELL_KINDS) and named, named
+
+
+def test_검색_기한_손잡이():
+    assert cr.search_timeout_s({}) == 60.0
+    assert cr.search_timeout_s({"CARD_REVIEW_SEARCH_TIMEOUT_S": "15"}) == 15.0
+    for bad in ("0", "-3", "육십"):
+        assert cr.search_timeout_s({"CARD_REVIEW_SEARCH_TIMEOUT_S": bad}) == 60.0
+    a = _lim(1_048_576, env={"CARD_REVIEW_SEARCH_TIMEOUT_S": "15"})
+    assert a["search"] == {"timeout_s": 15.0} and a["limits_rev"] == _lim(1_048_576)["limits_rev"], (
+        "검색 기한은 시간 손잡이다 — 예산의 모양이 아니라 판에 들지 않는다")
+
+
+def test_새_종류의_몫_손잡이():
+    base = _lim(1_048_576)
+    assert _lim(1_048_576, env={"CARD_REVIEW_SHARE_NOINPUT": "0.4"})["noinput"]["p"] > base["noinput"]["p"]
+    assert _lim(1_048_576, env={"CARD_REVIEW_SHARE_SUMMARY": "0.2"})["summary"]["p"] < base["summary"]["p"]
 
 
 # ── plan() ──────────────────────────────────────────────────────────────────

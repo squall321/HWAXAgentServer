@@ -50,39 +50,62 @@ from evidence import _NUM_TOK_RE, sig_numbers
 from review_gate import Busy
 
 # ── 판 번호 ──────────────────────────────────────────────────────────────────
-API_REV = "cr-1"
-KINDS = ("sweep", "verdict", "offcard")
-# 예산 식의 판. 식을 바꾸면 손으로 올린다(limits_rev 에 들어간다).
-LIMITS_FORMULA_REV = "cr-l1"
+API_REV = "cr-1"                  # M3 도 cr-1 그대로다 — 더하기만 하므로 앱은 kinds 에 그 종류가 있는지로 가른다(M3.md #58)
+KINDS = ("sweep", "verdict", "offcard", "noinput", "summary")
+# 셀 일을 하는 종류 — ctx_too_small 은 이것들만 본다. summary 만 못 도는 박스는 runnable.summary=false 로만 알리고 셀 일을
+# 멈추지 않는다(앱이 그 박스에서 요약을 코드 조립본으로 낸다 — M3.md 4.3).
+CELL_KINDS = ("sweep", "verdict", "offcard", "noinput")
+# 예산 식의 판. 식을 바꾸면 손으로 올린다(limits_rev 에 들어간다). cr-l2 = M3(종류 다섯·verdict 메커니즘 몫·긴 문서 몫).
+LIMITS_FORMULA_REV = "cr-l2"
 
 # ── 예산 손잡이(전부 선택 — 안 적으면 기본값) ─────────────────────────────────
 K_DEFAULT = 8                     # CARD_REVIEW_K — verdict 한 호출의 카드 장수 상한(M0-b 로 다시 정한다)
-SHARE_DEFAULT = {"verdict": 0.25, "sweep": 0.50, "offcard": 0.30}   # 종류별 몫 — 넘으면 거절이 아니라 soft_over
+# 종류별 몫 — 넘으면 거절이 아니라 soft_over
+SHARE_DEFAULT = {"verdict": 0.25, "sweep": 0.50, "offcard": 0.30, "noinput": 0.30, "summary": 0.50}
 _SHARE_ENV = {"verdict": "CARD_REVIEW_SHARE_VERDICT", "sweep": "CARD_REVIEW_SHARE_SWEEP",
-              "offcard": "CARD_REVIEW_SHARE_OFFCARD"}
+              "offcard": "CARD_REVIEW_SHARE_OFFCARD", "noinput": "CARD_REVIEW_SHARE_NOINPUT",
+              "summary": "CARD_REVIEW_SHARE_SUMMARY"}
+# 카드 대조 호출만의 출력 상한(토큰). 0 이면 심의 LLM 의 DELIB_MAX_TOKENS 를 따른다. 심의의 상한을 올리면 의장·좌석 예산까지
+# 움직이므로 따로 둔다 — 이 값이 있으면 run 이 그 호출에만 llm.bind(max_tokens=…) 로 건다(심의 LLM 인스턴스를 바꾸지 않는다).
+# 큰 K(k_out)·요약의 꼭 다룰 행 수(cover_max)·입력 결손 영향 줄 수(items_max)는 이 상한에서 유도된다(M3.md #61·#62).
+MAX_TOKENS_ENV = "CARD_REVIEW_MAX_TOKENS"
+# 긴 문서 검색어 하나의 기한(초) — 검색어 셋은 동시에 돈다. 시간 한도 사슬(요청 최악)에 더해진다.
+SEARCH_TIMEOUT_DEFAULT = 60.0
+SEARCH_TIMEOUT_ENV = "CARD_REVIEW_SEARCH_TIMEOUT_S"
 
 # ── 예산 상수 ────────────────────────────────────────────────────────────────
 # 틀(시스템 글·지시·고정 머리)의 **선언한 여유값**(자). 실제 틀 길이를 재지 않는다 — 재면 틀 한 글자가 단위 상한·
 # limits_rev 를 흔들어 며칠짜리 실행의 열린 셀을 무른다(P-06). 시험이 '실제 틀 ≤ 여유값' 을 못박는다.
-TEMPLATE_ALLOW = {"sweep": 2_400, "verdict": 3_200, "offcard": 3_600}
+TEMPLATE_ALLOW = {"sweep": 2_400, "verdict": 3_200, "offcard": 3_600, "noinput": 3_600, "summary": 2_800}
 # 몫이 작은 창에서 P 의 바닥(틀 + 이만큼의 본문). 품질 몫과 창 한도 사이의 절벽을 없앤다(P-16).
-BODY_MIN = {"sweep": 20_000, "verdict": 16_000, "offcard": 16_000}
+BODY_MIN = {"sweep": 20_000, "verdict": 16_000, "offcard": 16_000, "noinput": 16_000, "summary": 16_000}
 # 프롬프트 몫(P) 가운데 각 블록에 떼어 두는 비율 — 고정 천장 대신 창에서 유도한다(PLAN 4절, C-17·C-32).
-#   role 역할 원문 · digest 배경 카드 제목 · domains 영역 코드 · known 이미 낸 판정 · mech 메커니즘 목록
+#   role 역할 원문 · digest 배경 카드 제목 · domains 영역 코드 · known 이미 낸 판정 · mech 메커니즘 목록 ·
+#   missing 훑기의 전문가 단위 결측(cr-sweep-2) · blocks 요약의 집계 블록
 _BLOCK_SHARE = {
-    "sweep": {"role": 0.10, "domains": 0.05},
-    "verdict": {"role": 0.10, "digest": 0.05},
+    "sweep": {"role": 0.10, "domains": 0.05, "missing": 0.01},
+    "verdict": {"role": 0.10, "digest": 0.05, "mech": 0.05},
     "offcard": {"role": 0.10, "digest": 0.05, "known": 0.05, "mech": 0.05, "domains": 0.05},
+    "noinput": {"role": 0.10, "digest": 0.05, "known": 0.05, "mech": 0.05},
+    "summary": {"blocks": 0.10},
 }
+# 카드 밖 호출의 긴 문서 발췌 몫 — P 의 25%. 블록 몫(고정)이 아니라 **본문에서** 쓴다(단위가 쓰고 남은 자리를 발췌가 먼저,
+# 그다음 배경 카드). 검색은 카드 0장 전문가만 하므로(M3.md #38) 고정 몫으로 떼면 카드가 있는 전문가 전원의 배경 카드 자리가
+# 줄어든다. 본문 안이라 P 를 넘지 않는다.
+LONGDOC_SHARE = 0.25
 # 보충 호출의 지적 블록 몫 — P 의 2%, 바닥 600자(좁은 창에서도 빠진 별칭 목록이 들어가게).
 HINT_SHARE, HINT_FLOOR = 0.02, 600
 VERDICT_UNIT_SHARE = 0.47         # verdict 본문 가운데 단위 몫(나머지는 카드 묶음)
 SWEEP_PAGE_SHARE = 0.20           # sweep 본문 가운데 단위 목록 한 쪽의 몫
 OUT_USE = 0.6                     # 출력 몫 가운데 행에 쓰는 비율(추론 토큰 여유)
-ROW_CHARS = {"verdict": 520, "sweep": 150, "offcard": 600}   # 행 한 줄의 글자 어림
-# 출력의 행 말고 드는 몫 어림(sweep 의 h 줄·inj 줄, offcard 의 m·more·none·h·need 줄). 행 한 줄의 글자 어림과 함께
-# 지시의 길이 안내(verdict why 200자·sweep why 80자)에 맞춘 값이다 — 안내를 바꾸면 이 값들도 본다.
-SWEEP_OUT_HEAD, OFFCARD_OUT_HEAD = 400, 1_400
+# 행 한 줄의 글자 어림. summary 는 줄 하나의 상한(line_max)이기도 하다 — 앱이 행 한 줄을 이 안으로 만들고 지시가 출력 줄을
+# 이 안으로 쓰게 한다.
+ROW_CHARS = {"verdict": 520, "sweep": 150, "offcard": 600, "noinput": 600, "summary": 400}
+# 출력의 행 말고 드는 몫 어림(sweep 의 h 줄·inj 줄, offcard 의 m·more·none·h·need 줄, noinput 의 q2·more 줄, summary 의
+# head 줄). 행 한 줄의 글자 어림과 함께 지시의 길이 안내(verdict why 200자·sweep why 80자)에 맞춘 값이다 — 안내를 바꾸면
+# 이 값들도 본다.
+SWEEP_OUT_HEAD, OFFCARD_OUT_HEAD, NOINPUT_OUT_HEAD, SUMMARY_HEAD = 400, 1_400, 800, 300
+NARRATIVE_SHARE = 0.25            # 요약 출력의 행 몫 가운데 서술 문단(para)의 몫 — 나머지가 꼭 다룰 행(risk·conflict) 줄이다
 MANIFEST_ITEM_FLOOR = 800         # 목록 항목 상한의 바닥(쪽당 단위가 많아도 항목 하나는 이만큼 싣는다)
 # 이 박스에서 그 종류를 돌릴 수 있다고 볼 본문 바닥(자). 단위·카드·목록 쪽이 이보다 작으면 ctx_too_small 이다 —
 # 다시 쪼개지 않는다(D-22). 천장이 아니라 '이것도 안 들어가면 돌리지 않는다' 의 바닥이다.
@@ -95,10 +118,11 @@ _NEED_CTX_MAX = 1 << 30           # ctx_too_small 의 need_ctx_tokens 를 찾는
 # 값으로 따로 든다. 손으로 올리는 LIMITS_FORMULA_REV 에만 맡기면 상수만 고친 배포에서 판은 같은데 실효 K·단위 상한이 바뀌어,
 # 앱이 얼린 계획이 같은 판 아래 deck_too_large·over_budget 이 됐다. 예산 식(_budget·_need_ctx·limits·plan·unit_size)이 읽는
 # 모듈 상수를 더하면 여기에도 더한다 — 시험이 둘을 대조한다.
-LIMITS_CONSTANTS = ("LIMITS_FORMULA_REV", "TEMPLATE_ALLOW", "BODY_MIN", "_BLOCK_SHARE", "HINT_SHARE", "HINT_FLOOR",
-                    "VERDICT_UNIT_SHARE", "SWEEP_PAGE_SHARE", "OUT_USE", "ROW_CHARS", "SWEEP_OUT_HEAD",
-                    "OFFCARD_OUT_HEAD", "MANIFEST_ITEM_FLOOR", "RUN_FLOOR", "UNIT_SIZE", "MANIFEST_ITEM_OVERHEAD",
-                    "_NEED_CTX_MAX", "_NO_CARDS", "_EVID_KO_CPT", "_PRE_SAFETY", "_CHAIR_RESERVE")
+LIMITS_CONSTANTS = ("LIMITS_FORMULA_REV", "TEMPLATE_ALLOW", "BODY_MIN", "_BLOCK_SHARE", "LONGDOC_SHARE", "HINT_SHARE",
+                    "HINT_FLOOR", "VERDICT_UNIT_SHARE", "SWEEP_PAGE_SHARE", "OUT_USE", "ROW_CHARS", "SWEEP_OUT_HEAD",
+                    "OFFCARD_OUT_HEAD", "NOINPUT_OUT_HEAD", "SUMMARY_HEAD", "NARRATIVE_SHARE", "MANIFEST_ITEM_FLOOR",
+                    "RUN_FLOOR", "UNIT_SIZE", "MANIFEST_ITEM_OVERHEAD", "_NEED_CTX_MAX", "_NO_CARDS", "_EVID_KO_CPT",
+                    "_PRE_SAFETY", "_CHAIR_RESERVE")
 
 
 def _limits_constants() -> list:
@@ -114,6 +138,50 @@ def _knob_k(env) -> int:
     except ValueError:
         print(f"[card_review] env CARD_REVIEW_K='{raw}' 정수 파싱 실패 — 기본값 {K_DEFAULT} 사용")
         return K_DEFAULT
+
+
+def knob_max_tokens(env=os.environ) -> int:
+    """CARD_REVIEW_MAX_TOKENS — 카드 대조 호출만의 출력 상한(토큰). 비거나 0 이면 0(= 심의 LLM 의 상한을 따른다). 못 읽거나
+    음수면 경고하고 0 이다(기동을 죽이지 않는다)."""
+    raw = str(env.get(MAX_TOKENS_ENV) or "").strip()
+    if not raw:
+        return 0
+    try:
+        v = int(raw)
+    except ValueError:
+        print(f"[card_review] env {MAX_TOKENS_ENV}='{raw[:40]}' 정수 파싱 실패 — 0(심의 LLM 의 상한을 따른다)으로 읽는다")
+        return 0
+    if v < 0:
+        print(f"[card_review] env {MAX_TOKENS_ENV}={v} 는 음수다 — 0(심의 LLM 의 상한을 따른다)으로 읽는다")
+        return 0
+    return v
+
+
+def resolve_max_tokens(delib_mt, env=os.environ) -> tuple[int, str]:
+    """카드 대조 예산의 출력 상한과 그 출처 — (토큰, card_review·delib·none). CARD_REVIEW_MAX_TOKENS 가 있으면 그것, 없으면 심의
+    LLM 의 max_tokens(DELIB_MAX_TOKENS), 둘 다 없으면 0(미설정 — 예산은 창의 1/4 또는 _CHAIR_RESERVE 를 가정한다)."""
+    own = knob_max_tokens(env)
+    if own > 0:
+        return own, "card_review"
+    if isinstance(delib_mt, int) and not isinstance(delib_mt, bool) and delib_mt > 0:
+        return delib_mt, "delib"
+    return 0, "none"
+
+
+def search_timeout_s(env=os.environ) -> float:
+    """CARD_REVIEW_SEARCH_TIMEOUT_S — 긴 문서 검색어 하나의 기한(초). 못 읽거나 0 이하면 기본값(검색을 기한 없이 두지 않는다)."""
+    raw = str(env.get(SEARCH_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return SEARCH_TIMEOUT_DEFAULT
+    try:
+        v = float(raw)
+    except ValueError:
+        print(f"[card_review] env {SEARCH_TIMEOUT_ENV}='{raw[:40]}' 숫자 파싱 실패 — 기본값 {SEARCH_TIMEOUT_DEFAULT:g} 사용")
+        return SEARCH_TIMEOUT_DEFAULT
+    if not v > 0:
+        print(f"[card_review] env {SEARCH_TIMEOUT_ENV}={raw} 는 0 이하다 — 기본값 {SEARCH_TIMEOUT_DEFAULT:g} 사용")
+        return SEARCH_TIMEOUT_DEFAULT
+    return v
 
 
 def _knob_shares(env) -> dict:
@@ -133,11 +201,12 @@ def _knob_shares(env) -> dict:
     return out
 
 
-def _budget(ctx: int, mt: int, k_knob: int, shares: dict) -> dict:
+def _budget(ctx: int, mt: int, k_knob: int, shares: dict, retries: int = 2) -> dict:
     """창(토큰)·출력 상한(토큰, 0=미설정)에서 종류별 예산(자)을 유도한다 — 순수. limits() 와 need_ctx 찾기가 같이 쓴다.
 
     본문(body)은 P 에 대해 줄지 않는 한 식으로 잡는다(블록 몫을 하나씩 내림하면 P 가 1 늘 때 본문이 1~2자 줄 수 있다 —
-    창이 커지면 단위 상한이 줄지 않는다는 단조성이 깨진다)."""
+    창이 커지면 단위 상한이 줄지 않는다는 단조성이 깨진다). retries 는 보충 횟수(CARD_REVIEW_PARSE_RETRIES)다 — 요약의
+    cover_hard_max(= cover_max × 시도 수)에만 든다."""
     ctx = max(0, int(ctx))
     mt = max(0, int(mt or 0))
     out_t = max(mt, min(_CHAIR_RESERVE, ctx // 4))
@@ -154,7 +223,7 @@ def _budget(ctx: int, mt: int, k_knob: int, shares: dict) -> dict:
         body = max(0, int(min(p * (1 - frac) - HINT_FLOOR, p * (1 - frac - HINT_SHARE))) - TEMPLATE_ALLOW[kind])
         fixed = p - body if body else TEMPLATE_ALLOW[kind] + sum(caps.values()) + hint
         b[kind] = {"p": p, "p_soft": p_soft, "fixed": fixed, "body": body, **caps, "hint_max": hint}
-    v, s, o = b["verdict"], b["sweep"], b["offcard"]
+    v, s, o, n, su = b["verdict"], b["sweep"], b["offcard"], b["noinput"], b["summary"]
     v["unit_body_max"] = int(v["body"] * VERDICT_UNIT_SHARE)
     v["card_budget"] = v["body"] - v["unit_body_max"]
     v["k_out"] = int(rows_out // ROW_CHARS["verdict"])
@@ -164,27 +233,45 @@ def _budget(ctx: int, mt: int, k_knob: int, shares: dict) -> dict:
     s["units_per_page_max"] = max(1, int((rows_out - SWEEP_OUT_HEAD) // ROW_CHARS["sweep"]))
     s["manifest_item_max"] = max(MANIFEST_ITEM_FLOOR, s["manifest_page_max"] // s["units_per_page_max"])
     o["findings_max"] = max(1, int((rows_out - OFFCARD_OUT_HEAD) // ROW_CHARS["offcard"]))
-    # 카드 밖 호출은 배경 카드를 제목으로 내릴 수 있어(bg_dropped) 본문 전부를 단위에 줄 수 있다.
-    # 그래서 단위 상한은 verdict 몫과 offcard 본문 가운데 작은 쪽이다(P-02 덧붙임 — 단위를 싣는 종류마다 BODY ≥ 상한).
+    o["longdoc_max"] = int(o["p"] * LONGDOC_SHARE)
+    n["items_max"] = max(1, int((rows_out - NOINPUT_OUT_HEAD) // ROW_CHARS["noinput"]))
+    # 카드 밖·입력 결손 호출은 카드를 제목으로 내릴 수 있어(bg_dropped) 본문 전부를 단위에 줄 수 있다. 그래서 단위 상한은
+    # verdict 몫과 두 본문 가운데 작은 쪽이다(P-02 덧붙임 — 단위를 싣는 종류마다 BODY ≥ 상한).
     o["unit_body_max"] = o["body"]
-    b["unit_body_max"] = min(v["unit_body_max"], o["body"])
+    n["unit_body_max"] = n["body"]
+    b["unit_body_max"] = min(v["unit_body_max"], o["body"], n["body"])
     o["card_budget"] = max(0, o["body"] - b["unit_body_max"])
+    n["card_budget"] = max(0, n["body"] - b["unit_body_max"])
+    # 요약 — 출력의 행 몫을 서술 문단(narrative)과 꼭 다룰 행 줄로 나눈다. 꼭 다룰 행 수는 출력에서만 유도한다(낮은 고정 천장
+    # 없음). cover_hard_max 는 시도 수만큼이다 — 앱은 cover_max 안에서 고르고, 넘으면 엔진이 422 cover_too_large 로 막는다.
+    su["line_max"] = ROW_CHARS["summary"]
+    su["narrative_max"] = int(rows_out * NARRATIVE_SHARE)
+    cover_raw = int((rows_out - su["narrative_max"] - SUMMARY_HEAD) // ROW_CHARS["summary"])
+    su["cover_max"] = max(1, cover_raw)
+    su["cover_hard_max"] = su["cover_max"] * (1 + max(0, int(retries)))
     b["runnable"] = {
         "sweep": s["card_budget"] >= RUN_FLOOR and s["manifest_page_max"] >= s["manifest_item_max"],
         "verdict": v["unit_body_max"] >= RUN_FLOOR and v["card_budget"] >= RUN_FLOOR,
         "offcard": o["body"] >= RUN_FLOOR,
+        "noinput": n["body"] >= RUN_FLOOR,
+        "summary": su["body"] >= RUN_FLOOR and cover_raw >= 1,
     }
     return b
 
 
+def _cells_runnable(b: dict) -> bool:
+    """셀 일을 하는 종류(CELL_KINDS)가 다 돌 수 있나 — ctx_too_small 의 판정이다(summary 는 들지 않는다)."""
+    return all(b["runnable"][k] for k in CELL_KINDS)
+
+
 def _need_ctx(ctx: int, mt: int, k_knob: int, shares: dict) -> int | None:
-    """세 종류가 다 돌 수 있는 가장 작은 창(토큰). 예산은 창에 대해 줄지 않으므로 이분 탐색이다. 위 끝에서도 안 되면 None."""
-    if not all(_budget(_NEED_CTX_MAX, mt, k_knob, shares)["runnable"].values()):
+    """셀 일의 종류가 다 돌 수 있는 가장 작은 창(토큰). 예산은 창에 대해 줄지 않으므로 이분 탐색이다. 위 끝에서도 안 되면 None."""
+    if not _cells_runnable(_budget(_NEED_CTX_MAX, mt, k_knob, shares)):
         return None
     lo, hi = max(1, ctx), _NEED_CTX_MAX
     while lo < hi:
         mid = (lo + hi) // 2
-        if all(_budget(mid, mt, k_knob, shares)["runnable"].values()):
+        if _cells_runnable(_budget(mid, mt, k_knob, shares)):
             hi = mid
         else:
             lo = mid + 1
@@ -192,41 +279,52 @@ def _need_ctx(ctx: int, mt: int, k_knob: int, shares: dict) -> int | None:
 
 
 def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying: bool = False,
-           env=os.environ, model: str = "") -> dict:
+           env=os.environ, model: str = "", max_tokens_source: str | None = None) -> dict:
     """이 박스에서 한 호출에 무엇을 얼마나 실을 수 있나 — `GET /card-review/limits` 의 본문(관문 칸 `gate` 는 라우트가 더한다).
 
     순수 함수다 — 창은 부르는 쪽이 `app._model_context_state()` 로 물어 넘긴다(그 조회는 동기 httpx 라 라우트가
     asyncio.to_thread 로 돈다 — P-10). 낮은 고정 천장이 없다 — 역할·제목 목록·이미 낸 판정·메커니즘·영역 목록은
-    P 의 몫, 행 수는 출력 몫에서 유도한다. 창이 모자라면 다시 쪼개지 않고 `ctx_too_small` 을 싣는다(D-22)."""
+    P 의 몫, 행 수는 출력 몫에서 유도한다. 창이 모자라면 다시 쪼개지 않고 `ctx_too_small` 을 싣는다(D-22) — 셀 일의 종류
+    (CELL_KINDS)만 본다. max_tokens 는 resolve_max_tokens() 가 고른 출력 상한이고 max_tokens_source 가 그 출처다(안 주면
+    상한이 있으면 delib, 없으면 none)."""
     k_knob, shares = _knob_k(env), _knob_shares(env)
-    b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares)
-    v, s, o = b["verdict"], b["sweep"], b["offcard"]
+    b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares, _parse_retries(env))
+    v, s, o, n, su = b["verdict"], b["sweep"], b["offcard"], b["noinput"], b["summary"]
     rev_src = {"ctx": b["ctx"], "out": b["out"], "mt": b["mt"], "k": k_knob, "share": shares,
                "const": _limits_constants()}
     out = {
-        "api_rev": API_REV, "kinds": list(KINDS), "model": model,
+        "api_rev": API_REV, "kinds": list(KINDS), "cell_kinds": list(CELL_KINDS), "model": model,
         "ctx_tokens": b["ctx"], "ctx_source": ctx_source, "ctx_retrying": bool(retrying),
-        "llm_max_tokens": b["mt"] or None, "out_tokens": b["out"], "p_hard": b["p_hard"],
+        "llm_max_tokens": b["mt"] or None,
+        "max_tokens_source": max_tokens_source or ("delib" if b["mt"] else "none"),
+        "out_tokens": b["out"], "p_hard": b["p_hard"],
         "unit_body_max": b["unit_body_max"],
-        "verdict": {k: v[k] for k in ("p", "fixed", "body", "role_max", "digest_max", "hint_max",
+        "verdict": {k: v[k] for k in ("p", "fixed", "body", "role_max", "digest_max", "mech_max", "hint_max",
                                       "unit_body_max", "card_budget", "k", "k_out")},
-        "sweep": {k: s[k] for k in ("p", "fixed", "body", "role_max", "domains_max", "hint_max",
+        "sweep": {k: s[k] for k in ("p", "fixed", "body", "role_max", "domains_max", "missing_max", "hint_max",
                                     "manifest_page_max", "card_budget", "units_per_page_max", "manifest_item_max")},
         "offcard": {k: o[k] for k in ("p", "fixed", "body", "role_max", "digest_max", "known_max", "mech_max",
-                                      "domains_max", "hint_max", "unit_body_max", "card_budget", "findings_max")},
+                                      "domains_max", "hint_max", "unit_body_max", "card_budget", "findings_max",
+                                      "longdoc_max")},
+        "noinput": {k: n[k] for k in ("p", "fixed", "body", "role_max", "digest_max", "known_max", "mech_max",
+                                      "hint_max", "unit_body_max", "card_budget", "items_max")},
+        "summary": {k: su[k] for k in ("p", "fixed", "body", "hint_max", "blocks_max", "line_max", "narrative_max",
+                                       "cover_max", "cover_hard_max")},
         "runnable": dict(b["runnable"]),
+        "search": {"timeout_s": search_timeout_s(env)},
         "unit_size": dict(UNIT_SIZE), "manifest_item": {"overhead": MANIFEST_ITEM_OVERHEAD},
         "prompt_rev": dict(PROMPT_REV), "norm_rev": NORM_REV,
         "limits_rev": hashlib.sha256(json.dumps(rev_src, sort_keys=True).encode()).hexdigest()[:8],
     }
-    if not all(b["runnable"].values()):
+    if not _cells_runnable(b):
         need = _need_ctx(b["ctx"], b["mt"], k_knob, shares)
-        short = [k for k in KINDS if not b["runnable"][k]]
+        short = [k for k in CELL_KINDS if not b["runnable"][k]]
         out["ctx_too_small"] = {
             "need_ctx_tokens": need,
             "message": (f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
                         "쪼개지 않는다. " + (f"창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
-                                          if need else "출력 상한(DELIB_MAX_TOKENS)이 창보다 크다 — 그 값을 줄여라.")),
+                                          if need else "출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 "
+                                          "크다 — 그 값을 줄여라.")),
         }
     return out
 
@@ -516,7 +614,7 @@ def pack_hash(agent_key: str, role_hash: str, cards: list) -> str:
 # ── 요청 → 별칭 표(순수) ──────────────────────────────────────────────────────
 # 모델은 카드를 K, 줄을 L, 단위를 U 번호로만 부른다. 이 표가 그 닫힌 집합이고, 프롬프트 렌더(build_prompt)와 출력 검사
 # (check_rows)가 같은 표를 쓴다 — 렌더한 번호와 되돌리는 번호가 어긋날 길이 없다.
-UNSUPPORTED_KINDS = ("noinput", "cross")             # 설계서의 다섯 종류 가운데 M2 에 없는 둘(M3·M4)
+UNSUPPORTED_KINDS = ("cross", "hunt")                # 2차 영향(cross)·결손 사냥(hunt)은 M4 다(M3.md 4.1)
 _UNIT_KINDS_UNSUPPORTED = ("snap_unit", "excluded")   # 현황 단위 틀은 M4(P-01), 제외 단위는 부를 일이 없다
 
 
@@ -545,7 +643,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
     check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
-        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다")
+        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 받는다")
     if kind not in KINDS:
         raise RequestError("bad_request", f"모르는 호출 종류 '{kind}'")
     variant = req.get("variant")
@@ -1306,7 +1404,11 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
 # 모든 프롬프트가 한 자리(_assemble)를 지나 창 한도(P_hard)를 호출 **전에** 견준다 — 넘으면 LLM 을 부르지 않고 거절한다
 # (조용히 줄이지 않는다). 틀은 손으로 올리는 판 번호(PROMPT_REV)가 정본이고, 틀 글의 sha 는 '판을 안 올리고 글을 바꿨다'
 # 를 잡는 시험에만 쓴다(P-06④). 틀 길이는 TEMPLATE_ALLOW 안이어야 한다(시험이 못박는다 — 예산이 틀을 재지 않으므로).
-PROMPT_REV = {"sweep": "cr-sweep-1", "verdict": "cr-verdict-1", "offcard": "cr-offcard-1"}
+# M3 의 판 다섯은 한 판에 모아 올린다(M3.md #37) — 셀 지문이 판을 잇으므로 판 하나를 따로 올리면 도는 셀이 처음부터 돈다.
+#   sweep cr-sweep-2(결측 블록) · verdict cr-verdict-2(메커니즘 mech) · offcard cr-offcard-2(긴 문서 발췌 D) ·
+#   noinput cr-noinput-1(입력 결손 두 질문) · summary cr-summary-1(영역 요약·과제 종합의 서술)
+PROMPT_REV = {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2", "noinput": "cr-noinput-1",
+              "summary": "cr-summary-1"}
 
 _SYSTEM = (
     "당신은 사내 전문가 '{key}' 한 명입니다. 회의가 아니라 단독 검토입니다 — 다른 전문가의 의견을 보지 못하고 도구도 쓸 수 "
@@ -1942,7 +2044,7 @@ def prepare(req: dict, lim: dict) -> dict:
     check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
-        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다")
+        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 받는다")
     if kind not in KINDS:
         raise RequestError("bad_request", f"모르는 호출 종류 '{kind}'")
     exp = req.get("expect") if isinstance(req.get("expect"), dict) else {}
@@ -2086,6 +2188,9 @@ async def run(app, prep: dict):
         return
 
     llm = getattr(app.state, "delib_llm", None)
+    # 카드 대조만의 출력 상한(CARD_REVIEW_MAX_TOKENS)은 이 호출에만 건다 — 심의 LLM 인스턴스는 그대로다(오류 분류는 원래 것으로).
+    own_mt = knob_max_tokens()
+    ask_llm = llm.bind(max_tokens=own_mt) if llm is not None and own_mt > 0 else llm
     attempts_max = 1 + _parse_retries()
     hb = float(DELIB_HEARTBEAT_S)
     system, human0 = prep["system"], prep["human"]
@@ -2124,7 +2229,7 @@ async def run(app, prep: dict):
                     repair_error = {"code": exc.code, "attempt": n, "message": exc.message}
                     break
             yield frame("status", {"step": "attempt", "n": n})
-            task = asyncio.ensure_future(_ask(llm, system, human))
+            task = asyncio.ensure_future(_ask(ask_llm, system, human))
             st["launched"] += 1
             t1 = time.monotonic()
             try:
@@ -2409,14 +2514,15 @@ FEATURE = "feat:deliberation"
 
 
 async def limits_now(app) -> dict:
-    """이 박스의 지금 예산 — 창은 app._model_context_state()(동기 httpx 라 스레드에서 — P-10), 출력 상한은 delib_llm 의
-    max_tokens(DELIB_MAX_TOKENS), 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다)."""
+    """이 박스의 지금 예산 — 창은 app._model_context_state()(동기 httpx 라 스레드에서 — P-10), 출력 상한은
+    CARD_REVIEW_MAX_TOKENS 가 있으면 그것, 없으면 delib_llm 의 max_tokens(DELIB_MAX_TOKENS)이고 출처를 max_tokens_source 에
+    싣는다. 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다)."""
     import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
 
     state = await asyncio.to_thread(_a._model_context_state)
-    mt = getattr(getattr(app.state, "delib_llm", None), "max_tokens", None)
-    lim = limits(state["tokens"], state["source"], mt if isinstance(mt, int) and not isinstance(mt, bool) else 0,
-                 retrying=state["retrying"], model=_a.VLLM_MODEL)
+    mt, src = resolve_max_tokens(getattr(getattr(app.state, "delib_llm", None), "max_tokens", None))
+    lim = limits(state["tokens"], state["source"], mt, retrying=state["retrying"], model=_a.VLLM_MODEL,
+                 max_tokens_source=src)
     snap = gate_of(app).snapshot()
     lim["gate"] = {k: snap[k] for k in ("limit", "limit_reason", "active")}
     return lim
