@@ -513,3 +513,23 @@ def test_until_idle_도_시계가_뒤로_가면_남은_수명을_믿지_않는�
     assert d.snapshot()["on"] is True
     clock["t"] -= 86_400
     assert d.snapshot()["on"] is False
+
+
+def test_idle_since_를_못_써도_grace_는_한_번만_선다(tmp_path, monkeypatch):
+    """RB3C-9 — 쓸 수 없는 디렉터리에서 idle_since 를 못 쓰면 읽을 때마다 '지금' 으로 다시 서서 grace 가 끝나지 않고 깃발이
+    max_s(46,800초)까지 섰다. 못 쓴 grace 시계는 기억해 다음 읽기에 쓴다."""
+    d, clock, load = _drain(tmp_path, delib=(1, 0))
+    d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 100, "max_s": 46_800})
+
+    def deny(_st):
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr(d, "_write", deny)
+        load["v"] = (0, 0)
+        t0 = clock["t"]
+        for dt in (0, 50, 99):
+            clock["t"] = t0 + dt
+            assert d.snapshot()["on"] is True
+        clock["t"] = t0 + 100
+        assert d.snapshot()["on"] is False, "못 쓴 grace 시계가 읽을 때마다 다시 섰다"

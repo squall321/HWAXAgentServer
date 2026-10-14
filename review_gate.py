@@ -287,6 +287,7 @@ class DrainState:
         self.delib_load = delib_load
         self._lock = _lock_for(path)
         self._said: dict = {}
+        self._idle: tuple | None = None   # (until_idle 를 세운 때, idle_since) — 파일에 못 쓴 grace 시계를 기억한다(RB3C-9)
 
     def _say(self, key: str, msg: str) -> None:
         """같은 사유의 경고는 _LOG_EVERY_S 마다 한 번 — 읽을 수 없는 파일(EACCES)이 /health 마다 한 줄씩 쌓이지 않게."""
@@ -344,8 +345,9 @@ class DrainState:
 
     def _keep(self, st: dict) -> None:
         """읽는 길에서 고친 until_idle.idle_since 를 파일에 적는다. 못 쓰면(디스크 가득·권한) 한 줄 남기고 깃발은 그대로 산다 —
-        쓰기 실패를 판정 실패로 받아 살아 있는 깃발을 지우거나 꺼짐으로 읽던 것(RB3B-7, 앱이 grace 동안 패널을 집었다). 못 쓰는
-        동안은 grace 시계가 파일에 서지 않아 깃발이 max_s 까지 갈 수 있다(비우는 쪽으로 틀린다)."""
+        쓰기 실패를 판정 실패로 받아 살아 있는 깃발을 지우거나 꺼짐으로 읽던 것(RB3B-7, 앱이 grace 동안 패널을 집었다). 못 쓴
+        grace 시계는 이 프로세스가 기억해(_idle) 다음 읽기에 쓴다 — 읽을 때마다 '지금' 으로 다시 서면 grace 가 끝나지 않아 깃발이
+        max_s 까지 갔다(RB3C-9). 재기동하면 잊는다(그때 grace 가 다시 선다 — 비우는 쪽으로 틀린다)."""
         try:
             self._write(st)
         except OSError as exc:
@@ -372,18 +374,22 @@ class DrainState:
         ui = st.get("until_idle")
         if ui is not None:
             any_life = True
-            cap = float(st.get("set_idle_at") or st.get("set_at") or now) + float(ui["max_s"])
+            set_idle = float(st.get("set_idle_at") or st.get("set_at") or now)
+            cap = set_idle + float(ui["max_s"])
             if now < cap and cap - now <= float(ui["max_s"]):
                 n = self._delib_sum()
                 if n is None or n > 0:
+                    self._idle = (set_idle, None)
                     if ui.get("idle_since") is not None:
                         ui["idle_since"] = None
                         self._keep(st)
                     alive = True
                 else:
                     if ui.get("idle_since") is None:
-                        ui["idle_since"] = now
+                        mem = self._idle
+                        ui["idle_since"] = mem[1] if mem and mem[0] == set_idle and mem[1] is not None else now
                         self._keep(st)
+                    self._idle = (set_idle, float(ui["idle_since"]))
                     if now < float(ui["idle_since"]) + float(ui["grace_s"]):
                         alive = True
         if not any_life:
