@@ -490,6 +490,22 @@ def test_결측_훑기는_결측_블록을_싣고_판이_cr_sweep_2_다():
     assert {r["rel"] for r in res["rows"]} == {"maybe"} and all("결측" in r["why"] for r in res["rows"])
 
 
+def test_메커니즘_세_갈래는_보충_없이_한_번에_끝난다():
+    """계약 예제 result_verdict_mech.json 의 장면 — WARNING 줄은 목록 코드, 목록 밖 코드는 free + mech_free(원래 값), FAIL
+    인데 빈 mech 는 checks.mech=missing 이고 quality.attempts 가 1 이다(보충하지 않는다)."""
+    pack = PACK
+    chk = [c for c in pack if c["checkable"]][:4]
+    mechs = [{"code": "mechanical.drop_stress", "label": "낙하 응력"}, {"code": "interface.seal_loss", "label": "실링"}]
+    prep = cr.prepare(_req("verdict", chk, _digest(pack, [c["alias"] for c in chk]), unit=_unit(0), variant="fwd",
+                           extra={"mechanisms": mechs}), LIM)
+    fr, llm, _ = _go(prep, ["mech_mix"])
+    res = _last(fr)[1]
+    assert res["quality"]["attempts"] == 1 and len(llm.calls) == 1 and res["meta"]["prompt_rev"] == "cr-verdict-2"
+    got = [(r["judgement"], r["mech"], r["mech_free"], r["checks"]["mech"]) for r in res["rows"]]
+    assert got[:3] == [("WARNING", "mechanical.drop_stress", "", "ok"), ("FAIL", "free", "not.in.taxonomy", "free"),
+                       ("FAIL", "", "", "missing")] and got[3][3] == "ok"
+
+
 def test_offcard_결과():
     fr, _llm, _ = _go(_offcard(), ["oracle"])
     res = _last(fr)[1]

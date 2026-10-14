@@ -117,6 +117,7 @@ def test_틀_길이는_여유값_안이다(kind, variant):
     if kind == "verdict":
         req["cards"] = [c for c in pack if c["checkable"]][: (1 if variant == "solo" else 8)]
         req["digest"] = _digest(pack, [c["alias"] for c in req["cards"]])
+        req["extra"] = {"mechanisms": MECHS}                      # 메커니즘 목록·규칙 줄까지 실은 가장 긴 틀
     elif kind == "sweep":
         req["unit"], req["cards"] = None, pack
         req["manifest"] = [{"unit_id": f"u-{i}", "kind": "bundle", "title": "t", "text": "x"} for i in range(100)]
@@ -616,3 +617,29 @@ def test_결측_블록은_몫을_넘으면_외_n건으로_말한다():
     many = [{"kind": "ecad", "note": f"영역 실마리 {i} — 회로 배치가 없다"} for i in range(30)]
     _, human, ctx = cr.build_prompt(_sweep_gaps_req(many), lim)
     assert ctx["sizes"]["missing"] <= lim["sweep"]["missing_max"] and "건(이 칸의 몫" in human
+
+
+# ── M3 E3-4 — 판정 틀의 메커니즘 목록(cr-verdict-2) ─────────────────────────────
+@pytest.mark.parametrize("variant", ["fwd", "rev", "solo"])
+def test_메커니즘_목록은_verdict_에_싣고_규칙_줄은_목록이_있을_때만이다(variant):
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    pack = _pack()
+    chk = [c for c in pack if c["checkable"]][: 1 if variant == "solo" else 3]
+    base = _req("verdict", chk, _digest(pack, [c["alias"] for c in chk]), unit=_unit(0), variant=variant)
+    _, plain, c0 = cr.build_prompt(base, lim)
+    _, with_m, c1 = cr.build_prompt({**base, "extra": {"mechanisms": MECHS}}, lim)
+    assert "[메커니즘 목록]" not in plain and cr._INSTR_VERDICT_MECH not in plain and c0["mechs"] == set()
+    assert "[메커니즘 목록]\nmech.code_00=메커니즘 이름 0 · " in with_m and cr._INSTR_VERDICT_MECH in with_m
+    assert with_m.index("[메커니즘 목록]") > with_m.index("[검토 단위") and with_m.index(cr._INSTR_VERDICT_MECH) > \
+        with_m.index("[지시]")
+    assert c1["mechs"] == {m["code"] for m in MECHS} and c1["sizes"]["mech"] <= lim["verdict"]["mech_max"]
+
+
+def test_메커니즘_목록은_몫을_넘으면_코드만_그래도_넘으면_표식과_끊는다():
+    lim = cr.limits(16_384, "server", 0, env={})
+    pack = _pack()
+    chk = [c for c in pack if c["checkable"]][:1]
+    req = _req("verdict", chk, [], unit=_unit(0), variant="fwd", extra={"mechanisms": MECHS * 3})
+    _, human, ctx = cr.build_prompt(req, lim)
+    assert ctx["sizes"]["mech"] <= lim["verdict"]["mech_max"] and "=" not in human.split("[메커니즘 목록]\n")[1].split(
+        "\n")[0], "몫을 넘으면 이름을 떼고 코드만 싣는다"

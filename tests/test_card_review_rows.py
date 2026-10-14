@@ -212,7 +212,47 @@ def test_정답은_전부_통과하고_별칭을_되돌린다():
     assert r["record_id"] == ctx["cards"][r["k"]]["record_id"] and r["card_id"]
     assert r["refs"] == ["c:ab12cd34ef56"] and r["from_attempt"] == 1
     assert r["checks"] == {"quote": "ok", "quote_sid": "1", "refs": "ok", "nums_unsourced": [], "need": "ok",
-                           "coerced": []}
+                           "coerced": [], "mech": "no_list"}
+
+
+# ── M3 E3-4 — 판정 틀의 메커니즘(cr-verdict-2) ─────────────────────────────────
+MECH_LIST = [{"code": "mechanical.drop_stress", "label": "낙하 응력"}, {"code": "interface.seal_loss", "label": "실링 상실"}]
+
+
+@pytest.mark.parametrize("variant", ["fwd", "rev", "solo"])
+def test_걸린_줄의_메커니즘은_목록_코드이고_목록_밖은_free_빈_칸은_표지만이다(variant):
+    """M3.md 4.4.3 · #30 — 모든 v 줄에 칸이 있고 WARNING·FAIL 에만 필수, 비어도 보충하지 않는다(표지 missing). 목록 밖 코드는
+    free + mech_free(원래 값). OK·na 줄은 비어도 된다. 변형과 상관없다."""
+    pack = _pack(n_checkable=4)
+    chk = [c for c in pack if c["checkable"]]
+    cards = chk[:1] if variant == "solo" else chk[:4]
+    ctx = _ctx(_req(variant=variant, cards=cards, extra={"mechanisms": MECH_LIST}))
+    a = ctx["judge"]
+    rows = [_good_v(ctx, a[0], mech="interface.seal_loss")]
+    if variant != "solo":
+        rows += [_good_v(ctx, a[1], judgement="FAIL", mech="thermal.not_listed"),
+                 _good_v(ctx, a[2], judgement="FAIL", mech=""),
+                 _good_v(ctx, a[3], judgement="OK", mech="")]
+    res = cr.check_rows("verdict", variant, cr.parse_rows(_jl(rows), "verdict")[0], ctx)
+    by = {r["k"]: r for r in res["rows"]}
+    assert (by[a[0]]["mech"], by[a[0]]["mech_free"], by[a[0]]["checks"]["mech"]) == ("interface.seal_loss", "", "ok")
+    if variant != "solo":
+        assert (by[a[1]]["mech"], by[a[1]]["mech_free"], by[a[1]]["checks"]["mech"]) == ("free", "thermal.not_listed", "free")
+        assert "mech:thermal.not_listed" in by[a[1]]["checks"]["coerced"]
+        assert (by[a[2]]["mech"], by[a[2]]["checks"]["mech"]) == ("", "missing")
+        assert by[a[3]]["checks"]["mech"] == "ok", "OK 줄의 빈 메커니즘은 문제가 아니다"
+        assert not res["repair"], "메커니즘이 빠졌다고 보충하지 않는다"
+        assert res["flagged"] == 2, "목록 밖(고친 값)과 빠진 메커니즘은 표지 행으로 센다"
+
+
+def test_메커니즘_목록_없이_온_판정은_칸을_비우고_no_list_다():
+    ctx = _ctx(_req())
+    a = ctx["judge"][0]
+    res = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="FAIL", mech="mechanical.x")]),
+                                                        "verdict")[0], ctx)
+    r = res["rows"][0]
+    assert (r["mech"], r["mech_free"], r["checks"]["mech"]) == ("", "mechanical.x", "no_list")
+    assert r["checks"]["coerced"] == [] and res["flagged"] == 0
 
 
 def test_실리지_않은_별칭과_배경_카드의_행은_버린다():

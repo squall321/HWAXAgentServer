@@ -750,7 +750,8 @@ _ROW_TYPES = {"sweep": ("u", "h", "inj"), "verdict": ("v", "c", "inj"),
 _LIST_FIELDS = {("verdict", "v"): ("l",), ("verdict", "c"): ("l",), ("sweep", "u"): ("k",),
                 ("offcard", "f"): ("l",), ("offcard", "m"): ("seen",), ("offcard", "h"): ("l",)}
 _STR_FIELDS = {
-    ("verdict", "v"): ("k", "applies", "judgement", "cq", "why", "need", "sev", "path", "check_kind", "check"),
+    ("verdict", "v"): ("k", "applies", "judgement", "cq", "why", "need", "sev", "path", "check_kind", "check", "mech",
+                       "mech_free"),
     ("verdict", "c"): ("cond", "met", "note"),
     ("sweep", "u"): ("u", "rel", "why"), ("sweep", "h"): ("u", "to", "why"),
     ("offcard", "f"): ("dir", "title", "mech", "mech_free", "path", "src", "q", "sev", "conf", "check_kind", "check"),
@@ -952,7 +953,7 @@ _CURLY = str.maketrans({"“": '"', "”": '"', "„": '"', "‟": '"',
                         "‘": "'", "’": "'", "‚": "'", "‛": "'"})
 # 검사 결과 가운데 '문제' 로 세는 것(행 하나의 문제 수 — 같은 별칭이 두 번이면 적은 쪽을 남긴다).
 _OK = {"quote": ("ok", ""), "refs": ("ok", ""), "need": ("ok", ""), "why": ("ok", ""), "src": ("ok", "exp", ""),
-       "to": ("ok", "")}
+       "to": ("ok", ""), "mech": ("ok", "free", "no_list", "")}
 
 
 def _nq(s) -> str:
@@ -1070,10 +1071,30 @@ def _check_v(row: dict, ctx: dict, attempt: int) -> dict:
     checks["nums_unsourced"] = nums_unsourced(row["why"], src)
     if (row["applies"] == "unknown" or row["judgement"] == "undetermined") and _subst(row["need"]) < NEED_SUBST_MIN:
         checks["need"] = "missing"
+    checks["mech"] = _check_mech(row, ctx, checks, required=row["judgement"] in ("WARNING", "FAIL"))
     if "_shape" in row:
         checks["shape"] = row.pop("_shape")
     return {**row, "record_id": card["record_id"], "card_id": card["card_id"], "from_attempt": attempt,
             "checks": checks}
+
+
+def _check_mech(row: dict, ctx: dict, checks: dict, *, required: bool) -> str:
+    """판정·영향 줄의 메커니즘(택소노미 1.2 — M3.md 4.4.3·#30). 목록 밖 코드는 free 로 고치고 원래 값을 mech_free 에 둔다
+    (coerced). 걸린 줄(required)인데 비었으면 'missing' — 표지만이다(보충 사유가 아니다. 앱이 미분류로 받는다). 메커니즘 목록
+    없이 온 요청이면 칸을 비우고 'no_list' 다(모델이 고를 집합이 없었다 — 적은 값은 mech_free 로 남긴다)."""
+    m = row.get("mech", "")
+    if not ctx["mechs"]:
+        if m and m != "free":
+            row["mech_free"] = row.get("mech_free") or m
+        row["mech"] = ""
+        return "no_list"
+    if m and m != "free" and m not in ctx["mechs"]:
+        checks["coerced"].append(f"mech:{m}")
+        row["mech_free"] = row.get("mech_free") or m
+        row["mech"] = "free"
+    if required and not row["mech"]:
+        return "missing"
+    return "free" if row["mech"] == "free" else "ok"
 
 
 def _check_c(row: dict, ctx: dict, attempt: int) -> dict:
@@ -1470,6 +1491,12 @@ _INSTR_VERDICT_RULES = (
     "OK 와 no 는 기본값이 아니다. 대조해서 확인한 것만 그렇게 적는다. 확인하지 못했으면 unknown 이다.\n"
     "이 호출은 카드 대조만 한다. 카드에 없는 리스크는 다른 호출이 묻는다.\n"
 )
+# 판정 틀의 메커니즘(cr-verdict-2) — [메커니즘 목록]이 실린 요청에만 붙는다(목록 없이 온 요청은 M2 처럼 돈다). 걸린 줄에만
+# 필수다(OK·na 줄은 비워 출력 몫을 지킨다 — M3.md #30).
+_INSTR_VERDICT_MECH = (
+    '- mech — judgement 가 WARNING·FAIL 이면 v 줄에 "mech" 로 [메커니즘 목록]의 코드 하나를 단다. 맞는 것이 없으면 '
+    '"mech":"free" 와 "mech_free":"한 구절". OK·na·undetermined 면 "" 이다.\n'
+)
 _INSTR_SWEEP = (
     "[지시]\n"
     "이 호출은 판정이 아니라 선별이다. 어느 단위를 당신이 자세히 들여다봐야 하는지만 가린다.\n"
@@ -1603,7 +1630,7 @@ def _canon_sha(obj) -> str:
 def template_sha(kind: str) -> str:
     """그 종류의 틀 글(시스템·지시·고정 머리) sha — 판을 안 올리고 글을 바꿨는지 잡는 시험에만 쓴다(정본은 PROMPT_REV)."""
     parts = [_SYSTEM, "".join(_UNIT_HEADS.values())]
-    parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES],
+    parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES, _INSTR_VERDICT_MECH],
               "sweep": [_INSTR_SWEEP, _INSTR_SWEEP_MISSING],
               "offcard": [_INSTR_OFFCARD]}[kind]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
@@ -1685,6 +1712,10 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         add("frame", "\n")
     else:
         add("unit", _render_unit(unit, ctx))
+    if kind == "verdict" and extra.get("mechanisms"):
+        add("frame", "[메커니즘 목록]\n")
+        add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"]))
+        add("frame", "\n\n")
     if kind == "offcard":
         known = [k for k in extra.get("known") or [] if isinstance(k, dict)]
         if known:
@@ -1703,7 +1734,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
 
     if kind == "verdict":
         add("frame", (_INSTR_SOLO.format() if variant == "solo" else _INSTR_VERDICT.format(n=len(order)))
-            + _INSTR_VERDICT_RULES)
+            + _INSTR_VERDICT_RULES + (_INSTR_VERDICT_MECH if extra.get("mechanisms") else ""))
     elif kind == "sweep":
         add("frame", _INSTR_SWEEP.format() + (_INSTR_SWEEP_MISSING if extra.get("missing") else ""))
     else:
