@@ -731,6 +731,8 @@ def test_목록_밖_메커니즘으로_고친_FAIL_도_OK_에_밀려나지_않�
     res = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl(rows), "verdict")[0], ctx)
     kept = next(r for r in res["rows"] if r["k"] == a)
     assert kept["judgement"] == "WARNING" and kept["checks"]["dup_conflict"] is True
+    assert "mech:thermal.not_listed" in kept["checks"]["coerced"] and cr.row_issues(kept) == 0, (
+        "목록 밖 메커니즘을 고친 것(coerced mech:…)도 문제 수에 들지 않는다")
 
 
 def test_보충의_OK_재출력이_걸린_FAIL_을_갈아_끼지_않고_갈린_사실을_남긴다():
@@ -786,12 +788,13 @@ def test_입력_결손_보충은_인용이_틀린_앞_줄만_갈아_끼고_걸�
     bad = "지어낸 인용 문장을 열다섯 자 넘게 적었다"
     first = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx, k, title="고칠 줄", cq=bad),
                                                              _q1(ctx, k, title="멀쩡한 줄"),
-                                                             _q1(ctx, k, title="걸린 영향", cq=bad, mech=""), _Q2]),
+                                                             _q1(ctx, k, title="걸린 영향", cq=bad, mech=""),
+                                                             _q1(ctx, k, title="", cq=bad, path="빈 제목 앞 줄"), _Q2]),
                                                        "noinput")[0], ctx)
     again = [_q1(ctx, k, title="고칠 줄"),                                   # 인용을 고쳤다 — 갈아 낀다
              _q1(ctx, k, title="멀쩡한 줄", path="다른 경로"),               # 앞 줄의 인용이 맞다 — 새 영향으로 붙는다
              _q1(ctx, k, title="걸린 영향", impact="no", why="영향이 없다고 본다 — 간극이 남는다"),   # 걸린 줄을 지킨다
-             _q1(ctx, k, title="", cq=bad), _MORE]                          # 제목이 빈 줄은 갈아 끼지 않는다
+             _q1(ctx, k, title="", path="빈 제목 새 줄"), _MORE]            # 제목이 빈 줄은 갈아 끼지 않는다
     fixed = cr.check_rows("noinput", None, cr.parse_rows(_jl(again), "noinput")[0], ctx, attempt=2)
     merged = cr.merge_rows("noinput", first["rows"], fixed["rows"], 2)
     q1 = [r for r in merged if r["t"] == "q1"]
@@ -801,7 +804,8 @@ def test_입력_결손_보충은_인용이_틀린_앞_줄만_갈아_끼고_걸�
     assert [r["checks"]["quote"] for r in by["고칠 줄"]] == ["ok"] and by["고칠 줄"][0]["from_attempt"] == 2
     assert [r["path"] for r in by["멀쩡한 줄"]] == ["보스 → 보드", "다른 경로"]
     assert [(r["impact"], r["checks"].get("dup_conflict")) for r in by["걸린 영향"]] == [("yes", True)]
-    assert len(by[""]) == 1 and len(q1) == 5
+    assert sorted(r["path"] for r in by[""]) == ["빈 제목 새 줄", "빈 제목 앞 줄"] and len(q1) == 6, (
+        "제목이 빈 줄은 같은 카드라도 다른 영향일 수 있다 — 갈아 끼지 않는다")
 
 
 def test_입력_결손의_까닭_없는_영향_없음은_보충하고_표지_행으로_센다():

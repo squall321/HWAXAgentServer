@@ -5,6 +5,7 @@
 # 으로 센다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_review_gate.py -q
+import json
 import sys
 from pathlib import Path
 
@@ -289,7 +290,11 @@ def test_판정이_터져도_꺼짐으로_읽고_파일을_지운다(tmp_path):
         raise ZeroDivisionError("x")
 
     d._live = boom
-    assert d.snapshot() == rg.OFF and d.active_scope() is None
+    try:
+        snap = d.snapshot()
+    except Exception as exc:  # noqa: BLE001 — 판정 예외가 밖으로 샜다(/health·관문·끄기가 500)
+        snap = exc
+    assert snap == rg.OFF and d.active_scope() is None, snap
     assert not (tmp_path / "drain.json").exists(), "판정이 터진 깃발 파일을 남겼다"
 
 
@@ -308,9 +313,12 @@ def test_읽을_수_없는_깃발_파일의_경고는_한_번이다(tmp_path, ca
 def test_무한_ttl_max_s_는_거절한다(tmp_path, kw):
     """RB3-8 — ttl_s Infinity 를 받아 써 두면 그 파일을 다시 읽지 못했다."""
     d, _, _ = _drain(tmp_path)
-    with pytest.raises(rg.DrainError) as e:
+    try:
         d.set_on(scope="all", by="x", **kw)
-    assert (e.value.status, e.value.code) == (422, "bad_request"), kw
+        got = None
+    except Exception as exc:  # noqa: BLE001 — 422 가 아닌 예외(쓰기 실패)도 받아 단언으로 본다
+        got = exc
+    assert isinstance(got, rg.DrainError) and (got.status, got.code) == (422, "bad_request"), (kw, got)
     assert not (tmp_path / "drain.json").exists()
 
 
@@ -400,7 +408,13 @@ def test_by_는_120자에서_끊는다(tmp_path):
     long_by = "update-all:" + "가" * 5_000
     s = d.set_on(scope="all", by=long_by, reason="r" * 5_000, ttl_s=60)
     assert len(s["by"]) == rg.DRAIN_BY_MAX and len(s["reason"]) == rg.DRAIN_REASON_MAX
-    assert d.set_off(by=long_by)["on"] is False
+    stored = json.loads((tmp_path / "drain.json").read_text(encoding="utf-8"))
+    assert len(stored["by"]) == rg.DRAIN_BY_MAX, "파일에 끊지 않은 by 를 썼다"
+    try:
+        off = d.set_off(by=long_by)
+    except rg.DrainError as exc:
+        off = exc.body()
+    assert off == rg.OFF, off
 
 
 def test_until_idle_도_시계가_뒤로_가면_남은_수명을_믿지_않는다(tmp_path):

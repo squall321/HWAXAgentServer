@@ -715,7 +715,7 @@ def test_몫에서_끊은_입력은_ctx_clipped_에_원래와_남긴_길이로_�
     req = _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0), role="역할 " * 20_000,
                extra={"mechanisms": mechs, "known": [{"alias": "K01", "judgement": "OK", "why": "까닭 " * 400}] * 200})
     _sys, _human, ctx = cr.build_prompt(req, lim)
-    c = ctx["clipped"]
+    c = ctx.get("clipped") or {}
     assert set(c) >= {"role", "mechanisms", "known"}, c
     assert all(v["kept_chars"] < v["orig_chars"] for v in c.values())
     assert c["known"]["orig_items"] == 200 and c["known"]["kept_items"] < 200 and c["mechanisms"]["labels_dropped"]

@@ -145,11 +145,11 @@ def test_끊은_집계_블록은_결과에_적고_수치_원천은_모델이_본
     tail = " 끝에만 있는 수치 7,654건"
     big = [{"name": "numbers", "title": "영역 수치", "text": "가" * 60_000 + tail}]
     ctx = cr.build_ctx(summary_req(n_rows=3, n_cover=1, blocks=big), LIM)
-    clip = ctx["clipped"]["blocks"]
-    assert clip["orig_chars"] > 60_000 and clip["kept_chars"] <= LIM["summary"]["blocks_max"], clip
+    clip = ctx.get("clipped", {}).get("blocks") or {}
+    assert clip and clip["orig_chars"] > 60_000 and clip["kept_chars"] <= LIM["summary"]["blocks_max"], clip
     assert cr.nums_unsourced("수치는 7,654건이다", ctx["num_src"]) == ["7,654"], "모델이 못 본 수치를 원천으로 받았다"
     fr, _llm, _app_, res = _go(summary_req(n_rows=6, n_cover=2, blocks=big))
-    assert res["meta"]["clipped"]["blocks"] == clip, res["meta"].get("clipped")
+    assert res["meta"].get("clipped", {}).get("blocks") == clip, res["meta"].get("clipped")
     assert _go(summary_req())[3]["meta"]["clipped"] == {}, "끊은 것이 없으면 빈 사전이다"
 
 
