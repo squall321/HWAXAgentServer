@@ -314,7 +314,8 @@ def test_모르는_별칭만_지운_줄은_남은_별칭을_덮고_한_줄은_�
     res = _check([{"t": "head", "text": "요지", "r": ["R001"]}, {"t": "risk", "r": ["R001", "R999"], "text": "걸림"},
                   {"t": "risk", "r": ["R002"], "text": "둘째"}, {"t": "para", "text": "문단", "r": ["R001"]}])
     risk = next(r for r in res["rows"] if r["t"] == "risk" and r["text"] == "걸림")
-    assert (risk["r"], risk["checks"]["refs"]) == (["R001"], "unknown_alias") and res["missing"] == [] and not res["repair"]
+    assert (risk["r"], risk["checks"]["refs"]) == (["R001"], "unknown_alias")
+    assert res["missing"] == [] and not res["repair"]
     six = summary_req(n_rows=8, n_cover=6)
     res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
                   {"t": "conflict", "r": ["R001", "R002", "R003", "R004", "R005", "R006"], "text": "다툼"},

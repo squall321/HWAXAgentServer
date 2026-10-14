@@ -630,7 +630,7 @@ def test_plan_은_계획과_같은_때의_종류별_판을_싣는다():
     lim = _lim(1_048_576)
     out = cr.plan([{"alias": "K01", "record_id": "R1", "checkable": True, "chars": 500}],
                   [{"unit_id": "u", "manifest_chars": 300, "body_chars": 2_000}], lim)
-    assert out["limits_rev_by_kind"] == lim["limits_rev_by_kind"] and out["limits_rev"] == lim["limits_rev"]
+    assert out.get("limits_rev_by_kind") == lim["limits_rev_by_kind"] and out["limits_rev"] == lim["limits_rev"]
     with pytest.raises(cr.RequestError) as e:
         cr.check_shape(cr.PlanRequest, {"cards": [], "units": [], "expect": {"limits_rev_kind": "x"}})
     assert e.value.code == "unknown_fields"

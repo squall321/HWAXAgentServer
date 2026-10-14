@@ -713,7 +713,8 @@ def test_까닭을_고친_보충은_한_번에_끝나고_상한이_걸린_영향
     yes = _ni_q1(impact="yes", title="보드 휨 영향", mech="pcb.board_flex", k=k, cq=prep["ctx"]["cards"][k]["text"][:30],
                  why="변경 줄의 간극 축소가 카드 조건과 겹친다")
     q2 = {"t": "q2", "item": "부품 배치", "needs": "ECAD", "k": "", "l": ["L01"], "why": "간극을 본다"}
-    fr, llm, _ = _go(prep, [_jl(_ni_q1(why="회로 무관"), q2, {"t": "more", "more": "no"}), _jl(_ni_q1(), yes), _jl(_ni_q1(), yes)])
+    fr, llm, _ = _go(prep, [_jl(_ni_q1(why="회로 무관"), q2, {"t": "more", "more": "no"}), _jl(_ni_q1(), yes),
+                            _jl(_ni_q1(), yes)])
     e, res = _last(fr)
     assert e == "result" and len(llm.calls) == 2, (e, len(llm.calls))
     assert [(r["impact"], r["checks"]["why"]) for r in res["rows"] if r["t"] == "q1"] == [("no", "ok"), ("yes", "ok")]
@@ -750,5 +751,6 @@ def test_검증된_철회가_오면_지어낸_인용을_더_묻지_않고_진_�
     e, res = _last(fr)
     assert e == "result" and len(llm.calls) == 2, len(llm.calls)
     kept = next(r for r in res["rows"] if r["k"] == a)
-    assert (kept["judgement"], kept["checks"]["quote"], kept["contested_by"]["quote"]) == ("FAIL", "not_found", "ok")
+    assert (kept["judgement"], kept["checks"]["quote"], (kept.get("contested_by") or {}).get("quote")) == (
+        "FAIL", "not_found", "ok"), kept
     assert (res["quality"]["dup_conflict"], res["quality"]["flipped"]) == (1, 0)

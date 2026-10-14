@@ -161,7 +161,9 @@ def test_남의_깃발에_낸_요청은_409_drain_owned_이고_못_지운_끄기
     깃발 파일을 못 지운 끄기가 200 이었다."""
     client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 7_200, "by": "human:koopark", "reason": "점검"})
     r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 1_800, "by": "update-all", "reason": "1h"})
-    assert (r.status_code, r.json()["code"], r.json()["drain"]["by"]) == (409, "drain_owned", "human:koopark"), r.text
+    body = r.json()
+    assert (r.status_code, body.get("code"), (body.get("drain") or {}).get("by")) == (409, "drain_owned", "human:koopark"), (
+        r.text[:300])
     assert client.get("/drain").json()["reason"] == "점검"
 
     def deny(_path):

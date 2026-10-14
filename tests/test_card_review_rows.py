@@ -915,8 +915,8 @@ def test_지어낸_인용의_걸림은_남기고_검증된_철회를_contested_b
     merged = cr.merge_rows("verdict", r1["rows"], r2["rows"], 2)
     kept = next(r for r in merged if r["k"] == a)
     assert (kept["judgement"], kept["checks"]["quote"], kept["checks"]["dup_conflict"]) == ("FAIL", "not_found", True)
-    assert kept["contested_by"] == {"verdict": ("yes", "OK"), "cq": ok_text, "quote": "ok", "why": "한계 안이다",
-                                    "attempt": 2}, kept.get("contested_by")
+    assert kept.get("contested_by") == {"verdict": ("yes", "OK"), "cq": ok_text, "quote": "ok", "why": "한계 안이다",
+                                        "attempt": 2}, kept.get("contested_by")
     assert not cr.settle("verdict", merged, ctx)["repair"], "검증된 반대 답이 온 인용을 또 묻는다"
     # 반대 답의 인용도 지어냈으면 그 인용은 여전히 보충 사유다.
     r2b = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="OK", cq=bad)]), "verdict")[0],
@@ -929,7 +929,7 @@ def test_지어낸_인용의_걸림은_남기고_검증된_철회를_contested_b
                                                             [_good_v(ctx, x) for x in ctx["judge"][2:]]), "verdict")[0],
                         ctx)
     kept = next(r for r in one["rows"] if r["k"] == a)
-    assert kept["judgement"] == "FAIL" and kept["contested_by"]["attempt"] == 1 and not one["repair"]
+    assert kept["judgement"] == "FAIL" and (kept.get("contested_by") or {}).get("attempt") == 1 and not one["repair"]
 
 
 def test_갈린_줄을_같은_판정의_나은_줄이_갈아_껴도_표지가_남는다():
@@ -947,7 +947,8 @@ def test_갈린_줄을_같은_판정의_나은_줄이_갈아_껴도_표지가_�
                                                        "verdict")[0], ctx, attempt=2)
     kept = next(r for r in cr.merge_rows("verdict", r1["rows"], r2["rows"], 2) if r["k"] == a)
     assert (kept["checks"]["quote"], kept["from_attempt"]) == ("ok", 2), "나은 FAIL 이 갈아 끼지 않았다"
-    assert kept["checks"].get("dup_conflict") is True and kept["contested_by"]["verdict"] == ("yes", "OK"), kept
+    assert kept["checks"].get("dup_conflict") is True and (kept.get("contested_by") or {}).get("verdict") == (
+        "yes", "OK"), kept
     flip1 = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="OK")]), "verdict")[0], ctx)
     flip2 = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="FAIL", cq=bad)]),
                                                           "verdict")[0], ctx, attempt=2)

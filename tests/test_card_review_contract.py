@@ -617,8 +617,9 @@ def test_M3_비우기_예제():
     assert off["body"]["on"] is False
     assert (held["status"], held["body"]["code"], held["body"]["drain"]["hold"]) == (409, "drain_held", True)
     owned = _load("drain_owned.json")
-    assert (owned["status"], owned["body"]["code"], owned["body"]["drain"]["by"], owned["body"]["drain"]["hold"]) == (
-        409, "drain_owned", "human:운영자", False)
+    ob = owned["body"]
+    assert (owned["status"], ob.get("code"), (ob.get("drain") or {}).get("by"), (ob.get("drain") or {}).get("hold")) == (
+        409, "drain_owned", "human:운영자", False), ob
     assert set(got) == {"on", "scope", "until", "until_idle", "hold", "by", "reason", "set_at", "review_active",
                         "delib_active", "delib_queued"}
     h = _load("drain_health.json")
@@ -635,9 +636,9 @@ def test_RB3B_다툼과_뒤집힘_예제():
     assert (con["quality"]["dup_conflict"], con["quality"]["flipped"], con["quality"]["attempts"]) == (1, 0, 2)
     k01 = next(r for r in con["rows"] if r["k"] == "K01")
     assert (k01["judgement"], k01["checks"]["quote"], k01["checks"]["dup_conflict"]) == ("FAIL", "not_found", True)
-    assert set(k01["contested_by"]) == {"verdict", "cq", "quote", "why", "attempt"}
-    assert (k01["contested_by"]["verdict"], k01["contested_by"]["quote"], k01["contested_by"]["attempt"]) == (
-        ["yes", "OK"], "ok", 2)
+    cb = k01.get("contested_by") or {}
+    assert set(cb) == {"verdict", "cq", "quote", "why", "attempt"}, k01
+    assert (cb["verdict"], cb["quote"], cb["attempt"]) == (["yes", "OK"], "ok", 2)
     flip = _load("result_verdict_flipped.json")
     assert flip["quality"]["flipped"] == len(flip["rows"]) == 8 and flip["quality"]["dup_conflict"] == 0
     assert all(r["judgement"] == "FAIL" and r["flipped_from"] == {"verdict": ["yes", "OK"], "attempt": 1}
@@ -645,5 +646,6 @@ def test_RB3B_다툼과_뒤집힘_예제():
     ni = _load("result_noinput_contested.json")
     hit = [r for r in ni["rows"] if r["t"] == "q1" and (r.get("checks") or {}).get("dup_conflict")]
     assert ni["quality"]["dup_conflict"] == len(hit) == 1 and hit[0]["impact"] == "yes"
-    assert (hit[0]["contested_by"]["verdict"], hit[0]["contested_by"]["quote"]) == (["no"], "ok")
+    cb = hit[0].get("contested_by") or {}
+    assert (cb.get("verdict"), cb.get("quote")) == (["no"], "ok"), hit[0]
 
