@@ -188,20 +188,20 @@
   "model": "fake-glm",
   "ctx_tokens": 1048576,
   "ctx_source": "server",
-  "prompt_rev": "cr-summary-1",
+  "prompt_rev": "cr-summary-2",
   "norm_rev": "cr-n1",
   "limits_rev": "63611252",
   "limits_rev_kind": "17d5f29b",
   "input_sha": "e804fecfde797718b4cfd4d8bf6a1e7debb17e5d4ac1a2dc179b7bfd2e834b37",
-  "prompt_chars": 4041,
+  "prompt_chars": 4104,
   "usage": {
    "llm_calls": 1,
-   "tokens_in": 2020,
+   "tokens_in": 2052,
    "tokens_out": 310,
    "per_attempt": [
     {
      "n": 1,
-     "tokens_in": 2020,
+     "tokens_in": 2052,
      "tokens_out": 310
     }
    ]
