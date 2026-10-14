@@ -272,10 +272,12 @@ def test_시도를_다_써도_빠진_꼭_다룰_행은_missing_에_실린다():
     assert any(r["checks"]["nums_unsourced"] == ["0.35"] for r in res["rows"] if r["t"] == "para")
 
 
-def test_요약만_못_도는_박스에서_summary_를_부르면_ctx_too_small_이다():
-    """runnable.summary=false(출력 상한이 작아 꼭 다룰 행 줄이 하나도 안 든다)인 박스 — 앱은 부르지 않고 코드 조립본을 낸다.
-    불러도 LLM 전에 422 ctx_too_small 이다. 셀 일의 종류는 돈다(ctx_too_small 이 limits 에 서지 않는다)."""
-    lim = cr.limits(1_048_576, "server", 1_000, env={})
+def test_요약만_못_도는_박스에서_summary_를_부르면_ctx_too_small_이다(monkeypatch):
+    """runnable.summary=false(꼭 다룰 행 줄이 하나도 안 든다)인 박스 — 앱은 부르지 않고 코드 조립본을 낸다. 불러도 LLM 전에
+    422 ctx_too_small 이다. 셀 일의 종류는 돈다(ctx_too_small 이 limits 에 서지 않는다). 출력 상한만으로는 이 박스가 생기지
+    않는다(RB3-14 — 카드 밖 f 줄 하나에 드는 출력이 요약의 꼭 다룰 행 줄 하나보다 크다) — 요약 머리 상수를 키워 만든다."""
+    monkeypatch.setattr(cr, "SUMMARY_HEAD", 10 ** 7)
+    lim = cr.limits(1_048_576, "server", 0, env={})
     assert lim["runnable"]["summary"] is False and "ctx_too_small" not in lim
     with pytest.raises(cr.RequestError) as e:
         cr.prepare(summary_req(n_rows=5, n_cover=1), lim)

@@ -133,6 +133,52 @@ def _limits_constants() -> list:
     return [[name, g[name]] for name in LIMITS_CONSTANTS]
 
 
+# 종류마다의 판(limits_rev_by_kind — RB3-6). 판이 하나뿐이면 요약에만 닿는 손잡이·상수(CARD_REVIEW_SHARE_SUMMARY·
+# TEMPLATE_ALLOW["summary"]·NARRATIVE_SHARE·SUMMARY_HEAD)를 바꿔도 도는 셀이 처음부터 돌았다(#37·리허설 3.3-8). 그 종류의 예산을
+# 움직이는 입력만 그 종류의 판에 든다.
+#   _REV_BASE      모든 종류 — 식의 판·창에서 자 수로·창 한도·출력 몫·지적 블록·돌릴 바닥
+#   _REV_KEYED     종류 이름이 열쇠인 상수 — 그 종류의 값만 든다
+#   _REV_UNIT      verdict·offcard·noinput 은 단위 상한(unit_body_max = 셋의 본문 가운데 작은 것)을 함께 쓴다 — 셋의 몫·틀·
+#                  바닥·블록 몫과 단위 몫·단위 크기 식이 셋 모두의 판에 든다(하나가 바뀌면 단위 상한이 바뀐다)
+#   _REV_ONLY      그 종류만 읽는 상수
+# 시험이 LIMITS_CONSTANTS 전부가 어느 종류의 판에든 드는지, 요약만의 입력이 셀 종류의 판을 흔들지 않는지 본다.
+_REV_BASE = ("LIMITS_FORMULA_REV", "_EVID_KO_CPT", "_PRE_SAFETY", "_CHAIR_RESERVE", "OUT_USE", "HINT_SHARE",
+             "HINT_FLOOR", "RUN_FLOOR")
+_REV_KEYED = ("TEMPLATE_ALLOW", "BODY_MIN", "_BLOCK_SHARE", "ROW_CHARS")
+_REV_UNIT_KINDS = ("verdict", "offcard", "noinput")
+_REV_UNIT = ("VERDICT_UNIT_SHARE", "UNIT_SIZE")
+_REV_ONLY = {
+    "sweep": ("SWEEP_OUT_HEAD", "SWEEP_PAGE_SHARE", "MANIFEST_ITEM_FLOOR", "MANIFEST_ITEM_OVERHEAD", "_NO_CARDS"),
+    "verdict": (),
+    "offcard": ("OFFCARD_OUT_HEAD", "LONGDOC_SHARE"),
+    "noinput": ("NOINPUT_OUT_HEAD",),
+    "summary": ("SUMMARY_HEAD", "NARRATIVE_SHARE"),
+}
+_REV_CELL = ("_NEED_CTX_MAX",)    # 셀 종류의 ctx_too_small(need_ctx_tokens)만 읽는다
+
+
+def _rev_src(kind: str, b: dict, k_knob: int, shares: dict, retries: int) -> dict:
+    """그 종류의 판이 해시하는 입력 — 창·출력 상한(값), 그 종류에 닿는 손잡이, 그 종류에 닿는 상수(이름과 지금 값)."""
+    g = globals()
+    group = _REV_UNIT_KINDS if kind in _REV_UNIT_KINDS else (kind,)
+    names = list(_REV_BASE) + list(_REV_ONLY[kind]) + (list(_REV_UNIT) if kind in _REV_UNIT_KINDS else [])
+    names += list(_REV_CELL) if kind in CELL_KINDS else []
+    src = {"ctx": b["ctx"], "out": b["out"], "mt": b["mt"],
+           "share": {k: shares[k] for k in group},
+           "const": [[n, g[n]] for n in names],
+           "keyed": [[n, {k: g[n][k] for k in group if k in g[n]}] for n in _REV_KEYED if n not in ("ROW_CHARS",)]
+           + [["ROW_CHARS", g["ROW_CHARS"][kind]]]}
+    if kind == "verdict":
+        src["k"] = k_knob
+    if kind == "summary":
+        src["retries"] = retries          # cover_hard_max = cover_max × (1 + CARD_REVIEW_PARSE_RETRIES)
+    return src
+
+
+def _rev(src) -> str:
+    return hashlib.sha256(json.dumps(src, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
+
+
 def _knob_k(env) -> int:
     raw = str(env.get("CARD_REVIEW_K") or "").strip()
     try:
@@ -251,14 +297,30 @@ def _budget(ctx: int, mt: int, k_knob: int, shares: dict, retries: int = 2) -> d
     cover_raw = int((rows_out - su["narrative_max"] - SUMMARY_HEAD) // ROW_CHARS["summary"])
     su["cover_max"] = max(1, cover_raw)
     su["cover_hard_max"] = su["cover_max"] * (1 + max(0, int(retries)))
+    # 출력 몫이 행 한 줄도 못 내는 종류 — k_out 0·목록 쪽 단위 0·f 줄 0·q1 줄 0. 예전엔 출력 상한(CARD_REVIEW_MAX_TOKENS
+    # 300·800)이 작아도 셀 종류가 runnable 이라 k_out=0 인 판정이 돌았다(RB3-14).
+    b["out_short"] = [k for k, ok in (
+        ("sweep", rows_out - SWEEP_OUT_HEAD >= ROW_CHARS["sweep"]),
+        ("verdict", v["k_out"] >= 1),
+        ("offcard", rows_out - OFFCARD_OUT_HEAD >= ROW_CHARS["offcard"]),
+        ("noinput", rows_out - NOINPUT_OUT_HEAD >= ROW_CHARS["noinput"]),
+        ("summary", cover_raw >= 1)) if not ok]
     b["runnable"] = {
         "sweep": s["card_budget"] >= RUN_FLOOR and s["manifest_page_max"] >= s["manifest_item_max"],
         "verdict": v["unit_body_max"] >= RUN_FLOOR and v["card_budget"] >= RUN_FLOOR,
         "offcard": o["body"] >= RUN_FLOOR,
         "noinput": n["body"] >= RUN_FLOOR,
-        "summary": su["body"] >= RUN_FLOOR and cover_raw >= 1,
+        "summary": su["body"] >= RUN_FLOOR,
     }
+    for k in b["out_short"]:
+        b["runnable"][k] = False
     return b
+
+
+def _rows_out_need() -> int:
+    """셀 종류가 다 행 한 줄 이상을 낼 출력 몫(자) — 출력 상한이 모자랄 때 알리는 값의 바탕이다."""
+    return max(ROW_CHARS["verdict"], SWEEP_OUT_HEAD + ROW_CHARS["sweep"], OFFCARD_OUT_HEAD + ROW_CHARS["offcard"],
+               NOINPUT_OUT_HEAD + ROW_CHARS["noinput"])
 
 
 def _cells_runnable(b: dict) -> bool:
@@ -289,11 +351,10 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
     P 의 몫, 행 수는 출력 몫에서 유도한다. 창이 모자라면 다시 쪼개지 않고 `ctx_too_small` 을 싣는다(D-22) — 셀 일의 종류
     (CELL_KINDS)만 본다. max_tokens 는 resolve_max_tokens() 가 고른 출력 상한이고 max_tokens_source 가 그 출처다(안 주면
     상한이 있으면 delib, 없으면 none)."""
-    k_knob, shares = _knob_k(env), _knob_shares(env)
-    b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares, _parse_retries(env))
+    k_knob, shares, retries = _knob_k(env), _knob_shares(env), _parse_retries(env)
+    b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares, retries)
     v, s, o, n, su = b["verdict"], b["sweep"], b["offcard"], b["noinput"], b["summary"]
-    rev_src = {"ctx": b["ctx"], "out": b["out"], "mt": b["mt"], "k": k_knob, "share": shares,
-               "const": _limits_constants()}
+    by_kind = {k: _rev(_rev_src(k, b, k_knob, shares, retries)) for k in KINDS}
     out = {
         "api_rev": API_REV, "kinds": list(KINDS), "cell_kinds": list(CELL_KINDS), "model": model,
         "ctx_tokens": b["ctx"], "ctx_source": ctx_source, "ctx_retrying": bool(retrying),
@@ -316,18 +377,31 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
         "search": {"timeout_s": search_timeout_s(env)},
         "unit_size": dict(UNIT_SIZE), "manifest_item": {"overhead": MANIFEST_ITEM_OVERHEAD},
         "prompt_rev": dict(PROMPT_REV), "norm_rev": NORM_REV,
-        "limits_rev": hashlib.sha256(json.dumps(rev_src, sort_keys=True).encode()).hexdigest()[:8],
+        # 종류마다의 판(RB3-6) — 앱은 run 의 expect.limits_rev_kind 로 그 종류의 판만 견준다. 전체 판(limits_rev)은 M2 앱이
+        # 견주는 값이라 남기되 셀 종류 넷의 판만 묶는다(요약에만 닿는 입력이 M2 앱의 셀을 처음부터 돌리지 않게).
+        "limits_rev_by_kind": by_kind,
+        "limits_rev": _rev({k: by_kind[k] for k in CELL_KINDS}),
     }
     if not _cells_runnable(b):
-        need = _need_ctx(b["ctx"], b["mt"], k_knob, shares)
         short = [k for k in CELL_KINDS if not b["runnable"][k]]
-        out["ctx_too_small"] = {
-            "need_ctx_tokens": need,
-            "message": (f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
-                        "쪼개지 않는다. " + (f"창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
-                                          if need else "출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 "
-                                          "크다 — 그 값을 줄여라.")),
-        }
+        out_short = [k for k in short if k in b["out_short"]]
+        if out_short and b["mt"]:
+            # 출력 상한이 행 한 줄도 못 낸다 — 창을 키워도 소용없다(행 몫이 출력 상한에서만 나온다).
+            need_mt = math.ceil(_rows_out_need() / (OUT_USE * _EVID_KO_CPT))
+            out["ctx_too_small"] = {
+                "reason": "output_cap", "need_ctx_tokens": None, "need_max_tokens": need_mt,
+                "message": (f"출력 상한 {b['mt']:,} 토큰으로는 카드 대조({'·'.join(out_short)})가 행 한 줄도 못 낸다 — "
+                            f"CARD_REVIEW_MAX_TOKENS(없으면 DELIB_MAX_TOKENS)를 {need_mt:,} 토큰 이상으로 올린다."),
+            }
+        else:
+            need = _need_ctx(b["ctx"], b["mt"], k_knob, shares)
+            out["ctx_too_small"] = {
+                "reason": "window" if need else "output_too_large", "need_ctx_tokens": need,
+                "message": (f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 "
+                            "다시 쪼개지 않는다. " + (f"창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
+                                                if need else "출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 "
+                                                "크다 — 그 값을 줄여라.")),
+            }
     return out
 
 
@@ -631,6 +705,15 @@ class RequestError(ValueError):
         return {"code": self.code, "message": self.message, **self.detail}
 
 
+ECHO_MAX = 80                     # 거절이 되비추는 호출자 값 하나의 글자 상한(RB3-15)
+
+
+def _echo(v) -> str:
+    """호출자가 보낸 값을 거절 본문·로그에 되비출 때 — 80자에서 끊고 원래 길이를 단다(본문이 입력 크기만큼 커지지 않게)."""
+    s = str(v)
+    return s if len(s) <= ECHO_MAX else f"{s[:ECHO_MAX]}…({len(s)}자)"
+
+
 def _alias(prefix: str, i: int, n: int) -> str:
     return f"{prefix}{i:0{alias_width(n)}d}"
 
@@ -645,9 +728,10 @@ def build_ctx(req: dict, lim: dict) -> dict:
     check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
-        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 받는다")
+        raise RequestError("unsupported_kind", f"호출 종류 '{_echo(kind)}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 "
+                           "받는다")
     if kind not in KINDS:
-        raise RequestError("bad_request", f"모르는 호출 종류 '{kind}'")
+        raise RequestError("bad_request", f"모르는 호출 종류 '{_echo(kind)}'")
     variant = req.get("variant")
     if kind == "verdict":
         if variant not in ("fwd", "rev", "solo"):
@@ -707,7 +791,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
         if not isinstance(unit, dict):
             raise RequestError("bad_request", f"{kind} 에는 unit 이 있어야 한다")
         if _str(unit.get("kind")) in _UNIT_KINDS_UNSUPPORTED:
-            raise RequestError("unsupported_unit_kind", f"단위 종류 '{unit.get('kind')}' 는 이 판에 틀이 없다(M4)")
+            raise RequestError("unsupported_unit_kind", f"단위 종류 '{_echo(unit.get('kind'))}' 는 이 판에 틀이 없다(M4)")
         parts = []
         for part, key in (("line", "lines"), ("context", "context"), ("evidence", "evidence")):
             for x in unit.get(key) or []:
@@ -788,7 +872,8 @@ def _summary_ctx(req: dict, lim: dict) -> dict:
     cover = [_str(x) for x in sm.get("must_cover") or []]
     outside = [x for x in cover if x not in by_ref]
     if outside:
-        raise RequestError("bad_request", f"summary.must_cover 의 {len(outside)}건이 rows 에 없다({', '.join(outside[:5])})")
+        raise RequestError("bad_request", f"summary.must_cover 의 {len(outside)}건이 rows 에 없다"
+                           f"({', '.join(_echo(x) for x in outside[:5])})")
     hard = int(lim["summary"]["cover_hard_max"])
     if len(set(cover)) > hard:
         raise RequestError("cover_too_large", f"꼭 다룰 행 {len(set(cover))}건이 이 박스의 상한 {hard}건(cover_hard_max)을 "
@@ -2355,7 +2440,7 @@ async def build_pack(tools: dict, agent_key: str) -> dict:
     raw, why = await _pack_call(tools, "get_agent_session", {"agent_type": key})
     if why:
         if "agent not found" in why.lower():
-            raise PackError("agent_not_found", 404, f"전문가 '{key}' 가 없다", agent_key=key)
+            raise PackError("agent_not_found", 404, f"전문가 '{_echo(key)}' 가 없다", agent_key=_echo(key))
         raise PackError("card_list_failed", 502, f"역할을 받지 못했다 — {why}", step="get_agent_session")
     sess = _first_dict(_parse_json(raw))
     sd = _first_dict(sess.get("data", sess)) if sess else {}
@@ -2707,20 +2792,29 @@ def prepare(req: dict, lim: dict) -> dict:
     check_shape(RunRequest, req)
     kind = req.get("kind")
     if kind in UNSUPPORTED_KINDS:
-        raise RequestError("unsupported_kind", f"호출 종류 '{kind}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 받는다")
+        raise RequestError("unsupported_kind", f"호출 종류 '{_echo(kind)}' 는 이 판(M3)에 없다(M4) — {'·'.join(KINDS)} 만 "
+                           "받는다")
     if kind not in KINDS:
-        raise RequestError("bad_request", f"모르는 호출 종류 '{kind}'")
+        raise RequestError("bad_request", f"모르는 호출 종류 '{_echo(kind)}'")
+    # 판 견주기 — 준 것만 견준다. limits_rev_kind(M3 앱)는 이 요청 종류의 판(limits_rev_by_kind[kind])과, limits_rev(M2 앱)는
+    # 전체 판과 견준다. M3 앱은 limits_rev_kind 만 보내면 요약에만 닿는 손잡이가 셀의 판을 흔들지 않는다(RB3-6).
     exp = req.get("expect") if isinstance(req.get("expect"), dict) else {}
-    cur = {"prompt_rev": PROMPT_REV[kind], "limits_rev": lim["limits_rev"]}
+    cur = {"prompt_rev": PROMPT_REV[kind], "limits_rev": lim["limits_rev"],
+           "limits_rev_kind": lim["limits_rev_by_kind"][kind]}
     if any(exp.get(k) not in (None, cur[k]) for k in cur):
-        want = ", ".join(f"{k}={exp.get(k)}" for k in cur if exp.get(k) is not None)
+        want = ", ".join(f"{k}={_echo(exp.get(k))}" for k in cur if exp.get(k) is not None)
         have = ", ".join(f"{k}={v}" for k, v in cur.items())
-        raise RequestError("rev_mismatch", f"요청이 기대한 판({want})이 이 서버의 판({have})과 다르다 — limits 를 다시 받고 "
-                           "계획을 다시 짠다", status=409, expect=exp, **cur)
+        raise RequestError("rev_mismatch", f"요청이 기대한 판({want})이 이 서버의 {kind} 판({have})과 다르다 — limits 를 "
+                           "다시 받고 계획을 다시 짠다", status=409,
+                           expect={k: _echo(v) for k, v in exp.items() if v is not None}, **cur)
     if not lim["runnable"][kind]:
         small = lim.get("ctx_too_small") or {}
-        raise RequestError("ctx_too_small", small.get("message") or f"이 박스의 창으로는 {kind} 를 돌릴 수 없다",
-                           need_ctx_tokens=small.get("need_ctx_tokens"), ctx_tokens=lim["ctx_tokens"])
+        msg = small.get("message") if kind in CELL_KINDS else None
+        raise RequestError("ctx_too_small", msg or f"이 박스의 창·출력 상한으로는 {kind} 를 돌릴 수 없다",
+                           need_ctx_tokens=small.get("need_ctx_tokens"), ctx_tokens=lim["ctx_tokens"],
+                           **({"reason": small["reason"]} if small.get("reason") and kind in CELL_KINDS else {}),
+                           **({"need_max_tokens": small["need_max_tokens"]} if small.get("need_max_tokens")
+                              and kind in CELL_KINDS else {}))
     system, human, ctx = build_prompt(req, lim)
     return {"req": req, "lim": lim, "system": system, "human": human, "ctx": ctx}
 
@@ -3004,6 +3098,7 @@ async def run(app, prep: dict):
             "quality": quality,
             "meta": {"model": lim.get("model", ""), "ctx_tokens": lim["ctx_tokens"], "ctx_source": lim.get("ctx_source"),
                      "prompt_rev": PROMPT_REV[kind], "norm_rev": NORM_REV, "limits_rev": lim["limits_rev"],
+                     "limits_rev_kind": lim["limits_rev_by_kind"][kind],
                      "input_sha": ctx["input_sha"], "prompt_chars": ctx["prompt_chars"], "usage": _usage(per),
                      "finish_reason": finishes[-1] if finishes else None, "llm_ms": llm_ms,
                      "soft_over": ctx["soft_over"], "basis": ctx["basis"], "bg_dropped": ctx["bg_dropped"],
@@ -3143,8 +3238,15 @@ class RunExtra(_Strict):
 
 
 class Expect(_Strict):
+    """plan 의 기대 판 — limits_rev(전체 판)만 견준다(plan 은 sweep·verdict 두 종류를 한 번에 짠다)."""
     prompt_rev: str | None = None
     limits_rev: str | None = None
+
+
+class RunExpect(Expect):
+    """run 의 기대 판 — limits_rev_kind 는 이 요청 종류의 판(limits.limits_rev_by_kind[kind])이다(RB3-6). M3 앱은 이것을
+    보내고, M2 앱은 limits_rev(전체 판)를 보낸다. 둘 다 오면 둘 다 견준다."""
+    limits_rev_kind: str | None = None
 
 
 class SummaryScope(_Strict):
@@ -3187,7 +3289,7 @@ class RunRequest(_Ident):
     unit: RunUnit | None = None
     manifest: list[RunManifestItem] = []
     extra: RunExtra | None = None
-    expect: Expect | None = None
+    expect: RunExpect | None = None
 
 
 class PackRequest(_Ident):
@@ -3220,12 +3322,14 @@ def check_shape(model, body) -> None:
     try:
         model.model_validate(body)
     except ValidationError as exc:
-        errs = [{"loc": ".".join(str(x) for x in e["loc"]), "type": e["type"], "msg": e["msg"]}
+        # 칸 이름(loc)은 호출자가 보낸 값이다 — 이름마다 80자, 20개까지만 되비춘다(fields_n 이 전부의 수 — RB3-15).
+        errs = [{"loc": _echo(".".join(str(x) for x in e["loc"])), "type": e["type"], "msg": _echo(e["msg"])}
                 for e in exc.errors(include_url=False)]
         extra = [e["loc"] for e in errs if e["type"] == "extra_forbidden"]
         if extra:
             raise RequestError("unknown_fields", f"선언하지 않은 칸 {len(extra)}개({', '.join(extra[:20])}) — 조용히 버리지 "
-                               "않고 거절한다. 앱과 에이전트 서버의 판이 섞였는지 본다", fields=extra, errors=errs[:20]) from None
+                               "않고 거절한다. 앱과 에이전트 서버의 판이 섞였는지 본다", fields=extra[:20],
+                               fields_n=len(extra), errors=errs[:20]) from None
         raise RequestError("bad_request", f"요청 모양이 계약과 다르다 — {errs[0]['loc']}: {errs[0]['msg']}",
                            errors=errs[:20]) from None
 
@@ -3347,9 +3451,9 @@ async def post_plan(request: Request):
         refuse_unknown_ctx(lim)                    # 창을 모르면 판을 견주지 않는다(503 ctx_unknown — RB-3)
         want = (body.get("expect") or {}).get("limits_rev")
         if want not in (None, lim["limits_rev"]):
-            raise RequestError("rev_mismatch", f"요청이 기대한 limits_rev({want})가 이 서버의 판({lim['limits_rev']})과 "
+            raise RequestError("rev_mismatch", f"요청이 기대한 limits_rev({_echo(want)})가 이 서버의 판({lim['limits_rev']})과 "
                                "다르다 — limits 를 다시 받고 계획을 다시 짠다", status=409, limits_rev=lim["limits_rev"],
-                               expect=body.get("expect"))
+                               expect={k: _echo(v) for k, v in (body.get("expect") or {}).items() if v is not None})
     except RequestError as exc:
         return _reject(exc, "plan")
     out = plan(body.get("cards") or [], body.get("units") or [], lim)

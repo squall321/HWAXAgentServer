@@ -144,10 +144,18 @@ def _bump(v):
 @pytest.mark.parametrize("name", cr.LIMITS_CONSTANTS)
 def test_limits_rev_는_예산_상수마다_바뀐다(monkeypatch, name):
     """RB-6 — 판이 손잡이와 계수 셋만 담아, 행 길이 어림·단위 몫 같은 상수만 고친 배포에서 판은 같은데 실효 K·단위 상한이
-    바뀌었다(ROW_CHARS·VERDICT_UNIT_SHARE 를 바꾸자 K 8→4, unit_body_max 105,871→67,577, 판은 그대로)."""
-    before = _lim(1_048_576)["limits_rev"]
-    monkeypatch.setattr(cr, name, _bump(getattr(cr, name)))
-    assert _lim(1_048_576)["limits_rev"] != before, f"{name} 를 바꿨는데 limits_rev 가 같다"
+    바뀌었다(ROW_CHARS·VERDICT_UNIT_SHARE 를 바꾸자 K 8→4, unit_body_max 105,871→67,577, 판은 그대로). 상수는 어느 종류의
+    판(limits_rev_by_kind)에든 든다 — 종류 이름이 열쇠인 상수는 종류마다 따로 본다(RB3-6)."""
+    v = getattr(cr, name)
+    keys = list(v) if name in cr._REV_KEYED else [None]
+    for key in keys:
+        before = _lim(1_048_576)["limits_rev_by_kind"]
+        monkeypatch.setattr(cr, name, {**v, key: _bump(v[key])} if key else _bump(v))
+        after = _lim(1_048_576)["limits_rev_by_kind"]
+        assert after != before, f"{name}[{key}] 를 바꿨는데 어느 종류의 판도 같다"
+        if key:
+            assert after[key] != before[key], f"{name}[{key}] 가 {key} 의 판에 들지 않는다"
+        monkeypatch.setattr(cr, name, v)
 
 
 def _global_names(fn) -> set:
@@ -249,9 +257,11 @@ def test_출력_상한_손잡이_CARD_REVIEW_MAX_TOKENS():
     assert lim["limits_rev"] != _lim(1_048_576)["limits_rev"], "출력 상한은 판에 든다"
 
 
-def test_요약만_못_도는_박스는_ctx_too_small_이_아니다():
-    """출력 상한이 아주 작으면(1,000 토큰) 꼭 다룰 행 줄이 하나도 안 든다 — 요약만 runnable=false 이고 셀 일은 돈다."""
-    lim = _lim(1_048_576, 1_000)
+def test_요약만_못_도는_박스는_ctx_too_small_이_아니다(monkeypatch):
+    """꼭 다룰 행 줄이 하나도 안 들면 요약만 runnable=false 이고 셀 일은 돈다. 출력 상한만으로는 이 박스가 생기지 않는다
+    (RB3-14 — 셀 종류가 행 한 줄을 낼 출력이면 요약도 한 줄은 든다) — 요약 머리 상수를 키워 만든다."""
+    monkeypatch.setattr(cr, "SUMMARY_HEAD", 10 ** 7)
+    lim = _lim(1_048_576)
     assert lim["runnable"]["summary"] is False
     assert all(lim["runnable"][k] for k in cr.CELL_KINDS) and "ctx_too_small" not in lim
     assert lim["summary"]["cover_max"] == 1, "보고하는 cover_max 는 1 아래로 내려가지 않는다(식의 max(1, …))"
@@ -425,3 +435,188 @@ def test_창_출처가_limits_에_그대로_실린다(lookup):
     s = app._model_context_state()
     lim = cr.limits(s["tokens"], s["source"], 0, retrying=s["retrying"], env={})
     assert (lim["ctx_tokens"], lim["ctx_source"], lim["ctx_retrying"]) == (128_000, "fallback", True)
+
+
+# ── 종류마다의 판(RB3-6) ──────────────────────────────────────────────────────
+def _view(lim: dict, kind: str):
+    """그 종류의 예산으로 앱이 얼리는 것 — 종류 칸·돌 수 있나·단위 상한·단위 크기 식·목록 항목."""
+    out = {"k": lim[kind], "run": lim["runnable"][kind]}
+    if kind in ("verdict", "offcard", "noinput"):
+        out.update(ub=lim["unit_body_max"], us=lim["unit_size"])
+    if kind == "sweep":
+        out["mi"] = lim["manifest_item"]
+    return out
+
+
+def _bumps():
+    """손잡이·상수를 하나씩 바꾼 limits() 부르기 — (이름, 부르는 함수)."""
+    out = [(f"env:{k}", lambda k=k, v=v: _lim(1_048_576, env={k: v})) for k, v in (
+        ("CARD_REVIEW_K", "5"), ("CARD_REVIEW_SHARE_VERDICT", "0.3"), ("CARD_REVIEW_SHARE_SWEEP", "0.6"),
+        ("CARD_REVIEW_SHARE_OFFCARD", "0.35"), ("CARD_REVIEW_SHARE_NOINPUT", "0.35"), ("CARD_REVIEW_SHARE_SUMMARY", "0.6"),
+        ("CARD_REVIEW_PARSE_RETRIES", "4"))]
+    out += [("mt", lambda: _lim(1_048_576, 40_000)), ("ctx", lambda: _lim(1_048_575))]
+    return out
+
+
+@pytest.mark.parametrize("name,call", _bumps(), ids=[n for n, _ in _bumps()])
+def test_종류의_예산이_바뀌면_그_종류의_판이_바뀐다_손잡이(name, call):
+    """오라클 — 종류마다 앱이 얼리는 예산(_view)이 바뀌면 그 종류의 판이 바뀌어야 한다(판이 예산 변화를 놓치지 않는다)."""
+    base, now = _lim(1_048_576), call()
+    for k in cr.KINDS:
+        if _view(now, k) != _view(base, k):
+            assert now["limits_rev_by_kind"][k] != base["limits_rev_by_kind"][k], (name, k)
+
+
+def _const_cases():
+    out = []
+    for name in cr.LIMITS_CONSTANTS:
+        v = getattr(cr, name)
+        for key in (list(v) if name in cr._REV_KEYED else [None]):
+            out.append((name, key))
+    return out
+
+
+@pytest.mark.parametrize("name,key", _const_cases(), ids=[f"{n}-{k}" for n, k in _const_cases()])
+def test_종류의_예산이_바뀌면_그_종류의_판이_바뀐다_상수(monkeypatch, name, key):
+    base = _lim(1_048_576)
+    v = getattr(cr, name)
+    monkeypatch.setattr(cr, name, {**v, key: _bump(v[key])} if key else _bump(v))
+    now = _lim(1_048_576)
+    for k in cr.KINDS:
+        if _view(now, k) != _view(base, k):
+            assert now["limits_rev_by_kind"][k] != base["limits_rev_by_kind"][k], (name, key, k)
+
+
+SUMMARY_ONLY = [("env", "CARD_REVIEW_SHARE_SUMMARY", "0.6"), ("env", "CARD_REVIEW_PARSE_RETRIES", "4"),
+                ("const", "SUMMARY_HEAD", None), ("const", "NARRATIVE_SHARE", None),
+                ("keyed", "TEMPLATE_ALLOW", "summary"), ("keyed", "BODY_MIN", "summary"),
+                ("keyed", "_BLOCK_SHARE", "summary"), ("keyed", "ROW_CHARS", "summary")]
+
+
+@pytest.mark.parametrize("how,name,arg", SUMMARY_ONLY, ids=[f"{h}-{n}" for h, n, _ in SUMMARY_ONLY])
+def test_요약에만_닿는_입력은_셀_종류의_판과_전체_판을_흔들지_않는다(monkeypatch, how, name, arg):
+    """RB3-6 — 판이 하나뿐이라 요약에만 닿는 손잡이·상수가 도는 셀을 처음부터 돌렸다(#37·리허설 3.3-8). 이제 요약의 판만
+    바뀐다. 시도 수(CARD_REVIEW_PARSE_RETRIES)는 cover_hard_max 를 움직이므로 요약의 판에 든다."""
+    base = _lim(1_048_576)
+    if how == "env":
+        now = _lim(1_048_576, env={name: arg})
+    else:
+        v = getattr(cr, name)
+        monkeypatch.setattr(cr, name, {**v, arg: _bump(v[arg])} if arg else _bump(v))
+        now = _lim(1_048_576)
+    assert now["limits_rev_by_kind"]["summary"] != base["limits_rev_by_kind"]["summary"], name
+    for k in cr.CELL_KINDS:
+        assert now["limits_rev_by_kind"][k] == base["limits_rev_by_kind"][k], (name, k)
+    assert now["limits_rev"] == base["limits_rev"], f"{name} 가 전체 판(M2 앱이 견주는 값)을 흔들었다"
+
+
+@pytest.mark.parametrize("how,name,arg,still", [
+    ("env", "CARD_REVIEW_SHARE_SWEEP", "0.6", ("verdict", "offcard", "noinput", "summary")),
+    ("const", "SWEEP_OUT_HEAD", None, ("verdict", "offcard", "noinput", "summary")),
+    ("const", "LONGDOC_SHARE", None, ("sweep", "verdict", "noinput", "summary")),
+    ("const", "NOINPUT_OUT_HEAD", None, ("sweep", "verdict", "offcard", "summary")),
+    ("env", "CARD_REVIEW_K", "5", ("sweep", "offcard", "noinput", "summary")),
+])
+def test_한_종류에만_닿는_입력은_다른_종류의_판을_흔들지_않는다(monkeypatch, how, name, arg, still):
+    base = _lim(1_048_576)
+    if how == "env":
+        now = _lim(1_048_576, env={name: arg})
+    else:
+        monkeypatch.setattr(cr, name, _bump(getattr(cr, name)))
+        now = _lim(1_048_576)
+    for k in still:
+        assert now["limits_rev_by_kind"][k] == base["limits_rev_by_kind"][k], (name, k)
+
+
+def test_단위_상한을_함께_쓰는_세_종류는_서로의_몫에_판이_같이_움직인다():
+    """verdict·offcard·noinput 은 단위 상한(셋의 본문 가운데 작은 것)을 함께 쓴다 — noinput 의 몫이 그 상한을 정하면 verdict 의
+    판도 바뀌어야 한다(앱이 얼린 단위가 verdict 에서 over_budget 이 되지 않게)."""
+    base = _lim(1_048_576)
+    now = _lim(1_048_576, env={"CARD_REVIEW_SHARE_NOINPUT": "0.05"})
+    assert now["unit_body_max"] != base["unit_body_max"]
+    for k in ("verdict", "offcard", "noinput"):
+        assert now["limits_rev_by_kind"][k] != base["limits_rev_by_kind"][k], k
+    assert now["limits_rev_by_kind"]["sweep"] == base["limits_rev_by_kind"]["sweep"]
+
+
+def test_판_상수는_어느_종류의_판에든_든다():
+    """LIMITS_CONSTANTS 의 이름은 종류 판 무리(_REV_BASE·_REV_KEYED·_REV_UNIT·_REV_ONLY·_REV_CELL) 가운데 하나에 든다."""
+    grouped = set(cr._REV_BASE) | set(cr._REV_KEYED) | set(cr._REV_UNIT) | set(cr._REV_CELL)
+    grouped |= {n for names in cr._REV_ONLY.values() for n in names}
+    assert set(cr.LIMITS_CONSTANTS) == grouped, sorted(set(cr.LIMITS_CONSTANTS) ^ grouped)
+
+
+def test_run_의_기대_판은_종류_판이면_그_종류만_전체_판이면_전체를_견준다():
+    """RB3-6 — expect.limits_rev_kind(M3 앱)는 요청 종류의 판과, expect.limits_rev(M2 앱)는 전체 판과 견준다. 요약 손잡이가
+    바뀌어도 셀 종류의 판을 보낸 셀 호출은 지나고, 요약의 옛 판을 보낸 요약 호출만 409 다."""
+    from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: PLC0415
+    from test_card_review_summary import summary_req  # noqa: PLC0415
+
+    base = _lim(1_048_576)
+    changed = _lim(1_048_576, env={"CARD_REVIEW_SHARE_SUMMARY": "0.6"})
+    pack = _pack()
+    off = _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0))
+    off_kind = {**off, "expect": {"limits_rev_kind": base["limits_rev_by_kind"]["offcard"]}}
+    assert cr.validate_run_request(off_kind, changed) == [], "요약 손잡이가 카드 밖 호출을 409 로 막았다"
+    m2 = {**off, "expect": {"limits_rev": base["limits_rev"]}}
+    assert cr.validate_run_request(m2, changed) == [], "요약 손잡이가 M2 앱의 전체 판을 흔들었다"
+    sm = {**summary_req(n_rows=5, n_cover=1), "expect": {"limits_rev_kind": base["limits_rev_by_kind"]["summary"]}}
+    errs = cr.validate_run_request(sm, changed)
+    assert len(errs) == 1 and (errs[0]["status"], errs[0]["code"]) == (409, "rev_mismatch"), errs
+    err = errs[0]
+    assert err["limits_rev_kind"] == changed["limits_rev_by_kind"]["summary"] and err["expect"] == sm["expect"]
+    wrong = {**off, "expect": {"limits_rev_kind": base["limits_rev_by_kind"]["verdict"]}}
+    errs = cr.validate_run_request(wrong, base)
+    assert errs and errs[0]["code"] == "rev_mismatch", "다른 종류의 판을 보냈는데 지났다"
+    long_want = {**off, "expect": {"limits_rev_kind": "x" * 5_000}}
+    errs = cr.validate_run_request(long_want, base)
+    assert len(errs) == 1 and len(errs[0]["expect"]["limits_rev_kind"]) < 100 and len(errs[0]["message"]) < 600, (
+        "기대 판을 끊지 않고 되비췄다(RB3-15)")
+
+
+@pytest.mark.parametrize("mt", [300, 800, 2_000])
+def test_출력_상한이_행_한_줄도_못_내면_셀_종류는_돌지_않고_올릴_값을_말한다(mt):
+    """RB3-14 — CARD_REVIEW_MAX_TOKENS 300·800 이면 k_out=0 인데도 셀 종류가 runnable 이었다. 출력 몫이 행 한 줄도 못 내는
+    종류는 runnable=false 이고 ctx_too_small{reason: output_cap, need_max_tokens} 다(창을 키워도 소용없다)."""
+    from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: PLC0415
+
+    lim = _lim(1_048_576, mt)
+    assert not all(lim["runnable"][k] for k in cr.CELL_KINDS), lim["runnable"]
+    small = lim["ctx_too_small"]
+    assert (small["reason"], small["need_ctx_tokens"]) == ("output_cap", None) and small["need_max_tokens"] > mt
+    assert "CARD_REVIEW_MAX_TOKENS" in small["message"]
+    ok = _lim(1_048_576, small["need_max_tokens"])
+    assert all(ok["runnable"][k] for k in cr.CELL_KINDS) and "ctx_too_small" not in ok and ok["verdict"]["k_out"] >= 1
+    pack = _pack()
+    req = _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0))
+    errs = cr.validate_run_request(req, lim)
+    assert len(errs) == 1 and (errs[0]["code"], errs[0].get("reason")) == ("ctx_too_small", "output_cap"), errs
+
+
+def test_창이_모자란_ctx_too_small_은_reason_window_다():
+    small = _lim(8_192)["ctx_too_small"]
+    assert small["reason"] == "window" and small["need_ctx_tokens"] > 8_192
+
+
+
+def test_거절은_호출자_값을_80자_안으로_되비춘다():
+    """RB3-15 — 422 가 종류·모르는 칸 이름·must_cover 의 ref 를 길이·개수 제한 없이 되비췄다."""
+    from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: PLC0415
+    from test_card_review_summary import summary_req  # noqa: PLC0415
+
+    lim = _lim(1_048_576)
+    pack = _pack()
+    base = _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0))
+    many = {**base, **{("칸" * 3_000) + str(i): 1 for i in range(50)}}
+    errs = cr.validate_run_request(many, lim)
+    assert len(errs) == 1, errs
+    e = errs[0]
+    assert e["code"] == "unknown_fields" and e["fields_n"] == 50 and len(e["fields"]) == 20, str(e)[:300]
+    assert all(len(f) <= 100 for f in e["fields"]) and len(e["message"]) < 3_000 and len(str(e["errors"])) < 6_000
+    for bad in ({**base, "kind": "k" * 5_000}, {**base, "kind": "hunt" + "x" * 5_000}):
+        errs = cr.validate_run_request(bad, lim)
+        assert len(errs) == 1 and len(errs[0]["message"]) < 300, errs[0]["message"][:120]
+    sm = summary_req(n_rows=3, n_cover=1)
+    sm["summary"]["must_cover"] = ["r" * 5_000 + str(i) for i in range(5)]
+    errs = cr.validate_run_request(sm, lim)
+    assert len(errs) == 1 and errs[0]["code"] == "bad_request" and len(errs[0]["message"]) < 800
