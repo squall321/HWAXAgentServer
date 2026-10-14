@@ -162,8 +162,10 @@ def test_남의_깃발에_낸_요청은_409_drain_owned_이고_못_지운_끄기
     client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 7_200, "by": "human:koopark", "reason": "점검"})
     r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 1_800, "by": "update-all", "reason": "1h"})
     body = r.json()
-    assert (r.status_code, body.get("code"), (body.get("drain") or {}).get("by")) == (409, "drain_owned", "human:koopark"), (
-        r.text[:300])
+    drain = body.get("drain") or {}
+    # update-all 은 주인을 drain.by 에서, 문구를 drain.hold 로 고른다 — drain_held 와 같은 _drain_view 꼴이다.
+    assert (r.status_code, body.get("code"), drain.get("by"), drain.get("scope"), drain.get("hold")) == (
+        409, "drain_owned", "human:koopark", "all", False), r.text[:300]
     assert client.get("/drain").json()["reason"] == "점검"
 
     def deny(_path):
