@@ -18,8 +18,10 @@ asyncio 기본 객체를 쓰지 않는다 — 수만 센다. 그래서 처음 �
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 
 CONCURRENCY_DEFAULT = 8           # D-34 — 낮 시간 동시 수 8(4 에서)
@@ -391,6 +393,63 @@ class DrainState:
         self._remove()
         print(f"[drain] 깃발을 내렸다(by {by}{', force' if force else ''})")
         return dict(OFF)
+
+
+# ── 챗 첫 조각 지연(D-34 '챗 첫 응답 지연이 평소의 2배를 넘으면 알린다') ─────────────────────────────
+CHAT_WINDOW = 50                  # 고리마다 최근 몇 턴
+CHAT_MIN_N = 10                   # 두 고리가 다 이만큼 있어야 slow 를 판정한다
+CHAT_SLOW_RATIO = 2.0             # review.p50 > 이 배수 × idle.p50 이면 slow
+
+
+def _pct(xs: list, q: float) -> int | None:
+    """가장 가까운 순위의 백분위(ms) — 비면 None."""
+    if not xs:
+        return None
+    ys = sorted(xs)
+    return int(ys[min(len(ys) - 1, max(0, math.ceil(q * len(ys)) - 1))])
+
+
+class ChatLoad:
+    """챗 턴의 첫 LLM 조각까지의 지연(ms)을 두 고리에 모은다 — 턴을 시작할 때 카드 대조가 0 이면 idle, 1 이상이면 review(각 최근
+    CHAT_WINDOW 턴). slow 는 두 고리가 다 CHAT_MIN_N 턴 이상이고 review.p50 > 2 × idle.p50 일 때 참이고, 참으로 바뀌면 한 줄을
+    남긴다(낮추는 것은 사람이다 — 손잡이 CARD_REVIEW_CONCURRENCY). 수만 센다(asyncio 객체 없음). 계측 실패가 챗을 건드리지
+    않게 부르는 쪽이 감싼다(app._timed_events)."""
+
+    def __init__(self, *, window: int = CHAT_WINDOW, min_n: int = CHAT_MIN_N, ratio: float = CHAT_SLOW_RATIO,
+                 clock=time.time, log=print):
+        self.window, self.min_n, self.ratio, self.clock, self.log = window, min_n, ratio, clock, log
+        self.rings = {"idle": deque(maxlen=window), "review": deque(maxlen=window)}
+        self.active = 0                   # 지금 도는 챗 턴 수
+        self.slow = False
+        self.slow_since: float | None = None
+
+    def record(self, ms: float, review_active: int) -> None:
+        ring = "review" if int(review_active or 0) > 0 else "idle"
+        self.rings[ring].append(max(0, int(ms)))
+        was = self.slow
+        self.slow = self._judge()
+        if self.slow and not was:
+            self.slow_since = self.clock()
+            r, i = self._p50("review"), self._p50("idle")
+            self.log(f"[load] ⚠ 챗 첫 조각 p50 {r}ms 가 평소 {i}ms 의 {r / max(1, i):.1f}배다(카드 대조 "
+                     f"{int(review_active or 0)}건 도는 중) — CARD_REVIEW_CONCURRENCY 를 낮춘다")
+        elif not self.slow:
+            self.slow_since = None
+
+    def _p50(self, ring: str) -> int | None:
+        return _pct(list(self.rings[ring]), 0.5)
+
+    def _judge(self) -> bool:
+        if len(self.rings["idle"]) < self.min_n or len(self.rings["review"]) < self.min_n:
+            return False
+        return self._p50("review") > self.ratio * self._p50("idle")
+
+    def snapshot(self) -> dict:
+        out = {k: {"n": len(v), "p50": _pct(list(v), 0.5), "p95": _pct(list(v), 0.95)} for k, v in self.rings.items()}
+        i, r = out["idle"]["p50"], out["review"]["p50"]
+        return {"active": self.active, "window": self.window, "ttft_ms": out,
+                "ratio_p50": round(r / i, 2) if i and r is not None else None, "slow": self.slow,
+                "slow_since": self.slow_since}
 
 
 def from_env(delib_human, env=os.environ, *, drain: DrainState | None = None) -> ReviewGate:

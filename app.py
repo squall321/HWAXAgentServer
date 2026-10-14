@@ -96,6 +96,7 @@ from deliberation import (
     strip_test_plan_trigger,
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
+import review_gate as _review_gate
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -2874,6 +2875,44 @@ def _mentioned_tools(text: str, names) -> list:
     return out
 
 
+# 챗 첫 조각 지연(M3 E3-9 · D-34) — 한 턴의 첫 on_chat_model_start 에서 첫 on_chat_model_stream 조각까지(스트리밍을 끈 박스는
+# on_chat_model_end 까지)를 잰다. LLM 줄 대기와 미리 채우기(prefill)가 드러나는 값이고 도구 왕복은 들지 않는다. 턴을 시작할 때의
+# 카드 대조 수(review_active)로 idle·review 고리에 넣는다. 계측은 챗을 건드리지 않는다 — 실패는 삼킨다.
+_CHAT_LOAD = _review_gate.ChatLoad()
+
+
+def _review_active_now() -> int:
+    if _card_review is None:
+        return 0
+    return int(_card_review.gate_of(app).active)
+
+
+async def _timed_events(events):
+    """astream_events 를 그대로 흘리며 첫 조각 지연을 한 번 잰다(_CHAT_LOAD). 지금 도는 챗 턴 수(active)도 센다."""
+    _CHAT_LOAD.active += 1
+    t0, review, done = None, 0, False
+    try:
+        async for ev in events:
+            if not done:
+                try:
+                    k = ev.get("event") if isinstance(ev, dict) else None
+                    if k == "on_chat_model_start" and t0 is None:
+                        t0, review = time.monotonic(), _review_active_now()
+                    elif t0 is not None and (k == "on_chat_model_stream" or (
+                            k == "on_chat_model_end" and getattr(app.state, "llm_nostream", False))):
+                        _CHAT_LOAD.record((time.monotonic() - t0) * 1000, review)
+                        done = True
+                except Exception as exc:  # noqa: BLE001 — 계측 실패가 챗을 죽이지 않는다
+                    done = True
+                    print(f"[load] 챗 첫 조각 계측 실패(무시) — {type(exc).__name__}: {exc}"[:200])
+            yield ev
+    finally:
+        _CHAT_LOAD.active = max(0, _CHAT_LOAD.active - 1)
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
@@ -3191,7 +3230,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
         _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
-        async for event in agent.astream_events(inputs, version="v2", config=_cfg):
+        async for event in _timed_events(agent.astream_events(inputs, version="v2", config=_cfg)):
             kind = event["event"]
             if kind == "on_chat_model_stream":
                 token = event["data"]["chunk"].content
@@ -4752,6 +4791,8 @@ def health() -> dict:
         "delib_queued": _queued,
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
         **_card_review_health(),
+        # 챗 첫 조각 지연 — idle(카드 대조 0)·review(1 이상) 고리와 slow(review.p50 > 2 × idle.p50, 두 고리 10턴 이상).
+        "load": {"chat": _CHAT_LOAD.snapshot()},
         "model": VLLM_MODEL,
         "vllm": VLLM_BASE_URL,
         "mcp": list(getattr(app.state, "connections", {})),
