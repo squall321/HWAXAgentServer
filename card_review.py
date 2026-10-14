@@ -2467,6 +2467,22 @@ async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: s
 _EMPTY_SCOPE_RE = re.compile(r"has 0 mapped records|0 mapped")
 
 
+def _search_envelope_error(d: dict) -> str:
+    """agent_search 응답이 오류 봉투인가 — 사유(아니면 ""). hits 칸이 없거나 목록이 아니면, ok:false·status error·
+    error·errors 가 있으면 '못 물었다'(failed)다 — 예전엔 hits 가 없는 오류 봉투를 빈 적중(no_hits — '물어봤고 없었다')
+    으로 읽어 앱이 다시 묻지 않았다(RB3-7). refused:true 는 오류가 아니다(최고 점수가 문턱 밑 — 적중을 그대로 쓴다)."""
+    if d.get("ok") is False:
+        return f"게이트웨이·도구가 ok:false 로 답했다({_excerpt(d.get('error') or d.get('message') or '', 120)})"
+    if str(d.get("status") or "").strip().lower() in ("error", "failed", "fail"):
+        return f"status={_excerpt(d.get('status'), 20)} 로 답했다({_excerpt(d.get('error') or d.get('message') or '', 120)})"
+    for k in ("error", "errors"):
+        if d.get(k):
+            return f"{k} 를 실어 답했다({_excerpt(d[k], 120)})"
+    if not isinstance(d.get("hits"), list):
+        return "응답에 hits 목록이 없다"
+    return ""
+
+
 async def longdoc_search(tools: dict, agent_key: str, queries: list, *, timeout_s: float) -> dict:
     """검색어마다 agent_search(agent_type, q, mode=hybrid) 한 번 — 셋을 동시에, 하나에 timeout_s. 돌려주는 것은
     {state, per_query[{q, hits[], scope_n}], scope_n, note}. state 는 ok(적중이 있다) · empty_scope(묶인 자료 0건) ·
@@ -2488,8 +2504,11 @@ async def longdoc_search(tools: dict, agent_key: str, queries: list, *, timeout_
         if isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
             return None, _RA_FAIL_WRAP.sub("", raw.strip(), count=1)[:300]
         d = _first_dict(_parse_json(raw))
-        if not d or not isinstance(d.get("hits", []), list):
+        if not d:
             return None, f"응답 모양이 다르다({_excerpt(raw, 120)})"
+        why = _search_envelope_error(d)
+        if why:
+            return None, f"«{_frame_safe(q)[:40]}» {why}"[:300]
         return d, ""
 
     got = await asyncio.gather(*(one(q) for q in queries))
@@ -2514,21 +2533,23 @@ async def longdoc_search(tools: dict, agent_key: str, queries: list, *, timeout_
 
 
 def render_excerpt(e: dict) -> str:
-    """프롬프트에 싣는 발췌 한 건(끝 줄바꿈 포함). 출처(record_id·§절)는 틀 밖 한 줄로 위생하고, 제목·본문은 «» 안이다."""
+    """프롬프트에 싣는 발췌 한 건(끝 줄바꿈 포함). 출처(record_id·§절)는 틀 밖 한 줄로 위생하고, 제목·본문은 «» 안이다.
+    끊은 발췌의 길이 표식은 «» **밖** 다음 줄이다 — 본문(인용 대조 원문)에 섞이면 표식을 옮겨 적은 인용이 대조를
+    지났다(RB3-16)."""
     head = _unquote_marks(e.get("title")).strip()
     sec = _unquote_marks(e.get("section_title")).strip()
     src = _frame_safe(e.get("record_id")) + (f" §{_frame_safe(e.get('section_id'))}" if e.get("section_id") else "")
-    return (f"[{e['alias']}] 출처 {src} · 제목 «{head}{(' › ' + sec) if sec else ''}»\n"
-            f"«{_unquote_marks(e.get('text'))}»\n")
+    text = _unquote_marks(e.get("text"))
+    mark = f"…[{int(e.get('orig_chars') or 0):,}자 중 앞 {len(text):,}자]\n" if e.get("clipped") else ""
+    return f"[{e['alias']}] 출처 {src} · 제목 «{head}{(' › ' + sec) if sec else ''}»\n«{text}»\n{mark}"
 
 
 def fit_excerpts(found: dict, exclude_ids, cap: int) -> tuple[list, dict]:
     """검색 결과 → (실을 발췌 [{alias, record_id, section_id, title, section_title, text, orig_chars, clipped}],
     meta.search 의 used·hits_n·note). 검색어마다의 순위를 번갈아(1위들 → 2위들 …) 채우고, 같은 절은 한 번, 팩 카드(exclude)는
-    뺀다. 몫(cap — 렌더 길이)을 넘는 적중은 _cut_mark 로 끊고 clipped·orig_chars 를 적는다(바닥 EXCERPT_FLOOR 자보다 좁으면
-    싣지 않는다). 몫이 다 차면 남은 적중은 싣지 않고 note 에 센다(조용히 빼지 않는다)."""
-    from deliberation import _cut_mark  # noqa: PLC0415
-
+    뺀다. 몫(cap — 렌더 길이)을 넘는 적중은 앞을 남겨 끊고 clipped·orig_chars 를 적는다(길이 표식은 render_excerpt 가 «» 밖에
+    단다 — 본문 text 에는 넣지 않는다. 바닥 EXCERPT_FLOOR 자보다 좁으면 싣지 않는다). 몫이 다 차면 남은 적중은 싣지 않고
+    note 에 센다(조용히 빼지 않는다)."""
     ex = {str(x) for x in exclude_ids or () if x}
     lists = [p["hits"] for p in found.get("per_query") or []]
     order, seen = [], set()
@@ -2550,10 +2571,10 @@ def fit_excerpts(found: dict, exclude_ids, cap: int) -> tuple[list, dict]:
              "orig_chars": len(body), "clipped": False}
         n = len(render_excerpt(e))
         if n > room:
-            fit = room - (n - len(e["text"])) - 1
+            fit = room - (n - len(e["text"])) - _MARK_ROOM      # 표식 줄(«» 밖)이 들 자리를 뺀다
             if fit < EXCERPT_FLOOR:
                 break
-            e["text"], e["clipped"] = _cut_mark(e["text"], max(1, fit - _MARK_ROOM)), True
+            e["text"], e["clipped"] = e["text"][:fit].rstrip(), True   # 본문에는 표식을 넣지 않는다(RB3-16)
             n = len(render_excerpt(e))
         out.append(e)
         room -= n

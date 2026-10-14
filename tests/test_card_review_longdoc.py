@@ -104,6 +104,21 @@ def test_못_물었으면_failed_다(make, why):
     assert f["state"] == "failed" and why in f["note"] and f["per_query"] == []
 
 
+@pytest.mark.parametrize("envelope,why", [
+    ({"error": "gateway timeout"}, "error 를 실어"),
+    ({"errors": [{"message": "upstream 502"}]}, "errors 를 실어"),
+    ({"status": "error", "message": "AIDataHub down"}, "status=error"),
+    ({"ok": False, "error": "denied"}, "ok:false"),
+    ({"refused": False, "applied_config": {"agent_record_scope": 9}}, "hits 목록이 없다"),
+    ({"hits": "없음"}, "hits 목록이 없다"),
+])
+def test_오류_봉투는_적중_0건이_아니라_failed_다(envelope, why):
+    """RB3-7 — hits 가 없는 오류 봉투를 d.get("hits", []) 로 빈 적중(no_hits — 물어봤고 없었다)으로 읽어, 앱이 인프라로
+    다시 묻지 않고 role_only 로 받았다. refused:true 는 오류가 아니다(그 경우는 위 시험들이 본다)."""
+    f = _found(Search(default=envelope))
+    assert f["state"] == "failed" and why in f["note"] and f["per_query"] == [], f
+
+
 def test_검색어_하나라도_못_물었으면_failed_이고_적중을_쓰지_않는다():
     class Mixed(Search):
         async def ainvoke(self, args):
@@ -140,6 +155,29 @@ def test_큰_적중은_몫에서_끊고_원래_길이를_적으며_남은_적중
     assert [u["clipped"] for u in fit["used"]] == [False, True]
     assert fit["used"][1]["orig_chars"] == len(big.strip()) > fit["used"][1]["chars"]
     assert "적중 3건 가운데 2건을 실었다" in fit["note"]
+
+
+def test_끊은_발췌의_길이_표식은_본문_밖이고_인용이_표식을_빌려_대조를_지나지_못한다():
+    """RB3-16 — 끊은 발췌의 '…[N자 중 앞 M자]' 표식이 발췌 본문(인용 대조 원문)에 들어 있어, 본문 끝 몇 자와 표식을 이어
+    적은 인용이 대조를 지났다. 표식은 «» 밖 다음 줄이고 대조 원문(ctx.docs 의 text)에는 없다."""
+    big = "보스 주변 리브의 열 응력은 두께가 줄면 국부 집중이 커진다 " * 400
+    found = {"per_query": [{"hits": [_hit(1, body=big)]}], "note": ""}
+    docs, fit = cr.fit_excerpts(found, [], 3_000)
+    (e,) = docs if len(docs) == 1 else (None,)
+    assert e is not None and e["clipped"] is True and "…[" not in e["text"], docs
+    shown = cr.render_excerpt(e)
+    body = shown.split("\n")[1]
+    assert body.startswith("«") and body.endswith("»") and "…[" not in body and len(shown) <= 3_000
+    assert shown.rstrip("\n").split("\n")[-1] == f"…[{e['orig_chars']:,}자 중 앞 {len(e['text']):,}자]"
+    req = {**_req("offcard", [], [], unit=_unit(0), role="열 해석 전문가"), "extra": {"search": {"queries": ["리브"]}}}
+    _sys, _human, ctx = cr.build_prompt(req, LIM, docs=docs)
+    forged = e["text"][-12:] + f" …[{e['orig_chars']:,}자 중 앞"
+    row = {"t": "f", "dir": "risk", "title": "t", "mech": "", "mech_free": "", "path": "p", "src": e["alias"],
+           "q": forged, "sev": "", "conf": "low", "check_kind": "", "check": "", "l": ["L01"]}
+    got = cr.check_rows("offcard", None, [row], ctx)["rows"][0]
+    assert got["checks"]["quote"] == "not_found", got["checks"]
+    honest = {**row, "q": e["text"][-40:]}
+    assert cr.check_rows("offcard", None, [honest], ctx)["rows"][0]["checks"]["quote"] == "ok"
 
 
 def test_몫이_바닥보다_좁으면_싣지_않는다():
