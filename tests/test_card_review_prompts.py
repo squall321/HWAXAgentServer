@@ -605,6 +605,13 @@ def test_결측_블록이_있는_훑기와_없는_훑기는_블록과_문장_하
     assert c1["input_sha"] != c0["input_sha"], "결측은 셀 입력이다"
 
 
+def _one_err(req: dict, lim: dict) -> dict:
+    """거절이 정확히 한 건인지 — 거절이 없으면 언팩 오류가 아니라 단언으로 떨어지게 한다(변이 시험이 단언 실패만 센다)."""
+    errs = cr.validate_run_request(req, lim)
+    assert len(errs) == 1, errs
+    return errs[0]
+
+
 @pytest.mark.parametrize("kind", ["verdict", "offcard"])
 def test_전문가_단위_결측은_sweep_에만_싣는다(kind):
     """다른 종류의 결측은 unit.missing(단위 결측)이다 — 둘을 섞지 않는다(422 bad_request, LLM 을 부르지 않는다)."""
@@ -612,7 +619,7 @@ def test_전문가_단위_결측은_sweep_에만_싣는다(kind):
     pack = _pack()
     cards = [c for c in pack if c["checkable"]][:2] if kind == "verdict" else [c for c in pack if not c["checkable"]]
     req = _req(kind, cards, [], unit=_unit(0), variant="fwd" if kind == "verdict" else None, extra={"missing": GAPS})
-    (err,) = cr.validate_run_request(req, lim)
+    err = _one_err(req, lim)
     assert (err["status"], err["code"]) == (422, "bad_request") and "unit.missing" in err["message"]
     req["extra"]["missing"] = []
     assert cr.validate_run_request(req, lim) == [], "빈 목록은 결측이 아니다"
@@ -659,9 +666,9 @@ def _ni_req(pack=None, unit=None, **kw):
 
 def test_입력_결손은_결측_단위에만_부르고_변형이_없다():
     lim = cr.limits(1_048_576, "server", 0, env={})
-    (err,) = cr.validate_run_request(_ni_req(unit=_unit(0, missing=0)), lim)
+    err = _one_err(_ni_req(unit=_unit(0, missing=0)), lim)
     assert (err["status"], err["code"]) == (422, "bad_request") and "unit.missing" in err["message"]
-    (err,) = cr.validate_run_request(_ni_req(variant="fwd"), lim)
+    err = _one_err(_ni_req(variant="fwd"), lim)
     assert err["code"] == "bad_request"
     assert cr.validate_run_request(_ni_req(), lim) == []
 

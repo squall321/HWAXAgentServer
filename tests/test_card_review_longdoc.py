@@ -24,7 +24,7 @@ import app as a  # noqa: E402
 import card_review as cr  # noqa: E402
 import delib_jobs  # noqa: E402
 from fakes.llm import FakeLLM  # noqa: E402
-from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: E402
+from test_card_review_prompts import _digest, _one_err, _pack, _req, _unit  # noqa: E402
 
 LIM = cr.limits(1_048_576, "server", 0, env={}, model="fake-glm")
 KEY = "sim-structural-calc"
@@ -157,14 +157,14 @@ def _req_search(queries=("리브 응력",), cards=None, kind="offcard"):
 
 @pytest.mark.parametrize("queries", [[], ["a", "b", "c", "d"], ["  "]])
 def test_검색어는_1에서_3개다(queries):
-    (err,) = cr.validate_run_request(_req_search(queries), LIM)
+    err = _one_err(_req_search(queries), LIM)
     assert (err["status"], err["code"]) == (422, "bad_request")
 
 
 def test_검색은_offcard_에만():
     req = _req_search()
     req["kind"] = "noinput"
-    (err,) = cr.validate_run_request(req, LIM)
+    err = _one_err(req, LIM)
     assert err["code"] == "bad_request" and "offcard 에만" in err["message"]
 
 

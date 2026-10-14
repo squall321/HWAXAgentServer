@@ -24,7 +24,7 @@ import app as a  # noqa: E402
 import card_review as cr  # noqa: E402
 import delib_jobs  # noqa: E402
 from fakes.llm import FakeLLM  # noqa: E402
-from test_card_review_prompts import INJ, _closed, _outside  # noqa: E402
+from test_card_review_prompts import INJ, _closed, _one_err, _outside  # noqa: E402
 
 LIM = cr.limits(1_048_576, "server", 0, env={}, model="fake-glm")
 
@@ -78,7 +78,7 @@ def _no_delib(monkeypatch):
 def test_요약_요청이_계약에_안_맞으면_422(mutate, why):
     req = summary_req()
     mutate(req)
-    (err,) = cr.validate_run_request(req, LIM)
+    err = _one_err(req, LIM)
     assert (err["status"], err["code"]) == (422, "bad_request") and why in err["message"], err
 
 
@@ -87,16 +87,16 @@ def test_다른_종류에_summary_칸을_실으면_422_이고_expert_는_있어�
 
     pack = _pack()
     v = _req("verdict", [c for c in pack if c["checkable"]][:1], [], unit=_unit(0), variant="fwd")
-    (err,) = cr.validate_run_request({**v, "summary": summary_req()["summary"]}, LIM)
+    err = _one_err({**v, "summary": summary_req()["summary"]}, LIM)
     assert err["code"] == "bad_request" and "kind=summary 에만" in err["message"]
-    (err,) = cr.validate_run_request({k: x for k, x in v.items() if k != "expert"}, LIM)
+    err = _one_err({k: x for k, x in v.items() if k != "expert"}, LIM)
     assert err["code"] == "bad_request" and "expert 가 있어야" in err["message"]
 
 
 def test_꼭_다룰_행이_cover_hard_max_를_넘으면_cover_too_large_이고_LLM_을_부르지_않는다():
     hard = LIM["summary"]["cover_hard_max"]
     req = summary_req(n_rows=hard + 5, n_cover=hard + 1)
-    (err,) = cr.validate_run_request(req, LIM)
+    err = _one_err(req, LIM)
     assert (err["status"], err["code"], err["have"], err["max"]) == (422, "cover_too_large", hard + 1, hard)
     assert cr.validate_run_request(summary_req(n_rows=hard + 5, n_cover=hard), LIM) == []
 

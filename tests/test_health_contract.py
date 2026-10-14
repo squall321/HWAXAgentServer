@@ -130,7 +130,7 @@ def test_drain_의_모양과_거절(client):
                       ({"on": True, "scope": "all", "until_idle": 5, "by": "x"}, "bad_request"),
                       ({"on": False, "by": "x", "force": "yes"}, "bad_request")):
         r = client.post("/drain", json=bad)
-        assert (r.status_code, r.json()["code"]) == (422, code), bad
+        assert (r.status_code, r.json().get("code")) == (422, code), (bad, r.status_code, r.json())
     assert client.post("/drain", content=b"{not json").status_code == 422
 
 
