@@ -77,7 +77,7 @@ def read_prompt(human: str) -> dict:
         kind = "offcard"
     named = set(re.findall(r"\b([KU]\d{2,})\b", hint)) if hint else None
     return {"kind": kind, "cards": cards, "lines": _LINE.findall(body), "units": _UNIT.findall(body),
-            "solo": '"t":"c"' in body, "hint_aliases": named, "hint": hint}
+            "solo": '"t":"c"' in body, "hint_aliases": named, "hint": hint, "gaps": "\n[결측]\n" in body}
 
 
 def quote_of(sections: list) -> str:
@@ -105,10 +105,13 @@ def default_oracle(system: str, human: str) -> list:
                          "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""})
     elif p["kind"] == "sweep":
         first = list(p["cards"])[:1]
+        # 결측 블록(cr-sweep-2)이 있으면 지시대로 '결측 때문에 가릴 수 없으면 maybe' 로 답한다(결손 훑기).
+        why = ("결측 입력이 없어 이 단위의 영향을 가릴 수 없다" if p["gaps"]
+               else "카드의 적용 조건이 이 단위에 걸릴 수 있다")
         for u in p["units"]:
             if want and u not in want:
                 continue
-            rows.append({"t": "u", "u": u, "rel": "maybe", "k": first, "why": "카드의 적용 조건이 이 단위에 걸릴 수 있다"})
+            rows.append({"t": "u", "u": u, "rel": "maybe", "k": first, "why": why})
     else:
         rows.append({"t": "f", "dir": "risk", "title": "접착 계면 들뜸 위험", "mech": "free", "mech_free": "계면 박리",
                      "path": "후면 커버 둘레 접착 계면", "l": l1, "src": "exp", "q": "", "sev": "중대", "conf": "medium",

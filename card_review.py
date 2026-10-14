@@ -725,6 +725,9 @@ def build_ctx(req: dict, lim: dict) -> dict:
             raise RequestError("deck_too_large", f"verdict 한 호출의 카드는 {k}장까지다(이 박스의 K)",
                                have=len(order), k=k)
     extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
+    if extra.get("missing") and kind != "sweep":
+        raise RequestError("bad_request", f"extra.missing(전문가 단위 결측)은 sweep 에만 싣는다 — {kind} 의 결측은 "
+                           "unit.missing(단위 결측)이다. 둘을 섞지 않는다")
 
     def codes(items, key):          # 프롬프트에 렌더한 것과 같은 위생(_code_list) — 모델은 본 코드를 고른다
         return {_frame_safe(x.get(key)) for x in items or [] if isinstance(x, dict) and _frame_safe(x.get(key))}
@@ -1479,6 +1482,10 @@ _INSTR_SWEEP = (
     '{{"t":"h","u":"U03","to":"영역 코드","why":"…"}}\n'
     "no 는 기본값이 아니다. 카드의 적용 조건과 단위의 변경을 맞대어 보고 걸리는 것이 없을 때만 no 다.\n"
 )
+# 훑기의 결측 문장(cr-sweep-2) — 전문가 단위 결측(extra.missing)이 있을 때만 붙는다. 결측이 없는 요청의 프롬프트는 이 문장과
+# [결측] 블록 말고 글자까지 같다(M3.md 4.4.1). 입력 결손 전문가의 '무관' 이 결측을 모르고 나오지 않게 한다(X1-17) — 앱은
+# 이 판의 답일 때만 그 전문가의 셀을 거른다(D-33 의 '둘 다 무관일 때만').
+_INSTR_SWEEP_MISSING = "결측 입력이 와도 무관한 단위만 no 다. 결측 때문에 가릴 수 없으면 maybe 다.\n"
 _INSTR_OFFCARD = (
     "[지시]\n"
     "당신 카드와의 대조는 다른 호출에서 끝났다([이미 판정한 것]을 되풀이하지 마라). 지금은 카드에 적혀 있지 않지만 당신 "
@@ -1561,12 +1568,17 @@ def unit_size(unit: dict) -> int:
     return n + len(rows) * max(0, 1 + alias_width(len(rows)) - 4)
 
 
+def _missing_lines(items) -> list:
+    """결측 항목 줄 — 종류는 틀 밖의 짧은 표지라 한 줄로 위생하고, 메모(원천 글)는 «» 안에 싣는다(RB-5)."""
+    return [f"- {_frame_safe(m.get('kind'))} — «{_unquote_marks(m.get('note'))}»\n"
+            for m in items or [] if isinstance(m, dict)]
+
+
 def _render_missing(unit: dict) -> str:
-    ms = [m for m in unit.get("missing") or [] if isinstance(m, dict)]
+    ms = _missing_lines(unit.get("missing"))
     if not ms:
         return ""
-    return "[결측]\n" + "".join(f"- {_frame_safe(m.get('kind'))} — «{_unquote_marks(m.get('note'))}»\n"
-                                for m in ms) + "\n"
+    return "[결측]\n" + "".join(ms) + "\n"
 
 
 def _render_unit(unit: dict, ctx: dict) -> str:
@@ -1591,7 +1603,8 @@ def _canon_sha(obj) -> str:
 def template_sha(kind: str) -> str:
     """그 종류의 틀 글(시스템·지시·고정 머리) sha — 판을 안 올리고 글을 바꿨는지 잡는 시험에만 쓴다(정본은 PROMPT_REV)."""
     parts = [_SYSTEM, "".join(_UNIT_HEADS.values())]
-    parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES], "sweep": [_INSTR_SWEEP],
+    parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES],
+              "sweep": [_INSTR_SWEEP, _INSTR_SWEEP_MISSING],
               "offcard": [_INSTR_OFFCARD]}[kind]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
 
@@ -1621,8 +1634,14 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     add("frame", f"[당신]\n{key}\n역할 «")
     add("role", _clip((f"{who} — " if who else "") + role, kl["role_max"]))
     add("frame", "»\n\n")
+    extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
     if kind != "sweep":
         add("unit", _render_missing(unit))
+    elif extra.get("missing"):
+        # 전문가 단위 결측 — 단위 목록 앞에 한 번(목록 쪽마다 같은 머리). 몫(missing_max)을 넘는 꼬리는 '외 n건' 으로 말한다.
+        add("frame", "[결측]\n")
+        add("missing", _cap_lines(_missing_lines(extra["missing"]), kl["missing_max"], "건"))
+        add("frame", "\n")
 
     order = list(ctx["card_order"])
     if kind == "verdict" and variant == "rev":
@@ -1666,7 +1685,6 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         add("frame", "\n")
     else:
         add("unit", _render_unit(unit, ctx))
-    extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
     if kind == "offcard":
         known = [k for k in extra.get("known") or [] if isinstance(k, dict)]
         if known:
@@ -1687,7 +1705,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         add("frame", (_INSTR_SOLO.format() if variant == "solo" else _INSTR_VERDICT.format(n=len(order)))
             + _INSTR_VERDICT_RULES)
     elif kind == "sweep":
-        add("frame", _INSTR_SWEEP.format())
+        add("frame", _INSTR_SWEEP.format() + (_INSTR_SWEEP_MISSING if extra.get("missing") else ""))
     else:
         add("frame", _INSTR_OFFCARD.format(f=ctx["findings_max"]))
     if hint:
@@ -2433,6 +2451,8 @@ class RunExtra(_Strict):
     domains: list[DomainItem] = []
     mechanisms: list[MechItem] = []
     known: list[KnownItem] = []
+    # 전문가 단위 결측(cr-sweep-2) — sweep 에만. 다른 종류에 실으면 422 bad_request(단위 결측은 unit.missing 이다).
+    missing: list[MissingItem] = []
 
 
 class Expect(_Strict):

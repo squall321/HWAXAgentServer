@@ -26,7 +26,7 @@ import app as a  # noqa: E402
 import card_review as cr  # noqa: E402
 import delib_jobs  # noqa: E402
 from fakes.llm import FAKE_QUOTE, Act, FakeLLM  # noqa: E402
-from test_card_review_prompts import CANARY, _digest, _pack, _req, _unit  # noqa: E402
+from test_card_review_prompts import CANARY, GAPS, _digest, _pack, _req, _unit  # noqa: E402
 
 LIM = cr.limits(1_048_576, "server", 0, env={}, model="fake-glm")
 # 지어낸 카드 열 장(점검형 여섯)에 늘린 점검형 넷 — 묶음 하나(K=8)를 채울 수 있게.
@@ -478,6 +478,16 @@ def test_sweep_은_걸리지_않은_카드를_여집합으로_낸다():
     res = _last(fr)[1]
     pack = PACK
     assert res["extras"]["unmatched_cards"] == [c["alias"] for c in pack][1:]
+
+
+def test_결측_훑기는_결측_블록을_싣고_판이_cr_sweep_2_다():
+    """입력 결손 전문가의 훑기(M3.md 4.4.1) — 앱은 meta.prompt_rev.sweep 이 cr-sweep-2 이상인 답일 때만 그 전문가의 셀을 거른다."""
+    manifest = [{"unit_id": f"u-{i:02d}", "kind": "bundle", "title": f"단위 {i}", "text": "보드 고정 보스"} for i in range(6)]
+    prep = cr.prepare(_req("sweep", PACK, [], manifest=manifest, extra={"missing": GAPS}), LIM)
+    fr, llm, _ = _go(prep, ["oracle"])
+    res = _last(fr)[1]
+    assert res["meta"]["prompt_rev"] == "cr-sweep-2" and "\n[결측]\n- ecad — «" in llm.calls[0]["human"]
+    assert {r["rel"] for r in res["rows"]} == {"maybe"} and all("결측" in r["why"] for r in res["rows"])
 
 
 def test_offcard_결과():

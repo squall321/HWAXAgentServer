@@ -100,6 +100,8 @@ def _closed(text: str) -> bool:
 
 
 MECHS = [{"code": f"mech.code_{i:02d}", "label": f"메커니즘 이름 {i}"} for i in range(52)]
+# 입력 결손 전문가의 전문가 단위 결측(리스크 앱 input-gap.v1.json 의 영역 실마리 꼴).
+GAPS = [{"kind": "ecad", "note": "보드 고정점·지지 스팬·보드 근접 계면을 볼 회로 배치(ECAD)가 이 과제에 없다"}]
 DOMAINS = [{"key": f"d{i:02d}", "label": f"영역 {i}"} for i in range(15)]
 
 
@@ -118,7 +120,7 @@ def test_틀_길이는_여유값_안이다(kind, variant):
     elif kind == "sweep":
         req["unit"], req["cards"] = None, pack
         req["manifest"] = [{"unit_id": f"u-{i}", "kind": "bundle", "title": "t", "text": "x"} for i in range(100)]
-        req["extra"] = {"domains": DOMAINS}
+        req["extra"] = {"domains": DOMAINS, "missing": GAPS}      # 결측 블록·문장까지 실은 가장 긴 틀
     else:
         req["cards"] = [c for c in pack if not c["checkable"]]
         req["digest"] = _digest(pack, [c["alias"] for c in req["cards"]])
@@ -497,6 +499,7 @@ def test_심은_지시_표지는_어느_칸에서도_틀_밖에_서지_못한다
                         extra=extra),
         "solo": _req("verdict", chk[:1], _digest(pack, [chk[0]["alias"]]), unit=_unit(0), variant="solo"),
         "sweep": _req("sweep", pack, [], manifest=manifest, extra=extra),
+        "sweep_gaps": _req("sweep", pack, [], manifest=manifest, extra={**extra, "missing": GAPS}),
         "offcard": _req("offcard", bg, _digest(pack, [c["alias"] for c in bg]), unit=_unit(0), extra=extra),
     }
     for name, req in reqs.items():
@@ -567,3 +570,49 @@ def test_ask_는_절단과_토큰을_모르면_None_으로_돌려준다(msg, wan
     text, meta = asyncio.run(cr._ask(llm, "시스템", "사람"))
     assert (text, meta["finish_reason"], meta["usage"]) == want
     assert llm.seen == [("system", "시스템"), ("human", "사람")]
+
+
+# ── M3 E3-3 — 훑기의 결측 블록(cr-sweep-2) ─────────────────────────────────────
+def _sweep_gaps_req(missing=None, pack=None):
+    manifest = [{"unit_id": f"u-{i}", "kind": "bundle", "title": f"단위 {i}", "text": "보드 고정 보스 위치 변경"}
+                for i in range(5)]
+    extra = {"domains": DOMAINS}
+    if missing is not None:
+        extra["missing"] = missing
+    return _req("sweep", pack or _pack(), [], manifest=manifest, extra=extra)
+
+
+def test_결측_블록이_있는_훑기와_없는_훑기는_블록과_문장_하나_말고_같다():
+    """M3.md 4.4.1 — 결측이 있으면 [결측] 블록과 한 문장('결측 입력이 와도 무관한 단위만 no …')이 붙고, 없는 요청의 프롬프트는
+    그 둘 말고 글자까지 같다. 블록은 [당신] 뒤·카드 앞(같은 전문가의 쪽마다 같은 머리)이다."""
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    sys_a, plain, c0 = cr.build_prompt(_sweep_gaps_req(), lim)
+    sys_b, gaps, c1 = cr.build_prompt(_sweep_gaps_req(GAPS), lim)
+    block = f"[결측]\n- ecad — «{GAPS[0]['note']}»\n\n"
+    sentence = "결측 입력이 와도 무관한 단위만 no 다. 결측 때문에 가릴 수 없으면 maybe 다.\n"
+    assert cr._INSTR_SWEEP_MISSING == sentence
+    assert block in gaps and sentence in gaps and "[결측]" not in plain and sentence not in plain
+    assert sys_a == sys_b and gaps.replace(block, "", 1).replace(sentence, "", 1) == plain
+    assert gaps.index("»\n\n[결측]") < gaps.index("[내 카드") and gaps.index(sentence) > gaps.index("[지시]")
+    assert c1["sizes"]["missing"] == len(block) - len("[결측]\n") - 1 and "missing" not in c0["sizes"]
+    assert c1["input_sha"] != c0["input_sha"], "결측은 셀 입력이다"
+
+
+@pytest.mark.parametrize("kind", ["verdict", "offcard"])
+def test_전문가_단위_결측은_sweep_에만_싣는다(kind):
+    """다른 종류의 결측은 unit.missing(단위 결측)이다 — 둘을 섞지 않는다(422 bad_request, LLM 을 부르지 않는다)."""
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    pack = _pack()
+    cards = [c for c in pack if c["checkable"]][:2] if kind == "verdict" else [c for c in pack if not c["checkable"]]
+    req = _req(kind, cards, [], unit=_unit(0), variant="fwd" if kind == "verdict" else None, extra={"missing": GAPS})
+    (err,) = cr.validate_run_request(req, lim)
+    assert (err["status"], err["code"]) == (422, "bad_request") and "unit.missing" in err["message"]
+    req["extra"]["missing"] = []
+    assert cr.validate_run_request(req, lim) == [], "빈 목록은 결측이 아니다"
+
+
+def test_결측_블록은_몫을_넘으면_외_n건으로_말한다():
+    lim = cr.limits(16_384, "server", 0, env={})
+    many = [{"kind": "ecad", "note": f"영역 실마리 {i} — 회로 배치가 없다"} for i in range(30)]
+    _, human, ctx = cr.build_prompt(_sweep_gaps_req(many), lim)
+    assert ctx["sizes"]["missing"] <= lim["sweep"]["missing_max"] and "건(이 칸의 몫" in human
