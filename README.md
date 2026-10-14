@@ -152,7 +152,7 @@ k, cq, sev, why}` · `q2{item, needs, k, l, why}` · `more` (`quality.maybe_more
 `more=yes`; a `q1` with `impact=no` or a `q2` with an empty `item` needs a reason — `checks.why="short"` is re-asked;
 `quality.ok`/`flagged` count `q1` and `q2` rows; `q1` rows fold only when identical; a repair replaces an earlier `q1`
 with the same title and card only when that row had something to fix — a wrong quote, an `impact` the engine coerced,
-or a short reason (same impact) — preferring the same impact, then the same place (`path` · `l`); and a repaired `q2` replaces the earlier empty-item `q2` whose reason was
+or a short reason (same impact) — preferring the same place (`path` · `l`), then the same impact; and a repaired `q2` replaces the earlier empty-item `q2` whose reason was
 short; above `items_max` the hits the model wrote (`yes` · `unknown`) are kept first, then engine-coerced ones, and `quality.dropped_over_cap` counts each dropped
 row once), `summary` `head` · `risk` · `conflict` ·
 `gain` · `watch` · `ask` · `para` with `r` (row aliases) and `refs` (the row refs) — `head`/`para`/`risk`/`conflict`
@@ -164,15 +164,19 @@ covered is re-asked, what is still missing after the repairs is in `result.missi
 resolve them with `meta.aliases.rows`). Several `head` lines keep the first with text (`checks.extra_heads`). When two
 rows for the same card/unit/impact disagree, a hit (WARNING·FAIL, `rel` yes·maybe, `impact` yes·unknown) is never
 displaced by a non-hit — unless the engine coerced that verdict from an out-of-vocabulary value (`rel` → `maybe`,
-`impact` → `unknown`), which an explicit answer replaces (a value differing only in case or surrounding spaces —
-`Yes`, `Fail` — is taken as written, not coerced; a coerced verdict never makes a conflict). The survivor carries `checks.dup_conflict=true` and the losing
-row as `contested_by{verdict, cq, quote, why, attempt}`; once a contesting answer's quote is verified, the survivor's
+`impact` → `unknown`, `judgement` → `undetermined`), which an explicit answer replaces. Before coercing, a value is
+matched case- and space-insensitively and through the alias table below (an aliased word is the model's explicit meaning,
+not a coercion; the raw word stays in `checks.alias` as `"<field>:<word>"`). A coerced row is never dropped without a
+trace: replaced by an explicit answer it leaves `flipped_from.raw`, and when it clashes with a row of another verdict it
+is a conflict like any other (`contested_by.raw` carries the word when the coerced row loses). The survivor carries
+`checks.dup_conflict=true` and the losing row as `contested_by{verdict, cq, quote, why, attempt}`; once a contesting answer's quote is verified, the survivor's
 own failed quote is not re-asked (its `checks.quote` stays) — for `q1` only when the contesting row is in the same place
 (`contested_by` then also carries its `path` and `l`). Between rows of the same standing, repair reasons
 (out-of-vocabulary values, failed quotes, short reasons, empty text) weigh before flag-only checks (unsourced numbers,
 refs). A repair that replaces a row with a different verdict carries `flipped_from{verdict, attempt}` (plus `raw`, the
-value the model wrote, when the replaced verdict was coerced), and a
-replacement keeps the `dup_conflict`, `contested_by` and `flipped_from` of the row it replaces. `quality.dup_conflict` and `quality.flipped` count those rows. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
+value the model wrote, when the replaced verdict was coerced; a repair that re-sends an existing explicit `q1`
+replaces a coerced `q1` only at the same place — card, `path`, `l` — and never when either row already has
+`flipped_from`), and a replacement keeps the `dup_conflict`, `contested_by` and `flipped_from` of the row it replaces. `quality.dup_conflict` and `quality.flipped` count those rows. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
 `noinput` · `rows`; offcard with search carries `meta.search{state: ok·empty_scope·no_hits·failed, queries, hits_n,
 scope_n, used[{alias, record_id, section_id, title, chars, orig_chars, clipped}], note, req_cut}` (`failed` = could
 not ask — the only one the app re-issues; an error envelope — no `hits` list, `ok:false`, `status:"error"`, `error` or
@@ -181,6 +185,19 @@ carries its length mark on the line after the closing `»`, outside the quoted t
 result carries `meta.clipped{<input>: {orig_chars, kept_chars, …}}` for the inputs cut to their share (`role`,
 `digest`, `missing`, `known` with `orig_items`/`kept_items`, `mechanisms`/`domains` with `labels_dropped`, summary
 `blocks`; `{}` when nothing was cut). Summary number checks use the text the model actually saw (not the clip mark, nor a number the clip cut in half).
+
+Enum aliases (`card_review.ENUM_ALIASES`, matched after removing case and all spaces; anything else is coerced):
+
+| field | means | words |
+|---|---|---|
+| `rel` (sweep `u`) | `no` | none · irrelevant · not relevant · n/a · 없음 · 무관 · 해당 없음 |
+| `rel` | `yes` | relevant · likely · 해당 |
+| `impact` (noinput `q1`) | `no` | none · irrelevant · not relevant · n/a · 없음 · 무관 · 해당 없음 |
+| `impact` | `yes` | likely · relevant · 해당 · 있음 |
+| `judgement` (verdict `v`) | `OK` | pass · passed · 통과 · 문제없음 |
+| `judgement` | `WARNING` | warn · 경고 |
+| `judgement` | `FAIL` | failed · 실패 |
+| `judgement` | `na` | n/a · 해당 없음 |
 
 Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,

@@ -875,25 +875,25 @@ def test_열거_밖_값을_고친_걸림은_명시적_답에_진다():
     """RB3B-2 — rel 'irrelevant' → maybe, impact 'none' → unknown 처럼 엔진이 고친 값까지 걸림으로 지켜, 보충의 명시적 답
     (rel no · impact no)이 그 오타를 고치지 못했다(앱은 dup_conflict 를 걸림으로 다루니 오타가 다투는 걸림이 됐다)."""
     sctx = _sweep_ctx()
-    r1 = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "irrelevant",
+    r1 = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "애매",
                                                           "why": "보스와 무관한 단위다"}]), "sweep")[0], sctx)
     assert r1["rows"][0]["rel"] == "maybe" and r1["repair"]
     r2 = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "no",
                                                           "why": "보스와 무관한 단위다"}]), "sweep")[0], sctx, attempt=2)
     u = next(r for r in cr.merge_rows("sweep", r1["rows"], r2["rows"], 2) if r["t"] == "u")
-    assert (u["rel"], u.get("flipped_from")) == ("no", {"verdict": ("maybe",), "attempt": 1, "raw": "irrelevant"}), u
+    assert (u["rel"], u.get("flipped_from")) == ("no", {"verdict": ("maybe",), "attempt": 1, "raw": "애매"}), u
     assert not u["checks"].get("dup_conflict")
-    one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "irrelevant", "why": "x"},
+    one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "애매", "why": "x"},
                                                           {"t": "u", "u": "U01", "k": [], "rel": "no",
                                                            "why": "보스와 무관한 단위다"}]), "sweep")[0], sctx)
     assert next(r for r in one["rows"] if r["t"] == "u")["rel"] == "no", "한 시도 안에서도 고친 값은 지키지 않는다"
     ctx = _ni_ctx()
-    first = _ni(ctx, [_q1(ctx, impact="none", title="회로 영향", why="회로 배치와 떨어져 있다고 본다", mech=""), _Q2, _MORE])
+    first = _ni(ctx, [_q1(ctx, impact="애매", title="회로 영향", why="회로 배치와 떨어져 있다고 본다", mech=""), _Q2, _MORE])
     assert [r["impact"] for r in first["rows"] if r["t"] == "q1"] == ["unknown"] and first["repair"]
     fixed = _ni(ctx, [_q1(ctx, impact="no", title="회로 영향", why="회로 배치와 떨어져 있다고 본다", mech="")], attempt=2)
     q1 = [r for r in cr.merge_rows("noinput", first["rows"], fixed["rows"], 2) if r["t"] == "q1"]
     assert [(r["impact"], r.get("flipped_from")) for r in q1] == [
-        ("no", {"verdict": ("unknown",), "attempt": 1, "raw": "none"})], q1
+        ("no", {"verdict": ("unknown",), "attempt": 1, "raw": "애매"})], q1
     # 모델이 직접 쓴 unknown 은 그대로 걸림이다 — 보충의 no 에 밀려나지 않는다.
     keep = _ni(ctx, [_q1(ctx, impact="unknown", title="회로 영향", mech=""), _Q2, _MORE])
     q1 = [r for r in cr.merge_rows("noinput", keep["rows"], fixed["rows"], 2) if r["t"] == "q1"]
@@ -992,7 +992,7 @@ def test_상한은_모델이_낸_걸림을_엔진이_고친_걸림보다_먼저_
     그 둘을 no 로 고치면 셀에 걸림이 하나도 없다(거짓 음성). 지키는 걸림, 고친 걸림, 나머지 순이다."""
     ctx = _ni_ctx()
     ctx["items_max"] = 2
-    rows = [_q1(ctx, impact="none", title="A", mech=""), _q1(ctx, impact="none", title="B", mech=""),
+    rows = [_q1(ctx, impact="애매", title="A", mech=""), _q1(ctx, impact="애매", title="B", mech=""),
             _q1(ctx, impact="yes", title="C"), _Q2, _MORE]
     res = _ni(ctx, rows)
     assert [(r["title"], r["impact"]) for r in res["rows"] if r["t"] == "q1"] == [("A", "unknown"), ("C", "yes")]
@@ -1057,20 +1057,117 @@ def test_까닭을_고친_영향_없음은_같은_카드의_줄만_갈아_낀다
     assert [(r["k"], r["checks"]["why"]) for r in merged if r["t"] == "q1"] == [(k1, "short"), (k2, "ok")]
 
 
-def test_고친_값과_명시적_답의_다툼은_다툼이_아니고_같은_줄이_고친_값의_줄을_대신한다():
-    """RB3C-6 — 한 시도의 [U01 'irrelevant', U01 no] 는 no 를 남기되 dup_conflict 를 달아 앱이 다투는 걸림으로 읽었다(고친 값은
-    모델의 답이 아니다). 한 시도의 [A 'none', A no] 는 보충이 no 를 그대로 다시 내면 겹침으로 버려져 고친 값이 끝내 남았다."""
-    one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "irrelevant", "why": "x"},
+def test_고친_값과_명시적_답의_다툼은_raw_를_실은_다툼으로_남고_같은_자리의_같은_줄만_고친_값의_줄을_대신한다():
+    """D-42 A2 — 고친 값은 걸림인지 모르는 값이라 명시적 답에 말없이 지지 않는다(RB3D-1 — 'FAILED' 가 OK 에 흔적 없이 졌다). 한
+    시도의 [U01 '애매', U01 no] 는 no 를 남기고 dup_conflict 와 contested_by.raw 를 단다. RB3C-6 — 한 시도의 [A '애매'@X, A no@X]
+    는 보충이 no@X 를 그대로 다시 내면 같은 줄이 고친 값의 줄을 대신한다. D-42 B — 다른 자리(@Y)의 고친 줄은 지우지 않는다."""
+    one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "애매", "why": "x"},
                                                           {"t": "u", "u": "U01", "k": [], "rel": "no",
                                                            "why": "보스와 무관한 단위다"}]), "sweep")[0], _sweep_ctx())
     u = next(r for r in one["rows"] if r["t"] == "u")
-    assert (u["rel"], u["checks"].get("dup_conflict"), u.get("contested_by")) == ("no", None, None), u
+    cb = u.get("contested_by") or {}
+    assert (u["rel"], u["checks"].get("dup_conflict"), cb.get("verdict"), cb.get("raw")) == ("no", True, ("maybe",), "애매"), u
     ctx = _ni_ctx()
-    no = _q1(ctx, impact="no", title="A", mech="")
-    first = _ni(ctx, [_q1(ctx, impact="none", title="A", mech=""), no, _Q2, _MORE])
+    no = _q1(ctx, impact="no", title="A", mech="", path="X")
+    first = _ni(ctx, [_q1(ctx, impact="애매", title="A", mech="", path="X"), no, _Q2, _MORE])
     assert first["repair"] and [r["impact"] for r in first["rows"] if r["t"] == "q1"] == ["unknown", "no"]
     stats: dict = {}
     merged = cr.merge_rows("noinput", first["rows"], _ni(ctx, [no], attempt=2)["rows"], 2, stats=stats)
     q1 = [r for r in merged if r["t"] == "q1"]
-    assert [(r["impact"], (r.get("flipped_from") or {}).get("raw")) for r in q1] == [("no", "none")], q1
+    assert [(r["impact"], (r.get("flipped_from") or {}).get("raw")) for r in q1] == [("no", "애매")], q1
     assert not cr.settle("noinput", merged, ctx)["repair"] and stats["dup"] == 1
+    other = _ni(ctx, [_q1(ctx, impact="애매", title="A", mech="", path="Y"), no, _Q2, _MORE])
+    merged = cr.merge_rows("noinput", other["rows"], _ni(ctx, [no], attempt=2)["rows"], 2)
+    assert [(r["path"], r["impact"]) for r in merged if r["t"] == "q1"] == [("Y", "unknown"), ("X", "no")], (
+        "다른 자리의 고친 줄을 흔적 없이 지웠다")
+
+
+
+# ── 적대 검토 6라운드(RB3D · D-42) ────────────────────────────────────────────────
+def test_판정_칸의_별칭은_그_뜻의_값이고_고친_값이_아니다():
+    """D-42 A1 — 'FAILED'·'relevant'·'likely' 같은 낱말을 열거 밖으로 고쳐 걸림인지 모르는 값이 되면, 같은 줄의 OK·no 에 흔적
+    없이 졌다(RB3D-1). 별칭 표의 낱말은 그 뜻의 값이고(보충 사유가 아니다) 원래 낱말은 checks.alias 에 남는다."""
+    ctx = _ctx(_req())
+    a, b = ctx["judge"][:2]
+    rows = [_good_v(ctx, a, judgement="FAILED"), _good_v(ctx, a, judgement="OK"), _good_v(ctx, b, judgement="  통과 ")]
+    rows += [_good_v(ctx, x) for x in ctx["judge"][2:]]
+    res = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl(rows), "verdict")[0], ctx)
+    by = {r["k"]: r for r in res["rows"]}
+    assert (by[a]["judgement"], by[a]["checks"].get("alias"), by[a]["checks"].get("dup_conflict")) == (
+        "FAIL", ["judgement:FAILED"], True), by[a]
+    assert (by[b]["judgement"], by[b]["checks"].get("alias"), by[b]["checks"]["coerced"]) == ("OK", ["judgement:통과"], [])
+    assert not res["repair"], "별칭은 보충 사유가 아니다"
+    u = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "Not  Relevant", "why": "보스와 "
+                                                         "무관한 단위다"}, {"t": "u", "u": "U02", "k": [], "rel": "relevant",
+                                                                            "why": "x"}]), "sweep")[0], _sweep_ctx())
+    assert [(r["rel"], r["checks"].get("alias")) for r in u["rows"] if r["t"] == "u"] == [
+        ("no", ["rel:Not  Relevant"]), ("yes", ["rel:relevant"])]
+    nctx = _ni_ctx()
+    q = _ni(nctx, [_q1(nctx, impact="likely", title="걸림"), _q1(nctx, impact="해당없음", title="없음", why="떨어져 있는 부품이다",
+                                                               mech=""), _Q2, _MORE])
+    assert [(r["impact"], r["checks"].get("alias")) for r in q["rows"] if r["t"] == "q1"] == [
+        ("yes", ["impact:likely"]), ("no", ["impact:해당없음"])]
+    na = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, applies="no", judgement="N/A", cq="")]),
+                                                       "verdict")[0], ctx)["rows"][0]
+    assert (na["judgement"], na["checks"]["coerced"]) == ("na", []), na
+
+
+def test_고친_판정이_명시적_답과_부딪치면_raw_를_실은_다툼으로_남는다():
+    """D-42 A2 — 표에도 없는 낱말은 고친다(judgement → undetermined). 고친 줄은 걸림인지 모르는 줄이라 명시적 OK 와 부딪치면
+    말없이 지지 않고 dup_conflict 와 contested_by.raw 를 남긴다(한 시도 안에서도, 보충에서도)."""
+    ctx = _ctx(_req())
+    a = ctx["judge"][0]
+    rest = [_good_v(ctx, x) for x in ctx["judge"][1:]]
+    one = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="보류중", need="판정에 쓸 응력 값"),
+                                                             _good_v(ctx, a, judgement="OK")] + rest), "verdict")[0], ctx)
+    k = next(r for r in one["rows"] if r["k"] == a)
+    cb = k.get("contested_by") or {}
+    assert (k["judgement"], k["checks"].get("dup_conflict"), cb.get("verdict"), cb.get("raw")) == (
+        "OK", True, ("yes", "undetermined"), "보류중"), k
+    first = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="OK")] + rest), "verdict")[0], ctx)
+    again = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(ctx, a, judgement="보류중", need="판정에 쓸 응력 값")]),
+                                                          "verdict")[0], ctx, attempt=2)
+    k = next(r for r in cr.merge_rows("verdict", first["rows"], again["rows"], 2) if r["k"] == a)
+    assert (k["judgement"], k["checks"].get("dup_conflict"), (k.get("contested_by") or {}).get("raw")) == ("OK", True, "보류중")
+
+
+def test_같은_자리의_철회가_다른_자리의_없음보다_먼저_고칠_줄이다():
+    """D-42 C — 같은 영향을 먼저 고르면 [A yes@X(지어낸 인용), A no@Y(까닭 없음)] 에서 같은 자리의 철회 no@X 가 no@Y 를 갈아
+    끼워 X 의 지어낸 인용이 남고 다툼도 없었다(RB3D-3). 같은 자리를 먼저 고른다 — X 가 다툼(같은 자리라 인용은 더 묻지 않는다)."""
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    bad = "카드에 없는 문장을 열다섯 자 넘게 지어냈다고 본다"
+    first = _ni(ctx, [_q1(ctx, k, title="A", path="X", cq=bad),
+                      _q1(ctx, k, impact="no", title="A", path="Y", cq="", why="없음", mech=""), _Q2, _MORE])
+    fix = _ni(ctx, [_q1(ctx, k, impact="no", title="A", path="X", why="보드 고정점이 이 변경과 떨어져 있다", mech="")],
+              attempt=2)
+    merged = cr.merge_rows("noinput", first["rows"], fix["rows"], 2)
+    got = [(r["path"], r["impact"], r["checks"].get("dup_conflict"), (r.get("contested_by") or {}).get("path"),
+            r["checks"].get("why")) for r in merged if r["t"] == "q1"]
+    assert got == [("X", "yes", True, "X", "ok"), ("Y", "no", None, None, "short")], got
+    assert [p[1] for p in cr.settle("noinput", merged, ctx)["problems"]] == ["why"]
+
+
+def test_같은_줄이_고친_값의_줄을_대신할_때_어느_쪽의_flipped_from_도_버리지_않는다():
+    """D-42 B — 이미 flipped_from 이 있는 줄이면 갈아 끼지 않는다(그 흔적이 사라진다). 고친 값의 줄은 그대로 남는다."""
+    ctx = _ni_ctx()
+    no = _q1(ctx, impact="no", title="A", mech="", path="X")
+    first = _ni(ctx, [_q1(ctx, impact="애매", title="A", mech="", path="X"), no, _Q2, _MORE])
+    rows = [dict(r, flipped_from={"verdict": ("yes",), "attempt": 1}) if r["t"] == "q1" and r["impact"] == "no" else r
+            for r in first["rows"]]
+    merged = cr.merge_rows("noinput", rows, _ni(ctx, [no], attempt=2)["rows"], 2)
+    got = [(r["impact"], r.get("flipped_from")) for r in merged if r["t"] == "q1"]
+    assert got == [("unknown", None), ("no", {"verdict": ("yes",), "attempt": 1})], got
+
+
+def test_README_의_별칭_표는_엔진의_표와_같다():
+    """별칭 표는 계약이다(D-42 A1 — README 계약 절). 엔진 표를 고치고 README 를 안 고치면 앱이 낡은 표를 읽는다."""
+    import re  # noqa: PLC0415
+
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    at = text.index("Enum aliases (`card_review.ENUM_ALIASES`")
+    text = text[at:text.index("\n\n", text.index("|---", at))]
+    got: dict = {}
+    for f, means, words in re.findall(r"^\| `(\w+)`[^|]*\| `(\w+)` \| ([^|]+) \|$", text, re.M):
+        got.setdefault(f, {})[means] = tuple(w.strip() for w in words.split("·"))
+    assert got == cr.ENUM_ALIASES, got
