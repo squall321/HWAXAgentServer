@@ -533,3 +533,20 @@ def test_idle_since_를_못_써도_grace_는_한_번만_선다(tmp_path, monkeyp
             assert d.snapshot()["on"] is True
         clock["t"] = t0 + 100
         assert d.snapshot()["on"] is False, "못 쓴 grace 시계가 읽을 때마다 다시 섰다"
+
+
+def test_못_지운_깃발의_풀림_줄은_5분에_한_번이다(tmp_path, monkeypatch, capsys):
+    """RB3D-6 — 수명이 끝났는데 파일을 못 지우면 읽을 때마다 '깃발 수명이 끝나 풀었다' 를 찍었다(25번 읽으면 25줄)."""
+    d, clock, _ = _drain(tmp_path)
+    d.set_on(scope="all", by="update-all", ttl_s=60)
+    clock["t"] += 100
+
+    def deny(_path):
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr(rg.os, "remove", deny)
+        for _ in range(25):
+            assert d.snapshot()["on"] is False
+    assert capsys.readouterr().out.count("수명이 끝나 풀었다") == 1
+    assert d.snapshot()["on"] is False and not (tmp_path / "drain.json").exists()

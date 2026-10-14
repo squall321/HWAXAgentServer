@@ -331,9 +331,10 @@ class DrainState:
                 pass
             raise
 
-    def _remove(self, *, strict: bool = False) -> None:
-        """파일을 지운다 — 못 지우면 한 줄 남기고, strict(끄기)면 OSError 를 그대로 올린다(내리지 못한 깃발을 내렸다고 200 으로
-        답하지 않는다 — RB3B-8). 읽는 길(수명이 끝났다·깨졌다)은 strict 가 아니다 — 다음 읽기도 꺼짐으로 읽는다."""
+    def _remove(self, *, strict: bool = False) -> bool:
+        """파일을 지운다 — 지웠거나 없으면 참. 못 지우면 한 줄 남기고(5분에 한 번) 거짓이고, strict(끄기)면 OSError 를 그대로
+        올린다(내리지 못한 깃발을 내렸다고 200 으로 답하지 않는다 — RB3B-8). 읽는 길(수명이 끝났다·깨졌다)은 strict 가 아니다 —
+        다음 읽기도 꺼짐으로 읽는다."""
         try:
             os.remove(self.path)
         except FileNotFoundError:
@@ -342,6 +343,8 @@ class DrainState:
             self._say(f"rm:{type(exc).__name__}", f"[drain] 깃발 파일을 지우지 못했다({type(exc).__name__}): {self.path}")
             if strict:
                 raise
+            return False
+        return True
 
     def _keep(self, st: dict) -> None:
         """읽는 길에서 고친 until_idle.idle_since 를 파일에 적는다. 못 쓰면(디스크 가득·권한) 한 줄 남기고 깃발은 그대로 산다 —
@@ -410,8 +413,11 @@ class DrainState:
                 self._remove()
                 return None
             if not live:
-                self._remove()
-                print(f"[drain] 깃발 수명이 끝나 풀었다(by {str(st.get('by'))[:DRAIN_BY_MAX]}, scope {st.get('scope')})")
+                note = f"[drain] 깃발 수명이 끝나 풀었다(by {str(st.get('by'))[:DRAIN_BY_MAX]}, scope {st.get('scope')})"
+                if self._remove():
+                    print(note)
+                else:                              # 못 지운 파일은 읽을 때마다 다시 풀린다 — 5분에 한 번만 남긴다(RB3D-6)
+                    self._say("release", note + " — 파일은 못 지웠다(꺼짐으로 읽는다)")
                 return None
             return st
 
