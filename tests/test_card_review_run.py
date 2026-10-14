@@ -688,3 +688,67 @@ def test_결과의_quality_가_갈린_판정과_뒤집힘을_센다():
     assert by[a]["judgement"] == "FAIL" and by[a]["checks"]["dup_conflict"] is True
     assert by[b]["judgement"] == "FAIL" and tuple(by[b]["flipped_from"]["verdict"]) == ("yes", "OK"), by[b]
     assert (res["quality"]["dup_conflict"], res["quality"]["flipped"]) == (1, 1), res["quality"]
+
+
+# ── 적대 검토 4라운드(RB3B) — 실행기에서 ───────────────────────────────────────────
+def _jl(*rows):
+    return Act(text="\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
+
+
+def _ni_q1(**kw):
+    r = {"t": "q1", "impact": "no", "title": "영향 없음", "mech": "", "mech_free": "", "path": "", "l": ["L01"], "k": "",
+         "cq": "", "sev": "", "why": "보드 고정점이 이 변경과 떨어져 있다"}
+    r.update(kw)
+    return r
+
+
+def test_까닭을_고친_보충은_한_번에_끝나고_상한이_걸린_영향을_버리지_않는다():
+    """RB3B-1 — 까닭이 짧은 q1 no(‘회로 무관’ — 실질 4자)를 보충이 고치고 걸린 영향을 하나 더 내면, 옛 줄이 남아 상한(2)을
+    차지해 걸린 영향을 버렸고(셀이 none 으로 끝나는 거짓 음성) 같은 줄을 두 번 세며 시도를 다 썼다."""
+    lim = cr.limits(1_048_576, "server", 4_096, env={}, model="fake-glm")
+    assert lim["noinput"]["items_max"] == 2
+    prep = cr.prepare(_req("noinput", PACK, _digest(PACK), unit=_unit(0),
+                           extra={"mechanisms": [{"code": "pcb.board_flex", "label": "보드 휨"}]}), lim)
+    k = prep["ctx"]["card_order"][0]
+    yes = _ni_q1(impact="yes", title="보드 휨 영향", mech="pcb.board_flex", k=k, cq=prep["ctx"]["cards"][k]["text"][:30],
+                 why="변경 줄의 간극 축소가 카드 조건과 겹친다")
+    q2 = {"t": "q2", "item": "부품 배치", "needs": "ECAD", "k": "", "l": ["L01"], "why": "간극을 본다"}
+    fr, llm, _ = _go(prep, [_jl(_ni_q1(why="회로 무관"), q2, {"t": "more", "more": "no"}), _jl(_ni_q1(), yes), _jl(_ni_q1(), yes)])
+    e, res = _last(fr)
+    assert e == "result" and len(llm.calls) == 2, (e, len(llm.calls))
+    assert [(r["impact"], r["checks"]["why"]) for r in res["rows"] if r["t"] == "q1"] == [("no", "ok"), ("yes", "ok")]
+    assert res["quality"]["dropped_over_cap"] == 0
+
+
+def test_상한에서_버린_줄을_보충이_다시_내도_한_번만_센다():
+    """RB3B-1 — 상한에서 버린 영향 줄을 보충이 그대로 다시 내 또 버리면 dropped_over_cap 이 두 번 셌다."""
+    lim = cr.limits(1_048_576, "server", 4_096, env={}, model="fake-glm")
+    prep = cr.prepare(_req("noinput", PACK, _digest(PACK), unit=_unit(0)), lim)
+    ys = [_ni_q1(impact="yes", title=f"영향 {i}", l=["L01"], why="변경 줄의 간극 축소") for i in range(3)]
+    short_q2 = {"t": "q2", "item": "", "needs": "", "k": "", "l": [], "why": "없다"}
+    good_q2 = {**short_q2, "why": "결측 입력이 와도 이 변경과 겹치는 부품이 없다"}
+    fr, llm, _ = _go(prep, [_jl(*ys, short_q2, {"t": "more", "more": "no"}), _jl(ys[2], good_q2)])
+    e, res = _last(fr)
+    assert e == "result" and len(llm.calls) == 2
+    assert [r["title"] for r in res["rows"] if r["t"] == "q1"] == ["영향 0", "영향 1"]
+    assert res["quality"]["dropped_over_cap"] == 1, res["quality"]
+
+
+def test_검증된_철회가_오면_지어낸_인용을_더_묻지_않고_진_줄을_싣는다():
+    """RB3B-3 — 지어낸 인용의 FAIL 이 보충의 검증된 OK 를 이겨 남되 보충마다 같은 인용을 다시 물어 3번을 다 썼다(d62813a 는
+    2번에 OK 로 갈았다). 걸림은 남기고(D-37) contested_by 를 싣고 두 번에 끝난다."""
+    prep = _verdict(2)
+    ctx = prep["ctx"]
+    a, b = ctx["judge"]
+
+    def v(k, judgement, cq=None):
+        return {"t": "v", "k": k, "applies": "yes", "judgement": judgement,
+                "cq": cq if cq is not None else ctx["cards"][k]["text"][:30], "l": ["L01"],
+                "why": "변경 줄과 카드를 맞대었다", "need": ""}
+
+    fr, llm, _ = _go(prep, [_jl(v(a, "FAIL", FAKE_QUOTE), v(b, "OK")), _jl(v(a, "OK")), _jl(v(a, "OK"))])
+    e, res = _last(fr)
+    assert e == "result" and len(llm.calls) == 2, len(llm.calls)
+    kept = next(r for r in res["rows"] if r["k"] == a)
+    assert (kept["judgement"], kept["checks"]["quote"], kept["contested_by"]["quote"]) == ("FAIL", "not_found", "ok")
+    assert (res["quality"]["dup_conflict"], res["quality"]["flipped"]) == (1, 0)

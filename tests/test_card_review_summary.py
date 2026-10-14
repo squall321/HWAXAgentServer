@@ -292,3 +292,18 @@ def test_서술이_길면_long():
                                                               {"t": "risk", "r": ["R001"], "text": "r"}, long_para]),
         "summary")[0], ctx)["rows"], ctx)
     assert res["long"] is True and res["narrative_chars"] == ctx["narrative_max"] + 1 and not res["repair"]
+
+
+# ── 적대 검토 4라운드(RB3B) ──────────────────────────────────────────────────────
+def test_글이_있는_head_는_표지가_많아도_빈_head_를_갈아_낀다():
+    """RB3B-4 — head 도 문제 수로 골라, 원천에 없는 수치 둘인 head(표지만)나 r 이 빈 head 가 글이 빈 head 를 못 갈아 끼고
+    missing ['head'] 로 끝났다. 빈 글은 보충 사유의 무게이고 표지는 그것을 넘지 못한다."""
+    ctx = cr.build_ctx(summary_req(n_rows=4, n_cover=1), LIM)
+    empty = _check([{"t": "head", "text": "", "r": ["R001"]}], summary_req(n_rows=4, n_cover=1))
+    for head in ({"t": "head", "text": "요지는 1,234 와 5,678 이다", "r": ["R001"]}, {"t": "head", "text": "요지다", "r": []}):
+        again = cr.check_rows("summary", None, cr.parse_rows(json.dumps(head, ensure_ascii=False), "summary")[0], ctx,
+                              attempt=2)
+        assert cr.row_issues(again["rows"][0]) >= 1, again["rows"][0]["checks"]
+        merged = cr.merge_rows("summary", empty["rows"], again["rows"], 2)
+        assert [r["text"] for r in merged if r["t"] == "head"] == [head["text"]], head
+        assert "head" not in cr.settle("summary", merged, ctx)["missing"]
