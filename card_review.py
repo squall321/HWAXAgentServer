@@ -2710,24 +2710,6 @@ async def run(app, prep: dict):
     t0 = time.monotonic()
     tag = (f"summary/- synth {_frame_safe(ctx['scope'].get('key'))[:80]}" if kind == "summary" else
            f"{kind}/{variant or '-'} {ctx['expert'].get('key', '')} {ctx['unit_id'] or '-'}")
-    got = gate.try_acquire(tag)
-    if isinstance(got, Busy):
-        why = ("리스크 검토 비우기 중이다(update-all) — 새 호출을 받지 않는다" if got.reason == "draining"
-               else f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason})")
-        yield _sse("error", _err("review_busy", f"{why}. {got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
-                                 knob="CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB",
-                                 reason=got.reason, retry_after_s=got.retry_after_s, limit=got.limit, active=got.active))
-        yield _sse("done", {})
-        print(f"[card_review] {tag} → review_busy ({got.active}/{got.limit} {got.reason})")
-        return
-
-    llm = getattr(app.state, "delib_llm", None)
-    # 카드 대조만의 출력 상한(CARD_REVIEW_MAX_TOKENS)은 이 호출에만 건다 — 심의 LLM 인스턴스는 그대로다(오류 분류는 원래 것으로).
-    own_mt = knob_max_tokens()
-    ask_llm = llm.bind(max_tokens=own_mt) if llm is not None and own_mt > 0 else llm
-    attempts_max = 1 + _parse_retries()
-    hb = float(DELIB_HEARTBEAT_S)
-    system, human0 = prep["system"], prep["human"]
     st = {"outcome": "cancelled", "truncated": False, "repaired": False, "launched": 0}
     per: list = []                       # 시도마다 {n, tokens_in, tokens_out} — 실패한 시도는 None 둘
     llm_ms: list = []
@@ -2746,7 +2728,26 @@ async def run(app, prep: dict):
         last = time.monotonic()
         return _sse(event, data)
 
+    got = gate.try_acquire(tag)
+    if isinstance(got, Busy):
+        why = ("리스크 검토 비우기 중이다(update-all) — 새 호출을 받지 않는다" if got.reason == "draining"
+               else f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason})")
+        yield _sse("error", _err("review_busy", f"{why}. {got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
+                                 knob="CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB",
+                                 reason=got.reason, retry_after_s=got.retry_after_s, limit=got.limit, active=got.active))
+        yield _sse("done", {})
+        print(f"[card_review] {tag} → review_busy ({got.active}/{got.limit} {got.reason})")
+        return
+
     try:
+        llm = getattr(app.state, "delib_llm", None)
+        # 카드 대조만의 출력 상한(CARD_REVIEW_MAX_TOKENS)은 이 호출에만 건다 — 심의 LLM 인스턴스는 그대로다(오류 분류는 원래 것으로).
+        # 자리를 잡은 뒤의 모든 것은 이 try 안이다 — bind·손잡이 읽기가 터져도 finally 가 자리를 돌려준다(RB3-9).
+        own_mt = knob_max_tokens()
+        ask_llm = llm.bind(max_tokens=own_mt) if llm is not None and own_mt > 0 else llm
+        attempts_max = 1 + _parse_retries()
+        hb = float(DELIB_HEARTBEAT_S)
+        system, human0 = prep["system"], prep["human"]
         if llm is None:
             st["outcome"] = "llm_misconfigured"
             yield frame("error", _err("llm_misconfigured", "이 서버에 심의 LLM(delib_llm)이 준비되지 않았다",

@@ -182,3 +182,23 @@ def test_사용량을_모르면_null_이다(kind):
     frames = _drain(lambda: cr.run(_app(FakeLLM(["oracle"], usage=False)), cr.prepare(_request(kind), LIM)))
     res = frames[-2][1]
     assert res["meta"]["usage"] is None, json.dumps(res["meta"], ensure_ascii=False)[:300]
+
+
+# ⑥ ──────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("kind", KINDS)
+def test_자리를_잡은_뒤_무엇이_터져도_자리를_돌려준다(kind, monkeypatch):
+    """RB3-9 — try_acquire 와 try: 사이(llm.bind·손잡이 읽기)에서 터지면 자리가 샜다. 이제 끝 프레임을 내고 자리를 돌려준다."""
+    monkeypatch.setenv("CARD_REVIEW_MAX_TOKENS", "4096")
+
+    class BadBind(FakeLLM):
+        def bind(self, **_kw):
+            raise RuntimeError("bind 실패")
+
+    app = _app(BadBind(["oracle"]))
+    try:
+        frames = _drain(lambda: cr.run(app, cr.prepare(_request(kind), LIM)))
+    except RuntimeError as exc:            # 스트림 밖으로 샌 예외 — 끝 프레임이 없었다
+        frames = [("raised", str(exc))]
+    assert [e for e, _ in frames] == ["error", "done"] and frames[0][1]["code"] == "internal_error", frames
+    g = cr.gate_of(app)
+    assert g.active == 0 and g.totals["error"] == 1, (g.active, g.totals)
