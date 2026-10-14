@@ -381,7 +381,9 @@ def test_다른_주체의_hold_아닌_요청은_합치지_않고_409_drain_owned
             got = exc
         assert got is not None and (got.status, got.code) == (409, "drain_owned"), (kw, got)
         body = got.body()
-        assert (body["drain"]["by"], body["drain"]["scope"], body["drain"]["until"]) == ("update-all", "panels", 11_800.0)
+        drain = body.get("drain") or {}
+        assert (drain.get("by"), drain.get("scope"), drain.get("until"), drain.get("hold")) == (
+            "update-all", "panels", 11_800.0, False), body
         assert "update-all" in body["message"] and "panels" in body["message"]
     after = json.loads((tmp_path / "drain.json").read_text(encoding="utf-8"))
     assert after == before, "거절한 요청이 깃발을 고쳤다(수명·scope 를 합쳤다)"
