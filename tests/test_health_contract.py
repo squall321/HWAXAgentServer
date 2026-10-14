@@ -148,8 +148,12 @@ def test_drain_거절은_호출자_값을_80자_안으로_되비추고_쓰기_�
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(cr.gate_of(a.app).drain, "_write", deny)
-    r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 600, "by": "u" * 10_000})
-    assert (r.status_code, r.json().get("code")) == (503, "drain_unavailable"), (r.status_code, r.text[:200])
+    try:
+        r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 600, "by": "u" * 10_000})
+    except PermissionError:                # 라우트 밖으로 샌 예외(500) — 사유가 없다
+        r = None
+    assert r is not None and (r.status_code, r.json().get("code")) == (503, "drain_unavailable"), (
+        r and (r.status_code, r.text[:200]))
 
 
 def test_사람의_고정은_update_all_이_풀지_못한다(client):
