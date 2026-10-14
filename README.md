@@ -163,7 +163,10 @@ verdict carries `flipped_from{verdict, attempt}`. `quality.dup_conflict` and `qu
 scope_n, used[{alias, record_id, section_id, title, chars, orig_chars, clipped}], note, req_cut}` (`failed` = could
 not ask — the only one the app re-issues; an error envelope — no `hits` list, `ok:false`, `status:"error"`, `error` or
 `errors` — is `failed`, while `refused:true` is not an error). Search runs with the user's PAT only. A clipped excerpt
-carries its length mark on the line after the closing `»`, outside the quoted text, so a quote cannot borrow the mark.
+carries its length mark on the line after the closing `»`, outside the quoted text, so a quote cannot borrow the mark. Every
+result carries `meta.clipped{<input>: {orig_chars, kept_chars, …}}` for the inputs cut to their share (`role`,
+`digest`, `missing`, `known` with `orig_items`/`kept_items`, `mechanisms`/`domains` with `labels_dropped`, summary
+`blocks`; `{}` when nothing was cut). Summary number checks use the text the model actually saw.
 
 Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,

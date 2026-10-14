@@ -704,3 +704,21 @@ def test_입력_결손의_되묻기는_이미_낸_영향을_싣는다():
     _, human, ctx = cr.build_prompt(req, lim)
     assert "[이미 낸 영향 — 되풀이하지 말고 이것 말고 더 있는 것만 낸다]\nF01  — «보드 근접 계면 간극 축소»" in human
     assert ctx["sizes"]["known"] <= lim["noinput"]["known_max"]
+
+
+
+def test_몫에서_끊은_입력은_ctx_clipped_에_원래와_남긴_길이로_적힌다():
+    """RB3-11 — 역할·영역·메커니즘·이미 낸 판정·결측을 몫에서 끊어도 결과에 표지가 없었다. 결과의 meta.clipped 가 된다."""
+    lim = cr.limits(65_536, "server", 0, env={})
+    pack = _pack()
+    mechs = [{"code": f"mechanical.code_{i:03d}", "label": "긴 이름 " * 20} for i in range(400)]
+    req = _req("offcard", [c for c in pack if not c["checkable"]], _digest(pack), unit=_unit(0), role="역할 " * 20_000,
+               extra={"mechanisms": mechs, "known": [{"alias": "K01", "judgement": "OK", "why": "까닭 " * 400}] * 200})
+    _sys, _human, ctx = cr.build_prompt(req, lim)
+    c = ctx["clipped"]
+    assert set(c) >= {"role", "mechanisms", "known"}, c
+    assert all(v["kept_chars"] < v["orig_chars"] for v in c.values())
+    assert c["known"]["orig_items"] == 200 and c["known"]["kept_items"] < 200 and c["mechanisms"]["labels_dropped"]
+    _sys, _human, plain = cr.build_prompt(_req("offcard", [c_ for c_ in pack if not c_["checkable"]], _digest(pack),
+                                               unit=_unit(0)), lim)
+    assert "clipped" not in plain

@@ -795,15 +795,20 @@ def _summary_ctx(req: dict, lim: dict) -> dict:
                            f"넘는다 — 앱은 limits.summary.cover_max({lim['summary']['cover_max']}) 안에서 고른다",
                            have=len(set(cover)), max=hard)
     blocks = [b for b in sm.get("blocks") or [] if isinstance(b, dict)]
-    num_src = "\n".join([v["text"] for v in rows.values()] +
-                        [_str(b.get("title")) + "\n" + _str(b.get("text")) for b in blocks])
-    return {
+    ctx = {
         "kind": "summary", "variant": None, "expert": {}, "unit_id": "", "cards": {}, "card_order": [], "digest": {},
-        "judge": [], "lines": {}, "units": {}, "num_src": num_src, "mechs": set(), "domains": set(),
+        "judge": [], "lines": {}, "units": {}, "num_src": "", "mechs": set(), "domains": set(),
         "findings_max": 0, "items_max": 0, "bg_dropped": 0, "docs": {},
         "rows": rows, "must_cover": list(dict.fromkeys(by_ref[x] for x in cover)), "scope": dict(scope),
         "blocks": blocks, "narrative_max": int(lim["summary"]["narrative_max"]),
     }
+    # 집계 블록은 몫(blocks_max) 안으로 여기서 렌더한다 — 끊었으면 meta.clipped.blocks 에 적고, 수치 원천은 모델이 실제로 본
+    # 글(행 전부 + 렌더한 블록)이다. 예전엔 끊기 전 블록으로 대조해, 모델이 못 본 수치를 '원천 있음' 으로 받았다(RB3-11).
+    ctx["blocks_text"] = _clip("".join(f"- {_frame_safe(b.get('name'))} · «{_unquote_marks(b.get('title'))}»\n"
+                                       f"«{_unquote_marks(b.get('text'))}»\n" for b in blocks),
+                               int(lim["summary"]["blocks_max"]), note=(ctx, "blocks")) if blocks else ""
+    ctx["num_src"] = "\n".join([v["text"] for v in rows.values()] + [ctx["blocks_text"]])
+    return ctx
 
 
 # ── 출력 파서(순수) ──────────────────────────────────────────────────────────
@@ -1905,8 +1910,7 @@ def _summary_prompt(req: dict, lim: dict, ctx: dict, hint: str) -> tuple[str, st
 
     if ctx["blocks"]:
         add("frame", _SUMMARY_HEADS[0])
-        add("blocks", _clip("".join(f"- {_frame_safe(b.get('name'))} · «{_unquote_marks(b.get('title'))}»\n"
-                                    f"«{_unquote_marks(b.get('text'))}»\n" for b in ctx["blocks"]), kl["blocks_max"]))
+        add("blocks", ctx["blocks_text"])
         add("frame", "\n")
     add("frame", _SUMMARY_HEADS[1].format(n=len(ctx["rows"])))
     add("rows", "".join(f"{a} «{_unquote_marks(v['text'])}»\n" for a, v in ctx["rows"].items()))
@@ -1946,34 +1950,51 @@ class OverBudget(RequestError):
 _MARK_ROOM = 32     # _cut_mark 표식의 최대 길이(원문 1억 자 미만에서 31자) + 1
 
 
-def _clip(s: str, cap: int) -> str:
+def _note_clip(note, orig: int, kept: int, **more) -> None:
+    """입력 하나를 몫에서 끊었으면 ctx["clipped"][이름] = {orig_chars, kept_chars, …} 로 적는다 — 결과의 meta.clipped 가
+    된다(RB3-11 — 요약의 집계 블록이 끊겨도 결과에 아무 표지가 없었다). note 는 (ctx, 이름) 이거나 None 이다."""
+    if note is not None and kept < orig:
+        ctx, name = note
+        ctx.setdefault("clipped", {})[name] = {"orig_chars": orig, "kept_chars": kept, **more}
+
+
+def _clip(s: str, cap: int, note=None) -> str:
     """cap 자 안으로 — 넘으면 앞쪽을 남기고 원문 길이 표식을 단다(표식까지 cap 안이다). 조용히 자르지 않는다."""
     from deliberation import _cut_mark  # noqa: PLC0415
 
     s = str(s or "")
-    return s if len(s) <= cap else _cut_mark(s, max(0, cap - _MARK_ROOM))
+    if len(s) <= cap:
+        return s
+    n = max(0, cap - _MARK_ROOM)
+    _note_clip(note, len(s), len(s[:n].rstrip()) if n else len(s))
+    return _cut_mark(s, n)
 
 
-def _cap_lines(lines: list, cap: int, what: str) -> str:
+def _cap_lines(lines: list, cap: int, what: str, note=None) -> str:
     """줄 목록을 cap 자 안에 싣는다 — 넘치는 꼬리는 '외 n{what}' 로 적는다(빠진 수를 말한다)."""
     out, used = [], 0
     for i, ln in enumerate(lines):
         if used + len(ln) > cap - 40:
             out.append(f"…외 {len(lines) - i}{what}(이 칸의 몫 {cap:,}자를 넘어 생략)\n")
+            _note_clip(note, sum(len(x) for x in lines), used, orig_items=len(lines), kept_items=i)
             break
         out.append(ln)
         used += len(ln)
     return "".join(out)
 
 
-def _code_list(items: list, key: str, cap: int) -> str:
+def _code_list(items: list, key: str, cap: int, note=None) -> str:
     """코드 목록(메커니즘·영역) — '코드=이름' 이 몫을 넘으면 코드만, 그래도 넘으면 표식과 함께 끊는다. 틀 밖에 서므로
-    코드·이름을 한 줄로 위생한다(RB-5). 닫힌 집합(ctx 의 mechs·domains)도 같은 위생을 거친 코드다 — 모델이 본 그대로 고른다."""
+    코드·이름을 한 줄로 위생한다(RB-5). 닫힌 집합(ctx 의 mechs·domains)도 같은 위생을 거친 코드다 — 모델이 본 그대로 고른다.
+    이름을 뗀 것도 끊은 것으로 적는다(meta.clipped)."""
     pairs = [(_frame_safe(x.get(key)), _frame_safe(x.get("label"))) for x in items or [] if isinstance(x, dict)]
     full = " · ".join(f"{c}={lb}" if lb else c for c, lb in pairs if c)
     if len(full) <= cap:
         return full
-    return _clip(" · ".join(c for c, _ in pairs if c), cap)
+    codes = " · ".join(c for c, _ in pairs if c)
+    out = _clip(codes, cap)
+    _note_clip(note, len(full), min(len(codes), len(out)), labels_dropped=True)
+    return out
 
 
 def unit_size(unit: dict) -> int:
@@ -2057,7 +2078,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
     who = " · ".join(_unquote_marks(expert.get(k)).strip() for k in ("name", "domain") if _str(expert.get(k)).strip())
     role = _unquote_marks(expert.get("role")).strip()
     add("frame", f"[당신]\n{key}\n역할 «")
-    add("role", _clip((f"{who} — " if who else "") + role, kl["role_max"]))
+    add("role", _clip((f"{who} — " if who else "") + role, kl["role_max"], note=(ctx, "role")))
     add("frame", "»\n\n")
     extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
     if kind != "sweep":
@@ -2065,7 +2086,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
     elif extra.get("missing"):
         # 전문가 단위 결측 — 단위 목록 앞에 한 번(목록 쪽마다 같은 머리). 몫(missing_max)을 넘는 꼬리는 '외 n건' 으로 말한다.
         add("frame", "[결측]\n")
-        add("missing", _cap_lines(_missing_lines(extra["missing"]), kl["missing_max"], "건"))
+        add("missing", _cap_lines(_missing_lines(extra["missing"]), kl["missing_max"], "건", note=(ctx, "missing")))
         add("frame", "\n")
 
     order = list(ctx["card_order"])
@@ -2096,7 +2117,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
                 else f"[카드 제목 {len(ctx['digest'])}장 — 전문이 실리지 않은 카드]\n")
         add("frame", head)
         add("digest", _cap_lines([f"{a} {_frame_safe(d['type']) or '미상'} · «{_unquote_marks(d['title'])}»\n"
-                                  for a, d in ctx["digest"].items()], kl["digest_max"], "장"))
+                                  for a, d in ctx["digest"].items()], kl["digest_max"], "장", note=(ctx, "digest")))
         add("frame", "\n")
     card_head = {"verdict": f"[점검 카드 {len(order)}장 — 판정 대상. 실린 순서에는 뜻이 없다]\n",
                  "sweep": f"[내 카드 {len(order)}장 — 전문]\n",
@@ -2123,7 +2144,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
         add("unit", _render_unit(unit, ctx))
     if kind == "verdict" and extra.get("mechanisms"):
         add("frame", "[메커니즘 목록]\n")
-        add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"]))
+        add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"], note=(ctx, "mechanisms")))
         add("frame", "\n\n")
     if kind in ("offcard", "noinput"):
         known = [k for k in extra.get("known") or [] if isinstance(k, dict)]
@@ -2131,15 +2152,16 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
             add("frame", "[이미 판정한 것 — 되풀이하지 마라]\n" if kind == "offcard"
                 else "[이미 낸 영향 — 되풀이하지 말고 이것 말고 더 있는 것만 낸다]\n")
             add("known", _cap_lines([f"{_frame_safe(k.get('alias'))} {_frame_safe(k.get('judgement'))} — "
-                                     f"«{_unquote_marks(k.get('why'))}»\n" for k in known], kl["known_max"], "건"))
+                                     f"«{_unquote_marks(k.get('why'))}»\n" for k in known], kl["known_max"], "건",
+                                    note=(ctx, "known")))
             add("frame", "\n")
         if extra.get("mechanisms"):
             add("frame", "[메커니즘 목록]\n")
-            add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"]))
+            add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"], note=(ctx, "mechanisms")))
             add("frame", "\n\n")
     if kind in ("sweep", "offcard") and extra.get("domains"):
         add("frame", "[영역 코드]\n")
-        add("domains", _code_list(extra["domains"], "key", kl["domains_max"]))
+        add("domains", _code_list(extra["domains"], "key", kl["domains_max"], note=(ctx, "domains")))
         add("frame", "\n\n")
 
     if kind == "verdict":
@@ -2985,7 +3007,9 @@ async def run(app, prep: dict):
                      "input_sha": ctx["input_sha"], "prompt_chars": ctx["prompt_chars"], "usage": _usage(per),
                      "finish_reason": finishes[-1] if finishes else None, "llm_ms": llm_ms,
                      "soft_over": ctx["soft_over"], "basis": ctx["basis"], "bg_dropped": ctx["bg_dropped"],
-                     "order_effective": ctx["order_effective"], "aliases": ctx["aliases"]},
+                     "order_effective": ctx["order_effective"], "aliases": ctx["aliases"],
+                     # 몫에서 끊은 입력 — {이름: {orig_chars, kept_chars, …}}(끊은 것이 없으면 {}) — RB3-11
+                     "clipped": ctx.get("clipped") or {}},
         }
         if search_meta is not None:
             result["meta"]["search"] = search_meta
