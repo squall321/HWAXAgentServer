@@ -3,39 +3,50 @@
  "kinds": [
   "sweep",
   "verdict",
-  "offcard"
+  "offcard",
+  "noinput",
+  "summary"
+ ],
+ "cell_kinds": [
+  "sweep",
+  "verdict",
+  "offcard",
+  "noinput"
  ],
  "model": "fake-glm",
  "ctx_tokens": 1048576,
  "ctx_source": "server",
  "ctx_retrying": false,
  "llm_max_tokens": null,
+ "max_tokens_source": "none",
  "out_tokens": 16000,
  "p_hard": 1008310,
- "unit_body_max": 105871,
+ "unit_body_max": 99402,
  "verdict": {
   "p": 275251,
-  "fixed": 49993,
-  "body": 225258,
+  "fixed": 63756,
+  "body": 211495,
   "role_max": 27525,
   "digest_max": 13762,
+  "mech_max": 13762,
   "hint_max": 5505,
-  "unit_body_max": 105871,
-  "card_budget": 119387,
+  "unit_body_max": 99402,
+  "card_budget": 112093,
   "k": 8,
   "k_out": 19
  },
  "sweep": {
   "p": 550502,
-  "fixed": 95986,
-  "body": 454516,
+  "fixed": 101491,
+  "body": 449011,
   "role_max": 55050,
   "domains_max": 27525,
+  "missing_max": 5505,
   "hint_max": 11010,
-  "manifest_page_max": 90903,
-  "card_budget": 363613,
+  "manifest_page_max": 89802,
+  "card_budget": 359209,
   "units_per_page_max": 64,
-  "manifest_item_max": 1420
+  "manifest_item_max": 1403
  },
  "offcard": {
   "p": 330301,
@@ -48,13 +59,43 @@
   "domains_max": 16515,
   "hint_max": 6606,
   "unit_body_max": 221004,
-  "card_budget": 115133,
-  "findings_max": 14
+  "card_budget": 121602,
+  "findings_max": 14,
+  "longdoc_max": 82575
+ },
+ "noinput": {
+  "p": 330301,
+  "fixed": 92782,
+  "body": 237519,
+  "role_max": 33030,
+  "digest_max": 16515,
+  "known_max": 16515,
+  "mech_max": 16515,
+  "hint_max": 6606,
+  "unit_body_max": 237519,
+  "card_budget": 138117,
+  "items_max": 15
+ },
+ "summary": {
+  "p": 550502,
+  "fixed": 68861,
+  "body": 481641,
+  "hint_max": 11010,
+  "blocks_max": 55050,
+  "line_max": 400,
+  "narrative_max": 2520,
+  "cover_max": 18,
+  "cover_hard_max": 54
  },
  "runnable": {
   "sweep": true,
   "verdict": true,
-  "offcard": true
+  "offcard": true,
+  "noinput": true,
+  "summary": true
+ },
+ "search": {
+  "timeout_s": 60.0
  },
  "unit_size": {
   "per_line": 11,
@@ -64,14 +105,16 @@
   "overhead": 14
  },
  "prompt_rev": {
-  "sweep": "cr-sweep-1",
-  "verdict": "cr-verdict-1",
-  "offcard": "cr-offcard-1"
+  "sweep": "cr-sweep-2",
+  "verdict": "cr-verdict-2",
+  "offcard": "cr-offcard-2",
+  "noinput": "cr-noinput-1",
+  "summary": "cr-summary-1"
  },
  "norm_rev": "cr-n1",
- "limits_rev": "21349c51",
+ "limits_rev": "36c0f10a",
  "gate": {
-  "limit": 4,
+  "limit": 8,
   "limit_reason": "normal",
   "active": 0
  }

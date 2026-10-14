@@ -1,0 +1,23 @@
+{
+ "request": {
+  "on": true,
+  "scope": "all",
+  "ttl_s": 1800,
+  "by": "update-all",
+  "reason": "update-all 1h — §2 앞"
+ },
+ "status": 200,
+ "body": {
+  "on": true,
+  "scope": "all",
+  "until": 1760401800.0,
+  "until_idle": null,
+  "hold": false,
+  "by": "update-all",
+  "reason": "update-all 1h — §2 앞",
+  "set_at": 1760400000.0,
+  "review_active": 0,
+  "delib_active": 0,
+  "delib_queued": 0
+ }
+}

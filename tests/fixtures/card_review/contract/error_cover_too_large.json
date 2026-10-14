@@ -1,0 +1,11 @@
+{
+ "status": 422,
+ "body": {
+  "code": "cover_too_large",
+  "message": "꼭 다룰 행 55건이 이 박스의 상한 54건(cover_hard_max)을 넘는다 — 앱은 limits.summary.cover_max(18) 안에서 고른다",
+  "have": 55,
+  "max": 54
+ },
+ "llm_calls": 0,
+ "_how": "req_summary_domain 의 must_cover 를 cover_hard_max+1(55)건으로"
+}

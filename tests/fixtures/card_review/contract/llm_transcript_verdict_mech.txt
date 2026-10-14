@@ -1,0 +1,5 @@
+=== 시도 1 · mech_mix · finish_reason=stop ===
+{"t": "v", "k": "K01", "applies": "yes", "judgement": "WARNING", "cq": "정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": "", "mech": "thermal.cte_mismatch", "mech_free": ""}
+{"t": "v", "k": "K02", "applies": "yes", "judgement": "FAIL", "cq": "정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": "", "mech": "not.in.taxonomy", "mech_free": ""}
+{"t": "v", "k": "K03", "applies": "yes", "judgement": "FAIL", "cq": "나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": "", "mech": "", "mech_free": ""}
+{"t": "v", "k": "K04", "applies": "yes", "judgement": "OK", "cq": "나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""}

@@ -1,0 +1,124 @@
+{
+ "kind": "offcard",
+ "variant": null,
+ "rows": [
+  {
+   "t": "f",
+   "l": [
+    "L01"
+   ],
+   "dir": "risk",
+   "title": "접착 계면 들뜸 위험",
+   "mech": "free",
+   "mech_free": "계면 박리",
+   "path": "후면 커버 둘레 접착 계면",
+   "src": "exp",
+   "q": "",
+   "sev": "중대",
+   "conf": "medium",
+   "check_kind": "test",
+   "check": "고온 고습 시험으로 박리를 본다",
+   "refs": [
+    "c:ab12cd34ef56"
+   ],
+   "basis": "경험칙",
+   "from_attempt": 1,
+   "checks": {
+    "refs": "ok",
+    "src": "exp",
+    "quote": "ok",
+    "quote_sid": "",
+    "coerced": []
+   }
+  },
+  {
+   "t": "m",
+   "seen": [],
+   "from_attempt": 1,
+   "checks": {
+    "coerced": []
+   }
+  },
+  {
+   "t": "more",
+   "more": "no",
+   "from_attempt": 1,
+   "checks": {
+    "coerced": []
+   }
+  }
+ ],
+ "missing": [],
+ "extras": {
+  "inj": []
+ },
+ "quality": {
+  "expected": 3,
+  "ok": 1,
+  "flagged": 0,
+  "missing": 0,
+  "bad_lines": 0,
+  "truncated": false,
+  "tail_broken": false,
+  "attempts": 1,
+  "repaired": false,
+  "stamp": false,
+  "dropped_over_cap": 0,
+  "maybe_more": false,
+  "dropped_alias": 0,
+  "dup": 0
+ },
+ "meta": {
+  "model": "fake-glm",
+  "ctx_tokens": 1048576,
+  "ctx_source": "server",
+  "prompt_rev": "cr-offcard-2",
+  "norm_rev": "cr-n1",
+  "limits_rev": "36c0f10a",
+  "input_sha": "d30dece70d131eacdd79fed78ff06b9c73c4042a8897ef2c00de8964f68241b9",
+  "prompt_chars": 2309,
+  "usage": {
+   "llm_calls": 1,
+   "tokens_in": 1154,
+   "tokens_out": 142,
+   "per_attempt": [
+    {
+     "n": 1,
+     "tokens_in": 1154,
+     "tokens_out": 142
+    }
+   ]
+  },
+  "finish_reason": "stop",
+  "llm_ms": [
+   0
+  ],
+  "soft_over": false,
+  "basis": "role_only",
+  "bg_dropped": 0,
+  "order_effective": true,
+  "aliases": {
+   "cards": {},
+   "lines": {
+    "L01": "c:ab12cd34ef56",
+    "L02": "c:ctx0",
+    "L03": "c:ctx1",
+    "L04": "tool:call-0",
+    "L05": "tool:call-1"
+   },
+   "units": {}
+  },
+  "search": {
+   "state": "failed",
+   "queries": [
+    "보스 둘레 리브 응력",
+    "고정점 간극 낙하"
+   ],
+   "hits_n": 0,
+   "scope_n": null,
+   "used": [],
+   "note": "«보스 둘레 리브 응력» 0.05초 안에 답하지 않았다 · «고정점 간극 낙하» 0.05초 안에 답하지 않았다",
+   "req_cut": 0
+  }
+ }
+}

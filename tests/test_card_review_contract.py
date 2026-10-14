@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import app as a  # noqa: E402
 import card_review as cr  # noqa: E402
 import delib_jobs  # noqa: E402
+import review_gate  # noqa: E402
 from fakes.llm import Act, FakeLLM  # noqa: E402
 from test_card_review_pack import KEY, Hub, _tools  # noqa: E402
 from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: E402
@@ -37,7 +38,7 @@ OUT = ROOT / "tests" / "fixtures" / "card_review" / "contract"
 _UPDATE = os.environ.get("CARD_REVIEW_CONTRACT_UPDATE") == "1"
 # 이 시험이 만드는 파일(머리 이름). 그 밖의 파일(정규화·인용 벡터·틀 잠금)은 다른 시험이 만든다.
 MANAGED = ("index.json", "rejects.json", "limits_", "pack_", "plan_", "req_", "run_", "result_", "error_",
-           "llm_transcript_")
+           "llm_transcript_", "drain_")
 MODEL = "fake-glm"
 W1M, W16K = 1_048_576, 16_384
 
@@ -65,6 +66,44 @@ def _offcard_req():
                 extra={"domains": DOMAINS, "mechanisms": MECHS, "known": known})
 
 
+def _sweep_gaps_req():
+    """입력 결손 전문가의 훑기(cr-sweep-2) — req_sweep 에 전문가 단위 결측만 더했다(프롬프트는 [결측] 블록과 한 문장만 다르다)."""
+    r = _sweep_req()
+    r["extra"] = {**r["extra"], "missing": [{"kind": "ecad", "note": "보드 고정점·지지 스팬·보드 근접 계면을 볼 회로 배치가 없다"}]}
+    return r
+
+
+def _verdict_mech_req():
+    return _req("verdict", CHECK[:4], _digest(PACK, [c["alias"] for c in CHECK[:4]]), unit=_unit(0), variant="fwd",
+                extra={"mechanisms": MECHS})
+
+
+def _noinput_req():
+    """입력 결손 두 질문 — 카드 전부(점검·배경), 단위의 결측(unit.missing), 메커니즘 목록."""
+    return _req("noinput", PACK, _digest(PACK), unit=_unit(0), extra={"mechanisms": MECHS})
+
+
+def _offcard_search_req():
+    """카드 0장 전문가의 카드 밖 호출 + 긴 문서 검색(cr-offcard-2)."""
+    r = _req("offcard", [], [], unit=_unit(0), extra={"domains": DOMAINS, "mechanisms": MECHS,
+                                                       "search": {"queries": ["보스 둘레 리브 응력", "고정점 간극 낙하"]}})
+    r["expert"] = {**r["expert"], "key": "sim-structural-calc", "name": "구조 해석", "domain": "sim"}
+    return r
+
+
+def _summary_req():
+    """영역 요약 — 등록부 행 40(리스크 앱 synth.row_line 꼴) · 꼭 다룰 행 6 · 집계 블록 하나."""
+    rows = [{"ref": f"reg:{i:012x}", "text": f"{'치명' if i < 3 else '중대'}/{'FAIL' if i < 6 else 'WARNING'} · "
+                                            f"mechanical.drop_stress · «REAR_COVER_{i}» · 제기 {i % 7 + 1}명/{i % 3 + 1}영역"}
+            for i in range(40)]
+    return {"kind": "summary", "variant": None, "target_key": "diff:" + "ab" * 16, "expert": None,
+            "summary": {"scope": {"kind": "domain", "key": "mech", "label": "기구(구조)"}, "rows": rows,
+                        "must_cover": [r["ref"] for r in rows[:6]],
+                        "blocks": [{"name": "numbers", "title": "영역 수치",
+                                    "text": "전문가 122 · 셀 검토함 2,301 · 거름 1,204 · 입력 결손 0"}]},
+            "expect": {"prompt_rev": "cr-summary-1"}}
+
+
 def _near_window_req():
     """16K 창에서 조립 길이가 창 한도 바로 밑에 닿는 verdict — 한글 본문이라 추정 토큰이 창의 85% 를 넘는다."""
     lim = cr.limits(W16K, "server", 0, model=MODEL)
@@ -79,7 +118,19 @@ REQUESTS = {
     "verdict_fwd": _verdict_req("fwd"), "verdict_rev": _verdict_req("rev"), "verdict_solo": _verdict_req("solo"),
     "verdict_one": _verdict_req(n=1), "sweep": _sweep_req(), "offcard": _offcard_req(),
     "verdict_near_window_16k": _near_window_req(),
+    # M3 — 결측 훑기 · 판정 틀의 mech · 입력 결손 두 질문 · 긴 문서 검색 · 요약
+    "sweep_gaps": _sweep_gaps_req(), "verdict_mech": _verdict_mech_req(), "noinput": _noinput_req(),
+    "offcard_search": _offcard_search_req(), "summary_domain": _summary_req(),
 }
+# 포털 중계가 덮어쓰는 신원 칸 넷 — 예제 요청 파일에는 싣지 않고 보낼 때만 더한다(긴 문서 검색은 사용자 PAT 로만 돈다).
+IDENT = {"groups": ["g"], "user_email": "u@x.com", "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
+SEARCH_HITS = {"hits": [{"record_id": f"DOC-LD-{i:04d}", "section_id": f"s{i}", "title": f"구조 해석 보고서 {i}",
+                         "section_title": "리브 응력", "score": 0.4,
+                         "snippet": f"보스 둘레 리브의 응력은 두께가 줄면 국부 집중이 커진다 — 절 {i}. 낙하 1.5 m 에서 여유가 "
+                                    "줄어든 사례가 있다."} for i in (1, 2, 3)],
+               "refused": False, "applied_config": {"agent_record_scope": 2_734}}
+SEARCH_EMPTY = {"hits": [], "refused": True, "refusal_message": "해당 자료를 찾지 못했습니다.",
+                "applied_config": {"reason": "agent 'sim-structural-calc' has 0 mapped records"}}
 # 장면 — (요청, 대본, 창). review_busy 는 대본이 아니라 관문을 미리 채운다.
 SCENES = {
     "verdict_ok": ("verdict_fwd", ["oracle"], W1M),
@@ -102,7 +153,24 @@ SCENES = {
     "context_overflow": ("verdict_near_window_16k", ["http_400"], W16K),
     "truncated_empty": ("verdict_one", ["truncate_empty"], W1M),
     "no_rows": ("verdict_one", ["prose_only"], W1M),
+    # M3
+    "sweep_gaps": ("sweep_gaps", ["oracle"], W1M),
+    "verdict_mech": ("verdict_mech", ["mech_mix"], W1M),
+    "noinput_ok": ("noinput", ["oracle"], W1M),
+    "noinput_repaired": ("noinput", ["noinput_flawed", "oracle"], W1M),
+    "noinput_capped": ("noinput", ["noinput_many"], W1M),
+    "offcard_search_ok": ("offcard_search", ["oracle"], W1M),
+    "offcard_search_empty_scope": ("offcard_search", ["oracle"], W1M),
+    "offcard_search_failed": ("offcard_search", ["oracle"], W1M),
+    "summary_ok": ("summary_domain", ["oracle"], W1M),
+    "summary_repaired": ("summary_domain", ["summary_skip_cover", "oracle"], W1M),
+    "summary_missing": ("summary_domain", ["summary_skip_cover", "summary_skip_one", "summary_skip_one"], W1M),
+    "review_busy_draining": ("verdict_one", ["oracle"], W1M),
 }
+# 장면마다 더 하는 준비 — 검색 도구의 답(사용자 PAT 로 붙는 가짜 게이트웨이)·검색 기한·비우기 깃발.
+SEARCH_SCENES = {"offcard_search_ok": ("answer", SEARCH_HITS), "offcard_search_empty_scope": ("answer", SEARCH_EMPTY),
+                 "offcard_search_failed": ("hang", None)}
+T0 = 1_760_400_000.0          # 비우기 깃발 예제의 시계(정해 둔 값 — 예제가 다시 떠도 같다)
 
 
 def _dump(obj) -> str:
@@ -227,14 +295,39 @@ def produce(monkeypatch) -> dict:
         llm = FakeLLM(script)
         c = _setup(monkeypatch, window, llm)
         held = []
+        body = REQUESTS[req_name]
         if name == "review_busy":
             gate = cr.gate_of(a.app)
             held = [gate.try_acquire("held") for _ in range(8)]
-        r = c.post("/card-review/run", json=REQUESTS[req_name])
+        if name == "review_busy_draining":
+            cr.gate_of(a.app).drain.set_on(scope="all", by="update-all", ttl_s=600)
+        if name in SEARCH_SCENES:
+            how, answer = SEARCH_SCENES[name]
+            body = {**body, **IDENT}
+            monkeypatch.setenv("CARD_REVIEW_SEARCH_TIMEOUT_S", "0.05" if how == "hang" else "60")
+
+            class _Search:
+                def __init__(self, how=how, answer=answer):
+                    self.how, self.answer = how, answer
+
+                async def ainvoke(self, _args):
+                    if self.how == "hang":
+                        await asyncio.sleep(5)
+                    return json.dumps(self.answer, ensure_ascii=False)
+
+            async def tools_by_name(*_a, _s=_Search(), **_k):
+                return {"agent_search": _s}
+
+            monkeypatch.setattr(cr, "_tools_by_name", tools_by_name)
+        r = c.post("/card-review/run", json=body)
         assert r.status_code == 200, (name, r.text[:300])
         frames = [delib_jobs._parse_sse(x.encode()) for x in r.text.split("\n\n") if x.strip()]
         for t in held:
             cr.gate_of(a.app).release(t, "ok")
+        if name == "review_busy_draining":
+            cr.gate_of(a.app).drain.set_off(by="update-all")
+        if name in SEARCH_SCENES:
+            monkeypatch.delenv("CARD_REVIEW_SEARCH_TIMEOUT_S")
         masked = [(e, _mask(e, d)) for e, d in frames]
         files[f"run_{name}.sse"] = b"".join(a._sse(e, d) for e, d in masked).decode()
         event, last = masked[-2]
@@ -242,6 +335,11 @@ def produce(monkeypatch) -> dict:
         files[final] = _dump(last)
         entry = {"request": f"req_{req_name}.json", "script": list(script),
                  "ctx_tokens": window, "frames": f"run_{name}.sse", "final": final, "llm_calls": len(llm.calls)}
+        if name in SEARCH_SCENES:
+            entry["search"] = {"how": SEARCH_SCENES[name][0], "identity": "포털이 덮어쓰는 신원 칸 넷을 더해 보냈다",
+                               **({"timeout_s": 0.05} if SEARCH_SCENES[name][0] == "hang" else {})}
+        if name == "review_busy_draining":
+            entry["drain"] = {"on": True, "scope": "all", "by": "update-all"}
         if llm.calls:
             files[f"llm_transcript_{name}.txt"] = _transcript(llm)
             entry["transcript"] = f"llm_transcript_{name}.txt"
@@ -264,6 +362,8 @@ def produce(monkeypatch) -> dict:
         "over_budget": big,
         "rev_mismatch": {**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"], "limits_rev": "00000000"}},
         "denied": {**one, "entitlements": ["feat:thinking"]},
+        # M3 — 앱이 limits.summary.cover_max 를 어겼다(꼭 다룰 행이 cover_hard_max 를 넘는다).
+        "cover_too_large": _cover_too_large(lim),
     }
     rejects = {}
     for code, b in rejects_in.items():
@@ -281,6 +381,50 @@ def produce(monkeypatch) -> dict:
     r = c.post("/card-review/run", json={**one, "expect": {"prompt_rev": lim["prompt_rev"]["verdict"],
                                                           "limits_rev": lim["limits_rev"]}})
     rejects["ctx_unknown"] = {"status": r.status_code, "body": r.json()}
+    # M3 요약의 크기 거절 둘 — LLM 0회(스트림을 열기 전). 영역을 나눠 부르지 않는다(D-22).
+    llm0 = FakeLLM(["oracle"])
+    c = _setup(monkeypatch, W1M, llm0)
+    lim = c.get("/card-review/limits").json()
+    r = c.post("/card-review/run", json=_cover_too_large(lim))
+    files["error_cover_too_large.json"] = _dump({"status": r.status_code, "body": r.json(), "llm_calls": len(llm0.calls),
+                                                  "_how": f"req_summary_domain 의 must_cover 를 cover_hard_max+1"
+                                                          f"({lim['summary']['cover_hard_max'] + 1})건으로"})
+    big_rows = [{"ref": f"reg:{i:012x}", "text": "가" * 380} for i in range(lim["p_hard"] // 390 + 10)]
+    r = c.post("/card-review/run", json={**REQUESTS["summary_domain"],
+                                         "summary": {**REQUESTS["summary_domain"]["summary"], "rows": big_rows,
+                                                     "must_cover": []}})
+    files["error_over_budget_summary.json"] = _dump({"status": r.status_code, "body": r.json(),
+                                                     "llm_calls": len(llm0.calls),
+                                                     "_how": f"req_summary_domain 의 rows 를 380자 행 {len(big_rows):,}개로"})
+    assert len(llm0.calls) == 0
+
+    # M3 비우기 — POST·GET /drain 과 그때의 /health(카드 대조 칸만). 시계는 T0 로 고정한다.
+    c = _setup(monkeypatch, W1M, FakeLLM(["oracle"]))
+    monkeypatch.setattr(a, "_CHAT_LOAD", review_gate.ChatLoad())
+    gate = cr.gate_of(a.app)
+    gate.drain.clock = lambda: T0
+    gate.drain.set_off(by="-", force=True)
+
+    def post(body):
+        r = c.post("/drain", json=body)
+        return {"request": body, "status": r.status_code, "body": r.json()}
+
+    files["drain_on_all.json"] = _dump(post({"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all",
+                                             "reason": "update-all 1h — §2 앞"}))
+    h = c.get("/health").json()
+    files["drain_health.json"] = _dump({
+        **{k: h[k] for k in ("delib_active", "delib_queued", "review_active", "draining", "drain", "capabilities")},
+        "card_review": {k: h["card_review"][k] for k in ("kinds", "limit", "limit_reason", "delib_human", "active",
+                                                         "search_timeout_s")},
+        "load": h["load"]})
+    files["drain_until_idle.json"] = _dump(post({"on": True, "scope": "panels", "by": "update-all",
+                                                 "until_idle": {"grace_s": 1800, "max_s": 46800},
+                                                 "reason": "update-all 끝 — 재기동 건너뜀 장부"}))
+    files["drain_off.json"] = _dump(post({"on": False, "by": "update-all"}))
+    post({"on": True, "scope": "all", "hold": True, "by": "human:운영자", "reason": "사람이 고정"})
+    files["drain_held.json"] = _dump(post({"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all"}))
+    files["drain_get.json"] = _dump(c.get("/drain").json())
+    gate.drain.set_off(by="human:운영자", force=True)
     # over_budget 의 본문에는 요청이 없다(크기만) — 요청은 싣지 않고 어떻게 만들었는지만 적는다.
     files["rejects.json"] = _dump({"_how": {"over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
                                             "ctx_too_small": "창 4,096 에서 req_verdict_one",
@@ -288,6 +432,15 @@ def produce(monkeypatch) -> dict:
                                                            "판을 expect 로 실은 req_verdict_one",
                                             "_else": "req_verdict_one 을 코드 이름대로 한 칸 바꿨다"}, **rejects})
     return files
+
+
+def _cover_too_large(lim: dict) -> dict:
+    """요약 요청 — 꼭 다룰 행이 그 박스의 cover_hard_max 를 하나 넘는다(앱이 cover_max 를 어겼다 — 422 cover_too_large)."""
+    hard = lim["summary"]["cover_hard_max"]
+    req = copy.deepcopy(REQUESTS["summary_domain"])
+    rows = [{"ref": f"reg:{i:012x}", "text": f"중대/WARNING · 행 {i}"} for i in range(hard + 5)]
+    req["summary"].update(rows=rows, must_cover=[r["ref"] for r in rows[:hard + 1]])
+    return req
 
 
 def _managed(name: str) -> bool:
@@ -325,7 +478,7 @@ def test_엔진이_내는_오류_코드마다_예제가_있다():
     rejects = _load("rejects.json")
     assert set(rejects) - {"_how"} == {"unknown_fields", "bad_request", "unsupported_kind", "unsupported_unit_kind",
                                        "empty_unit", "deck_too_large", "over_budget", "rev_mismatch", "denied",
-                                       "ctx_too_small", "ctx_unknown"}
+                                       "ctx_too_small", "ctx_unknown", "cover_too_large"}
     assert {rejects[k]["status"] for k in ("rev_mismatch", "denied", "ctx_unknown")} == {409, 403, 503}
     assert rejects["ctx_unknown"]["body"]["retry_after_s"] >= 1 and rejects["ctx_unknown"]["body"]["infra"] is True
 
@@ -337,7 +490,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "finish_reason", "llm_ms", "soft_over", "basis", "bg_dropped", "order_effective", "aliases"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 11
+    assert len(results) == 22
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -364,7 +517,94 @@ def test_limits_예제의_판이_팩_결과와_같다():
     assert "ctx_too_small" in _load("limits_ctx_too_small.json")
 
 
-@pytest.mark.parametrize("name", ["req_verdict_fwd.json", "req_sweep.json", "req_offcard.json", "req_verdict_solo.json"])
+@pytest.mark.parametrize("name", ["req_verdict_fwd.json", "req_sweep.json", "req_offcard.json", "req_verdict_solo.json",
+                                  "req_sweep_gaps.json", "req_verdict_mech.json", "req_noinput.json",
+                                  "req_offcard_search.json", "req_summary_domain.json"])
 def test_요청_예제는_app_없는_검증기를_지난다(name):
     lim = _load("limits_1m.json")
     assert cr.validate_run_request(_load(name), lim) == []
+
+
+# ── M3 예제가 계약(M3.md 4.3~4.7)을 싣는다 ──────────────────────────────────────────
+def test_M3_limits_예제():
+    lim = _load("limits_1m.json")
+    assert lim["kinds"] == ["sweep", "verdict", "offcard", "noinput", "summary"]
+    assert lim["cell_kinds"] == ["sweep", "verdict", "offcard", "noinput"] and lim["api_rev"] == "cr-1"
+    assert lim["runnable"] == dict.fromkeys(lim["kinds"], True) and lim["max_tokens_source"] == "none"
+    assert (lim["noinput"]["items_max"], lim["summary"]["cover_max"], lim["summary"]["cover_hard_max"],
+            lim["summary"]["narrative_max"], lim["summary"]["line_max"]) == (15, 18, 54, 2_520, 400)
+    assert lim["offcard"]["longdoc_max"] > 0 and lim["verdict"]["mech_max"] > 0 and lim["search"] == {"timeout_s": 60.0}
+    assert lim["prompt_rev"] == {"sweep": "cr-sweep-2", "verdict": "cr-verdict-2", "offcard": "cr-offcard-2",
+                                 "noinput": "cr-noinput-1", "summary": "cr-summary-1"}
+    assert lim["gate"] == {"limit": 8, "limit_reason": "normal", "active": 0}
+
+
+def test_M3_결측_훑기_예제는_결측_블록과_문장만_다르다():
+    lim = _load("limits_1m.json")
+    _, plain, _ = cr.build_prompt(_load("req_sweep.json"), lim)
+    _, gaps, _ = cr.build_prompt(_load("req_sweep_gaps.json"), lim)
+    note = _load("req_sweep_gaps.json")["extra"]["missing"][0]["note"]
+    block = f"[결측]\n- ecad — «{note}»\n\n"
+    assert gaps.replace(block, "", 1).replace(cr._INSTR_SWEEP_MISSING, "", 1) == plain
+    assert _load("result_sweep_gaps.json")["meta"]["prompt_rev"] == "cr-sweep-2"
+
+
+def test_M3_입력_결손_예제():
+    ok = _load("result_noinput_ok.json")
+    q1 = [r for r in ok["rows"] if r["t"] == "q1"]
+    assert [r["impact"] for r in q1] == ["yes", "yes"] and sum(r["t"] == "q2" for r in ok["rows"]) == 2
+    assert next(r["more"] for r in ok["rows"] if r["t"] == "more") == "no"
+    assert (ok["meta"]["basis"], ok["quality"]["attempts"], ok["quality"]["maybe_more"]) == ("noinput", 1, False)
+    rep = _load("result_noinput_repaired.json")
+    assert rep["quality"]["attempts"] == 2 and rep["missing"] == []
+    hint = (OUT / "llm_transcript_noinput_repaired.txt").read_text(encoding="utf-8")
+    assert "=== 시도 2" in hint
+    cap = _load("result_noinput_capped.json")
+    assert cap["quality"]["maybe_more"] is True and cap["quality"]["dropped_over_cap"] == 2
+
+
+def test_M3_판정_틀_mech_예제():
+    res = _load("result_verdict_mech.json")
+    assert res["quality"]["attempts"] == 1 and res["meta"]["prompt_rev"] == "cr-verdict-2"
+    got = [(r["judgement"], r["mech"], r["mech_free"], r["checks"]["mech"]) for r in res["rows"][:3]]
+    assert got == [("WARNING", "thermal.cte_mismatch", "", "ok"), ("FAIL", "free", "not.in.taxonomy", "free"),
+                   ("FAIL", "", "", "missing")]
+
+
+def test_M3_긴_문서_검색_예제():
+    ok, empty, failed = (_load(f"result_offcard_search_{x}.json") for x in ("ok", "empty_scope", "failed"))
+    assert (ok["meta"]["search"]["state"], ok["meta"]["basis"]) == ("ok", "search_only")
+    assert [u["alias"] for u in ok["meta"]["search"]["used"]] == ["D01", "D02", "D03"]
+    assert any(r["t"] == "f" and r["src"] == "D01" and r["checks"]["quote"] == "ok" for r in ok["rows"])
+    assert (empty["meta"]["search"]["state"], empty["meta"]["basis"]) == ("empty_scope", "role_only")
+    assert "묶인 자료 0건" in empty["meta"]["search"]["note"]
+    assert (failed["meta"]["search"]["state"], failed["meta"]["basis"]) == ("failed", "role_only")
+    frames = (OUT / "run_offcard_search_ok.sse").read_text(encoding="utf-8")
+    assert frames.startswith('event: status\ndata: {"step": "search"}')
+
+
+def test_M3_요약_예제():
+    ok, rep, miss = (_load(f"result_summary_{x}.json") for x in ("ok", "repaired", "missing"))
+    assert (ok["missing"], ok["quality"]["attempts"], ok["meta"]["basis"]) == ([], 1, "rows")
+    assert (rep["missing"], rep["quality"]["attempts"]) == ([], 2)
+    assert (miss["missing"], miss["quality"]["attempts"]) == (["R001"], 3)
+    assert ok["meta"]["aliases"]["rows"]["R001"] == _load("req_summary_domain.json")["summary"]["rows"][0]["ref"]
+    cover, over = _load("error_cover_too_large.json"), _load("error_over_budget_summary.json")
+    assert (cover["status"], cover["body"]["code"], cover["llm_calls"]) == (422, "cover_too_large", 0)
+    assert (over["status"], over["body"]["code"], over["llm_calls"]) == (422, "over_budget", 0)
+
+
+def test_M3_비우기_예제():
+    on, idle, off, held, got = (_load(f"drain_{x}.json") for x in ("on_all", "until_idle", "off", "held", "get"))
+    assert (on["status"], on["body"]["on"], on["body"]["scope"], on["body"]["until"] - on["body"]["set_at"]) == (
+        200, True, "all", 1800)
+    assert idle["body"]["scope"] == "panels" and idle["body"]["until_idle"]["max_s"] == 46800
+    assert off["body"]["on"] is False
+    assert (held["status"], held["body"]["code"], held["body"]["drain"]["hold"]) == (409, "drain_held", True)
+    assert set(got) == {"on", "scope", "until", "until_idle", "hold", "by", "reason", "set_at", "review_active",
+                        "delib_active", "delib_queued"}
+    h = _load("drain_health.json")
+    assert (h["draining"], h["card_review"]["limit"], h["card_review"]["limit_reason"]) == (True, 0, "draining")
+    assert h["capabilities"] == ["card_review", "drain"]
+    busy = _load("error_review_busy_draining.json")
+    assert (busy["code"], busy["reason"], busy["retry_after_s"], busy["limit"]) == ("review_busy", "draining", 60, 0)

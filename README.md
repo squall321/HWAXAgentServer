@@ -106,16 +106,18 @@ read, so the `list/` folder is derived data and may be deleted.
 ### Card review
 
 `card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review
-redesign M2, `HWAXPortal/docs/risk-review-redesign/M2.md` §4 is the contract). The risk app calls it through
+redesign M2, `HWAXPortal/docs/risk-review-redesign/M2.md` §4 is the contract; M3 adds two kinds, the long-document
+search, `mech` and drain — `M3.md` §4.3–4.7). The risk app calls it through
 the portal relay `/agent/card-review/*`, which overwrites the four identity fields (`groups`, `user_email`,
 `user_pat`, `entitlements`). Not a meeting: no tools, no seats, one LLM call per request (plus repairs).
 
 | route | what |
 |---|---|
-| `GET /card-review/limits` | Budgets derived from the context window (`ctx_source` = `server` · `env` · `fallback`, `ctx_retrying`), `runnable{}` and `ctx_too_small` when the window is too small (units are never re-split), versions (`prompt_rev`, `norm_rev`, `limits_rev`) and `gate{limit, limit_reason, active}`. |
+| `GET /card-review/limits` | Budgets derived from the context window (`ctx_source` = `server` · `env` · `fallback`, `ctx_retrying`), `kinds` (five) and `cell_kinds` (four — `ctx_too_small` looks at these only; a box that cannot run `summary` says `runnable.summary=false` and keeps doing cell work), per kind budgets (`noinput.items_max`, `summary.{line_max, narrative_max, cover_max, cover_hard_max}`, `verdict.mech_max`, `offcard.longdoc_max`), `llm_max_tokens` + `max_tokens_source` (`card_review` · `delib` · `none`), `search.timeout_s`, versions (`prompt_rev` per kind, `norm_rev`, `limits_rev`) and `gate{limit, limit_reason, active}`. |
 | `POST /card-review/pack` | `{agent_key}` → all of the expert's cards, normalised (`pack_hash`). User PAT only — a rejected PAT stops with `credential_*` (the remaining card fetches are cancelled at once), it never falls back to the service account. At most 2 packs are built at a time; a request that cannot get a slot within 30 s gets 429 `review_busy{retry_after_s, limit}` instead of queueing past the portal's unary timeout, and a build whose caller has gone away is cancelled. |
 | `POST /card-review/plan` | `{cards[{alias, record_id, checkable, chars}], units[{unit_id, manifest_chars, body_chars}]}` → verdict decks, sweep decks, manifest pages, `oversize`, `soft_over`, `pair_over[{deck_id, unit_id, need, have}]`, planned against the current `limits_rev`. Every (verdict deck, unit) and (sweep deck, manifest page) pair it hands out fits the window; a pair that only fits card by card is listed in `pair_over` (run those cards for that unit as `solo`), and a unit that does not fit even with its largest card is in `oversize.units`. |
-| `POST /card-review/run` | One call (`kind` = `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`). SSE: `status{step:"attempt", n}` · `ping{idle_s, ts}` · `result` · `error{code, message, infra, retryable, knob?}` · `done`. No `hello` frame. |
+| `POST /card-review/run` | One call (`kind` = `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard` · `noinput` · `summary`). SSE: `status{step:"search"}` (offcard with `extra.search` only) · `status{step:"attempt", n}` · `ping{idle_s, ts}` · `result` · `error{code, message, infra, retryable, knob?}` · `done`. No `hello` frame. |
+| `POST /drain` · `GET /drain` | The update-all drain flag (not relayed by the portal, loopback only): `{on, scope: all\|panels, ttl_s \| until_idle{grace_s, max_s}, hold?, by, reason, force?}`. Life only grows; a `hold` flag is changed only by a `hold` request; turning off needs the same `by` (or `force`) — otherwise 409 `drain_held`. `scope=all` makes the gate 0 (`review_busy{reason:"draining", retry_after_s: 60}` for run and pack), `panels` only tells the risk app not to pick new panels. The flag is a file (`DRAIN_STATE_PATH`, default `<ARTIFACT_DIR>/review-drain.json`) and survives a restart. |
 
 Request models are `extra="forbid"` at every level, nested items included: an undeclared field is a 422
 `unknown_fields` naming its path (`extra.known.0.reason`), not silently dropped. The `run` body (`?` = optional,
@@ -123,15 +125,16 @@ text fields accept `null` as empty):
 
 | field | shape |
 |---|---|
-| `kind` · `variant` · `target_key` | `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard`; `variant` is `null` except for verdict |
-| `expert` | `{key, name?, domain?, role?}` — `key` is 1–120 chars without whitespace, `«»`, braces or brackets |
+| `kind` · `variant` · `target_key` | `sweep` · `verdict` (`fwd`·`rev`·`solo`) · `offcard` · `noinput` · `summary`; `variant` is `null` except for verdict |
+| `expert` | `{key, name?, domain?, role?}` — `key` is 1–120 chars without whitespace, `«»`, braces or brackets. `null` for (and only for) `summary` |
+| `summary` | `{scope{kind: domain\|target, key, label?}, rows[{ref, text}], must_cover[ref], blocks[{name, title?, text?}]}` — `summary` only; rows get `R001…` aliases, `must_cover` above `cover_hard_max` is 422 `cover_too_large`, an assembled prompt above `p_hard` is 422 `over_budget` (never re-split) |
 | `cards[]` | pack cards exactly as `/pack` returned them (`alias`, `sections[{sid, title, text}]`, …), sent back unchanged |
 | `digest[]` | `{alias, type?, title?, record_id?, card_id?}` — background cards shown by title only (verdict · offcard) |
 | `unit` | `{unit_id, kind?, title?, summary?, notes?, lines[], context[], evidence[], missing[], unit_hash?, summary_sha?, evidence_sha?, evidence_status?, input_gaps?}` for verdict · offcard, `null` for sweep |
 | `unit.lines[]` · `context[]` · `evidence[]` | `{ref, text, owner_unit?}` |
 | `unit.missing[]` | `{kind, note?}` (e.g. `{"kind": "ecad", "note": "회로 변경 정보가 없다"}`) |
 | `manifest[]` | `{unit_id, kind?, title?, text?}` (sweep only) |
-| `extra` | `{domains[{key, label?}], mechanisms[{code, label?}], known[{alias, judgement?, why?}]}` — the risk taxonomy's `domain.code` goes in `key` |
+| `extra` | `{domains[{key, label?}], mechanisms[{code, label?}], known[{alias, judgement?, why?}], missing[{kind, note?}], search{queries[1..3]}}` — the risk taxonomy's `domain.code` goes in `key`; `missing` (expert-level gaps) is for `sweep` only, `search` (long-document excerpts `D01…`) for `offcard` only |
 | `expect` | `{prompt_rev?, limits_rev?}` — only the given ones are compared |
 | identity | `groups` · `user_email` · `user_pat` · `entitlements` (overwritten by the portal relay) |
 
@@ -140,6 +143,16 @@ Everything that comes from cards or the risk app is rendered either inside the p
 for short labels that stand outside it (card type/confidence/causal status, section ids, line refs, missing kinds,
 manifest kinds, known alias/judgement, mechanism and domain codes and labels), flattened to one line with `«»`,
 `[]` and `{}` removed — a planted `[지시]` block can never stand outside the frame.
+
+Rows per kind (JSON Lines): verdict `v` (+ `mech`/`mech_free` — required on WARNING·FAIL rows when a mechanism
+list was sent, `checks.mech` = `ok`·`free`·`missing`·`no_list`), `noinput` `q1{impact, title, mech, mech_free, path, l,
+k, cq, sev, why}` · `q2{item, needs, k, l, why}` · `more` (`quality.maybe_more` when `q1` reaches `items_max` or
+`more=yes`), `summary` `head` · `risk` · `conflict` · `gain` · `watch` · `ask` · `para` with `r` (row aliases) and
+`refs` (the row refs) — a `must_cover` row missing from every `risk`/`conflict` is re-asked, what is still missing
+after the repairs is in `result.missing`. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
+`noinput` · `rows`; offcard with search carries `meta.search{state: ok·empty_scope·no_hits·failed, queries, hits_n,
+scope_n, used[{alias, record_id, section_id, title, chars, orig_chars, clipped}], note, req_cut}` (`failed` = could
+not ask — the only one the app re-issues). Search runs with the user's PAT only.
 
 Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,
@@ -156,21 +169,32 @@ cell instead of retrying forever).
 There is **no queue**: when the gate is full the stream answers `error{review_busy, retry_after_s}` → `done`
 at once and the caller retries later without counting it. Card-review calls are **not** counted in
 `delib_active` / `delib_queued` and do not hold a restart back (a cut call is re-issued by the risk app);
-`/health` reports them separately as `review_active`, `capabilities: ["card_review"]` and
-`card_review{limit, limit_reason, active, timeout_s, tries, attempts_max, request_worst_s, prompt_rev, totals, last_error}`.
-Closing the stream cancels the running LLM call and frees the slot.
+`/health` reports them separately as `review_active`, `draining`, `drain{on, scope, until, until_idle, hold, by,
+reason, set_at}`, `capabilities: ["card_review", "drain"]`,
+`card_review{kinds, limit, limit_reason, delib_human, active, timeout_s, tries, attempts_max, search_timeout_s,
+request_worst_s, prompt_rev, totals, last_error}` and `load.chat{active, window, ttft_ms{idle, review}, ratio_p50, slow,
+slow_since}` (first chunk latency of chat turns while card review is idle vs running; `slow` when both rings have
+10 turns and review p50 > 2 × idle p50 — logged once, never acted on: lower `CARD_REVIEW_CONCURRENCY`). The gate
+halves only for deliberations a person started (`delib_opts.started_by != "app"`); the risk app's panels count in
+`delib_active` (restart hold) but not in `delib_human`. Closing the stream cancels the running LLM call (and a
+running search) and frees the slot. `scripts/llm_ttft_probe.py` samples the LLM's first-chunk latency every
+minute with the same `.env` (`--dry-run` touches nothing).
 
-It uses the deliberation LLM (`DELIB_*`) as is. Worst case of one request = (1 + `CARD_REVIEW_PARSE_RETRIES`)
-× ((1 + `DELIB_LLM_MAX_RETRIES`) × `DELIB_TIMEOUT_S` + 8) = 10824 s by default (`request_worst_s`); the risk
-app's per-call wall clock must stay above it. These knobs are deliberately not in the Time limits table yet
-(the portal's env kit test reads that table; merging the chains is M3 `WP5a P3`).
+It uses the deliberation LLM (`DELIB_*`) as is (with `CARD_REVIEW_MAX_TOKENS` bound per call when set). Worst case
+of one request = (1 + `CARD_REVIEW_PARSE_RETRIES`) × ((1 + `DELIB_LLM_MAX_RETRIES`) × `DELIB_TIMEOUT_S` + 8) +
+`CARD_REVIEW_SEARCH_TIMEOUT_S` = 10884 s by default (`request_worst_s`); the risk app's per-call wall clock must stay
+above it. These knobs are deliberately not in the Time limits table yet (the portal's env kit test reads that table;
+merging the chains is M3 `WP5a P3`).
 
 | var | default | meaning |
 |---|---|---|
 | `CARD_REVIEW_K` | `8` | Most cards in one verdict call (also capped by the output budget, `verdict.k_out`). |
-| `CARD_REVIEW_SHARE_VERDICT` · `_SWEEP` · `_OFFCARD` | `0.25` · `0.50` · `0.30` | Share of the window each kind aims for. Going over is flagged (`soft_over`), not refused; the hard refusal is the window itself (`p_hard`). |
-| `CARD_REVIEW_CONCURRENCY` | `4` | Card-review calls running at once in this process. |
-| `CARD_REVIEW_CONCURRENCY_WITH_DELIB` | `2` | The same while a deliberation is running (clamped to the value above). |
+| `CARD_REVIEW_SHARE_VERDICT` · `_SWEEP` · `_OFFCARD` · `_NOINPUT` · `_SUMMARY` | `0.25` · `0.50` · `0.30` · `0.30` · `0.50` | Share of the window each kind aims for. Going over is flagged (`soft_over`), not refused; the hard refusal is the window itself (`p_hard`). |
+| `CARD_REVIEW_MAX_TOKENS` | `0` | Output cap for card-review calls only (`llm.bind(max_tokens)`); `0` follows `DELIB_MAX_TOKENS`. Opens `k_out`, `cover_max`, `items_max`; part of `limits_rev`. |
+| `CARD_REVIEW_CONCURRENCY` | `8` | Card-review calls running at once in this process. |
+| `CARD_REVIEW_CONCURRENCY_WITH_DELIB` | half of the above (`4`) | The same while a deliberation a person started is running (clamped to the value above). |
+| `CARD_REVIEW_SEARCH_TIMEOUT_S` | `60` | Deadline of one long-document search query (the up to three queries run at once). |
+| `DRAIN_STATE_PATH` | `<ARTIFACT_DIR>/review-drain.json` | The drain flag file. |
 | `CARD_REVIEW_RETRY_AFTER_S` | `30` | `retry_after_s` in a `review_busy` answer. |
 | `CARD_REVIEW_PARSE_RETRIES` | `2` | Repair calls for missing rows, unreadable lines, out-of-vocabulary values and failed quotes. A failure during a repair ends with `result` and `quality.repair_error` (rows already received are kept). |
 

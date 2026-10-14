@@ -1,0 +1,12 @@
+{
+ "status": 422,
+ "body": {
+  "code": "over_budget",
+  "message": "프롬프트 1,010,584자가 이 박스의 창 한도 1,008,310자를 넘는다(가장 큰 조각 rows) — 다시 쪼개지 않는다",
+  "need": 1010584,
+  "have": 1008310,
+  "part": "rows"
+ },
+ "llm_calls": 0,
+ "_how": "req_summary_domain 의 rows 를 380자 행 2,595개로"
+}

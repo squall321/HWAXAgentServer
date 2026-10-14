@@ -228,5 +228,158 @@
   "final": "error_no_rows.json",
   "llm_calls": 3,
   "transcript": "llm_transcript_no_rows.txt"
+ },
+ "sweep_gaps": {
+  "request": "req_sweep_gaps.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_sweep_gaps.sse",
+  "final": "result_sweep_gaps.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_sweep_gaps.txt"
+ },
+ "verdict_mech": {
+  "request": "req_verdict_mech.json",
+  "script": [
+   "mech_mix"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_verdict_mech.sse",
+  "final": "result_verdict_mech.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_verdict_mech.txt"
+ },
+ "noinput_ok": {
+  "request": "req_noinput.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_noinput_ok.sse",
+  "final": "result_noinput_ok.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_noinput_ok.txt"
+ },
+ "noinput_repaired": {
+  "request": "req_noinput.json",
+  "script": [
+   "noinput_flawed",
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_noinput_repaired.sse",
+  "final": "result_noinput_repaired.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_noinput_repaired.txt"
+ },
+ "noinput_capped": {
+  "request": "req_noinput.json",
+  "script": [
+   "noinput_many"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_noinput_capped.sse",
+  "final": "result_noinput_capped.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_noinput_capped.txt"
+ },
+ "offcard_search_ok": {
+  "request": "req_offcard_search.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_offcard_search_ok.sse",
+  "final": "result_offcard_search_ok.json",
+  "llm_calls": 1,
+  "search": {
+   "how": "answer",
+   "identity": "포털이 덮어쓰는 신원 칸 넷을 더해 보냈다"
+  },
+  "transcript": "llm_transcript_offcard_search_ok.txt"
+ },
+ "offcard_search_empty_scope": {
+  "request": "req_offcard_search.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_offcard_search_empty_scope.sse",
+  "final": "result_offcard_search_empty_scope.json",
+  "llm_calls": 1,
+  "search": {
+   "how": "answer",
+   "identity": "포털이 덮어쓰는 신원 칸 넷을 더해 보냈다"
+  },
+  "transcript": "llm_transcript_offcard_search_empty_scope.txt"
+ },
+ "offcard_search_failed": {
+  "request": "req_offcard_search.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_offcard_search_failed.sse",
+  "final": "result_offcard_search_failed.json",
+  "llm_calls": 1,
+  "search": {
+   "how": "hang",
+   "identity": "포털이 덮어쓰는 신원 칸 넷을 더해 보냈다",
+   "timeout_s": 0.05
+  },
+  "transcript": "llm_transcript_offcard_search_failed.txt"
+ },
+ "summary_ok": {
+  "request": "req_summary_domain.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_summary_ok.sse",
+  "final": "result_summary_ok.json",
+  "llm_calls": 1,
+  "transcript": "llm_transcript_summary_ok.txt"
+ },
+ "summary_repaired": {
+  "request": "req_summary_domain.json",
+  "script": [
+   "summary_skip_cover",
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_summary_repaired.sse",
+  "final": "result_summary_repaired.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_summary_repaired.txt"
+ },
+ "summary_missing": {
+  "request": "req_summary_domain.json",
+  "script": [
+   "summary_skip_cover",
+   "summary_skip_one",
+   "summary_skip_one"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_summary_missing.sse",
+  "final": "result_summary_missing.json",
+  "llm_calls": 3,
+  "transcript": "llm_transcript_summary_missing.txt"
+ },
+ "review_busy_draining": {
+  "request": "req_verdict_one.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 1048576,
+  "frames": "run_review_busy_draining.sse",
+  "final": "error_review_busy_draining.json",
+  "llm_calls": 0,
+  "drain": {
+   "on": true,
+   "scope": "all",
+   "by": "update-all"
+  }
  }
 }

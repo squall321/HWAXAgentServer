@@ -1,0 +1,4 @@
+=== 시도 1 · oracle · finish_reason=stop ===
+{"t": "f", "dir": "risk", "title": "접착 계면 들뜸 위험", "mech": "free", "mech_free": "계면 박리", "path": "후면 커버 둘레 접착 계면", "l": ["L01"], "src": "exp", "q": "", "sev": "중대", "conf": "medium", "check_kind": "test", "check": "고온 고습 시험으로 박리를 본다"}
+{"t": "m", "seen": []}
+{"t": "more", "more": "no"}

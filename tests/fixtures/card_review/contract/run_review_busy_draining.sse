@@ -1,0 +1,6 @@
+event: error
+data: {"code": "review_busy", "message": "리스크 검토 비우기 중이다(update-all) — 새 호출을 받지 않는다. 60초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)", "infra": true, "retryable": true, "knob": "CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB", "reason": "draining", "retry_after_s": 60, "limit": 0, "active": 0}
+
+event: done
+data: {}
+

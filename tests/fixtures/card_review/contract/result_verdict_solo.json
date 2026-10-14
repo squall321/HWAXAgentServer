@@ -17,6 +17,8 @@
    "path": "",
    "check_kind": "",
    "check": "",
+   "mech": "",
+   "mech_free": "",
    "refs": [
     "c:ab12cd34ef56"
    ],
@@ -29,7 +31,8 @@
     "refs": "ok",
     "nums_unsourced": [],
     "need": "ok",
-    "coerced": []
+    "coerced": [],
+    "mech": "no_list"
    }
   },
   {
@@ -76,9 +79,9 @@
   "model": "fake-glm",
   "ctx_tokens": 1048576,
   "ctx_source": "server",
-  "prompt_rev": "cr-verdict-1",
+  "prompt_rev": "cr-verdict-2",
   "norm_rev": "cr-n1",
-  "limits_rev": "21349c51",
+  "limits_rev": "36c0f10a",
   "input_sha": "0a2703593c5db182310b2bf75077e4a09c59c8b3ae93a8efa51f7ab729ee96dc",
   "prompt_chars": 3509,
   "usage": {

@@ -26,21 +26,14 @@
   "status": 422,
   "body": {
    "code": "bad_request",
-   "message": "요청 모양이 계약과 다르다 — expert: Field required",
-   "errors": [
-    {
-     "loc": "expert",
-     "type": "missing",
-     "msg": "Field required"
-    }
-   ]
+   "message": "verdict 에는 expert 가 있어야 한다(summary 만 expert 가 없다)"
   }
  },
  "unsupported_kind": {
   "status": 422,
   "body": {
    "code": "unsupported_kind",
-   "message": "호출 종류 'cross' 는 이 판(M2)에 없다 — sweep·verdict·offcard 만 받는다"
+   "message": "호출 종류 'cross' 는 이 판(M3)에 없다(M4) — sweep·verdict·offcard·noinput·summary 만 받는다"
   }
  },
  "unsupported_unit_kind": {
@@ -80,13 +73,13 @@
   "status": 409,
   "body": {
    "code": "rev_mismatch",
-   "message": "요청이 기대한 판(prompt_rev=cr-verdict-1, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-1, limits_rev=21349c51)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
+   "message": "요청이 기대한 판(prompt_rev=cr-verdict-2, limits_rev=00000000)이 이 서버의 판(prompt_rev=cr-verdict-2, limits_rev=36c0f10a)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
    "expect": {
-    "prompt_rev": "cr-verdict-1",
+    "prompt_rev": "cr-verdict-2",
     "limits_rev": "00000000"
    },
-   "prompt_rev": "cr-verdict-1",
-   "limits_rev": "21349c51"
+   "prompt_rev": "cr-verdict-2",
+   "limits_rev": "36c0f10a"
   }
  },
  "denied": {
@@ -97,12 +90,21 @@
    "need": "feat:deliberation"
   }
  },
+ "cover_too_large": {
+  "status": 422,
+  "body": {
+   "code": "cover_too_large",
+   "message": "꼭 다룰 행 55건이 이 박스의 상한 54건(cover_hard_max)을 넘는다 — 앱은 limits.summary.cover_max(18) 안에서 고른다",
+   "have": 55,
+   "max": 54
+  }
+ },
  "ctx_too_small": {
   "status": 422,
   "body": {
    "code": "ctx_too_small",
-   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,246 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
-   "need_ctx_tokens": 11246,
+   "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,379 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL).",
+   "need_ctx_tokens": 11379,
    "ctx_tokens": 4096
   }
  },

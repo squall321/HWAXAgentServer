@@ -582,9 +582,9 @@
   "model": "fake-glm",
   "ctx_tokens": 1048576,
   "ctx_source": "server",
-  "prompt_rev": "cr-sweep-1",
+  "prompt_rev": "cr-sweep-2",
   "norm_rev": "cr-n1",
-  "limits_rev": "21349c51",
+  "limits_rev": "36c0f10a",
   "input_sha": "abf9d1fcc46f12df1c20285b79d3ef1b36880c93691d9d6aae273d52df1f5b69",
   "prompt_chars": 7025,
   "usage": {

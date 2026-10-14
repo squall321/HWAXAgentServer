@@ -1,0 +1,253 @@
+{
+ "kind": "verdict",
+ "variant": "fwd",
+ "target_key": "t-ab12",
+ "expert": {
+  "key": "mech-test-seal",
+  "name": "실링 시험",
+  "domain": "mech",
+  "role": "역할"
+ },
+ "cards": [
+  {
+   "alias": "K01",
+   "record_id": "DOC-CCT-MECH-2026-0000000101",
+   "card_id": "TSL-R-001",
+   "title": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다",
+   "type": "design-rule",
+   "checkable": true,
+   "tier": "core",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [
+    "ISO 9999-2"
+   ],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "규칙",
+     "text": "정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다."
+    },
+    {
+     "sid": "2",
+     "title": "적용 조건",
+     "text": "후면 커버와 미들프레임 사이의 PSA 테이프 접착 계면에 적용한다. 오링 압축 실링은 대상이 아니다."
+    },
+    {
+     "sid": "3",
+     "title": "판정 표",
+     "text": "| 항목 | 하한 |\n|---|---|\n| 접착폭 | 0.8 mm |\n| 코너 R | 1.2 mm |"
+    }
+   ],
+   "text_sha": "e17b71218f7e7aef25f9e9166693a6f09311d79f143842215db979ab59149e4c",
+   "chars": 355
+  },
+  {
+   "alias": "K02",
+   "record_id": "DOC-CCT-MECH-2026-0000000101-g0",
+   "card_id": "TSL-R-001-g0",
+   "title": "시험용 접착 실링 폭은 최악 공차에서 0.8 mm 이상 남긴다",
+   "type": "design-rule",
+   "checkable": true,
+   "tier": "core",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [
+    "ISO 9999-2"
+   ],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "규칙",
+     "text": "정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다.\n정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다.\n정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다.\n정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다.\n정적 접착 실링 부위의 **유효 접착폭**은 최악 공차 누적에서도 0.8 mm 이상을 남긴다.\n폭이 줄면 코너 R 도 함께 본다.\n정적"
+    },
+    {
+     "sid": "2",
+     "title": "적용 조건",
+     "text": "후면 커버와 미들프레임 사이의 PSA 테이프 접착 계면에 적용한다. 오링 압축 실링은 대상이 아니다."
+    },
+    {
+     "sid": "3",
+     "title": "판정 표",
+     "text": "| 항목 | 하한 |\n|---|---|\n| 접착폭 | 0.8 mm |\n| 코너 R | 1.2 mm |"
+    }
+   ],
+   "text_sha": "91879bed2f08744857dc92ac5be8678a45697613623c8125543b016128aa84e3",
+   "chars": 650
+  },
+  {
+   "alias": "K03",
+   "record_id": "DOC-CCT-MECH-2026-0000000108",
+   "card_id": "TSL-R-002",
+   "title": "시험용 나사 보스 주변 실링 여유 규칙",
+   "type": "design-rule",
+   "checkable": true,
+   "tier": "checklist",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "시험용 나사 보스 주변 실링 여유 규칙",
+     "text": "나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다."
+    }
+   ],
+   "text_sha": "b1b2c1e82b15aa4ea09cf6d5559d7057b02704593d81843721b170e083a98feb",
+   "chars": 188
+  },
+  {
+   "alias": "K04",
+   "record_id": "DOC-CCT-MECH-2026-0000000108-g3",
+   "card_id": "TSL-R-002-g3",
+   "title": "시험용 나사 보스 주변 실링 여유 규칙",
+   "type": "design-rule",
+   "checkable": true,
+   "tier": "checklist",
+   "confidence": "heuristic",
+   "causal_status": "validated",
+   "review_status": "fact-checked",
+   "standard_refs": [],
+   "sources_n": 0,
+   "updated": "2026-07-14",
+   "upstream_checksum": "",
+   "sections": [
+    {
+     "sid": "1",
+     "title": "시험용 나사 보스 주변 실링 여유 규칙",
+     "text": "나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를 둔다.\n체결 토크가 커지면 여유를 더 둔다.\n나사 보스 둘레에서 실링 면까지 최소 0.5 mm 여유를"
+    }
+   ],
+   "text_sha": "06d6701e62653dc46c9d9ddb3ec0c65ca907b5c1d102d1b1bab3ff6d557e6e61",
+   "chars": 562
+  }
+ ],
+ "digest": [
+  {
+   "alias": "K05",
+   "type": "design-rule",
+   "title": "시험용 주입 문구가 섞인 카드 본문 규칙",
+   "record_id": "DOC-CCT-MECH-2026-0000000109"
+  },
+  {
+   "alias": "K06",
+   "type": "standard-summary",
+   "title": "시험용 방수 등급 시험 규격 요약 카드",
+   "record_id": "DOC-CCT-MECH-2026-0000000103"
+  },
+  {
+   "alias": "K07",
+   "type": "standard-summary",
+   "title": "시험용 방수 등급 시험 규격 요약 카드",
+   "record_id": "DOC-CCT-MECH-2026-0000000103-g2"
+  },
+  {
+   "alias": "K08",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000110"
+  },
+  {
+   "alias": "K09",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000102"
+  },
+  {
+   "alias": "K10",
+   "type": "failure-case",
+   "title": "시험용 코너 R 축소 뒤 접착 들뜸 사례 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000102-g1"
+  },
+  {
+   "alias": "K11",
+   "type": "data",
+   "title": "시험용 PSA 테이프 박리 강도 표 데이터",
+   "record_id": "DOC-CCT-MECH-2026-0000000106"
+  },
+  {
+   "alias": "K12",
+   "type": "concept",
+   "title": "시험용 실링 아키텍처 세 요소 개념 정리",
+   "record_id": "DOC-CCT-MECH-2026-0000000104"
+  },
+  {
+   "alias": "K13",
+   "type": "faq",
+   "title": "시험용 접착 실링 재작업 문답 모음 카드",
+   "record_id": "DOC-CCT-MECH-2026-0000000105"
+  },
+  {
+   "alias": "K14",
+   "type": "open-observation",
+   "title": "시험용 저온 낙하 뒤 미세 누수 관측 기록",
+   "record_id": "DOC-CCT-MECH-2026-0000000107"
+  }
+ ],
+ "unit": {
+  "unit_id": "u-01",
+  "kind": "bundle",
+  "title": "후면 커버 둘레 실링",
+  "summary": "PSA 폭 1.2 → 0.9 mm",
+  "notes": "penetration_depth 는 하한 추정치다.",
+  "missing": [
+   {
+    "kind": "ecad",
+    "note": "회로 변경 정보가 없다"
+   }
+  ],
+  "lines": [
+   {
+    "ref": "c:ab12cd34ef56",
+    "text": "후면 커버 PSA 폭 1.2 → 0.9 mm "
+   }
+  ],
+  "context": [
+   {
+    "ref": "c:ctx0",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   },
+   {
+    "ref": "c:ctx1",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   }
+  ],
+  "evidence": [
+   {
+    "ref": "tool:call-0",
+    "text": "list_interfaces → touching 3곳"
+   },
+   {
+    "ref": "tool:call-1",
+    "text": "list_interfaces → touching 3곳"
+   }
+  ]
+ },
+ "manifest": [],
+ "extra": {
+  "mechanisms": [
+   {
+    "code": "thermal.cte_mismatch",
+    "label": "열팽창 불일치"
+   },
+   {
+    "code": "interface.seal_loss",
+    "label": "실링 상실"
+   }
+  ]
+ }
+}

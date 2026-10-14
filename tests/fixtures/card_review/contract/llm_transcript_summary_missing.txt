@@ -1,0 +1,13 @@
+=== 시도 1 · summary_skip_cover · finish_reason=stop ===
+{"t": "head", "text": "이 범위의 걸림은 낙하 응력과 계면 간극에 몰린다", "r": ["R001", "R002"]}
+{"t": "risk", "r": ["R003"], "text": "R003 행의 걸림이 같은 계면에 겹친다"}
+{"t": "risk", "r": ["R004"], "text": "R004 행의 걸림이 같은 계면에 겹친다"}
+{"t": "risk", "r": ["R005"], "text": "R005 행의 걸림이 같은 계면에 겹친다"}
+{"t": "risk", "r": ["R006"], "text": "R006 행의 걸림이 같은 계면에 겹친다"}
+{"t": "conflict", "r": ["R007", "R008"], "text": "두 행의 판정이 갈린다 — 한쪽은 걸림, 한쪽은 문제없음"}
+{"t": "para", "text": "범위의 걸림을 정리한 서술 문단이다. 꼭 다룰 행은 위 risk 줄에 있다.", "r": ["R001"]}
+=== 시도 2 · summary_skip_one · finish_reason=stop ===
+{"t": "risk", "r": ["R002"], "text": "R002 행의 걸림이 같은 계면에 겹친다"}
+{"t": "para", "text": "보충 서술 — 간극은 0.35 mm 로 줄었다.", "r": ["R001"]}
+=== 시도 3 · summary_skip_one · finish_reason=stop ===
+{"t": "para", "text": "보충 서술 — 간극은 0.35 mm 로 줄었다.", "r": ["R001"]}

@@ -3,22 +3,32 @@
  "kinds": [
   "sweep",
   "verdict",
-  "offcard"
+  "offcard",
+  "noinput",
+  "summary"
+ ],
+ "cell_kinds": [
+  "sweep",
+  "verdict",
+  "offcard",
+  "noinput"
  ],
  "model": "fake-glm",
  "ctx_tokens": 4096,
  "ctx_source": "server",
  "ctx_retrying": false,
  "llm_max_tokens": null,
+ "max_tokens_source": "none",
  "out_tokens": 1024,
  "p_hard": 2999,
  "unit_body_max": 0,
  "verdict": {
   "p": 2999,
-  "fixed": 4248,
+  "fixed": 4397,
   "body": 0,
   "role_max": 299,
   "digest_max": 149,
+  "mech_max": 149,
   "hint_max": 600,
   "unit_body_max": 0,
   "card_budget": 0,
@@ -27,10 +37,11 @@
  },
  "sweep": {
   "p": 2999,
-  "fixed": 3448,
+  "fixed": 3477,
   "body": 0,
   "role_max": 299,
   "domains_max": 149,
+  "missing_max": 29,
   "hint_max": 600,
   "manifest_page_max": 0,
   "card_budget": 0,
@@ -49,12 +60,42 @@
   "hint_max": 600,
   "unit_body_max": 0,
   "card_budget": 0,
-  "findings_max": 1
+  "findings_max": 1,
+  "longdoc_max": 749
+ },
+ "noinput": {
+  "p": 2999,
+  "fixed": 4946,
+  "body": 0,
+  "role_max": 299,
+  "digest_max": 149,
+  "known_max": 149,
+  "mech_max": 149,
+  "hint_max": 600,
+  "unit_body_max": 0,
+  "card_budget": 0,
+  "items_max": 1
+ },
+ "summary": {
+  "p": 2999,
+  "fixed": 3699,
+  "body": 0,
+  "hint_max": 600,
+  "blocks_max": 299,
+  "line_max": 400,
+  "narrative_max": 161,
+  "cover_max": 1,
+  "cover_hard_max": 3
  },
  "runnable": {
   "sweep": false,
   "verdict": false,
-  "offcard": false
+  "offcard": false,
+  "noinput": false,
+  "summary": false
+ },
+ "search": {
+  "timeout_s": 60.0
  },
  "unit_size": {
   "per_line": 11,
@@ -64,18 +105,20 @@
   "overhead": 14
  },
  "prompt_rev": {
-  "sweep": "cr-sweep-1",
-  "verdict": "cr-verdict-1",
-  "offcard": "cr-offcard-1"
+  "sweep": "cr-sweep-2",
+  "verdict": "cr-verdict-2",
+  "offcard": "cr-offcard-2",
+  "noinput": "cr-noinput-1",
+  "summary": "cr-summary-1"
  },
  "norm_rev": "cr-n1",
- "limits_rev": "98f05b34",
+ "limits_rev": "2c205915",
  "ctx_too_small": {
-  "need_ctx_tokens": 11246,
-  "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,246 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
+  "need_ctx_tokens": 11379,
+  "message": "이 박스의 창 4,096 토큰으로는 카드 대조(sweep·verdict·offcard·noinput)를 돌릴 수 없다 — 단위·카드를 다시 쪼개지 않는다. 창이 11,379 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL)."
  },
  "gate": {
-  "limit": 4,
+  "limit": 8,
   "limit_reason": "normal",
   "active": 0
  }

@@ -1,0 +1,87 @@
+{
+ "kind": "offcard",
+ "variant": null,
+ "target_key": "t-ab12",
+ "expert": {
+  "key": "sim-structural-calc",
+  "name": "구조 해석",
+  "domain": "sim",
+  "role": "역할"
+ },
+ "cards": [],
+ "digest": [],
+ "unit": {
+  "unit_id": "u-01",
+  "kind": "bundle",
+  "title": "후면 커버 둘레 실링",
+  "summary": "PSA 폭 1.2 → 0.9 mm",
+  "notes": "penetration_depth 는 하한 추정치다.",
+  "missing": [
+   {
+    "kind": "ecad",
+    "note": "회로 변경 정보가 없다"
+   }
+  ],
+  "lines": [
+   {
+    "ref": "c:ab12cd34ef56",
+    "text": "후면 커버 PSA 폭 1.2 → 0.9 mm "
+   }
+  ],
+  "context": [
+   {
+    "ref": "c:ctx0",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   },
+   {
+    "ref": "c:ctx1",
+    "text": "이웃 단위의 변경 줄",
+    "owner_unit": "u-02"
+   }
+  ],
+  "evidence": [
+   {
+    "ref": "tool:call-0",
+    "text": "list_interfaces → touching 3곳"
+   },
+   {
+    "ref": "tool:call-1",
+    "text": "list_interfaces → touching 3곳"
+   }
+  ]
+ },
+ "manifest": [],
+ "extra": {
+  "domains": [
+   {
+    "key": "mech",
+    "label": "기구"
+   },
+   {
+    "key": "rel",
+    "label": "신뢰성"
+   },
+   {
+    "key": "therm",
+    "label": "열"
+   }
+  ],
+  "mechanisms": [
+   {
+    "code": "thermal.cte_mismatch",
+    "label": "열팽창 불일치"
+   },
+   {
+    "code": "interface.seal_loss",
+    "label": "실링 상실"
+   }
+  ],
+  "search": {
+   "queries": [
+    "보스 둘레 리브 응력",
+    "고정점 간극 낙하"
+   ]
+  }
+ }
+}

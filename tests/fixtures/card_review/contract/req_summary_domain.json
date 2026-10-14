@@ -1,0 +1,193 @@
+{
+ "kind": "summary",
+ "variant": null,
+ "target_key": "diff:abababababababababababababababab",
+ "expert": null,
+ "summary": {
+  "scope": {
+   "kind": "domain",
+   "key": "mech",
+   "label": "기구(구조)"
+  },
+  "rows": [
+   {
+    "ref": "reg:000000000000",
+    "text": "치명/FAIL · mechanical.drop_stress · «REAR_COVER_0» · 제기 1명/1영역"
+   },
+   {
+    "ref": "reg:000000000001",
+    "text": "치명/FAIL · mechanical.drop_stress · «REAR_COVER_1» · 제기 2명/2영역"
+   },
+   {
+    "ref": "reg:000000000002",
+    "text": "치명/FAIL · mechanical.drop_stress · «REAR_COVER_2» · 제기 3명/3영역"
+   },
+   {
+    "ref": "reg:000000000003",
+    "text": "중대/FAIL · mechanical.drop_stress · «REAR_COVER_3» · 제기 4명/1영역"
+   },
+   {
+    "ref": "reg:000000000004",
+    "text": "중대/FAIL · mechanical.drop_stress · «REAR_COVER_4» · 제기 5명/2영역"
+   },
+   {
+    "ref": "reg:000000000005",
+    "text": "중대/FAIL · mechanical.drop_stress · «REAR_COVER_5» · 제기 6명/3영역"
+   },
+   {
+    "ref": "reg:000000000006",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_6» · 제기 7명/1영역"
+   },
+   {
+    "ref": "reg:000000000007",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_7» · 제기 1명/2영역"
+   },
+   {
+    "ref": "reg:000000000008",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_8» · 제기 2명/3영역"
+   },
+   {
+    "ref": "reg:000000000009",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_9» · 제기 3명/1영역"
+   },
+   {
+    "ref": "reg:00000000000a",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_10» · 제기 4명/2영역"
+   },
+   {
+    "ref": "reg:00000000000b",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_11» · 제기 5명/3영역"
+   },
+   {
+    "ref": "reg:00000000000c",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_12» · 제기 6명/1영역"
+   },
+   {
+    "ref": "reg:00000000000d",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_13» · 제기 7명/2영역"
+   },
+   {
+    "ref": "reg:00000000000e",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_14» · 제기 1명/3영역"
+   },
+   {
+    "ref": "reg:00000000000f",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_15» · 제기 2명/1영역"
+   },
+   {
+    "ref": "reg:000000000010",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_16» · 제기 3명/2영역"
+   },
+   {
+    "ref": "reg:000000000011",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_17» · 제기 4명/3영역"
+   },
+   {
+    "ref": "reg:000000000012",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_18» · 제기 5명/1영역"
+   },
+   {
+    "ref": "reg:000000000013",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_19» · 제기 6명/2영역"
+   },
+   {
+    "ref": "reg:000000000014",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_20» · 제기 7명/3영역"
+   },
+   {
+    "ref": "reg:000000000015",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_21» · 제기 1명/1영역"
+   },
+   {
+    "ref": "reg:000000000016",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_22» · 제기 2명/2영역"
+   },
+   {
+    "ref": "reg:000000000017",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_23» · 제기 3명/3영역"
+   },
+   {
+    "ref": "reg:000000000018",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_24» · 제기 4명/1영역"
+   },
+   {
+    "ref": "reg:000000000019",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_25» · 제기 5명/2영역"
+   },
+   {
+    "ref": "reg:00000000001a",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_26» · 제기 6명/3영역"
+   },
+   {
+    "ref": "reg:00000000001b",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_27» · 제기 7명/1영역"
+   },
+   {
+    "ref": "reg:00000000001c",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_28» · 제기 1명/2영역"
+   },
+   {
+    "ref": "reg:00000000001d",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_29» · 제기 2명/3영역"
+   },
+   {
+    "ref": "reg:00000000001e",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_30» · 제기 3명/1영역"
+   },
+   {
+    "ref": "reg:00000000001f",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_31» · 제기 4명/2영역"
+   },
+   {
+    "ref": "reg:000000000020",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_32» · 제기 5명/3영역"
+   },
+   {
+    "ref": "reg:000000000021",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_33» · 제기 6명/1영역"
+   },
+   {
+    "ref": "reg:000000000022",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_34» · 제기 7명/2영역"
+   },
+   {
+    "ref": "reg:000000000023",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_35» · 제기 1명/3영역"
+   },
+   {
+    "ref": "reg:000000000024",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_36» · 제기 2명/1영역"
+   },
+   {
+    "ref": "reg:000000000025",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_37» · 제기 3명/2영역"
+   },
+   {
+    "ref": "reg:000000000026",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_38» · 제기 4명/3영역"
+   },
+   {
+    "ref": "reg:000000000027",
+    "text": "중대/WARNING · mechanical.drop_stress · «REAR_COVER_39» · 제기 5명/1영역"
+   }
+  ],
+  "must_cover": [
+   "reg:000000000000",
+   "reg:000000000001",
+   "reg:000000000002",
+   "reg:000000000003",
+   "reg:000000000004",
+   "reg:000000000005"
+  ],
+  "blocks": [
+   {
+    "name": "numbers",
+    "title": "영역 수치",
+    "text": "전문가 122 · 셀 검토함 2,301 · 거름 1,204 · 입력 결손 0"
+   }
+  ]
+ },
+ "expect": {
+  "prompt_rev": "cr-summary-1"
+ }
+}

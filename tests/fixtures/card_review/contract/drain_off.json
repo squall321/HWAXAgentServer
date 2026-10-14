@@ -1,0 +1,20 @@
+{
+ "request": {
+  "on": false,
+  "by": "update-all"
+ },
+ "status": 200,
+ "body": {
+  "on": false,
+  "scope": null,
+  "until": null,
+  "until_idle": null,
+  "hold": false,
+  "by": null,
+  "reason": null,
+  "set_at": null,
+  "review_active": 0,
+  "delib_active": 0,
+  "delib_queued": 0
+ }
+}

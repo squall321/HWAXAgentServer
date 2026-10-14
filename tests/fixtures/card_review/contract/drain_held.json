@@ -1,0 +1,23 @@
+{
+ "request": {
+  "on": true,
+  "scope": "all",
+  "ttl_s": 1800,
+  "by": "update-all"
+ },
+ "status": 409,
+ "body": {
+  "code": "drain_held",
+  "message": "사람이 고정한 비우기 깃발이다(by human:운영자) — hold 아닌 요청으로 바꾸지 않는다",
+  "drain": {
+   "on": true,
+   "scope": "all",
+   "until": null,
+   "until_idle": null,
+   "hold": true,
+   "by": "human:운영자",
+   "reason": "사람이 고정",
+   "set_at": 1760400000.0
+  }
+ }
+}

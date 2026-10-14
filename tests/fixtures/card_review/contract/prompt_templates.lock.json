@@ -1,14 +1,22 @@
 {
  "sweep": {
-  "prompt_rev": "cr-sweep-1",
-  "template_sha": "6006b7713aa67738207e233b86d068b706e0ca600b8c7c8e458fd9961cf3743b"
+  "prompt_rev": "cr-sweep-2",
+  "template_sha": "a0d24cc980b1e26aa0d88ab6f4c8157e9d728115c9ec8ca46d665ed1ae748e54"
  },
  "verdict": {
-  "prompt_rev": "cr-verdict-1",
-  "template_sha": "767c6ffd884cf3d55cf88b98fe47b7a2398eff5b790fae0ae1fcfd44cc5e4bbd"
+  "prompt_rev": "cr-verdict-2",
+  "template_sha": "f8f4dac6c39bafc75904898c88bfa6f688d92bd0e75646ff3ed054809bf7287d"
  },
  "offcard": {
-  "prompt_rev": "cr-offcard-1",
-  "template_sha": "11423806f239a36de035d7e7511a53aa4d15af1b288579b5fa1f71c225ca3075"
+  "prompt_rev": "cr-offcard-2",
+  "template_sha": "e4f233d83ada07e1b7399abcf10252f65c66b1c231efbaee3fbd75897e3bcc3d"
+ },
+ "noinput": {
+  "prompt_rev": "cr-noinput-1",
+  "template_sha": "da53a5913e7503beb09360e23c527591e54e1e9d586444f53871b49510767bf9"
+ },
+ "summary": {
+  "prompt_rev": "cr-summary-1",
+  "template_sha": "ede51d6b0d85b7d74748a5fce5408a490a027dcb15ac8fb897a73e2ae2bc3956"
  }
 }
