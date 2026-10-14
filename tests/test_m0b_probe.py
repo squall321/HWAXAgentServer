@@ -568,3 +568,91 @@ def test_명령줄_그대로_가짜_LLM_서버에_돌린다(fake_llm_server, tmp
     assert ov["error"]["status"] == 400 and ov["error"]["code"] == "context_overflow" and ov["cpt_source"] == "max-observed"
     assert summary["output"] == {**summary["output"], "finish_known": 1, "usage_known": 1, "length": 0}
     assert not (tmp_path / "jobs").exists()                                          # 잡 원장을 만들지도 않는다
+
+
+# ── 보강 팔(M3 E3-12) — 일치 · 합친 · 요약, 팔별 OK+na ───────────────────────────────────
+def test_보강_팔은_고를_때만_계획에_들고_끝_묶음_앞에_선다():
+    pack = _big_pack()
+    units, _src = probe.load_units(None)
+    lim = cr.limits(W1M, "server", 0, env={})
+    arms = probe.parse_k_arms("1,8", lim["verdict"]["k_out"])
+    base = probe.build_plan(pack, units, lim, reps=4, k_arms=arms, skip=set(), nonce="n")
+    items = probe.build_plan(pack, units, lim, reps=4, k_arms=arms, skip=set(), nonce="n", extra=set(probe.EXTRAS),
+                             agree_reps=3)
+    assert [x["arm"] for x in base] == [x["arm"] for x in items if not x.get("group") and not
+                                        x["arm"].startswith("summary-")], "보강 팔을 고르지 않은 계획이 바뀌었다"
+    assert [x["arm"] for x in items[-4:]] == ["cache-cold", "cache-repeat", "cache-repair", "overflow"]
+    count = {a: sum(1 for x in items if x["arm"] == a) for a in ("agree-deck", "agree-one", "merged-joint",
+                                                                 "merged-verdict", "merged-offcard")}
+    assert count == {"agree-deck": 3, "agree-one": 3 * 8, "merged-joint": 2, "merged-verdict": 2, "merged-offcard": 2}
+    assert [x["k"] for x in items if x["arm"].startswith("summary-")] == list(probe.SUMMARY_SIZES)
+    for g in {x["group"] for x in items if x["arm"] == "agree-deck"}:
+        deck = next(x for x in items if x.get("group") == g and x["arm"] == "agree-deck")
+        ones = [x for x in items if x.get("group") == g and x["arm"] == "agree-one"]
+        assert sorted(c["alias"] for x in ones for c in x["req"]["cards"]) == sorted(c["alias"] for c in deck["req"]["cards"])
+        assert all(x["req"]["unit"] == deck["req"]["unit"] for x in ones)
+    joint = next(x for x in items if x["arm"] == "merged-joint")
+    sep = next(x for x in items if x["arm"] == "merged-verdict" and x["group"] == joint["group"])
+    pj, ps = probe.prepare(joint, lim), probe.prepare(sep, lim)
+    assert pj["human"].startswith(ps["human"]) and "[탐침 — 판정과 카드 밖을 한 번에]" in pj["human"][len(ps["human"]):]
+    assert pj["octx"]["kind"] == "offcard" and set(pj["octx"]["cards"]) == set(pj["ctx"]["cards"])
+    s300 = probe.prepare(next(x for x in items if x["arm"] == "summary-300"), lim)
+    assert s300["ctx"]["kind"] == "summary" and len(s300["ctx"]["must_cover"]) == lim["summary"]["cover_max"]
+
+
+def test_보강_팔을_돌리면_원문_없이_세고_창을_넘는_요약은_부르지_않는다(fake_box, capsys):
+    out_file = fake_box["tmp"] / "m0b-m3.jsonl"
+    rc = _main("--pack-file", PACK_OK, "--reps", "2", "--k-arms", "1,4", "--extra", "all", "--agree-reps", "2",
+               "--out", out_file, "--env-file", fake_box["env"])
+    printed = capsys.readouterr().out
+    assert rc == 0, printed
+    meta, calls, summary = _read(out_file)
+    assert meta["plan"]["extra"] == ["agree", "merged", "summary"] and meta["plan"]["agree_reps"] == 2
+    skipped = [r for r in calls if (r.get("error") or {}).get("code") == "skipped"]
+    assert {r["arm"] for r in skipped} == {"summary-1500", "summary-3000"}, "64K 창에 1,500·3,000 행 요약은 들지 않는다"
+    assert len(fake_box["llm"].calls) == len(calls) - len(skipped) == meta["plan"]["calls"]
+    ag, mg = summary["agree"], summary["merged"]
+    assert (ag["groups"], ag["cards"], ag["applies_agree"], ag["judgement_agree"], ag["flag_to_okna"]) == (2, 8, 1.0,
+                                                                                                         1.0, 0)
+    assert (mg["groups"], mg["verdict_agree"], mg["f_joint"], mg["f_separate"], mg["f_overlap_rate"]) == (1, 1.0, 1, 1,
+                                                                                                         0.0)
+    assert [x["rows"] for x in summary["summary_arm"]] == [300, 1_500, 3_000]
+    assert summary["summary_arm"][0]["missing_cover"] == 0 and summary["summary_arm"][1]["error"] == "skipped"
+    assert all(a["okna_rate"] == 1.0 for a in summary["arms"] if a["kind"] == "verdict"), summary["arms"]
+    text = out_file.read_text(encoding="utf-8")
+    pack = json.loads(PACK_OK.read_text(encoding="utf-8"))
+    units, _src = probe.load_units(None)
+    assert [x for x in _contents(pack, units) if x in text] == [], "보강 팔이 카드·단위 원문을 결과 파일에 썼다"
+    assert "[일치 팔] 묶음 2" in printed and "[합친 팔] 묶음 1" in printed and "[요약 팔] 행 1,500 · 부르지 않음" in printed
+    assert summary == {**probe.summarize(meta, calls), "rec": "summary"}
+
+
+def test_일치_팔의_뒤집힘과_합친_팔의_겹침을_센다():
+    def call(arm, g, **kw):
+        return {"rec": "call", "ts": 1.0, "kind": "verdict", "variant": "fwd", "arm": arm, "k": 1, "rep": 0, "group": g,
+                "seconds": 2.0, "error": None, **kw}
+
+    calls = [call("agree-deck", "a0", verdicts={"K01": ["yes", "OK"], "K02": ["yes", "FAIL"], "K03": ["unknown", "na"]}),
+             call("agree-one", "a0", verdicts={"K01": ["yes", "WARNING"]}),
+             call("agree-one", "a0", verdicts={"K02": ["yes", "FAIL"]}),
+             call("agree-one", "a0", verdicts={"K03": ["yes", "FAIL"]}),
+             call("merged-joint", "m0", verdicts={"K01": ["yes", "OK"], "K02": ["yes", "FAIL"]}, f_n=4, f_overlap=1,
+                  finish_reason="length"),
+             call("merged-verdict", "m0", verdicts={"K01": ["yes", "OK"], "K02": ["yes", "WARNING"]}),
+             {**call("merged-offcard", "m0", f_n=2), "kind": "offcard"}]
+    ag, mg = probe._agree_stats(calls), probe._merged_stats(calls)
+    assert (ag["cards"], ag["applies_agree"], ag["judgement_agree"], ag["flagged_alone"], ag["flag_to_okna"]) == (
+        3, round(2 / 3, 4), round(1 / 3, 4), 3, 2), ag
+    assert (mg["verdict_agree"], mg["f_ratio"], mg["f_overlap_rate"], mg["length_joint"], mg["p50_s_separate"]) == (
+        0.5, 2.0, 0.25, 1, 4.0), mg
+
+
+def test_보강_팔의_dry_run_은_계획만_찍는다(fake_box, capsys):
+    assert _main("--pack-file", PACK_OK, "--dry-run", "--extra", "agree,summary", "--agree-reps", "1",
+                 "--env-file", fake_box["env"]) == 0
+    out = capsys.readouterr().out
+    assert fake_box["llm"].calls == [] and list(fake_box["tmp"].iterdir()) == []
+    assert "agree-deck" in out and "agree-one" in out and "merged-joint" not in out
+    assert "○ summary-1500 — 이 창에서는 부르지 않는다" in out and "summary-300" in out
+    with pytest.raises(SystemExit):
+        _main("--pack-file", PACK_OK, "--dry-run", "--extra", "nope", "--env-file", fake_box["env"])

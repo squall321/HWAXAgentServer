@@ -27,6 +27,15 @@ M2 가 아직 가정으로 두는 값을 잰다(`reference/m2-wp3a.md` '실측�
   .venv/bin/python scripts/m0b_probe.py --agent <키1>,<키2> --out m0b.jsonl     (두 전문가의 카드를 합쳐 K_out 팔을 채운다)
   .venv/bin/python scripts/m0b_probe.py --pack-file pack.json --unit-file unit.json --out m0b.jsonl
   .venv/bin/python scripts/m0b_probe.py --summarize m0b-1012.jsonl             (파일에서 요약만 다시)
+
+보강 팔(M3 E3-12 — 고르면 더한다. 기본 탐침의 계획은 그대로다).
+  · agree   — 같은 점검 카드 K 장을 묶음 하나(K)로 한 번, 한 장씩(K=1 fwd) K 번 불러 카드별 applies·judgement 일치율과
+              '걸림 → OK·na' 뒤집힘 수를 잰다(K 가 판정을 바꾸는지 — 다른 묶음을 돌려 쓰는 K 팔로는 못 잰다). 회차 --agree-reps.
+  · merged  — 판정과 카드 밖을 한 프롬프트로 묻는 틀(이 탐침 안에만 있다 — 운영 코드에 없다)과, 같은 단위·같은 카드로 따로
+              부른 판정·카드 밖 두 호출을 견준다(판정 일치율 · f 줄 수 비 · 카드 판정과 겹치는 f 비율 · length · 초).
+  · summary — 합성 등록부 행 300·1,500·3,000개로 summary 를 불러 초·빠진 꼭 다룰 행·length 를 잰다(창을 넘으면 부르지 않고
+              그렇다고 적는다). 요약 블록에 팔별 OK+na 비율이 붙는다(K 규칙의 조건 4).
+  .venv/bin/python scripts/m0b_probe.py --agent <키> --extra all --out m0b-m3.jsonl
 """
 from __future__ import annotations
 
@@ -53,11 +62,22 @@ FIXTURES = ROOT / "tests" / "fixtures" / "card_review" / "contract"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-PROBE_REV = "m0b-1"
+PROBE_REV = "m0b-2"   # m0b-2 — 보강 팔(agree·merged·summary)과 팔별 OK+na 비율(M3 E3-12)
 PAT_ENV = "HWAX_PROBE_PAT"
 DEFAULT_PORTAL = "http://127.0.0.1:8723"
 DEFAULT_K_ARMS = "1,4,8,kout"
 SKIPPABLE = ("sweep", "offcard", "cache", "overflow")
+EXTRAS = ("agree", "merged", "summary")      # 보강 팔(M3 E3-12) — --extra 로 고른다
+SUMMARY_SIZES = (300, 1_500, 3_000)          # 요약 팔의 합성 행 수
+# 판정과 카드 밖을 한 번에 묻는 틀 — **탐침 전용**이다(운영 card_review 에 없다). 판정 프롬프트 끝에 붙인다.
+MERGED_INSTR = (
+    "\n[탐침 — 판정과 카드 밖을 한 번에]\n"
+    "위 판정 줄(v)을 카드마다 다 낸 뒤, 이어서 카드에 적혀 있지 않지만 당신 전문 영역에서 이 변경에 대해 보이는 리스크와 개선을 "
+    "같은 출력에 낸다(최대 {f}줄).\n"
+    '{{"t":"f","dir":"risk|improvement","title":"…","mech":"free","mech_free":"…","path":"…","l":["L03"],"src":"exp",'
+    '"q":"","sev":"경미|중대|치명","conf":"high|medium|low","check_kind":"tool|sim|test|field","check":"…"}}\n'
+    '마지막 줄은 {{"t":"more","more":"yes|no"}}.\n'
+)
 CACHE_PAD_CHARS = 200_000     # 접두 캐시 셋의 단위 채움(자) — 미리 채우기(prefill)가 호출 초에 드러날 만큼. 창 한도 안으로 줄인다
 OVERFLOW_OVER = 1.10          # 창 초과 호출이 노리는 입력 토큰 = 창 × 이 값
 # 글자/토큰 비를 하나도 못 읽었을 때 채움 글에 거는 값. 크게 잡을수록 글이 길어져 확실히 넘친다 — 모자라게 잡으면 창 안에
@@ -432,7 +452,65 @@ def _fit_pad(req: dict, lim: dict, want: int, corpus: str, tag: str) -> tuple[di
     raise ProbeError("접두 캐시 호출의 채움을 창 한도 안으로 줄이지 못했다")
 
 
-def build_plan(pack: dict, units: list, lim: dict, *, reps: int, k_arms: list, skip: set, nonce: str) -> list:
+def _summary_rows(n: int) -> list:
+    """요약 팔의 합성 등록부 행 — 리스크 앱 synth.row_line 의 꼴(약 120자). 원문이 아니라 지어낸 행이다."""
+    sev = ("치명", "중대", "경미")
+    return [{"ref": f"reg:{i:012x}", "text": f"{sev[i % 3]}/{'FAIL' if i % 4 == 0 else 'WARNING'} · mechanical.drop_stress · "
+                                            f"«PART_{i:05d}» · 제기 {i % 9 + 1}명/{i % 4 + 1}영역 · 단위 u-{i % 211:03d} · "
+                                            "보스 둘레 간극 축소와 낙하 응력"} for i in range(n)]
+
+
+def build_extra(pack: dict, units: list, lim: dict, *, extra: set, k_arms: list, agree_reps: int, reps: int) -> list:
+    """보강 팔(M3 E3-12)의 호출들. agree 는 묶음(agree-deck) 하나와 그 카드 한 장씩(agree-one)을 group 으로 묶고, merged 는
+    한 번에(merged-joint) · 판정만(merged-verdict) · 카드 밖만(merged-offcard) 셋을 group 으로 묶는다. summary 는 행 수마다 하나."""
+    cards = pack["cards"]
+    check = [c for c in cards if c.get("checkable")]
+    bg = [c for c in cards if not c.get("checkable")]
+    n = len(check)
+    expert = _expert(pack)
+    tax = _taxonomy()
+    items: list = []
+    if "agree" in extra and n:
+        k = max(1, min(max(kk for _lab, kk in k_arms), n))
+        for r in range(max(1, agree_reps)):
+            start = (r * k) % n
+            deck = [check[i] for i in sorted({(start + j) % n for j in range(k)})]
+            unit = units[r % len(units)]
+            g = f"a{r}"
+            items.append({"kind": "verdict", "variant": "fwd", "arm": "agree-deck", "k": len(deck), "rep": r, "group": g,
+                          "req": _req("verdict", "fwd", expert, deck, _digest(cards, deck), unit=unit)})
+            for c in deck:
+                items.append({"kind": "verdict", "variant": "fwd", "arm": "agree-one", "k": 1, "rep": r, "group": g,
+                              "req": _req("verdict", "fwd", expert, [c], _digest(cards, [c]), unit=unit)})
+    if "merged" in extra and n:
+        k = max(1, min(int(lim["verdict"]["k"]), n))
+        for r in range(max(1, reps // 2)):
+            start = (r * k) % n
+            deck = [check[i] for i in sorted({(start + j) % n for j in range(k)})]
+            unit = units[r % len(units)]
+            g = f"m{r}"
+            vreq = _req("verdict", "fwd", expert, deck, _digest(cards, deck), unit=unit, extra={"mechanisms": tax["mechanisms"]})
+            items.append({"kind": "verdict", "variant": "fwd", "arm": "merged-joint", "k": len(deck), "rep": r, "group": g,
+                          "req": vreq})
+            items.append({"kind": "verdict", "variant": "fwd", "arm": "merged-verdict", "k": len(deck), "rep": r,
+                          "group": g, "req": vreq})
+            items.append({"kind": "offcard", "variant": None, "arm": "merged-offcard", "k": len(bg), "rep": r, "group": g,
+                          "req": _req("offcard", None, expert, bg, _digest(cards, bg), unit=unit, extra=tax)})
+    if "summary" in extra:
+        for size in SUMMARY_SIZES:
+            rows = _summary_rows(size)
+            cover = int(lim["summary"]["cover_max"])
+            items.append({"kind": "summary", "variant": None, "arm": f"summary-{size}", "k": size, "rep": 0,
+                          "req": {"kind": "summary", "variant": None, "target_key": "m0b-probe", "expert": None,
+                                  "summary": {"scope": {"kind": "domain", "key": "mech", "label": "기구(탐침)"},
+                                              "rows": rows, "must_cover": [x["ref"] for x in rows[:cover]],
+                                              "blocks": [{"name": "numbers", "title": "탐침 수치",
+                                                          "text": f"행 {size} · 꼭 다룰 행 {cover}"}]}}})
+    return items
+
+
+def build_plan(pack: dict, units: list, lim: dict, *, reps: int, k_arms: list, skip: set, nonce: str,
+               extra: set = frozenset(), agree_reps: int = 4) -> list:
     """부를 차례 — 회차마다 K 팔 전부 → sweep → offcard 를 번갈아(시간대의 부하가 팔마다 고르게 든다), 끝에 접두 캐시 셋과
     창 초과 하나. 묶음은 점검 카드를 팩 순서로 돌려 가며 고른다(회차마다 다른 카드 — 같은 프롬프트를 되풀이하지 않게).
     verdict 의 순서는 짝수 회차 fwd·홀수 회차 rev 다(운영의 이중 판정과 같다). sweep·offcard 는 reps // 2 회(최소 1)."""
@@ -473,6 +551,7 @@ def build_plan(pack: dict, units: list, lim: dict, *, reps: int, k_arms: list, s
             items.append({"kind": "offcard", "variant": None, "arm": "offcard", "k": len(bg), "rep": r,
                           "req": _req("offcard", None, expert, bg, _digest(cards, bg), unit=unit,
                                       extra={**tax, "known": known})})
+    items += build_extra(pack, units, lim, extra=set(extra), k_arms=k_arms, agree_reps=agree_reps, reps=reps)
     if "cache" not in skip:
         # 역할 머리에 이 실행만의 표지를 넣어 첫 호출은 캐시에 없는 글이 되게 한다(같은 전문가의 앞 호출과 [당신] 뒤로 갈린다).
         deck = check[:1]
@@ -500,12 +579,22 @@ def cap_plan(items: list, max_calls: int) -> tuple[list, int]:
 
 
 def prepare(item: dict, lim: dict) -> dict:
-    """item 의 프롬프트 — {system, human, ctx, lim}. 계약에 안 맞으면 card_review.RequestError."""
+    """item 의 프롬프트 — {system, human, ctx, lim}. 계약에 안 맞으면 card_review.RequestError. merged-joint 는 판정 프롬프트
+    끝에 탐침 전용 지시(MERGED_INSTR)를 붙이고, f 줄을 읽을 카드 밖 별칭 표(octx — 같은 단위·같은 카드)를 같이 준다."""
     import card_review as cr  # noqa: PLC0415
 
     li = lim_for(lim, item, unbounded=item["arm"] == "overflow")
     system, human, ctx = cr.build_prompt(item["req"], li, hint=item.get("hint") or "")
-    return {"system": system, "human": human, "ctx": ctx, "lim": li}
+    out = {"system": system, "human": human, "ctx": ctx, "lim": li}
+    if item["arm"] == "merged-joint":
+        human += MERGED_INSTR.format(f=li["offcard"]["findings_max"])
+        if len(system) + len(human) > li["p_hard"]:
+            raise cr.OverBudget(len(system) + len(human), li["p_hard"], "merged")
+        octx = cr.build_ctx({**item["req"], "kind": "offcard", "variant": None,
+                             "extra": {"mechanisms": item["req"]["extra"].get("mechanisms") or []}}, li)
+        out.update(human=human, octx=octx)
+        ctx["prompt_chars"] = len(system) + len(human)
+    return out
 
 
 def overflow_item(item: dict, lim: dict, cpt: float, cpt_source: str) -> dict:
@@ -531,17 +620,27 @@ def overflow_cpt(calls: list) -> tuple[float, str]:
 
 
 # ── 한 번 재기 ────────────────────────────────────────────────────────────────
-_MAIN_ROW = {"verdict": "v", "sweep": "u", "offcard": "f"}
+_MAIN_ROW = {"verdict": "v", "sweep": "u", "offcard": "f", "summary": "risk"}
+_FLAG = ("WARNING", "FAIL")
 
 
 def _tally(kind: str, rows: list, chk: dict) -> dict:
-    """행의 셈만(원문 없이) — verdict 판정별 수, sweep 관련도별 수, offcard 의 f 줄 수와 '더 있나'."""
+    """행의 셈만(원문 없이) — verdict 판정별 수, sweep 관련도별 수, offcard 의 f 줄 수와 '더 있나', summary 의 줄 종류별 수와
+    빠진 꼭 다룰 행 수."""
     main = [r for r in rows if r.get("t") == _MAIN_ROW[kind]]
     if kind == "verdict":
         return dict(Counter(str(r.get("judgement")) for r in main))
     if kind == "sweep":
         return dict(Counter(str(r.get("rel")) for r in main))
+    if kind == "summary":
+        return {**dict(Counter(str(r.get("t")) for r in rows)), "missing_cover": sum(1 for m in chk.get("missing") or []
+                                                                                   if str(m).startswith("R"))}
     return {"f": len(main), "maybe_more": chk.get("maybe_more")}
+
+
+def _verdicts(rows: list) -> dict:
+    """카드별 판정 — {별칭: [applies, judgement]}(원문 없이 별칭과 열거값만)."""
+    return {r["k"]: [r.get("applies"), r.get("judgement")] for r in rows if r.get("t") == "v"}
 
 
 async def measure(item: dict, prep: dict, llm, base_lim: dict) -> dict:
@@ -554,7 +653,7 @@ async def measure(item: dict, prep: dict, llm, base_lim: dict) -> dict:
     req = item["req"]
     rec = {"rec": "call", "ts": round(time.time(), 1), "kind": item["kind"], "variant": item.get("variant"),
            "arm": item["arm"], "k": item["k"], "rep": item["rep"],
-           "deck_sha": _sha([[c["alias"], c.get("record_id")] for c in req["cards"]]),
+           "deck_sha": _sha([[c["alias"], c.get("record_id")] for c in req.get("cards") or []]),
            "unit_sha": _sha(req["unit"]) if req.get("unit") else None,
            "prompt_sha": _sha(prompt), "prompt_chars": ctx["prompt_chars"], "prompt_bytes": len(prompt.encode("utf-8")),
            "est_tokens": a._est_tokens_all(prompt), "pad_chars": item.get("pad_chars", 0),
@@ -597,6 +696,21 @@ async def measure(item: dict, prep: dict, llm, base_lim: dict) -> dict:
                foreign=ps["foreign"], dropped_alias=chk["stats"]["dropped_alias"], dup=chk["stats"]["dup"],
                repair_needed=bool(chk["repair"] or ps["bad_lines"]), tally=_tally(item["kind"], chk["rows"], chk),
                error=None)
+    if item.get("group"):
+        rec["group"] = item["group"]
+        if item["kind"] == "verdict":
+            rec["verdicts"] = _verdicts(chk["rows"])
+        if item["arm"] == "merged-joint":
+            frows, _fs = cr.parse_rows(text, "offcard")
+            fchk = cr.check_rows("offcard", None, frows, prep["octx"], attempt=1)
+            fs = [r for r in fchk["rows"] if r["t"] == "f"]
+            deck = set(rec["verdicts"])
+            flagged_l = {x for r in chk["rows"] if r.get("t") == "v" and r.get("judgement") in _FLAG for x in r.get("l") or []}
+            # 카드 판정과 대상이 겹치는 f — 판정한 카드를 근거로 댔거나, 걸린 판정이 댄 줄만 댔다(같은 것을 다시 말한다).
+            rec["f_n"] = len(fs)
+            rec["f_overlap"] = sum(1 for r in fs if r.get("src") in deck or (r.get("l") and set(r["l"]) <= flagged_l))
+        elif item["arm"] == "merged-offcard":
+            rec["f_n"] = int((rec["tally"] or {}).get("f") or 0)
     return rec
 
 
@@ -616,11 +730,15 @@ def _special(arm: str) -> bool:
 def summarize(meta: dict | None, calls: list, *, interrupted: bool = False) -> dict:
     """결과 줄들 → 요약(숫자만). 호출 초·글자/토큰 비는 성공한 호출만, 종류별 초는 채움이 든 호출(접두 캐시·창 초과)을 뺀다."""
     meta = meta or {}
+    skipped = [r for r in calls if (r.get("error") or {}).get("code") == "skipped"]   # 창을 넘어 부르지 않은 보강 팔
+    calls = [r for r in calls if r not in skipped]
     ok = [r for r in calls if not r.get("error")]
     normal = [r for r in calls if not _special(r["arm"])]
     out: dict = {"rec": "summary", "probe_rev": PROBE_REV, "interrupted": bool(interrupted),
                  "calls_planned": (meta.get("plan") or {}).get("calls"), "calls_done": len(calls),
                  "calls_failed": len(calls) - len(ok)}
+    if skipped:
+        out["skipped"] = [{"arm": r["arm"], "k": r["k"], "why": (r.get("error") or {}).get("excerpt")} for r in skipped]
     for k in ("model", "ctx_tokens", "ctx_source", "llm_max_tokens", "out_tokens", "k_default", "k_out"):
         out[k] = meta.get(k)
     if calls:
@@ -665,14 +783,21 @@ def summarize(meta: dict | None, calls: list, *, interrupted: bool = False) -> d
         exp = sum(r["rows_expected"] or 0 for r in good)
         miss = sum(r["rows_missing"] or 0 for r in good)
         flag = sum(r["rows_flagged"] or 0 for r in good)
+        # OK+na 비율(K 규칙의 조건 4 — 행은 다 왔는데 가운데 카드를 '문제없음' 으로 찍는 쏠림). verdict 팔만.
+        okna = (sum(int((r.get("tally") or {}).get(j) or 0) for r in good for j in ("OK", "na"))
+                if rs[0]["kind"] == "verdict" else None)
         arms.append({"arm": arm, "kind": rs[0]["kind"], "k": sorted({r["k"] for r in rs}), "n": len(rs), "ok": len(good),
                      "expected": exp, "missing": miss, "missing_rate": round(miss / exp, 4) if exp else None,
                      "bad_lines": sum(r["bad_lines"] or 0 for r in good),
                      "repair_needed": sum(1 for r in good if r.get("repair_needed")),
                      "flagged": flag, "flag_rate": round(flag / exp, 4) if exp else None,
+                     "okna_rate": round(okna / exp, 4) if okna is not None and exp else None,
                      "length": sum(1 for r in good if r.get("finish_reason") == "length"),
                      "p50_s": pct([r["seconds"] for r in good], 50)})
     out["arms"] = arms
+    out["agree"] = _agree_stats(calls)
+    out["merged"] = _merged_stats(calls)
+    out["summary_arm"] = _summary_stats(calls + skipped)
     ov = next((r for r in calls if r["arm"] == "overflow"), None)
     out["overflow"] = None if ov is None else {
         "accepted": not ov.get("error"), "status": (ov.get("error") or {}).get("status"),
@@ -691,6 +816,71 @@ def summarize(meta: dict | None, calls: list, *, interrupted: bool = False) -> d
     out["dup_prompts"] = sum(1 for r in calls if r.get("dup_prompt") and not r["arm"].startswith("cache"))
     out["errors"] = dict(Counter(r["error"]["code"] for r in calls if r.get("error")))
     return out
+
+
+def _agree_stats(calls: list) -> dict | None:
+    """일치 팔 — group 마다 묶음(agree-deck)의 카드별 판정과 한 장씩(agree-one)의 판정을 맞댄다. 한 장씩이 기준이다(같은 카드를
+    혼자 볼 때의 판정). 뒤집힘은 한 장씩이 걸림(WARNING·FAIL)인데 묶음이 OK·na 로 찍은 카드다(K 의 거짓 음성)."""
+    deck = {r["group"]: r.get("verdicts") or {} for r in calls if r["arm"] == "agree-deck" and not r.get("error")}
+    if not deck:
+        return None
+    one: dict = {}
+    for r in calls:
+        if r["arm"] == "agree-one" and not r.get("error"):
+            one.setdefault(r["group"], {}).update(r.get("verdicts") or {})
+    cards = applies = judge = flagged = flips = 0
+    for g, dv in deck.items():
+        for alias, (ap1, jd1) in (one.get(g) or {}).items():
+            if alias not in dv:
+                continue
+            ap, jd = dv[alias]
+            cards += 1
+            applies += ap == ap1
+            judge += jd == jd1
+            if jd1 in _FLAG:
+                flagged += 1
+                flips += jd in ("OK", "na")
+    return {"groups": len(deck), "cards": cards, "applies_agree": round(applies / cards, 4) if cards else None,
+            "judgement_agree": round(judge / cards, 4) if cards else None, "flagged_alone": flagged,
+            "flag_to_okna": flips, "flag_to_okna_rate": round(flips / flagged, 4) if flagged else None}
+
+
+def _merged_stats(calls: list) -> dict | None:
+    """합친 팔 — group 마다 한 번에(merged-joint) 대 따로(merged-verdict·merged-offcard). 판정 일치율은 같은 카드의 judgement,
+    f 줄 비는 한 번에 ÷ 따로, 겹침은 한 번에 낸 f 가운데 카드 판정과 대상이 겹치는 것의 비율이다."""
+    by: dict = {}
+    for r in calls:
+        if r["arm"].startswith("merged-") and not r.get("error"):
+            by.setdefault(r["group"], {})[r["arm"]] = r
+    groups = [g for g in by.values() if {"merged-joint", "merged-verdict", "merged-offcard"} <= set(g)]
+    if not groups:
+        return None
+    same = total = fj = fs = ov = 0
+    for g in groups:
+        jv, sv = g["merged-joint"].get("verdicts") or {}, g["merged-verdict"].get("verdicts") or {}
+        for alias, (_ap, jd) in sv.items():
+            if alias in jv:
+                total += 1
+                same += jv[alias][1] == jd
+        fj += int(g["merged-joint"].get("f_n") or 0)
+        fs += int(g["merged-offcard"].get("f_n") or 0)
+        ov += int(g["merged-joint"].get("f_overlap") or 0)
+    joint = [g["merged-joint"] for g in groups]
+    return {"groups": len(groups), "verdict_agree": round(same / total, 4) if total else None,
+            "f_joint": fj, "f_separate": fs, "f_ratio": round(fj / fs, 4) if fs else None,
+            "f_overlap_rate": round(ov / fj, 4) if fj else None,
+            "length_joint": sum(1 for r in joint if r.get("finish_reason") == "length"),
+            "p50_s_joint": pct([r["seconds"] for r in joint], 50),
+            "p50_s_separate": pct([g["merged-verdict"]["seconds"] + g["merged-offcard"]["seconds"] for g in groups], 50)}
+
+
+def _summary_stats(calls: list) -> list | None:
+    rs = [r for r in calls if r["arm"].startswith("summary-")]
+    if not rs:
+        return None
+    return [{"rows": r["k"], "seconds": r.get("seconds"), "missing_cover": (r.get("tally") or {}).get("missing_cover"),
+             "finish_reason": r.get("finish_reason"), "prompt_chars": r.get("prompt_chars"),
+             "error": (r.get("error") or {}).get("code")} for r in rs]
 
 
 def _n(x, fmt: str = "{:,}") -> str:
@@ -738,12 +928,27 @@ def render(sm: dict) -> str:
     L.append(f"  finish_reason 분포 {json.dumps(o.get('finish_reasons') or {}, ensure_ascii=False)}")
     L.append("[K 팔 · 종류별 행 — 첫 시도만(보충 호출 없음)]")
     L.append(f"  {'팔':<9}{'K/카드':>8}{'호출':>5}{'성공':>5}{'기대행':>7}{'빠진행':>7}{'비율':>7}{'못읽음':>7}"
-             f"{'보충필요':>9}{'표지행':>7}{'비율':>7}{'length':>7}{'p50초':>8}")
+             f"{'보충필요':>9}{'표지행':>7}{'비율':>7}{'OK+na':>7}{'length':>7}{'p50초':>8}")
     for a in sm.get("arms") or []:
         ks = "/".join(str(k) for k in a["k"])
         L.append(f"  {a['arm']:<9}{ks:>8}{a['n']:>6}{a['ok']:>6}{a['expected']:>9}{a['missing']:>8}"
                  f"{_rate(a['missing_rate']):>8}{a['bad_lines']:>7}{str(a['repair_needed']) + '/' + str(a['ok']):>10}"
-                 f"{a['flagged']:>7}{_rate(a['flag_rate']):>8}{a['length']:>6}{_s(a['p50_s']):>9}")
+                 f"{a['flagged']:>7}{_rate(a['flag_rate']):>8}{_rate(a.get('okna_rate')):>8}{a['length']:>6}"
+                 f"{_s(a['p50_s']):>9}")
+    ag = sm.get("agree")
+    if ag:
+        L.append(f"[일치 팔] 묶음 {ag['groups']} · 카드 {ag['cards']} · applies 일치 {_rate(ag['applies_agree'])} · "
+                 f"judgement 일치 {_rate(ag['judgement_agree'])} · 한 장씩 걸림 {ag['flagged_alone']} 가운데 묶음이 OK·na "
+                 f"{ag['flag_to_okna']}({_rate(ag['flag_to_okna_rate'])})")
+    mg = sm.get("merged")
+    if mg:
+        L.append(f"[합친 팔] 묶음 {mg['groups']} · 판정 일치 {_rate(mg['verdict_agree'])} · f 줄 한 번에 {mg['f_joint']} / 따로 "
+                 f"{mg['f_separate']}({_rate(mg['f_ratio'])}) · 카드 판정과 겹치는 f {_rate(mg['f_overlap_rate'])} · "
+                 f"length {mg['length_joint']} · p50 한 번에 {_s(mg['p50_s_joint'])}초 / 따로 {_s(mg['p50_s_separate'])}초")
+    for x in sm.get("summary_arm") or []:
+        L.append(f"[요약 팔] 행 {x['rows']:,} · " + (f"부르지 않음 — {x['error']}" if x.get("error") == "skipped" else
+                 f"{_s(x['seconds'])}초 · 빠진 꼭 다룰 행 {_n(x['missing_cover'])} · {x.get('finish_reason') or x.get('error')}"
+                 f" · {_n(x['prompt_chars'])}자"))
     ov = sm.get("overflow")
     if ov:
         head = ("받아들였다(거절 없음 — 창이 알려 준 값보다 크거나 넘치지 않았다)" if ov["accepted"]
@@ -765,6 +970,9 @@ def render(sm: dict) -> str:
         first = next(iter(cache.values()))
         L.append(f"[접두 캐시 — 프롬프트 {_n(first.get('prompt_chars'))}자(채움 {_n(first.get('pad_chars'))}자)·카드 1장] "
                  + " · ".join(parts))
+    for x in sm.get("skipped") or []:
+        if not x["arm"].startswith("summary-"):
+            L.append(f"[부르지 않음] {x['arm']} — {x['why']}")
     if sm.get("errors"):
         L.append(f"[오류] {json.dumps(sm['errors'], ensure_ascii=False)}")
     L.append("===== 요약 끝 =====")
@@ -904,18 +1112,26 @@ async def run_probe(args) -> int:
     if beyond:
         print(f"  ⚠ K 팔 {', '.join(beyond)} 는 이 창의 K_out({lim['verdict']['k_out']})보다 크다 — 운영 엔진은 그 묶음을 거절한다")
 
+    extra = set(EXTRAS) if "all" in args.extra else set(args.extra)
     nonce = secrets.token_hex(4)
-    items = build_plan(pack, units, lim, reps=args.reps, k_arms=k_arms, skip=skip, nonce=nonce)
+    items = build_plan(pack, units, lim, reps=args.reps, k_arms=k_arms, skip=skip, nonce=nonce, extra=extra,
+                       agree_reps=args.agree_reps)
     items, dropped = cap_plan(items, args.max_calls)
     preps: dict = {}
+    unfit: dict = {}                 # 창을 넘어 부르지 않는 보강 팔(요약 팔의 큰 행 수) — 결과에 '부르지 않음' 으로 적는다
     for i, it in enumerate(items):
         if it["arm"] == "overflow":
             continue
         try:
             preps[i] = prepare(it, lim)
         except cr.RequestError as exc:
+            if it["arm"].startswith("summary-") or it["arm"] == "merged-joint":
+                unfit[i] = f"{exc.code}: {exc.message}"[:200]
+                continue
             raise ProbeError(f"{it['arm']} 회차 {it['rep']} 의 프롬프트를 엔진이 받지 않는다 — {exc.code}: {exc.message}") \
                 from None
+    for i, why in unfit.items():
+        print(f"  ○ {items[i]['arm']} — 이 창에서는 부르지 않는다({why})")
     load0 = agent_load(args.agent_url)
     print(f"[계획] 호출 {len(items)}회(동시 1)" + (f" · --max-calls 로 {dropped}회를 버렸다" if dropped else "")
           + f" · 표지 {nonce}")
@@ -956,9 +1172,10 @@ async def run_probe(args) -> int:
             "units": [{"unit_sha": _sha(u), "size": cr.unit_size(u), "lines": len(u.get("lines") or []),
                        "context": len(u.get("context") or []), "evidence": len(u.get("evidence") or [])} for u in units],
             "unit_source": unit_src,
-            "plan": {"calls": len(items), "dropped": dropped, "reps": args.reps,
+            "plan": {"calls": len(items) - len(unfit), "dropped": dropped, "reps": args.reps,
                      "k_arms": [[lab, k] for lab, k in k_arms], "skip": sorted(skip),
-                     "arms": dict(Counter(it["arm"] for it in items))},
+                     "arms": dict(Counter(it["arm"] for i, it in enumerate(items) if i not in unfit)),
+                     **({"extra": sorted(extra), "agree_reps": args.agree_reps} if extra else {})},
             "nonce": nonce, "load_at_start": load0}
     fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
     fh.flush()
@@ -971,6 +1188,13 @@ async def run_probe(args) -> int:
     stopped = ""
     try:
         for i, it in enumerate(items):
+            if i in unfit:
+                calls.append({"rec": "call", "ts": round(time.time(), 1), "kind": it["kind"], "variant": None,
+                              "arm": it["arm"], "k": it["k"], "rep": it["rep"], "seconds": None,
+                              "error": {"code": "skipped", "status": None, "infra": False, "excerpt": unfit[i][:EXCERPT],
+                                        "excerpt_chars": len(unfit[i])}, "i": i + 1, "n": len(items)})
+                fh.write(json.dumps(calls[-1], ensure_ascii=False) + "\n")
+                continue
             if it["arm"] == "overflow":
                 cpt, src = overflow_cpt(calls)
                 it = overflow_item(it, lim, cpt, src)
@@ -989,7 +1213,7 @@ async def run_probe(args) -> int:
             calls.append(rec)
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
-            done = [r["seconds"] for r in calls if r["arm"] != "overflow"]
+            done = [r["seconds"] for r in calls if r["arm"] != "overflow" and r.get("seconds") is not None]
             left = sum(1 for x in items[i + 1:] if x["arm"] != "overflow")
             print(_progress(rec, i + 1, len(items), sum(done) / len(done) * left if done and left else None), flush=True)
             if it["arm"] != "overflow":
@@ -1034,6 +1258,8 @@ def main(argv=None) -> int:
     ap.add_argument("--k-arms", default=DEFAULT_K_ARMS, help=f"verdict 묶음 장수(기본 {DEFAULT_K_ARMS})")
     ap.add_argument("--max-calls", type=int, default=100, help="LLM 호출 상한(기본 100) — 넘으면 회차 꼬리를 버리고 말한다")
     ap.add_argument("--skip", default="", help=f"뺄 것을 쉼표로 — {', '.join(SKIPPABLE)}")
+    ap.add_argument("--extra", default="", help=f"더할 보강 팔을 쉼표로 — {', '.join(EXTRAS)} · all(M3 E3-12)")
+    ap.add_argument("--agree-reps", type=int, default=4, help="일치 팔의 회차(기본 4)")
     ap.add_argument("--portal", default=DEFAULT_PORTAL, help=f"포털 백엔드 주소(기본 {DEFAULT_PORTAL})")
     ap.add_argument("--env-file", default=str(ROOT / ".env"), help="에이전트 서버 .env(기본 리포 루트의 .env)")
     ap.add_argument("--allow-busy", action="store_true", help="심의·카드 대조가 돌아도 강행한다")
@@ -1048,8 +1274,11 @@ def main(argv=None) -> int:
         ap.error("--agent 나 --pack-file 가운데 하나가 있어야 한다")
     if not args.dry_run and not args.out:
         ap.error("--out 이 있어야 한다(또는 --dry-run)")
-    if args.reps < 1 or args.max_calls < 1:
-        ap.error("--reps·--max-calls 는 1 이상이다")
+    if args.reps < 1 or args.max_calls < 1 or args.agree_reps < 1:
+        ap.error("--reps·--max-calls·--agree-reps 는 1 이상이다")
+    args.extra = [x.strip() for x in args.extra.split(",") if x.strip()]
+    if set(args.extra) - set(EXTRAS) - {"all"}:
+        ap.error(f"--extra 는 {', '.join(EXTRAS)}·all 가운데서 고른다")
 
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(line_buffering=True)     # 진행 줄이 nohup·파이프에서도 바로 보이게

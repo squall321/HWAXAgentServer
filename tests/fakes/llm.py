@@ -122,6 +122,12 @@ def default_oracle(system: str, human: str) -> list:
                              "note": "변경 줄에서 조건을 확인했다"})
             rows.append({"t": "v", "k": k, "applies": "yes", "judgement": "OK", "cq": quote_of(secs), "l": l1,
                          "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""})
+        if "[탐침 — 판정과 카드 밖을 한 번에]" in human and not want:
+            # M0-b 합친 팔(탐침 전용 틀) — 판정 뒤에 카드 밖 줄 하나와 more 를 같은 출력에 낸다.
+            rows.append({"t": "f", "dir": "risk", "title": "보스 둘레 크랙 위험", "mech": "free", "mech_free": "보스 크랙",
+                         "path": "고정 보스 둘레", "l": l1, "src": "exp", "q": "", "sev": "중대", "conf": "medium",
+                         "check_kind": "sim", "check": "낙하 해석으로 보스 둘레 응력을 본다"})
+            rows.append({"t": "more", "more": "no"})
     elif p["kind"] == "sweep":
         first = list(p["cards"])[:1]
         # 결측 블록(cr-sweep-2)이 있으면 지시대로 '결측 때문에 가릴 수 없으면 maybe' 로 답한다(결손 훑기).
