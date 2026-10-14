@@ -150,9 +150,9 @@ decides which of two rows for the same card survives), `noinput` `q1{impact, tit
 k, cq, sev, why}` · `q2{item, needs, k, l, why}` · `more` (`quality.maybe_more` when `q1` reaches `items_max` or
 `more=yes`; a `q1` with `impact=no` or a `q2` with an empty `item` needs a reason — `checks.why="short"` is re-asked;
 `quality.ok`/`flagged` count `q1` and `q2` rows; `q1` rows fold only when identical; a repair replaces an earlier `q1`
-with the same title only when that row had something to fix — a wrong quote or an `impact` the engine coerced (same
-card), or a short reason (same impact) — and a repaired `q2` replaces the earlier empty-item `q2` whose reason was
-short; above `items_max` the hits (`yes` · `unknown`) are kept first and `quality.dropped_over_cap` counts each dropped
+with the same title and card only when that row had something to fix — a wrong quote, an `impact` the engine coerced,
+or a short reason (same impact) — preferring the same impact, then the same place (`path` · `l`); and a repaired `q2` replaces the earlier empty-item `q2` whose reason was
+short; above `items_max` the hits the model wrote (`yes` · `unknown`) are kept first, then engine-coerced ones, and `quality.dropped_over_cap` counts each dropped
 row once), `summary` `head` · `risk` · `conflict` ·
 `gain` · `watch` · `ask` · `para` with `r` (row aliases) and `refs` (the row refs) — `head`/`para`/`risk`/`conflict`
 need text (`checks.text="empty"` counts as a missing line), a `risk` cites at most 3 rows (`checks.refs="too_many"`),
@@ -162,11 +162,14 @@ covered is re-asked, what is still missing after the repairs is in `result.missi
 resolve them with `meta.aliases.rows`). Several `head` lines keep the first with text (`checks.extra_heads`). When two
 rows for the same card/unit/impact disagree, a hit (WARNING·FAIL, `rel` yes·maybe, `impact` yes·unknown) is never
 displaced by a non-hit — unless the engine coerced that verdict from an out-of-vocabulary value (`rel` → `maybe`,
-`impact` → `unknown`), which an explicit answer replaces. The survivor carries `checks.dup_conflict=true` and the losing
+`impact` → `unknown`), which an explicit answer replaces (a value differing only in case or surrounding spaces —
+`Yes`, `Fail` — is taken as written, not coerced; a coerced verdict never makes a conflict). The survivor carries `checks.dup_conflict=true` and the losing
 row as `contested_by{verdict, cq, quote, why, attempt}`; once a contesting answer's quote is verified, the survivor's
-own failed quote is not re-asked (its `checks.quote` stays). Between rows of the same standing, repair reasons
+own failed quote is not re-asked (its `checks.quote` stays) — for `q1` only when the contesting row is in the same place
+(`contested_by` then also carries its `path` and `l`). Between rows of the same standing, repair reasons
 (out-of-vocabulary values, failed quotes, short reasons, empty text) weigh before flag-only checks (unsourced numbers,
-refs). A repair that replaces a row with a different verdict carries `flipped_from{verdict, attempt}`, and a
+refs). A repair that replaces a row with a different verdict carries `flipped_from{verdict, attempt}` (plus `raw`, the
+value the model wrote, when the replaced verdict was coerced), and a
 replacement keeps the `dup_conflict`, `contested_by` and `flipped_from` of the row it replaces. `quality.dup_conflict` and `quality.flipped` count those rows. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
 `noinput` · `rows`; offcard with search carries `meta.search{state: ok·empty_scope·no_hits·failed, queries, hits_n,
 scope_n, used[{alias, record_id, section_id, title, chars, orig_chars, clipped}], note, req_cut}` (`failed` = could

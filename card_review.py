@@ -1216,16 +1216,40 @@ def _hit(r: dict) -> bool:
 _VERDICT_FIELD = {"v": "judgement", "u": "rel", "q1": "impact"}
 
 
+def _coerced(r: dict) -> bool:
+    """판정 칸(v judgement · u rel · q1 impact)이 열거 밖 값이라 엔진이 고친 줄인가 — 그 값은 모델의 답이 아니다."""
+    return _VERDICT_FIELD.get(r["t"]) in ((r.get("checks") or {}).get("enum") or [])
+
+
 def _protected(r: dict) -> bool:
     """밀려나지 않는 걸린 줄 — 걸렸고, 그 판정이 열거 밖 값을 엔진이 고친 것(rel 'irrelevant' → maybe · impact 'none' →
     unknown)이 아니다. 고친 값까지 지키면 같은 정체의 명시적 답(rel no·impact no)이 그 오타를 영영 못 고쳤다(RB3B-2 — 앱은
     dup_conflict 를 걸림으로 다루니 오타가 다투는 걸림이 됐다). 고친 줄은 문제 수(열거 밖)로 명시적 답에 진다."""
-    return _hit(r) and _VERDICT_FIELD.get(r["t"]) not in ((r.get("checks") or {}).get("enum") or [])
+    return _hit(r) and not _coerced(r)
 
 
 def _contest_verified(r: dict) -> bool:
-    """이 줄과 다툰 진 줄(contested_by)의 인용이 원문에서 확인됐나 — 그러면 이 줄의 인용 불일치를 더 묻지 않는다(RB3B-3)."""
-    return (r.get("contested_by") or {}).get("quote") == "ok"
+    """이 줄과 다툰 진 줄(contested_by)의 인용이 원문에서 확인됐나 — 그러면 이 줄의 인용 불일치를 더 묻지 않는다(RB3B-3).
+    q1 은 진 줄이 같은 자리(path·l)였을 때만이다 — 제목만 같은 다른 영향의 검증된 인용이 이 줄의 지어낸 인용을 덮지 않게(RB3C-3)."""
+    cb = r.get("contested_by") or {}
+    return cb.get("quote") == "ok" and (r["t"] != "q1" or (cb.get("path"), cb.get("l")) == (r.get("path"), r.get("l")))
+
+
+def _flip(prev: dict) -> dict:
+    """갈아 낀 앞 줄의 판정 — flipped_from{verdict, attempt}. 앞 줄의 판정이 엔진이 고친 값이면 모델이 실제로 쓴 값을 raw 에
+    싣는다(RB3C-4 — 'none' 을 unknown 으로 고친 줄을 갈아 끼우면 흔적이 unknown 만 남았다)."""
+    out = {"verdict": _verdict_of(prev), "attempt": prev.get("from_attempt")}
+    if _coerced(prev):
+        f = _VERDICT_FIELD[prev["t"]]
+        out["raw"] = next((str(c).split(":", 1)[1] for c in (prev.get("checks") or {}).get("coerced") or []
+                           if str(c).startswith(f + ":")), "")
+    return out
+
+
+def _clash(a: dict, b: dict) -> bool:
+    """같은 정체의 두 줄이 판정으로 부딪쳤나 — 판정이 다르고, 어느 쪽 판정도 엔진이 고친 값이 아니다. 고친 값은 모델의 답이
+    아니라 다툼이 아니다(RB3C-6 — 한 시도의 [U01 'irrelevant', U01 no] 가 dup_conflict 로 앱에 다투는 걸림이 됐다)."""
+    return _verdict_of(a) != _verdict_of(b) and not (_coerced(a) or _coerced(b))
 
 
 def _row_problems(r: dict) -> list:
@@ -1274,6 +1298,8 @@ def _conflicted(win: dict, lose: dict) -> dict:
         out["contested_by"] = {"verdict": _verdict_of(lose), "cq": lose.get("cq", ""),
                                "quote": (lose.get("checks") or {}).get("quote"), "why": lose.get("why", ""),
                                "attempt": lose.get("from_attempt")}
+        if lose["t"] == "q1":                      # 같은 자리였는지(_contest_verified) — 영향 줄은 경로·참조가 자리다
+            out["contested_by"].update(path=lose.get("path", ""), l=list(lose.get("l") or []))
     return out
 
 
@@ -1294,6 +1320,10 @@ def _enum(row: dict, f: str, allowed, fallback: str, checks: dict, *, empty_too:
     """열거 밖 값은 불확실한 쪽(fallback)으로 고치고 coerced·enum 에 적는다(enum 은 보충을 일으킨다). 빈 값은 empty_too 일
     때만 고친다(그 밖에는 그 칸이 필요한지를 따로 본다)."""
     v = row.get(f, "")
+    if v not in allowed:
+        # 대소문자·앞뒤 빈칸만 다른 값은 그 값이다(RB3C-4 — 'Yes'·'Fail' 을 열거 밖으로 고쳐 걸림이 걸림으로 지켜지지 않았다).
+        v = next((a for a in allowed if a and a.casefold() == str(v).strip().casefold()), v)
+        row[f] = v
     if (v or empty_too) and v not in allowed:
         checks["coerced"].append(f"{f}:{v}")
         checks.setdefault("enum", []).append(f)
@@ -1570,7 +1600,7 @@ def _dedupe(rows: list, key, verdict_of) -> tuple[list, int]:
         dups += 1
         old = kept[k]
         win, lose = (_carry(r, old), old) if _better(r, old) else (old, r)
-        if verdict_of(win) != verdict_of(lose):
+        if verdict_of(win) != verdict_of(lose) and not (_coerced(win) or _coerced(lose)):
             win = _conflicted(win, lose)
         kept[k] = win
     return [kept[k] for k in order], dups
@@ -1766,26 +1796,31 @@ _QUOTE_BAD = ("not_found", "short", "empty")      # 보충 사유가 되는 인�
 def _fix_target(out: list, r: dict) -> int | None:
     """보충이 고쳐 다시 낸 q1·q2 가 갈아 낄 앞 줄의 자리 — 고칠 까닭이 있던 앞 줄만이다. 그 밖의 q1·q2 는 완전히 같을 때만
     겹침이다(RB3-2 — 같은 카드를 댄 다른 영향을 접지 않는다).
-    q1 — 같은 제목(정규화)이고 ① 같은 카드(k)·비지 않은 제목에 앞 줄의 인용이 틀렸다(RB3-2) ② 같은 카드에 앞 줄의 영향이 열거
-    밖이라 엔진이 unknown 으로 고쳤다(RB3B-2 — 명시적 답이 그 자리를 갈아 낀다) ③ 앞 줄이 까닭 없는 '영향 없음' 이고 새 줄도
-    같은 영향이다(RB3B-1 — 고친 줄이 붙기만 해 옛 줄이 남아 보충이 끝나지 않았고 상한을 차지해 걸린 영향을 밀어냈다).
+    q1 — 같은 제목(정규화)·같은 카드(k)이고 ① 비지 않은 제목에 앞 줄의 인용이 틀렸다(RB3-2) ② 앞 줄의 영향이 열거 밖이라
+    엔진이 unknown 으로 고쳤다(RB3B-2 — 명시적 답이 그 자리를 갈아 낀다) ③ 앞 줄이 까닭 없는 '영향 없음' 이고 새 줄도 같은
+    영향이다(RB3B-1 — 고친 줄이 붙기만 해 옛 줄이 남아 보충이 끝나지 않았고 상한을 차지해 걸린 영향을 밀어냈다). 후보가
+    여럿이면 같은 영향, 그다음 같은 자리(path·l)다.
     q2 — 앞의 까닭 없는 빈 항목 줄('확인할 것 없음')이다(RB3B-1)."""
     if r["t"] == "q2":
-        return next((i for i, p in enumerate(out) if p["t"] == "q2" and not p.get("item")
+        return next((i for i, p in enumerate(out) if p is not None and p["t"] == "q2" and not p.get("item")
                      and (p.get("checks") or {}).get("why") == "short"), None)
     if r["t"] != "q1":
         return None
     title = _nq(r.get("title"))
+    best, at = None, None
     for i, p in enumerate(out):
-        if p["t"] != "q1" or _nq(p.get("title")) != title:
-            continue
+        if p is None or p["t"] != "q1" or _nq(p.get("title")) != title or p.get("k") != r.get("k"):
+            continue                               # 같은 카드여야 한다(RB3C-5 — 다른 카드의 '없음' 이 갈아 껴 흔적 없이 사라졌다)
         ch = p.get("checks") or {}
-        same_card = p.get("k") == r.get("k")
-        if ((r.get("k") and title and same_card and ch.get("quote") in _QUOTE_BAD)
-                or (same_card and "impact" in (ch.get("enum") or []))
+        if not ((r.get("k") and title and ch.get("quote") in _QUOTE_BAD) or "impact" in (ch.get("enum") or [])
                 or (ch.get("why") == "short" and p.get("impact") == r.get("impact"))):
-            return i
-    return None
+            continue
+        # 후보가 여럿이면 같은 영향, 그다음 같은 자리(path·l)를 고른다(RB3C-3 — 까닭을 고친 '없음' 이 같은 제목의 걸린 영향에
+        # 붙어 그 지어낸 인용을 덮고, 고칠 '없음' 은 끝내 남았다). 같으면 앞 것이다.
+        score = (p.get("impact") == r.get("impact"), (p.get("path"), p.get("l")) == (r.get("path"), r.get("l")))
+        if best is None or score > best:
+            best, at = score, i
+    return at
 
 
 def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None = None) -> list:
@@ -1796,7 +1831,8 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
     잇고(_carry), 갈아 낀 판정이 앞 시도와 다르면 `flipped_from` 을 싣는다(P-08). 갈아 끼지 않았는데 판정이 갈렸으면 남긴
     줄에 checks.dup_conflict 와 진 줄(contested_by)을 단다(앱이 둘 다 센다 — quality.flipped·dup_conflict). 한 줄짜리
     (m·more·none)는 새 것으로 갈아 끼우고, head 는 무게가 가벼울 때만 갈아 낀다(아니면 dup — 글이 있는 head 가 빈 head 를
-    이긴다). 정체가 없는 줄(f·c·h·need·나머지 q1·q2)은 앞 행과 **완전히 같을 때만** 버리고 stats["dup"] 에 센다. 새 행은
+    이긴다). 정체가 없는 줄(f·c·h·need·나머지 q1·q2)은 앞 행과 **완전히 같을 때만** 버리고 stats["dup"] 에 센다 — 다만
+    그 줄이 엔진이 고친 값의 줄을 고친 답이면 이미 있는 같은 줄이 고친 값의 줄을 대신한다(RB3C-6). 새 행은
     `from_attempt=attempt` 다."""
     out = list(old)
     at: dict = {}                                  # 정체 열쇠 → out 의 자리
@@ -1808,10 +1844,18 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
     for r in new:
         k = _merge_key(r)
         ident = _identity(r)
-        if k is None and ident in seen:
-            dup += 1                               # 앞 시도의 줄을 그대로 다시 냈다 — 하나만 둔다(고칠 줄을 갈아 끼지 않는다)
-            continue
         j = at.get(k) if k is not None else _fix_target(out, r)
+        if k is None and ident in seen:
+            twin = next((i for i, p in enumerate(out) if p is not None and i != j and _identity(p) == ident), None)
+            fixes_coerced = j is not None and _coerced(out[j])
+            if twin is not None or not fixes_coerced:
+                dup += 1                           # 앞 시도의 줄을 그대로 다시 냈다 — 하나만 둔다(고칠 줄을 갈아 끼지 않는다)
+                if twin is not None and fixes_coerced:
+                    # 다만 그 줄이 엔진이 고친 값의 줄을 고친 답이면 이미 있는 같은 줄이 그 자리를 대신한다(RB3C-6 — 한 시도의
+                    # [A 'none', A no] 에서 보충이 no 를 그대로 다시 내면 겹침으로 버려져 고친 값이 끝내 남았다).
+                    out[twin] = {**out[twin], "flipped_from": out[twin].get("flipped_from") or _flip(out[j])}
+                    out[j] = None
+                continue
         if j is not None:
             prev = out[j]
             if r["t"] in _SINGLE_ROWS and r["t"] != "head":
@@ -1819,9 +1863,9 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
             elif _better(r, prev):
                 r = _carry(r, prev)
                 if _verdict_of(r) != _verdict_of(prev):
-                    r = {**r, "flipped_from": {"verdict": _verdict_of(prev), "attempt": prev.get("from_attempt")}}
+                    r = {**r, "flipped_from": _flip(prev)}
                 out[j] = r
-            elif _verdict_of(r) != _verdict_of(prev):
+            elif _clash(r, prev):
                 out[j] = _conflicted(prev, r)      # 걸린 줄을 지켰다 — 갈린 사실과 진 줄을 남긴다
             else:
                 dup += 1
@@ -1830,6 +1874,7 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
         if k is not None:
             at[k] = len(out)
         out.append(r)
+    out = [r for r in out if r is not None]          # 같은 줄이 대신한 고친 값의 줄(위)
     if kind == "offcard" and any(r["t"] == "none" for r in out) and any(r["t"] == "f" for r in out):
         out = [r for r in out if r["t"] != "none"]   # 보충에서 f 가 왔으면 '없음' 줄은 낡았다
     if stats is not None:
@@ -2991,9 +3036,10 @@ def _err(code: str, message: str, **kw) -> dict:
 def _cap_findings(rows: list, cap: int, t: str = "f") -> tuple[list, list]:
     """t 줄(카드 밖 f · 입력 결손 q1)이 상한을 넘으면 걸린 줄(q1 yes·unknown)을 먼저, 그다음 앞의 것(먼저 받은 것)을 남긴다 —
     (남긴 행, 버린 줄). 남긴 줄의 차례는 그대로다. check_rows(한 시도)와 run(보충으로 합친 뒤)이 같이 쓴다. 앞선 '영향 없음'
-    줄이 상한을 차지해 걸린 영향이 버려지면 셀이 거짓 음성으로 끝났다(RB3B-1·12). 열거 밖 값을 고친 걸림도 걸림으로 남긴다."""
+    줄이 상한을 차지해 걸린 영향이 버려지면 셀이 거짓 음성으로 끝났다(RB3B-1·12). 열거 밖 값을 엔진이 고친 걸림(impact 'none'
+    → unknown)은 모델이 실제로 낸 걸림 뒤에 남긴다 — 고친 줄들이 상한을 차지해 걸린 영향을 버렸다(RB3C-1)."""
     idx = [i for i, r in enumerate(rows) if r["t"] == t]
-    keep = set(sorted(idx, key=lambda i: not _hit(rows[i]))[:max(0, cap)])
+    keep = set(sorted(idx, key=lambda i: (not _protected(rows[i]), not _hit(rows[i])))[:max(0, cap)])
     return [r for i, r in enumerate(rows) if r["t"] != t or i in keep], [rows[i] for i in idx if i not in keep]
 
 

@@ -881,7 +881,7 @@ def test_열거_밖_값을_고친_걸림은_명시적_답에_진다():
     r2 = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "no",
                                                           "why": "보스와 무관한 단위다"}]), "sweep")[0], sctx, attempt=2)
     u = next(r for r in cr.merge_rows("sweep", r1["rows"], r2["rows"], 2) if r["t"] == "u")
-    assert (u["rel"], u.get("flipped_from")) == ("no", {"verdict": ("maybe",), "attempt": 1}), u
+    assert (u["rel"], u.get("flipped_from")) == ("no", {"verdict": ("maybe",), "attempt": 1, "raw": "irrelevant"}), u
     assert not u["checks"].get("dup_conflict")
     one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "irrelevant", "why": "x"},
                                                           {"t": "u", "u": "U01", "k": [], "rel": "no",
@@ -892,7 +892,8 @@ def test_열거_밖_값을_고친_걸림은_명시적_답에_진다():
     assert [r["impact"] for r in first["rows"] if r["t"] == "q1"] == ["unknown"] and first["repair"]
     fixed = _ni(ctx, [_q1(ctx, impact="no", title="회로 영향", why="회로 배치와 떨어져 있다고 본다", mech="")], attempt=2)
     q1 = [r for r in cr.merge_rows("noinput", first["rows"], fixed["rows"], 2) if r["t"] == "q1"]
-    assert [(r["impact"], r.get("flipped_from")) for r in q1] == [("no", {"verdict": ("unknown",), "attempt": 1})], q1
+    assert [(r["impact"], r.get("flipped_from")) for r in q1] == [
+        ("no", {"verdict": ("unknown",), "attempt": 1, "raw": "none"})], q1
     # 모델이 직접 쓴 unknown 은 그대로 걸림이다 — 보충의 no 에 밀려나지 않는다.
     keep = _ni(ctx, [_q1(ctx, impact="unknown", title="회로 영향", mech=""), _Q2, _MORE])
     q1 = [r for r in cr.merge_rows("noinput", keep["rows"], fixed["rows"], 2) if r["t"] == "q1"]
@@ -983,3 +984,93 @@ def test_같은_별칭이_둘인_거절은_별칭을_80자에서_끊는다():
     with pytest.raises(cr.RequestError) as e:
         cr.build_ctx(_req(cards=[c, c]), LIM)
     assert e.value.code == "bad_request" and len(json.dumps(e.value.body(), ensure_ascii=False)) < 400
+
+
+# ── 적대 검토 5라운드(RB3C) ────────────────────────────────────────────────────────
+def test_상한은_모델이_낸_걸림을_엔진이_고친_걸림보다_먼저_남긴다():
+    """RB3C-1 — 상한을 _hit 로 골라 impact 'none' → unknown 으로 고친 줄 둘이 상한(2)을 차지하고 모델이 낸 yes 를 버렸다. 보충이
+    그 둘을 no 로 고치면 셀에 걸림이 하나도 없다(거짓 음성). 지키는 걸림, 고친 걸림, 나머지 순이다."""
+    ctx = _ni_ctx()
+    ctx["items_max"] = 2
+    rows = [_q1(ctx, impact="none", title="A", mech=""), _q1(ctx, impact="none", title="B", mech=""),
+            _q1(ctx, impact="yes", title="C"), _Q2, _MORE]
+    res = _ni(ctx, rows)
+    assert [(r["title"], r["impact"]) for r in res["rows"] if r["t"] == "q1"] == [("A", "unknown"), ("C", "yes")]
+    assert [r["title"] for r in res["stats"]["cut"]] == ["B"]
+
+
+def test_고칠_앞_줄은_같은_영향_같은_자리를_먼저_고르고_다른_자리의_반대_답은_인용을_덮지_않는다():
+    """RB3C-3 — 같은 제목·같은 카드의 [걸린 영향 A(지어낸 인용), 까닭 없는 '없음' B] 에서 B 를 고친 답이 A 에 붙어(인용이 틀린 첫
+    줄), A 의 지어낸 인용이 검증된 반대 답으로 덮이고 B 는 끝내 남았다. 같은 영향을 먼저 고르고, 반대 답이 인용을 덮는 것은 같은
+    자리(path·l)일 때만이다."""
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    bad = "카드에 없는 문장을 열다섯 자 넘게 지어냈다고 본다"
+    first = _ni(ctx, [_q1(ctx, k, title="회로 영향", path="A", cq=bad),
+                      _q1(ctx, k, impact="no", title="회로 영향", path="B", cq="", why="없음", mech=""), _Q2, _MORE])
+    fix = _ni(ctx, [_q1(ctx, k, impact="no", title="회로 영향", path="B", why="보드 고정점이 이 변경과 떨어져 있다", mech="")],
+              attempt=2)
+    merged = cr.merge_rows("noinput", first["rows"], fix["rows"], 2)
+    got = [(r["path"], r["impact"], r["checks"].get("why"), r["checks"].get("dup_conflict"))
+           for r in merged if r["t"] == "q1"]
+    assert got == [("A", "yes", "ok", None), ("B", "no", "ok", None)], got
+    assert cr.settle("noinput", merged, ctx)["problems"] == [(k, "quote", "not_found")], "지어낸 인용을 더 묻지 않는다"
+    # A 만 있을 때 다른 자리의 검증된 '없음' 이 와서 다투면, 다툼은 싣되 A 의 인용은 계속 묻는다.
+    only = _ni(ctx, [_q1(ctx, k, title="회로 영향", path="A", cq=bad), _Q2, _MORE])
+    other = _ni(ctx, [_q1(ctx, k, impact="no", title="회로 영향", path="C", why="보드 고정점이 이 변경과 떨어져 있다",
+                          mech="")], attempt=2)
+    merged = cr.merge_rows("noinput", only["rows"], other["rows"], 2)
+    a = next(r for r in merged if r["t"] == "q1" and r["path"] == "A")
+    assert (a.get("contested_by") or {}).get("path") == "C" and a["checks"].get("dup_conflict") is True
+    assert cr.settle("noinput", merged, ctx)["problems"] == [(k, "quote", "not_found")]
+    same = _ni(ctx, [_q1(ctx, k, impact="no", title="회로 영향", path="A", why="보드 고정점이 이 변경과 떨어져 있다",
+                         mech="")], attempt=2)
+    assert not cr.settle("noinput", cr.merge_rows("noinput", only["rows"], same["rows"], 2), ctx)["repair"], (
+        "같은 자리의 검증된 반대 답은 그 인용을 더 묻지 않는다(RB3B-3)")
+
+
+def test_대소문자만_다른_판정은_고친_값이_아니다():
+    """RB3C-4 — 'Yes'·'Fail' 을 열거 밖으로 고쳐(unknown·undetermined·maybe) 걸림이 지켜지지 않았고, 갈아 끼면 흔적이 고친 값만
+    남았다. 대소문자·앞뒤 빈칸만 다른 값은 그 값이다. 정말 열거 밖인 값을 갈아 끼면 flipped_from.raw 에 모델이 쓴 값이 남는다."""
+    ctx = _ni_ctx()
+    res = _ni(ctx, [_q1(ctx, impact=" Yes ", title="T"), _Q2, _MORE])
+    q = next(r for r in res["rows"] if r["t"] == "q1")
+    assert (q["impact"], q["checks"]["coerced"], cr._protected(q)) == ("yes", [], True)
+    vctx = _ctx(_req())
+    a = vctx["judge"][0]
+    v = cr.check_rows("verdict", "fwd", cr.parse_rows(_jl([_good_v(vctx, a, applies="Yes", judgement="Fail")]),
+                                                      "verdict")[0], vctx)["rows"][0]
+    assert (v["applies"], v["judgement"], v["checks"]["coerced"]) == ("yes", "FAIL", [])
+    u = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "YES", "why": "x"}]),
+                                                   "sweep")[0], _sweep_ctx())["rows"][0]
+    assert (u["rel"], u["checks"]["coerced"]) == ("yes", [])
+
+
+def test_까닭을_고친_영향_없음은_같은_카드의_줄만_갈아_낀다():
+    """RB3C-5 — 까닭 없는 '없음' 을 고치는 규칙이 카드를 보지 않아, K01 의 줄이 같은 제목의 K02 '없음' 에 갈아 껴 흔적 없이
+    사라졌다."""
+    ctx = _ni_ctx()
+    k1, k2 = ctx["card_order"][:2]
+    first = _ni(ctx, [_q1(ctx, k1, impact="no", why="없음", mech=""), _Q2, _MORE])
+    fix = _ni(ctx, [_q1(ctx, k2, impact="no", mech="")], attempt=2)
+    merged = cr.merge_rows("noinput", first["rows"], fix["rows"], 2)
+    assert [(r["k"], r["checks"]["why"]) for r in merged if r["t"] == "q1"] == [(k1, "short"), (k2, "ok")]
+
+
+def test_고친_값과_명시적_답의_다툼은_다툼이_아니고_같은_줄이_고친_값의_줄을_대신한다():
+    """RB3C-6 — 한 시도의 [U01 'irrelevant', U01 no] 는 no 를 남기되 dup_conflict 를 달아 앱이 다투는 걸림으로 읽었다(고친 값은
+    모델의 답이 아니다). 한 시도의 [A 'none', A no] 는 보충이 no 를 그대로 다시 내면 겹침으로 버려져 고친 값이 끝내 남았다."""
+    one = cr.check_rows("sweep", None, cr.parse_rows(_jl([{"t": "u", "u": "U01", "k": [], "rel": "irrelevant", "why": "x"},
+                                                          {"t": "u", "u": "U01", "k": [], "rel": "no",
+                                                           "why": "보스와 무관한 단위다"}]), "sweep")[0], _sweep_ctx())
+    u = next(r for r in one["rows"] if r["t"] == "u")
+    assert (u["rel"], u["checks"].get("dup_conflict"), u.get("contested_by")) == ("no", None, None), u
+    ctx = _ni_ctx()
+    no = _q1(ctx, impact="no", title="A", mech="")
+    first = _ni(ctx, [_q1(ctx, impact="none", title="A", mech=""), no, _Q2, _MORE])
+    assert first["repair"] and [r["impact"] for r in first["rows"] if r["t"] == "q1"] == ["unknown", "no"]
+    stats: dict = {}
+    merged = cr.merge_rows("noinput", first["rows"], _ni(ctx, [no], attempt=2)["rows"], 2, stats=stats)
+    q1 = [r for r in merged if r["t"] == "q1"]
+    assert [(r["impact"], (r.get("flipped_from") or {}).get("raw")) for r in q1] == [("no", "none")], q1
+    assert not cr.settle("noinput", merged, ctx)["repair"] and stats["dup"] == 1

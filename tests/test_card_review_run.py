@@ -754,3 +754,20 @@ def test_검증된_철회가_오면_지어낸_인용을_더_묻지_않고_진_�
     assert (kept["judgement"], kept["checks"]["quote"], (kept.get("contested_by") or {}).get("quote")) == (
         "FAIL", "not_found", "ok"), kept
     assert (res["quality"]["dup_conflict"], res["quality"]["flipped"]) == (1, 0)
+
+
+def test_고친_값의_줄들이_상한을_차지해도_모델이_낸_걸림은_남는다():
+    """RB3C-1 — 상한 2 에 [impact 'none' A, 'none' B, yes C] 면 고친 줄 둘이 상한을 차지해 C 가 버려졌고, 보충이 A·B 를 no 로
+    고치자 셀에 걸림이 하나도 없었다(거짓 음성 — 3f23572 는 걸림을 남겼다)."""
+    lim = cr.limits(1_048_576, "server", 4_096, env={}, model="fake-glm")
+    prep = cr.prepare(_req("noinput", PACK, _digest(PACK), unit=_unit(0),
+                           extra={"mechanisms": [{"code": "pcb.board_flex", "label": "보드 휨"}]}), lim)
+    yes = _ni_q1(impact="yes", title="C 걸림", mech="pcb.board_flex", why="간극 축소가 카드 조건과 겹친다")
+    q2 = {"t": "q2", "item": "부품 배치", "needs": "ECAD", "k": "", "l": ["L01"], "why": "간극을 본다"}
+    fr, llm, _ = _go(prep, [_jl(_ni_q1(impact="none", title="A"), _ni_q1(impact="none", title="B"), yes, q2,
+                                {"t": "more", "more": "no"}),
+                            _jl(_ni_q1(title="A"), _ni_q1(title="B")), _jl(_ni_q1(title="A"), _ni_q1(title="B"))])
+    e, res = _last(fr)
+    assert e == "result", res
+    q1 = [(r["title"], r["impact"]) for r in res["rows"] if r["t"] == "q1"]
+    assert ("C 걸림", "yes") in q1, q1
