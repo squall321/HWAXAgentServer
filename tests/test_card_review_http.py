@@ -115,7 +115,8 @@ def test_run_자리가_없으면_error_done(client):
 @pytest.mark.parametrize("mutate,code,field", [
     (lambda b: b.update(extras={}), "unknown_fields", "extras"),
     (lambda b: b["unit"].update(evidences=[]), "unknown_fields", "unit.evidences"),
-    (lambda b: b.update(extra={"search": {"q": "x"}}), "unknown_fields", "extra.search"),
+    # M3 에서 extra.search 를 선언했다(cr-offcard-2) — 안쪽 칸 이름이 어긋나면(q ≠ queries) 거절한다.
+    (lambda b: b.update(extra={"search": {"q": "x"}}), "unknown_fields", "extra.search.q"),
     (lambda b: b["unit"]["lines"][0].update(kind="x"), "unknown_fields", "unit.lines.0.kind"),
     (lambda b: b["expert"].update(persona="x"), "unknown_fields", "expert.persona"),
     # 안쪽 항목(RB-4) — 칸 이름이 어긋나면 블록이 말없이 비던 자리.
@@ -322,9 +323,10 @@ def test_health_에_카드_대조_칸이_있고_기존_칸은_그대로다(clien
     assert h["capabilities"] == ["card_review"] and h["review_active"] == 0
     c = h["card_review"]
     assert {"rev", "kinds", "limit", "limit_reason", "active", "timeout_s", "tries", "attempts_max", "request_worst_s",
-            "prompt_rev", "totals", "last_error"} <= set(c)
-    # 요청 최악 = (1 + 보충 2) × (2 시도 × 1800 + 8) = 10,824초(m2-wp3a 걸음 5).
-    assert (c["timeout_s"], c["tries"], c["attempts_max"], c["request_worst_s"]) == (1800, 2, 3, 10_824)
+            "prompt_rev", "totals", "last_error", "delib_human", "search_timeout_s"} <= set(c)
+    assert c["kinds"] == list(cr.KINDS) and c["search_timeout_s"] == 60.0
+    # 요청 최악 = (1 + 보충 2) × (2 시도 × 1800 + 8) + 긴 문서 검색 기한 60 = 10,884초(m2-wp3a 걸음 5 · M3 E3-5).
+    assert (c["timeout_s"], c["tries"], c["attempts_max"], c["request_worst_s"]) == (1800, 2, 3, 10_884)
     assert set(c["totals"]) >= {"calls", "ok", "error", "busy", "truncated", "repaired", "over_budget",
                                 "context_overflow", "tokens_in", "tokens_out", "tokens_unknown_calls"}
 

@@ -53,6 +53,7 @@ def act(x) -> Act:
 
 # ── 프롬프트 읽기 ─────────────────────────────────────────────────────────────
 _CARD_HEAD = re.compile(r"^\[(K\d+)\] 종류 ", re.M)
+_DOC_HEAD = re.compile(r"^\[(D\d+)\] 출처 [^\n]*\n«([^«»]*)»", re.M)      # 긴 문서 발췌(cr-offcard-2)
 _LINE = re.compile(r"^(L\d+) \[[^\]]*\] «", re.M)
 _UNIT = re.compile(r"^(U\d+) \[[^\]]*\] «", re.M)
 # 절 본문은 줄 머리에서 여는 «…» 다 — 머리 줄의 검토·규격, 제목 줄, 절 제목 줄(§sid «…»)의 «…» 는 줄 가운데서 연다.
@@ -87,7 +88,8 @@ def read_prompt(human: str) -> dict:
         mechs = [x.split("=", 1)[0].strip() for x in line.split(" · ") if x.strip()]
     return {"kind": kind, "cards": cards, "lines": _LINE.findall(body), "units": _UNIT.findall(body),
             "solo": '"t":"c"' in body, "hint_aliases": named, "hint": hint, "gaps": "\n[결측]\n" in body,
-            "mechs": mechs, "items_max": int(m.group(1)) if (m := re.search(r"최대 (\d+)줄", body)) else 0}
+            "mechs": mechs, "items_max": int(m.group(1)) if (m := re.search(r"최대 (\d+)줄", body)) else 0,
+            "docs": {d: [text] for d, text in _DOC_HEAD.findall(body)}}
 
 
 def quote_of(sections: list) -> str:
@@ -132,6 +134,10 @@ def default_oracle(system: str, human: str) -> list:
         rows.append({"t": "f", "dir": "risk", "title": "접착 계면 들뜸 위험", "mech": "free", "mech_free": "계면 박리",
                      "path": "후면 커버 둘레 접착 계면", "l": l1, "src": "exp", "q": "", "sev": "중대", "conf": "medium",
                      "check_kind": "test", "check": "고온 고습 시험으로 박리를 본다"})
+        for d, secs in list(p["docs"].items())[:1]:        # 긴 문서 발췌가 실렸으면 그 발췌를 근거로 한 줄 더(D 인용)
+            rows.append({"t": "f", "dir": "risk", "title": "문서 근거 열 응력 집중", "mech": "free", "mech_free": "열 응력",
+                         "path": "보스 주변 리브", "l": l1, "src": d, "q": quote_of(secs), "sev": "경미",
+                         "conf": "low", "check_kind": "sim", "check": "열 해석으로 응력 분포를 본다"})
         rows.append({"t": "m", "seen": []})
         rows.append({"t": "more", "more": "no"})
     return rows

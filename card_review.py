@@ -72,6 +72,8 @@ MAX_TOKENS_ENV = "CARD_REVIEW_MAX_TOKENS"
 # 긴 문서 검색어 하나의 기한(초) — 검색어 셋은 동시에 돈다. 시간 한도 사슬(요청 최악)에 더해진다.
 SEARCH_TIMEOUT_DEFAULT = 60.0
 SEARCH_TIMEOUT_ENV = "CARD_REVIEW_SEARCH_TIMEOUT_S"
+SEARCH_QUERIES_MAX, SEARCH_QUERY_CHARS = 3, 600   # 검색어 수 · 하나의 글자 상한(엔진 knowledge_query 와 같은 수)
+EXCERPT_FLOOR = 300                               # 끊어 싣는 발췌가 남기는 본문의 바닥(자) — 이보다 좁으면 싣지 않는다
 
 # ── 예산 상수 ────────────────────────────────────────────────────────────────
 # 틀(시스템 글·지시·고정 머리)의 **선언한 여유값**(자). 실제 틀 길이를 재지 않는다 — 재면 틀 한 글자가 단위 상한·
@@ -730,6 +732,13 @@ def build_ctx(req: dict, lim: dict) -> dict:
     if extra.get("missing") and kind != "sweep":
         raise RequestError("bad_request", f"extra.missing(전문가 단위 결측)은 sweep 에만 싣는다 — {kind} 의 결측은 "
                            "unit.missing(단위 결측)이다. 둘을 섞지 않는다")
+    search = extra.get("search")
+    if search is not None:
+        if kind != "offcard":
+            raise RequestError("bad_request", f"extra.search(긴 문서 검색)는 offcard 에만 싣는다 — {kind} 에는 없다")
+        qs = (search or {}).get("queries") or []
+        if not 1 <= len(qs) <= SEARCH_QUERIES_MAX or not all(str(q).strip() for q in qs):
+            raise RequestError("bad_request", f"extra.search.queries 는 빈 글이 아닌 검색어 1~{SEARCH_QUERIES_MAX}개다")
 
     def codes(items, key):          # 프롬프트에 렌더한 것과 같은 위생(_code_list) — 모델은 본 코드를 고른다
         return {_frame_safe(x.get(key)) for x in items or [] if isinstance(x, dict) and _frame_safe(x.get(key))}
@@ -740,7 +749,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
         "lines": lines, "units": units, "num_src": num_src,
         "mechs": codes(extra.get("mechanisms"), "code"), "domains": codes(extra.get("domains"), "key"),
         "findings_max": int(lim["offcard"]["findings_max"]), "items_max": int(lim["noinput"]["items_max"]),
-        "bg_dropped": 0,
+        "bg_dropped": 0, "docs": {},
     }
 
 
@@ -1161,8 +1170,14 @@ def _check_f(row: dict, ctx: dict, attempt: int) -> dict:
         checks["src"], checks["quote"] = "digest_only", "unchecked"   # 제목만 실린 카드 — 대조할 본문이 없다
         row["basis"] = "카드 제목"
         row["record_id"] = ctx["digest"][src]["record_id"]
+    elif src in ctx.get("docs", {}):
+        doc = ctx["docs"][src]                                    # 긴 문서 발췌(cr-offcard-2) — 그 발췌 원문에 대조한다
+        checks["src"] = "ok"
+        row["basis"] = "긴 문서"
+        row["record_id"], row["section_id"] = doc["record_id"], doc["section_id"]
+        checks["quote"], checks["quote_sid"] = quote_check(row["q"], doc)
     else:
-        checks["src"], checks["quote"] = "unknown_alias", "unchecked"   # M2 에는 긴 문서(D)가 없다
+        checks["src"], checks["quote"] = "unknown_alias", "unchecked"   # 실리지 않은 K·D 번호
         row["basis"] = "경험칙"
     if "_shape" in row:
         checks["shape"] = row.pop("_shape")
@@ -1633,6 +1648,9 @@ _INSTR_OFFCARD = (
     '{{"t":"more","more":"yes|no"}}\n'
     "리스크만 나열하지 말고 개선도 같은 형식으로 낸다. 없는 것을 지어내지 않는다. 없으면 none 이다.\n"
 )
+# 긴 문서 발췌(cr-offcard-2) — 발췌가 실린 요청에만 붙는다(검색하지 않은 카드 밖 호출은 M2 틀 그대로).
+_INSTR_OFFCARD_DOCS = ("- src 에 D 번호(긴 문서 발췌)도 댈 수 있다. D 를 댔으면 q 에 그 발췌 «…» 에서 15자 이상을 그대로 "
+                       "복사한다. 발췌는 판정 대상이 아니라 근거다.\n")
 
 
 # 입력 결손 두 질문(cr-noinput-1) — ECAD 같은 입력이 없는 전문가가 카드 전부를 보고 답한다(M3.md 4.4.2). 셀을 어떻게 닫는지는
@@ -1749,11 +1767,11 @@ def template_sha(kind: str) -> str:
     parts = [_SYSTEM, "".join(_UNIT_HEADS.values())]
     parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES, _INSTR_VERDICT_MECH],
               "sweep": [_INSTR_SWEEP, _INSTR_SWEEP_MISSING],
-              "offcard": [_INSTR_OFFCARD], "noinput": [_INSTR_NOINPUT]}[kind]
+              "offcard": [_INSTR_OFFCARD, _INSTR_OFFCARD_DOCS], "noinput": [_INSTR_NOINPUT]}[kind]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
 
 
-def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
+def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None) -> tuple[str, str, dict]:
     """요청 하나 → (시스템 글, 사람 글, ctx). 블록 순서는 [당신] → [카드] → [단위 또는 목록] → [지시] 다(같은 전문가·같은
     묶음의 호출이 같은 머리를 공유한다). 계약에 안 맞으면 RequestError, 창 한도를 넘으면 OverBudget 이다.
 
@@ -1790,10 +1808,13 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     order = list(ctx["card_order"])
     if kind == "verdict" and variant == "rev":
         order.reverse()                  # 카드 순서만 뒤집는다 — 별칭은 그대로다
+    docs = list(docs or []) if kind == "offcard" else []
+    docs_text = "".join(render_excerpt(e) for e in docs)
     if kind in ("offcard", "noinput"):
         # 카드 전문은 본문 몫에서 단위가 쓰고 남은 만큼 — 넘치는 꼬리는 제목으로 내리고 그 수를 알린다(M2.md 5절 10). 입력
         # 결손 호출은 카드 전부(점검·배경, 훑기 k 에 걸린 것 먼저 — 앱이 순서를 정한다)를 같은 규칙으로 싣는다(M3.md 4.4.2).
-        room = max(0, kl["body"] - unit_size(unit))
+        # 긴 문서 발췌(run_search 가 같은 자리에 맞춘 것)가 있으면 먼저 쓰고 남은 자리를 카드가 쓴다.
+        room = max(0, kl["body"] - unit_size(unit) - len(docs_text))
         keep, used = [], 0
         for a in order:
             n = len(render_card(ctx["cards"][a]["card"], a))
@@ -1824,6 +1845,12 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
             else _NO_CARDS)
         add("frame", "\n")
 
+    if docs:
+        add("frame", f"[긴 문서 발췌 {len(docs)}건 — 이 전문가에게 묶인 문서의 절. 판정 대상이 아니다. D 번호로만 부른다]\n")
+        add("longdoc", docs_text)
+        add("frame", "\n")
+        ctx["docs"] = {e["alias"]: {"record_id": e["record_id"], "section_id": e["section_id"], "title": e["title"],
+                                    "text": e["text"], "sections": [(e["section_id"], e["text"])]} for e in docs}
     if kind == "sweep":
         add("frame", f"[검토 단위 목록 {len(ctx['units'])}개 — 이 쪽이 전부가 아닐 수 있다]\n")
         add("manifest", "".join(f"{a} [{_frame_safe(u['kind'])}] «{_unquote_marks(u['title'])} — "
@@ -1860,7 +1887,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     elif kind == "noinput":
         add("frame", _INSTR_NOINPUT.format(n=ctx["items_max"]))
     else:
-        add("frame", _INSTR_OFFCARD.format(f=ctx["findings_max"]))
+        add("frame", _INSTR_OFFCARD.format(f=ctx["findings_max"]) + (_INSTR_OFFCARD_DOCS if docs else ""))
     if hint:
         add("hint", "\n" + _clip(hint, kl["hint_max"] - 1))
 
@@ -1870,16 +1897,21 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     ctx.update({
         "prompt_chars": total, "sizes": sizes, "soft_over": total > kl["p"],
         "order_effective": not (kind == "verdict" and variant == "rev" and len(order) < 2),
-        # 카드 0장이면 역할만으로 답했다. 입력 결손 호출은 늘 noinput 이다(셀을 어떻게 닫는지는 앱이 정한다 — 4.4.2).
-        "basis": "noinput" if kind == "noinput" else "cards" if (order or ctx["digest"]) else "role_only",
+        # 카드 0장이면 역할만으로(긴 문서 발췌가 있으면 그것으로) 답했다. 입력 결손 호출은 늘 noinput 이다(셀을 어떻게 닫는지는
+        # 앱이 정한다 — 4.4.2).
+        "basis": ("noinput" if kind == "noinput" else "cards" if (order or ctx["digest"])
+                  else "search_only" if docs else "role_only"),
         "input_sha": _canon_sha({
             "kind": kind, "variant": variant, "expert": key, "role": role_sha(_str(expert.get("role"))),
             "cards": [[a, _text_sha([{"sid": _str(x.get("sid")), "title": _str(x.get("title")),
                                        "text": _str(x.get("text"))} for x in ctx["cards"][a]["card"]["sections"]
                                       if isinstance(x, dict)])] for a in order],
             "digest": sorted(ctx["digest"]), "unit": unit if kind != "sweep" else None,
-            "manifest": req.get("manifest") if kind == "sweep" else None, "extra": extra}),
+            "manifest": req.get("manifest") if kind == "sweep" else None, "extra": extra,
+            **({"docs": [[e["alias"], e["record_id"], e["section_id"], _canon_sha(e["text"])] for e in docs]}
+               if docs else {})}),
         "aliases": {"cards": {a: ctx["cards"][a]["record_id"] for a in order},
+                    **({"docs": {e["alias"]: e["record_id"] for e in docs}} if docs else {}),
                     "lines": {a: x["ref"] for a, x in ctx["lines"].items()},
                     "units": {a: u["unit_id"] for a, u in ctx["units"].items()}},
     })
@@ -2156,6 +2188,145 @@ async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: s
 
 
 
+# ── 긴 문서 검색(카드 밖 호출 — cr-offcard-2) ────────────────────────────────────
+# 카드 0장 전문가(sim-structural-calc·sim-thermal-sed 등)는 대조할 카드가 없다. 그 전문가에게 묶인 문서(AIDataHub 의 절)를
+# agent_search 로 찾아 카드 밖 호출에 'D' 발췌로 싣는다(M3.md 4.4.4). '없다'(묶인 자료 0건·맞는 것 없음)와 '못 물었다'(시간 초과·
+# 도구 없음·자격 거절)를 가른다 — 앞의 둘은 정상 답이고 failed 만 앱이 인프라로 다시 낸다. 심의 엔진의 _agent_search_hits 는
+# 거절(refused)을 빈 목록·빈 사유로 돌려줘 '0건 매핑' 과 '맞는 것이 없다' 를 가를 수 없어 쓰지 않는다(P-04 고침 (가)).
+# 도구는 팩과 같은 사용자 PAT 로만 붙는다(서비스 계정으로 내려가지 않는다 — load_pack_tools).
+_EMPTY_SCOPE_RE = re.compile(r"has 0 mapped records|0 mapped")
+
+
+async def longdoc_search(tools: dict, agent_key: str, queries: list, *, timeout_s: float) -> dict:
+    """검색어마다 agent_search(agent_type, q, mode=hybrid) 한 번 — 셋을 동시에, 하나에 timeout_s. 돌려주는 것은
+    {state, per_query[{q, hits[], scope_n}], scope_n, note}. state 는 ok(적중이 있다) · empty_scope(묶인 자료 0건) ·
+    no_hits(자료는 있는데 맞는 것이 없다) · failed(하나라도 못 물었다 — 그때는 적중을 쓰지 않는다). 점수는 임계로 쓰지 않는다
+    (AIDataHub 의 refused 는 '최고 점수가 문턱 밑' 이라 적중이 있으면 그대로 쓴다)."""
+    if "agent_search" not in (tools or {}):
+        return {"state": "failed", "per_query": [], "scope_n": None, "note": "agent_search 도구가 게이트웨이에 없다"}
+
+    async def one(q: str):
+        try:
+            raw = await asyncio.wait_for(_call(tools, "agent_search", {"agent_type": agent_key, "q": q,
+                                                                       "mode": "hybrid"}), timeout_s)
+        except asyncio.TimeoutError:
+            return None, f"«{_frame_safe(q)[:40]}» {timeout_s:g}초 안에 답하지 않았다"
+        if _auth_rejected(raw):
+            return None, "게이트웨이가 사용자 토큰을 거절했다(만료·폐기) — 서비스 계정으로 내려가지 않는다"
+        if raw is None:
+            return None, "도구가 없거나 빈 답"
+        if isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
+            return None, _RA_FAIL_WRAP.sub("", raw.strip(), count=1)[:300]
+        d = _first_dict(_parse_json(raw))
+        if not d or not isinstance(d.get("hits", []), list):
+            return None, f"응답 모양이 다르다({_excerpt(raw, 120)})"
+        return d, ""
+
+    got = await asyncio.gather(*(one(q) for q in queries))
+    fails = [why for d, why in got if d is None]
+    if fails:
+        return {"state": "failed", "per_query": [], "scope_n": None, "note": " · ".join(dict.fromkeys(fails))[:600]}
+    per, scope_n, empty = [], None, False
+    for q, (d, _why) in zip(queries, got):
+        cfg = d.get("applied_config") if isinstance(d.get("applied_config"), dict) else {}
+        reason = str(cfg.get("reason") or "")
+        if _EMPTY_SCOPE_RE.search(reason):
+            empty = True
+        n = cfg.get("agent_record_scope")
+        if isinstance(n, int) and not isinstance(n, bool):
+            scope_n = n if scope_n is None else max(scope_n, n)
+        per.append({"q": q, "hits": [h for h in d.get("hits") or [] if isinstance(h, dict)]})
+    if empty:
+        return {"state": "empty_scope", "per_query": per, "scope_n": 0,
+                "note": "이 전문가에게 묶인 자료가 0건이다(묶인 자료 0건 — 역할만으로 답한다)"}
+    return {"state": "ok" if any(p["hits"] for p in per) else "no_hits", "per_query": per, "scope_n": scope_n,
+            "note": "" if any(p["hits"] for p in per) else "묶인 자료에서 맞는 절이 없었다"}
+
+
+def render_excerpt(e: dict) -> str:
+    """프롬프트에 싣는 발췌 한 건(끝 줄바꿈 포함). 출처(record_id·§절)는 틀 밖 한 줄로 위생하고, 제목·본문은 «» 안이다."""
+    head = _unquote_marks(e.get("title")).strip()
+    sec = _unquote_marks(e.get("section_title")).strip()
+    src = _frame_safe(e.get("record_id")) + (f" §{_frame_safe(e.get('section_id'))}" if e.get("section_id") else "")
+    return (f"[{e['alias']}] 출처 {src} · 제목 «{head}{(' › ' + sec) if sec else ''}»\n"
+            f"«{_unquote_marks(e.get('text'))}»\n")
+
+
+def fit_excerpts(found: dict, exclude_ids, cap: int) -> tuple[list, dict]:
+    """검색 결과 → (실을 발췌 [{alias, record_id, section_id, title, section_title, text, orig_chars, clipped}],
+    meta.search 의 used·hits_n·note). 검색어마다의 순위를 번갈아(1위들 → 2위들 …) 채우고, 같은 절은 한 번, 팩 카드(exclude)는
+    뺀다. 몫(cap — 렌더 길이)을 넘는 적중은 _cut_mark 로 끊고 clipped·orig_chars 를 적는다(바닥 EXCERPT_FLOOR 자보다 좁으면
+    싣지 않는다). 몫이 다 차면 남은 적중은 싣지 않고 note 에 센다(조용히 빼지 않는다)."""
+    from deliberation import _cut_mark  # noqa: PLC0415
+
+    ex = {str(x) for x in exclude_ids or () if x}
+    lists = [p["hits"] for p in found.get("per_query") or []]
+    order, seen = [], set()
+    for rank in range(max((len(x) for x in lists), default=0)):
+        for hits in lists:
+            if rank < len(hits):
+                h = hits[rank]
+                rid, sid = str(h.get("record_id") or h.get("id") or ""), str(h.get("section_id") or "")
+                if not rid or rid in ex or (rid, sid) in seen:
+                    continue
+                seen.add((rid, sid))
+                order.append(h)
+    out, used, room = [], [], max(0, int(cap))
+    for h in order:
+        body = str(h.get("snippet") or h.get("text") or "").strip()
+        e = {"alias": _alias("D", len(out) + 1, max(len(order), 1)), "record_id": str(h.get("record_id") or h.get("id")),
+             "section_id": str(h.get("section_id") or ""), "title": str(h.get("title") or ""),
+             "section_title": str(h.get("section_title") or ""), "text": _unquote_marks(body),
+             "orig_chars": len(body), "clipped": False}
+        n = len(render_excerpt(e))
+        if n > room:
+            fit = room - (n - len(e["text"])) - 1
+            if fit < EXCERPT_FLOOR:
+                break
+            e["text"], e["clipped"] = _cut_mark(e["text"], max(1, fit - _MARK_ROOM)), True
+            n = len(render_excerpt(e))
+        out.append(e)
+        room -= n
+        used.append({"alias": e["alias"], "record_id": e["record_id"], "section_id": e["section_id"],
+                     "title": e["title"], "chars": len(e["text"]), "orig_chars": e["orig_chars"],
+                     "clipped": e["clipped"]})
+    note = found.get("note") or ""
+    if len(out) < len(order):
+        note = (note + " · " if note else "") + (f"적중 {len(order)}건 가운데 {len(out)}건을 실었다(긴 문서 몫 {cap:,}자 — "
+                                                 "남은 적중은 싣지 않았다)")
+    return out, {"hits_n": len(order), "used": used, "note": note}
+
+
+async def run_search(app, req: dict, lim: dict, ctx: dict) -> tuple[list, dict]:
+    """run 의 검색 단계 — (발췌, meta.search). 사용자 PAT 로 도구를 받고(못 받으면 failed — 서비스 계정 길이 없다), 검색하고,
+    본문 몫에서 단위가 쓰고 남은 자리와 longdoc_max 가운데 작은 것에 발췌를 맞춘다."""
+    spec = ((req.get("extra") or {}).get("search")) or {}
+    raw_q = [str(q) for q in spec.get("queries") or []]
+    queries = [q[:SEARCH_QUERY_CHARS] for q in raw_q]
+    meta = {"state": None, "queries": queries, "hits_n": 0, "scope_n": None, "used": [], "note": "",
+            "req_cut": sum(1 for q in raw_q if len(q) > SEARCH_QUERY_CHARS)}
+    try:
+        tools = await load_pack_tools(app, req.get("groups") or [], user_email=req.get("user_email") or "",
+                                      user_pat=req.get("user_pat") or "")
+    except PackError as exc:
+        meta.update(state="failed", note=f"{exc.code} — {exc.message}"[:600])
+        return [], meta
+    found = await longdoc_search(tools, _str(ctx["expert"].get("key")), queries, timeout_s=search_timeout_s())
+    meta.update(state=found["state"], scope_n=found["scope_n"], note=found["note"])
+    if found["state"] != "ok":
+        return [], meta
+    unit = req.get("unit") if isinstance(req.get("unit"), dict) else {}
+    kl = lim["offcard"]
+    cap = min(kl["longdoc_max"], max(0, kl["body"] - unit_size(unit)))
+    exclude = [c["record_id"] for c in ctx["cards"].values()] + [d["record_id"] for d in ctx["digest"].values()]
+    docs, fit = fit_excerpts(found, exclude, cap)
+    meta.update(hits_n=fit["hits_n"], used=fit["used"], note=fit["note"])
+    if not docs:
+        meta["state"] = "no_hits"                 # 팩 카드를 빼거나 몫이 없어 실은 것이 없다 — 물어봤고 없었다
+    return docs, meta
+
+
+
 # ── 실행기(관문·ping·보충·오류 분류) ──────────────────────────────────────────
 # 요청 1건 = (전문가 × 단위 × 묶음 1개)의 논리 호출 1건이다. 줄을 세우지 않고(자리가 없으면 곧바로 review_busy), 끊기면
 # 접고(구독이 닫히면 LLM 태스크를 취소하고 자리를 돌려준다 — 남기는 것이 없다), 빠진 행만 다시 묻는다.
@@ -2393,11 +2564,30 @@ async def run(app, prep: dict):
             yield frame("done", {})
             return
         hint = ""
+        docs, search_meta = [], None
+        if kind == "offcard" and (req.get("extra") or {}).get("search"):
+            # 긴 문서 검색 — LLM 전에 한 번(검색어 셋은 동시에). 도는 동안 ping 을 내고, 구독이 끊기면 검색을 접는다.
+            yield frame("status", {"step": "search"})
+            stask = asyncio.ensure_future(run_search(app, req, lim, ctx))
+            try:
+                while not stask.done():
+                    if hb > 0:
+                        done, _pending = await asyncio.wait({stask}, timeout=hb)
+                        if not done:
+                            yield _sse("ping", {"idle_s": int(time.monotonic() - last), "ts": int(time.time() * 1000)})
+                    else:
+                        await asyncio.wait({stask})
+            finally:
+                if not stask.done():
+                    stask.cancel()
+            docs, search_meta = stask.result()
+            if docs:
+                system, human0, ctx = build_prompt(req, lim, docs=docs)
         for n in range(1, attempts_max + 1):
             human = human0
             if n > 1:
                 try:
-                    human = build_prompt(req, lim, hint=hint)[1]
+                    human = build_prompt(req, lim, hint=hint, docs=docs)[1]
                 except RequestError as exc:     # 지적 블록을 붙이니 창을 넘는다 — 보충을 멈추고 가진 것으로 끝낸다
                     repair_error = {"code": exc.code, "attempt": n, "message": exc.message}
                     break
@@ -2489,6 +2679,8 @@ async def run(app, prep: dict):
                      "soft_over": ctx["soft_over"], "basis": ctx["basis"], "bg_dropped": ctx["bg_dropped"],
                      "order_effective": ctx["order_effective"], "aliases": ctx["aliases"]},
         }
+        if search_meta is not None:
+            result["meta"]["search"] = search_meta
         st.update(outcome="ok", truncated=quality["truncated"] is True, repaired=quality["repaired"])
         yield frame("result", result)
         yield frame("done", {})
@@ -2603,12 +2795,19 @@ class RunManifestItem(_Strict):
     text: str = ""
 
 
+class SearchSpec(_Strict):
+    """카드 밖 호출의 긴 문서 검색(cr-offcard-2) — 검색어 1~3개(하나당 600자, 넘으면 끊고 meta.search.req_cut 에 센다)."""
+    queries: list[str]
+
+
 class RunExtra(_Strict):
     domains: list[DomainItem] = []
     mechanisms: list[MechItem] = []
     known: list[KnownItem] = []
     # 전문가 단위 결측(cr-sweep-2) — sweep 에만. 다른 종류에 실으면 422 bad_request(단위 결측은 unit.missing 이다).
     missing: list[MissingItem] = []
+    # 긴 문서 검색(cr-offcard-2) — offcard 에만. 앱은 카드 0장 전문가에게만 보낸다(M3.md #38).
+    search: SearchSpec | None = None
 
 
 class Expect(_Strict):
@@ -2815,14 +3014,18 @@ async def post_run(request: Request):
 
 
 def health_fields(app) -> dict:
-    """/health.card_review — 관문(상한·사유·도는 수), 이 박스에 실제로 걸린 LLM 한도로 셈한 요청 최악(초), 판, 끝의 셈.
-    request_worst_s = (1 + CARD_REVIEW_PARSE_RETRIES) × (시도 수 × DELIB_TIMEOUT_S + 8) 이고 한도가 꺼진 박스는 None 이다
-    (리스크 앱의 호출 벽시계가 이보다 커야 구체적인 사유가 먼저 온다)."""
+    """/health.card_review — 관문(상한·사유·도는 수·사람 심의 수), 이 박스에 실제로 걸린 LLM 한도로 셈한 요청 최악(초), 판,
+    끝의 셈. request_worst_s = (1 + CARD_REVIEW_PARSE_RETRIES) × (시도 수 × DELIB_TIMEOUT_S + 8) + 긴 문서 검색 기한
+    (CARD_REVIEW_SEARCH_TIMEOUT_S — 검색어 셋은 동시라 한 번)이고 한도가 꺼진 박스는 None 이다(리스크 앱의 호출 벽시계가
+    이보다 커야 구체적인 사유가 먼저 온다)."""
     snap = gate_of(app).snapshot()
     read, tries = _llm_limit(getattr(app.state, "delib_llm", None))
     attempts = 1 + _parse_retries()
     return {"rev": API_REV, "kinds": list(KINDS), "limit": snap["limit"], "limit_reason": snap["limit_reason"],
+            "delib_human": snap["delib_human"],
             "active": snap["active"], "retry_after_s": snap["retry_after_s"],
             "timeout_s": read or None, "tries": tries or None, "attempts_max": attempts,
-            "request_worst_s": round(attempts * (tries * read + 8)) if read > 0 and tries > 0 else None,
+            "search_timeout_s": search_timeout_s(),
+            "request_worst_s": (round(attempts * (tries * read + 8) + search_timeout_s()) if read > 0 and tries > 0
+                                else None),
             "prompt_rev": dict(PROMPT_REV), "totals": snap["totals"], "last_error": snap["last_error"]}

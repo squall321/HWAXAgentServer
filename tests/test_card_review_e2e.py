@@ -166,7 +166,7 @@ def test_run_이_실제_LLM_호출을_지나_끝까지_돈다(stack):
     assert stats["calls"] == 1 and stats["behaviors"] == ["oracle"]
     assert h["capabilities"] == ["card_review"] and h["review_active"] == 0 and h["delib_active"] == 0
     cr = h["card_review"]
-    assert (cr["timeout_s"], cr["tries"], cr["request_worst_s"]) == (1800, 2, 10_824) and cr["totals"]["ok"] >= 1
+    assert (cr["timeout_s"], cr["tries"], cr["request_worst_s"]) == (1800, 2, 10_884) and cr["totals"]["ok"] >= 1
 
 
 def test_보충과_HTTP_오류가_실제_전송으로_갈린다(stack):
