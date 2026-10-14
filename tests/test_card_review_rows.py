@@ -1171,3 +1171,61 @@ def test_README_의_별칭_표는_엔진의_표와_같다():
     for f, means, words in re.findall(r"^\| `(\w+)`[^|]*\| `(\w+)` \| ([^|]+) \|$", text, re.M):
         got.setdefault(f, {})[means] = tuple(w.strip() for w in words.split("·"))
     assert got == cr.ENUM_ALIASES, got
+
+
+# ── 적대 검토 7라운드(RB3E) ──────────────────────────────────────────────────────
+def _vrows(ctx, rows, attempt=1):
+    return cr.check_rows("verdict", "fwd", cr.parse_rows(_jl(rows), "verdict")[0], ctx, attempt=attempt)["rows"]
+
+
+def test_보충_안의_다툼은_같은_판정의_앞_줄에_이어진다():
+    """RB3E-1 — 보충 시도 안의 [K01 OK, K01 'NG'] 는 그 시도에서 OK 에 dup_conflict·contested_by.raw 를 달았는데, 합칠 때 앞 시도의
+    같은 판정 OK 와 비겨 겹침으로 버려졌다(앞 줄은 표지가 없다) — 'NG' 가 흔적 없이 사라졌다. 남는 앞 줄에 표지를 잇는다."""
+    ctx = _ctx(_req())
+    a, b = ctx["judge"][:2]
+    rest = [_good_v(ctx, x) for x in ctx["judge"][2:]]
+    first = _vrows(ctx, [_good_v(ctx, a, judgement="OK"), _good_v(ctx, b, judgement="보류", need="판정에 쓸 응력 값")] + rest)
+    again = _vrows(ctx, [_good_v(ctx, a, judgement="OK"), _good_v(ctx, a, judgement="NG", need="판정에 쓸 응력 값"),
+                         _good_v(ctx, b, judgement="OK")], attempt=2)
+    k = next(r for r in cr.merge_rows("verdict", first, again, 2) if r["k"] == a)
+    cb = k.get("contested_by") or {}
+    assert (k["judgement"], k["from_attempt"], k["checks"].get("dup_conflict"), cb.get("raw")) == ("OK", 1, True, "NG"), k
+    # 판정이 다른 앞 줄(FAIL)을 지킬 때도 새 줄이 단 raw 를 잇는다(앞 줄에 진 줄이 없으면).
+    first = _vrows(ctx, [_good_v(ctx, a, judgement="FAIL"), _good_v(ctx, b, judgement="보류", need="판정에 쓸 응력 값")] + rest)
+    k = next(r for r in cr.merge_rows("verdict", first, again, 2) if r["k"] == a)
+    assert (k["judgement"], k["checks"].get("dup_conflict"), (k.get("contested_by") or {}).get("raw")) == ("FAIL", True, "NG")
+
+
+def test_raw_는_먼저_단_것이_남는다():
+    """RB3E-2(결정 — 칸은 하나씩, 먼저 단 raw 를 덮지 않는다). A2 — 검증되지 않은 진 줄에 실린 raw 를 뒤의 다툼이 덮었다. B2 —
+    둘째 뒤집힘이 첫째 뒤집힘(raw)을 갈아 끼웠다."""
+    ctx = _ctx(_req())
+    a = ctx["judge"][0]
+    rest = [_good_v(ctx, x) for x in ctx["judge"][1:]]
+    bad = "카드에 없는 문장을 열다섯 자 넘게 지어냈다"
+    m = cr.merge_rows("verdict", _vrows(ctx, [_good_v(ctx, a, judgement="OK"),
+                                               _good_v(ctx, a, judgement="보류", cq=bad, need="판정에 쓸 응력 값")] + rest),
+                      _vrows(ctx, [_good_v(ctx, a, judgement="WARNING")], attempt=2), 2)
+    m = cr.merge_rows("verdict", m, _vrows(ctx, [_good_v(ctx, a, judgement="FAIL")], attempt=3), 3)
+    k = next(r for r in m if r["k"] == a)
+    assert (k["checks"].get("dup_conflict"), (k.get("contested_by") or {}).get("raw")) == (True, "보류"), k
+    m = cr.merge_rows("verdict", _vrows(ctx, [_good_v(ctx, a, judgement="보류", need="판정에 쓸 응력 값")] + rest),
+                      _vrows(ctx, [_good_v(ctx, a, judgement="OK")], attempt=2), 2)
+    m = cr.merge_rows("verdict", m, _vrows(ctx, [_good_v(ctx, a, judgement="FAIL")], attempt=3), 3)
+    k = next(r for r in m if r["k"] == a)
+    assert (k["judgement"], k.get("flipped_from")) == (
+        "FAIL", {"verdict": ("yes", "undetermined"), "attempt": 1, "raw": "보류"}), k
+
+
+def test_applies_를_고친_판정_줄도_고친_줄이고_raw_는_그_낱말이다():
+    """RB3E-3 — v 줄의 고친 칸을 judgement 로만 보아, applies 'maybe' 를 고친 줄(정합으로 undetermined)이 고친 줄이 아니었고
+    갈아 껴도 flipped_from 에 raw 가 없었다."""
+    ctx = _ctx(_req())
+    a = ctx["judge"][0]
+    rest = [_good_v(ctx, x) for x in ctx["judge"][1:]]
+    first = _vrows(ctx, [_good_v(ctx, a, applies="maybe", judgement="FAILED", need="판정에 쓸 응력 값")] + rest)
+    row = next(r for r in first if r["k"] == a)
+    assert cr._coerced(row) and cr._raw(row) == "maybe" and not cr._protected(row)
+    k = next(r for r in cr.merge_rows("verdict", first, _vrows(ctx, [_good_v(ctx, a, judgement="OK")], attempt=2), 2)
+             if r["k"] == a)
+    assert (k["judgement"], (k.get("flipped_from") or {}).get("raw")) == ("OK", "maybe"), k

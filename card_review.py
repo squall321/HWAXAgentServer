@@ -1213,12 +1213,14 @@ def _hit(r: dict) -> bool:
     return False
 
 
-_VERDICT_FIELD = {"v": "judgement", "u": "rel", "q1": "impact"}
+# 판정 칸 — v 는 judgement 와 applies 둘이다(applies 를 고쳐도 판정이 정합으로 undetermined 가 된다 — RB3E-3).
+_VERDICT_FIELDS = {"v": ("judgement", "applies"), "u": ("rel",), "q1": ("impact",)}
 
 
 def _coerced(r: dict) -> bool:
-    """판정 칸(v judgement · u rel · q1 impact)이 열거 밖 값이라 엔진이 고친 줄인가 — 그 값은 모델의 답이 아니다."""
-    return _VERDICT_FIELD.get(r["t"]) in ((r.get("checks") or {}).get("enum") or [])
+    """판정 칸(v judgement·applies · u rel · q1 impact)이 열거 밖 값이라 엔진이 고친 줄인가 — 그 값은 모델의 답이 아니다."""
+    enum = (r.get("checks") or {}).get("enum") or []
+    return any(f in enum for f in _VERDICT_FIELDS.get(r["t"], ()))
 
 
 def _protected(r: dict) -> bool:
@@ -1236,10 +1238,13 @@ def _contest_verified(r: dict) -> bool:
 
 
 def _raw(r: dict) -> str:
-    """엔진이 고친 판정 칸에 모델이 실제로 쓴 값(checks.coerced 의 '칸:값')."""
-    f = _VERDICT_FIELD[r["t"]]
-    return next((str(c).split(":", 1)[1] for c in (r.get("checks") or {}).get("coerced") or []
-                 if str(c).startswith(f + ":")), "")
+    """엔진이 고친 판정 칸에 모델이 실제로 쓴 값(checks.coerced 의 '칸:값') — v 는 judgement, 그것이 아니면 applies 의 값."""
+    coerced = [str(c) for c in (r.get("checks") or {}).get("coerced") or []]
+    for f in _VERDICT_FIELDS[r["t"]]:
+        hit = next((c.split(":", 1)[1] for c in coerced if c.startswith(f + ":")), None)
+        if hit is not None:
+            return hit
+    return ""
 
 
 def _flip(prev: dict) -> dict:
@@ -1298,9 +1303,11 @@ def _conflicted(win: dict, lose: dict) -> dict:
     단 사본 — 앞 시도의 행 사전을 고치지 않는다. 걸린 줄이 이겨 남아도 진 줄의 내용(검증된 철회 인용 등)을 버리지 않는다(RB3B-3).
     엔진이 고친 값의 줄도 다툼으로 남긴다 — 고친 값은 걸림인지 모르는 값이라 말없이 지면 'FAILED' 같은 낱말이 OK 에 흔적 없이
     졌다(D-42 A2 · RB3D-1). 그 줄이 지면 contested_by.raw 에 모델이 쓴 낱말을 싣는다.
-    이미 단 진 줄의 인용이 검증됐으면 그것을 지킨다(그 줄이 이 별칭의 인용을 더 묻지 않는 근거다)."""
+    이미 단 진 줄의 인용이 검증됐거나 raw 를 실었으면 그것을 지킨다(앞은 이 별칭의 인용을 더 묻지 않는 근거, 뒤는 먼저 본 낱말).
+    한 칸이라 뒤의 다툼이 늘 실리는 것은 아니다 — 늘 남는 것은 dup_conflict 다."""
     out = {**win, "checks": {**(win.get("checks") or {}), "dup_conflict": True}}
-    if not _contest_verified(win):
+    # 한 칸이다 — 검증된 인용의 진 줄(인용을 더 묻지 않는 근거)과 모델이 쓴 낱말(raw)을 실은 진 줄은 먼저 단 것을 지킨다(RB3E-2).
+    if not (_contest_verified(win) or (win.get("contested_by") or {}).get("raw")):
         out["contested_by"] = {"verdict": _verdict_of(lose), "cq": lose.get("cq", ""),
                                "quote": (lose.get("checks") or {}).get("quote"), "why": lose.get("why", ""),
                                "attempt": lose.get("from_attempt")}
@@ -1312,9 +1319,9 @@ def _conflicted(win: dict, lose: dict) -> dict:
 
 
 def _carry(new: dict, prev: dict) -> dict:
-    """갈아 낄 때 앞 줄의 다툼 표지(checks.dup_conflict·contested_by·flipped_from)를 새 줄에 잇는다 — 판정이 갈렸던 줄을 같은
-    판정의 나은 줄이 갈아 끼면 표지가 사라져 quality.dup_conflict 가 0 이 됐다(RB3B-14). 판정이 바뀌는 갈아 끼우기의
-    flipped_from 은 부르는 쪽이 새로 단다."""
+    """prev 의 다툼 표지(checks.dup_conflict·contested_by·flipped_from)를 new 에 잇는다(new 에 없는 것만) — 판정이 갈렸던 줄을
+    같은 판정의 나은 줄이 갈아 끼면 표지가 사라져 quality.dup_conflict 가 0 이 됐다(RB3B-14). 거꾸로 앞 줄을 둘 때도 새 줄의
+    표지를 앞 줄에 잇는다(RB3E-1). 판정이 바뀌는 갈아 끼우기의 flipped_from 은 부르는 쪽이 단다."""
     out = dict(new)
     if (prev.get("checks") or {}).get("dup_conflict"):
         out["checks"] = {**(new.get("checks") or {}), "dup_conflict": True}
@@ -1900,12 +1907,16 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
                 out[j] = r
             elif _better(r, prev):
                 r = _carry(r, prev)
-                if _verdict_of(r) != _verdict_of(prev):
+                # 한 칸이다 — 앞 뒤집힘이 모델이 쓴 낱말(raw)을 실었으면 그것을 지킨다(RB3E-2 — 둘째 뒤집힘이 첫째의 raw 를 지웠다).
+                if _verdict_of(r) != _verdict_of(prev) and not (r.get("flipped_from") or {}).get("raw"):
                     r = {**r, "flipped_from": _flip(prev)}
                 out[j] = r
             elif _verdict_of(r) != _verdict_of(prev):
-                out[j] = _conflicted(prev, r)      # 걸린 줄을 지켰다 — 갈린 사실과 진 줄을 남긴다
+                out[j] = _conflicted(_carry(prev, r), r)   # 걸린 줄을 지켰다 — 갈린 사실과 진 줄을 남긴다
             else:
+                # 같은 판정이라 앞 줄을 둔다. 새 줄이 그 시도 안에서 단 다툼 표지(dup_conflict·contested_by)는 앞 줄에 잇는다 —
+                # 버리면 보충 안의 [OK, 'NG'] 다툼이 흔적 없이 사라졌다(RB3E-1).
+                out[j] = _carry(prev, r)
                 dup += 1
             continue
         seen.add(ident)

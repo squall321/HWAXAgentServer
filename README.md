@@ -167,9 +167,13 @@ rows for the same card/unit/impact disagree, a hit (WARNING·FAIL, `rel` yes·ma
 displaced by a non-hit — unless the engine coerced that verdict from an out-of-vocabulary value (`rel` → `maybe`,
 `impact` → `unknown`, `judgement` → `undetermined`), which an explicit answer replaces. Before coercing, a value is
 matched case- and space-insensitively and through the alias table below (an aliased word is the model's explicit meaning,
-not a coercion; the raw word stays in `checks.alias` as `"<field>:<word>"`). A coerced row is never dropped without a
-trace: replaced by an explicit answer it leaves `flipped_from.raw`, and when it clashes with a row of another verdict it
-is a conflict like any other (`contested_by.raw` carries the word when the coerced row loses). The survivor carries
+not a coercion; the raw word stays in `checks.alias` as `"<field>:<word>"`). A coerced row (a `v` row whose `judgement` or
+`applies` was coerced, a `u` row's `rel`, a `q1` row's `impact`) never disappears unflagged: replaced by an explicit
+answer it leaves a `flipped_from`, and when it clashes with a row of another verdict it is a conflict like any other
+(`checks.dup_conflict`). The word the model wrote is kept as `raw` in `flipped_from` or `contested_by` — each is a single
+object and the first `raw` is never overwritten, so a later word is not always kept (the guarantee is the flag, not
+every word). A repair row that ties an earlier row hands its own `dup_conflict`/`contested_by` to the row that stays.
+The survivor carries
 `checks.dup_conflict=true` and the losing row as `contested_by{verdict, cq, quote, why, attempt}`; once a contesting answer's quote is verified, the survivor's
 own failed quote is not re-asked (its `checks.quote` stays) — for `q1` only when the contesting row is in the same place
 (`contested_by` then also carries its `path` and `l`). Between rows of the same standing, repair reasons
@@ -177,7 +181,8 @@ own failed quote is not re-asked (its `checks.quote` stays) — for `q1` only wh
 refs). A repair that replaces a row with a different verdict carries `flipped_from{verdict, attempt}` (plus `raw`, the
 value the model wrote, when the replaced verdict was coerced; a repair that re-sends an existing explicit `q1`
 replaces a coerced `q1` only at the same place — card, `path`, `l` — and never when either row already has
-`flipped_from`), and a replacement keeps the `dup_conflict`, `contested_by` and `flipped_from` of the row it replaces. `quality.dup_conflict` and `quality.flipped` count those rows. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
+`flipped_from`; known limit: two coerced `q1` rows at the same place answered by one explicit line leave the second one
+coerced — it stays `unknown`, a hit, until the retries run out), and a replacement keeps the `dup_conflict`, `contested_by` and `flipped_from` of the row it replaces. `quality.dup_conflict` and `quality.flipped` count those rows. `meta.basis` is `cards` · `background` · `role_only` · `search_only` ·
 `noinput` · `rows`; offcard with search carries `meta.search{state: ok·empty_scope·no_hits·failed, queries, hits_n,
 scope_n, used[{alias, record_id, section_id, title, chars, orig_chars, clipped}], note, req_cut}` (`failed` = could
 not ask — the only one the app re-issues; an error envelope — no `hits` list, `ok:false`, `status:"error"`, `error` or
