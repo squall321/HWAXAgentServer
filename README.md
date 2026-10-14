@@ -156,7 +156,8 @@ short; above `items_max` the hits (`yes` · `unknown`) are kept first and `quali
 row once), `summary` `head` · `risk` · `conflict` ·
 `gain` · `watch` · `ask` · `para` with `r` (row aliases) and `refs` (the row refs) — `head`/`para`/`risk`/`conflict`
 need text (`checks.text="empty"` counts as a missing line), a `risk` cites at most 3 rows (`checks.refs="too_many"`),
-and a `must_cover` row counts as covered only by a `risk`/`conflict` with text and `checks.refs="ok"`; what is not
+and a `must_cover` row counts as covered only by a `risk`/`conflict` with text and `checks.refs` `ok` or `unknown_alias`
+(the valid aliases left count), one line covering at most 3 `must_cover` rows; what is not
 covered is re-asked, what is still missing after the repairs is in `result.missing` (`head`/`para` and R aliases —
 resolve them with `meta.aliases.rows`). Several `head` lines keep the first with text (`checks.extra_heads`). When two
 rows for the same card/unit/impact disagree, a hit (WARNING·FAIL, `rel` yes·maybe, `impact` yes·unknown) is never
@@ -174,7 +175,7 @@ not ask — the only one the app re-issues; an error envelope — no `hits` list
 carries its length mark on the line after the closing `»`, outside the quoted text, so a quote cannot borrow the mark. Every
 result carries `meta.clipped{<input>: {orig_chars, kept_chars, …}}` for the inputs cut to their share (`role`,
 `digest`, `missing`, `known` with `orig_items`/`kept_items`, `mechanisms`/`domains` with `labels_dropped`, summary
-`blocks`; `{}` when nothing was cut). Summary number checks use the text the model actually saw.
+`blocks`; `{}` when nothing was cut). Summary number checks use the text the model actually saw (not the clip mark, nor a number the clip cut in half).
 
 Other refusals before the stream opens: 422 `bad_request` · `unsupported_kind` ·
 `unsupported_unit_kind` · `empty_unit` · `deck_too_large` · `over_budget{need, have, part}` · `ctx_too_small`,

@@ -225,7 +225,6 @@ def test_head_는_한_줄이고_보충의_head_가_갈아_낀다():
     ([{"t": "risk", "r": ["R001"], "text": ""}], ["R001"]),                                # 빈 risk 는 덮지 않는다
     ([{"t": "conflict", "r": ["R001"], "text": "한 행뿐"}], ["R001"]),                      # 별칭 하나 conflict
     ([{"t": "risk", "r": ["R001", "R003", "R004", "R005"], "text": "몰아 덮기"}], ["R001"]),  # risk 의 r 은 3개까지
-    ([{"t": "risk", "r": ["R001", "R999"], "text": "모르는 별칭"}], ["R001"]),               # 참조가 틀린 줄
 ])
 def test_요약은_글이_있고_참조가_맞는_줄만_꼭_다룰_행을_덮는다(bad, want_missing):
     """RB3-3 — 글이 빈 head·para·risk 와 별칭 하나짜리 conflict 를 '다 덮었다' 로 받았다. 꼭 다룰 행은 글이 있고 refs=ok 인
@@ -307,3 +306,40 @@ def test_글이_있는_head_는_표지가_많아도_빈_head_를_갈아_낀다()
         merged = cr.merge_rows("summary", empty["rows"], again["rows"], 2)
         assert [r["text"] for r in merged if r["t"] == "head"] == [head["text"]], head
         assert "head" not in cr.settle("summary", merged, ctx)["missing"]
+
+
+def test_모르는_별칭만_지운_줄은_남은_별칭을_덮고_한_줄은_셋까지_덮는다():
+    """RB3B-11 — risk [R001, R999] 는 R999 만 지우는 것이 계약(4.4.5)인데 refs=unknown_alias 라 R001 까지 못 덮어 세 번을
+    물었다. 거꾸로 conflict 한 줄은 상한이 없어 꼭 다룰 행 여섯을 한 번에 덮었다(risk 의 셋 상한을 비켜 갔다)."""
+    res = _check([{"t": "head", "text": "요지", "r": ["R001"]}, {"t": "risk", "r": ["R001", "R999"], "text": "걸림"},
+                  {"t": "risk", "r": ["R002"], "text": "둘째"}, {"t": "para", "text": "문단", "r": ["R001"]}])
+    risk = next(r for r in res["rows"] if r["t"] == "risk" and r["text"] == "걸림")
+    assert (risk["r"], risk["checks"]["refs"]) == (["R001"], "unknown_alias") and res["missing"] == [] and not res["repair"]
+    six = summary_req(n_rows=8, n_cover=6)
+    res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
+                  {"t": "conflict", "r": ["R001", "R002", "R003", "R004", "R005", "R006"], "text": "다툼"},
+                  {"t": "para", "text": "문단", "r": ["R001"]}], six)
+    assert res["missing"] == ["R004", "R005", "R006"] and res["repair"], res["missing"]
+    res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
+                  {"t": "conflict", "r": ["R007", "R001", "R008", "R002", "R003"], "text": "다툼"},
+                  {"t": "risk", "r": ["R004", "R005", "R006"], "text": "셋"}, {"t": "para", "text": "문단", "r": ["R001"]}],
+                 six)
+    assert res["missing"] == [], "꼭 다룰 행이 아닌 별칭이 한 줄의 셋 몫을 차지했다"
+
+
+def test_끊은_집계_블록의_표식과_끊긴_수는_수치_원천이_아니다():
+    """RB3B-15 — 끊은 블록 끝의 표식(…[n자 중 앞 m자])의 수가 원천으로 읽혔고, 끊긴 자리에 걸친 수('12,345' 의 '12,3')가
+    원문에 없는 수 123 으로 원천에 들었다."""
+    cap = LIM["summary"]["blocks_max"]
+    pre = "- n · «수»\n«"
+    keep = cap - cr._MARK_ROOM
+    text = "가" * (keep - len(pre) - 5) + " 12,345 끝" + "나" * 70_000
+    ctx = cr.build_ctx(summary_req(n_rows=3, n_cover=1, blocks=[{"name": "n", "title": "수", "text": text}]), LIM)
+    mark = ctx["blocks_text"].rsplit("…[", 1)[1]
+    orig = mark.split("자", 1)[0]
+    assert orig.replace(",", "").isdigit() and int(orig.replace(",", "")) > 70_000, mark
+    assert cr.nums_unsourced(f"원문은 {orig}자다", ctx["num_src"]) == [orig], "표식의 수를 원천으로 받았다"
+    assert ctx["blocks_text"].rsplit("…[", 1)[0].rstrip().endswith("12,3"), ctx["blocks_text"][-60:]
+    assert cr.nums_unsourced("값은 123 이다", ctx["num_src"]) == ["123"], "끊긴 수의 앞 조각을 원천으로 받았다"
+    whole = cr.build_ctx(summary_req(n_rows=3, n_cover=1, blocks=[{"name": "n", "title": "수", "text": "값 12,345 끝"}]), LIM)
+    assert cr.nums_unsourced("값은 12,345 다", whole["num_src"]) == [], "끊지 않은 블록의 수는 원천이다"

@@ -888,11 +888,12 @@ def _summary_ctx(req: dict, lim: dict) -> dict:
         "blocks": blocks, "narrative_max": int(lim["summary"]["narrative_max"]),
     }
     # 집계 블록은 몫(blocks_max) 안으로 여기서 렌더한다 — 끊었으면 meta.clipped.blocks 에 적고, 수치 원천은 모델이 실제로 본
-    # 글(행 전부 + 렌더한 블록)이다. 예전엔 끊기 전 블록으로 대조해, 모델이 못 본 수치를 '원천 있음' 으로 받았다(RB3-11).
-    ctx["blocks_text"] = _clip("".join(f"- {_frame_safe(b.get('name'))} · «{_unquote_marks(b.get('title'))}»\n"
-                                       f"«{_unquote_marks(b.get('text'))}»\n" for b in blocks),
-                               int(lim["summary"]["blocks_max"]), note=(ctx, "blocks")) if blocks else ""
-    ctx["num_src"] = "\n".join([v["text"] for v in rows.values()] + [ctx["blocks_text"]])
+    # 글(행 전부 + 렌더한 블록의 앞부분)이다. 예전엔 끊기 전 블록으로 대조해, 모델이 못 본 수치를 '원천 있음' 으로 받았다(RB3-11).
+    full = "".join(f"- {_frame_safe(b.get('name'))} · «{_unquote_marks(b.get('title'))}»\n"
+                   f"«{_unquote_marks(b.get('text'))}»\n" for b in blocks)
+    cap = int(lim["summary"]["blocks_max"])
+    ctx["blocks_text"] = _clip(full, cap, note=(ctx, "blocks")) if blocks else ""
+    ctx["num_src"] = "\n".join([v["text"] for v in rows.values()] + [_clip_seen(full, cap)])
     return ctx
 
 
@@ -1487,7 +1488,8 @@ def _check_q2(row: dict, ctx: dict, attempt: int) -> dict:
     return {**row, "from_attempt": attempt, "checks": checks}
 
 
-SUMMARY_RISK_R_MAX = 3            # risk 줄 하나가 덮을 수 있는 행 수 — 한 줄에 꼭 다룰 행을 몰아 덮었다고 하지 않게(RB3-3)
+# risk 줄 하나의 r 상한이자 risk·conflict 줄 하나가 덮는 꼭 다룰 행 수 — 한 줄에 몰아 덮었다고 하지 않게(RB3-3·RB3B-11)
+SUMMARY_RISK_R_MAX = 3
 _SUMMARY_TEXT_REQ = ("head", "para", "risk", "conflict")   # 글이 비면 없는 줄로 보는 줄
 
 
@@ -1686,12 +1688,16 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         res["stamp"] = bool(main) and not missing and all(r["rel"] == "no" for r in main) and len(whys) <= 2
     elif kind == "summary":
         main = [r for r in rows if r["t"] in _SUMMARY_ROWS]
-        # 글이 빈 줄은 없는 줄이다. 꼭 다룰 행은 글이 있고 참조가 맞는(refs=ok — conflict 는 둘 이상, risk 는 3개까지)
-        # risk·conflict 줄에 나와야 덮인다(RB3-3 — 빈 head·para·risk 와 별칭 하나짜리 conflict 를 다 덮었다고 받았다).
+        # 글이 빈 줄은 없는 줄이다. 꼭 다룰 행은 글이 있고 참조가 맞는(conflict 는 둘 이상, risk 는 3개까지) risk·conflict
+        # 줄에 나와야 덮인다(RB3-3 — 빈 head·para·risk 와 별칭 하나짜리 conflict 를 다 덮었다고 받았다). 모르는 별칭만 지운 줄
+        # (refs=unknown_alias)의 남은 별칭은 덮는다 — 계약(4.4.5)은 그 별칭만 지운다(RB3B-11 — 맞는 R001 까지 못 덮어 시도를
+        # 다 썼다). 줄 하나가 덮는 꼭 다룰 행은 SUMMARY_RISK_R_MAX 까지다(RB3B-11 — conflict 한 줄이 여섯을 다 덮었다).
         good = [r for r in rows if (r.get("checks") or {}).get("text", "ok") == "ok"]
         ts = {r["t"] for r in good}
-        covered = {a for r in good if r["t"] in ("risk", "conflict") and (r.get("checks") or {}).get("refs") == "ok"
-                   for a in r.get("r") or []}
+        must = set(ctx["must_cover"])
+        covered = {a for r in good if r["t"] in ("risk", "conflict")
+                   and (r.get("checks") or {}).get("refs") in ("ok", "unknown_alias")
+                   for a in [x for x in r.get("r") or [] if x in must][:SUMMARY_RISK_R_MAX]}
         cover_missing = [a for a in ctx["must_cover"] if a not in covered]
         lines_missing = [t for t in ("head", "para") if t not in ts]
         missing = lines_missing + cover_missing      # 결과의 missing — 남은 꼭 다룰 행(R 별칭)도 그대로 싣는다
@@ -2122,6 +2128,20 @@ def _clip(s: str, cap: int, note=None) -> str:
     n = max(0, cap - _MARK_ROOM)
     _note_clip(note, len(s), len(s[:n].rstrip()) if n else len(s))
     return _cut_mark(s, n)
+
+
+def _clip_seen(s: str, cap: int) -> str:
+    """_clip 이 남기는 앞부분 그대로, 표식 없이 — 수치 원천에 쓴다. 표식의 원문 길이(…[62,228자 중 앞 55,018자])는 모델이
+    본 원천 수치가 아니고, 끊긴 자리에 걸친 수의 앞 조각('12,345' 의 '12,3')은 원문에 없는 수(123)로 읽힌다 — 둘 다 원천에서
+    뺀다(RB3B-15). 빼서 생기는 것은 '원천 없음' 표지뿐이다(표지만이다)."""
+    s = str(s or "")
+    if len(s) <= cap:
+        return s
+    n = max(0, cap - _MARK_ROOM)
+    head = s[:n]
+    if re.match(r"[\d.,]", s[n:n + 1]):
+        head = re.sub(r"[\d.,]+$", "", head)
+    return head
 
 
 def _cap_lines(lines: list, cap: int, what: str, note=None) -> str:
