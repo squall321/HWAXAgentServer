@@ -41,8 +41,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.messages import ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -4660,16 +4660,85 @@ def _delib_human() -> int:
         return n
 
 
+_DRAIN_OFF = {"on": False, "scope": None, "until": None, "until_idle": None, "hold": False, "by": None, "reason": None,
+              "set_at": None}
+
+
 def _card_review_health() -> dict:
-    """/health 의 카드 대조 칸 — review_active · capabilities · card_review{…}. 모듈을 못 붙였거나 셈이 실패하면 capabilities 를
-    비우고 사유를 싣는다(/health 는 늘 답한다)."""
+    """/health 의 카드 대조 칸 — review_active · draining · drain{…} · capabilities · card_review{…}. 모듈을 못 붙였거나 셈이
+    실패하면 capabilities 를 비우고 사유를 싣는다(/health 는 늘 답한다). draining 은 비우기 scope all(카드 대조 새 호출을 받지
+    않는다)이고 셸이 grep 으로 읽게 최상위에 둔다. drain.on 은 scope 와 상관없이 '앱이 새 패널을 집지 않는다' 다(M3.md 4.7)."""
     if _card_review is None:
-        return {"review_active": 0, "capabilities": [], "card_review": {"error": _CARD_REVIEW_ERR}}
+        return {"review_active": 0, "draining": False, "drain": dict(_DRAIN_OFF), "capabilities": [],
+                "card_review": {"error": _CARD_REVIEW_ERR}}
     try:
         fields = _card_review.health_fields(app)
+        drain = _card_review.gate_of(app).drain.snapshot()
     except Exception as exc:  # noqa: BLE001
-        return {"review_active": 0, "capabilities": [], "card_review": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
-    return {"review_active": fields["active"], "capabilities": ["card_review"], "card_review": fields}
+        return {"review_active": 0, "draining": False, "drain": dict(_DRAIN_OFF), "capabilities": [],
+                "card_review": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
+    return {"review_active": fields["active"], "draining": bool(drain["on"] and drain["scope"] == "all"),
+            "drain": drain, "capabilities": ["card_review", "drain"], "card_review": fields}
+
+
+# ── 비우기(update-all 동안 — M3.md 4.7) ─────────────────────────────────────────
+# POST /drain {on, scope: all|panels, ttl_s | until_idle{grace_s, max_s}, hold?, by, reason, force?} · GET /drain. 깃발은
+# review_gate.DrainState(파일 하나 — 재기동을 넘긴다)이고 규칙도 거기 있다. 인증은 없다 — 서버는 루프백에만 묶이고 /chat 도
+# 같은 신뢰 수준이다. 포털은 /drain 을 중계하지 않는다(포털 시험이 라우터에서 뽑아 본다).
+_DRAIN_FIELDS = ("on", "scope", "ttl_s", "until_idle", "hold", "by", "reason", "force")
+
+
+def _drain_view(gate) -> dict:
+    a, q = _delib_load()
+    return {**gate.drain.snapshot(), "review_active": gate.active, "delib_active": a, "delib_queued": q}
+
+
+@app.get("/drain")
+def get_drain():
+    if _card_review is None:
+        return JSONResponse({"code": "drain_unavailable", "message": f"카드 대조 모듈이 없다 — {_CARD_REVIEW_ERR}"},
+                            status_code=503)
+    return _drain_view(_card_review.gate_of(app))
+
+
+@app.post("/drain")
+async def post_drain(request: Request):
+    if _card_review is None:
+        return JSONResponse({"code": "drain_unavailable", "message": f"카드 대조 모듈이 없다 — {_CARD_REVIEW_ERR}"},
+                            status_code=503)
+    from review_gate import DrainError  # noqa: PLC0415
+
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"code": "bad_request", "message": "본문이 JSON 이 아니다"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"code": "bad_request", "message": "본문은 JSON 객체여야 한다"}, status_code=422)
+    extra = sorted(set(body) - set(_DRAIN_FIELDS))
+    if extra:
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {extra} — 조용히 버리지 않고 거절한다",
+                             "fields": extra}, status_code=422)
+    if not isinstance(body.get("on"), bool):
+        return JSONResponse({"code": "bad_request", "message": "on 은 true|false 다"}, status_code=422)
+    for k in ("hold", "force"):
+        if not isinstance(body.get(k, False), bool):
+            return JSONResponse({"code": "bad_request", "message": f"{k} 는 true|false 다"}, status_code=422)
+    if body.get("until_idle") is not None and not isinstance(body["until_idle"], dict):
+        return JSONResponse({"code": "bad_request", "message": "until_idle 은 {grace_s, max_s} 다"}, status_code=422)
+    gate = _card_review.gate_of(app)
+    try:
+        if body["on"]:
+            snap = gate.drain.set_on(scope=body.get("scope"), by=body.get("by"), reason=body.get("reason") or "",
+                                     ttl_s=body.get("ttl_s"), until_idle=body.get("until_idle"),
+                                     hold=bool(body.get("hold")))
+            print(f"[drain] 깃발 on scope={snap['scope']} by={snap['by']} hold={snap['hold']} until={snap['until']} "
+                  f"until_idle={snap['until_idle']}")
+        else:
+            gate.drain.set_off(by=body.get("by") or "", force=bool(body.get("force")))
+    except DrainError as exc:
+        print(f"[drain] 거절 {exc.status} {exc.code} — {exc.message}"[:300])
+        return JSONResponse(exc.body(), status_code=exc.status)
+    return _drain_view(gate)
 
 
 @app.get("/health")

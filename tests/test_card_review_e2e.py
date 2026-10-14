@@ -164,7 +164,7 @@ def test_run_이_실제_LLM_호출을_지나_끝까지_돈다(stack):
     # 사용량은 가짜 서버의 usage 가 ChatOpenAI 를 지나 온 것이다(엔진이 0 으로 지어내지 않는다).
     assert m["usage"]["tokens_in"] > 0 and m["usage"]["llm_calls"] == 1
     assert stats["calls"] == 1 and stats["behaviors"] == ["oracle"]
-    assert h["capabilities"] == ["card_review"] and h["review_active"] == 0 and h["delib_active"] == 0
+    assert h["capabilities"] == ["card_review", "drain"] and h["review_active"] == 0 and h["delib_active"] == 0
     cr = h["card_review"]
     assert (cr["timeout_s"], cr["tries"], cr["request_worst_s"]) == (1800, 2, 10_884) and cr["totals"]["ok"] >= 1
 

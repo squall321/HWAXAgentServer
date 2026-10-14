@@ -320,7 +320,7 @@ def test_health_에_카드_대조_칸이_있고_기존_칸은_그대로다(clien
     env.max_retries = 1
     h = client.get("/health").json()
     assert {"status", "delib_active", "delib_queued", "model", "context_tokens", "evid_budget"} <= set(h)
-    assert h["capabilities"] == ["card_review"] and h["review_active"] == 0
+    assert h["capabilities"] == ["card_review", "drain"] and h["review_active"] == 0
     c = h["card_review"]
     assert {"rev", "kinds", "limit", "limit_reason", "active", "timeout_s", "tries", "attempts_max", "request_worst_s",
             "prompt_rev", "totals", "last_error", "delib_human", "search_timeout_s"} <= set(c)
@@ -363,7 +363,9 @@ def test_모듈을_못_붙이면_capabilities_가_비고_사유를_싣는다(mon
     monkeypatch.setattr(a, "_card_review", None)
     monkeypatch.setattr(a, "_CARD_REVIEW_ERR", "ImportError: x")
     h = a._card_review_health()
-    assert h == {"review_active": 0, "capabilities": [], "card_review": {"error": "ImportError: x"}}
+    assert h == {"review_active": 0, "draining": False, "drain": a._DRAIN_OFF, "capabilities": [],
+                 "card_review": {"error": "ImportError: x"}}
+    assert a.app.state is not None and TestClient(a.app).get("/drain").status_code == 503
 
 
 def test_검증기는_app_없이_돈다():

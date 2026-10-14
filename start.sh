@@ -99,25 +99,46 @@ secs_or() {   # secs_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는�
 }
 STOP_GRACE_S="$(secs_or AGENT_STOP_GRACE_S "${AGENT_STOP_GRACE_S:-2}" 2)"
 HEALTH_PROBE_S="$(secs_or AGENT_HEALTH_PROBE_S "${AGENT_HEALTH_PROBE_S:-3}" 3)"
+# /health 본문은 한 번만 묻는다(아래 둘이 같은 본문을 읽는다) — 답이 없으면 빈 글이다.
+health_body() {
+  local probe="$HOST"
+  [ "$probe" = "0.0.0.0" ] && probe="127.0.0.1"
+  curl -s --noproxy '*' --max-time "$HEALTH_PROBE_S" "http://${probe}:${PORT}/health" 2>/dev/null || true
+}
 # 떠 있는 인스턴스가 돌리고 있는 심의 수 — "<진행> <대기>" 를 찍는다. **모르면 아무것도 안 찍는다**
 # (/health 무응답 · 그 수를 안 주는 옛 빌드 · curl 없음). '모름' 과 '0건' 을 섞지 않는다 — 섞으면 답 없는
 # 서버를 '심의 없음' 으로 읽는다. 출력을 먼저 변수에 받고 나서 가른다(판정을 파이프에 걸지 않는다).
-delib_load() {
-  local body act que probe="$HOST"
-  [ "$probe" = "0.0.0.0" ] && probe="127.0.0.1"
-  body="$(curl -s --noproxy '*' --max-time "$HEALTH_PROBE_S" "http://${probe}:${PORT}/health" 2>/dev/null || true)"
+delib_load() {   # delib_load <health 본문>
+  local body="${1:-}" act que
   act="$(printf '%s' "$body" | grep -oE '"delib_active": *[0-9]+' | grep -oE '[0-9]+$' || true)"
   que="$(printf '%s' "$body" | grep -oE '"delib_queued": *[0-9]+' | grep -oE '[0-9]+$' || true)"
   if [ -n "$act" ] && [ -n "$que" ]; then echo "$act $que"; fi
 }
+# 카드 대조·비우기 안내 — 판정은 바꾸지 않는다(재기동을 막는 것은 심의뿐이다 — 카드 대조는 끊기면 리스크 앱이 차감 없이 다시
+# 낸다). 끊길 카드 대조 수와 서 있는 비우기 깃발을 한 줄씩 찍는다. 모르면(무응답·옛 판) 아무것도 찍지 않는다. grep -q 를 파이프에
+# 걸지 않는다 — pipefail 아래서 일찍 끝난 grep 이 printf 를 SIGPIPE 로 죽여 '찾았다' 를 '없다' 로 읽는다.
+review_notes() {   # review_notes <health 본문>
+  local body="${1:-}" ra on by
+  ra="$(printf '%s' "$body" | grep -oE '"review_active": *[0-9]+' | grep -oE '[0-9]+$' || true)"
+  if [ -n "$ra" ] && [ "$ra" -gt 0 ]; then
+    echo "  · 카드 대조 ${ra}건이 돈다 — 재기동으로 끊긴다(리스크 앱이 차감 없이 다시 돌린다)"
+  fi
+  on="$(printf '%s' "$body" | grep -oE '"drain": *\{ *"on": *true' || true)"
+  if [ -n "$on" ]; then
+    by="$(printf '%s' "$body" | grep -oE '"by": *"[^"]*"' | head -1 | sed -E 's/^"by": *"//; s/"$//' || true)"
+    echo "  · 리스크 검토 비우기 중(by ${by:-?}) — 재기동해도 깃발은 남는다"
+  fi
+}
 OLD_PIDS="$(port_pids || true)"
 if [ -n "$OLD_PIDS" ]; then
+  HEALTH_BODY="$(health_body)"
+  review_notes "$HEALTH_BODY" || true
   # 재기동은 도는 심의와 줄 선 심의를 **전부 끊는다**(도는 것은 interrupted 로 남고, 줄 선 것은 사라진다).
   # 좌석 20석 넘는 패널은 수 시간 돈다 — 종전엔 코드를 고치고 이 스크립트를 부르는 순간(update-forges 도
   # 직접 부른다) 그 심의가 말없이 사라졌다. 유예를 늘리는 것은 답이 아니다(수 시간을 기다릴 수는 없다).
   # 도는 심의가 있으면 **내리지 않고 나간다**(exit 3 — 건너뜀). 강행은 AGENT_RESTART_FORCE=1.
   # 수를 모르면(위 delib_load) 그대로 재기동한다 — 답 없는 서버는 다시 띄울 수 있어야 한다.
-  LOAD="$(delib_load || true)"
+  LOAD="$(delib_load "$HEALTH_BODY" || true)"
   if [ -n "$LOAD" ]; then
     D_ACT="${LOAD%% *}"; D_QUE="${LOAD##* }"
     if [ $((D_ACT + D_QUE)) -gt 0 ]; then
