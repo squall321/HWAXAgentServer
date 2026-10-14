@@ -107,7 +107,7 @@ DOMAINS = [{"key": f"d{i:02d}", "label": f"영역 {i}"} for i in range(15)]
 
 # ── 틀 ───────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("kind,variant", [("verdict", "fwd"), ("verdict", "rev"), ("verdict", "solo"),
-                                          ("sweep", None), ("offcard", None)])
+                                          ("sweep", None), ("offcard", None), ("noinput", None)])
 def test_틀_길이는_여유값_안이다(kind, variant):
     """예산은 틀을 재지 않고 TEMPLATE_ALLOW 를 믿는다(P-06). 가장 긴 키(120자)·세 자리 수로 재도 그 안이어야 한다."""
     lim = cr.limits(1_048_576, "server", 0, env={})
@@ -122,6 +122,10 @@ def test_틀_길이는_여유값_안이다(kind, variant):
         req["unit"], req["cards"] = None, pack
         req["manifest"] = [{"unit_id": f"u-{i}", "kind": "bundle", "title": "t", "text": "x"} for i in range(100)]
         req["extra"] = {"domains": DOMAINS, "missing": GAPS}      # 결측 블록·문장까지 실은 가장 긴 틀
+    elif kind == "noinput":
+        req["cards"] = pack[:20]
+        req["digest"] = _digest(pack, [c["alias"] for c in req["cards"]])
+        req["extra"] = {"mechanisms": MECHS, "known": [{"alias": "F01", "judgement": None, "why": "w"}]}
     else:
         req["cards"] = [c for c in pack if not c["checkable"]]
         req["digest"] = _digest(pack, [c["alias"] for c in req["cards"]])
@@ -502,6 +506,8 @@ def test_심은_지시_표지는_어느_칸에서도_틀_밖에_서지_못한다
         "sweep": _req("sweep", pack, [], manifest=manifest, extra=extra),
         "sweep_gaps": _req("sweep", pack, [], manifest=manifest, extra={**extra, "missing": GAPS}),
         "offcard": _req("offcard", bg, _digest(pack, [c["alias"] for c in bg]), unit=_unit(0), extra=extra),
+        "noinput": _req("noinput", pack[:4], _digest(pack, [c["alias"] for c in pack[:4]]), unit=_unit(0),
+                        extra={**extra, "known": [{"alias": "F01", "judgement": None, "why": "이미 낸 영향"}]}),
     }
     for name, req in reqs.items():
         planted = _plant(req)
@@ -643,3 +649,51 @@ def test_메커니즘_목록은_몫을_넘으면_코드만_그래도_넘으면_�
     _, human, ctx = cr.build_prompt(req, lim)
     assert ctx["sizes"]["mech"] <= lim["verdict"]["mech_max"] and "=" not in human.split("[메커니즘 목록]\n")[1].split(
         "\n")[0], "몫을 넘으면 이름을 떼고 코드만 싣는다"
+
+
+# ── M3 E3-2 — 입력 결손 두 질문(noinput) ───────────────────────────────────────
+def _ni_req(pack=None, unit=None, **kw):
+    pack = pack or _pack()
+    return _req("noinput", pack, _digest(pack), unit=unit or _unit(0), extra={"mechanisms": MECHS}, **kw)
+
+
+def test_입력_결손은_결측_단위에만_부르고_변형이_없다():
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    (err,) = cr.validate_run_request(_ni_req(unit=_unit(0, missing=0)), lim)
+    assert (err["status"], err["code"]) == (422, "bad_request") and "unit.missing" in err["message"]
+    (err,) = cr.validate_run_request(_ni_req(variant="fwd"), lim)
+    assert err["code"] == "bad_request"
+    assert cr.validate_run_request(_ni_req(), lim) == []
+
+
+def test_입력_결손_프롬프트는_결측_카드_전부_단위_메커니즘_지시_순이다():
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    pack = _pack()
+    system, human, ctx = cr.build_prompt(_ni_req(pack), lim)
+    order = ["[결측]", f"[내 카드 {len(pack)}장 — 전문. 판정 대상이 아니라 근거다]", "[검토 단위", "[메커니즘 목록]",
+             "[지시]\n[결측]에 적힌 입력이 이 과제에 없다"]
+    at = [human.index(x) for x in order]
+    assert at == sorted(at), at
+    assert "최대 15줄" in human and ctx["basis"] == "noinput" and ctx["bg_dropped"] == 0
+    assert set(ctx["aliases"]["cards"]) == {c["alias"] for c in pack}, "점검·배경 카드 전부를 싣는다"
+    assert system == cr._SYSTEM.format(key="mech-test-seal")
+
+
+def test_입력_결손의_넘치는_카드는_제목으로_내리고_창_안이다():
+    """1M 이 아닌 창 — 카드가 본문 몫을 넘으면 꼬리를 제목으로 내리고 bg_dropped 로 센다(over_budget 이 아니다)."""
+    lim = cr.limits(16_384, "server", 0, env={})
+    pack = _pack(random.Random(5), n=10, size=(1_500, 2_500))
+    system, human, ctx = cr.build_prompt(_ni_req(pack), lim)
+    assert ctx["bg_dropped"] > 0 and ctx["prompt_chars"] <= lim["p_hard"]
+    for a in ctx["digest"]:
+        assert a not in ctx["card_order"]
+    assert f"[카드 제목 {len(ctx['digest'])}장" in human
+
+
+def test_입력_결손의_되묻기는_이미_낸_영향을_싣는다():
+    lim = cr.limits(1_048_576, "server", 0, env={})
+    req = _ni_req()
+    req["extra"]["known"] = [{"alias": "F01", "judgement": None, "why": "보드 근접 계면 간극 축소"}]
+    _, human, ctx = cr.build_prompt(req, lim)
+    assert "[이미 낸 영향 — 되풀이하지 말고 이것 말고 더 있는 것만 낸다]\nF01  — «보드 근접 계면 간극 축소»" in human
+    assert ctx["sizes"]["known"] <= lim["noinput"]["known_max"]

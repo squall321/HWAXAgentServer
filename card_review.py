@@ -715,6 +715,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
         num_src = "\n".join([_str(unit.get("title")), _str(unit.get("summary")), _str(unit.get("notes"))] +
                             [_str((m or {}).get("note")) for m in unit.get("missing") or [] if isinstance(m, dict)])
 
+    if kind == "noinput" and not [m for m in (unit or {}).get("missing") or [] if isinstance(m, dict)]:
+        raise RequestError("bad_request", "unit.missing 이 없다 — noinput 은 결손 입력이 있는 단위에만 부른다")
     if kind == "verdict":
         if not order:
             raise RequestError("bad_request", "verdict 에 판정할 카드가 없다")
@@ -737,7 +739,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
         "cards": cards, "card_order": order, "digest": digest, "judge": list(order) if kind == "verdict" else [],
         "lines": lines, "units": units, "num_src": num_src,
         "mechs": codes(extra.get("mechanisms"), "code"), "domains": codes(extra.get("domains"), "key"),
-        "findings_max": int(lim["offcard"]["findings_max"]), "bg_dropped": 0,
+        "findings_max": int(lim["offcard"]["findings_max"]), "items_max": int(lim["noinput"]["items_max"]),
+        "bg_dropped": 0,
     }
 
 
@@ -745,10 +748,11 @@ def build_ctx(req: dict, lim: dict) -> dict:
 # 한 줄에 객체 하나(JSON Lines)가 정본이다 — 긴 배열 하나는 따옴표 하나로 통째로 깨지지만, 줄 단위면 깨진 줄 하나만 잃고
 # 그 행만 다시 물으면 된다. `_parse_json`(마지막 객체 하나)을 쓰지 않는다 — 30행 배열이 한 행으로 보인다(설계서 2.2).
 _ROW_TYPES = {"sweep": ("u", "h", "inj"), "verdict": ("v", "c", "inj"),
-              "offcard": ("f", "m", "h", "need", "none", "more", "inj")}
+              "offcard": ("f", "m", "h", "need", "none", "more", "inj"), "noinput": ("q1", "q2", "more", "inj")}
 # (종류, 줄 종류) → 목록 칸. 나머지 칸은 문자열이다.
 _LIST_FIELDS = {("verdict", "v"): ("l",), ("verdict", "c"): ("l",), ("sweep", "u"): ("k",),
-                ("offcard", "f"): ("l",), ("offcard", "m"): ("seen",), ("offcard", "h"): ("l",)}
+                ("offcard", "f"): ("l",), ("offcard", "m"): ("seen",), ("offcard", "h"): ("l",),
+                ("noinput", "q1"): ("l",), ("noinput", "q2"): ("l",)}
 _STR_FIELDS = {
     ("verdict", "v"): ("k", "applies", "judgement", "cq", "why", "need", "sev", "path", "check_kind", "check", "mech",
                        "mech_free"),
@@ -757,6 +761,8 @@ _STR_FIELDS = {
     ("offcard", "f"): ("dir", "title", "mech", "mech_free", "path", "src", "q", "sev", "conf", "check_kind", "check"),
     ("offcard", "h"): ("to", "why"), ("offcard", "need"): ("what",), ("offcard", "none"): ("why",),
     ("offcard", "more"): ("more",),
+    ("noinput", "q1"): ("impact", "title", "mech", "mech_free", "path", "k", "cq", "sev", "why"),
+    ("noinput", "q2"): ("item", "needs", "k", "why"), ("noinput", "more"): ("more",),
 }
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 _FENCE_RE = re.compile(r"^\s*```")
@@ -1163,6 +1169,62 @@ def _check_f(row: dict, ctx: dict, attempt: int) -> dict:
     return {**row, "from_attempt": attempt, "checks": checks}
 
 
+def _card_ref(row: dict, ctx: dict, checks: dict) -> str:
+    """행의 k(근거 카드 별칭) — 전문이 실린 카드면 'card', 제목만 실린 카드면 'digest', 비었으면 ''. 실리지 않은 별칭은 지우고
+    coerced 에 적는다(지어낸 번호가 결과에 들어갈 길이 없다). record_id 를 단다."""
+    k = row.get("k", "")
+    if not k:
+        return ""
+    if k in ctx["cards"]:
+        row["record_id"] = ctx["cards"][k]["record_id"]
+        return "card"
+    if k in ctx["digest"]:
+        row["record_id"] = ctx["digest"][k]["record_id"]
+        return "digest"
+    checks["coerced"].append(f"k:{k}")
+    row["k"] = ""
+    return ""
+
+
+def _check_q1(row: dict, ctx: dict, attempt: int) -> dict:
+    """noinput 의 q1 줄 — 지금 실린 변경만으로 말할 수 있는 영향 하나(M3.md 4.4.2). impact=yes 면 l 이 필수(없으면 refs=missing
+    표지만), 메커니즘도 필수(없으면 mech=missing 표지만). 전문이 실린 카드의 cq 는 원문에 대조하고(보충 사유 — settle),
+    제목만 실린 카드면 quote=digest_only, 카드를 대지 않았는데 cq 가 있으면 unexpected 다."""
+    checks: dict = {"refs": "ok", "quote": "ok", "quote_sid": "", "nums_unsourced": [], "coerced": []}
+    _enum(row, "impact", APPLIES, "unknown", checks, empty_too=True)
+    _enum(row, "sev", SEVS, "", checks)
+    l = _resolve_l(row, ctx, checks)
+    if row["impact"] == "yes" and not l:
+        checks["refs"] = "missing"
+    ref = _card_ref(row, ctx, checks)
+    if ref == "card":
+        checks["quote"], checks["quote_sid"] = quote_check(row["cq"], ctx["cards"][row["k"]])
+    elif ref == "digest":
+        checks["quote"] = "digest_only"
+    elif row["cq"]:
+        checks["quote"] = "unexpected"
+    card = ctx["cards"].get(row["k"]) if ref == "card" else None
+    src = "\n".join(([card["header"], card["title"], card["text"]] if card else []) + [ctx["num_src"]] +
+                    [ctx["lines"][x]["text"] for x in l])
+    checks["nums_unsourced"] = nums_unsourced(row["why"], src)
+    checks["mech"] = _check_mech(row, ctx, checks, required=row["impact"] == "yes")
+    if "_shape" in row:
+        checks["shape"] = row.pop("_shape")
+    return {**row, "from_attempt": attempt, "checks": checks}
+
+
+def _check_q2(row: dict, ctx: dict, attempt: int) -> dict:
+    """noinput 의 q2 줄 — 결측 입력이 오면 확인할 것 하나. 항목이 빈 줄은 '확인할 것이 없다' 이고 그 까닭(why)이 있어야 한다."""
+    checks: dict = {"refs": "ok", "why": "ok", "coerced": []}
+    _resolve_l(row, ctx, checks)
+    _card_ref(row, ctx, checks)
+    if not row["item"] and _subst(row["why"]) < NEED_SUBST_MIN:
+        checks["why"] = "short"
+    if "_shape" in row:
+        checks["shape"] = row.pop("_shape")
+    return {**row, "from_attempt": attempt, "checks": checks}
+
+
 def _check_side(kind: str, row: dict, ctx: dict, attempt: int) -> dict | None:
     """곁가지 줄(h·need·none·more·m) — 버릴 것이면 None."""
     t = row["t"]
@@ -1209,7 +1271,11 @@ def _dedupe(rows: list, key, verdict_of) -> tuple[list, int]:
 
 
 def _verdict_of(r: dict):
-    return (r.get("applies"), r.get("judgement")) if r["t"] == "v" else (r.get("rel"),) if r["t"] == "u" else None
+    if r["t"] == "v":
+        return r.get("applies"), r.get("judgement")
+    if r["t"] == "u":
+        return (r.get("rel"),)
+    return (r.get("impact"),) if r["t"] == "q1" else None
 
 
 def _identity(r: dict) -> str:
@@ -1248,6 +1314,10 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
                 got = _check_u(r, ctx, attempt)
         elif kind == "offcard" and t == "f":
             got = _check_f(r, ctx, attempt)
+        elif kind == "noinput" and t == "q1":
+            got = _check_q1(r, ctx, attempt)
+        elif kind == "noinput" and t == "q2":
+            got = _check_q2(r, ctx, attempt)
         else:
             got = _check_side(kind, r, ctx, attempt)
         if got is None:
@@ -1260,6 +1330,14 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
     elif kind == "sweep":
         us, stats["dup"] = _dedupe([r for r in out if r["t"] == "u"], lambda r: r["u"], _verdict_of)
         out = us + [r for r in out if r["t"] != "u"]
+    elif kind == "noinput":
+        # q1 은 (근거 카드, 제목)이 같으면 같은 영향이다(카드를 대지 않은 줄은 완전히 같을 때만), q2 는 완전히 같을 때만 접는다.
+        q1s, d1 = _dedupe([r for r in out if r["t"] == "q1"], lambda r: _merge_key(r) or _identity(r), _verdict_of)
+        q2s, d2 = _dedupe([r for r in out if r["t"] == "q2"], _identity, lambda r: None)
+        stats["dup"] = d1 + d2
+        cap = ctx["items_max"]
+        stats["dropped_over_cap"] = max(0, len(q1s) - cap)     # 상한을 넘는 q1 은 앞의 것을 남기고 센다(4.4.2)
+        out = q1s[:cap] + q2s + [r for r in out if r["t"] == "more"][-1:]
     else:
         # f 줄에는 정해진 정체가 없다(제목은 열쇠가 아니다) — 완전히 같은 줄만 하나로 두고 dup 에 센다.
         fs, stats["dup"] = _dedupe([r for r in out if r["t"] == "f"], _identity, lambda r: None)
@@ -1289,6 +1367,9 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
             problems.append((r["k"], "quote", ch["quote"]))
         if r["t"] == "f" and ch.get("src") == "ok" and ch.get("quote") != "ok":
             problems.append((r["src"], "quote", ch["quote"]))
+        if (r["t"] == "q1" and r.get("k") in ctx["cards"] and r.get("impact") in ("yes", "unknown")
+                and ch.get("quote") != "ok"):
+            problems.append((r["k"], "quote", ch["quote"]))     # 전문이 실린 카드를 댄 영향 줄의 인용 — 보충 사유
     res: dict = {"stamp": False, "unmatched_cards": [], "maybe_more": None}
     if kind == "verdict":
         main = [r for r in rows if r["t"] == "v"]
@@ -1305,6 +1386,16 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         res["unmatched_cards"] = [a for a in ctx["card_order"] if a not in used]
         whys = {_nq(r["why"]) for r in main}
         res["stamp"] = bool(main) and not missing and all(r["rel"] == "no" for r in main) and len(whys) <= 2
+    elif kind == "noinput":
+        main = [r for r in rows if r["t"] == "q1"]
+        ts = {r["t"] for r in rows}
+        missing = [t for t in ("q1", "q2", "more") if t not in ts]
+        expected = 3                                   # 꼭 있어야 하는 줄 — q1 · q2 · more
+        more = next((r["more"] for r in rows if r["t"] == "more"), None)
+        if len(main) >= ctx["items_max"] or more == "yes":
+            res["maybe_more"] = True                   # 상한까지 냈거나 더 있다고 했다 — 앱이 known 을 실어 더 묻는다
+        elif more == "no":
+            res["maybe_more"] = False
     else:
         main = [r for r in rows if r["t"] == "f"]
         ts = {r["t"] for r in rows}
@@ -1333,6 +1424,8 @@ def _merge_key(r: dict):
         return ("v", r["k"])
     if r["t"] == "u":
         return ("u", r["u"])
+    if r["t"] == "q1" and r.get("k"):
+        return ("q1", r["k"], _nq(r.get("title")))      # 카드를 댄 영향 줄 — 보충이 인용을 고쳐 다시 낸 줄이 앞 줄을 갈아 낀다
     if r["t"] in _SINGLE_ROWS:
         return (r["t"],)
     return None
@@ -1376,8 +1469,10 @@ def merge_rows(kind: str, old: list, new: list, attempt: int, stats: dict | None
     return out
 
 
-_MISSING_SAY = {"m": "m 줄(따져 본 메커니즘)", "more": "more 줄(더 있나)", "f_or_none": "f 줄(없으면 none 줄)"}
-_HINT_ALIAS = re.compile(r"[KLU]\d{2,}|[a-z]{1,4}")      # 지적 블록에 그대로 쓰는 대상 — 별칭, 줄 종류(f·m·h·need…)
+_MISSING_SAY = {"m": "m 줄(따져 본 메커니즘)", "more": "more 줄(더 있나)", "f_or_none": "f 줄(없으면 none 줄)",
+                "q1": "q1 줄(질문 1 — 지금 변경으로 말할 수 있는 영향. 없으면 impact=no 한 줄)",
+                "q2": "q2 줄(질문 2 — 결측 입력이 오면 확인할 것. 없으면 item 이 빈 한 줄)"}
+_HINT_ALIAS = re.compile(r"[KLU]\d{2,}|[a-z]{1,4}|q[12]")  # 지적 블록에 그대로 쓰는 대상 — 별칭, 줄 종류(f·m·h·need·q1…)
 _HINT_SAY = {
     "missing": "줄이 없다",
     "enum": "열거 밖 값을 적었다",
@@ -1540,6 +1635,28 @@ _INSTR_OFFCARD = (
 )
 
 
+# 입력 결손 두 질문(cr-noinput-1) — ECAD 같은 입력이 없는 전문가가 카드 전부를 보고 답한다(M3.md 4.4.2). 셀을 어떻게 닫는지는
+# 앱이 q1·q2 로 정한다(정산표). 메커니즘은 영향(impact=yes) 줄에만 필수다(#30).
+_INSTR_NOINPUT = (
+    "[지시]\n"
+    "[결측]에 적힌 입력이 이 과제에 없다. 그래서 질문을 둘로 나눈다.\n"
+    "질문 1 — 지금 실린 변경만으로, 이 변경이 당신 영역에 만드는 영향이 있는가. 영향마다 한 줄(최대 {n}줄, 중요한 것부터).\n"
+    '{{"t":"q1","impact":"yes|no|unknown","title":"…","mech":"메커니즘 코드 또는 free","mech_free":"…","path":"…",'
+    '"l":["L03"],"k":"K05","cq":"…","sev":"경미|중대|치명","why":"…"}}\n'
+    '- impact=yes 면 l 은 필수다. 카드가 근거면 k 와 cq(그 카드 본문 «…» 에서 15자 이상 그대로)를 적고, 아니면 k 는 "" 이다.\n'
+    '- impact=yes 면 mech 는 [메커니즘 목록]의 코드 하나다. 맞는 것이 없으면 "free" 와 mech_free.\n'
+    '- 영향이 없으면 impact="no" 한 줄에 why 를 적는다. 결측 입력이 없어서 가릴 수 없으면 impact="unknown" 이다.\n'
+    "질문 2 — 결측 입력이 오면 무엇을 확인해야 하는가.\n"
+    '{{"t":"q2","item":"확인할 항목","needs":"필요한 데이터(네트·스택업·배치·부품값 등)","k":"K07","l":["L03"],'
+    '"why":"…"}}\n'
+    "- 이 변경 때문에 확인이 필요해진 항목만 적는다. 일반 점검표를 옮기지 않는다. 없으면 "
+    '{{"t":"q2","item":"","why":"결측 입력이 와도 확인할 것이 없는 까닭"}} 한 줄.\n'
+    "마지막 줄은 반드시 — 질문 1 의 영향이 여기 적은 것 말고 더 있는가.\n"
+    '{{"t":"more","more":"yes|no"}}\n'
+    "no·unknown 은 기본값이 아니다. 카드의 적용 조건과 변경 줄을 맞대어 보고 정한다.\n"
+)
+
+
 class OverBudget(RequestError):
     """조립한 프롬프트가 창 한도(P_hard)를 넘는다 — LLM 을 부르지 않는다(422 over_budget{need, have, part})."""
 
@@ -1632,7 +1749,7 @@ def template_sha(kind: str) -> str:
     parts = [_SYSTEM, "".join(_UNIT_HEADS.values())]
     parts += {"verdict": [_INSTR_VERDICT, _INSTR_SOLO, _INSTR_VERDICT_RULES, _INSTR_VERDICT_MECH],
               "sweep": [_INSTR_SWEEP, _INSTR_SWEEP_MISSING],
-              "offcard": [_INSTR_OFFCARD]}[kind]
+              "offcard": [_INSTR_OFFCARD], "noinput": [_INSTR_NOINPUT]}[kind]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
 
 
@@ -1673,8 +1790,9 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     order = list(ctx["card_order"])
     if kind == "verdict" and variant == "rev":
         order.reverse()                  # 카드 순서만 뒤집는다 — 별칭은 그대로다
-    if kind == "offcard":
-        # 배경 카드 전문은 본문 몫에서 단위가 쓰고 남은 만큼 — 넘치는 꼬리는 제목으로 내리고 그 수를 알린다(M2.md 5절 10).
+    if kind in ("offcard", "noinput"):
+        # 카드 전문은 본문 몫에서 단위가 쓰고 남은 만큼 — 넘치는 꼬리는 제목으로 내리고 그 수를 알린다(M2.md 5절 10). 입력
+        # 결손 호출은 카드 전부(점검·배경, 훑기 k 에 걸린 것 먼저 — 앱이 순서를 정한다)를 같은 규칙으로 싣는다(M3.md 4.4.2).
         room = max(0, kl["body"] - unit_size(unit))
         keep, used = [], 0
         for a in order:
@@ -1689,7 +1807,7 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         order = keep
         ctx["card_order"] = keep
 
-    if kind in ("verdict", "offcard") and ctx["digest"]:
+    if kind in ("verdict", "offcard", "noinput") and ctx["digest"]:
         head = ("[배경 카드 — 제목만. 판정 대상이 아니다]\n" if kind == "verdict"
                 else f"[카드 제목 {len(ctx['digest'])}장 — 전문이 실리지 않은 카드]\n")
         add("frame", head)
@@ -1698,7 +1816,8 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         add("frame", "\n")
     card_head = {"verdict": f"[점검 카드 {len(order)}장 — 판정 대상. 실린 순서에는 뜻이 없다]\n",
                  "sweep": f"[내 카드 {len(order)}장 — 전문]\n",
-                 "offcard": f"[배경 카드 {len(order)}장 — 전문. 판정 대상이 아니다]\n"}[kind]
+                 "offcard": f"[배경 카드 {len(order)}장 — 전문. 판정 대상이 아니다]\n",
+                 "noinput": f"[내 카드 {len(order)}장 — 전문. 판정 대상이 아니라 근거다]\n"}[kind]
     if order or kind == "sweep":
         add("frame", card_head)
         add("cards", "".join(render_card(ctx["cards"][a]["card"], a) for a in order) if order
@@ -1716,10 +1835,11 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
         add("frame", "[메커니즘 목록]\n")
         add("mech", _code_list(extra["mechanisms"], "code", kl["mech_max"]))
         add("frame", "\n\n")
-    if kind == "offcard":
+    if kind in ("offcard", "noinput"):
         known = [k for k in extra.get("known") or [] if isinstance(k, dict)]
         if known:
-            add("frame", "[이미 판정한 것 — 되풀이하지 마라]\n")
+            add("frame", "[이미 판정한 것 — 되풀이하지 마라]\n" if kind == "offcard"
+                else "[이미 낸 영향 — 되풀이하지 말고 이것 말고 더 있는 것만 낸다]\n")
             add("known", _cap_lines([f"{_frame_safe(k.get('alias'))} {_frame_safe(k.get('judgement'))} — "
                                      f"«{_unquote_marks(k.get('why'))}»\n" for k in known], kl["known_max"], "건"))
             add("frame", "\n")
@@ -1737,6 +1857,8 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
             + _INSTR_VERDICT_RULES + (_INSTR_VERDICT_MECH if extra.get("mechanisms") else ""))
     elif kind == "sweep":
         add("frame", _INSTR_SWEEP.format() + (_INSTR_SWEEP_MISSING if extra.get("missing") else ""))
+    elif kind == "noinput":
+        add("frame", _INSTR_NOINPUT.format(n=ctx["items_max"]))
     else:
         add("frame", _INSTR_OFFCARD.format(f=ctx["findings_max"]))
     if hint:
@@ -1748,7 +1870,8 @@ def build_prompt(req: dict, lim: dict, hint: str = "") -> tuple[str, str, dict]:
     ctx.update({
         "prompt_chars": total, "sizes": sizes, "soft_over": total > kl["p"],
         "order_effective": not (kind == "verdict" and variant == "rev" and len(order) < 2),
-        "basis": "cards" if (order or ctx["digest"]) else "role_only",     # 카드 0장이면 역할만으로 답했다
+        # 카드 0장이면 역할만으로 답했다. 입력 결손 호출은 늘 noinput 이다(셀을 어떻게 닫는지는 앱이 정한다 — 4.4.2).
+        "basis": "noinput" if kind == "noinput" else "cards" if (order or ctx["digest"]) else "role_only",
         "input_sha": _canon_sha({
             "kind": kind, "variant": variant, "expert": key, "role": role_sha(_str(expert.get("role"))),
             "cards": [[a, _text_sha([{"sid": _str(x.get("sid")), "title": _str(x.get("title")),
@@ -2176,11 +2299,12 @@ def _err(code: str, message: str, **kw) -> dict:
     return {"code": code, "message": message, "infra": infra, "retryable": retryable, **kw}
 
 
-def _cap_findings(rows: list, cap: int) -> tuple[list, int]:
-    """보충으로 합친 뒤 f 줄이 상한을 넘으면 앞의 것(먼저 받은 것)을 남기고 버린 수를 돌려준다(check_rows 와 같은 규칙)."""
+def _cap_findings(rows: list, cap: int, t: str = "f") -> tuple[list, int]:
+    """보충으로 합친 뒤 t 줄(카드 밖 f · 입력 결손 q1)이 상한을 넘으면 앞의 것(먼저 받은 것)을 남기고 버린 수를 돌려준다
+    (check_rows 와 같은 규칙)."""
     keep, out, cut = 0, [], 0
     for r in rows:
-        if r["t"] == "f":
+        if r["t"] == t:
             if keep >= cap:
                 cut += 1
                 continue
@@ -2320,8 +2444,9 @@ async def run(app, prep: dict):
             tally["over_cap"] += chk["stats"]["dropped_over_cap"]
             inj += [x for x in chk["extras"]["inj"] if x not in inj]
             rows = chk["rows"] if n == 1 else merge_rows(kind, rows, chk["rows"], n, stats=tally)
-            if kind == "offcard":
-                rows, cut = _cap_findings(rows, ctx["findings_max"])
+            if kind in ("offcard", "noinput"):
+                rows, cut = _cap_findings(rows, ctx["findings_max"] if kind == "offcard" else ctx["items_max"],
+                                          "f" if kind == "offcard" else "q1")
                 tally["over_cap"] += cut
             settled = settle(kind, rows, ctx)
             if n == 1 and meta.get("finish_reason") == "length" and not rows:

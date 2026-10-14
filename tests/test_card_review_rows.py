@@ -602,3 +602,105 @@ def test_카드_장수는_이_박스의_K_를_넘지_못한다():
     with pytest.raises(cr.RequestError) as e:
         cr.build_ctx(_req(variant="solo", cards=cards[:2]), LIM)
     assert e.value.code == "deck_too_large"
+
+
+# ── M3 E3-2 — 입력 결손 두 질문(noinput) ───────────────────────────────────────
+def _ni_ctx(**kw):
+    pack = _pack()
+    cards = [c for c in pack][:6]
+    req = _req("noinput", variant=None, cards=cards,
+               extra={"mechanisms": [{"code": "pcb.board_flex", "label": "보드 휨"}]}, **kw)
+    return cr.build_ctx(req, LIM)
+
+
+def _q1(ctx, alias="", **over):
+    row = {"t": "q1", "impact": "yes", "title": "보드 고정점 간극 축소", "mech": "pcb.board_flex", "mech_free": "",
+           "path": "보스 → 보드", "l": ["L01"], "k": alias,
+           "cq": ctx["cards"][alias]["text"][:30] if alias in ctx["cards"] else "", "sev": "중대",
+           "why": "PSA 폭이 0.9 mm 로 줄었다"}
+    row.update(over)
+    return row
+
+
+_Q2 = {"t": "q2", "item": "보드 고정점 주변 부품 배치", "needs": "ECAD 배치", "k": "", "l": ["L01"], "why": "간극을 본다"}
+_MORE = {"t": "more", "more": "no"}
+
+
+def test_입력_결손_정답은_보충_없이_통과하고_카드를_되돌린다():
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    rows = cr.parse_rows(_jl([_q1(ctx, k), _q1(ctx, title="카드 없이 본 영향", cq=""), _Q2, _MORE]), "noinput")[0]
+    res = cr.check_rows("noinput", None, rows, ctx)
+    assert not res["repair"] and res["missing"] == [] and res["expected"] == 3 and res["maybe_more"] is False
+    q1 = [r for r in res["rows"] if r["t"] == "q1"]
+    assert [r["checks"]["quote"] for r in q1] == ["ok", "ok"] and q1[0]["record_id"] == ctx["cards"][k]["record_id"]
+    assert q1[0]["refs"] == ["c:ab12cd34ef56"] and all(r["checks"]["mech"] == "ok" for r in q1)
+    assert res["ok"] == 2 and res["flagged"] == 0
+
+
+def test_입력_결손_꼭_있어야_할_줄이_빠지면_그것만_보충한다():
+    ctx = _ni_ctx()
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx)]), "noinput")[0], ctx)
+    assert res["missing"] == ["q2", "more"] and res["repair"] and res["maybe_more"] is None
+    hint = cr.repair_hint(res["problems"], 2, 3)
+    assert "q2 줄(질문 2" in hint and "more 줄(더 있나)" in hint and "q1 줄" not in hint
+
+
+def test_입력_결손_인용은_카드를_댄_영향_줄만_보충_사유다():
+    ctx = _ni_ctx()
+    k1, k2 = ctx["card_order"][:2]
+    bad = "카드에 없는 문장을 열다섯 자 넘게 지어냈다고 본다"
+    rows = [_q1(ctx, k1, cq=bad), _q1(ctx, k2, impact="no", cq=bad, title="영향 없음", mech=""), _Q2, _MORE]
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl(rows), "noinput")[0], ctx)
+    assert res["problems"] == [(k1, "quote", "not_found")], "impact=no 줄의 인용은 표지만이다"
+    by = {r["title"]: r for r in res["rows"] if r["t"] == "q1"}
+    assert by["영향 없음"]["checks"]["quote"] == "not_found" and res["flagged"] == 2
+
+
+def test_입력_결손_표지들():
+    ctx = _ni_ctx()
+    dg = next(iter(ctx["digest"]))
+    rows = [_q1(ctx, l=[]),                                         # impact=yes 인데 줄이 없다 — refs=missing(표지만)
+            _q1(ctx, dg, title="제목만 실린 카드"),                  # quote=digest_only
+            _q1(ctx, "K99", title="지어낸 카드"),                   # k 를 지우고 coerced
+            _q1(ctx, title="카드 없이 인용만", cq="어딘가의 문장"),  # unexpected
+            _q1(ctx, title="목록 밖", mech="rf.antenna_detune"),     # free + mech_free
+            _q1(ctx, title="빈 메커니즘", mech=""),                  # missing(보충 없음)
+            {"t": "q2", "item": "", "why": ""},                    # 빈 항목인데 까닭이 없다 — why=short
+            _MORE]
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl(rows), "noinput")[0], ctx)
+    q = {r["title"]: r for r in res["rows"] if r["t"] == "q1"}
+    assert q["보드 고정점 간극 축소"]["checks"]["refs"] == "missing"
+    assert q["제목만 실린 카드"]["checks"]["quote"] == "digest_only" and q["제목만 실린 카드"]["record_id"]
+    assert q["지어낸 카드"]["k"] == "" and "k:K99" in q["지어낸 카드"]["checks"]["coerced"]
+    assert q["카드 없이 인용만"]["checks"]["quote"] == "unexpected"
+    assert (q["목록 밖"]["mech"], q["목록 밖"]["mech_free"]) == ("free", "rf.antenna_detune")
+    assert q["빈 메커니즘"]["checks"]["mech"] == "missing"
+    q2 = next(r for r in res["rows"] if r["t"] == "q2")
+    assert q2["checks"]["why"] == "short"
+    assert not res["repair"], "어느 것도 보충 사유가 아니다(전문이 실린 카드의 인용만 보충한다)"
+
+
+def test_입력_결손_상한을_넘는_영향은_앞의_것을_남기고_더_있을_수_있다():
+    ctx = _ni_ctx()
+    n = ctx["items_max"]
+    rows = [_q1(ctx, title=f"영향 {i}") for i in range(n + 3)] + [_Q2, _MORE]
+    res = cr.check_rows("noinput", None, cr.parse_rows(_jl(rows), "noinput")[0], ctx)
+    q1 = [r["title"] for r in res["rows"] if r["t"] == "q1"]
+    assert q1 == [f"영향 {i}" for i in range(n)] and res["stats"]["dropped_over_cap"] == 3
+    assert res["maybe_more"] is True, "상한까지 냈다 — 앱이 known 을 실어 더 묻는다"
+    more = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx), _Q2, {"t": "more", "more": "yes"}]),
+                                                         "noinput")[0], ctx)
+    assert more["maybe_more"] is True
+
+
+def test_입력_결손_보충은_고친_영향_줄이_앞_줄을_갈아_낀다():
+    ctx = _ni_ctx()
+    k = ctx["card_order"][0]
+    first = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx, k, cq="지어낸 인용 문장을 열다섯 자 넘게 적었다"),
+                                                             _Q2]), "noinput")[0], ctx)
+    fixed = cr.check_rows("noinput", None, cr.parse_rows(_jl([_q1(ctx, k), _MORE]), "noinput")[0], ctx, attempt=2)
+    merged = cr.merge_rows("noinput", first["rows"], fixed["rows"], 2)
+    q1 = [r for r in merged if r["t"] == "q1"]
+    assert len(q1) == 1 and q1[0]["checks"]["quote"] == "ok" and q1[0]["from_attempt"] == 2
+    assert not cr.settle("noinput", merged, ctx)["repair"]

@@ -506,6 +506,53 @@ def test_메커니즘_세_갈래는_보충_없이_한_번에_끝난다():
                        ("FAIL", "", "", "missing")] and got[3][3] == "ok"
 
 
+def _noinput(pack=PACK, unit=None, extra=None):
+    return cr.prepare(_req("noinput", pack, _digest(pack), unit=unit or _unit(0),
+                           extra=extra or {"mechanisms": [{"code": "pcb.board_flex", "label": "보드 휨"}]}), LIM)
+
+
+def test_입력_결손_정답은_한_번에_끝나고_결과_판과_basis_가_noinput_이다():
+    fr, llm, _ = _go(_noinput(), ["oracle"])
+    assert _names(fr) == ["status", "result", "done"]
+    res = _last(fr)[1]
+    q1 = [r for r in res["rows"] if r["t"] == "q1"]
+    q2 = [r for r in res["rows"] if r["t"] == "q2"]
+    assert [r["impact"] for r in q1] == ["yes", "yes"] and len(q2) == 2 and res["rows"][-1] == {
+        **res["rows"][-1], "t": "more", "more": "no"}
+    assert res["meta"]["basis"] == "noinput" and res["meta"]["prompt_rev"] == "cr-noinput-1"
+    assert res["quality"]["maybe_more"] is False and res["quality"]["expected"] == 3 and res["missing"] == []
+    assert all(r["mech"] == "pcb.board_flex" and r["checks"]["quote"] == "ok" for r in q1)
+
+
+def test_입력_결손_보충은_빠진_more_와_틀린_인용만_다시_묻는다():
+    """계약 예제 result_noinput_repaired 의 장면 — 첫 답에 more 줄이 없고 인용 하나가 원문에 없다 → 둘째 프롬프트의 지적
+    블록에 그 둘만 있고 attempts 2."""
+    fr, llm, _ = _go(_noinput(), ["noinput_flawed", "oracle"])
+    res = _last(fr)[1]
+    assert res["quality"]["attempts"] == 2 and res["missing"] == []
+    hint = llm.calls[1]["human"].split("(보충 2/3")[1]
+    assert "more 줄(더 있나)" in hint and "K01" in hint and "q2 줄" not in hint and "K02" not in hint
+    q1 = [r for r in res["rows"] if r["t"] == "q1"]
+    assert len(q1) == 2 and all(r["checks"]["quote"] == "ok" for r in q1) and FAKE_QUOTE not in json.dumps(q1,
+                                                                                                         ensure_ascii=False)
+
+
+def test_입력_결손_영향이_상한이면_앞의_것을_남기고_더_있을_수_있다():
+    """계약 예제 result_noinput_capped 의 장면."""
+    fr, _llm, _ = _go(_noinput(), ["noinput_many"])
+    res = _last(fr)[1]
+    n = LIM["noinput"]["items_max"]
+    assert sum(1 for r in res["rows"] if r["t"] == "q1") == n
+    assert res["quality"]["dropped_over_cap"] == 2 and res["quality"]["maybe_more"] is True
+
+
+def test_카드_0장_전문가의_입력_결손은_역할만으로_unknown_을_낸다():
+    prep = cr.prepare(_req("noinput", [], [], unit=_unit(0), extra={"mechanisms": [{"code": "pcb.board_flex"}]}), LIM)
+    fr, _llm, _ = _go(prep, ["oracle"])
+    res = _last(fr)[1]
+    assert [r["impact"] for r in res["rows"] if r["t"] == "q1"] == ["unknown"] and res["meta"]["basis"] == "noinput"
+
+
 def test_offcard_결과():
     fr, _llm, _ = _go(_offcard(), ["oracle"])
     res = _last(fr)[1]
