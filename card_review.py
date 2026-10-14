@@ -2345,6 +2345,13 @@ async def make_pack(app, agent_key: str, *, groups, user_email: str, user_pat: s
     관문 자리는 PACK_WAIT_S 까지만 기다리고, 넘으면 429 review_busy{retry_after_s}(기다림 부류)다 — 기한 없이 기다리면 전문가
     아홉의 팩을 한꺼번에 청할 때 셋째부터의 줄 기다림이 포털 단발 한도에 들었다(RB-8). 취소되면(호출자가 떠남) 자리를 놓고
     도는 조회를 접는다(build_pack 이 남은 조회를 취소한다)."""
+    drain = getattr(gate_of(app), "drain", None)
+    if drain is not None and drain.active_scope() == "all":
+        # update-all 의 비우기(scope all) — 새 팩도 받지 않는다(카드 대조 관문과 같은 어휘 — 기다림 부류, 아무것도 세지 않는다).
+        from review_gate import DRAIN_RETRY_AFTER_S  # noqa: PLC0415
+        raise PackError("review_busy", 429, f"리스크 검토 비우기 중이다(update-all) — {DRAIN_RETRY_AFTER_S}초 뒤 같은 호출을 "
+                        "다시 낸다(아무것도 세지 않는다)", reason="draining", retry_after_s=DRAIN_RETRY_AFTER_S,
+                        limit=0, infra=True, retryable=True)
     sem = pack_gate(app)
     try:
         await asyncio.wait_for(sem.acquire(), PACK_WAIT_S)
@@ -2539,16 +2546,23 @@ def _parse_retries(env=os.environ) -> int:
 
 
 def gate_of(app):
-    """이 앱의 관문 — 기동 때 만들고(app.lifespan), 없으면 처음 쓸 때 만든다(수만 세므로 이벤트 루프에 묶이지 않는다)."""
+    """이 앱의 관문 — 기동 때 만들고(app.lifespan), 없으면 처음 쓸 때 만든다(수만 세므로 이벤트 루프에 묶이지 않는다).
+    절반 판정은 사람이 띄운 심의(app._delib_human — started_by ≠ app)만 본다(M3.md #26). 비우기 깃발(DrainState)을 함께
+    만든다 — until_idle 의 '심의가 0' 은 전부 센 심의(app._delib_load)로 본다(재기동 미룸과 같은 셈)."""
     gate = getattr(app.state, "review_gate", None)
     if gate is None:
         import review_gate  # noqa: PLC0415
 
-        def delib_running() -> int:
-            from app import _delib_load  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
-            return _delib_load()[0]
+        def delib_human() -> int:
+            from app import _delib_human  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+            return _delib_human()
 
-        gate = review_gate.from_env(delib_running)
+        def delib_load():
+            from app import _delib_load  # noqa: PLC0415
+            return _delib_load()
+
+        drain = review_gate.DrainState(review_gate.drain_state_path(), delib_load=delib_load)
+        gate = review_gate.from_env(delib_human, drain=drain)
         app.state.review_gate = gate
     return gate
 
@@ -2698,8 +2712,9 @@ async def run(app, prep: dict):
            f"{kind}/{variant or '-'} {ctx['expert'].get('key', '')} {ctx['unit_id'] or '-'}")
     got = gate.try_acquire(tag)
     if isinstance(got, Busy):
-        yield _sse("error", _err("review_busy", f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason}). "
-                                 f"{got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
+        why = ("리스크 검토 비우기 중이다(update-all) — 새 호출을 받지 않는다" if got.reason == "draining"
+               else f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason})")
+        yield _sse("error", _err("review_busy", f"{why}. {got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
                                  knob="CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB",
                                  reason=got.reason, retry_after_s=got.retry_after_s, limit=got.limit, active=got.active))
         yield _sse("done", {})

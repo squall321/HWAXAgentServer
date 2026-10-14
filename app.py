@@ -79,6 +79,7 @@ from deliberation import (
     _llm_limit,
     _quiet_calls,
     _resolve_opts,
+    _started_by,
     _tools_by_name,
     is_deliberation,
     is_operator,
@@ -553,6 +554,8 @@ def _sse(event: str, data: dict) -> bytes:
 # 죽였다(취소 스택만 남고 GPU 시간 전소). 심의 본체를 백그라운드 태스크로 옮기고
 # SSE 는 큐 구독만 한다 — 구독이 끊겨도 태스크는 계속 돌아 저장까지 완주한다.
 _DETACHED_TASKS: set = set()   # 태스크 GC 방지 — 참조가 사라지면 asyncio 가 조용히 버린다
+# 분리 태스크마다 누가 띄웠나(human | app — delib_opts.started_by, M3.md #26). 카드 대조 관문의 절반 판정만 읽는다.
+_DETACHED_BY: dict = {}
 # 심의 SSE heartbeat 간격(초), 0=끔. 이벤트가 없는 동안에도 이 간격으로 `event: ping` 을 흘린다.
 # 심의는 LLM 호출 한 번(의장 결정문·좌석 발언·요약)이 도는 동안 스트림에 바이트가 0 이다 — 그 침묵이
 # 바깥의 침묵 한도(포털 릴레이·nginx /agent/·리스크 앱 읽기 한도·사내 프록시)를 넘기면 **살아 있는**
@@ -564,7 +567,7 @@ _DETACHED_TASKS: set = set()   # 태스크 GC 방지 — 참조가 사라지면 
 DELIB_HEARTBEAT_S = _env_float("DELIB_HEARTBEAT_S", 15.0)
 
 
-def _detach_stream(gen, label: str):
+def _detach_stream(gen, label: str, started_by: str = "human"):
     q: asyncio.Queue = asyncio.Queue()   # 무제한 — 소비자가 없어도 생산이 막히지 않는다
 
     async def _drive():
@@ -579,7 +582,9 @@ def _detach_stream(gen, label: str):
 
     task = asyncio.create_task(_drive(), name=f"delib-{label}")
     _DETACHED_TASKS.add(task)
+    _DETACHED_BY[task] = started_by
     task.add_done_callback(_DETACHED_TASKS.discard)
+    task.add_done_callback(lambda t: _DETACHED_BY.pop(t, None))
 
     async def _subscribe():
         # ⚠ q.get() 을 wait_for 로 감싸지 않는다. wait_for 는 만료 때마다 안쪽 get 을 **취소**하고, 취소와
@@ -3714,24 +3719,26 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if denied:
         # 메뉴를 숨겨도 슬래시 명령은 손으로 칠 수 있다 — 트리거를 아는 이쪽이 마지막으로 막는다.
         return StreamingResponse(_deny_stream(denied), media_type="text/event-stream", headers=SSE_HEADERS)
+    # 누가 띄운 심의인가 — 리스크 앱 러너의 패널은 app(카드 대조 관문의 절반 판정에 세지 않는다 — M3.md #26).
+    started_by = _started_by(req.delib_opts.get("started_by") if isinstance(req.delib_opts, dict) else None)
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         stream = _detach_stream(run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups,
                                                      req.delib_opts, req.user_email, req.user_pat,
-                                                     req.history), "sim")
+                                                     req.history), "sim", started_by)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
         stream = _detach_stream(run_test_plan(app, strip_test_plan_trigger(req.message), req.groups,
                                               req.delib_opts, req.user_email, req.user_pat,
-                                              req.history), "test-plan")
+                                              req.history), "test-plan", started_by)
     elif is_deliberation(req.message):
         # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
         # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
         # (종전엔 빈 문자열로 그대로 심의가 돌았다 — 가드가 없었다).
         # 그때만 대화에서 뽑고, **무엇을 화두로 삼았는지 화면에 밝힌다.**
-        stream = _detach_stream(_delib_with_topic(req), "delib")
+        stream = _detach_stream(_delib_with_topic(req), "delib", started_by)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
@@ -4640,6 +4647,17 @@ def _delib_load() -> tuple[int, int]:
         return active + delib_jobs.running_count(), len(delib_jobs._PENDING)
     except Exception:  # noqa: BLE001
         return active, 0
+
+
+def _delib_human() -> int:
+    """사람이 띄운 도는 심의 수 — 분리 태스크 가운데 started_by 가 app 이 아닌 것 + MCP 잡 가운데 같은 것(M3.md #26).
+    카드 대조 관문의 절반 판정만 이 수를 본다. delib_active(_delib_load)는 그대로 전부 센다(재기동 미룸 판정)."""
+    n = sum(1 for t in list(_DETACHED_TASKS) if _DETACHED_BY.get(t, "human") != "app")
+    try:
+        import delib_jobs  # noqa: PLC0415 — 심의 MCP 가 비활성이어도 /health 는 답해야 한다
+        return n + delib_jobs.running_human_count()
+    except Exception:  # noqa: BLE001
+        return n
 
 
 def _card_review_health() -> dict:

@@ -284,6 +284,11 @@ def running_count() -> int:
     return sum(1 for j in _JOBS.values() if j.get("status") == "running")
 
 
+def running_human_count() -> int:
+    """도는 잡 가운데 사람이 띄운 것(started_by ≠ app) — 카드 대조 관문의 절반 판정만 이 수를 본다(M3.md #26)."""
+    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and j.get("started_by") != "app")
+
+
 def _owner(job: dict) -> str:
     return str(job.get("user") or "").strip().lower()
 
@@ -584,8 +589,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
                else "줄이 빠진 뒤 다시 하라."))
 
     from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _resolve_opts,  # noqa: PLC0415
-                              _role_req_max, _seal, _seat_key, run_deliberation, run_sim_deliberation,
-                              run_test_plan)
+                              _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
+                              run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
 
@@ -628,6 +633,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "error": None, "warnings": [], "evidence_omitted": [],
         "started_at": None, "updated_at": _now(), "finished_at": None,
         "user": user_email or "",
+        # 누가 띄웠나(M3.md #26) — app 이면 카드 대조 관문의 절반 판정에 세지 않는다(running_human_count).
+        "started_by": _started_by(opts.get("started_by")),
     }
     _JOBS[job_id] = job
     # 누구든 줄 끝에 세운 다음 줄을 한 번 돌린다 — 자리가 있으면 그 자리에서 곧바로 뜬다(종전과 같다).

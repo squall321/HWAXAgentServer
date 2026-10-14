@@ -394,3 +394,26 @@ def test_포털이_덮어쓰는_신원_칸_넷은_세_POST_가_다_받는다(cli
     assert client.post("/card-review/run", json={**_verdict(1), **ident}).status_code == 200
     assert client.post("/card-review/pack", json={"agent_key": "mech-test-seal", **ident}).status_code == 200
     assert client.post("/card-review/plan", json={"cards": [], "units": [], **ident}).status_code == 200
+
+
+def test_비우기_중이면_팩도_429_review_busy_draining_이고_조회하지_않는다(client, monkeypatch, tmp_path):
+    """M3.md 4.5 — 비우기(scope all)면 새 run·pack 이 review_busy{reason:"draining", retry_after_s 60}(기다림)이다. 팩은
+    게이트웨이에 한 건도 묻지 않는다. scope panels 는 막지 않는다."""
+    hub = Hub()
+    loads = []
+
+    async def fake_load(_app, groups, *, user_email, user_pat):
+        loads.append(1)
+        return _tools(hub)
+
+    monkeypatch.setattr(cr, "load_pack_tools", fake_load)
+    monkeypatch.setenv("DRAIN_STATE_PATH", str(tmp_path / "drain.json"))
+    monkeypatch.setattr(a.app.state, "review_gate", None, raising=False)
+    cr.gate_of(a.app).drain.set_on(scope="all", by="update-all", ttl_s=600)
+    body = {"agent_key": "mech-test-seal", "user_pat": "pat"}
+    r = client.post("/card-review/pack", json=body)
+    out = r.json()
+    assert r.status_code == 429 and (out["code"], out["reason"], out["retry_after_s"]) == ("review_busy", "draining", 60)
+    assert loads == [] and (out["infra"], out["retryable"]) == (True, True)
+    cr.gate_of(a.app).drain.set_on(scope="panels", by="update-all", ttl_s=600)
+    assert client.post("/card-review/pack", json=body).status_code == 200 and loads == [1]

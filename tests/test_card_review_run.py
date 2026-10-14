@@ -316,13 +316,43 @@ def test_동시_12건이면_LLM_동시_수는_8_이하이고_나머지는_곧바
     assert app.state.review_gate.active == 0 and app.state.review_gate.totals["busy"] == 4
 
 
-def test_심의가_돌면_동시_수는_4_이하(monkeypatch):
+def test_사람이_띄운_심의가_돌면_동시_수는_4_이하(monkeypatch):
     monkeypatch.setattr(a, "_delib_load", lambda: (1, 0))
+    monkeypatch.setattr(a, "_delib_human", lambda: 1)
     llm = FakeLLM([Act("slow", delay=0.2)])
     outs = _concurrent(_app(llm), 12, _verdict(2))
     assert llm.peak <= 4 and sum(1 for f in outs if _last(f)[0] == "result") == 4
     busy = next(_last(f)[1] for f in outs if _last(f)[1].get("code") == "review_busy")
     assert busy["reason"] == "delib_human" and busy["limit"] == 4
+
+
+def test_리스크_앱이_띄운_패널만_돌면_동시_수는_8_이다(monkeypatch):
+    """#26 — 쟁점 패널(started_by=app)은 delib_active 에는 들지만 관문의 절반 판정에는 들지 않는다."""
+    monkeypatch.setattr(a, "_delib_load", lambda: (2, 0))
+    monkeypatch.setattr(a, "_delib_human", lambda: 0)
+    llm = FakeLLM([Act("slow", delay=0.2)])
+    app = _app(llm)
+    outs = _concurrent(app, 12, _verdict(2))
+    assert sum(1 for f in outs if _last(f)[0] == "result") == 8
+    assert cr.gate_of(app).snapshot()["limit_reason"] == "normal"
+
+
+def test_비우기_중이면_1초_안에_review_busy_draining_이고_LLM_을_부르지_않는다(monkeypatch, tmp_path):
+    monkeypatch.setattr(a, "_delib_load", lambda: (0, 0))
+    monkeypatch.setenv("DRAIN_STATE_PATH", str(tmp_path / "drain.json"))
+    llm = FakeLLM(["oracle"])
+    app = _app(llm)
+    cr.gate_of(app).drain.set_on(scope="all", by="update-all", ttl_s=600)
+    t0 = time.monotonic()
+    fr, _llm, _ = _go(_verdict(2), None, app=app, llm=llm)
+    assert time.monotonic() - t0 < 1.0 and llm.calls == []
+    assert _names(fr) == ["error", "done"]
+    err = fr[0][1]
+    assert (err["code"], err["reason"], err["retry_after_s"], err["limit"], err["infra"]) == (
+        "review_busy", "draining", 60, 0, True) and "비우기" in err["message"]
+    cr.gate_of(app).drain.set_on(scope="panels", by="update-all", ttl_s=600)
+    fr, _llm, _ = _go(_verdict(2), None, app=app, llm=llm)
+    assert _last(fr)[0] == "result", "비우기 panels 는 카드 대조를 막지 않는다"
 
 
 def test_자리가_없으면_1초_안에_error_done_이고_LLM_을_부르지_않는다(monkeypatch):

@@ -1222,6 +1222,13 @@ _ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cros
 _ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
 
 
+def _started_by(v) -> str:
+    """누가 띄운 심의인가(M3.md #26) — 리스크 앱 러너가 delib_opts.started_by 에 'app' 을 싣는다. 그 밖(없음·모르는 값)은
+    사람(human)이다. 카드 대조 관문의 '심의가 돌면 절반' 판정만 이 값을 본다(delib_active·재기동 미룸은 그대로 전부 센다).
+    스스로 밝히는 값이라 검증하지 않는다 — 잘못 달아도 카드 대조 동시 수가 4 대신 8 이 될 뿐이다."""
+    return "app" if str(v or "").strip().lower() == "app" else "human"
+
+
 def _resolve_opts(req_opts):
     """요청 단위 오버라이드 — 웹 토글이 심의마다 손잡이를 바꿀 수 있게(env 는 기본값).
     미지정 키는 env 기본값 유지(하위호환). 값은 화이트리스트 키만 읽고 정수/실수로 강제·클램프
@@ -1310,8 +1317,11 @@ def _resolve_opts(req_opts):
         req_unread={},
         # 호출당 한도(timeout_s)를 받는 범위로 죄었으면 (보낸 값, 걸린 값) — 스트림이 카드로 알린다.
         timeout_clamped=None,
+        # 누가 띄운 심의인가 — human(기본) | app(리스크 앱 러너가 편성한 패널). _started_by 참고.
+        started_by="human",
     )
     if isinstance(req_opts, dict):
+        o.started_by = _started_by(req_opts.get("started_by"))
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
         # 값이 딸려 켜는 것(웹 리서치가 강제하는 인용 계약 등)이 남는다.
         req_opts, o.sealed_reopen = _seal(req_opts)
