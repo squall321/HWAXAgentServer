@@ -366,40 +366,127 @@ def test_깃발_쓰기는_고유한_임시_파일이고_읽고_쓰기는_한_줄
     assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")], "임시 파일이 남았다"
 
 
-def test_다른_주체의_hold_아닌_요청은_주인을_바꾸지_않고_넓히기만_한다(tmp_path):
-    """RB3-12 — 살아 있는 깃발에 다른 by 가 hold 아닌 요청을 내면 주인이 바뀌어, 원래 주인(update-all)이 끄지 못했다."""
+def test_다른_주체의_hold_아닌_요청은_합치지_않고_409_drain_owned_다(tmp_path):
+    """RB3-12 — 살아 있는 깃발에 다른 by 가 hold 아닌 요청을 내면 주인이 바뀌어, 원래 주인(update-all)이 끄지 못했다. RB3B-9 —
+    그래서 수명만 합쳤더니 그 주체(koopark 의 2시간)가 답에 아무 표지 없이 흡수되고, update-all 의 끝맺음(panels)·끄기에 함께
+    지워졌다. 합치지 않고 409 drain_owned 다(본문이 주인·scope·until 을 싣는다). hold 요청은 그대로 받는다(면제)."""
     d, clock, _ = _drain(tmp_path)
-    d.set_on(scope="all", by="update-all", reason="§2", ttl_s=1_800)
-    s = d.set_on(scope="panels", by="deploy-x", reason="다른 일", ttl_s=3_600)
-    assert (s["by"], s["reason"], s["scope"], s["until"]) == ("update-all", "§2", "all", 13_600.0), s
+    d.set_on(scope="panels", by="update-all", reason="§2", ttl_s=1_800)
+    before = json.loads((tmp_path / "drain.json").read_text(encoding="utf-8"))
+    for kw in ({"scope": "all", "ttl_s": 7_200}, {"scope": "panels", "until_idle": {"grace_s": 10, "max_s": 100}}):
+        try:
+            d.set_on(by="human:koopark", reason="내 점검", **kw)
+            got = None
+        except rg.DrainError as exc:
+            got = exc
+        assert got is not None and (got.status, got.code) == (409, "drain_owned"), (kw, got)
+        body = got.body()
+        assert (body["drain"]["by"], body["drain"]["scope"], body["drain"]["until"]) == ("update-all", "panels", 11_800.0)
+        assert "update-all" in body["message"] and "panels" in body["message"]
+    after = json.loads((tmp_path / "drain.json").read_text(encoding="utf-8"))
+    assert after == before, "거절한 요청이 깃발을 고쳤다(수명·scope 를 합쳤다)"
+    d.set_on(scope="panels", by="update-all", ttl_s=60)          # 주인은 늘리고 좁힐 수 있다
+    s = d.set_on(scope="all", by="human:koo", reason="점검", hold=True)
+    assert (s["by"], s["hold"], s["scope"]) == ("human:koo", True, "all"), "hold 요청은 누구의 것이든 받는다"
     with pytest.raises(rg.DrainError):
-        d.set_off(by="deploy-x")
-    d.set_on(scope="panels", by="update-all", ttl_s=60)          # 주인은 좁힐 수 있다(끝맺음 all → panels)
-    assert d.snapshot()["scope"] == "panels"
-    assert d.set_on(scope="all", by="deploy-x", ttl_s=60)["scope"] == "all", "남이 넓히는 것은 받는다"
-    assert d.set_off(by="update-all")["on"] is False
+        d.set_off(by="update-all")
+    assert d.set_off(by="human:koo", force=True)["on"] is False
 
 
-def test_TTL_깃발에도_절대_수명이_있다(tmp_path):
-    """RB3-13 — 벽시계로 도는 TTL 깃발이 늘리기만 하면 영영 선다. 요청 하나는 6시간까지, 처음 TTL 을 세운 때부터 6시간이면
-    늘려도 풀리고, 시계가 뒤로 가 남은 수명이 6시간보다 길어 보이면 믿지 않는다. 사람의 고정은 이 상한을 받지 않는다."""
+def test_TTL_깃발의_상한은_잊힌_깃발에만_걸린다(tmp_path):
+    """RB3-13 — 벽시계로 도는 TTL 깃발이 늘리기만 하면 영영 선다. 요청 하나는 6시간까지(넘으면 422 — 포털이 그 안으로 자른다),
+    시계가 뒤로 가 남은 수명이 6시간보다 길어 보이면 믿지 않는다. 사람의 고정은 이 상한을 받지 않는다.
+    RB3B-6 — 처음 TTL 부터 6시간을 재면 1,500초마다 늘리는 update-all 이 21,600초에 깃발을 잃고 다음 늘림(22,500초)까지 900초
+    동안 카드 대조가 돌았다. 살아 있는 깃발을 주인이 늘리면 창을 새로 연다 — 늘림이 멈추면 마지막 늘림 + ttl 에 풀린다."""
     d, clock, _ = _drain(tmp_path)
     with pytest.raises(rg.DrainError) as e:
         d.set_on(scope="all", by="x", ttl_s=rg.DRAIN_TTL_MAX_S + 1)
     assert e.value.status == 422
-    start = t = clock["t"]
-    while t < start + rg.DRAIN_TTL_MAX_S:                       # 1,700초마다 1,800초로 늘린다(update-all 의 § 머리)
-        clock["t"] = t
+    start = clock["t"]
+    off = []
+    for i in range(24):                                          # 1,500초마다 1,800초로 늘린다(update-all 의 § 머리) — 10시간
+        clock["t"] = start + i * 1_500
         assert d.set_on(scope="all", by="update-all", ttl_s=1_800)["on"] is True
-        t += 1_700
-    clock["t"] = start + rg.DRAIN_TTL_MAX_S
-    assert d.snapshot()["on"] is False, "늘리기만 한 TTL 깃발이 절대 수명을 넘겨 섰다"
+        for dt in (1, 750, 1_499):
+            clock["t"] = start + i * 1_500 + dt
+            if not d.snapshot()["on"]:
+                off.append(clock["t"] - start)
+    assert off == [], f"늘리는 동안 깃발이 풀렸다 — {off[:3]}"
+    last = start + 23 * 1_500
+    clock["t"] = last + 1_799
+    assert d.snapshot()["on"] is True
+    clock["t"] = last + 1_800
+    assert d.snapshot()["on"] is False, "늘림이 멈춘 깃발이 마지막 늘림 + ttl 뒤에도 섰다"
     d.set_on(scope="all", by="update-all", ttl_s=600)
     clock["t"] -= 86_400                                       # 시계가 하루 뒤로 — 남은 수명 24시간+ 은 믿지 않는다
     assert d.snapshot()["on"] is False
     d.set_on(scope="all", by="human:koo", hold=True, ttl_s=rg.DRAIN_TTL_MAX_S * 4)
     clock["t"] += rg.DRAIN_TTL_MAX_S * 2
     assert d.snapshot()["on"] is True, "사람의 고정은 TTL 상한을 받지 않는다"
+
+
+def test_끝난_TTL_을_다시_세우면_새_TTL_이다(tmp_path):
+    """RB3B-5 — update-all N 이 until_idle 로 끝나 심의가 7시간 돌면 TTL 몫은 죽은 채 ttl_since 만 남는다. N+1 의 TTL 1,800 은
+    그 ttl_since 를 이어 받자마자 죽었다(until_idle 의 grace 가 끝나는 +1,080초에 풀렸다). 끝난 TTL 은 새 TTL 이다."""
+    d, clock, load = _drain(tmp_path, delib=(1, 0))
+    d.set_on(scope="all", by="update-all", ttl_s=1_800)
+    d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 1_800, "max_s": 46_800})
+    clock["t"] += 7 * 3_600 - 720
+    load["v"] = (0, 0)
+    assert d.snapshot()["until_idle"]["idle_since"] == clock["t"]
+    clock["t"] += 720
+    t1 = clock["t"]
+    s = d.set_on(scope="all", by="update-all", ttl_s=1_800)
+    assert s["until"] == t1 + 1_800
+    for dt in (600, 1_080, 1_799):
+        clock["t"] = t1 + dt
+        assert d.snapshot()["on"] is True, f"새 TTL 이 +{dt}초에 죽었다"
+    clock["t"] = t1 + 1_800
+    assert d.snapshot()["on"] is False
+
+
+def test_읽는_길의_쓰기_실패는_살아_있는_깃발을_지우거나_끄지_않는다(tmp_path, monkeypatch, capsys):
+    """RB3B-7 — until_idle 의 idle_since 를 쓰다 디스크가 차면(ENOSPC) 판정 실패로 받아 깃발 파일을 지웠고, 디렉터리가 555 면
+    파일은 남은 채 읽을 때마다 꺼짐이었다(앱이 grace 동안 패널을 집었다). 못 써도 깃발은 그대로 산다(한 줄만 남긴다)."""
+    import errno
+
+    d, clock, load = _drain(tmp_path, delib=(1, 0))
+    d.set_on(scope="panels", by="update-all", until_idle={"grace_s": 1_800, "max_s": 46_800})
+    load["v"] = (0, 0)
+
+    def enospc(_st):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with monkeypatch.context() as m:
+        m.setattr(d, "_write", enospc)
+        for _ in range(3):
+            try:
+                snap = d.snapshot()
+            except Exception as exc:  # noqa: BLE001 — 쓰기 실패가 판정 밖으로 샜다
+                snap = {"on": exc}
+            assert snap["on"] is True, snap
+    assert (tmp_path / "drain.json").exists(), "쓰기 실패로 살아 있는 깃발 파일을 지웠다"
+    assert capsys.readouterr().out.count("idle_since 를 쓰지 못했다") == 1
+    assert d.snapshot()["until_idle"]["idle_since"] == clock["t"], "쓰기가 돌아오면 grace 시계를 적는다"
+
+
+def test_끄기에서_파일을_못_지우면_내렸다고_하지_않는다(tmp_path, monkeypatch):
+    """RB3B-8 — 디렉터리 권한으로 파일을 못 지워도 끄기가 꺼짐을 돌려줘 POST /drain {on:false} 가 200 이었다(/health 는 여전히
+    비우기). 못 지우면 OSError 가 올라가 라우트가 503 drain_unavailable 로 답한다."""
+    d, _clock, _ = _drain(tmp_path)
+    d.set_on(scope="all", by="update-all", ttl_s=1_800)
+
+    def deny(_path):
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr(rg.os, "remove", deny)
+        try:
+            got = d.set_off(by="update-all")
+        except OSError as exc:
+            got = exc
+    assert isinstance(got, OSError), f"못 지운 깃발을 내렸다고 답했다 — {got}"
+    assert d.snapshot()["on"] is True and d.set_off(by="update-all")["on"] is False
 
 
 def test_by_는_120자에서_끊는다(tmp_path):

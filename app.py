@@ -4786,9 +4786,9 @@ async def post_drain(request: Request):
     except DrainError as exc:
         print(f"[drain] 거절 {exc.status} {exc.code} — {exc.message}"[:300])
         return JSONResponse(exc.body(), status_code=exc.status)
-    except OSError as exc:                  # 깃발 파일을 못 쓴다(권한·디스크) — 500 이 아니라 사유를 싣는다
-        print(f"[drain] 깃발 파일을 쓰지 못했다 — {type(exc).__name__}: {exc}"[:300])
-        return JSONResponse({"code": "drain_unavailable", "message": f"비우기 깃발 파일을 쓰지 못했다 — "
+    except OSError as exc:                  # 깃발 파일을 못 쓰거나 못 지운다(권한·디스크) — 500·거짓 200 이 아니라 사유를 싣는다
+        print(f"[drain] 깃발 파일을 쓰거나 지우지 못했다 — {type(exc).__name__}: {exc}"[:300])
+        return JSONResponse({"code": "drain_unavailable", "message": f"비우기 깃발 파일을 쓰거나 지우지 못했다 — "
                              f"{type(exc).__name__}(DRAIN_STATE_PATH 의 권한·디스크를 본다)"}, status_code=503)
     return _drain_view(gate)
 

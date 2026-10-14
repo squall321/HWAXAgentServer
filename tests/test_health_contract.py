@@ -156,6 +156,25 @@ def test_drain_거절은_호출자_값을_80자_안으로_되비추고_쓰기_�
         r and (r.status_code, r.text[:200]))
 
 
+def test_남의_깃발에_낸_요청은_409_drain_owned_이고_못_지운_끄기는_503_이다(client, monkeypatch):
+    """RB3B-9 — 주인 아닌 by 의 hold 아닌 요청은 합치지 않고 409(update-all 은 409 를 무엇이든 '남의 것' 으로 읽는다). RB3B-8 —
+    깃발 파일을 못 지운 끄기가 200 이었다."""
+    client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 7_200, "by": "human:koopark", "reason": "점검"})
+    r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 1_800, "by": "update-all", "reason": "1h"})
+    assert (r.status_code, r.json()["code"], r.json()["drain"]["by"]) == (409, "drain_owned", "human:koopark"), r.text
+    assert client.get("/drain").json()["reason"] == "점검"
+
+    def deny(_path):
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr("os.remove", deny)
+        r = client.post("/drain", json={"on": False, "by": "human:koopark"})
+    assert (r.status_code, r.json().get("code")) == (503, "drain_unavailable"), (r.status_code, r.text[:200])
+    assert client.get("/health").json()["drain"]["on"] is True
+    assert client.post("/drain", json={"on": False, "by": "human:koopark"}).json()["on"] is False
+
+
 def test_사람의_고정은_update_all_이_풀지_못한다(client):
     client.post("/drain", json={"on": True, "scope": "all", "hold": True, "by": "human:koo", "reason": "점검"})
     r = client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 1800, "by": "update-all"})

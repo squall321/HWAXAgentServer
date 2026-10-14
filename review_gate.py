@@ -191,7 +191,7 @@ def drain_state_path(env=os.environ) -> str:
 
 
 class DrainError(ValueError):
-    """비우기 요청이 계약에 안 맞거나(422 bad_request) 사람의 고정·다른 주체의 깃발에 막혔다(409 drain_held)."""
+    """비우기 요청이 계약에 안 맞거나(422 bad_request) 사람의 고정·다른 주체의 깃발에 막혔다(409 drain_held·drain_owned)."""
 
     def __init__(self, code: str, message: str, status: int, snapshot: dict | None = None):
         super().__init__(message)
@@ -206,9 +206,11 @@ class DrainError(ValueError):
 
 OFF = {"on": False, "scope": None, "until": None, "until_idle": None, "hold": False, "by": None, "reason": None,
        "set_at": None}
-# TTL 깃발의 절대 수명(초) — until_idle 의 max_s 처럼 TTL 에도 끝을 둔다(벽시계로 도는 깃발이 늘리기만 하다 영영 서 있지
-# 않게). 요청 하나의 ttl_s 도 이것을 넘지 못하고(422), 처음 TTL 을 세운 때(ttl_since)부터 이만큼 지나면 늘려도 풀린다. 시계가
-# 뒤로 가 남은 수명이 이보다 길어 보이면 그 수명을 믿지 않는다(풀린다). 사람의 고정(hold)은 이 상한을 받지 않는다.
+# TTL 깃발의 상한(초) — until_idle 의 max_s 처럼 TTL 에도 끝을 둔다(잊힌 깃발이 영영 서 있지 않게). 요청 하나의 ttl_s 는
+# 이것을 넘지 못하고(422 — 포털이 그 안으로 자른다), 마지막으로 TTL 을 세우거나 늘린 때(ttl_since)부터 이만큼 지나면 풀린다.
+# 살아 있는 깃발을 주인이 늘리면 창을 새로 연다 — 계속 늘리는 update-all 은 잊힌 것이 아니다(RB3B-6 — 처음 TTL 부터 재면
+# 6시간째에 도는 update-all 한가운데서 깃발이 풀렸다). 끝난 TTL 을 다시 세우는 요청은 새 TTL 이다(RB3B-5). 시계가 뒤로 가 남은
+# 수명이 이보다 길어 보이면 그 수명을 믿지 않는다(풀린다). 사람의 고정(hold)은 이 상한을 받지 않는다.
 DRAIN_TTL_MAX_S = 6 * 3600
 DRAIN_BY_MAX = 120                # by(세운 주체)의 글자 상한 — /health·/drain 이 되비추는 값이다
 DRAIN_REASON_MAX = 300
@@ -250,20 +252,33 @@ def _check_file(st) -> None:
             raise ValueError("until_idle.idle_since 가 유한한 수가 아니다")
 
 
+def _ttl_alive(st: dict, now: float) -> bool:
+    """깃발의 TTL 몫이 살아 있나 — until 전이고, 남은 수명이 상한 안이고(시계가 뒤로 가면 믿지 않는다), TTL 을 마지막으로
+    세우거나 늘린 때(ttl_since)부터 상한 안이다. 사람의 고정은 until 만 본다. until 이 없으면 TTL 몫이 없다."""
+    if st.get("until") is None:
+        return False
+    until = float(st["until"])
+    since = float(st.get("ttl_since") or st.get("set_at") or now)
+    return (now < until and until - now <= DRAIN_TTL_MAX_S and now < since + DRAIN_TTL_MAX_S) or bool(
+        st.get("hold") and now < until)
+
+
 class DrainState:
     """비우기 깃발 하나(파일). 규칙(M3.md 4.7 · engine-ops 계약 9).
 
     - 수명은 늘리기만 한다 — ttl 은 until = max(지금 until, now + ttl). until_idle 은 심의 합(delib_load)이 처음 0 이 된 때
       (idle_since)부터 grace_s 뒤에 풀리고, 그 전에 심의가 다시 서면 idle_since 를 지운다. until_idle 은 어떤 경우에도 세운 때
       + max_s 를 넘기지 않는다. 둘이 다 있으면 둘 다 끝나야 풀린다(나중 요청이 앞 수명을 줄이지 않는다).
-    - TTL 에도 절대 상한이 있다(DRAIN_TTL_MAX_S — 요청 하나의 ttl_s 상한이자 처음 TTL 을 세운 때부터의 수명). 사람의 고정은 빼고.
-    - 주인(by)은 바뀌지 않는다 — 살아 있는 깃발에 다른 주체가 hold 아닌 요청을 내면 수명을 늘리고 scope 를 넓히기만(panels →
-      all) 하며 by·reason 은 그대로다. scope 를 좁히는 것(update-all 끝맺음의 all → panels)은 주인만 한다.
-    - hold 깃발은 hold 아닌 요청으로 바뀌지 않는다(409 drain_held). 끄기는 세운 주체(by)와 같아야 하고, 다르거나 hold 면
-      force 가 있어야 한다. 수명 없는 깃발은 hold 만 받는다(사람이 풀 때까지) — 수명 없이 hold 를 세우면 앞 깃발의 수명을
-      물려받지 않는다(그 수명에 풀리면 사람의 고정이 아니다).
+    - TTL 에도 상한이 있다(DRAIN_TTL_MAX_S — 요청 하나의 ttl_s 상한이자 TTL 을 마지막으로 세우거나 늘린 때부터의 수명). 살아
+      있는 깃발을 주인이 늘리면 6시간 창을 새로 열고, 끝난 TTL 을 다시 세우면 새 TTL 이다. 사람의 고정은 빼고.
+    - 주인(by)은 바뀌지 않는다 — 살아 있는 깃발에 다른 주체가 hold 아닌 요청을 내면 합치지 않고 409 drain_owned 다(합치면 그
+      주체의 수명이 주인의 끄기에 함께 지워졌다 — RB3B-9). 그 요청이 넓히려던 scope 도 바꾸지 않는다.
+    - hold 깃발은 hold 아닌 요청으로 바뀌지 않는다(409 drain_held). hold 요청은 누구의 것이든 받고 주인이 된다. 끄기는 세운
+      주체(by)와 같아야 하고, 다르거나 hold 면 force 가 있어야 한다. 수명 없는 깃발은 hold 만 받는다(사람이 풀 때까지) — 수명
+      없이 hold 를 세우면 앞 깃발의 수명을 물려받지 않는다(그 수명에 풀리면 사람의 고정이 아니다).
     - 판정은 읽을 때 한다. 칸 하나라도 깨진 파일은 '꺼짐' 으로 읽고 지우며 한 줄 남긴다(같은 사유는 _LOG_EVERY_S 마다 한
-      번). 쓰기는 원자적이다(같은 디렉터리의 고유한 임시 파일 → os.replace)이고 읽고-고치고-쓰기는 경로마다 잠금 하나다.
+      번). 읽는 길에서 idle_since 를 못 쓰면(디스크·권한) 깃발은 그대로 산다. 쓰기는 원자적이다(같은 디렉터리의 고유한 임시
+      파일 → os.replace)이고 읽고-고치고-쓰기는 경로마다 잠금 하나다. 끄기에서 파일을 못 지우면 OSError 가 그대로 오른다(503).
     clock 은 epoch 초(time.time), delib_load() 는 (도는, 줄 선) 심의 수다(시험이 둘 다 주입한다)."""
 
     def __init__(self, path: str, *, clock=time.time, delib_load=None):
@@ -315,13 +330,27 @@ class DrainState:
                 pass
             raise
 
-    def _remove(self) -> None:
+    def _remove(self, *, strict: bool = False) -> None:
+        """파일을 지운다 — 못 지우면 한 줄 남기고, strict(끄기)면 OSError 를 그대로 올린다(내리지 못한 깃발을 내렸다고 200 으로
+        답하지 않는다 — RB3B-8). 읽는 길(수명이 끝났다·깨졌다)은 strict 가 아니다 — 다음 읽기도 꺼짐으로 읽는다."""
         try:
             os.remove(self.path)
         except FileNotFoundError:
             pass
         except OSError as exc:
             self._say(f"rm:{type(exc).__name__}", f"[drain] 깃발 파일을 지우지 못했다({type(exc).__name__}): {self.path}")
+            if strict:
+                raise
+
+    def _keep(self, st: dict) -> None:
+        """읽는 길에서 고친 until_idle.idle_since 를 파일에 적는다. 못 쓰면(디스크 가득·권한) 한 줄 남기고 깃발은 그대로 산다 —
+        쓰기 실패를 판정 실패로 받아 살아 있는 깃발을 지우거나 꺼짐으로 읽던 것(RB3B-7, 앱이 grace 동안 패널을 집었다). 못 쓰는
+        동안은 grace 시계가 파일에 서지 않아 깃발이 max_s 까지 갈 수 있다(비우는 쪽으로 틀린다)."""
+        try:
+            self._write(st)
+        except OSError as exc:
+            self._say(f"keep:{type(exc).__name__}", f"[drain] 깃발의 idle_since 를 쓰지 못했다({type(exc).__name__}) — "
+                                                    f"깃발은 그대로 산다: {self.path}")
 
     def _delib_sum(self) -> int | None:
         if self.delib_load is None:
@@ -338,11 +367,8 @@ class DrainState:
         alive, any_life = False, False
         if st.get("until") is not None:
             any_life = True
-            until = float(st["until"])
-            since = float(st.get("ttl_since") or st.get("set_at") or now)
-            # 남은 수명이 상한보다 길어 보이면(시계가 뒤로 갔다) 믿지 않는다. 처음 TTL 을 세운 때부터 상한이 지나도 풀린다.
-            alive = (now < until and until - now <= DRAIN_TTL_MAX_S and now < since + DRAIN_TTL_MAX_S) or bool(
-                st.get("hold") and now < until)
+            # 남은 수명이 상한보다 길어 보이면(시계가 뒤로 갔다) 믿지 않는다. TTL 을 마지막으로 늘린 때부터 상한이 지나도 풀린다.
+            alive = _ttl_alive(st, now)
         ui = st.get("until_idle")
         if ui is not None:
             any_life = True
@@ -352,12 +378,12 @@ class DrainState:
                 if n is None or n > 0:
                     if ui.get("idle_since") is not None:
                         ui["idle_since"] = None
-                        self._write(st)
+                        self._keep(st)
                     alive = True
                 else:
                     if ui.get("idle_since") is None:
                         ui["idle_since"] = now
-                        self._write(st)
+                        self._keep(st)
                     if now < float(ui["idle_since"]) + float(ui["grace_s"]):
                         alive = True
         if not any_life:
@@ -408,7 +434,8 @@ class DrainState:
     def set_on(self, *, scope: str, by: str, reason: str = "", ttl_s: float | None = None,
                until_idle: dict | None = None, hold: bool = False) -> dict:
         """깃발을 세우거나 늘린다 — 지금 깃발(snapshot 꼴)을 돌려준다. 계약에 안 맞으면 DrainError(422), 사람이 고정한 깃발에
-        hold 아닌 요청이면 DrainError(409 drain_held)."""
+        hold 아닌 요청이면 DrainError(409 drain_held), 다른 주체가 세운 살아 있는 깃발에 hold 아닌 요청이면 DrainError(409
+        drain_owned — 본문의 drain 이 주인·scope·until 을 싣는다)."""
         if scope not in DRAIN_SCOPES:
             raise DrainError("bad_request", f"scope 는 {'·'.join(DRAIN_SCOPES)} 가운데 하나다", 422)
         by = str(by or "").strip()[:DRAIN_BY_MAX]
@@ -436,13 +463,16 @@ class DrainState:
             if cur is not None and cur.get("hold") and not hold:
                 raise DrainError("drain_held", f"사람이 고정한 비우기 깃발이다(by {str(cur.get('by'))[:DRAIN_BY_MAX]}) — "
                                  "hold 아닌 요청으로 바꾸지 않는다", 409, self._view(cur))
+            if cur is not None and not hold and cur.get("by") != by:
+                # 주인이 아니다 — 합치지 않는다. 합치면 이 주체의 수명이 주인의 끝맺음(scope 좁히기·끄기)에 함께 지워졌다(RB3B-9).
+                # update-all 은 409 를 무엇이든 '남의 것 — 건드리지 않는다' 로 읽는다.
+                owner = str(cur.get("by"))[:DRAIN_BY_MAX]
+                raise DrainError("drain_owned", f"다른 주체(by {owner})가 세운 비우기 깃발이다(scope {cur.get('scope')}, "
+                                 f"until {cur.get('until')}) — 합치지 않는다. 그 주체가 내리거나 수명이 끝난 뒤 다시 세운다",
+                                 409, self._view(cur))
             st = dict(cur or {})
-            owner = cur is None or hold or cur.get("by") == by
-            if owner:
-                st.update(scope=scope, by=by, reason=str(reason or "")[:DRAIN_REASON_MAX],
-                          hold=bool(hold or (cur or {}).get("hold")))
-            elif scope == "all":                       # 주인이 아니면 넓히기만 — by·reason 은 그대로다
-                st["scope"] = "all"
+            st.update(scope=scope, by=by, reason=str(reason or "")[:DRAIN_REASON_MAX],
+                      hold=bool(hold or (cur or {}).get("hold")))
             if cur is None:
                 st["set_at"] = now
                 st["until"], st["until_idle"] = None, None
@@ -452,9 +482,11 @@ class DrainState:
                 for k in ("set_idle_at", "ttl_since"):
                     st.pop(k, None)
             if ttl_s is not None:
-                if st.get("until") is None or not st.get("ttl_since"):
-                    st["ttl_since"] = now
-                st["until"] = max(float(st.get("until") or 0), now + float(ttl_s))
+                # 살아 있는 TTL 은 늘리기만 하고 6시간 창을 새로 연다(RB3B-6). 없거나 끝난 TTL(until_idle 만으로 산 깃발 위의 다음
+                # update-all 등)은 새 TTL 이다 — 앞 TTL 의 ttl_since 를 이으면 새 수명이 받자마자 죽었다(RB3B-5).
+                alive = _ttl_alive(st, now)
+                st["until"] = max(float(st["until"]), now + float(ttl_s)) if alive else now + float(ttl_s)
+                st["ttl_since"] = now
             if until_idle is not None:
                 old = st.get("until_idle")
                 if old is None:
@@ -472,7 +504,7 @@ class DrainState:
 
     def set_off(self, *, by: str, force: bool = False) -> dict:
         """깃발을 내린다 — 내린 뒤의 snapshot(꺼짐)을 돌려준다. 이미 꺼져 있으면 그대로 꺼짐이다(멱등). 사람이 고정했거나 다른
-        주체가 세운 깃발은 force 가 있어야 내린다(DrainError 409 drain_held)."""
+        주체가 세운 깃발은 force 가 있어야 내린다(DrainError 409 drain_held). 파일을 못 지우면 OSError 다(라우트가 503)."""
         with self._lock:
             cur = self._current()
             if cur is None:
@@ -482,7 +514,7 @@ class DrainState:
                 why = ("사람이 고정한 깃발이다" if cur.get("hold")
                        else f"다른 주체(by {str(cur.get('by'))[:DRAIN_BY_MAX]})가 세운 깃발이다")
                 raise DrainError("drain_held", f"{why} — 내리려면 force 를 준다", 409, self._view(cur))
-            self._remove()
+            self._remove(strict=True)
             print(f"[drain] 깃발을 내렸다(by {by}{', force' if force else ''})")
             return dict(OFF)
 
