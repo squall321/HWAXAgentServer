@@ -1775,7 +1775,10 @@ def settle(kind: str, rows: list, ctx: dict) -> dict:
         cover_missing = [a for a in ctx["must_cover"] if a not in covered]
         lines_missing = [t for t in ("head", "para") if t not in ts]
         missing = lines_missing + cover_missing      # 결과의 missing — 남은 꼭 다룰 행(R 별칭)도 그대로 싣는다
-        problems += [("", "cover", a) for a in cover_missing]
+        # r 이 셋을 넘은 risk 줄(refs=too_many)은 아무것도 덮지 않았다 — 그 줄에 단 행은 따로 지적한다(D-42 D · RB3D-7).
+        over = {a for r in good if r["t"] == "risk" and (r.get("checks") or {}).get("refs") == "too_many"
+                for a in r.get("r") or []}
+        problems += [("", "cover_too_many" if a in over else "cover", a) for a in cover_missing]
         expected = 2 + len(ctx["must_cover"])         # 꼭 있어야 하는 줄 — head · para · 꼭 다룰 행 하나씩
         res["narrative_chars"] = sum(len(r.get("text") or "") for r in rows if r["t"] == "para")
         res["long"] = res["narrative_chars"] > ctx["narrative_max"]   # 넘으면 표지만(버리지 않는다)
@@ -1932,6 +1935,8 @@ _HINT_SAY = {
              f"않았다 — 줄 하나는 꼭 다룰 행을 {SUMMARY_RISK_R_MAX}개까지 덮는다) — 그 행마다 글이 있는 risk(r "
              f"{SUMMARY_RISK_R_MAX}개까지) 또는 conflict(r 둘 이상) 줄을 낸다",
     "why": "까닭(why)이 비었거나 짧다 — impact=no 인 q1 줄과 item 이 빈 q2 줄은 왜 없는지 한 문장으로 적는다",
+    "cover_too_many": f"이 행을 단 risk 줄은 r 이 {SUMMARY_RISK_R_MAX}개를 넘어 아무것도 덮지 않았다 — r 을 {SUMMARY_RISK_R_MAX}개까지"
+                      "로 나눠 risk 줄을 다시 낸다",
 }
 
 
@@ -1952,15 +1957,15 @@ def repair_hint(problems: list, attempt: int, total: int, *, bad_lines: int = 0,
             groups.setdefault("enum", []).append(f"{who}({what})")
         elif code == "quote":
             groups.setdefault(f"quote:{what}", []).append(str(who))
-        elif code == "cover":
-            groups.setdefault("cover", []).append(str(what))
+        elif code in ("cover", "cover_too_many"):
+            groups.setdefault(code, []).append(str(what))
         elif code == "why":
             who = str(who) if _HINT_ALIAS.fullmatch(str(who)) else f"«{_unquote_marks(who)}»"
             groups.setdefault("why", []).append(who)
     head = (f"(보충 {attempt}/{total} — 직전 출력에 아래 문제가 있었다. 문제가 있는 줄만 다시 내라. "
             "이미 받은 줄은 다시 내지 않는다.)")
     lines = [head]
-    for code in ("missing", "cover", "enum", "why", "quote:not_found", "quote:short", "quote:empty"):
+    for code in ("missing", "cover", "cover_too_many", "enum", "why", "quote:not_found", "quote:short", "quote:empty"):
         if groups.get(code):
             lines.append(f"- {_HINT_SAY[code]} — {', '.join(dict.fromkeys(groups[code]))}")
     if bad_lines:

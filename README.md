@@ -159,7 +159,7 @@ row once), `summary` `head` · `risk` · `conflict` ·
 need text (`checks.text="empty"` counts as a missing line), a `risk` cites at most 3 rows (`checks.refs="too_many"`),
 and a `must_cover` row counts as covered only by a `risk`/`conflict` with text and `checks.refs` `ok` or `unknown_alias`
 (the valid aliases left count), one line covering at most 3 `must_cover` rows (the prompt and the repair hint say
-so — `cr-summary-2`); what is not
+so — `cr-summary-2`; a `risk` line over 3 covers none, and the hint says that); what is not
 covered is re-asked, what is still missing after the repairs is in `result.missing` (`head`/`para` and R aliases —
 resolve them with `meta.aliases.rows`). Several `head` lines keep the first with text (`checks.extra_heads`). When two
 rows for the same card/unit/impact disagree, a hit (WARNING·FAIL, `rel` yes·maybe, `impact` yes·unknown) is never

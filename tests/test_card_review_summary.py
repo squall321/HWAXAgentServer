@@ -372,3 +372,14 @@ def test_수_뒤의_구두점에서_끊긴_블록의_수는_원천이다():
         assert ctx["blocks_text"].rsplit(" …[", 1)[0].endswith(num), ctx["blocks_text"][-60:]
         assert cr.nums_unsourced(f"값은 {num} 이다", ctx["num_src"]) == [], (tail, "다 본 수를 원천에서 뺐다")
 
+
+def test_셋을_넘은_risk_줄의_행은_아무것도_덮지_않았다고_지적한다():
+    """RB3D-7 — r 이 넷인 risk 줄은 too_many 라 하나도 덮지 않는데 지적은 '넘는 것은 덮지 않았다' 며 넷을 다 적었다."""
+    res = _check([{"t": "head", "text": "요지", "r": ["R001"]},
+                  {"t": "risk", "r": ["R001", "R002", "R003", "R004"], "text": "넷"},
+                  {"t": "para", "text": "문단", "r": ["R001"]}], summary_req(n_rows=6, n_cover=4))
+    assert res["missing"] == ["R001", "R002", "R003", "R004"]
+    hint = cr.repair_hint(res["problems"], 2, 3)
+    assert f"r 이 {cr.SUMMARY_RISK_R_MAX}개를 넘어 아무것도 덮지 않았다" in hint and hint.rstrip().endswith("R001, R002, R003, R004")
+    assert "넘는 것은 덮지 않았다" not in hint
+
