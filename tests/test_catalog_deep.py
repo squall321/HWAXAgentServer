@@ -193,6 +193,99 @@ def test_어디에도_글이_없으면_빈_카드이고_RAG_조회_실패는_실
     assert [c[0] for c in calls] == ["get_record"]
 
 
+def _page(rid, at=None):
+    """읽기 칸 한 쪽 — at 은 앞 쪽의 next 를 그대로 돌려준다(포털 fetchRecord 와 같은 꼴)."""
+    req = a.RecordRequest(id=rid, **({"section_offset": at["section"], "char_offset": at["char"]} if at else {}))
+    return asyncio.run(a.catalog_record(req))
+
+
+def _total(v):
+    return v.get("total_sections"), v.get("total_chars")
+
+
+def test_긴_카드는_총량과_이어_읽을_위치를_주고_따라가면_원문과_같다(monkeypatch):
+    """6만 자에서 말없이 잘리던 카드(열어 본 카드 38%) — 총량(total_sections·total_chars)과 다음 위치(next)를 준다.
+    상한은 대개 절 중간에서 걸린다 — 절 번호만 넘기면 그 절 앞을 되풀이하거나 뒤를 건너뛰어 글자 위치를 함께 넘긴다."""
+    assert a.RECORD_TEXT_MAX == 60_000, "아래 위치는 6만 자 상한 기준이다"
+    secs = [{"section_id": str(i), "level": 1, "title": f"절{i}",
+             "content_text": "".join(f"{i}{j:07d}" for j in range(3125))} for i in range(5)]    # 25,000자씩 5절
+    rag = [{"section_id": "1", "level": 1, "title": "본문", "content_text": ""},
+           {"section_id": "2", "level": 1, "title": "가", "content_text": "가" * 50_000},
+           {"section_id": "3", "level": 2, "title": "나", "content_text": "나" * 20_000}]
+    cards = {"DOC-LONG": {"id": "DOC-LONG", "title": "긴 카드", "data_type": "DOC", "content": {"sections": secs}},
+             "DOC-EDGE": {"id": "DOC-EDGE", "title": "경계", "data_type": "DOC", "content": {"sections": [
+                 {"section_id": "1", "level": 1, "title": "꽉 참", "content_text": "가" * 60_000},
+                 {"section_id": "2", "level": 1, "title": "빈 절", "content_text": ""}]}},
+             "DOC-MX-WP-9": _STUB,
+             "SIM-1": {"id": "SIM-1", "title": "해석", "data_type": "SIM", "content": {"tool_call": {"e": 1}}}}
+    calls = _card_calls(monkeypatch, cards,
+                        rag=lambda rid: "".join(json.dumps(r, ensure_ascii=False) for r in rag))
+
+    # 1) 5절·125,000자 — next 를 따라 세 쪽에 다 받고, 이어 붙이면 원문과 글자까지 같다.
+    pages, at = [], None
+    while len(pages) < 10:
+        pages.append(_page("DOC-LONG", at))
+        at = pages[-1].get("next")
+        if not at:
+            break
+    assert [_total(p) for p in pages] == [(5, 125_000)] * 3, "총량은 쪽마다 카드 전체 값이다"
+    assert [p.get("next") for p in pages] == [{"section": 2, "char": 10_000}, {"section": 4, "char": 20_000}, None]
+    assert [p["truncated"] for p in pages] == [True, True, False]
+    assert [sum(len(s["text"]) for s in p["sections"]) for p in pages] == [60_000, 60_000, 5_000]
+    got = []
+    for prev, p in zip([None, *pages], pages):
+        add = list(p["sections"])
+        if prev and prev["next"]["char"] > 0:      # 절 중간에서 이어 받은 첫 조각은 앞 절에 붙인다(포털 loadMore 규칙)
+            got[-1] = {**got[-1], "text": got[-1]["text"] + add.pop(0)["text"]}
+        got += add
+    assert [(s["title"], s["text"]) for s in got] == [(s["title"], s["content_text"]) for s in secs]
+
+    # 1-2) 한 절이 두 쪽을 넘으면 가운데 쪽은 그 절 안에서 시작해 그 절 안에서 끝난다(cam-aa-process 첫 카드의 꼴).
+    one = "".join(f"{j:07d};" for j in range(16_250))                                   # 130,000자 한 절
+    cards["DOC-ONE"] = {"id": "DOC-ONE", "title": "한 절", "data_type": "DOC",
+                        "content": {"sections": [{"section_id": "1", "level": 1, "title": "통", "content_text": one}]}}
+    texts, nexts, at = [], [], None
+    while len(nexts) < 10:
+        p = _page("DOC-ONE", at)
+        texts.append("".join(s["text"] for s in p["sections"]))
+        nexts.append(p.get("next"))
+        at = nexts[-1]
+        if not at:
+            break
+    assert nexts == [{"section": 0, "char": 60_000}, {"section": 0, "char": 120_000}, None] and "".join(texts) == one
+
+    # 2) 상한이 절 경계에 맞으면 다음 쪽은 다음 절의 처음이다. 그 쪽에 빈 절만 남아도 빈 카드가 아니다(카드 전체로 판정).
+    e1 = _page("DOC-EDGE")
+    assert e1.get("next") == {"section": 1, "char": 0} and e1["truncated"] is True and _total(e1) == (2, 60_000)
+    e2 = _page("DOC-EDGE", e1.get("next"))
+    assert [(s["title"], s["text"]) for s in e2["sections"]] == [("빈 절", "")] and e2.get("next") is None
+    assert e2["truncated"] is False and "get_record_sections" not in [c[0] for c in calls]
+
+    # 3) 끝을 넘긴 위치는 빈 쪽이다(원문(JSON) 보기로 바뀌지 않는다). 음수는 0 으로 막는다.
+    far = _page("DOC-LONG", {"section": 99, "char": 0})
+    assert far["sections"] == [] and far.get("next") is None and far["truncated"] is False and _total(far) == (5, 125_000)
+    neg = _page("DOC-LONG", {"section": -3, "char": -7})
+    assert neg["sections"] == pages[0]["sections"] and neg.get("next") == pages[0]["next"]
+
+    # 4) 모르는 모양(SIM)의 원문(JSON) 보기는 글이 있는 카드다 — 총량이 0 이면 빈 카드로 판정돼 RAG 로 갈린다.
+    s = _page("SIM-1")
+    assert [x["title"] for x in s["sections"]] == ["원문(JSON)"] and _total(s)[0] == 1 and _total(s)[1] > 0
+    assert "get_record_sections" not in [c[0] for c in calls]
+
+    # 5) 자리표시 카드의 RAG 절도 같은 위치로 이어 읽는다 — 총량·next 는 RAG 절 기준이다.
+    r1 = _page("DOC-MX-WP-9")
+    assert [(x["title"], len(x["text"])) for x in r1["sections"]] == [("가", 50_000), ("나", 10_000)]
+    assert r1.get("next") == {"section": 1, "char": 10_000} and r1["truncated"] is True and _total(r1) == (2, 70_000)
+    r2 = _page("DOC-MX-WP-9", r1.get("next"))
+    assert [(x["title"], x["text"]) for x in r2["sections"]] == [("나", "나" * 10_000)] and r2.get("next") is None
+    assert r2["truncated"] is False and _total(r2) == (2, 70_000)
+
+    # 6) 빈 카드 표지 — 절 0개·총량 0·next 없음.
+    rag.clear()
+    z = _page("DOC-MX-WP-9")
+    assert (z["sections"], _total(z), z.get("next"), z["truncated"]) == ([], (0, 0), None, False)
+
+
 def test_상세는_역할_문서와_지식카드_총수를_준다(monkeypatch):
     sess = {**PLAIN_SESSION, "system_prompt": "낙하 전문가 역할\n\n---\n\n## How to access this hub\n안내"}
 

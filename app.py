@@ -4580,6 +4580,9 @@ async def catalog_agent_records(req: AgentRecordsRequest) -> dict:
 class RecordRequest(BaseModel):
     id: str
     groups: list[str] = []
+    # 다음 부분 보기 — 앞 응답의 next 를 그대로 돌려받는다(절 번호 · 그 절 안 글자 위치).
+    section_offset: int = 0
+    char_offset: int = 0
 
 
 # 카드 한 장 본문 상한(문자)·표 행 상한. 표 레코드는 행이 수천 개일 수 있어 앞쪽만 싣고
@@ -4644,10 +4647,12 @@ def _flat_sections(secs, refs: dict):
         yield from _flat_sections(s.get("subsections") or s.get("children"), refs)
 
 
-def _record_view(rec: dict) -> dict:
+def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> dict:
     """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
     그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다).
-    DOC 절은 블록 구조(blocks·subsections·children)도 마크다운으로 풀어 싣는다(_flat_sections)."""
+    DOC 절은 블록 구조(blocks·subsections·children)도 마크다운으로 풀어 싣는다(_flat_sections).
+    한 쪽은 RECORD_TEXT_MAX 자다. total_sections·total_chars 는 카드 전체(푼 절 기준) 값이고, next 가 있으면
+    그 위치({section, char})를 section_offset·char_offset 으로 돌려받아 다음 쪽을 준다. 위치를 안 주면 첫 쪽이다."""
     content = rec.get("content") if isinstance(rec.get("content"), dict) else {}
     out = {**_record_row(rec), "agents": [str(a)[:120] for a in (rec.get("agents") or [])][:20],
            "sections": [], "table": None, "sources": [], "truncated": False}
@@ -4655,16 +4660,24 @@ def _record_view(rec: dict) -> dict:
     refs = {x["id"]: x for k in ("tables", "figures")
             for x in (content.get(k) if isinstance(content.get(k), list) else [])
             if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]}
+    flat = list(_flat_sections(content.get("sections"), refs))
+    secs, texts = [s for s, _ in flat], [t for _, t in flat]      # 이어 읽기는 이 목록 위에서 돈다
+    # 얼마나 잘렸는지 말하려면 총량이 있어야 한다. next 가 None 이면 절은 끝까지 실었다.
+    out.update(total_sections=len(secs), total_chars=sum(map(len, texts)), next=None)
     budget = RECORD_TEXT_MAX
-    for s, text in _flat_sections(content.get("sections"), refs):
+    for i in range(section_offset, len(secs)):
         if budget <= 0:
-            out["truncated"] = True
+            out["truncated"], out["next"] = True, {"section": i, "char": 0}
             break
-        if len(text) > budget:
-            text, out["truncated"] = text[:budget], True
+        start = char_offset if i == section_offset else 0
+        s, text = secs[i], texts[i][start:start + budget]
         budget -= len(text)
         out["sections"].append({"id": str(s.get("section_id") or "")[:40], "title": str(s.get("title") or "")[:200],
                                 "level": s.get("level") if isinstance(s.get("level"), int) else 1, "text": text})
+        if start + len(text) < len(texts[i]):
+            # 상한은 대개 절 중간에서 걸린다 — 절 번호만 넘기면 그 절 앞을 되풀이하거나 뒤를 건너뛴다.
+            out["truncated"], out["next"] = True, {"section": i, "char": start + len(text)}
+            break
     headers, rows = content.get("headers"), content.get("rows")
     if isinstance(headers, list) and isinstance(rows, list):
         out["table"] = {"caption": str(content.get("caption") or "")[:200],
@@ -4679,10 +4692,11 @@ def _record_view(rec: dict) -> dict:
         if src.get("title") or src.get("doi") or src.get("url"):
             out["sources"].append({k: str(src.get(k) or "")[:300] for k in ("title", "doi", "url", "kind", "authors")}
                                   | {"year": src.get("year") if isinstance(src.get("year"), int) else None})
-    if not out["sections"] and out["table"] is None:
+    if not secs and out["table"] is None:  # 끝을 넘긴 section_offset 이 원문(JSON) 보기로 바뀌지 않게
         rest = {k: v for k, v in content.items() if k != "sources"}
         if rest:
             text = json.dumps(rest, ensure_ascii=False, indent=1, default=str)
+            out.update(total_sections=1, total_chars=len(text))  # 비워 두면 SIM 카드가 '빈 카드'로 판정된다(catalog_record)
             out["truncated"] = out["truncated"] or len(text) > RECORD_TEXT_MAX
             out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1, "text": text[:RECORD_TEXT_MAX]})
     return out
@@ -4698,8 +4712,11 @@ async def catalog_record(req: RecordRequest) -> dict:
     rec = _first_dict(_parse_json(await _call(tools, "get_record", {"record_id": rid})))
     if not rec.get("id"):
         return {"error": "record_failed", "id": rid}
-    view = _record_view(rec)
-    if view["table"] is None and not any(s["text"] for s in view["sections"]):
+    # 다음 부분을 받을 때마다 get_record 로 카드 전체를 다시 받는다 — 첫 열기와 같은 비용이다. 음수는 목록과 같이 막는다.
+    so, co = max(0, req.section_offset), max(0, req.char_offset)
+    view = _record_view(rec, so, co)
+    # 빈 카드 판정은 이 쪽이 아니라 카드 전체로 한다 — 이어 읽은 쪽에 빈 절만 남은 멀쩡한 카드를 빈 카드로 보지 않게.
+    if view["table"] is None and view["total_chars"] == 0:
         # content 엔 빈 '본문' 자리표시뿐이고 글은 RAG 절에만 있는 카드가 있다(MX 자리표시 154장 중 149장, 실측).
         raw = await _call(tools, "get_record_sections", {"record_id": rid})
         # 조회 실패를 '빈 카드'로 보이지 않는다. 게이트웨이 도구의 실패는 _cap_tool 의 ✖ 로 오고(_result_ok 가 본다),
@@ -4710,8 +4727,10 @@ async def catalog_record(req: RecordRequest) -> dict:
         rows = [r for r in _parse_json_multi(raw) if isinstance(r, dict) and r.get("content_text")]
         # 어디에도 글이 없으면 절을 비운다 — 제목만 늘어놓지 않고 읽기 칸이 '본문이 비어 있는 카드입니다.' 를 띄운다.
         # 빈 목록을 _record_view 에 넘기면 원문(JSON) 폴백이 {"sections": []} 를 본문으로 띄우므로 넘기지 않는다.
-        alt = _record_view({**rec, "content": {"sections": rows}}) if rows else {"sections": [], "truncated": False}
-        view["sections"], view["truncated"] = alt["sections"], alt["truncated"]
+        # RAG 절로 다시 그릴 때도 같은 위치를 넘겨 총량·next 까지 RAG 절 기준으로 옮긴다.
+        alt = (_record_view({**rec, "content": {"sections": rows}}, so, co) if rows
+               else {"sections": [], "truncated": False, "total_sections": 0, "total_chars": 0, "next": None})
+        view.update({k: alt[k] for k in ("sections", "truncated", "total_sections", "total_chars", "next")})
     return view
 
 
