@@ -284,8 +284,10 @@ risk app, X-2).
 | `EXTERNAL_LLM_MAX_INFLIGHT` | `8` | External card-review calls one owner may have in flight (integer ≥ 1). External calls take no slot of the GLM review gate; this is their limit instead (see Card review). |
 
 Values are read once at startup and the path **fails closed**: with the switch on, a value that cannot be read (an
-integer knob given a fraction or a word), is not finite (`nan`, `inf`) or is below its floor, or a broken time chain
-(below), keeps the path closed — nothing falls back to a default. Startup prints one `⛔` line naming the setting; the
+integer knob given a fraction or a word), is not finite (`nan`, `inf`), is too large to compute with (an integer far
+past the float range) or is below its floor, or a broken time chain (below — including one that cannot be computed, e.g.
+such a `DELIB_LLM_MAX_RETRIES`), keeps the path closed — nothing falls back to a default and nothing raises (startup and
+the deliberation MCP tools come up as on a disabled box). Startup prints one `⛔` line naming the setting; the
 box then answers as a disabled one (no capability, no MCP tools, 409 `external_llm_disabled` whose message carries that
 line and whose `knob` names the setting). These knobs are not in the Time limits table yet (the portal's env kit test
 reads that table; the kit and the table get them together in X-4).
@@ -318,7 +320,13 @@ counts UTF-16 units and differs on characters outside the BMP (𝜎, 𝜀, some 
 The agent server's own chat and deliberation agents never bind the three task tools: they are dropped where gateway
 tools are loaded (`app._get_tools_retry` — chat, deliberation and catalogue paths all pass there), also under the
 gateway's `<app>_<tool>` alias, and a call through the always-bound `invoke_tool` is refused before it reaches the
-gateway — so a prompt-injected GLM turn cannot claim or answer the user's pending task.
+gateway — so a prompt-injected GLM turn cannot claim or answer the user's pending task. Nor can they create external
+work: a `deliberate_start`/`deliberate_continue` call of theirs (bound directly or named through `invoke_tool`, aliases
+included) whose `advanced.llm` reads as `external` (the engine's own reading) or that carries any `consent_external` key
+(top level or in `advanced`, whatever its value; JSON-string arguments are read the way FastMCP pre-parses them) is
+refused with a tool error and never sent — the gateway relays such a call under the user's identity, so a forged flag
+would start an external deliberation and record a consent nobody gave. Consent comes only from the person's own client.
+Calls without those fields are unchanged.
 
 **Card review.** `GET /card-review/limits?llm=external` and `llm: "external"` in the `plan`/`run` bodies select it
 (absent or `glm` = this server's LLM, unchanged; any other value is 422 `bad_request`). The external limits are
@@ -359,9 +367,15 @@ separately, `external_forced: {free_tools: 0}` — so a continuation, which runs
 the existing paths with `cause`: `warning{code: seat_lost, cause}`, skip warnings (`summary_skipped`, …) and
 `error{code: chair_failed, cause}`; a cut chair decision's `warning{code: chair_output_cut}` names
 `EXTERNAL_LLM_MAX_TOKENS`; with an absent worker the first round waits once and the rest fail at once. Refusals:
-`error{code: external_llm_disabled | external_consent_required | external_owner_missing}` → `done` before anything runs
-(in that order; MCP: `ValueError` `"<code>: …"`, no job is created). `delib_opts.timeout_s` does not apply to the
-external responder.
+`error{code: bad_request | external_llm_disabled | external_consent_required | external_owner_missing}` → `done` before
+anything runs (in that order; MCP: `ValueError` `"<code>: …"`, no job is created). `bad_request` is an `llm` value other
+than absent, `glm` or `external` (trimmed, case-insensitive) — refused whether the switch is on or off, as card review
+does; it never runs on this server's LLM instead. `delib_opts.timeout_s` does not apply to the external responder.
+External MCP jobs (`deliberate_start`/`deliberate_continue`) take **no slot of `DELIB_JOB_MAX_RUNNING`** (nor of
+`DELIB_JOB_MAX_RUNNING_PER_USER` — both count GLM jobs only): a human-paced worker must not hold the GLM deliberation
+slots for hours. Instead one external deliberation runs per owner (the task owner); the owner's next ones wait in the
+same queue (`DELIB_JOB_QUEUE_MAX`, `queue.why` says so) and start when it ends, even while the GLM slots are full. They
+still count in `/health.delib_active` (a restart cuts them).
 
 **MCP tools** (registered only when the path is open; a call without the gateway identity header is a tool error):
 
@@ -380,6 +394,12 @@ deliberation the prompt's own JSON or prose-then-JSON, and the chair's Markdown 
 `risk_spec` block for a risk review), the `max_tokens`/`max_chars` cap, the code-point units, and that only requests
 carrying `consent_external: true` become tasks (the flag is all the server checks).
 
+**Workflow (X-3).** Answer only tasks whose `run_id`/`target_key` belong to the job the workflow is serving — not every
+task `review_task_next` hands out. The queue is FIFO per owner, so any other external call under the owner's identity
+(another run of theirs, or a request that carried the flag without them) lands in the same line; this is defence in
+depth on top of the consent flag and the agent refusal above. A claimed task that is never answered goes back to the
+queue after `EXTERNAL_LLM_ANSWER_S` once and then fails its call with `external_answer_timeout`.
+
 **/health.** Enabled boxes add `"external_llm"` to `capabilities` and a block `external_llm{ctx_tokens, max_tokens,
 wait_s, answer_s, call_worst_s, max_inflight, inflight, queued, claimed, evid_budget}` — counts and settings only
 (`inflight` is external card-review calls in flight, also added to `review_active`). Disabled boxes — including ones
@@ -392,7 +412,10 @@ worker, ids, leases and clocks fixed, and rewritten only with
 `EXTERNAL_LLM_CONTRACT_UPDATE=1 .venv/bin/python -m pytest tests/test_external_llm_contract.py -q`. The regression tests
 for the first adversarial review (stale lease, owner decoding, gate, consent, tool deny list, evidence-budget cache,
 absent lapse, units and `max_chars`, cut knobs, continuation `free_tools`, fail-closed settings, owner pruning, and
-GLM byte-identity with the switch on/off and `llm: "glm"`) are `tests/test_external_llm_review_fixes.py`.
+GLM byte-identity with the switch on/off and `llm: "glm"`) are `tests/test_external_llm_review_fixes.py`; those for the
+second (the agent's forged consent, values too large to compute with, the shell's exported switch — the suite's
+`conftest.py` drops every `EXTERNAL_LLM_*` but `EXTERNAL_LLM_CONTRACT_UPDATE` — unknown `llm` values, and the external
+job slots) are `tests/test_external_llm_review2_fixes.py`.
 
 ## Status
 
