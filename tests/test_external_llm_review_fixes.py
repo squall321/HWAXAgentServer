@@ -332,3 +332,55 @@ def test_도구_설명은_서버가_표지_밖의_동의를_본다고_말하지_
     assert m._register_external(on, env={"EXTERNAL_LLM_ENABLED": "1"}) is True
     for t in asyncio.run(on.list_tools()):
         assert "consent_external" in t.description, t.name
+
+
+# ── 5. 이 서버의 에이전트는 과제 도구를 묶지도 부르지도 않는다 ────────────────────────────
+def _named(name: str):
+    @tool(name)
+    async def _t(arg: str = "") -> str:
+        """대역 도구."""
+        return f"called {name}"
+    return _t
+
+
+def test_게이트웨이_도구_목록에서_과제_도구와_그_별칭을_뺀다(monkeypatch):
+    """게이트웨이는 이 서버의 /mcp 를 사용자 신원으로 중계한다 — 챗·심의 에이전트가 과제 도구를 묶으면 주입된 지시를 받은 GLM 턴이
+    그 사람의 기다리는 과제를 집거나 답을 낼 수 있다. 목록을 받는 곳(_get_tools_retry)에서 빼고, 별칭(<앱키>_<도구>)도 뺀다."""
+    names = ["list_materials", "invoke_tool", "review_task_next", "review_task_read", "review_task_submit",
+             "hwaxdeliberation_review_task_submit"]
+
+    class _Gw:
+        def __init__(self, connections):
+            pass
+
+        async def get_tools(self):
+            return [_named(n) for n in names]
+
+    monkeypatch.setattr(a, "MultiServerMCPClient", _Gw)
+    got = asyncio.run(a._get_tools_retry({"gateway": {}}))
+    assert {t.name for t in got} == {"list_materials", "invoke_tool"}
+    conns = {"gateway": {"url": "http://gw/mcp", "transport": "streamable_http", "headers": {}}}
+    stub = SimpleNamespace(state=SimpleNamespace(connections=conns, llm=object(), delib_llm=None))
+    assert set(asyncio.run(d._tools_by_name(stub, ["g"]))) == {"list_materials", "invoke_tool"}, "심의 도구 사전도 같은 문이다"
+    assert a._AGENT_DENY_TOOLS == frozenset(x.TASK_TOOLS)
+
+
+def test_상시_묶이는_invoke_tool_로도_과제_도구를_부르지_못한다():
+    calls = []
+
+    @tool("invoke_tool")
+    async def invoke(name: str, arguments: dict | None = None) -> str:
+        """게이트웨이 invoke_tool 대역."""
+        calls.append(name)
+        return f"called {name}"
+
+    t = a._prep_tool(invoke)
+
+    async def go():
+        return [await t.ainvoke({"name": n, "arguments": {}})
+                for n in ("review_task_next", "HWAXDELIBERATION_review_task_submit", " review_task_read ", "list_materials")]
+
+    out = asyncio.run(go())
+    assert calls == ["list_materials"], "막아야 할 이름이 게이트웨이까지 갔다"
+    assert all(o.startswith(a._TOOL_FAIL_MARK) and "Claude Code 워크플로만" in o for o in out[:3]), out
+    assert out[3] == "called list_materials"

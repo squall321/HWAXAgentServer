@@ -65,6 +65,9 @@ READ_PAGE_MAX = 20_000            # review_task_read 응답 하나의 글자 상
 ANSWER_HARD_MAX = 2_000_000       # 나눠 받는 답의 글자 상한(메모리 보호 — max_tokens 로 자르기 전의 원문)
 
 KINDS = ("sweep", "verdict", "offcard", "noinput", "summary", "deliberation")
+# 워크플로가 부르는 과제 도구 — 이 서버의 챗·심의 에이전트는 이 이름을 묶지도 invoke_tool 로 부르지도 않는다(app._AGENT_DENY_TOOLS —
+# 주입된 지시를 받은 GLM 턴이 사용자의 기다리는 과제를 집거나 답을 내지 못하게).
+TASK_TOOLS = ("review_task_next", "review_task_read", "review_task_submit")
 
 # 스트림 안 오류 — {code: (infra, retryable)}. 둘 다 내용 탓이 아니다(앱은 세지 않고 잡을 external_worker 로 멈춘다 — X-2).
 ERRORS = {

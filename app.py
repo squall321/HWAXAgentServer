@@ -1066,6 +1066,17 @@ def _cap_tool(tool, result_max=None):
         return s
 
     async def capped(*a, **kw):
+        # 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
+        # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
+        if getattr(tool, "name", "") == "invoke_tool":
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _inner = _args.get("name") if isinstance(_args, dict) else None
+                if isinstance(_inner, str) and _agent_denied(_inner):
+                    print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
+                           "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
+                    return ((msg, None)
+                            if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         # 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
@@ -1817,16 +1828,28 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 
+# 이 서버의 챗·심의 에이전트가 묶지 않는 게이트웨이 도구 — 외부 응답자 과제 도구(external_llm.TASK_TOOLS). 게이트웨이는 이 서버의
+# /mcp 를 사용자 신원으로 중계하므로, 묶으면 주입된 지시를 받은 GLM 턴이 그 사람의 기다리는 과제를 집거나 답을 낼 수 있다.
+# 도구 목록을 받는 곳(_get_tools_retry — 챗·심의·카탈로그가 다 지난다)에서 빼고, 상시 묶이는 invoke_tool 로 부르는 것도 막는다(_cap_tool).
+_AGENT_DENY_TOOLS = frozenset(_external_llm.TASK_TOOLS)
+
+
+def _agent_denied(name: str) -> bool:
+    """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
+    n = str(name or "").strip().lower()
+    return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS)
+
+
 async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
     """게이트웨이에서 도구 목록을 받되, **일시적** 실패는 지수 백오프로 재시도한다(간헐 도구
     0개 해소). 게이트웨이 재기동·재연결은 보통 1~2초 내에 끝나므로, 그 창에 걸린 요청이
     도구 없이 응답하던 것을 흡수한다(cae00 '될 때도 안 될 때도' 실증). 401/403 인증 실패는
-    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다."""
+    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다. 이 서버의 에이전트가 묶지 않는 도구(_AGENT_DENY_TOOLS)는 여기서 뺀다."""
     import asyncio as _aio
     last = None
     for i in range(max(1, tries)):
         try:
-            got = await MultiServerMCPClient(scoped).get_tools()
+            got = [t for t in await MultiServerMCPClient(scoped).get_tools() if not _agent_denied(getattr(t, "name", ""))]
             # 빈 목록도 실패로 본다 — 게이트웨이가 부팅 직후 tools=0 인 과도 상태를 완결로
             # 받으면 도구 없는 에이전트가 만들어진다. 마지막 시도가 아니면 재시도.
             if not got and i < tries - 1:

@@ -737,7 +737,7 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
 # ── 외부 응답자 과제(리스크 심사 Claude 길 X-1) — EXTERNAL_LLM_ENABLED=1 인 서버에서만 등록한다 ─────────────────────────
 # 엔진의 판단 호출(카드 대조·심의 좌석/의장)이 LLM 대신 과제로 줄을 서면, 잡 주인의 Claude Code 워크플로가 이 셋으로 집어 읽고
 # 답을 낸다(external_llm.py). 주인만 — 신원은 게이트웨이가 검증된 PAT 로 싣는 x-hwax-user 다(_caller → header_owner 로 한 번
-# 푼다). 꺼진 서버에는 도구가 없다.
+# 푼다). 꺼진 서버에는 도구가 없다. 이 서버의 챗·심의 에이전트는 이 셋을 묶지 않는다(app._AGENT_DENY_TOOLS).
 _XS = external_llm.Settings.from_env()
 _TASK_FORMAT = (
     " 답의 꼴 — 그 프롬프트를 받은 모델이 낼 출력 그대로다. kind 가 sweep·verdict·offcard·noinput·summary(카드 대조)면 system 글이 "
