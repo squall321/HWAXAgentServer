@@ -260,6 +260,100 @@ and a throwaway agent server on free ports — never 9009, and never with the re
 that ledger's running jobs as interrupted). `tests/test_card_review_e2e.py` does exactly this and its header has
 the command lines. It is test-only: no production knob points at it.
 
+### External responder (Claude path — off by default)
+
+`external_llm.py` — the risk review's judgement calls can be answered by an **external responder** instead of this
+server's LLM: the job owner's Claude Code workflow (`HWAXPortal/docs/risk-claude-engine/`, decisions X-D1..X-D3). The
+engine's prompts, parsers, repairs and contracts stay as they are — only *who writes the answer* changes. A call that
+selects it is queued as a **task**; the owner's workflow claims it through three MCP tools, reads the prompt in pages,
+and submits the answer text, which the engine then parses, checks and repairs exactly like a GLM answer. Off by
+default; it is never exercised with a real Claude here (tests drive a fake worker through the real MCP tool functions —
+`tests/fakes/worker.py`). Consent to send card and change text outside is the risk app's job (X-2): the engine makes a
+task for any call that selects `external` and takes no consent field.
+
+| var | default | meaning |
+|---|---|---|
+| `EXTERNAL_LLM_ENABLED` | `0` | `1` (also `true`·`yes`·`on`) opens the path: the task queue, the three MCP tools and `llm: "external"` on card review and deliberation. Anything else — including an unreadable value, warned once — keeps it closed. |
+| `EXTERNAL_LLM_CTX_TOKENS` | `200000` | The external model's window. Card review `limits`/`plan` budget with it, and an external deliberation derives every window-based budget from it (evidence, transcript, role and summary shares). Set it to the smallest window the owners' Claude may have. |
+| `EXTERNAL_LLM_MAX_TOKENS` | `32000` | The external model's output cap — the `max_tokens` of every external call (card review binds it per call; `CARD_REVIEW_MAX_TOKENS` is a GLM-box knob and does not apply). An answer longer than the call's `max_tokens` (by the engine's own token estimate — `_est_tokens_all`) is cut there and comes back with `finish_reason=length`, as a capped model's would. |
+| `EXTERNAL_LLM_WAIT_S` | `300` | How long a task may wait **while the owner's workflow shows no sign of life** (no claim, read or submit, and no task of theirs claimed). Past it the call fails with `external_worker_absent`, and every waiting or new task of that owner fails the same way at once until the workflow calls any of the three tools again. While the owner has a task claimed, waiting tasks do not age — a busy worker is not an absent one. |
+| `EXTERNAL_LLM_ANSWER_S` | `1200` | How long a claimed task may take to its final submit. Past it the task goes back to the queue **once** (it is claimed again as `claim: 2`; a late submit of the first claim gets `not_claimed`), and the second miss fails the call with `external_answer_timeout`. |
+
+Values are read once at startup. A value that is not a number, or is ≤ 0, runs at the default with a warning — no value
+turns a limit off. These knobs are not in the Time limits table yet (the portal's env kit test reads that table; the kit
+and the table get them together in X-4).
+
+Time limits (inner first): the worst bounded case of one external call is wait + answer + (requeued) wait + answer
+= 2 × `EXTERNAL_LLM_WAIT_S` + 2 × `EXTERNAL_LLM_ANSWER_S` = 3000 s by default (`/health.external_llm.call_worst_s`),
+below one logical deliberation LLM call ((1 + `DELIB_LLM_MAX_RETRIES`) × `DELIB_TIMEOUT_S` + 8 = 3608 s) that the outer
+limits are sized on — so card review's `request_worst_s` and the risk app's wall clocks stay valid. The startup line
+prints the chain and warns when it does not hold. The exception is a busy worker: while the owner's workflow has a task
+claimed, a waiting task's wait is bounded only by the workflow's throughput (the queue is FIFO per owner, oldest first),
+and the outer wall clocks are the last net — size the workflow's concurrency to the engine's (card review gate, seats).
+
+Rules: tasks are **owner-only** — the owner is the call's identity (card review `user_email`, which the portal relay
+overwrites with the verified principal; deliberation's caller), and the workflow's identity is the gateway's
+`x-hwax-user` header (its PAT); both are compared percent-decoded (the gateway sends the header as
+`quote(user, safe="@.")`), trimmed and lower-cased, so the workflow must run with the job owner's PAT. Another owner's task id gets exactly the answer of a missing one. A caller that goes away (card review stream
+closed, deliberation job cancelled) removes its task; the workflow then gets `task_not_found`. The queue lives in
+memory — a restart loses it (the running streams break too, so the app re-issues as infra). Logs carry task ids,
+kinds and sizes only — never prompt or answer text.
+
+**Card review.** `GET /card-review/limits?llm=external` and `llm: "external"` in the `plan`/`run` bodies select it
+(absent or `glm` = this server's LLM, unchanged; any other value is 422 `bad_request`). The external limits are
+computed from `EXTERNAL_LLM_CTX_TOKENS`/`EXTERNAL_LLM_MAX_TOKENS` with `ctx_source`, `max_tokens_source` and `model`
+= `external` and an `llm: "external"` field, and every `limits_rev`/`limits_rev_by_kind` hashes the path name too, so it
+differs from GLM's even at equal numbers — switching a job's engine reruns its cells. `plan` answers carry
+`llm: "external"`, `run` results `meta.llm: "external"` (`meta.model` `external`, `meta.usage` null — unknown, not 0).
+External calls hold a review-gate slot like any other call (drain and `review_busy` unchanged). Refusals before the
+stream: 409 `external_llm_disabled{knob}` (the server did not open the path — the app holds the job, nothing is
+counted) and, for `run`, 422 `external_owner_missing` (no `user_email` — nobody's workflow could claim the task); 403
+`denied` and the shape checks come first. In the stream, a failed call is `error{code: external_worker_absent |
+external_answer_timeout, infra: true, retryable: true, knob, attempt}`; during a repair it ends with `result` and
+`quality.repair_error` like any other failure (`card_review.EXTERNAL_ERRORS` — separate from `ERRORS`, whose examples
+the risk app copies byte for byte).
+
+**Deliberation.** `delib_opts.llm: "external"` (portal `/chat` deliberation, `/시뮬심의`, `/시험계획`, and MCP
+`deliberate_start`'s `advanced.llm`) runs every judgement call of that deliberation — seats, chair, summaries, tool-argument
+planning — as tasks of the caller. It forces **evidence_only**: the seats' free lookup is closed (`free_tools=0` — the
+only place the engine binds tools to the model; `ExternalChatModel.bind_tools` raises), and a `free_tools` the caller
+sent is named in a notice card (`delib` evidence `source: "외부 응답자 실행 — evidence_only"`, `notice: true`).
+Engine-run steps (pinned tools, knowledge cards, VOC recall, evidence prepass) are unchanged; their LLM parts go to the
+responder as text tasks. The whole deliberation budgets with `EXTERNAL_LLM_CTX_TOKENS` (a context variable set at its
+entry — other deliberations, card review and chat keep this server's window); `/health.external_llm.evid_budget` is the
+evidence share under that window, for the risk app's brief. Marks: the decision text starts with `■ 외부 응답자 실행 — …`
+(stamped by code, like the sealed mark), the `result` frame gains `llm: "external", tool_mode: "evidence_only"`, and the
+MCP job's summary and transcript carry the same two fields (its `applied_opts` show `llm` and the forced `free_tools: 0`).
+Limit failures go through the existing paths with `cause`: `warning{code: seat_lost, cause}`, skip warnings
+(`summary_skipped`, …) and `error{code: chair_failed, cause}`; with an absent worker the first round waits once and the
+rest fail at once. Refusals: `error{code: external_llm_disabled | external_owner_missing}` → `done` before anything runs
+(MCP: `ValueError` `"<code>: …"`, no job is created). `delib_opts.timeout_s` does not apply to the external responder.
+Not carried by `deliberate_continue` (a continuation runs on this server's LLM unless `advanced.llm` is sent again).
+
+**MCP tools** (registered only when enabled; a call without the gateway identity header is a tool error):
+
+| tool | args | returns |
+|---|---|---|
+| `review_task_next` | `wait_s` (s, long-poll, capped at 25) | the caller's oldest waiting task, now claimed: `{task_id, kind (sweep·verdict·offcard·noinput·summary·deliberation), max_tokens, chars, parts[{role, start, chars}], answer_deadline (unix s), answer_s, claim (1·2), created_at, run_id?, target_key?, label?}` — or `{empty: true, claimed, waited_s}` |
+| `review_task_read` | `task_id`, `offset` | `{task_id, offset, next_offset, chars, text}` — one page; each result is ≤ 20,000 characters as FastMCP sends it (or `DELIB_MCP_PAGE_CHARS` if lower). Concatenate pages until `next_offset` is null and split by `parts`. |
+| `review_task_submit` | `task_id`, `text`, `offset?`, `final` | chunked: no `offset` appends, `0` restarts, otherwise it must equal the received length → `{ok: true, done: false, received_chars}`; `final: true` hands the answer to the engine → `{ok: true, done: true, chars, finish_reason (stop·length), cut_chars?}` |
+
+Expected failures are results, not tool errors: `{ok: false, code}` with `task_not_found` (missing, finished,
+cancelled or another owner's), `not_claimed` (requeued after `EXTERNAL_LLM_ANSWER_S`), `offset_mismatch{received_chars}`,
+`bad_offset`, `answer_too_large` (over 2,000,000 characters). The tool descriptions tell the workflow what the answer
+must look like (exactly the format the prompt asks for — JSON Lines with no prose or fences for the five card-review kinds,
+the prompt's own JSON or prose-then-JSON for deliberation), the `max_tokens` cap, and that the text holds in-house
+cards and change records released only for jobs whose owner consented.
+
+**/health.** Enabled boxes add `"external_llm"` to `capabilities` and a block `external_llm{ctx_tokens, max_tokens,
+wait_s, answer_s, call_worst_s, queued, claimed, evid_budget}` — counts and settings only. Disabled boxes answer exactly
+as before.
+
+Contract examples for this path live in `tests/fixtures/external_llm/contract/` (`index.json` maps the run scenes; the
+other files are the limits, plan, refusals, `/health`, the MCP tool list, every MCP tool result shape and the
+deliberation frames). They are produced by the real routes and tool functions with the fake worker, ids and clocks
+fixed, and rewritten only with `EXTERNAL_LLM_CONTRACT_UPDATE=1 .venv/bin/python -m pytest tests/test_external_llm_contract.py -q`.
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the

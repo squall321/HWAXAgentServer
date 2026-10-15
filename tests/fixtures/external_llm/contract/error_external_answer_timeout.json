@@ -1,0 +1,8 @@
+{
+ "code": "external_answer_timeout",
+ "message": "외부 응답자가 과제를 집고 1,200초 안에 답을 다 내지 않았다 — 한 번은 줄로 되돌려 다시 집게 했고 다시 집은 뒤에도 같았다. 답이 이 한도보다 오래 걸리는 모델이면 한도를 올린다",
+ "infra": true,
+ "retryable": true,
+ "knob": "EXTERNAL_LLM_ANSWER_S",
+ "attempt": 1
+}

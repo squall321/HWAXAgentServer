@@ -1,0 +1,65 @@
+{
+ "limits_rev": "75d363ab",
+ "limits_rev_by_kind": {
+  "sweep": "79d7ff35",
+  "verdict": "8cc967a8",
+  "offcard": "71c10cae",
+  "noinput": "21a08bbe",
+  "summary": "7a158e16"
+ },
+ "verdict_decks": [
+  {
+   "deck_id": "v-7e93a521",
+   "aliases": [
+    "K01",
+    "K02",
+    "K03",
+    "K04",
+    "K05",
+    "K06"
+   ],
+   "chars": 1439,
+   "soft_over": false
+  }
+ ],
+ "sweep_decks": [
+  {
+   "deck_id": "s-730f238f",
+   "aliases": [
+    "K01",
+    "K02",
+    "K03",
+    "K04",
+    "K05",
+    "K06",
+    "K07",
+    "K08",
+    "K09",
+    "K10"
+   ],
+   "chars": 2042,
+   "soft_over": false
+  }
+ ],
+ "manifest_pages": [
+  [
+   "u-00",
+   "u-01",
+   "u-02",
+   "u-03",
+   "u-04"
+  ]
+ ],
+ "oversize": {
+  "cards": [],
+  "kinds": {},
+  "units": [],
+  "manifest": []
+ },
+ "soft_over": {
+  "units": [],
+  "manifest": []
+ },
+ "pair_over": [],
+ "llm": "external"
+}

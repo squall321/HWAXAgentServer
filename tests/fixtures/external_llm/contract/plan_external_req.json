@@ -1,0 +1,92 @@
+{
+ "cards": [
+  {
+   "alias": "K01",
+   "record_id": "DOC-CCT-MECH-2026-0000000101",
+   "checkable": true,
+   "chars": 355
+  },
+  {
+   "alias": "K02",
+   "record_id": "DOC-CCT-MECH-2026-0000000108",
+   "checkable": true,
+   "chars": 188
+  },
+  {
+   "alias": "K03",
+   "record_id": "DOC-CCT-MECH-2026-0000000109",
+   "checkable": true,
+   "chars": 234
+  },
+  {
+   "alias": "K04",
+   "record_id": "DOC-CCT-MECH-2026-0000000103",
+   "checkable": true,
+   "chars": 213
+  },
+  {
+   "alias": "K05",
+   "record_id": "DOC-CCT-MECH-2026-0000000110",
+   "checkable": true,
+   "chars": 207
+  },
+  {
+   "alias": "K06",
+   "record_id": "DOC-CCT-MECH-2026-0000000102",
+   "checkable": true,
+   "chars": 242
+  },
+  {
+   "alias": "K07",
+   "record_id": "DOC-CCT-MECH-2026-0000000106",
+   "checkable": false,
+   "chars": 170
+  },
+  {
+   "alias": "K08",
+   "record_id": "DOC-CCT-MECH-2026-0000000104",
+   "checkable": false,
+   "chars": 136
+  },
+  {
+   "alias": "K09",
+   "record_id": "DOC-CCT-MECH-2026-0000000105",
+   "checkable": false,
+   "chars": 131
+  },
+  {
+   "alias": "K10",
+   "record_id": "DOC-CCT-MECH-2026-0000000107",
+   "checkable": false,
+   "chars": 166
+  }
+ ],
+ "units": [
+  {
+   "unit_id": "u-00",
+   "manifest_chars": 300,
+   "body_chars": 2000
+  },
+  {
+   "unit_id": "u-01",
+   "manifest_chars": 301,
+   "body_chars": 2001
+  },
+  {
+   "unit_id": "u-02",
+   "manifest_chars": 302,
+   "body_chars": 2002
+  },
+  {
+   "unit_id": "u-03",
+   "manifest_chars": 303,
+   "body_chars": 2003
+  },
+  {
+   "unit_id": "u-04",
+   "manifest_chars": 304,
+   "body_chars": 2004
+  }
+ ],
+ "llm": "external"
+}
