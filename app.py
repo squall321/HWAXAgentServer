@@ -4588,7 +4588,8 @@ def _record_row(r) -> dict:
 
 @app.post("/catalog/agent/records")
 async def catalog_agent_records(req: AgentRecordsRequest) -> dict:
-    """전문가 한 명의 지식카드 목록 — 제목·요약 검색(q)·쪽(offset·limit)·총수. 심층 보기 용(LLM 미경유)."""
+    """전문가 한 명의 지식카드 목록 — 낱말 검색(q — 공백으로 나눈 낱말을 모두 담은 카드. 제목·요약, AIDataHub 에서 본문 검색을
+    켜면 본문까지)·쪽(offset·limit)·총수. 심층 보기 용(LLM 미경유). q 는 그대로 넘긴다 — 나누고 거는 것은 AIDataHub 다."""
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     offset = max(0, int(req.offset or 0))
     if not tools or "list_records" not in tools:
