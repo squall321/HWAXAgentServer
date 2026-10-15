@@ -4486,7 +4486,9 @@ def _role_doc(system_prompt: str) -> str:
 async def catalog_agent(req: AgentDetailRequest) -> dict:
     """전문가 상세 + 보유 지식(레코드 목록) — 브라우즈 UI 용(결정적·LLM 미경유).
     LLM 텍스트 나열은 결과 절단 캡에 걸려 잘리므로, 탐색은 이 데이터로 UI 가 그린다.
-    records 는 미리보기 20건이고 records_total 이 전체 수다 — 전체는 /catalog/agent/records 로 넘긴다."""
+    records 는 미리보기 20건이고 records_total 이 전체 수다 — 전체는 /catalog/agent/records 로 넘긴다.
+    상세를 못 받으면 error="session_failed", 목록을 못 받으면 records_error="records_failed"(records_total 은 None) —
+    실패를 빈 전문가·0건으로 주지 않는다."""
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 상세·레코드를 JSON 으로 읽는다
     if not tools:
         return {"error": "gateway_unavailable"}
@@ -4494,8 +4496,14 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
     out: dict = {"key": key, "name": key, "role": "", "prompt": "", "tags": [], "samples": [], "records": [],
                  "records_total": None, "operator": False, "apps": []}
     try:
-        sess = _first_dict(_parse_json(await _call(tools, "get_agent_session", {"agent_type": key})))
+        raw_sess = await _call(tools, "get_agent_session", {"agent_type": key})
+        sess = _first_dict(_parse_json(raw_sess)) if _result_ok(raw_sess) else {}
         sd = _first_dict(sess.get("data", sess))
+        if not sd.get("agent_type"):
+            # 도구 없음(None)·✖ 호출 실패·'agent not found' 평문·실패 봉투가 다 여기로 온다. 빈 전문가로 주면 '역할도 지식도
+            # 없는 사람'으로 읽힌다. 원문을 받았으면 agent_type 이 늘 있다(적재 때 생긴 자리 행도) — 그때 역할이 비면 실패가
+            # 아니라 '아직 등록되지 않은 전문가'다(화면·심의 _restore_role 과 같은 기준).
+            raise ValueError(f"no agent session: {str(raw_sess)[:160]!r}")
         out["name"] = sd.get("name") or key
         out["role"] = str(sd.get("description") or "")[:2000]
         # 역할 문서 전문 — 심층 보기가 '이 전문가가 어떻게 생각하고 답하는가'를 그대로 보여 준다.
@@ -4513,11 +4521,16 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
                             "connected": (a in set(_tm.values())) if _tm else None}
                            for a in (rc.get("mcp_apps") or []) if isinstance(a, str) and a.strip()][:3]
     except Exception as exc:  # noqa: BLE001 — 상세 실패해도 지식 목록은 시도
+        out["error"] = "session_failed"
         print(f"[catalog] agent session failed: {exc!r}")
     try:
-        raw = _parse_json(await _call(tools, "list_records", {"agents": [key], "limit": 20}))
-        recs = raw if isinstance(raw, list) else (
-            (raw or {}).get("records") or (raw or {}).get("items") or (raw or {}).get("data") or [])
+        raw_rec = await _call(tools, "list_records", {"agents": [key], "limit": 20})
+        raw = _parse_json(raw_rec) if _result_ok(raw_rec) else None
+        if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+            # /catalog/agent/records 와 같은 판정 — '0건'과 '못 물어봤다'를 뭉개지 않는다. AIDataHub list_records 는
+            # 늘 {total, count, offset, items} 를 준다(종전의 list·records·data 갈래는 운영에서 쓰이지 않았다).
+            raise ValueError(f"no record list: {str(raw_rec)[:160]!r}")
+        recs = raw["items"]
         for r in recs[:20]:
             r = _first_dict(r)
             rid = r.get("id") or r.get("record_id") or ""
@@ -4529,6 +4542,7 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
         if isinstance(raw, dict) and isinstance(raw.get("total"), int):
             out["records_total"] = raw["total"]
     except Exception as exc:  # noqa: BLE001
+        out["records_error"] = "records_failed"
         print(f"[catalog] records failed: {exc!r}")
     return out
 

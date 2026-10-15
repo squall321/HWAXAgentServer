@@ -299,12 +299,15 @@ def test_전문가_상세는_scope_아래_태그를_읽고_운영_앱을_준다(
         return {"get_agent_session": object(), "list_records": object()}
 
     async def fake_call(tools, name, args):
-        return json.dumps(sess, ensure_ascii=False) if name == "get_agent_session" else json.dumps({"records": []})
+        # list_records 의 실제 응답 모양(AIDataHub mcp_runtime) — {"records": []} 는 이제 '목록을 못 받았다' 로 읽힌다.
+        return (json.dumps(sess, ensure_ascii=False) if name == "get_agent_session"
+                else json.dumps({"total": 0, "count": 0, "offset": 0, "items": []}))
 
     monkeypatch.setattr(a, "_tools_by_name", fake_tools)
     monkeypatch.setattr(a, "_call", fake_call)
     _prime_tools_map(monkeypatch, TS_MAP)
     out = asyncio.run(a.catalog_agent(a.AgentDetailRequest(key="he-calc-thermalshock")))
+    assert "error" not in out and "records_error" not in out and out["records_total"] == 0, "운영자는 카드 0건이 정상이다"
     assert out["tags"] == ["HE팀", "MCP 운영자"], "get_agent_session 은 태그를 scope 아래에 둔다"
     assert out["operator"] is True
     assert out["apps"] == [{"key": "heax-thermal_shock_mcp", "label": a._app_label("heax-thermal_shock_mcp"),

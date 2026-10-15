@@ -304,3 +304,33 @@ def test_상세는_역할_문서와_지식카드_총수를_준다(monkeypatch):
     out = asyncio.run(a.catalog_agent(a.AgentDetailRequest(key="rel-drop-impact")))
     assert out["prompt"] == "낙하 전문가 역할"
     assert out["records_total"] == 57 and len(out["records"]) == 1
+
+
+def test_상세_실패는_빈_전문가가_아니라_실패로_준다(monkeypatch):
+    """도구 없음·✖ 호출 실패·'agent not found' 평문·실패 봉투를 기본값(name=키, 역할 빈 값, 카드 0)으로 주면 '역할도 지식도
+    없는 사람'으로 읽힌다(10-15 실측: 없는 키·권한 빠진 그룹이 다 200·error 없음). 원문을 받았는데(agent_type 이 있다)
+    역할이 빈 것은 실패가 아니다 — '아직 등록되지 않은 전문가'(자리 행, 화면 K6-5 · 심의 _restore_role 과 같은 기준)."""
+    ok_list = json.dumps({"total": 0, "count": 0, "offset": 0, "items": []})
+
+    def run(sess, recs):
+        _stub_records(monkeypatch, lambda name, args: sess if name == "get_agent_session" else recs)
+        return asyncio.run(a.catalog_agent(a.AgentDetailRequest(key="zz")))
+
+    out = run("Error executing tool get_agent_session: agent not found: zz",          # 평문 실패
+              a._TOOL_FAIL_MARK + " 도구 list_records 호출 실패: backend session down")
+    assert out.get("error") == "session_failed" and out.get("records_error") == "records_failed"
+    assert out["records_total"] is None
+    for sess in (None, "(tool get_agent_session error: timeout)",
+                 a._TOOL_FAIL_MARK + " 도구 get_agent_session 호출 실패: backend session down",
+                 json.dumps({"status": "error", "agent_type": "zz", "message": "backend down"})):   # 실패 봉투
+        out = run(sess, ok_list)
+        assert out.get("error") == "session_failed" and "records_error" not in out and out["records_total"] == 0, sess
+    for recs in (None, json.dumps({"records": []}), json.dumps({"status": "error", "total": 0, "items": []})):
+        out = run(json.dumps(PLAIN_SESSION, ensure_ascii=False), recs)
+        assert out.get("records_error") == "records_failed" and out["records_total"] is None and "error" not in out, recs
+    # 자리 행 — 설명 0자·허브 자동 틀뿐이어도 원문은 받았다. 실패가 아니라 비어 있는 것이다.
+    blank = {"agent_type": "zz", "name": "zz", "description": "",
+             "system_prompt": 'You are an assistant for "zz" (`zz`) inside the hub.\n- Help the user with: (no description)'}
+    out = run(json.dumps(blank, ensure_ascii=False), ok_list)
+    assert "error" not in out and "records_error" not in out, out
+    assert (out["name"], out["role"], out["prompt"], out["records_total"]) == ("zz", "", "", 0)
