@@ -63,6 +63,8 @@ NEXT_WAIT_MAX = 25.0              # review_task_next 의 긴 폴링 상한(초) 
 POLL_S = 0.5                      # 긴 폴링이 다시 집어 보는 간격(초)
 READ_PAGE_MAX = 20_000            # review_task_read 응답 하나의 글자 상한(FastMCP 가 내보내는 JSON 글 그대로 잰다)
 ANSWER_HARD_MAX = 2_000_000       # 나눠 받는 답의 글자 상한(메모리 보호 — max_tokens 로 자르기 전의 원문)
+OWNER_IDLE_S = 86_400.0           # 과제도 없이 이만큼 조용한 주인 칸은 지운다(워크플로 쪽 호출마다 칸이 생긴다 — 쌓이지 않게)
+_PRUNE_EVERY_S = 60.0             # 위 정리를 다시 보는 간격(줄의 시계로)
 
 KINDS = ("sweep", "verdict", "offcard", "noinput", "summary", "deliberation")
 # 워크플로가 부르는 과제 도구 — 이 서버의 챗·심의 에이전트는 이 이름을 묶지도 invoke_tool 로 부르지도 않는다(app._AGENT_DENY_TOOLS —
@@ -157,9 +159,9 @@ class ExternalLLMError(Exception):
 
 def _absent(s: Settings, *, standing: bool) -> ExternalLLMError:
     if standing:
-        msg = (f"외부 응답자가 없다 — 이 사람의 과제가 {s.wait_s:,.0f}초 동안 집히지 않아 없다고 판정한 뒤로, 워크플로가 다시 붙을 "
-               "때까지(review_task_* 를 한 번이라도 부를 때까지) 새 과제를 줄 세우지 않고 바로 이 오류로 답한다. Claude Code 워크플로를 "
-               "다시 돌린 뒤 같은 호출을 다시 낸다")
+        msg = (f"외부 응답자가 없다 — 이 사람의 과제가 {s.wait_s:,.0f}초 동안 집히지 않아 없다고 판정한 뒤로, 워크플로가 다시 붙거나"
+               f"(review_task_* 를 한 번이라도 부르거나) 그 판정에서 {s.wait_s:,.0f}초가 지날 때까지 새 과제를 줄 세우지 않고 바로 이 "
+               "오류로 답한다. Claude Code 워크플로를 다시 돌린 뒤 같은 호출을 다시 낸다")
     else:
         msg = (f"외부 응답자가 이 과제를 {s.wait_s:,.0f}초 동안 집지 않았다 — 그동안 잡 주인의 워크플로가 아무 과제도 집거나 내지 "
                "않았다(돌고 있지 않거나 다른 신원으로 붙었다). Claude Code 워크플로를 잡 주인의 PAT 로 다시 돌린 뒤 같은 호출을 다시 낸다")
@@ -201,13 +203,14 @@ class _Task:
 
 
 class _Owner:
-    """주인 한 사람의 워크플로 상태 — 마지막으로 보인 때와 '없다' 판정."""
+    """주인 한 사람의 워크플로 상태 — 마지막으로 보인 때, '없다' 판정 때(그 뒤 WAIT_S 동안만 선다), 마지막 움직임(정리 기준)."""
 
-    __slots__ = ("alive_at", "absent")
+    __slots__ = ("alive_at", "absent_at", "last")
 
-    def __init__(self):
+    def __init__(self, now: float):
         self.alive_at: float | None = None
-        self.absent = False
+        self.absent_at: float | None = None
+        self.last = now
 
 
 def _wire(obj) -> str:
@@ -235,6 +238,7 @@ class Board:
         self._owners: dict[str, _Owner] = {}
         self._calls: dict[str, int] = {}
         self._seq = 0
+        self._pruned_at = clock()
         s = self.settings
         # 기다리는 쪽이 한도를 다시 보는 간격(실제 초) — 한도의 1/4(바닥 0.05초, 위 1초). 시계를 바꿔 끼운 시험은 따로 준다.
         self.tick = tick if tick is not None else max(0.05, min(1.0, s.wait_s / 4, s.answer_s / 4))
@@ -242,7 +246,8 @@ class Board:
     # ── 엔진 쪽 ──
     def open(self, *, owner: str, kind: str, parts: list, max_tokens: int | None, run_id: str = "",
              target_key: str = "", label: str = "") -> _Task:
-        """과제를 줄 세운다(부르는 쪽은 이벤트 루프 안이다). 주인이 '없다' 로 판정돼 있으면 줄 세우지 않고 바로 external_worker_absent."""
+        """과제를 줄 세운다(부르는 쪽은 이벤트 루프 안이다). 주인이 '없다' 로 판정된 뒤 WAIT_S 안이면 줄 세우지 않고 바로
+        external_worker_absent."""
         owner = _norm_owner(owner)
         if not owner:
             raise ValueError("외부 응답자 과제에는 주인(호출자 신원)이 있어야 한다")
@@ -251,8 +256,11 @@ class Board:
             now = self._clock()
             self._sweep(now)
             st = self._owners.get(owner)
-            if st is not None and st.absent:
+            if st is not None and self._standing(st, now):
                 raise _absent(self.settings, standing=True)
+            if st is None:
+                st = self._owners[owner] = _Owner(now)
+            st.last = now
             self._seq += 1
             text = "".join(t for _r, t in parts)
             task = _Task(id=self._new_id(), owner=owner, kind=kind, seq=self._seq, parts=list(parts), text=text,
@@ -424,17 +432,27 @@ class Board:
     def _touch(self, owner: str, now: float) -> None:
         """워크플로가 불렀다 — 그 주인은 지금 있다('없다' 판정을 푼다)."""
         if owner:
-            st = self._owners.setdefault(owner, _Owner())
-            st.alive_at, st.absent = now, False
+            st = self._owners.get(owner)
+            if st is None:
+                st = self._owners[owner] = _Owner(now)
+            st.alive_at, st.absent_at, st.last = now, None, now
+
+    def _standing(self, st: _Owner, now: float) -> bool:
+        """'없다' 판정이 아직 서 있나 — 판정 뒤 WAIT_S 동안만이다(그 뒤의 새 과제는 다시 WAIT_S 를 기다린다). 판정이 영영 서
+        있으면 워크플로를 먼저 켜 두지 않은 사람의 새 잡이 며칠 뒤에도 줄도 서지 못하고 곧바로 실패했다."""
+        return st.absent_at is not None and now - st.absent_at < self.settings.wait_s
 
     def _sweep(self, now: float) -> None:
-        """한도를 적용한다 — ① 집힌 과제가 있는 주인은 바쁘다(있다) ② 답 한도를 넘긴 집힘은 한 번 되돌리고 두 번째면 실패
-        ③ 주인이 WAIT_S 동안 아무것도 집거나 내지 않은 채 기다린 과제는 '없다' 로 실패(그 주인의 기다리는 과제 전부). 되돌린 집힘은
-        임대를 지운다."""
+        """한도를 적용한다 — ① 집힌 과제가 있는 주인은 바쁘다(있다) ② 답 한도를 넘긴 집힘은 한 번 되돌리고(임대를 지운다) 두
+        번째면 실패 ③ 주인이 WAIT_S 동안 아무것도 집거나 내지 않은 채 기다린 과제는 '없다' 로 실패(그 주인의 기다리는 과제 전부)
+        ④ 과제도 없이 하루 넘게 조용한 주인 칸은 지운다."""
         s = self.settings
         for t in self._tasks.values():
             if t.state == "claimed":
-                self._owners.setdefault(t.owner, _Owner()).alive_at = now
+                st = self._owners.get(t.owner)
+                if st is None:
+                    st = self._owners[t.owner] = _Owner(now)
+                st.alive_at = st.last = now
         for t in list(self._tasks.values()):
             if t.state == "claimed" and now >= t.deadline:
                 if t.claims >= 2:
@@ -443,11 +461,21 @@ class Board:
                     t.state, t.unclaimed_since, t.deadline, t.lease, t.buf, t.received = "waiting", now, None, None, [], 0
                     log.info("[external] 과제 %s 답 한도 %gs 초과 — 줄로 되돌렸다(한 번)", t.id, s.answer_s)
         for t in sorted((x for x in self._tasks.values() if x.state == "waiting"), key=lambda x: x.seq):
-            st = self._owners.setdefault(t.owner, _Owner())
+            st = self._owners.get(t.owner)
+            if st is None:
+                st = self._owners[t.owner] = _Owner(now)
             seen = st.alive_at if st.alive_at is not None else -math.inf
-            if st.absent or now - max(t.unclaimed_since, seen) >= s.wait_s:
-                st.absent = True
+            standing = self._standing(st, now)
+            if standing or now - max(t.unclaimed_since, seen) >= s.wait_s:
+                if not standing:
+                    st.absent_at = now
+                st.last = now
                 self._fail(t, _absent(s, standing=False))
+        if now - self._pruned_at >= _PRUNE_EVERY_S:
+            self._pruned_at = now
+            busy = {t.owner for t in self._tasks.values()}
+            for o in [o for o, st in self._owners.items() if o not in busy and now - st.last > OWNER_IDLE_S]:
+                del self._owners[o]
 
     def _fail(self, t: _Task, err: ExternalLLMError) -> None:
         del self._tasks[t.id]

@@ -190,7 +190,7 @@ def test_아무도_집지_않으면_WAIT_S_뒤에_absent_이고_그_뒤로는_�
 
     first, fast, msg = asyncio.run(go())
     assert (first.code, first.knob, fast.code) == ("external_worker_absent", "EXTERNAL_LLM_WAIT_S", "external_worker_absent")
-    assert "300초" in first.message and "다시 붙을 때까지" in fast.message
+    assert "300초" in first.message and "다시 붙거나" in fast.message and "300초가 지날 때까지" in fast.message
     assert msg.content == "다시 붙은 답"
 
 

@@ -427,3 +427,57 @@ def test_근거_몫_캐시는_창과_값을_한_덩이로_두어_다른_창의_�
         sys.setswitchinterval(old)
         d._evid_cache.clear()
     assert not bad, bad[:5]
+
+
+# ── L2. '없다' 판정은 WAIT_S 뒤에 풀린다 ────────────────────────────────────────────
+def test_없다_판정은_WAIT_S_동안만_서고_그_뒤의_새_과제는_다시_줄을_선다(stub):
+    """탐침 p01 standing_absent — 종전엔 한 번 '없다' 로 판정된 주인은 사흘 뒤의 새 잡도 줄을 서지 못하고 곧바로 실패했다(워크플로를
+    먼저 켜 두지 않았으면)."""
+    async def go():
+        first = _call(stub.app)
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        stub.clock.t += 301                                # 1301 — '없다' 판정
+        with pytest.raises(x.ExternalLLMError):
+            await first
+        with pytest.raises(x.ExternalLLMError) as fast:     # 판정 뒤 WAIT_S 안 — 줄 세우지 않고 바로
+            await _call(stub.app)
+        stub.clock.t += 299                                # 1600 — 아직 안(299초)
+        with pytest.raises(x.ExternalLLMError):
+            await _call(stub.app)
+        stub.clock.t += 1                                  # 1601 — 풀렸다
+        later = _call(stub.app, human="사흘 뒤의 새 잡")
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        await asyncio.sleep(0.1)
+        queued = not later.done()
+        h = await m.review_task_next(ctx=ctx_of(OWNER))      # 그 뒤에 켠 워크플로가 집는다
+        await m.review_task_submit(h["task_id"], h["lease"], "늦게 켠 워크플로의 답", final=True, ctx=ctx_of(OWNER))
+        return fast.value, queued, await later
+
+    fast, queued, msg = asyncio.run(go())
+    assert fast.code == "external_worker_absent" and "300초가 지날 때까지" in fast.message
+    assert queued, "판정이 풀린 뒤의 새 과제가 줄을 서지 못했다"
+    assert msg.content == "늦게 켠 워크플로의 답"
+
+
+# ── L8. 주인 칸 정리 ─────────────────────────────────────────────────────────────
+def test_과제도_없이_하루_넘게_조용한_주인_칸은_지운다(stub):
+    """탐침 p01 owners_growth — 워크플로 쪽 호출마다 신원별 칸이 생기고 지워지지 않았다(2만 신원이면 2만 칸)."""
+    for i in range(2000):
+        stub.board.claim(f"u{i}@x.com")
+    assert len(stub.board._owners) == 2000
+
+    async def go():
+        stub.clock.t += x.OWNER_IDLE_S - 1               # 아직 하루가 안 됐다
+        stub.board.sweep()
+        young = len(stub.board._owners)
+        stub.clock.t += x._PRUNE_EVERY_S + 2
+        call = _call(stub.app)
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        kept = set(stub.board._owners)
+        h = await m.review_task_next(ctx=ctx_of(OWNER))
+        await m.review_task_submit(h["task_id"], h["lease"], "답", final=True, ctx=ctx_of(OWNER))
+        await call
+        return young, kept
+
+    young, kept = asyncio.run(go())
+    assert young == 2000 and kept == {OWNER}
