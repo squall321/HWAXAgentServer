@@ -33,6 +33,10 @@
   "code": "external_owner_missing",
   "message": "외부 응답자 과제를 줄 사람(호출자 신원)이 없다 — 포털이나 게이트웨이를 지나 잡 주인의 신원으로 부른다."
  },
+ "refused_consent_required": {
+  "code": "external_consent_required",
+  "message": "외부 응답자 심의는 근거·지식카드 글을 외부(Claude)로 보낸다 — 같은 delib_opts(MCP 는 advanced)에 consent_external: true 를 실어야 연다. 이 심의는 시작하지 않았다(과제를 만들지 않았다). llm 을 빼면 이 서버의 LLM 으로 돈다."
+ },
  "refused_disabled": {
   "code": "external_llm_disabled",
   "message": "이 서버는 외부 응답자 길(delib_opts.llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). llm 을 빼면 이 서버의 LLM 으로 돈다.",
@@ -66,6 +70,7 @@
     "started_by": "app",
     "rounds": 3,
     "llm": "external",
+    "consent_external": true,
     "evidence": [
      {
       "key": "I1",

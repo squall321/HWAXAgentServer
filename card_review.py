@@ -3525,8 +3525,10 @@ class RunRequest(_Ident):
     extra: RunExtra | None = None
     expect: RunExpect | None = None
     # 판단 LLM — 없거나 glm 이면 종전 그대로(이 서버의 심의 LLM). external 이면 외부 응답자(EXTERNAL_LLM_ENABLED 박스만 — 꺼져 있으면
-    # 409 external_llm_disabled, 신원(user_email)이 없으면 422 external_owner_missing). 반출 동의는 리스크 앱이 잡마다 받는다(X-2).
+    # 409 external_llm_disabled, consent_external 이 true 가 아니면 422 external_consent_required, 신원(user_email)이 없으면 422
+    # external_owner_missing). 엔진이 보는 반출 동의는 consent_external 표지뿐이다 — 사람에게 동의를 받는 것은 리스크 앱이다(X-2).
     llm: Literal["glm", "external"] | None = None
+    consent_external: bool | None = None
 
 
 class PackRequest(_Ident):
@@ -3625,14 +3627,22 @@ _EXTERNAL_OFF = ("이 서버는 외부 응답자 길(llm=external)을 열지 않
 
 
 def refuse_external(app, llm, body: dict | None = None) -> None:
-    """외부 응답자 길의 거절 — 스트림을 열기 전에. 꺼진 박스면 409 external_llm_disabled(요청이 틀린 것이 아니라 서버가 그 길을 안
-    연다 — 앱은 세지 않고 잡을 멈춘다). run(body 를 준다)인데 신원(user_email)이 없으면 422 external_owner_missing — 과제를 누구의
-    워크플로에 줄지 모른다(포털 중계를 지난 호출에는 늘 있다). llm 이 없거나 glm 이면 아무것도 하지 않는다."""
+    """외부 응답자 길의 거절 — 스트림을 열기 전에(과제를 만들기 전에). 꺼진 박스면 409 external_llm_disabled(요청이 틀린 것이 아니라
+    서버가 그 길을 안 연다 — 앱은 세지 않고 잡을 멈춘다). run(body 를 준다)이면 그다음 차례로 — consent_external 이 true 가 아니면
+    422 external_consent_required(카드·변경 원문이 밖으로 나가는 요청마다 실어야 한다 — limits·plan 은 글이 나가지 않아 묻지
+    않는다), 신원(user_email)이 없으면 422 external_owner_missing(과제를 누구의 워크플로에 줄지 모른다 — 포털 중계를 지난 호출에는
+    늘 있다). llm 이 없거나 glm 이면 아무것도 하지 않는다."""
     if llm != "external":
         return
     if external_llm.board_of(app) is None:
         raise RequestError("external_llm_disabled", _EXTERNAL_OFF, status=409, knob=external_llm.ENABLED_ENV)
-    if body is not None and not str(body.get("user_email") or "").strip():
+    if body is None:
+        return
+    if body.get(external_llm.CONSENT_FIELD) is not True:
+        raise RequestError("external_consent_required", "외부 응답자 길은 카드·설계 변경 원문을 외부(Claude)로 보낸다 — run 본문에 "
+                           "consent_external: true 를 실어야 연다(엔진이 보는 동의는 이 표지뿐이다 — 사람에게 동의를 받는 것은 "
+                           "부르는 쪽이다). 과제를 만들지 않았다", status=422)
+    if not str(body.get("user_email") or "").strip():
         raise RequestError("external_owner_missing", "외부 응답자 과제를 줄 사람(user_email)이 없다 — 포털 중계를 지나 잡 주인의 "
                            "신원으로 부른다(과제는 그 사람의 Claude Code 워크플로만 집는다)", status=422)
 

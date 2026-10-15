@@ -334,5 +334,6 @@
  },
  "manifest": [],
  "extra": {},
- "llm": "external"
+ "llm": "external",
+ "consent_external": true
 }

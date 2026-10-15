@@ -67,9 +67,11 @@ ERRORS = {
     "external_worker_absent": (True, True),
     "external_answer_timeout": (True, True),
 }
-# 스트림을 열기 전의 거절 — {code: HTTP 상태}. 꺼진 서버는 409(요청이 틀린 것이 아니라 서버가 그 길을 안 연다), 신원 없는 외부
-# 호출은 422(과제를 누구에게 줄지 모른다 — 포털 중계를 지난 호출에는 늘 있다).
-REFUSALS = {"external_llm_disabled": 409, "external_owner_missing": 422}
+# 스트림을 열기 전의 거절 — {code: HTTP 상태}. 꺼진 서버는 409(요청이 틀린 것이 아니라 서버가 그 길을 안 연다), 반출 동의 표지
+# (consent_external: true)가 없는 외부 호출은 422(과제를 만들기 전에 — 글이 밖으로 나가는 요청마다 실어야 한다), 신원 없는 외부
+# 호출은 422(과제를 누구에게 줄지 모른다 — 포털 중계를 지난 호출에는 늘 있다). 이 차례로 본다.
+REFUSALS = {"external_llm_disabled": 409, "external_consent_required": 422, "external_owner_missing": 422}
+CONSENT_FIELD = "consent_external"
 
 # 외부 응답자 심의의 창 — 그 심의를 도는 태스크(문맥) 안에서만 app._model_context_tokens() 가 이 값을 돌려준다. 심의의 예산(근거·
 # 전사·역할 몫)은 전부 창에서 유도되는데 GLM 창(1백만 토큰)으로 짠 프롬프트는 외부 모델이 받지 못한다.

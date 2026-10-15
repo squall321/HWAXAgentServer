@@ -233,3 +233,46 @@ def test_MCP_로_연_외부_심의는_게이트웨이_헤더를_풀어_과제_�
     assert job["status"] == "done", job.get("error")
     assert job["user"] == hdr, "잡 주인은 헤더 원문 그대로다"
     assert owners and set(owners) == {"first+tag@x.com"} and w.seen
+
+
+# ── 4. 반출 동의 표지(엔진의 겹 방어) ─────────────────────────────────────────────
+def test_카드_대조_run_은_consent_external_true_가_없으면_과제를_만들기_전에_422_다(env):
+    c, board = env.client, env.board
+    one = {**REQUESTS["verdict_one"], **IDENT, "llm": "external"}
+    for consent in (None, False, "true", 1):
+        body = dict(one) if consent is None else {**one, "consent_external": consent}
+        r = c.post("/card-review/run", json=body)
+        assert (r.status_code, r.json()["code"]) == (422, "external_consent_required"), (consent, r.text[:200])
+    r = c.post("/card-review/run", json={**one, "user_email": ""})
+    assert r.json()["code"] == "external_consent_required", "동의 표지를 신원보다 먼저 본다"
+    assert board.counts() == {"queued": 0, "claimed": 0}
+    # limits·plan 은 글이 나가지 않아 묻지 않는다 · GLM 길은 표지와 상관없다
+    assert c.get("/card-review/limits", params={"llm": "external"}).status_code == 200
+    assert c.post("/card-review/plan", json={"cards": [], "units": [], "llm": "external"}).status_code == 200
+    rg = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT}))
+    assert [e for e, _ in rg][-2:] == ["result", "done"]
+
+
+def test_심의_입구_셋과_MCP_시작은_반출_동의_표지가_없으면_과제_없이_거절한다(monkeypatch, tmp_path):
+    from test_external_llm_delib import _mcp, _panel
+
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    for entry in (d.run_deliberation, d.run_sim_deliberation, d.run_test_plan):
+        for consent in (None, False, "true"):
+            events, _w, _bound, _tools, board = _panel(monkeypatch, {"consent_external": consent}, worker=False,
+                                                       entry=entry)
+            assert [ev for ev, _ in events] == ["error", "done"], (entry, consent)
+            assert events[0][1]["code"] == "external_consent_required" and board.counts() == {"queued": 0, "claimed": 0}
+    with pytest.raises(ValueError, match="^external_consent_required"):
+        _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "voc": "off"})
+    assert delib_jobs._JOBS == {}
+
+
+def test_도구_설명은_서버가_표지_밖의_동의를_본다고_말하지_않고_의장_결정문의_꼴을_적는다():
+    assert "서버가 보는 것은 그 표지 하나다" in m._TASK_EGRESS and "consent_external: true" in m._TASK_EGRESS
+    assert "동의는 리스크 앱이 잡마다 받는다" not in m._TASK_EGRESS
+    assert "마크다운 결정문" in m._TASK_FORMAT and "```json 코드 펜스로 감싼 risk_spec" in m._TASK_FORMAT
+    on = FastMCP(name="on")
+    assert m._register_external(on, env={"EXTERNAL_LLM_ENABLED": "1"}) is True
+    for t in asyncio.run(on.list_tools()):
+        assert "consent_external" in t.description, t.name

@@ -32,6 +32,7 @@ TK = "diff:" + "ab" * 16
 Q = f"[리스크심사 S26 Ultra {TK}] 쟁점 패널 — 보스 간극"
 PANEL = {"personas": SEATS, "free_tools": 1, "tool_budget": 3, "tools": [], "voc": "off", "rescreen": 0,
          "chair_template": "risk-review", "save_report": 0, "started_by": "app", "rounds": 3, "llm": "external",
+         "consent_external": True,
          "evidence": [{"key": "I1", "source": "쟁점 닻", "result": f"{TK} · mechanical.drop_stress · ck:0123456789ab"}]}
 
 
@@ -224,7 +225,8 @@ def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER)):
 
 
 def test_MCP_심의_시작도_외부_응답자로_돌고_잡_기록에_llm_과_tool_mode_가_남는다(monkeypatch, tmp_path, ctx_1m, on):
-    out, done, tr = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "voc": "off", "free_tools": 1})
+    out, done, tr = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "voc": "off",
+                                                          "free_tools": 1})
     assert (out["llm"], out["tool_mode"]) == ("external", "evidence_only")
     assert done["status"] == "done", done.get("error")
     assert (done["llm"], done["applied_opts"]["llm"], done["applied_opts"]["free_tools"]) == ("external", "external", 0)
@@ -239,7 +241,7 @@ def test_MCP_심의_시작은_꺼진_서버와_신원_없는_호출을_잡을_�
     assert delib_jobs._JOBS == {}
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
     with pytest.raises(ValueError, match="^external_owner_missing"):
-        _mcp(monkeypatch, tmp_path, advanced={"llm": "external"}, ctx=None)
+        _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True}, ctx=None)
     assert delib_jobs._JOBS == {}
 
 

@@ -29,6 +29,8 @@ from test_card_review_contract import REQUESTS  # noqa: E402
 OWNER = "owner@x.com"
 IDENT = {"groups": ["g"], "user_email": OWNER, "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
 CTX, MT = 200_000, 32_000
+# 외부 응답자 run 본문 — 판단 LLM 과 반출 동의 표지(consent_external: true — 없으면 422 external_consent_required).
+EXT = {"llm": "external", "consent_external": True}
 KIND_REQ = {"verdict": "verdict_fwd", "sweep": "sweep", "offcard": "offcard", "noinput": "noinput",
             "summary": "summary_domain"}
 
@@ -90,7 +92,7 @@ def test_다섯_종류가_외부_응답자로_GLM_길과_같은_프롬프트와_
     glm = FakeLLM(["oracle"], max_tokens=MT)
     _, (ev_g, res_g) = _run(env, body, llm=glm)
     with FakeWorker(OWNER).thread() as w:
-        _, (ev_x, res_x) = _run(env, {**body, "llm": "external"})
+        _, (ev_x, res_x) = _run(env, {**body, **EXT})
     assert (ev_g, ev_x) == ("result", "result"), (res_g, res_x)
     assert [(c["system"], c["human"]) for c in glm.calls] == [(s["system"], s["human"]) for s in w.seen], \
         "두 길의 프롬프트가 다르다"
@@ -114,7 +116,7 @@ def test_보충은_새_과제로_오고_결과가_GLM_길의_보충과_같다(en
     glm = FakeLLM(["skip_middle", "oracle"], max_tokens=MT)
     _, (_, res_g) = _run(env, body, llm=glm)
     with FakeWorker(OWNER, brain=_scripted("skip_middle", "oracle")).thread() as w:
-        _, (_, res_x) = _run(env, {**body, "llm": "external"})
+        _, (_, res_x) = _run(env, {**body, **EXT})
     assert res_x["quality"]["attempts"] == res_g["quality"]["attempts"] == 2
     assert res_x["rows"] == res_g["rows"] and res_x["missing"] == res_g["missing"] == []
     assert [s["human"] for s in w.seen] == [c["human"] for c in glm.calls], "보충 프롬프트(지적 블록)가 다르다"
@@ -124,7 +126,7 @@ def test_보충은_새_과제로_오고_결과가_GLM_길의_보충과_같다(en
 # ── 한도 — 기존 오류 길로, 코드가 보이게 ─────────────────────────────────────────────
 def test_일꾼이_없으면_첫_시도가_external_worker_absent_error_프레임으로_끝난다(env):
     board = env.use(x.Board(x.Settings(ctx_tokens=CTX, max_tokens=MT, wait_s=300), clock=scaled(), tick=0.02))
-    frames, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, "llm": "external"})
+    frames, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, **EXT})
     assert [e for e, _ in frames] == ["status", "error", "done"]
     assert ev == "error" and {k: err[k] for k in ("code", "infra", "retryable", "knob", "attempt")} == {
         "code": "external_worker_absent", "infra": True, "retryable": True, "knob": "EXTERNAL_LLM_WAIT_S", "attempt": 1}
@@ -136,7 +138,7 @@ def test_일꾼이_없으면_첫_시도가_external_worker_absent_error_프레�
 def test_집고_답하지_않으면_한_번_되돌린_뒤_external_answer_timeout_이다(env):
     env.use(x.Board(x.Settings(ctx_tokens=CTX, max_tokens=MT, wait_s=3000, answer_s=1200), clock=scaled(), tick=0.02))
     with FakeWorker(OWNER, hold=True, poll_s=0.05).thread() as w:
-        _, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, "llm": "external"})
+        _, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, **EXT})
     assert (ev, err["code"], err["infra"], err["retryable"], err["knob"]) == (
         "error", "external_answer_timeout", True, True, "EXTERNAL_LLM_ANSWER_S")
     assert [s["head"]["claim"] for s in w.seen] == [1, 2] and len({s["head"]["task_id"] for s in w.seen}) == 1
@@ -159,7 +161,7 @@ def test_보충_중의_외부_한도는_받은_행을_버리지_않고_repair_er
         w._stop.set()                     # 첫 답만 내고 떠난다 — 보충 과제는 아무도 집지 않는다
     w.handle = handle_then_quit
     with w.thread():
-        _, (ev, res) = _run(env, {**REQUESTS["verdict_fwd"], **IDENT, "llm": "external"})
+        _, (ev, res) = _run(env, {**REQUESTS["verdict_fwd"], **IDENT, **EXT})
     assert ev == "result" and res["rows"], res
     # GLM 길(계약 예제 verdict_repair_error)과 같은 모양 — 실패한 보충도 시도로 센다.
     assert {k: res["quality"]["repair_error"][k] for k in ("code", "attempt")} == {
@@ -173,7 +175,7 @@ def test_외부_호출도_관문을_지나고_비우기면_과제를_만들지_�
     board = a.app.state.external_board
     cr.gate_of(a.app).drain.set_on(scope="all", by="update-all", ttl_s=600)
     try:
-        _, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, "llm": "external"})
+        _, (ev, err) = _run(env, {**REQUESTS["verdict_one"], **IDENT, **EXT})
     finally:
         cr.gate_of(a.app).drain.set_off(by="update-all")
     assert (ev, err["code"], err["reason"]) == ("error", "review_busy", "draining")
@@ -184,7 +186,7 @@ def test_스트림이_닫히면_과제가_줄에서_빠지고_자리를_돌려�
     """구독이 끊기면(포털·앱이 스트림을 놓으면) LLM 태스크가 취소된다 — 외부 응답자면 그 과제가 줄에서 빠진다."""
     board = a.app.state.external_board
     lim = cr.limits(CTX, "external", MT, model="external", max_tokens_source="external", llm="external")
-    prep = cr.prepare({**REQUESTS["verdict_one"], **IDENT, "llm": "external"}, lim)
+    prep = cr.prepare({**REQUESTS["verdict_one"], **IDENT, **EXT}, lim)
 
     async def go():
         gen = cr.run(a.app, prep)
@@ -240,7 +242,7 @@ def _one():
 def test_꺼진_서버는_external_요청을_409_로_거절하고_GLM_길은_종전_그대로다(client):
     for r in (client.get("/card-review/limits", params={"llm": "external"}),
               client.post("/card-review/plan", json={"cards": [], "units": [], "llm": "external"}),
-              client.post("/card-review/run", json={**_one(), "llm": "external"})):
+              client.post("/card-review/run", json={**_one(), **EXT})):
         assert (r.status_code, r.json()["code"], r.json()["knob"]) == (409, "external_llm_disabled", "EXTERNAL_LLM_ENABLED")
     assert client.get("/card-review/limits").json() == client.get("/card-review/limits", params={"llm": "glm"}).json()
 
@@ -261,17 +263,17 @@ def test_켜진_서버의_limits_와_plan(client, on):
 
 def test_켜진_서버의_external_run_거절(client, on):
     one = _one()
-    r = client.post("/card-review/run", json={**one, "llm": "external", "user_email": ""})
+    r = client.post("/card-review/run", json={**one, **EXT, "user_email": ""})
     assert (r.status_code, r.json()["code"]) == (422, "external_owner_missing")
     r = client.post("/card-review/run", json={**one, "llm": "gpt"})
     assert (r.status_code, r.json()["code"]) == (422, "bad_request")
     r = client.get("/card-review/limits", params={"llm": "gpt"})
     assert (r.status_code, r.json()["code"]) == (422, "bad_request")
     lim = client.get("/card-review/limits").json()          # GLM 판을 기대한 외부 호출 — 판이 달라 409
-    r = client.post("/card-review/run", json={**one, "llm": "external",
+    r = client.post("/card-review/run", json={**one, **EXT,
                                               "expect": {"limits_rev_kind": lim["limits_rev_by_kind"]["verdict"]}})
     assert (r.status_code, r.json()["code"]) == (409, "rev_mismatch")
-    r = client.post("/card-review/run", json={**one, "llm": "external", "entitlements": ["feat:thinking"]})
+    r = client.post("/card-review/run", json={**one, **EXT, "entitlements": ["feat:thinking"]})
     assert (r.status_code, r.json()["code"]) == (403, "denied"), "권한 거절이 먼저다"
 
 

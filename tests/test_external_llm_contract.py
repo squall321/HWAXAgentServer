@@ -42,6 +42,8 @@ OWNER = "owner@x.com"
 # 포털 중계가 덮어쓰는 신원 칸 넷 — 예제 요청 파일에는 싣지 않고 보낼 때만 더한다(GLM 예제와 같다). 외부 길은 user_email 이 있어야 한다.
 IDENT = {"groups": ["g"], "user_email": OWNER, "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
 T0 = 1_760_400_000.0          # 고정한 벽시계(유닉스 초) — answer_deadline·created_at 이 다시 떠도 같다
+# 외부 응답자 run 본문의 두 칸 — 판단 LLM 과 반출 동의 표지(없으면 422 external_consent_required).
+EXT = {"llm": "external", "consent_external": True}
 
 
 class Clock:
@@ -153,23 +155,24 @@ def produce(monkeypatch) -> dict:
     c = _setup(monkeypatch, None, enabled=False)
     for where, call in (("limits", lambda: c.get("/card-review/limits", params={"llm": "external"})),
                         ("plan", lambda: c.post("/card-review/plan", json={"cards": [], "units": [], "llm": "external"})),
-                        ("run", lambda: c.post("/card-review/run", json={**one, "llm": "external"}))):
+                        ("run", lambda: c.post("/card-review/run", json={**one, **EXT}))):
         r = call()
         rejects[f"external_llm_disabled.{where}"] = {"status": r.status_code, "body": r.json()}
     c = _setup(monkeypatch, fixed())
     lim_glm = c.get("/card-review/limits").json()
     for name, call in (
-            ("external_owner_missing.run", lambda: c.post("/card-review/run",
-                                                          json={**one, "llm": "external", "user_email": ""})),
+            ("external_consent_required.run", lambda: c.post("/card-review/run", json={**one, "llm": "external"})),
+            ("external_owner_missing.run", lambda: c.post("/card-review/run", json={**one, **EXT, "user_email": ""})),
             ("bad_request.limits", lambda: c.get("/card-review/limits", params={"llm": "claude"})),
             ("bad_request.run", lambda: c.post("/card-review/run", json={**one, "llm": "claude"})),
             ("rev_mismatch.run", lambda: c.post("/card-review/run", json={
-                **one, "llm": "external", "expect": {"limits_rev_kind": lim_glm["limits_rev_by_kind"]["verdict"]}}))):
+                **one, **EXT, "expect": {"limits_rev_kind": lim_glm["limits_rev_by_kind"]["verdict"]}}))):
         r = call()
         rejects[name] = {"status": r.status_code, "body": r.json()}
     files["rejects.json"] = _dump({"_how": {
         "external_llm_disabled.*": "EXTERNAL_LLM_ENABLED 가 꺼진 서버에 llm=external(limits 는 ?llm=external)",
-        "external_owner_missing.run": "req_verdict_one + 신원 칸에서 user_email 을 비웠다",
+        "external_consent_required.run": "req_verdict_one + llm=external, consent_external 없이(true 가 아니면 같다)",
+        "external_owner_missing.run": "req_verdict_one + llm=external·consent_external=true + 신원 칸에서 user_email 을 비웠다",
         "bad_request.*": "llm 에 모르는 값('claude') — 받는 값은 glm·external 뿐이다(앱의 'claude' 는 엔진에 'external' 로 보낸다)",
         "rev_mismatch.run": "GLM limits 의 limits_rev_by_kind.verdict 를 expect 로 실은 외부 run — 두 길의 판은 갈린다"},
         **rejects})
@@ -179,7 +182,7 @@ def produce(monkeypatch) -> dict:
     for scene, req_name, brain in (("verdict_ok", "verdict_fwd", None),
                                    ("verdict_repaired", "verdict_fwd", _scripted("skip_middle", "oracle"))):
         c = _setup(monkeypatch, fixed())
-        body = {**REQUESTS[req_name], "llm": "external"}
+        body = {**REQUESTS[req_name], **EXT}
         files[f"req_{scene}.json"] = _dump(body)
         with FakeWorker(OWNER, **({"brain": brain} if brain else {})).thread() as w:
             frames = _run(c, {**body, **IDENT})
@@ -196,14 +199,14 @@ def produce(monkeypatch) -> dict:
         c = _setup(monkeypatch, x.Board(settings, clock=scaled(), tick=0.02, new_id=_ids()))
         if hold:
             with FakeWorker(OWNER, hold=True, poll_s=0.05).thread():
-                frames = _run(c, {**REQUESTS["verdict_one"], "llm": "external", **IDENT})
+                frames = _run(c, {**REQUESTS["verdict_one"], **EXT, **IDENT})
         else:
-            frames = _run(c, {**REQUESTS["verdict_one"], "llm": "external", **IDENT})
+            frames = _run(c, {**REQUESTS["verdict_one"], **EXT, **IDENT})
         files[f"run_{code}.sse"] = _sse(frames)
         event, last = frames[-2]
         assert (event, last["code"]) == ("error", code), last
         files[f"error_{code}.json"] = _dump(last)
-        index[code] = {"request": "req_verdict_one(GLM 계약 예제) + llm=external", "frames": f"run_{code}.sse",
+        index[code] = {"request": "req_verdict_one(GLM 계약 예제) + llm=external·consent_external=true", "frames": f"run_{code}.sse",
                        "final": f"error_{code}.json",
                        "how": "일꾼 없음" if not hold else "일꾼이 집고 답하지 않는다(한 번 되돌린 뒤 두 번째 집힘도 넘김)",
                        "settings": {"wait_s": settings.wait_s, "answer_s": settings.answer_s}}
@@ -296,6 +299,8 @@ def _delib_frames(monkeypatch) -> dict:
     out["chair_failed_absent"] = next(data for ev, data in events if ev == "error")
     events, *_ = _panel(monkeypatch, user="", worker=False)
     out["refused_owner_missing"] = events[0][1]
+    events, *_ = _panel(monkeypatch, {"consent_external": False}, worker=False)
+    out["refused_consent_required"] = events[0][1]
     monkeypatch.delenv("EXTERNAL_LLM_ENABLED")
     events, *_ = _panel(monkeypatch, worker=False)
     out["refused_disabled"] = events[0][1]
@@ -335,7 +340,8 @@ def test_외부_길의_오류_코드마다_예제가_있다():
     rejects = _load("rejects.json")
     assert {k: v["status"] for k, v in rejects.items() if k != "_how"} == {
         "external_llm_disabled.limits": 409, "external_llm_disabled.plan": 409, "external_llm_disabled.run": 409,
-        "external_owner_missing.run": 422, "bad_request.limits": 422, "bad_request.run": 422, "rev_mismatch.run": 409}
+        "external_consent_required.run": 422, "external_owner_missing.run": 422, "bad_request.limits": 422,
+        "bad_request.run": 422, "rev_mismatch.run": 409}
     assert all(v["body"]["code"] == k.split(".")[0] for k, v in rejects.items() if k != "_how")
 
 
@@ -363,5 +369,7 @@ def test_예제가_계약의_칸을_싣는다():
     frames = _load("delib_frames.json")
     assert (frames["result"]["llm"], frames["result"]["tool_mode"]) == ("external", "evidence_only")
     assert frames["seat_lost_absent"]["cause"] == frames["chair_failed_absent"]["cause"] == "external_worker_absent"
-    assert (frames["refused_disabled"]["code"], frames["refused_owner_missing"]["code"]) == (
-        "external_llm_disabled", "external_owner_missing")
+    assert (frames["refused_disabled"]["code"], frames["refused_owner_missing"]["code"],
+            frames["refused_consent_required"]["code"]) == (
+        "external_llm_disabled", "external_owner_missing", "external_consent_required")
+    assert _load("req_verdict_ok.json")["consent_external"] is True, "외부 run 예제 본문에 반출 동의 표지가 있어야 한다"

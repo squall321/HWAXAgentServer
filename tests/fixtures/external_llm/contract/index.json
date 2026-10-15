@@ -14,7 +14,7 @@
   "tasks": 2
  },
  "external_worker_absent": {
-  "request": "req_verdict_one(GLM 계약 예제) + llm=external",
+  "request": "req_verdict_one(GLM 계약 예제) + llm=external·consent_external=true",
   "frames": "run_external_worker_absent.sse",
   "final": "error_external_worker_absent.json",
   "how": "일꾼 없음",
@@ -24,7 +24,7 @@
   }
  },
  "external_answer_timeout": {
-  "request": "req_verdict_one(GLM 계약 예제) + llm=external",
+  "request": "req_verdict_one(GLM 계약 예제) + llm=external·consent_external=true",
   "frames": "run_external_answer_timeout.sse",
   "final": "error_external_answer_timeout.json",
   "how": "일꾼이 집고 답하지 않는다(한 번 되돌린 뒤 두 번째 집힘도 넘김)",

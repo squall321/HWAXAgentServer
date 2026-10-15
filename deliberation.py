@@ -1237,7 +1237,9 @@ def _wants_external(req_opts) -> bool:
 
 def _external_refusal(app, req_opts, user: str) -> dict | None:
     """외부 응답자 심의(delib_opts.llm=external)를 받을 수 없으면 오류 칸 {code, message, knob?}, 받으면(또는 external 이 아니면)
-    None. 꺼진 서버는 external_llm_disabled, 신원 없는 호출은 external_owner_missing 이다(과제를 누구의 워크플로에 줄지 모른다)."""
+    None. 차례 — 꺼진 서버는 external_llm_disabled, 반출 동의 표지(consent_external: true)가 없으면
+    external_consent_required(글이 밖으로 나가는 요청마다 실어야 한다 — 엔진이 보는 것은 이 표지뿐이다), 신원 없는 호출은
+    external_owner_missing 이다(과제를 누구의 워크플로에 줄지 모른다)."""
     if not _wants_external(req_opts):
         return None
     if external_llm.board_of(app) is None:
@@ -1245,6 +1247,11 @@ def _external_refusal(app, req_opts, user: str) -> dict | None:
                 "message": "이 서버는 외부 응답자 길(delib_opts.llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 "
                            "된다(/health 의 capabilities 에 external_llm 이 있는지 본다). llm 을 빼면 이 서버의 LLM 으로 돈다.",
                 "knob": external_llm.ENABLED_ENV}
+    if req_opts.get(external_llm.CONSENT_FIELD) is not True:
+        return {"code": "external_consent_required",
+                "message": "외부 응답자 심의는 근거·지식카드 글을 외부(Claude)로 보낸다 — 같은 delib_opts(MCP 는 advanced)에 "
+                           "consent_external: true 를 실어야 연다. 이 심의는 시작하지 않았다(과제를 만들지 않았다). llm 을 빼면 이 "
+                           "서버의 LLM 으로 돈다."}
     if not str(user or "").strip():
         return {"code": "external_owner_missing",
                 "message": "외부 응답자 과제를 줄 사람(호출자 신원)이 없다 — 포털이나 게이트웨이를 지나 잡 주인의 신원으로 부른다."}

@@ -622,7 +622,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
     applied = {**applied, **{k: getattr(_read, k) for k in applied
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
-    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·신원 없음) 잡을 만들기 전에 거절한다. 받으면 잡 기록에 판단
+    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다. 받으면 잡 기록에 판단
     # LLM 과 실제로 걸린 free_tools(evidence_only 라 0)를 적는다 — 보낸 값이 아니라 걸린 값이다(위와 같은 규칙).
     _refused = _external_refusal(app, applied, owner or user_email)
     if _refused:
