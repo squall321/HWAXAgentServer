@@ -317,12 +317,12 @@ def test_긴_프롬프트는_20000자_안의_쪽으로_나뉘고_이어_붙이�
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 def test_설정과_스위치():
     s = x.Settings.from_env({})
-    assert (s.ctx_tokens, s.max_tokens, s.wait_s, s.answer_s) == (200_000, 32_000, 300.0, 1200.0)
+    assert (s.ctx_tokens, s.max_tokens, s.wait_s, s.answer_s, s.max_inflight) == (200_000, 32_000, 300.0, 1200.0, 8)
     assert s.call_worst_s == 3000.0
-    bad = x.Settings.from_env({"EXTERNAL_LLM_CTX_TOKENS": "많이", "EXTERNAL_LLM_WAIT_S": "0", "EXTERNAL_LLM_ANSWER_S": "-1",
-                               "EXTERNAL_LLM_MAX_TOKENS": "64000"})
-    assert (bad.ctx_tokens, bad.wait_s, bad.answer_s, bad.max_tokens) == (200_000, 300.0, 1200.0, 64_000), \
-        "한도를 끄는 값은 없다 — 0·음수·못 읽는 값은 기본값"
+    ok = x.Settings.from_env({"EXTERNAL_LLM_MAX_TOKENS": "64000", "EXTERNAL_LLM_WAIT_S": " 120.5 "})
+    assert (ok.max_tokens, ok.wait_s) == (64_000, 120.5)
+    with pytest.raises(x.ConfigError):            # 못 읽는 값은 기본값으로 메우지 않는다(닫는 판정은 config — 회귀 시험 L6)
+        x.Settings.from_env({"EXTERNAL_LLM_WAIT_S": "0"})
     for v, want in (("1", True), ("on", True), ("TRUE", True), ("", False), ("0", False), ("off", False),
                     ("1 # 켬", False), ("yes please", False)):
         assert x.enabled({"EXTERNAL_LLM_ENABLED": v}) is want, v

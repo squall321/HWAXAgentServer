@@ -3642,7 +3642,7 @@ async def limits_now(app, llm: str | None = None) -> dict:
     if llm == "external":
         board = external_llm.board_of(app)
         if board is None:
-            raise RequestError("external_llm_disabled", _EXTERNAL_OFF, status=409, knob=external_llm.ENABLED_ENV)
+            raise _external_off()
         s = board.settings
         lim = limits(s.ctx_tokens, "external", s.max_tokens, model="external", max_tokens_source="external",
                      llm="external")
@@ -3667,6 +3667,13 @@ _EXTERNAL_OFF = ("이 서버는 외부 응답자 길(llm=external)을 열지 않
                  "capabilities 에 external_llm 이 있는지 본다). GLM(기본)으로 돌리거나 서버 설정을 켠다")
 
 
+def _external_off() -> RequestError:
+    """409 external_llm_disabled — 스위치를 켰는데 설정 오류로 닫혔으면 그 기동 오류 줄과 고칠 설정 이름을 싣는다."""
+    cfg = external_llm.config()
+    return RequestError("external_llm_disabled", _EXTERNAL_OFF + (f" — 지금은 {cfg.error}" if cfg.error else ""),
+                        status=409, knob=cfg.knob or external_llm.ENABLED_ENV)
+
+
 def refuse_external(app, llm, body: dict | None = None) -> None:
     """외부 응답자 길의 거절 — 스트림을 열기 전에(과제를 만들기 전에). 꺼진 박스면 409 external_llm_disabled(요청이 틀린 것이 아니라
     서버가 그 길을 안 연다 — 앱은 세지 않고 잡을 멈춘다). run(body 를 준다)이면 그다음 차례로 — consent_external 이 true 가 아니면
@@ -3676,7 +3683,7 @@ def refuse_external(app, llm, body: dict | None = None) -> None:
     if llm != "external":
         return
     if external_llm.board_of(app) is None:
-        raise RequestError("external_llm_disabled", _EXTERNAL_OFF, status=409, knob=external_llm.ENABLED_ENV)
+        raise _external_off()
     if body is None:
         return
     if body.get(external_llm.CONSENT_FIELD) is not True:

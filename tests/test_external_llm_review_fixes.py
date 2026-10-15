@@ -580,6 +580,94 @@ def test_외부_잡의_닫힌_free_tools_는_따로_적혀_GLM_이어하기가_�
     assert "free_tools" not in seen[1][0], "보내지 않은 값을 이어하기가 지어냈다"
 
 
+# ── L6. 켰는데 설정이 틀리면 닫힌다 ───────────────────────────────────────────────
+@pytest.mark.parametrize("name,raw,why", [
+    ("EXTERNAL_LLM_CTX_TOKENS", "많이", "정수로 읽지 못했다"),
+    ("EXTERNAL_LLM_CTX_TOKENS", "200000.0", "정수로 읽지 못했다"),
+    ("EXTERNAL_LLM_CTX_TOKENS", "512", "1024 미만"),
+    ("EXTERNAL_LLM_MAX_TOKENS", "0", "1 미만"),
+    ("EXTERNAL_LLM_WAIT_S", "0", "0.001 미만"),
+    ("EXTERNAL_LLM_WAIT_S", "nan", "유한한 수가 아니다"),
+    ("EXTERNAL_LLM_ANSWER_S", "inf", "유한한 수가 아니다"),
+    ("EXTERNAL_LLM_ANSWER_S", "-1", "0.001 미만"),
+    ("EXTERNAL_LLM_MAX_INFLIGHT", "0", "1 미만"),
+    ("EXTERNAL_LLM_MAX_INFLIGHT", "여덟", "정수로 읽지 못했다"),
+])
+def test_켰는데_값_하나라도_못_받으면_기본값으로_메우지_않고_닫힌다(name, raw, why):
+    cfg = x.config({"EXTERNAL_LLM_ENABLED": "1", name: raw})
+    assert cfg.settings is None and cfg.knob == name, cfg
+    assert why in cfg.error and "EXTERNAL_LLM_ENABLED=1 이지만" in cfg.error, cfg.error
+    if raw in ("nan", "inf"):
+        assert "미만" not in cfg.error, "nan·inf 를 '미만' 이라고 말했다"
+    assert x.is_open({"EXTERNAL_LLM_ENABLED": "1", name: raw}) is False
+    assert m._register_external(FastMCP(name="bad"), env={"EXTERNAL_LLM_ENABLED": "1", name: raw}) is False
+    assert x.config({name: raw}) == x.Config(None), "꺼진 서버는 값을 보지 않는다"
+
+
+def test_시간_한도_사슬이_깨지면_닫힌다():
+    env = {"EXTERNAL_LLM_ENABLED": "1", "EXTERNAL_LLM_WAIT_S": "900"}      # 2×900 + 2×1200 = 4,200 ≥ 2×1800 + 8
+    cfg = x.config(env)
+    assert cfg.settings is None and cfg.knob == "EXTERNAL_LLM_WAIT_S · EXTERNAL_LLM_ANSWER_S"
+    assert "4,200초" in cfg.error and "3,608초" in cfg.error
+    assert x.config({**env, "DELIB_TIMEOUT_S": "3000"}).settings.wait_s == 900, "심의 한도가 넉넉한 박스는 열린다"
+    assert x.config({**env, "DELIB_TIMEOUT_S": "0"}).settings is not None, "심의 한도를 끈 박스는 견줄 바깥 한도가 없다"
+    assert x.config({"EXTERNAL_LLM_ENABLED": "1", "DELIB_TIMEOUT_S": "1000"}).settings is None, "기본값도 사슬을 본다"
+    assert x.config({"EXTERNAL_LLM_ENABLED": "1"}).settings == x.Settings()
+
+
+def test_설정_오류로_닫힌_서버는_꺼진_서버처럼_거절하고_까닭과_손잡이를_싣는다(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(x, "_warned", set())
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    monkeypatch.setenv("EXTERNAL_LLM_WAIT_S", "nan")
+    monkeypatch.setenv("DRAIN_STATE_PATH", str(tmp_path / "drain.json"))
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    monkeypatch.setattr(a.app.state, "delib_llm", FakeLLM(["oracle"]), raising=False)
+    monkeypatch.setattr(a.app.state, "review_gate", None, raising=False)
+    monkeypatch.setattr(a.app.state, "external_board", None, raising=False)
+    monkeypatch.setattr(a, "_delib_load", lambda: (0, 0))
+    monkeypatch.setattr(a, "_delib_human", lambda: 0)
+    monkeypatch.setattr(m, "_APP", a.app)
+    c = TestClient(a.app)
+    h = c.get("/health").json()
+    assert h["capabilities"] == ["card_review", "drain"] and "external_llm" not in h
+    r = c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, **EXT})
+    body = r.json()
+    assert (r.status_code, body["code"], body["knob"]) == (409, "external_llm_disabled", "EXTERNAL_LLM_WAIT_S")
+    assert "유한한 수가 아니다" in body["message"]
+    refused = d._external_refusal(a.app, dict(EXT), OWNER)
+    assert (refused["code"], refused["knob"]) == ("external_llm_disabled", "EXTERNAL_LLM_WAIT_S")
+    with pytest.raises(ValueError, match="EXTERNAL_LLM_ENABLED"):
+        asyncio.run(m.review_task_next(ctx=ctx_of(OWNER)))
+    assert getattr(a.app.state, "external_board", None) is None
+    out = capsys.readouterr().out
+    assert "⛔" in out and "EXTERNAL_LLM_WAIT_S" in out and out.count("⛔") == 1, "기동 오류 줄은 한 번만"
+
+
+@pytest.mark.parametrize("delib_env", [{}, {"DELIB_TIMEOUT_S": "900", "DELIB_LLM_MAX_RETRIES": "2"},
+                                       {"DELIB_TIMEOUT_S": "많이"}, {"DELIB_LLM_MAX_RETRIES": "-3"},
+                                       {"DELIB_TIMEOUT_S": "0"}])
+def test_사슬의_바깥_한도는_기동한_심의_LLM_에_실제로_걸린_한도와_같다(monkeypatch, delib_env):
+    """config 는 기동 전(도구 등록 — import 때)에도 판정하므로 env 로 셈한다 — 기동 절차(app.lifespan)가 만드는 심의 LLM 의 한도와
+    같아야 한다."""
+    from test_llm_limits import _boot
+
+    st = _boot(monkeypatch, **delib_env)
+    read, tries = d._llm_limit(st.delib_llm)
+    assert x.delib_call_worst_s() == (tries * read + 8 if read > 0 else None)
+
+
+def test_기동_절차는_사슬이_깨진_설정이면_줄을_만들지_않고_오류_줄을_남긴다(monkeypatch, capsys):
+    from test_llm_limits import _boot
+
+    monkeypatch.setattr(x, "_warned", set())
+    st = _boot(monkeypatch, EXTERNAL_LLM_ENABLED="1", DELIB_TIMEOUT_S="1000")
+    assert getattr(st, "external_board", None) is None
+    out = capsys.readouterr().out
+    assert "⛔" in out and "외부 응답자 길을 열지 않는다" in out
+    st = _boot(monkeypatch, EXTERNAL_LLM_ENABLED="1")
+    assert isinstance(st.external_board, x.Board) and "켜짐" in capsys.readouterr().out
+
+
 # ── L8. 주인 칸 정리 ─────────────────────────────────────────────────────────────
 def test_과제도_없이_하루_넘게_조용한_주인_칸은_지운다(stub):
     """탐침 p01 owners_growth — 워크플로 쪽 호출마다 신원별 칸이 생기고 지워지지 않았다(2만 신원이면 2만 칸)."""

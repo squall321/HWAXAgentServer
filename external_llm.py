@@ -8,6 +8,8 @@
 
 규칙.
 1. 기본 꺼짐 — `EXTERNAL_LLM_ENABLED=1` 이 아니면 줄도 도구도 없고, `llm: "external"` 요청은 거절된다(사용자 결정 X-D1).
+   켰는데 `EXTERNAL_LLM_*` 값 하나라도 못 읽거나 범위 밖이거나 시간 한도 사슬이 깨졌으면 기본값으로 메우지 않고 꺼진 채
+   기동 오류 줄을 남긴다(닫힌 쪽으로 — config).
 2. 주인만 — 과제는 그 호출을 낸 사람(owner)의 워크플로만 본다. 남의 과제 id 는 없는 id 와 같은 답을 받는다. 주인 이름은
    앞뒤 공백을 떼고 소문자로만 맞춘다 — 퍼센트 인코딩을 푸는 것은 게이트웨이 신원 헤더(MCP 호출자 길)뿐이다(header_owner).
 3. 집기마다 임대(lease)가 붙는다 — 읽기·내기는 그 임대를 실어야 하고, 되돌려졌다 다시 집힌 과제에 묵은 임대로 낸 조각은
@@ -66,6 +68,9 @@ READ_PAGE_MAX = 20_000            # review_task_read 응답 하나의 글자 상
 ANSWER_HARD_MAX = 2_000_000       # 나눠 받는 답의 글자 상한(메모리 보호 — max_tokens 로 자르기 전의 원문)
 OWNER_IDLE_S = 86_400.0           # 과제도 없이 이만큼 조용한 주인 칸은 지운다(워크플로 쪽 호출마다 칸이 생긴다 — 쌓이지 않게)
 _PRUNE_EVERY_S = 60.0             # 위 정리를 다시 보는 간격(줄의 시계로)
+# 심의 LLM 논리 호출 1회의 최악을 셈하는 값 — app.py lifespan 이 심의 LLM 을 만드는 env·기본값과 같다(시험이 기동 절차로 맞댄다).
+DELIB_TIMEOUT_ENV, DELIB_RETRIES_ENV = "DELIB_TIMEOUT_S", "DELIB_LLM_MAX_RETRIES"
+DELIB_TIMEOUT_DEFAULT, DELIB_RETRIES_DEFAULT = 1800.0, 1
 
 KINDS = ("sweep", "verdict", "offcard", "noinput", "summary", "deliberation")
 # 워크플로가 부르는 과제 도구 — 이 서버의 챗·심의 에이전트는 이 이름을 묶지도 invoke_tool 로 부르지도 않는다(app._AGENT_DENY_TOOLS —
@@ -112,19 +117,28 @@ def enabled(env=os.environ) -> bool:
     return False
 
 
+class ConfigError(ValueError):
+    """EXTERNAL_LLM_* 값 하나를 받을 수 없다 — knob 은 그 설정 이름이다(켜진 서버는 이것이 나면 그 길을 열지 않는다)."""
+
+    def __init__(self, knob: str, message: str):
+        super().__init__(message)
+        self.knob, self.message = knob, message
+
+
 def _num(env, name: str, default: float, *, floor: float, integer: bool) -> float:
+    """설정 하나 — 비면 기본값. 못 읽거나(정수 자리의 소수 포함) 유한한 수가 아니거나(nan·inf) floor 미만이면 ConfigError 다 —
+    기본값으로 메우지 않는다(틀린 값 대신 더 큰 기본 한도로 말없이 돌던 것을 닫는다)."""
     raw = str(env.get(name) or "").strip()
     if not raw:
         return default
     try:
         v = int(raw) if integer else float(raw)
     except ValueError:
-        _warn_once(f"{name}:{raw}", f"env {name}='{raw[:40]}' 숫자 파싱 실패 — 기본값 {default:g} 사용")
-        return default
-    if not (v >= floor and math.isfinite(v)):
-        _warn_once(f"{name}:{raw}", f"env {name}={raw[:40]} 는 {floor:g} 미만이다 — 기본값 {default:g} 사용"
-                   "(한도를 끄는 값은 없다 — 끄면 호출이 끝없이 기다린다)")
-        return default
+        raise ConfigError(name, f"{name}='{raw[:40]}' 를 {'정수' if integer else '수'}로 읽지 못했다") from None
+    if not math.isfinite(v):
+        raise ConfigError(name, f"{name}={raw[:40]} 는 유한한 수가 아니다")
+    if v < floor:
+        raise ConfigError(name, f"{name}={raw[:40]} 는 {floor:g} 미만이다(한도를 끄는 값은 없다 — 끄면 호출이 끝없이 기다린다)")
     return v
 
 
@@ -138,6 +152,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Settings":
+        """설정을 읽는다 — 값 하나라도 받을 수 없으면 ConfigError(기본값으로 메우지 않는다)."""
         return cls(ctx_tokens=int(_num(env, CTX_ENV, CTX_DEFAULT, floor=1024, integer=True)),
                    max_tokens=int(_num(env, MAX_TOKENS_ENV, MAX_TOKENS_DEFAULT, floor=1, integer=True)),
                    wait_s=_num(env, WAIT_ENV, WAIT_DEFAULT, floor=0.001, integer=False),
@@ -148,6 +163,63 @@ class Settings:
     def call_worst_s(self) -> float:
         """과제 하나(논리 호출 1회)의 최악 — 기다림 · 답 · 되돌린 뒤 기다림 · 답. 주인의 워크플로가 바쁜 동안의 기다림은 들지 않는다."""
         return 2 * self.wait_s + 2 * self.answer_s
+
+
+def delib_call_worst_s(env=os.environ) -> float | None:
+    """심의 LLM 논리 호출 1회의 최악(초) — (1 + DELIB_LLM_MAX_RETRIES) × DELIB_TIMEOUT_S + 8. app.py lifespan 이 심의 LLM 을 만드는
+    값과 같은 규칙으로 읽는다(못 읽으면 기본값 1800초·1회, 재시도 음수는 0). 한도가 꺼져 있으면(DELIB_TIMEOUT_S ≤ 0) None 이다 —
+    그때는 견줄 바깥 한도가 없다."""
+    def read(name, default, conv):
+        raw = str(env.get(name) or "")
+        if not raw:
+            return default
+        try:
+            return conv(raw)
+        except ValueError:
+            return default
+
+    to = read(DELIB_TIMEOUT_ENV, DELIB_TIMEOUT_DEFAULT, float)
+    tries = max(0, read(DELIB_RETRIES_ENV, DELIB_RETRIES_DEFAULT, int)) + 1
+    return tries * to + 8 if to > 0 else None
+
+
+@dataclass(frozen=True)
+class Config:
+    """외부 응답자 길의 기동 판정 — settings 가 None 이면 닫혀 있다. 스위치는 켰는데 닫혔으면 error(기동 오류 줄 그대로)와 knob(고칠
+    설정 이름)이 있다. 스위치가 꺼져 있으면 셋 다 비어 있다."""
+    settings: Settings | None
+    error: str = ""
+    knob: str = ""
+
+
+def config(env=os.environ) -> Config:
+    """스위치·값·시간 한도 사슬을 한꺼번에 본다(닫힌 쪽으로). 켰는데 값 하나라도 받을 수 없거나, 과제 하나의 최악(2×WAIT_S +
+    2×ANSWER_S)이 심의 LLM 논리 호출 1회의 최악 이상이면(안쪽이 먼저 걸려야 사유가 먼저 온다) 길을 열지 않고 기동 오류 줄을
+    한 번 남긴다 — 종전엔 틀린 값을 기본값(더 큰 한도)으로 메우거나 경고만 하고 열었다."""
+    if not enabled(env):
+        return Config(None)
+    try:
+        s = Settings.from_env(env)
+    except ConfigError as exc:
+        return _closed(exc.knob, exc.message)
+    outer = delib_call_worst_s(env)
+    if outer is not None and s.call_worst_s >= outer:
+        return _closed(f"{WAIT_ENV} · {ANSWER_ENV}",
+                       f"과제 하나의 최악(2×{WAIT_ENV} + 2×{ANSWER_ENV} = {s.call_worst_s:,.0f}초)이 심의 LLM 논리 호출 1회의 "
+                       f"최악((1 + {DELIB_RETRIES_ENV}) × {DELIB_TIMEOUT_ENV} + 8 = {outer:,.0f}초) 이상이다 — 바깥 한도가 그 "
+                       "값에 맞춰져 있어 안쪽(외부 응답자)이 먼저 걸려야 한다")
+    return Config(s)
+
+
+def _closed(knob: str, why: str) -> Config:
+    msg = (f"{ENABLED_ENV}=1 이지만 외부 응답자 길을 열지 않는다(설정 오류 — 닫힌 쪽으로 돈다): {why}. 고친 뒤 재기동한다")
+    _warn_once(f"config:{msg}", f"⛔ {msg}")
+    return Config(None, msg, knob)
+
+
+def is_open(env=os.environ) -> bool:
+    """외부 응답자 길이 열렸나 — 스위치가 켜졌고 설정이 맞다(config). 도구 등록·안내 글이 이것을 본다."""
+    return config(env).settings is not None
 
 
 class ExternalLLMError(Exception):
@@ -551,13 +623,17 @@ def fit_answer(text: str, max_tokens: int | None) -> tuple[str, str]:
 
 # ── 앱에 붙이기 ──────────────────────────────────────────────────────────────
 def board_of(app) -> Board | None:
-    """이 앱의 과제 줄 — 꺼져 있으면 None. 처음 쓸 때(기동 때) 설정을 한 번 읽어 만든다(card_review.gate_of 와 같은 방식)."""
+    """이 앱의 과제 줄 — 꺼져 있거나 설정이 틀려 닫혔으면(config) None. 처음 쓸 때(기동 때) 설정을 한 번 읽어 만든다
+    (card_review.gate_of 와 같은 방식)."""
     if not enabled():
         return None
     state = getattr(app, "state", None)
     b = getattr(state, "external_board", None)
     if b is None:
-        b = Board(Settings.from_env())
+        cfg = config()
+        if cfg.settings is None:
+            return None
+        b = Board(cfg.settings)
         setattr(state, "external_board", b)
     return b
 
@@ -582,7 +658,8 @@ def health_fields(board: Board) -> dict:
 
 
 def startup_note(s: Settings, delib_read: float, delib_tries: int) -> str:
-    """기동 줄 — 켜졌다는 것과 시간 한도 사슬. 과제 하나의 최악이 심의 LLM 논리 호출 1회의 최악 이상이면 경고를 붙인다."""
+    """기동 줄 — 켜졌다는 것과 시간 한도 사슬. 사슬이 깨진 설정은 config 가 이미 닫았다 — 여기의 경고는 기동한 심의 LLM 에 실제로
+    걸린 값(app 이 넘긴다)이 env 로 셈한 것과 다를 때의 그물이다."""
     line = (f"[agent] 외부 응답자(EXTERNAL_LLM_ENABLED) 켜짐 — 창 {s.ctx_tokens:,} · 출력 {s.max_tokens:,} 토큰, 기다림 "
             f"{s.wait_s:g}초 · 답 {s.answer_s:g}초(과제 하나 최악 {s.call_worst_s:,.0f}초) · 카드 대조 동시 호출 한 사람당 "
             f"{s.max_inflight}건({MAX_INFLIGHT_ENV})")

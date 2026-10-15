@@ -220,13 +220,13 @@ _ADV_DESC = (
     "job='risk-review-sealed' 가 이것을 켠 리스크 심사다. 단발 심의에만 선다 — sim-plan·test-plan·"
     "build-plan 은 사내 자산 현황을 조회해 깔아야 해서 거절한다)."
 ) + (
-    # 외부 응답자가 켜진 서버에서만 적는다 — 꺼진 서버에 적으면 못 쓰는 손잡이를 안내하는 셈이다(보내면 거절된다).
+    # 외부 응답자가 열린 서버에서만 적는다 — 꺼졌거나 설정 오류로 닫힌 서버에 적으면 못 쓰는 손잡이를 안내하는 셈이다(보내면 거절된다).
     " · llm(판단 LLM: external — 좌석·의장의 LLM 호출을 잡 주인의 Claude Code 워크플로가 review_task_next·review_task_read·"
     "review_task_submit 로 받아 답한다. 좌석 도구 호출이 없는 evidence_only 로 돌고(좌석 자유 조회를 닫는다) 그 사실이 결정문 "
     "머리·잡 기록(llm·tool_mode)에 남는다. 근거·카드 글이 외부(Claude)로 나가므로 같은 advanced 에 consent_external: true 를 "
     "실어야 한다 — 없으면 잡을 만들기 전에 external_consent_required 로 거절한다. 서버가 보는 것은 이 표지뿐이다 — 사람에게 반출 "
     "동의를 받는 것은 부르는 쪽의 몫이다. 신원 없는 호출은 거절한다. 이어하기는 llm 을 이어받지 않는다)"
-    if external_llm.enabled() else ""
+    if external_llm.is_open() else ""
 )
 
 # 잡 상태 안내 — 시작·진행 조회·메뉴가 같은 글을 쓴다. 종전 설명은 '즉시 시작한다' 뿐이었다. 줄을 세우기
@@ -734,11 +734,11 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
     }
 
 
-# ── 외부 응답자 과제(리스크 심사 Claude 길 X-1) — EXTERNAL_LLM_ENABLED=1 인 서버에서만 등록한다 ─────────────────────────
+# ── 외부 응답자 과제(리스크 심사 Claude 길 X-1) — 외부 응답자 길이 열린 서버(EXTERNAL_LLM_ENABLED=1 · 설정이 맞다)에서만 등록한다 ──
 # 엔진의 판단 호출(카드 대조·심의 좌석/의장)이 LLM 대신 과제로 줄을 서면, 잡 주인의 Claude Code 워크플로가 이 셋으로 집어 읽고
 # 답을 낸다(external_llm.py). 주인만 — 신원은 게이트웨이가 검증된 PAT 로 싣는 x-hwax-user 다(_caller → header_owner 로 한 번
 # 푼다). 꺼진 서버에는 도구가 없다. 이 서버의 챗·심의 에이전트는 이 셋을 묶지 않는다(app._AGENT_DENY_TOOLS).
-_XS = external_llm.Settings.from_env()
+_XS = external_llm.config().settings or external_llm.Settings()
 # 길이·자리의 단위 — 셋이 같은 글을 쓴다(JS 로 짠 워크플로가 String.length 로 세면 BMP 밖 글자에서 어긋났다).
 _TASK_UNITS = (
     " 단위 — chars·start·offset·next_offset·received_chars·cut_chars·max_chars 는 전부 유니코드 코드 포인트(파이썬 글자) 수다. "
@@ -834,8 +834,9 @@ async def review_task_submit(task_id: str, lease: str, text: str, offset: int | 
 
 
 def _register_external(m: FastMCP, env=os.environ) -> bool:
-    """외부 응답자가 켜진 서버(EXTERNAL_LLM_ENABLED)에서만 과제 도구 셋을 m 에 올린다 — 꺼져 있으면 도구 목록에 없다."""
-    if not external_llm.enabled(env):
+    """외부 응답자 길이 열린 서버(스위치가 켜졌고 설정이 맞다 — external_llm.is_open)에서만 과제 도구 셋을 m 에 올린다 — 꺼졌거나
+    설정 오류로 닫혔으면 도구 목록에 없다."""
+    if not external_llm.is_open(env):
         return False
     m.add_tool(review_task_next, name="review_task_next", title="외부 응답자 — 과제 집기", description=_TASK_NEXT_DESC)
     m.add_tool(review_task_read, name="review_task_read", title="외부 응답자 — 과제 프롬프트 읽기",
