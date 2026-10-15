@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import contextvars
 import logging
 import math
@@ -40,10 +41,6 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import PrivateAttr
 
 log = logging.getLogger("agent.external_llm")
 
@@ -654,8 +651,8 @@ def model_for(app, *, owner: str, kind: str, run_id: str = "", target_key: str =
     b = board_of(app)
     if b is None:
         return None
-    return ExternalChatModel(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
-                             run_id=run_id, target_key=target_key, label=label)
+    return _model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
+                          run_id=run_id, target_key=target_key, label=label)
 
 
 def health_fields(board: Board) -> dict:
@@ -690,45 +687,63 @@ def _content_text(content) -> str:
     return "" if content is None else str(content)
 
 
-class ExternalChatModel(BaseChatModel):
-    """엔진이 LLM 을 쓰는 자리에 그대로 들어가는 외부 응답자 — ainvoke([("system", …), ("human", …)]) 와 bind(max_tokens=…)를
-    받는다. 부르면 과제를 줄 세우고 낸 글을 AIMessage(content, response_metadata.finish_reason)로 돌려준다. 토큰 사용량은 모른다
-    (싣지 않는다 — 0 으로 세지 않는다). 도구를 묶을 수 없다(bind_tools 는 NotImplementedError — 이 길은 evidence_only 다)."""
+@functools.lru_cache(maxsize=None)
+def _model_class():
+    """ExternalChatModel 을 처음 쓸 때 짓는다 — langchain_core 는 그때 읽는다. 이 모듈은 deliberation 이 맨 위에서 읽으므로, 여기서
+    langchain 을 읽으면 그것이 없는 가벼운 환경(포털의 계약 시험이 엔진의 _resolve_opts 를 부른다)에서 deliberation 자체를 못 읽는다."""
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import PrivateAttr
 
-    max_tokens: int | None = None
-    owner: str = ""
-    kind: str = "deliberation"
-    run_id: str = ""
-    target_key: str = ""
-    label: str = ""
-    _board: Any = PrivateAttr(default=None)
+    class ExternalChatModel(BaseChatModel):
+        """엔진이 LLM 을 쓰는 자리에 그대로 들어가는 외부 응답자 — ainvoke([("system", …), ("human", …)]) 와 bind(max_tokens=…)를
+        받는다. 부르면 과제를 줄 세우고 낸 글을 AIMessage(content, response_metadata.finish_reason)로 돌려준다. 토큰 사용량은 모른다
+        (싣지 않는다 — 0 으로 세지 않는다). 도구를 묶을 수 없다(bind_tools 는 NotImplementedError — 이 길은 evidence_only 다)."""
 
-    def __init__(self, board: Board | None = None, **kw):
-        super().__init__(**kw)
-        self._board = board
+        max_tokens: int | None = None
+        owner: str = ""
+        kind: str = "deliberation"
+        run_id: str = ""
+        target_key: str = ""
+        label: str = ""
+        _board: Any = PrivateAttr(default=None)
 
-    @property
-    def _llm_type(self) -> str:
-        return "hwax-external"
+        def __init__(self, board: Board | None = None, **kw):
+            super().__init__(**kw)
+            self._board = board
 
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        raise NotImplementedError("외부 응답자는 비동기로만 부른다(ainvoke)")
+        @property
+        def _llm_type(self) -> str:
+            return "hwax-external"
 
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
-        board = self._board
-        if board is None:
-            raise RuntimeError("외부 응답자 줄이 없다(EXTERNAL_LLM_ENABLED)")
-        mt = kwargs.get("max_tokens")
-        mt = mt if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0 else self.max_tokens
-        parts = [(m.type, _content_text(m.content)) for m in messages]
-        task = board.open(owner=self.owner, kind=self.kind, parts=parts, max_tokens=mt, run_id=self.run_id,
-                          target_key=self.target_key, label=self.label)
-        try:
-            text, finish = await board.wait(task)
-        finally:
-            board.drop(task)
-        msg = AIMessage(content=text, response_metadata={"finish_reason": finish, "model_name": "external"})
-        return ChatResult(generations=[ChatGeneration(message=msg, generation_info={"finish_reason": finish})])
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            raise NotImplementedError("외부 응답자는 비동기로만 부른다(ainvoke)")
 
-    def bind_tools(self, tools, **kwargs):
-        raise NotImplementedError("외부 응답자는 엔진의 도구를 실행할 수 없다 — 이 길은 좌석 도구 호출이 없는 evidence_only 다")
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+            board = self._board
+            if board is None:
+                raise RuntimeError("외부 응답자 줄이 없다(EXTERNAL_LLM_ENABLED)")
+            mt = kwargs.get("max_tokens")
+            mt = mt if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0 else self.max_tokens
+            parts = [(m.type, _content_text(m.content)) for m in messages]
+            task = board.open(owner=self.owner, kind=self.kind, parts=parts, max_tokens=mt, run_id=self.run_id,
+                              target_key=self.target_key, label=self.label)
+            try:
+                text, finish = await board.wait(task)
+            finally:
+                board.drop(task)
+            msg = AIMessage(content=text, response_metadata={"finish_reason": finish, "model_name": "external"})
+            return ChatResult(generations=[ChatGeneration(message=msg, generation_info={"finish_reason": finish})])
+
+        def bind_tools(self, tools, **kwargs):
+            raise NotImplementedError("외부 응답자는 엔진의 도구를 실행할 수 없다 — 이 길은 좌석 도구 호출이 없는 evidence_only 다")
+
+    return ExternalChatModel
+
+
+def __getattr__(name: str):
+    # `external_llm.ExternalChatModel` 은 그대로 쓴다(PEP 562) — 처음 닿을 때 _model_class() 가 짓는다.
+    if name == "ExternalChatModel":
+        return _model_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
