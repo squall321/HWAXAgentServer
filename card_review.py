@@ -23,12 +23,13 @@ import math
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+import external_llm
 from deliberation import (
     _CHAIR_RESERVE,
     _EVID_KO_CPT,
@@ -157,8 +158,10 @@ _REV_ONLY = {
 _REV_CELL = ("_NEED_CTX_MAX",)    # 셀 종류의 ctx_too_small(need_ctx_tokens)만 읽는다
 
 
-def _rev_src(kind: str, b: dict, k_knob: int, shares: dict, retries: int) -> dict:
-    """그 종류의 판이 해시하는 입력 — 창·출력 상한(값), 그 종류에 닿는 손잡이, 그 종류에 닿는 상수(이름과 지금 값)."""
+def _rev_src(kind: str, b: dict, k_knob: int, shares: dict, retries: int, llm: str = "glm") -> dict:
+    """그 종류의 판이 해시하는 입력 — 창·출력 상한(값), 그 종류에 닿는 손잡이, 그 종류에 닿는 상수(이름과 지금 값). 외부 응답자
+    길(llm=external)은 그 이름도 든다 — 창·출력 상한이 GLM 과 같은 수여도 판이 갈려, 잡 하나 안에서 엔진을 바꾸면 셀이 처음부터
+    돈다(PLAN 2절). GLM 길의 입력은 종전 그대로다(판이 바뀌지 않는다)."""
     g = globals()
     group = _REV_UNIT_KINDS if kind in _REV_UNIT_KINDS else (kind,)
     names = list(_REV_BASE) + list(_REV_ONLY[kind]) + (list(_REV_UNIT) if kind in _REV_UNIT_KINDS else [])
@@ -172,6 +175,8 @@ def _rev_src(kind: str, b: dict, k_knob: int, shares: dict, retries: int) -> dic
         src["k"] = k_knob
     if kind == "summary":
         src["retries"] = retries          # cover_hard_max = cover_max × (1 + CARD_REVIEW_PARSE_RETRIES)
+    if llm == "external":
+        src["llm"] = "external"
     return src
 
 
@@ -343,18 +348,25 @@ def _need_ctx(ctx: int, mt: int, k_knob: int, shares: dict) -> int | None:
 
 
 def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying: bool = False,
-           env=os.environ, model: str = "", max_tokens_source: str | None = None) -> dict:
+           env=os.environ, model: str = "", max_tokens_source: str | None = None, llm: str = "glm") -> dict:
     """이 박스에서 한 호출에 무엇을 얼마나 실을 수 있나 — `GET /card-review/limits` 의 본문(관문 칸 `gate` 는 라우트가 더한다).
 
     순수 함수다 — 창은 부르는 쪽이 `app._model_context_state()` 로 물어 넘긴다(그 조회는 동기 httpx 라 라우트가
     asyncio.to_thread 로 돈다 — P-10). 낮은 고정 천장이 없다 — 역할·제목 목록·이미 낸 판정·메커니즘·영역 목록은
     P 의 몫, 행 수는 출력 몫에서 유도한다. 창이 모자라면 다시 쪼개지 않고 `ctx_too_small` 을 싣는다(D-22) — 셀 일의 종류
     (CELL_KINDS)만 본다. max_tokens 는 resolve_max_tokens() 가 고른 출력 상한이고 max_tokens_source 가 그 출처다(안 주면
-    상한이 있으면 delib, 없으면 none)."""
+    상한이 있으면 delib, 없으면 none). llm=external 이면 외부 응답자의 창·출력 상한으로 셈한 것이라 판에 그 이름이 들고,
+    창이 모자랄 때의 안내가 외부 응답자 손잡이(EXTERNAL_LLM_*)를 가리킨다."""
     k_knob, shares, retries = _knob_k(env), _knob_shares(env), _parse_retries(env)
     b = _budget(ctx_tokens, max_tokens or 0, k_knob, shares, retries)
     v, s, o, n, su = b["verdict"], b["sweep"], b["offcard"], b["noinput"], b["summary"]
-    by_kind = {k: _rev(_rev_src(k, b, k_knob, shares, retries)) for k in KINDS}
+    by_kind = {k: _rev(_rev_src(k, b, k_knob, shares, retries, llm)) for k in KINDS}
+    # 창·출력 상한이 모자랄 때 안내가 가리키는 손잡이 — GLM 길은 종전 글 그대로, 외부 응답자 길은 그 길의 손잡이(external_llm 의
+    # CTX_ENV·MAX_TOKENS_ENV 와 같은 이름 — 시험이 맞댄다). 모듈 상수로 빼지 않는다 — 예산 식이 읽는 전역은 판에 들어야 한다.
+    ext = llm == "external"
+    knob = {"mt": "EXTERNAL_LLM_MAX_TOKENS" if ext else "CARD_REVIEW_MAX_TOKENS(없으면 DELIB_MAX_TOKENS)",
+            "ctx": "EXTERNAL_LLM_CTX_TOKENS" if ext else "LLM_CONTEXT_TOKENS·VLLM_MODEL",
+            "mt_or": "EXTERNAL_LLM_MAX_TOKENS" if ext else "CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS"}
     out = {
         "api_rev": API_REV, "kinds": list(KINDS), "cell_kinds": list(CELL_KINDS), "model": model,
         "ctx_tokens": b["ctx"], "ctx_source": ctx_source, "ctx_retrying": bool(retrying),
@@ -395,14 +407,14 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
         why = []
         if out_short:
             why.append(f"출력 상한 {b['mt']:,} 토큰으로는 카드 대조({'·'.join(out_short)})가 행 한 줄도 못 낸다 — "
-                       f"CARD_REVIEW_MAX_TOKENS(없으면 DELIB_MAX_TOKENS)를 {need_mt:,} 토큰 이상으로 올린다.")
+                       f"{knob['mt']}를 {need_mt:,} 토큰 이상으로 올린다.")
         if need:
             why.append(f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
-                       f"쪼개지 않는다. 창이 {need:,} 토큰 이상인 LLM 이 필요하다(LLM_CONTEXT_TOKENS·VLLM_MODEL"
+                       f"쪼개지 않는다. 창이 {need:,} 토큰 이상인 LLM 이 필요하다({knob['ctx']}"
                        + (f" — 출력 상한 {need_mt:,} 토큰 기준" if need_mt else "") + ").")
         elif not out_short:
             why.append(f"이 박스의 창 {b['ctx']:,} 토큰으로는 카드 대조({'·'.join(short)})를 돌릴 수 없다 — 단위·카드를 다시 "
-                       "쪼개지 않는다. 출력 상한(CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS)이 창보다 크다 — 그 값을 줄여라.")
+                       f"쪼개지 않는다. 출력 상한({knob['mt_or']})이 창보다 크다 — 그 값을 줄여라.")
         out["ctx_too_small"] = {
             "reason": "output_cap" if out_short else ("window" if need else "output_too_large"),
             # 종류마다의 사유 — 출력 상한이 모자란 종류는 output_cap, 나머지는 창(window — 창을 키워도 안 되면
@@ -2947,6 +2959,9 @@ ERRORS = {
     "truncated_empty": (False, False),
     "no_rows": (False, True),
 }
+# 외부 응답자 길(llm=external)에서만 나는 코드 — 표를 따로 둔다. GLM 길의 계약 예제(tests/fixtures/card_review/contract/)는 ERRORS
+# 만 다루고 리스크 앱이 그 디렉터리를 바이트째 복사해 견주므로, 외부 길의 예제는 tests/fixtures/external_llm/contract/ 에 따로 있다.
+EXTERNAL_ERRORS = external_llm.ERRORS
 
 
 def _parse_retries(env=os.environ) -> int:
@@ -3041,7 +3056,10 @@ def _http_status(exc) -> int | None:
 def classify(exc: BaseException, llm, *, est_tokens: int, lim: dict) -> dict:
     """LLM 호출 실패 → error 프레임 칸 {code, message, infra, retryable, knob?, status?, …}. 부류는 상태 코드와 예외
     사슬로 가르고 문구는 엔진의 _llm_fail_note 를 쓴다(P-13). 400·413·422 는 문구와 무관하게 infra 가 아니다 — 그 가운데
-    추정 토큰 + 출력 몫이 창의 85% 이상이면 context_overflow(다시 쪼개지 않는다 — D-22), 아니면 llm_rejected 다."""
+    추정 토큰 + 출력 몫이 창의 85% 이상이면 context_overflow(다시 쪼개지 않는다 — D-22), 아니면 llm_rejected 다. 외부 응답자의
+    한도(external_worker_absent · external_answer_timeout)는 그 코드 그대로다(인프라 — 앱이 세지 않는다)."""
+    if isinstance(exc, external_llm.ExternalLLMError):
+        return _err(exc.code, exc.message, knob=exc.knob)
     status = _http_status(exc)
     raw = f"{type(exc).__name__}: {exc}"[:200]
     extra: dict = {}
@@ -3085,7 +3103,7 @@ def classify(exc: BaseException, llm, *, est_tokens: int, lim: dict) -> dict:
 
 
 def _err(code: str, message: str, **kw) -> dict:
-    infra, retryable = ERRORS[code]
+    infra, retryable = ERRORS[code] if code in ERRORS else EXTERNAL_ERRORS[code]
     return {"code": code, "message": message, "infra": infra, "retryable": retryable, **kw}
 
 
@@ -3168,18 +3186,28 @@ async def run(app, prep: dict):
         return
 
     try:
-        llm = getattr(app.state, "delib_llm", None)
-        # 카드 대조만의 출력 상한(CARD_REVIEW_MAX_TOKENS)은 이 호출에만 건다 — 심의 LLM 인스턴스는 그대로다(오류 분류는 원래 것으로).
-        # 자리를 잡은 뒤의 모든 것은 이 try 안이다 — bind·손잡이 읽기가 터져도 finally 가 자리를 돌려준다(RB3-9).
-        own_mt = knob_max_tokens()
-        ask_llm = llm.bind(max_tokens=own_mt) if llm is not None and own_mt > 0 else llm
+        external = req.get("llm") == "external"
+        if external:
+            # 외부 응답자 길 — 이 호출 하나의 외부 모델(주인·종류를 실었다). 출력 상한은 limits 가 셈한 그 값을 건다(예산과 같은
+            # 수 — CARD_REVIEW_MAX_TOKENS 는 GLM 박스의 손잡이라 여기 걸지 않는다). 관문(자리)은 GLM 길과 같이 잡는다.
+            llm = external_llm.model_for(app, owner=req.get("user_email") or "", kind=kind,
+                                         target_key=str(req.get("target_key") or ""), label=tag)
+            ask_llm = (llm.bind(max_tokens=lim["llm_max_tokens"]) if llm is not None and lim.get("llm_max_tokens")
+                       else llm)
+        else:
+            llm = getattr(app.state, "delib_llm", None)
+            # 카드 대조만의 출력 상한(CARD_REVIEW_MAX_TOKENS)은 이 호출에만 건다 — 심의 LLM 인스턴스는 그대로다(오류 분류는 원래 것으로).
+            # 자리를 잡은 뒤의 모든 것은 이 try 안이다 — bind·손잡이 읽기가 터져도 finally 가 자리를 돌려준다(RB3-9).
+            own_mt = knob_max_tokens()
+            ask_llm = llm.bind(max_tokens=own_mt) if llm is not None and own_mt > 0 else llm
         attempts_max = 1 + _parse_retries()
         hb = float(DELIB_HEARTBEAT_S)
         system, human0 = prep["system"], prep["human"]
         if llm is None:
             st["outcome"] = "llm_misconfigured"
-            yield frame("error", _err("llm_misconfigured", "이 서버에 심의 LLM(delib_llm)이 준비되지 않았다",
-                                      knob="VLLM_BASE_URL · VLLM_MODEL"))
+            yield frame("error", _err("llm_misconfigured", "이 서버의 외부 응답자 길이 꺼져 있다" if external else
+                                      "이 서버에 심의 LLM(delib_llm)이 준비되지 않았다",
+                                      knob=external_llm.ENABLED_ENV if external else "VLLM_BASE_URL · VLLM_MODEL"))
             yield frame("done", {})
             return
         hint = ""
@@ -3312,6 +3340,8 @@ async def run(app, prep: dict):
         }
         if search_meta is not None:
             result["meta"]["search"] = search_meta
+        if external:
+            result["meta"]["llm"] = "external"       # 판단 LLM 이 외부 응답자였다(model 은 'external' — 사용량은 모른다)
         st.update(outcome="ok", truncated=quality["truncated"] is True, repaired=quality["repaired"])
         yield frame("result", result)
         yield frame("done", {})
@@ -3494,6 +3524,9 @@ class RunRequest(_Ident):
     manifest: list[RunManifestItem] = []
     extra: RunExtra | None = None
     expect: RunExpect | None = None
+    # 판단 LLM — 없거나 glm 이면 종전 그대로(이 서버의 심의 LLM). external 이면 외부 응답자(EXTERNAL_LLM_ENABLED 박스만 — 꺼져 있으면
+    # 409 external_llm_disabled, 신원(user_email)이 없으면 422 external_owner_missing). 반출 동의는 리스크 앱이 잡마다 받는다(X-2).
+    llm: Literal["glm", "external"] | None = None
 
 
 class PackRequest(_Ident):
@@ -3517,6 +3550,7 @@ class PlanRequest(_Ident):
     cards: list[PlanCard] = []
     units: list[PlanUnit] = []
     expect: Expect | None = None
+    llm: Literal["glm", "external"] | None = None      # run 과 같다 — external 이면 외부 응답자의 창·출력 상한으로 짠다
 
 
 def check_shape(model, body) -> None:
@@ -3558,19 +3592,49 @@ router = APIRouter(prefix="/card-review", tags=["card-review"])
 FEATURE = "feat:deliberation"
 
 
-async def limits_now(app) -> dict:
+async def limits_now(app, llm: str | None = None) -> dict:
     """이 박스의 지금 예산 — 창은 app._model_context_state()(동기 httpx 라 스레드에서 — P-10), 출력 상한은
     CARD_REVIEW_MAX_TOKENS 가 있으면 그것, 없으면 delib_llm 의 max_tokens(DELIB_MAX_TOKENS)이고 출처를 max_tokens_source 에
-    싣는다. 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다)."""
-    import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+    싣는다. 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다).
 
-    state = await asyncio.to_thread(_a._model_context_state)
-    mt, src = resolve_max_tokens(getattr(getattr(app.state, "delib_llm", None), "max_tokens", None))
-    lim = limits(state["tokens"], state["source"], mt, retrying=state["retrying"], model=_a.VLLM_MODEL,
-                 max_tokens_source=src)
+    llm=external 이면 외부 응답자의 창·출력 상한(EXTERNAL_LLM_CTX_TOKENS·EXTERNAL_LLM_MAX_TOKENS)으로 셈한다 — 창을 묻지 않고
+    출처(ctx_source·max_tokens_source)가 external, model 이 external 이고 llm 칸이 붙는다. 꺼진 박스면 부르기 전에
+    refuse_external 이 거절한다."""
+    if llm == "external":
+        board = external_llm.board_of(app)
+        if board is None:
+            raise RequestError("external_llm_disabled", _EXTERNAL_OFF, status=409, knob=external_llm.ENABLED_ENV)
+        s = board.settings
+        lim = limits(s.ctx_tokens, "external", s.max_tokens, model="external", max_tokens_source="external",
+                     llm="external")
+        lim["llm"] = "external"
+    else:
+        import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
+
+        state = await asyncio.to_thread(_a._model_context_state)
+        mt, src = resolve_max_tokens(getattr(getattr(app.state, "delib_llm", None), "max_tokens", None))
+        lim = limits(state["tokens"], state["source"], mt, retrying=state["retrying"], model=_a.VLLM_MODEL,
+                     max_tokens_source=src)
     snap = gate_of(app).snapshot()
     lim["gate"] = {k: snap[k] for k in ("limit", "limit_reason", "active")}
     return lim
+
+
+_EXTERNAL_OFF = ("이 서버는 외부 응답자 길(llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 "
+                 "capabilities 에 external_llm 이 있는지 본다). GLM(기본)으로 돌리거나 서버 설정을 켠다")
+
+
+def refuse_external(app, llm, body: dict | None = None) -> None:
+    """외부 응답자 길의 거절 — 스트림을 열기 전에. 꺼진 박스면 409 external_llm_disabled(요청이 틀린 것이 아니라 서버가 그 길을 안
+    연다 — 앱은 세지 않고 잡을 멈춘다). run(body 를 준다)인데 신원(user_email)이 없으면 422 external_owner_missing — 과제를 누구의
+    워크플로에 줄지 모른다(포털 중계를 지난 호출에는 늘 있다). llm 이 없거나 glm 이면 아무것도 하지 않는다."""
+    if llm != "external":
+        return
+    if external_llm.board_of(app) is None:
+        raise RequestError("external_llm_disabled", _EXTERNAL_OFF, status=409, knob=external_llm.ENABLED_ENV)
+    if body is not None and not str(body.get("user_email") or "").strip():
+        raise RequestError("external_owner_missing", "외부 응답자 과제를 줄 사람(user_email)이 없다 — 포털 중계를 지나 잡 주인의 "
+                           "신원으로 부른다(과제는 그 사람의 Claude Code 워크플로만 집는다)", status=422)
 
 
 def refuse_unknown_ctx(lim: dict) -> None:
@@ -3614,7 +3678,16 @@ async def _read(request: Request, model) -> dict:
 
 @router.get("/limits")
 async def get_limits(request: Request):
-    return JSONResponse(await limits_now(request.app))
+    # ?llm=external — 외부 응답자의 창·출력 상한으로 셈한 예산(꺼진 박스면 409). 없거나 glm 이면 종전 그대로다.
+    llm = request.query_params.get("llm") or None
+    try:
+        if llm not in (None, "glm", "external"):
+            raise RequestError("bad_request", f"모르는 llm '{_echo(llm)}' — glm(기본)·external 만 받는다")
+        refuse_external(request.app, llm)
+        lim = await limits_now(request.app, llm)
+    except RequestError as exc:
+        return _reject(exc, "limits")
+    return JSONResponse(lim)
 
 
 @router.post("/pack")
@@ -3651,7 +3724,8 @@ async def post_pack(request: Request):
 async def post_plan(request: Request):
     try:
         body = await _read(request, PlanRequest)
-        lim = await limits_now(request.app)
+        refuse_external(request.app, body.get("llm"))
+        lim = await limits_now(request.app, body.get("llm"))
         refuse_unknown_ctx(lim)                    # 창을 모르면 판을 견주지 않는다(503 ctx_unknown — RB-3)
         want = (body.get("expect") or {}).get("limits_rev")
         if want not in (None, lim["limits_rev"]):
@@ -3663,6 +3737,8 @@ async def post_plan(request: Request):
     out = plan(body.get("cards") or [], body.get("units") or [], lim)
     if lim.get("ctx_too_small"):
         out["ctx_too_small"] = lim["ctx_too_small"]
+    if lim.get("llm"):
+        out["llm"] = lim["llm"]                    # 외부 응답자의 창·출력 상한으로 짠 계획이다(판도 그 판이다)
     return JSONResponse(out)
 
 
@@ -3671,7 +3747,8 @@ async def post_run(request: Request):
     app = request.app
     try:
         body = await _read(request, RunRequest)
-        lim = await limits_now(app)
+        refuse_external(app, body.get("llm"), body)    # 외부 응답자 길 — 꺼진 박스 409 · 신원 없음 422
+        lim = await limits_now(app, body.get("llm"))
         refuse_unknown_ctx(lim)                    # 창을 모르면 판·예산을 셈하지 않는다(503 ctx_unknown — RB-3)
         prep = prepare(body, lim)
     except RequestError as exc:
