@@ -76,6 +76,18 @@ def _frames(r):
     return [delib_jobs._parse_sse(c.encode()) for c in r.text.split("\n\n") if c.strip()]
 
 
+def _bounded(client, body: dict, pending: list, timeout: float = 15.0):
+    """거절돼야 할 외부 run 하나 — 거절되지 않고 과제가 서면 시계가 멈춘 줄에서 끝나지 않는다. 그때 시험이 매달리지 않고 timeout
+    안에 그렇게 실패한다(남은 스레드는 pending 에 두고, 시험이 끝에 시계를 밀어 풀고 기다린다)."""
+    box: dict = {}
+    t = threading.Thread(target=lambda: box.setdefault("r", client.post("/card-review/run", json=body)), daemon=True)
+    pending.append(t)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), "거절돼야 할 외부 호출이 거절되지 않고 과제로 줄을 섰다"
+    return box["r"]
+
+
 @pytest.fixture
 def stub(monkeypatch):
     """외부 응답자가 켜진 앱 대역 — 과제 줄은 시계를 바꿔 끼운 것이다. MCP 도구도 이 앱을 본다."""
@@ -248,6 +260,7 @@ def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과
         results[i] = [(e, dd.get("code")) for e, dd in _frames(r) if e in ("error", "result")]
 
     ths = [threading.Thread(target=ext, args=(i, "a@x.com")) for i in range(2)]
+    pending: list = []
     for t in ths:
         t.start()
     try:
@@ -263,7 +276,7 @@ def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과
         assert [e for e, _ in rb][-2:] == ["result", "done"], rb[-2:]
         assert len(a.app.state.delib_llm.calls) == 1
         # A 의 셋째 외부 호출은 그 사람의 상한(2)에 걸린다 — 과제를 만들지 않는다
-        r3 = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": "a@x.com", **EXT}))
+        r3 = _frames(_bounded(c, {**REQUESTS["verdict_one"], **IDENT, "user_email": "a@x.com", **EXT}, pending))
         err = next(dd for e, dd in r3 if e == "error")
         assert {k: err[k] for k in ("code", "reason", "knob", "limit", "active", "infra", "retryable")} == {
             "code": "review_busy", "reason": "external_per_owner", "knob": "EXTERNAL_LLM_MAX_INFLIGHT", "limit": 2,
@@ -274,8 +287,7 @@ def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과
         # 비우기(scope all)면 다른 사람의 외부 호출도 받지 않는다
         gate.drain.set_on(scope="all", by="update-all", ttl_s=600)
         try:
-            r4 = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": "c@x.com",
-                                                           **EXT}))
+            r4 = _frames(_bounded(c, {**REQUESTS["verdict_one"], **IDENT, "user_email": "c@x.com", **EXT}, pending))
             lim = c.get("/card-review/limits", params={"llm": "external"}).json()["gate"]
         finally:
             gate.drain.set_off(by="update-all")
@@ -285,7 +297,7 @@ def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과
         assert (lim["limit"], lim["limit_reason"]) == (0, "draining")
     finally:
         env.clock.t += 301                                 # 일꾼이 없다 — A 의 둘은 '없다' 로 끝난다
-        for t in ths:
+        for t in ths + pending:
             t.join(30)
     assert results == {0: [("error", "external_worker_absent")], 1: [("error", "external_worker_absent")]}
     assert (board.calls_active(), c.get("/health").json()["review_active"]) == (0, 0)
@@ -293,14 +305,19 @@ def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과
 
 # ── 4. 반출 동의 표지(엔진의 겹 방어) ─────────────────────────────────────────────
 def test_카드_대조_run_은_consent_external_true_가_없으면_과제를_만들기_전에_422_다(env):
-    c, board = env.client, env.board
+    c, board, pending = env.client, env.board, []
     one = {**REQUESTS["verdict_one"], **IDENT, "llm": "external"}
-    for consent in (None, False, "true", 1):
-        body = dict(one) if consent is None else {**one, "consent_external": consent}
-        r = c.post("/card-review/run", json=body)
-        assert (r.status_code, r.json()["code"]) == (422, "external_consent_required"), (consent, r.text[:200])
-    r = c.post("/card-review/run", json={**one, "user_email": ""})
-    assert r.json()["code"] == "external_consent_required", "동의 표지를 신원보다 먼저 본다"
+    try:
+        for consent in (None, False, "true", 1):
+            body = dict(one) if consent is None else {**one, "consent_external": consent}
+            r = _bounded(c, body, pending)
+            assert (r.status_code, r.json()["code"]) == (422, "external_consent_required"), (consent, r.text[:200])
+        r = _bounded(c, {**one, "user_email": ""}, pending)
+        assert r.json()["code"] == "external_consent_required", "동의 표지를 신원보다 먼저 본다"
+    finally:
+        env.clock.t += 301                                 # 거절되지 않고 선 과제가 있으면 '없다' 로 끝내 스레드를 푼다
+        for t in pending:
+            t.join(30)
     assert board.counts() == {"queued": 0, "claimed": 0} and board.calls_active() == 0
     # limits·plan 은 글이 나가지 않아 묻지 않는다 · GLM 길은 표지와 상관없다
     assert c.get("/card-review/limits", params={"llm": "external"}).status_code == 200
@@ -310,13 +327,15 @@ def test_카드_대조_run_은_consent_external_true_가_없으면_과제를_만
 
 
 def test_심의_입구_셋과_MCP_시작은_반출_동의_표지가_없으면_과제_없이_거절한다(monkeypatch, tmp_path):
-    from test_external_llm_delib import _mcp, _panel
+    from test_external_llm_delib import _mcp, _panel, scaled
 
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
     for entry in (d.run_deliberation, d.run_sim_deliberation, d.run_test_plan):
         for consent in (None, False, "true"):
+            # 시계를 빨리 돌리는 줄 — 거절되지 않고 심의가 돌면 일꾼이 없어 곧 '없다' 로 끝나 시험이 매달리지 않고 실패한다
             events, _w, _bound, _tools, board = _panel(monkeypatch, {"consent_external": consent}, worker=False,
-                                                       entry=entry)
+                                                       entry=entry, board=x.Board(x.Settings(), clock=scaled(),
+                                                                                  tick=0.02))
             assert [ev for ev, _ in events] == ["error", "done"], (entry, consent)
             assert events[0][1]["code"] == "external_consent_required" and board.counts() == {"queued": 0, "claimed": 0}
     with pytest.raises(ValueError, match="^external_consent_required"):
