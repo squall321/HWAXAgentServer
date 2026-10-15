@@ -540,6 +540,46 @@ def test_외부_심의의_의장_결정문_절단_경고는_EXTERNAL_LLM_MAX_TOK
     assert cut and cut[0]["knob"] == "EXTERNAL_LLM_MAX_TOKENS", [dd for e, dd in events if e == "warning"]
 
 
+# ── L5. 외부 잡의 닫힌 free_tools 는 호출자의 선택과 따로 ─────────────────────────────
+def test_외부_잡의_닫힌_free_tools_는_따로_적혀_GLM_이어하기가_물려받지_않는다(monkeypatch, tmp_path):
+    """탐침 p10 — 외부 잡의 기록에 닫힌 free_tools=0 이 호출자의 값처럼 적혀, llm 을 이어받지 않는 이어하기(GLM)가 그 0 을
+    물려받았다(호출자는 free_tools 를 보내지 않았거나 1 을 보냈다)."""
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    seen = []
+
+    async def fake_run(app, q, groups, opts, user, pat, history, **kw):
+        seen.append((dict(opts or {}), kw))
+        yield d._sse("delib", {"kind": "decision", "text": "결정문"})
+        yield d._sse("done", {})
+
+    monkeypatch.setattr(d, "run_deliberation", fake_run)
+    monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None,
+                                                                          external_board=x.Board(x.Settings()))))
+    hdr = ctx_of("first%2Btag@x.com")
+
+    async def go(advanced):
+        out = await m.deliberate_start("화두", job="risk-review", advanced=advanced, ctx=hdr)
+        await delib_jobs._TASKS[out["job_id"]]
+        cont = await m.deliberate_continue(out["job_id"], "사람 의견", ctx=hdr)
+        await delib_jobs._TASKS[cont["job_id"]]
+        return delib_jobs._JOBS[out["job_id"]], delib_jobs._JOBS[cont["job_id"]]
+
+    prev, nxt = asyncio.run(go({**EXT, "free_tools": 1}))
+    assert (prev["opts"]["llm"], prev["opts"]["free_tools"], prev["opts"]["external_forced"]) == (
+        "external", 1, {"free_tools": 0})
+    (first_opts, first_kw), (cont_opts, cont_kw) = seen
+    assert first_kw == {"owner": "first+tag@x.com"} and d._resolve_opts(first_opts).free_tools == 0, "외부 잡은 닫혀 돈다"
+    assert cont_kw == {} and "llm" not in cont_opts and cont_opts["free_tools"] == 1
+    assert d._resolve_opts(cont_opts).free_tools == 1 and "external_forced" not in nxt["opts"]
+    seen.clear()
+    prev, _nxt = asyncio.run(go(dict(EXT)))                   # 호출자가 free_tools 를 보내지 않았다
+    assert "free_tools" not in prev["opts"] and prev["opts"]["external_forced"] == {"free_tools": 0}
+    assert "free_tools" not in seen[1][0], "보내지 않은 값을 이어하기가 지어냈다"
+
+
 # ── L8. 주인 칸 정리 ─────────────────────────────────────────────────────────────
 def test_과제도_없이_하루_넘게_조용한_주인_칸은_지운다(stub):
     """탐침 p01 owners_growth — 워크플로 쪽 호출마다 신원별 칸이 생기고 지워지지 않았다(2만 신원이면 2만 칸)."""

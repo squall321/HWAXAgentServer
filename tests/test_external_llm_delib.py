@@ -229,7 +229,10 @@ def test_MCP_심의_시작도_외부_응답자로_돌고_잡_기록에_llm_과_t
                                                           "free_tools": 1})
     assert (out["llm"], out["tool_mode"]) == ("external", "evidence_only")
     assert done["status"] == "done", done.get("error")
-    assert (done["llm"], done["applied_opts"]["llm"], done["applied_opts"]["free_tools"]) == ("external", "external", 0)
+    # 손잡이 칸은 호출자가 보낸 값(1)이고 외부 응답자 길이 닫은 값은 따로 적힌다(GLM 이어하기가 닫힌 0 을 물려받지 않게 — L5).
+    ao = done["applied_opts"]
+    assert (done["llm"], ao["llm"], ao["free_tools"], ao["external_forced"]) == ("external", "external", 1, {"free_tools": 0})
+    assert ao["consent_external"] is True, "반출 동의 표지가 잡 기록에 남아야 한다"
     assert done["decision"].startswith("■ 외부 응답자 실행 — ")
     assert (tr["llm"], tr["tool_mode"]) == ("external", "evidence_only") and tr["total"] > 0
     assert any(e["source"] == "외부 응답자 실행 — evidence_only" for e in done["evidence_omitted"])

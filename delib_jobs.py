@@ -618,17 +618,22 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 상한에서 줄인 것(rounds=99)이 걸린 값처럼 남는다 — 호출자가 손잡이를 끈 줄 아는 그 기록이 된다.
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
+    # 외부 응답자 길이 닫는 값(free_tools=0 — evidence_only)은 호출자의 선택이 아니다. 손잡이 칸에는 호출자가 보낸 값을 읽은 그대로
+    # 적고(외부 응답자 없이 읽은 값) 닫힌 값은 external_forced 에 따로 적는다 — 한 칸에 섞으면 이 잡을 GLM 으로 이어 갈 때
+    # (이어하기는 llm 을 이어받지 않는다) 닫힌 0 을 호출자가 고른 값처럼 물려받았다.
+    _mine = (_resolve_opts({k: v for k, v in applied.items() if k not in ("evidence", "llm")})
+             if _read.llm == "external" else _read)
     # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
     # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
-    applied = {**applied, **{k: getattr(_read, k) for k in applied
+    applied = {**applied, **{k: getattr(_mine, k) for k in applied
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
-    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다. 받으면 잡 기록에 판단
-    # LLM 과 실제로 걸린 free_tools(evidence_only 라 0)를 적는다 — 보낸 값이 아니라 걸린 값이다(위와 같은 규칙).
+    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다.
+    # 받으면 잡 기록에 판단 LLM 과 그 길이 닫은 값(external_forced)을 적는다.
     _refused = _external_refusal(app, applied, owner or user_email)
     if _refused:
         raise ValueError(f"{_refused['code']}: {_refused['message']}")
     if _read.llm == "external":
-        applied = {**applied, "llm": "external", "free_tools": _read.free_tools}
+        applied = {**applied, "llm": "external", "external_forced": {"free_tools": _read.free_tools}}
     elif "llm" in applied:
         applied = {**applied, "llm": _read.llm}
 
