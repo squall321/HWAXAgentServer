@@ -1,0 +1,9 @@
+event: status
+data: {"step": "attempt", "n": 1}
+
+event: error
+data: {"code": "external_worker_absent", "message": "외부 응답자가 이 과제를 300초 동안 집지 않았다 — 그동안 잡 주인의 워크플로가 아무 과제도 집거나 내지 않았다(돌고 있지 않거나 다른 신원으로 붙었다). Claude Code 워크플로를 잡 주인의 PAT 로 다시 돌린 뒤 같은 호출을 다시 낸다", "infra": true, "retryable": true, "knob": "EXTERNAL_LLM_WAIT_S", "attempt": 1}
+
+event: done
+data: {}
+

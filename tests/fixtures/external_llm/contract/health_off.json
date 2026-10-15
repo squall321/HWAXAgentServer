@@ -1,0 +1,7 @@
+{
+ "capabilities": [
+  "card_review",
+  "drain"
+ ],
+ "external_llm_present": false
+}

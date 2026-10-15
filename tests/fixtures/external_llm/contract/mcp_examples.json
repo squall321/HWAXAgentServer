@@ -1,0 +1,189 @@
+{
+ "next_empty": {
+  "empty": true,
+  "claimed": 0,
+  "waited_s": 0.0
+ },
+ "next_head": {
+  "task_id": "xt-0001",
+  "lease": "ls-0001",
+  "kind": "verdict",
+  "max_tokens": 32000,
+  "max_chars": 33600,
+  "chars": 146,
+  "parts": [
+   {
+    "role": "system",
+    "start": 0,
+    "chars": 64
+   },
+   {
+    "role": "human",
+    "start": 64,
+    "chars": 82
+   }
+  ],
+  "answer_deadline": 1760401200,
+  "answer_s": 1200,
+  "claim": 1,
+  "created_at": 1760400000,
+  "target_key": "t-ab12",
+  "label": "verdict/fwd mech-a u-01"
+ },
+ "read_page": {
+  "task_id": "xt-0001",
+  "offset": 0,
+  "next_offset": null,
+  "chars": 146,
+  "text": "당신은 사내 전문가 'mech-a' 한 명입니다. 출력은 한 줄에 JSON 객체 하나씩입니다(JSON Lines).[점검 카드]\n[K01] 종류 check «보스 둘레 간극은 0.3 mm 이상»\n\n[변경]\nL01 [c:1] «보스 간극 0.5 → 0.2 mm»\n"
+ },
+ "submit_partial": {
+  "ok": true,
+  "task_id": "xt-0001",
+  "done": false,
+  "received_chars": 93
+ },
+ "submit_offset_mismatch": {
+  "ok": false,
+  "code": "offset_mismatch",
+  "received_chars": 93,
+  "message": "서버가 받은 답은 93자(유니코드 코드 포인트)다 — offset=93 부터 다시 낸다(0 이면 처음부터)"
+ },
+ "read_not_claimed": {
+  "ok": false,
+  "code": "not_claimed",
+  "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"
+ },
+ "next_head_claim2": {
+  "task_id": "xt-0001",
+  "lease": "ls-0002",
+  "kind": "verdict",
+  "max_tokens": 32000,
+  "max_chars": 33600,
+  "chars": 146,
+  "parts": [
+   {
+    "role": "system",
+    "start": 0,
+    "chars": 64
+   },
+   {
+    "role": "human",
+    "start": 64,
+    "chars": 82
+   }
+  ],
+  "answer_deadline": 1760402401,
+  "answer_s": 1200,
+  "claim": 2,
+  "created_at": 1760400000,
+  "target_key": "t-ab12",
+  "label": "verdict/fwd mech-a u-01"
+ },
+ "submit_stale_lease": {
+  "ok": false,
+  "code": "not_claimed",
+  "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"
+ },
+ "submit_final": {
+  "ok": true,
+  "task_id": "xt-0001",
+  "done": true,
+  "chars": 122,
+  "finish_reason": "stop"
+ },
+ "read_task_not_found": {
+  "ok": false,
+  "code": "task_not_found",
+  "message": "그런 과제가 없다 — 끝났거나 취소됐거나 내 과제가 아니다. review_task_next 로 다음 과제를 집는다"
+ },
+ "submit_other_owner": {
+  "ok": false,
+  "code": "task_not_found",
+  "message": "그런 과제가 없다 — 끝났거나 취소됐거나 내 과제가 아니다. review_task_next 로 다음 과제를 집는다"
+ },
+ "engine_received": {
+  "content": "{\"t\":\"v\",\"k\":\"K01\",\"applies\":\"yes\",\"judgement\":\"FAIL\",\"cq\":\"보스 둘레 간극은 0.3 mm 이상\",\"l\":[\"L01\"],\"why\":\"간극 하한을 넘는다\",\"need\":\"\"}",
+  "response_metadata": {
+   "finish_reason": "stop",
+   "model_name": "external"
+  }
+ },
+ "read_chain_long": {
+  "head": {
+   "task_id": "xt-0002",
+   "lease": "ls-0003",
+   "kind": "sweep",
+   "max_tokens": 32000,
+   "max_chars": 33600,
+   "chars": 114064,
+   "parts": [
+    {
+     "role": "system",
+     "start": 0,
+     "chars": 64
+    },
+    {
+     "role": "human",
+     "start": 64,
+     "chars": 114000
+    }
+   ],
+   "answer_deadline": 1760402401,
+   "answer_s": 1200,
+   "claim": 1,
+   "created_at": 1760401201
+  },
+  "pages": [
+   {
+    "offset": 0,
+    "next_offset": 18543,
+    "chars": 114064,
+    "text_chars": 18543
+   },
+   {
+    "offset": 18543,
+    "next_offset": 37077,
+    "chars": 114064,
+    "text_chars": 18534
+   },
+   {
+    "offset": 37077,
+    "next_offset": 55610,
+    "chars": 114064,
+    "text_chars": 18533
+   },
+   {
+    "offset": 55610,
+    "next_offset": 74143,
+    "chars": 114064,
+    "text_chars": 18533
+   },
+   {
+    "offset": 74143,
+    "next_offset": 92676,
+    "chars": 114064,
+    "text_chars": 18533
+   },
+   {
+    "offset": 92676,
+    "next_offset": 111208,
+    "chars": 114064,
+    "text_chars": 18532
+   },
+   {
+    "offset": 111208,
+    "next_offset": null,
+    "chars": 114064,
+    "text_chars": 2856
+   }
+  ]
+ },
+ "submit_answer_too_large": {
+  "ok": false,
+  "code": "answer_too_large",
+  "received_chars": 0,
+  "max_chars": 2000000,
+  "message": "답이 2,000,000자를 넘는다 — 프롬프트가 요구한 꼴과 max_tokens 안으로 다시 쓴다"
+ }
+}

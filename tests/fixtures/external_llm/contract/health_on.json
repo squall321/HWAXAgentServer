@@ -1,0 +1,19 @@
+{
+ "capabilities": [
+  "card_review",
+  "drain",
+  "external_llm"
+ ],
+ "external_llm": {
+  "ctx_tokens": 200000,
+  "max_tokens": 32000,
+  "wait_s": 300.0,
+  "answer_s": 1200.0,
+  "call_worst_s": 3000.0,
+  "max_inflight": 8,
+  "inflight": 0,
+  "queued": 0,
+  "claimed": 0,
+  "evid_budget": 67183
+ }
+}

@@ -1,0 +1,129 @@
+{
+ "api_rev": "cr-1",
+ "kinds": [
+  "sweep",
+  "verdict",
+  "offcard",
+  "noinput",
+  "summary"
+ ],
+ "cell_kinds": [
+  "sweep",
+  "verdict",
+  "offcard",
+  "noinput"
+ ],
+ "model": "external",
+ "ctx_tokens": 200000,
+ "ctx_source": "external",
+ "ctx_retrying": false,
+ "llm_max_tokens": 32000,
+ "max_tokens_source": "external",
+ "out_tokens": 32000,
+ "p_hard": 164052,
+ "unit_body_max": 17742,
+ "verdict": {
+  "p": 52500,
+  "fixed": 14750,
+  "body": 37750,
+  "role_max": 5250,
+  "digest_max": 2625,
+  "mech_max": 2625,
+  "hint_max": 1050,
+  "unit_body_max": 17742,
+  "card_budget": 20008,
+  "k": 8,
+  "k_out": 38
+ },
+ "sweep": {
+  "p": 105000,
+  "fixed": 21300,
+  "body": 83700,
+  "role_max": 10500,
+  "domains_max": 5250,
+  "missing_max": 1050,
+  "hint_max": 2100,
+  "manifest_page_max": 16740,
+  "card_budget": 66960,
+  "units_per_page_max": 131,
+  "manifest_item_max": 800
+ },
+ "offcard": {
+  "p": 63000,
+  "fixed": 23761,
+  "body": 39239,
+  "role_max": 6300,
+  "digest_max": 3150,
+  "known_max": 3150,
+  "mech_max": 3150,
+  "domains_max": 3150,
+  "hint_max": 1260,
+  "unit_body_max": 39239,
+  "card_budget": 21497,
+  "findings_max": 31,
+  "longdoc_max": 15750
+ },
+ "noinput": {
+  "p": 63000,
+  "fixed": 20610,
+  "body": 42390,
+  "role_max": 6300,
+  "digest_max": 3150,
+  "known_max": 3150,
+  "mech_max": 3150,
+  "hint_max": 1260,
+  "unit_body_max": 42390,
+  "card_budget": 24648,
+  "items_max": 32
+ },
+ "summary": {
+  "p": 105000,
+  "fixed": 15400,
+  "body": 89600,
+  "hint_max": 2100,
+  "blocks_max": 10500,
+  "line_max": 400,
+  "narrative_max": 5040,
+  "cover_max": 37,
+  "cover_hard_max": 111
+ },
+ "runnable": {
+  "sweep": true,
+  "verdict": true,
+  "offcard": true,
+  "noinput": true,
+  "summary": true
+ },
+ "search": {
+  "timeout_s": 60.0
+ },
+ "unit_size": {
+  "per_line": 11,
+  "base": 160
+ },
+ "manifest_item": {
+  "overhead": 14
+ },
+ "prompt_rev": {
+  "sweep": "cr-sweep-2",
+  "verdict": "cr-verdict-2",
+  "offcard": "cr-offcard-2",
+  "noinput": "cr-noinput-1",
+  "summary": "cr-summary-2"
+ },
+ "norm_rev": "cr-n1",
+ "limits_rev_by_kind": {
+  "sweep": "79d7ff35",
+  "verdict": "8cc967a8",
+  "offcard": "71c10cae",
+  "noinput": "21a08bbe",
+  "summary": "7a158e16"
+ },
+ "limits_rev": "75d363ab",
+ "llm": "external",
+ "gate": {
+  "limit": 8,
+  "limit_reason": "external_per_owner",
+  "active": 0
+ }
+}

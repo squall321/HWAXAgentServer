@@ -71,6 +71,11 @@ MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 기본값에서는 건너뛸 일이 없어 한 사람의 잡 여럿이 줄을 통째로 차지할 수 있다 — 그게 싫으면 사용자별
 # 상한을 전역보다 낮춘다.
 QUEUE_MAX = max(0, _env_int("DELIB_JOB_QUEUE_MAX", 20))
+# 외부 응답자 심의(delib_opts.llm=external)의 자리 — 판단 호출이 전부 잡 주인의 Claude Code 워크플로로 가서 이 서버의 LLM 을 물지
+# 않는다. 사람 속도의 워커를 기다리는 그 잡이 전역 자리(MAX_RUNNING)를 쥐면 남의 GLM 심의가 그 몇 시간 동안 줄에 묶였다(X-D6).
+# 그래서 전역 상한·사용자별 상한(GLM 몫)에 세지 않고 주인(과제를 받는 사람)마다 이만큼만 돌린다 — 나머지는 줄에서 그 주인의 것이
+# 끝나기를 기다린다. 도는 수(running_count — /health 의 delib_active·재기동 미룸)에는 그대로 든다(재기동하면 끊긴다).
+EXTERNAL_PER_OWNER = 1
 # 메모리 원장 보존 개수(파일은 지우지 않는다 — 결과 회수는 파일에서도 된다).
 KEEP_IN_MEM = 200
 # 좌석 발언 전사 보존 상한(턴 수). 넘으면 이후 발언은 버리고 그 사실을 한 줄 남긴다.
@@ -213,11 +218,18 @@ def _list_path(job_id: str) -> Path:
 def _list_rec(job: dict) -> dict:
     """목록 한 행에 쓰는 칸만 — summary() 가 원장 대신 이것을 받아도 같은 행이 나온다(턴은 수, 좌석은 키, 체크포인트는 유무)."""
     rec = {k: job[k] for k in _LIST_KEYS if k in job}
-    rec["opts"] = {"sealed": (job.get("opts") or {}).get("sealed")}
+    rec["opts"] = {"sealed": (job.get("opts") or {}).get("sealed"),
+                   # 외부 응답자로 돈 잡만 그 표지를 싣는다(summary 의 llm·tool_mode) — 나머지 잡의 색인은 종전 모양이다.
+                   **({"llm": "external"} if _external(job) else {})}
     rec["seats"] = [{"key": s.get("key")} for s in (job.get("seats") or [])]
     rec["turn_count"] = len(job.get("turns") or [])
     rec["checkpoint"] = bool(job.get("checkpoint"))
     return rec
+
+
+def _external(job: dict) -> bool:
+    """외부 응답자(판단 LLM 이 잡 주인의 Claude Code 워크플로)로 돈 잡인가 — 잡 기록의 걸린 값으로 본다."""
+    return (job.get("opts") or {}).get("llm") == "external"
 
 
 def _stamp(st: os.stat_result) -> list:
@@ -301,9 +313,22 @@ def _foreign(job: dict, viewer: str) -> bool:
     return bool(me and _owner(job) and _owner(job) != me)
 
 
+def _glm_running_count() -> int:
+    """GLM 자리를 쓰는 도는 잡 수 — 전역 상한(MAX_RUNNING)이 이것을 본다. 외부 응답자 잡은 세지 않는다(EXTERNAL_PER_OWNER)."""
+    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and not _external(j))
+
+
 def _running_of(owner: str) -> list[str]:
-    """그 사람이 돌리고 있는 잡 id. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석)."""
-    return [j["id"] for j in _JOBS.values() if owner and j.get("status") == "running" and _owner(j) == owner]
+    """그 사람이 돌리고 있는 GLM 잡 id — 사용자별 상한(GLM 몫)이 본다. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석).
+    외부 응답자 잡은 따로 센다(_external_running_of)."""
+    return [j["id"] for j in _JOBS.values()
+            if owner and j.get("status") == "running" and not _external(j) and _owner(j) == owner]
+
+
+def _external_running_of(task_owner: str) -> list[str]:
+    """그 주인(과제를 받는 사람 — 잡의 task_owner)이 돌리고 있는 외부 응답자 잡 id — 주인마다 EXTERNAL_PER_OWNER 건이다."""
+    return [j["id"] for j in _JOBS.values()
+            if task_owner and j.get("status") == "running" and _external(j) and j.get("task_owner") == task_owner]
 
 
 def _launch(job: dict, spawn) -> None:
@@ -323,14 +348,19 @@ def _pump() -> None:
     자리 사정이 바뀌는 곳마다 부른다 — 새 요청, 끝남·취소·실패(_drive 의 finally), 본문에 들어가 보지도
     못하고 접힌 태스크(_settle). 세고 띄우는 사이에 await 가 없어 이벤트 루프가 끼어들지 못한다 — 그래서 자리
     하나에 둘이 뜨지 않고, 부른 뒤에는 '자리가 비었는데 뜰 수 있는 잡이 줄에 있다' 가 남지 않는다.
-    제 사용자별 상한에 걸린 잡은 **건너뛴다** — 거기서 멈추면 한 사람이 줄 전체를 세운다."""
+    제 사용자별 상한에 걸린 잡은 **건너뛴다** — 거기서 멈추면 한 사람이 줄 전체를 세운다. 외부 응답자 잡은 전역 자리를 보지 않고
+    주인마다 EXTERNAL_PER_OWNER 건으로 뜬다 — 그래서 전역 자리가 차도 멈추지 않고 끝까지 본다(GLM 잡은 어차피 다 건너뛴다)."""
     if _CLOSING:
         return
     for jid, (job, spawn) in list(_PENDING.items()):
-        if running_count() >= MAX_RUNNING:
-            return
-        if len(_running_of(_owner(job))) >= MAX_RUNNING_PER_USER:
-            continue
+        if _external(job):
+            if len(_external_running_of(job.get("task_owner") or "")) >= EXTERNAL_PER_OWNER:
+                continue
+        else:
+            if _glm_running_count() >= MAX_RUNNING:
+                continue
+            if len(_running_of(_owner(job))) >= MAX_RUNNING_PER_USER:
+                continue
         del _PENDING[jid]
         _launch(job, spawn)
 
@@ -359,10 +389,15 @@ def queue_info(job: dict) -> dict | None:
     pos = list(_PENDING).index(job["id"]) + 1
     # 무엇을 기다리는가 — 제 몫을 다 쓴 것이면 제 심의가 끝나야(또는 접어야) 차례가 오고, 그 사이
     # 뒤에 선 다른 사람이 먼저 갈 수 있다.
-    mine = len(_running_of(_owner(job)))
-    why = (f"사용자별 상한 {MAX_RUNNING_PER_USER}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
-           "선 다른 사람이 먼저 갈 수 있다)" if mine >= MAX_RUNNING_PER_USER
-           else f"전역 상한 {MAX_RUNNING}건 — 진행 중인 심의가 끝나야 차례가 온다")
+    if _external(job):
+        mine = len(_external_running_of(job.get("task_owner") or ""))
+        why = (f"외부 응답자 심의는 주인마다 {EXTERNAL_PER_OWNER}건씩 돈다 — 내 외부 응답자 심의 {mine}건이 끝나야 차례가 "
+               "온다(GLM 심의 자리와는 따로다)")
+    else:
+        mine = len(_running_of(_owner(job)))
+        why = (f"사용자별 상한 {MAX_RUNNING_PER_USER}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
+               "선 다른 사람이 먼저 갈 수 있다)" if mine >= MAX_RUNNING_PER_USER
+               else f"전역 상한 {MAX_RUNNING}건 — 진행 중인 심의가 끝나야 차례가 온다")
     return {"position": pos, "ahead": pos - 1, "length": len(_PENDING), "max": QUEUE_MAX, "why": why,
             "waited_s": round(_now() - (job.get("queued_at") or _now()), 1)}
 
@@ -536,7 +571,7 @@ async def _drive(job: dict, gen) -> None:
 
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
-          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "") -> dict:
+          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "") -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
@@ -546,7 +581,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     deliberation 모듈이 app.py 를 다시 부르는 순환을 피한다.
 
     ⚠ 웹과 같은 조합을 만든다 — 트리거(어느 run_*)와 chair_template 을 한 곳에서 세운다.
-    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본)."""
+    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본).
+
+    owner 는 외부 응답자 심의(delib_opts.llm=external)의 과제 주인이다 — MCP 호출자 길이 게이트웨이 헤더를 푼 이름을 준다
+    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
@@ -557,23 +595,34 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
     #   신원 없는 호출(서비스 계정)끼리도 서로 남이다 — 빈 이름이 같다고 한 사람으로 묶지 않는다.
     #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
-    total = running_count()
+    # 외부 응답자 잡(delib_opts.llm=external)은 GLM 자리(전역·사용자별) 대신 주인마다 EXTERNAL_PER_OWNER 건이다 — 어느 몫을 셀지 먼저
+    # 가린다. 주인은 과제를 받는 사람이다(owner — 비면 user_email, 엔진과 같게 공백·대소문자만 맞춘다).
+    from deliberation import _wants_external  # noqa: PLC0415 — 아래의 늦은 import 와 같은 까닭(순환 방지)
+    external = _wants_external(delib_opts)
+    x_owner = str(owner or user_email or "").strip().lower() if external else ""
+    total = _glm_running_count()
     me = (user_email or "").strip().lower()
-    mine = _running_of(me)
+    mine = _external_running_of(x_owner) if external else _running_of(me)
+    who = x_owner if external else me
     # 어느 상한에 걸렸는지 말한다 — 사용자별이면 제 것을 접으면 풀리고, 전역뿐이면 기다려야 한다.
     hit = []
-    if total >= MAX_RUNNING:
-        hit.append(f"전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING")
-    if me and len(mine) >= MAX_RUNNING_PER_USER:
-        hit.append(f"사용자별 {MAX_RUNNING_PER_USER}건 — DELIB_JOB_MAX_RUNNING_PER_USER")
+    if external:
+        if x_owner and len(mine) >= EXTERNAL_PER_OWNER:
+            hit.append(f"외부 응답자 심의 주인마다 {EXTERNAL_PER_OWNER}건 — GLM 심의 자리와는 따로다")
+    else:
+        if total >= MAX_RUNNING:
+            hit.append(f"전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING")
+        if me and len(mine) >= MAX_RUNNING_PER_USER:
+            hit.append(f"사용자별 {MAX_RUNNING_PER_USER}건 — DELIB_JOB_MAX_RUNNING_PER_USER")
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
+    # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.
     if hit and QUEUE_MAX <= 0:
         raise RuntimeError(
             f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
-            + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if me
+            + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if who
                else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
-            + f" · 전체 {total}/{MAX_RUNNING}. "
+            + ("" if external else f" · 전체 {total}/{MAX_RUNNING}") + ". "
             + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
                else "진행 중인 심의가 끝난 뒤 다시 하라."))
     if hit and len(_PENDING) >= QUEUE_MAX:
@@ -582,14 +631,14 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             f"동시 실행 상한에 걸렸고({' · '.join(hit)}) 대기열도 찼다"
             f"({len(_PENDING)}/{QUEUE_MAX}건 — DELIB_JOB_QUEUE_MAX) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}"
-               f" · 내 대기 {len(waiting)}건{' ' + ', '.join(waiting) if waiting else ''}" if me
+               f" · 내 대기 {len(waiting)}건{' ' + ', '.join(waiting) if waiting else ''}" if who
                else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
-            + f" · 전체 진행 {total}/{MAX_RUNNING}. "
+            + ("" if external else f" · 전체 진행 {total}/{MAX_RUNNING}") + ". "
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
-    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _resolve_opts,  # noqa: PLC0415
-                              _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
+    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _external_refusal,  # noqa: PLC0415
+                              _resolve_opts, _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
                               run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
@@ -608,10 +657,24 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 상한에서 줄인 것(rounds=99)이 걸린 값처럼 남는다 — 호출자가 손잡이를 끈 줄 아는 그 기록이 된다.
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
+    # 외부 응답자 길이 닫는 값(free_tools=0 — evidence_only)은 호출자의 선택이 아니다. 손잡이 칸에는 호출자가 보낸 값을 읽은 그대로
+    # 적고(외부 응답자 없이 읽은 값) 닫힌 값은 external_forced 에 따로 적는다 — 한 칸에 섞으면 이 잡을 GLM 으로 이어 갈 때
+    # (이어하기는 llm 을 이어받지 않는다) 닫힌 0 을 호출자가 고른 값처럼 물려받았다.
+    _mine = (_resolve_opts({k: v for k, v in applied.items() if k not in ("evidence", "llm")})
+             if _read.llm == "external" else _read)
     # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
     # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
-    applied = {**applied, **{k: getattr(_read, k) for k in applied
+    applied = {**applied, **{k: getattr(_mine, k) for k in applied
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
+    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다.
+    # 받으면 잡 기록에 판단 LLM 과 그 길이 닫은 값(external_forced)을 적는다.
+    _refused = _external_refusal(app, applied, owner or user_email)
+    if _refused:
+        raise ValueError(f"{_refused['code']}: {_refused['message']}")
+    if _read.llm == "external":
+        applied = {**applied, "llm": "external", "external_forced": {"free_tools": _read.free_tools}}
+    elif "llm" in applied:
+        applied = {**applied, "llm": _read.llm}
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
@@ -635,6 +698,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "user": user_email or "",
         # 누가 띄웠나(M3.md #26) — app 이면 카드 대조 관문의 절반 판정에 세지 않는다(running_human_count).
         "started_by": _started_by(opts.get("started_by")),
+        # 외부 응답자 잡만 — 과제를 받는 주인. 그 잡의 자리(주인마다 EXTERNAL_PER_OWNER 건)를 이 이름으로 센다(_pump).
+        **({"task_owner": x_owner} if _read.llm == "external" else {}),
     }
     _JOBS[job_id] = job
     # 누구든 줄 끝에 세운 다음 줄을 한 번 돌린다 — 자리가 있으면 그 자리에서 곧바로 뜬다(종전과 같다).
@@ -643,9 +708,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   잡은 앞 심의의 뒷정리 안에서 뜬다 — 그대로 만들면 앞 심의가 세운 요청 단위 표식(자격 강등
     #   _pat_degraded · 유령 ID 출처 _turn_ids)을 달고 돈다. 곧바로 뜨는 잡은 종전과 같은 컨텍스트다.
     groups, ctx = list(groups or []), contextvars.copy_context()
+    # 외부 응답자 잡만 과제 주인을 따로 넘긴다(GLM 잡의 진입 호출은 종전 그대로다).
+    ext_kw = {"owner": owner or user_email} if _read.llm == "external" else {}
 
     def spawn() -> asyncio.Task:
-        gen = entry(app, q, groups, opts or None, user_email, user_pat, None)
+        gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job_id}")
 
     _PENDING[job_id] = (job, spawn)
@@ -756,6 +823,9 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "checkpoint": bool(job.get("checkpoint")),
         "error": job.get("error"),
     }
+    if _external(job):
+        # 판단 LLM 이 외부 응답자였다 — 좌석 도구 호출이 없는 evidence_only 등급이다(리스크 원장의 tool_mode 와 같은 말).
+        out["llm"], out["tool_mode"] = "external", "evidence_only"
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
         # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —
@@ -829,7 +899,8 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
     lim = max(1, min(200, int(limit)))
     page = [_turn_view(t, full) for t in rows[off:off + lim]]
     clipped = sum(1 for t in page if t.get("say_clipped"))
-    return {"job_id": job_id, "total": total, "offset": off, "limit": lim,
+    return {"job_id": job_id, **({"llm": "external", "tool_mode": "evidence_only"} if _external(job) else {}),
+            "total": total, "offset": off, "limit": lim,
             "next_offset": off + lim if off + lim < total else None,
             "remaining": max(0, total - off - lim),
             "turns": page,

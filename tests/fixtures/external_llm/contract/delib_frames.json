@@ -1,0 +1,91 @@
+{
+ "start_status": {
+  "step": "외부 응답자 실행 — 판단 LLM 이 외부 응답자(잡 주인이 돌리는 Claude Code 워크플로)다 — 좌석 도구 호출이 없는 evidence_only 로 돈다(좌석은 [근거]와 지식카드만으로 발언한다).",
+  "tool": null
+ },
+ "notice_card": {
+  "kind": "evidence",
+  "source": "외부 응답자 실행 — evidence_only",
+  "included": false,
+  "notice": true,
+  "knob": "EXTERNAL_LLM_ENABLED",
+  "text": "판단 LLM 이 외부 응답자(잡 주인이 돌리는 Claude Code 워크플로)다 — 좌석·의장의 LLM 호출이 그 사람의 과제 줄로 가고, 좌석은 도구를 부를 수 없어 [근거]와 지식카드만으로 발언한다(evidence_only — 좌석 자유 조회를 닫았다). 창은 외부 응답자의 창(200,000 토큰)으로 셈했다. 호출자가 보낸 free_tools=1 는 닫혔다."
+ },
+ "result": {
+  "type": "text",
+  "llm": "external",
+  "tool_mode": "evidence_only",
+  "content": "■ 외부 응답자 실행 — 판단 LLM 은 외부 응답자(잡 주인이 돌린 Claude Code 워크플로 — 모델은 그 사람이 고른 것)였고, 좌석 도구 호출이 없는 evidence_only 로 돌았다(좌석은 [근거]와 지식카드만으로 발언했다).\n…(결정문 — 줄임)"
+ },
+ "seat_lost_absent": {
+  "code": "seat_lost",
+  "message": "1라운드 좌석 유실 — mech-a, rel-b, pcb-c, delib-baseline-defender 이(가) 이 라운드에 발언하지 못했다(mech-a, rel-b, pcb-c, delib-baseline-defender · 외부 응답자가 이 과제를 300초 동안 집지 않았다 — 그동안 잡 주인의 워크플로가 아무 과제도 집거나 내지 않았다(돌고 있지 않거나 다른 신원으로 붙었다). Claude Code 워크플로를 잡 주인의 PAT 로 다시 돌린 뒤 같은 호출을 다시 낸다(external_worker_absent)). 그 도메인의 판단이 빠진 채 진행한다.",
+  "knob": "EXTERNAL_LLM_WAIT_S",
+  "cause": "external_worker_absent"
+ },
+ "chair_failed_absent": {
+  "code": "chair_failed",
+  "message": "의장이 결정문을 내지 못했다 — 외부 응답자가 없다 — 이 사람의 과제가 300초 동안 집히지 않아 없다고 판정한 뒤로, 워크플로가 다시 붙거나(review_task_* 를 한 번이라도 부르거나) 그 판정에서 300초가 지날 때까지 새 과제를 줄 세우지 않고 바로 이 오류로 답한다. Claude Code 워크플로를 다시 돌린 뒤 같은 호출을 다시 낸다(external_worker_absent) (의장 호출 2번). 라운드 발언은 버리지 않았다 — 좌석별 마지막 입장을 결과로 내렸고 회의록·전사가 남아 있다. 호출당 타임아웃을 늘려 이어하기로 다시 수렴시키면 결정문을 받는다.",
+  "knob": "EXTERNAL_LLM_WAIT_S · 의장 재호출 DELIB_CHAIR_RETRIES",
+  "cause": "external_worker_absent"
+ },
+ "refused_owner_missing": {
+  "code": "external_owner_missing",
+  "message": "외부 응답자 과제를 줄 사람(호출자 신원)이 없다 — 포털이나 게이트웨이를 지나 잡 주인의 신원으로 부른다."
+ },
+ "refused_consent_required": {
+  "code": "external_consent_required",
+  "message": "외부 응답자 심의는 근거·지식카드 글을 외부(Claude)로 보낸다 — 같은 delib_opts(MCP 는 advanced)에 consent_external: true 를 실어야 연다. 이 심의는 시작하지 않았다(과제를 만들지 않았다). llm 을 빼면 이 서버의 LLM 으로 돈다."
+ },
+ "refused_disabled": {
+  "code": "external_llm_disabled",
+  "message": "이 서버는 외부 응답자 길(delib_opts.llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). llm 을 빼면 이 서버의 LLM 으로 돈다.",
+  "knob": "EXTERNAL_LLM_ENABLED"
+ },
+ "refused_bad_request": {
+  "code": "bad_request",
+  "message": "delib_opts.llm 에 모르는 값(claude)이 왔다 — 받는 값은 glm(이 서버의 LLM, 기본)과 external(외부 응답자)뿐이다(MCP 는 advanced.llm). 이 심의는 시작하지 않았다 — 모르는 값을 이 서버의 LLM 으로 조용히 돌리지 않는다."
+ },
+ "_how": {
+  "request": {
+   "question": "[리스크심사 S26 Ultra diff:abababababababababababababababab] 쟁점 패널 — 보스 간극",
+   "delib_opts": {
+    "personas": [
+     {
+      "key": "mech-a",
+      "role": "기구"
+     },
+     {
+      "key": "rel-b",
+      "role": "신뢰성"
+     },
+     {
+      "key": "pcb-c",
+      "role": "보드"
+     }
+    ],
+    "free_tools": 1,
+    "tool_budget": 3,
+    "tools": [],
+    "voc": "off",
+    "rescreen": 0,
+    "chair_template": "risk-review",
+    "save_report": 0,
+    "started_by": "app",
+    "rounds": 3,
+    "llm": "external",
+    "consent_external": true,
+    "evidence": [
+     {
+      "key": "I1",
+      "source": "쟁점 닻",
+      "result": "diff:abababababababababababababababab · mechanical.drop_stress · ck:0123456789ab"
+     }
+    ]
+   }
+  },
+  "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
+  "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",
+  "bad_request": "llm 에 모르는 값('claude') — 스위치가 꺼진 서버에서도 bad_request 다(받는 값은 glm·external)"
+ }
+}

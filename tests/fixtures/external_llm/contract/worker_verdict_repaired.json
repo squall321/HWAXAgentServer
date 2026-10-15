@@ -1,0 +1,98 @@
+[
+ {
+  "head": {
+   "task_id": "xt-0001",
+   "lease": "ls-0001",
+   "kind": "verdict",
+   "max_tokens": 32000,
+   "max_chars": 33600,
+   "chars": 5518,
+   "parts": [
+    {
+     "role": "system",
+     "start": 0,
+     "chars": 693
+    },
+    {
+     "role": "human",
+     "start": 693,
+     "chars": 4825
+    }
+   ],
+   "answer_deadline": 1760401200,
+   "answer_s": 1200,
+   "claim": 1,
+   "created_at": 1760400000,
+   "target_key": "t-ab12",
+   "label": "verdict/fwd mech-test-seal u-01"
+  },
+  "pages": [
+   {
+    "offset": 0,
+    "next_offset": null,
+    "chars": 5518,
+    "text_chars": 5518
+   }
+  ],
+  "submits": [
+   {
+    "ok": true,
+    "task_id": "xt-0001",
+    "done": false,
+    "received_chars": 700
+   },
+   {
+    "ok": true,
+    "task_id": "xt-0001",
+    "done": true,
+    "chars": 868,
+    "finish_reason": "stop"
+   }
+  ]
+ },
+ {
+  "head": {
+   "task_id": "xt-0002",
+   "lease": "ls-0002",
+   "kind": "verdict",
+   "max_tokens": 32000,
+   "max_chars": 33600,
+   "chars": 5609,
+   "parts": [
+    {
+     "role": "system",
+     "start": 0,
+     "chars": 693
+    },
+    {
+     "role": "human",
+     "start": 693,
+     "chars": 4916
+    }
+   ],
+   "answer_deadline": 1760401200,
+   "answer_s": 1200,
+   "claim": 1,
+   "created_at": 1760400000,
+   "target_key": "t-ab12",
+   "label": "verdict/fwd mech-test-seal u-01"
+  },
+  "pages": [
+   {
+    "offset": 0,
+    "next_offset": null,
+    "chars": 5609,
+    "text_chars": 5609
+   }
+  ],
+  "submits": [
+   {
+    "ok": true,
+    "task_id": "xt-0002",
+    "done": true,
+    "chars": 522,
+    "finish_reason": "stop"
+   }
+  ]
+ }
+]

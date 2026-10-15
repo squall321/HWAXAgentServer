@@ -81,6 +81,7 @@ from deliberation import (
     _resolve_opts,
     _started_by,
     _tools_by_name,
+    _wants_external,
     is_deliberation,
     is_operator,
     is_sim_deliberation,
@@ -96,6 +97,7 @@ from deliberation import (
     strip_test_plan_trigger,
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
+import external_llm as _external_llm
 import review_gate as _review_gate
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
@@ -382,6 +384,11 @@ async def lifespan(app: FastAPI):
     app.state.llm_nostream = disable_stream
     if _card_review is not None:
         _card_review.gate_of(app)    # 카드 대조 관문 — 평소 CARD_REVIEW_CONCURRENCY, 심의가 돌면 _WITH_DELIB(수만 센다)
+    # 외부 응답자(EXTERNAL_LLM_ENABLED=1) — 과제 줄을 기동 때 만들고(설정을 한 번 읽는다) 시간 한도 사슬을 적는다. 꺼져 있으면 없다.
+    _ext_board = _external_llm.board_of(app)
+    if _ext_board is not None:
+        _x_read, _x_tries = _llm_limit(app.state.delib_llm)
+        print(_external_llm.startup_note(_ext_board.settings, _x_read, _x_tries))
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
@@ -1060,6 +1067,32 @@ def _cap_tool(tool, result_max=None):
         return s
 
     async def capped(*a, **kw):
+        # 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
+        # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
+        if getattr(tool, "name", "") == "invoke_tool":
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _inner = _args.get("name") if isinstance(_args, dict) else None
+                if isinstance(_inner, str) and _agent_denied(_inner):
+                    print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
+                           "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
+                    return ((msg, None)
+                            if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
+        # 외부 응답자 심의는 사람의 클라이언트에서만 연다(X-D6) — 심의 시작·이어하기에 외부 선택(advanced.llm=external)이나 반출 동의
+        # 칸(consent_external)을 실은 호출은 보내지 않는다. 직접 묶인 그 도구로도, invoke_tool 의 안쪽 이름으로도 같다.
+        _via_inv = getattr(tool, "name", "") == "invoke_tool"
+        for _args in (kw, *(x for x in a if isinstance(x, dict))):
+            _target, _targs = ((_args.get("name"), _args.get("arguments")) if _via_inv
+                               else (getattr(tool, "name", ""), _args))
+            if _agent_external_call(_target, _targs):
+                _target = str(_target)[:80]
+                print(f"[gate] {_target} 차단 — 이 서버의 에이전트는 외부 응답자 심의·반출 동의 칸을 싣지 못한다")
+                msg = (f"{_TOOL_FAIL_MARK} 도구 {_target} 호출 실패: 외부 응답자 심의(advanced.llm=external)와 반출 동의 표지"
+                       "(consent_external)는 사람이 자기 클라이언트에서 고른다 — 이 대화의 에이전트는 그 칸을 실을 수 없어 이 호출은 "
+                       "보내지 않았다. 사용자가 외부 응답자 심의를 원하면 리스크 앱이나 자기 Claude Code 에서 직접 열라고 알려라. 인자 "
+                       "문제가 아니다 — 그 칸을 실어 다시 부르지 마라")
+                return ((msg, None)
+                        if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         # 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
@@ -1811,16 +1844,57 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 
 
 
+# 이 서버의 챗·심의 에이전트가 묶지 않는 게이트웨이 도구 — 외부 응답자 과제 도구(external_llm.TASK_TOOLS). 게이트웨이는 이 서버의
+# /mcp 를 사용자 신원으로 중계하므로, 묶으면 주입된 지시를 받은 GLM 턴이 그 사람의 기다리는 과제를 집거나 답을 낼 수 있다.
+# 도구 목록을 받는 곳(_get_tools_retry — 챗·심의·카탈로그가 다 지난다)에서 빼고, 상시 묶이는 invoke_tool 로 부르는 것도 막는다(_cap_tool).
+_AGENT_DENY_TOOLS = frozenset(_external_llm.TASK_TOOLS)
+
+
+def _agent_denied(name: str) -> bool:
+    """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
+    n = str(name or "").strip().lower()
+    return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS)
+
+
+# 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
+# 게이트웨이는 이 호출을 사용자 신원으로 중계하므로, 지식카드에 숨은 지시를 받은 GLM 턴이 advanced.llm=external 과
+# consent_external: true 를 스스로 달면 외부 심의가 서고 원장에 거짓 동의가 남는다(X-D6). 사람의 동의는 사람의 클라이언트에서만 온다.
+_AGENT_NO_EXTERNAL = ("deliberate_start", "deliberate_continue")
+
+
+def _arg_dict(v) -> dict | None:
+    """도구 인자의 객체 칸 — dict 이거나, FastMCP 가 도구에 넘기기 전에 풀어 주는 JSON 글(func_metadata.pre_parse_json)이면 푼 dict.
+    그 밖은 None 이다."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return None
+    return v if isinstance(v, dict) else None
+
+
+def _agent_external_call(name, args) -> bool:
+    """이 서버의 에이전트가 부르는 심의 시작·이어하기가 외부 응답자를 고르거나(advanced.llm — 엔진과 같은 읽기, _wants_external)
+    반출 동의 칸(consent_external — 값과 상관없이, 바깥 칸이든 advanced 안이든)을 싣는가."""
+    n = str(name or "").strip().lower()
+    if not any(n == t or n.endswith("_" + t) for t in _AGENT_NO_EXTERNAL):
+        return False
+    args = _arg_dict(args) or {}
+    adv = _arg_dict(args.get("advanced")) or {}
+    keys = {str(k).strip().lower() for k in (*args, *adv)}
+    return _wants_external(adv) or _external_llm.CONSENT_FIELD in keys
+
+
 async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
     """게이트웨이에서 도구 목록을 받되, **일시적** 실패는 지수 백오프로 재시도한다(간헐 도구
     0개 해소). 게이트웨이 재기동·재연결은 보통 1~2초 내에 끝나므로, 그 창에 걸린 요청이
     도구 없이 응답하던 것을 흡수한다(cae00 '될 때도 안 될 때도' 실증). 401/403 인증 실패는
-    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다."""
+    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다. 이 서버의 에이전트가 묶지 않는 도구(_AGENT_DENY_TOOLS)는 여기서 뺀다."""
     import asyncio as _aio
     last = None
     for i in range(max(1, tries)):
         try:
-            got = await MultiServerMCPClient(scoped).get_tools()
+            got = [t for t in await MultiServerMCPClient(scoped).get_tools() if not _agent_denied(getattr(t, "name", ""))]
             # 빈 목록도 실패로 본다 — 게이트웨이가 부팅 직후 tools=0 인 과도 상태를 완결로
             # 받으면 도구 없는 에이전트가 만들어진다. 마지막 시도가 아니면 재시도.
             if not got and i < tries - 1:
@@ -2331,7 +2405,13 @@ def _model_context_tokens() -> int:
 
     박스마다 모델이 다르다(dev 16K · 운영 GLM). env 로 박아 두면 한쪽에서 반드시 틀리고,
     틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다.
-    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다."""
+    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다.
+
+    외부 응답자 심의를 도는 태스크(문맥) 안에서는 그 응답자의 창(EXTERNAL_LLM_CTX_TOKENS)이다 — 심의 입구가 세운다
+    (deliberation._external_entry). 그 밖(챗·카드 대조·다른 심의·/health)은 종전 그대로 이 서버 모델의 창이다."""
+    _ov = _external_llm.ctx_override.get()
+    if _ov:
+        return _ov
     if "n" in _ctx_cache:
         return _ctx_cache["n"]
     n = _CTX_FALLBACK
@@ -4837,6 +4917,21 @@ def _card_review_health() -> dict:
             "drain": drain, "capabilities": ["card_review", "drain"], "card_review": fields}
 
 
+def _external_llm_health() -> dict:
+    """/health 의 외부 응답자 칸 — 꺼져 있으면 {}(종전 응답 그대로). 켜져 있으면 external_llm{ctx_tokens, max_tokens, wait_s,
+    answer_s, call_worst_s, queued, claimed, evid_budget}. 수와 설정만 싣는다(과제 글·주인은 싣지 않는다 — /health 는 인증이
+    없다). evid_budget 은 외부 응답자 창으로 셈한 심의 근거 몫(자)이다 — 리스크 앱이 외부 심의의 브리프를 이 값에 맞춘다."""
+    board = _external_llm.board_of(app)
+    if board is None:
+        return {}
+    token = _external_llm.ctx_override.set(board.settings.ctx_tokens)
+    try:
+        evid = _evid_budget()
+    finally:
+        _external_llm.ctx_override.reset(token)
+    return {"external_llm": {**_external_llm.health_fields(board), "evid_budget": evid}}
+
+
 # ── 비우기(update-all 동안 — M3.md 4.7) ─────────────────────────────────────────
 # POST /drain {on, scope: all|panels, ttl_s | until_idle{grace_s, max_s}, hold?, by, reason, force?} · GET /drain. 깃발은
 # review_gate.DrainState(파일 하나 — 재기동을 넘긴다)이고 규칙도 거기 있다. 인증은 없다 — 서버는 루프백에만 묶이고 /chat 도
@@ -4853,7 +4948,15 @@ def _echo(v) -> str:
 
 def _drain_view(gate) -> dict:
     a, q = _delib_load()
-    return {**gate.drain.snapshot(), "review_active": gate.active, "delib_active": a, "delib_queued": q}
+    return {**gate.drain.snapshot(), "review_active": gate.active + _external_review_active(), "delib_active": a,
+            "delib_queued": q}
+
+
+def _external_review_active() -> int:
+    """도는 외부 응답자 카드 대조 호출 수 — GLM 관문 자리를 잡지 않으므로 관문의 active 에 없다. review_active 에 더한다(update-all
+    비우기가 그 수가 0 이 되기를 기다린다 — 재기동하면 과제 줄을 잃는다). 꺼진 박스는 0 이다."""
+    board = _external_llm.board_of(app)
+    return board.calls_active() if board is not None else 0
 
 
 @app.get("/drain")
@@ -4913,6 +5016,13 @@ async def post_drain(request: Request):
 @app.get("/health")
 def health() -> dict:
     _active, _queued = _delib_load()
+    _review = _card_review_health()
+    _external = _external_llm_health()
+    if _external:
+        # 외부 응답자가 켜진 박스만 capabilities 에 external_llm 이 붙는다 — 리스크 앱은 이것을 보고 llm=claude 잡을 받는다(X-2).
+        _review["capabilities"] = [*_review["capabilities"], "external_llm"]
+        # 도는 외부 응답자 카드 대조 호출도 review_active 에 든다(GLM 관문 밖이다 — update-all 비우기가 이 수를 기다린다).
+        _review["review_active"] = _review["review_active"] + _external["external_llm"]["inflight"]
     return {
         "status": "ok",
         # 지금 도는 심의·줄 선 심의 수. 재기동은 이것들을 전부 끊는다 — start.sh 와 update-all 이 이 수를 보고
@@ -4920,7 +5030,9 @@ def health() -> dict:
         "delib_active": _active,
         "delib_queued": _queued,
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
-        **_card_review_health(),
+        **_review,
+        # 외부 응답자(켜진 박스만) — 과제 줄의 수. 재기동하면 줄을 잃는다(도는 호출은 앱이 인프라로 다시 낸다).
+        **_external,
         # 챗 첫 조각 지연 — idle(카드 대조 0)·review(1 이상) 고리와 slow(review.p50 > 2 × idle.p50, 두 고리 10턴 이상).
         "load": {"chat": _CHAT_LOAD.snapshot()},
         "model": VLLM_MODEL,

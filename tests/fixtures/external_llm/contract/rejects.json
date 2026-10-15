@@ -1,0 +1,81 @@
+{
+ "_how": {
+  "external_llm_disabled.*": "EXTERNAL_LLM_ENABLED 가 꺼진 서버에 llm=external(limits 는 ?llm=external)",
+  "external_consent_required.run": "req_verdict_one + llm=external, consent_external 없이(true 가 아니면 같다)",
+  "external_owner_missing.run": "req_verdict_one + llm=external·consent_external=true + 신원 칸에서 user_email 을 비웠다",
+  "bad_request.*": "llm 에 모르는 값('claude') — 받는 값은 glm·external 뿐이다(앱의 'claude' 는 엔진에 'external' 로 보낸다)",
+  "rev_mismatch.run": "GLM limits 의 limits_rev_by_kind.verdict 를 expect 로 실은 외부 run — 두 길의 판은 갈린다"
+ },
+ "external_llm_disabled.limits": {
+  "status": 409,
+  "body": {
+   "code": "external_llm_disabled",
+   "message": "이 서버는 외부 응답자 길(llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). GLM(기본)으로 돌리거나 서버 설정을 켠다",
+   "knob": "EXTERNAL_LLM_ENABLED"
+  }
+ },
+ "external_llm_disabled.plan": {
+  "status": 409,
+  "body": {
+   "code": "external_llm_disabled",
+   "message": "이 서버는 외부 응답자 길(llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). GLM(기본)으로 돌리거나 서버 설정을 켠다",
+   "knob": "EXTERNAL_LLM_ENABLED"
+  }
+ },
+ "external_llm_disabled.run": {
+  "status": 409,
+  "body": {
+   "code": "external_llm_disabled",
+   "message": "이 서버는 외부 응답자 길(llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). GLM(기본)으로 돌리거나 서버 설정을 켠다",
+   "knob": "EXTERNAL_LLM_ENABLED"
+  }
+ },
+ "external_consent_required.run": {
+  "status": 422,
+  "body": {
+   "code": "external_consent_required",
+   "message": "외부 응답자 길은 카드·설계 변경 원문을 외부(Claude)로 보낸다 — run 본문에 consent_external: true 를 실어야 연다(엔진이 보는 동의는 이 표지뿐이다 — 사람에게 동의를 받는 것은 부르는 쪽이다). 과제를 만들지 않았다"
+  }
+ },
+ "external_owner_missing.run": {
+  "status": 422,
+  "body": {
+   "code": "external_owner_missing",
+   "message": "외부 응답자 과제를 줄 사람(user_email)이 없다 — 포털 중계를 지나 잡 주인의 신원으로 부른다(과제는 그 사람의 Claude Code 워크플로만 집는다)"
+  }
+ },
+ "bad_request.limits": {
+  "status": 422,
+  "body": {
+   "code": "bad_request",
+   "message": "모르는 llm 'claude' — glm(기본)·external 만 받는다"
+  }
+ },
+ "bad_request.run": {
+  "status": 422,
+  "body": {
+   "code": "bad_request",
+   "message": "요청 모양이 계약과 다르다 — llm: Input should be 'glm' or 'external'",
+   "errors": [
+    {
+     "loc": "llm",
+     "type": "literal_error",
+     "msg": "Input should be 'glm' or 'external'"
+    }
+   ]
+  }
+ },
+ "rev_mismatch.run": {
+  "status": 409,
+  "body": {
+   "code": "rev_mismatch",
+   "message": "요청이 기대한 판(limits_rev_kind=b07ee1be)이 이 서버의 verdict 판(prompt_rev=cr-verdict-2, limits_rev=75d363ab, limits_rev_kind=8cc967a8)과 다르다 — limits 를 다시 받고 계획을 다시 짠다",
+   "expect": {
+    "limits_rev_kind": "b07ee1be"
+   },
+   "prompt_rev": "cr-verdict-2",
+   "limits_rev": "75d363ab",
+   "limits_rev_kind": "8cc967a8"
+  }
+ }
+}

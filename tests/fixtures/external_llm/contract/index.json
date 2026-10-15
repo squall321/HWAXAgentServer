@@ -1,0 +1,36 @@
+{
+ "verdict_ok": {
+  "request": "req_verdict_ok.json",
+  "frames": "run_verdict_ok.sse",
+  "final": "result_verdict_ok.json",
+  "worker": "worker_verdict_ok.json",
+  "tasks": 1
+ },
+ "verdict_repaired": {
+  "request": "req_verdict_repaired.json",
+  "frames": "run_verdict_repaired.sse",
+  "final": "result_verdict_repaired.json",
+  "worker": "worker_verdict_repaired.json",
+  "tasks": 2
+ },
+ "external_worker_absent": {
+  "request": "req_verdict_one(GLM 계약 예제) + llm=external·consent_external=true",
+  "frames": "run_external_worker_absent.sse",
+  "final": "error_external_worker_absent.json",
+  "how": "일꾼 없음",
+  "settings": {
+   "wait_s": 300.0,
+   "answer_s": 1200.0
+  }
+ },
+ "external_answer_timeout": {
+  "request": "req_verdict_one(GLM 계약 예제) + llm=external·consent_external=true",
+  "frames": "run_external_answer_timeout.sse",
+  "final": "error_external_answer_timeout.json",
+  "how": "일꾼이 집고 답하지 않는다(한 번 되돌린 뒤 두 번째 집힘도 넘김)",
+  "settings": {
+   "wait_s": 3000.0,
+   "answer_s": 1200.0
+  }
+ }
+}
