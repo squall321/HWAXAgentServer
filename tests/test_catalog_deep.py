@@ -65,6 +65,8 @@ def test_카드_본문은_문서·표·모르는_모양을_다_보인다(monkeyp
                    "content": {"headers": ["시료", "하중"], "rows": [["S1", 12.3]] * (a.RECORD_ROWS_MAX + 5),
                                "caption": "Sheet1"}},
         "SIM-1": {"id": "SIM-1", "title": "해석", "data_type": "SIM", "content": {"tool_call": {"args": {"e": 1.0}}}},
+        "SIM-BIG": {"id": "SIM-BIG", "title": "큰 해석", "data_type": "SIM",
+                    "content": {"inputs": {"deck": "x" * (a.RECORD_TEXT_MAX + 10)}}},
     }
     _stub_records(monkeypatch, lambda n, args: json.dumps(docs[args["record_id"]], ensure_ascii=False))
     d = asyncio.run(a.catalog_record(a.RecordRequest(id="DOC-1")))
@@ -75,6 +77,10 @@ def test_카드_본문은_문서·표·모르는_모양을_다_보인다(monkeyp
     assert t["truncated"] is True, "잘린 표를 전부인 척 보이지 않는다"
     s = asyncio.run(a.catalog_record(a.RecordRequest(id="SIM-1")))
     assert s["sections"][0]["title"] == "원문(JSON)" and '"tool_call"' in s["sections"][0]["text"]
+    j = s["sections"][0]["text"]
+    assert j.startswith("```json\n") and j.endswith("\n```"), "모르는 모양은 코드 블록으로 보인다"
+    big = asyncio.run(a.catalog_record(a.RecordRequest(id="SIM-BIG")))
+    assert big["truncated"] is True and big["sections"][0]["text"].endswith("\n```"), "잘라도 펜스는 닫는다(자른 뒤 감싼다)"
 
 
 # ── 블록 구조 본문(blocks·subsections·children)과 RAG 절 폴백 ───────────────────

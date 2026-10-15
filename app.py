@@ -4698,7 +4698,10 @@ def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> di
             text = json.dumps(rest, ensure_ascii=False, indent=1, default=str)
             out.update(total_sections=1, total_chars=len(text))  # 비워 두면 SIM 카드가 '빈 카드'로 판정된다(catalog_record)
             out["truncated"] = out["truncated"] or len(text) > RECORD_TEXT_MAX
-            out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1, "text": text[:RECORD_TEXT_MAX]})
+            # 코드 펜스로 감싼다 — 평문이면 포털이 비례폭 문단 하나로 그려 중첩을 못 따라간다(SIM 카드 86~119줄).
+            # 자른 뒤 감싸서 잘려도 펜스는 닫힌다. indent=1 출력은 첫·끝 줄 말고 공백으로 시작해 안에서 펜스가 안 닫힌다.
+            out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1,
+                                    "text": "```json\n" + text[:RECORD_TEXT_MAX] + "\n```"})
     return out
 
 
