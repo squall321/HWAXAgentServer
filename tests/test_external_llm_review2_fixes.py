@@ -6,6 +6,8 @@
 #   실행:  .venv/bin/python -m pytest tests/test_external_llm_review2_fixes.py -q
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 import pytest  # noqa: E402
 from langchain_core.tools import StructuredTool  # noqa: E402
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 import app as a  # noqa: E402
 import delib_jobs  # noqa: E402
@@ -174,3 +177,54 @@ def test_게이트웨이가_사용자_신원으로_중계해도_에이전트가_
     assert out.startswith(a._TOOL_FAIL_MARK), out
     assert reached == [] and delib_jobs._JOBS == {}, "에이전트가 지어낸 동의로 외부 심의가 섰다"
     assert w.seen == [] and board.counts() == {"queued": 0, "claimed": 0}
+
+
+# ── L1. 셈할 수 없을 만큼 큰 값 — 예외로 새지 않고 설정 오류로 닫는다 ─────────────────────────────
+_HUGE = "9" * 400        # 정수로는 읽힌다(파이썬 정수 자릿수 상한 4,300 안) — float 로 바꾸는 순간 OverflowError 다
+
+
+@pytest.mark.parametrize("name", ["EXTERNAL_LLM_CTX_TOKENS", "EXTERNAL_LLM_MAX_TOKENS", "EXTERNAL_LLM_MAX_INFLIGHT",
+                                  "DELIB_LLM_MAX_RETRIES"])
+def test_셈할_수_없을_만큼_큰_값은_예외로_새지_않고_설정_오류로_닫는다(monkeypatch, name):
+    """종전엔 OverflowError 가 config 밖으로 새 기동이 넘어지거나(lifespan) 심의 MCP 가 통째로 꺼졌다(import 때 도구 등록)."""
+    monkeypatch.setattr(x, "_warned", set())
+    env = {"EXTERNAL_LLM_ENABLED": "1", name: _HUGE}
+    cfg = x.config(env)
+    assert cfg.settings is None and name in cfg.knob.split(" · "), cfg
+    assert "EXTERNAL_LLM_ENABLED=1 이지만" in cfg.error and "셈할 수 없" in cfg.error, cfg.error
+    assert x.is_open(env) is False
+    assert m._register_external(FastMCP(name="huge"), env=env) is False
+    assert x.config({name: _HUGE}) == x.Config(None), "꺼진 서버는 값을 보지 않는다"
+
+
+@pytest.mark.parametrize("name", ["EXTERNAL_LLM_CTX_TOKENS", "DELIB_LLM_MAX_RETRIES"])
+def test_기동_절차는_셈할_수_없는_값에_넘어지지_않고_줄을_만들지_않은_채_오류_줄을_남긴다(monkeypatch, capsys, name):
+    from test_llm_limits import _boot
+
+    monkeypatch.setattr(x, "_warned", set())
+    st = _boot(monkeypatch, EXTERNAL_LLM_ENABLED="1", **{name: _HUGE})
+    assert getattr(st, "external_board", None) is None
+    out = capsys.readouterr().out
+    assert out.count("⛔") == 1 and name in out and "셈할 수 없" in out
+
+
+@pytest.mark.parametrize("name", ["EXTERNAL_LLM_CTX_TOKENS", "DELIB_LLM_MAX_RETRIES"])
+def test_셈할_수_없는_값이_있어도_import_는_넘어지지_않고_심의_MCP_도구가_그대로_뜬다(tmp_path, name):
+    """import 때(mcp_server 의 과제 도구 등록·안내 글)도 같은 판정이다 — 새 프로세스로 실제 import 를 본다(탐침 e1 과 같은 길)."""
+    script = (
+        "import asyncio, contextlib, io, json\n"
+        "buf = io.StringIO()\n"
+        "with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):\n"
+        "    import app, external_llm, mcp_server\n"
+        "    names = sorted(t.name for t in asyncio.run(mcp_server.mcp.list_tools()))\n"
+        "    board = external_llm.board_of(app.app)\n"
+        "print(json.dumps({'mcp': app._DELIB_MCP is not None, 'tools': names, 'ext': mcp_server._EXTERNAL_TOOLS,\n"
+        "                  'board': board is not None, 'out': buf.getvalue()}, ensure_ascii=False))\n")
+    env = {**os.environ, "EXTERNAL_LLM_ENABLED": "1", name: _HUGE, "DELIB_JOB_DIR": str(tmp_path / "jobs"),
+           "DRAIN_STATE_PATH": str(tmp_path / "drain.json")}
+    r = subprocess.run([sys.executable, "-c", script], cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["mcp"] and "deliberate_start" in got["tools"] and "review_task_next" not in got["tools"], got
+    assert got["ext"] is False and got["board"] is False
+    assert got["out"].count("⛔") == 1 and name in got["out"], got["out"]

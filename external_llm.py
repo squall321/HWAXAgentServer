@@ -126,8 +126,8 @@ class ConfigError(ValueError):
 
 
 def _num(env, name: str, default: float, *, floor: float, integer: bool) -> float:
-    """설정 하나 — 비면 기본값. 못 읽거나(정수 자리의 소수 포함) 유한한 수가 아니거나(nan·inf) floor 미만이면 ConfigError 다 —
-    기본값으로 메우지 않는다(틀린 값 대신 더 큰 기본 한도로 말없이 돌던 것을 닫는다)."""
+    """설정 하나 — 비면 기본값. 못 읽거나(정수 자리의 소수 포함) 유한한 수가 아니거나(nan·inf) 셈할 수 없을 만큼 크거나 floor
+    미만이면 ConfigError 다 — 기본값으로 메우지 않는다(틀린 값 대신 더 큰 기본 한도로 말없이 돌던 것을 닫는다)."""
     raw = str(env.get(name) or "").strip()
     if not raw:
         return default
@@ -135,7 +135,11 @@ def _num(env, name: str, default: float, *, floor: float, integer: bool) -> floa
         v = int(raw) if integer else float(raw)
     except ValueError:
         raise ConfigError(name, f"{name}='{raw[:40]}' 를 {'정수' if integer else '수'}로 읽지 못했다") from None
-    if not math.isfinite(v):
+    try:
+        finite = math.isfinite(v)
+    except ArithmeticError:     # OverflowError — 정수로는 읽혔지만 float 로 바꿀 수 없을 만큼 크다(기동이 넘어지던 자리)
+        raise ConfigError(name, f"{name}={raw[:40]}…({len(raw):,}자리) 는 셈할 수 없을 만큼 크다") from None
+    if not finite:
         raise ConfigError(name, f"{name}={raw[:40]} 는 유한한 수가 아니다")
     if v < floor:
         raise ConfigError(name, f"{name}={raw[:40]} 는 {floor:g} 미만이다(한도를 끄는 값은 없다 — 끄면 호출이 끝없이 기다린다)")
@@ -194,15 +198,21 @@ class Config:
 
 def config(env=os.environ) -> Config:
     """스위치·값·시간 한도 사슬을 한꺼번에 본다(닫힌 쪽으로). 켰는데 값 하나라도 받을 수 없거나, 과제 하나의 최악(2×WAIT_S +
-    2×ANSWER_S)이 심의 LLM 논리 호출 1회의 최악 이상이면(안쪽이 먼저 걸려야 사유가 먼저 온다) 길을 열지 않고 기동 오류 줄을
-    한 번 남긴다 — 종전엔 틀린 값을 기본값(더 큰 한도)으로 메우거나 경고만 하고 열었다."""
+    2×ANSWER_S)이 심의 LLM 논리 호출 1회의 최악 이상이거나 그 최악을 셈할 수 없으면(안쪽이 먼저 걸려야 사유가 먼저 온다) 길을
+    열지 않고 기동 오류 줄을 한 번 남긴다 — 종전엔 틀린 값을 기본값(더 큰 한도)으로 메우거나 경고만 하고 열었다. 예외로 새지 않는다
+    (import 때 도구 등록과 기동 절차가 이것을 부른다 — 새면 심의 MCP 가 통째로 꺼지거나 기동이 넘어진다)."""
     if not enabled(env):
         return Config(None)
     try:
         s = Settings.from_env(env)
     except ConfigError as exc:
         return _closed(exc.knob, exc.message)
-    outer = delib_call_worst_s(env)
+    try:
+        outer = delib_call_worst_s(env)
+    except ArithmeticError:     # OverflowError — 재시도 횟수가 float 로 바꿀 수 없을 만큼 크다(기동이 넘어지던 자리)
+        return _closed(f"{DELIB_RETRIES_ENV} · {DELIB_TIMEOUT_ENV}",
+                       f"심의 LLM 논리 호출 1회의 최악((1 + {DELIB_RETRIES_ENV}) × {DELIB_TIMEOUT_ENV} + 8)을 셈할 수 없다 — 값이 "
+                       "셈할 수 없을 만큼 크다")
     if outer is not None and s.call_worst_s >= outer:
         return _closed(f"{WAIT_ENV} · {ANSWER_ENV}",
                        f"과제 하나의 최악(2×{WAIT_ENV} + 2×{ANSWER_ENV} = {s.call_worst_s:,.0f}초)이 심의 LLM 논리 호출 1회의 "
