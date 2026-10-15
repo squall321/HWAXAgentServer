@@ -690,3 +690,83 @@ def test_과제도_없이_하루_넘게_조용한_주인_칸은_지운다(stub):
 
     young, kept = asyncio.run(go())
     assert young == 2000 and kept == {OWNER}
+
+
+# ── GLM 길은 바이트가 같다(스위치·llm=glm 과 상관없이) ─────────────────────────────────
+class _GlmClient(TestClient):
+    """카드 대조 요청마다 llm:"glm" 을 실어 보낸다(본문이 dict 인 것만) — limits 에는 ?llm=glm."""
+
+    def post(self, url, *args, json=None, **kw):
+        if str(url).startswith("/card-review/") and isinstance(json, dict) and not str(url).endswith("/pack"):
+            json = {**json, "llm": "glm"}
+        return super().post(url, *args, json=json, **kw)
+
+    def get(self, url, *args, params=None, **kw):
+        if str(url).startswith("/card-review/limits"):
+            params = {**(params or {}), "llm": "glm"}
+        return super().get(url, *args, params=params, **kw)
+
+
+@pytest.mark.parametrize("switch,inject", [("1", False), ("1", True), ("0", True)])
+def test_GLM_카드_대조는_스위치와_llm_glm_에_상관없이_계약_예제와_바이트가_같다(monkeypatch, switch, inject):
+    """탐침 p06 — GLM 계약 예제(tests/fixtures/card_review/contract/ — 리스크 앱이 바이트째 복사한다)를 스위치를 켜고·끄고, llm 을
+    안 주고·glm 으로 주고 다시 떠 견준다. 켜진 서버는 /health 의 capabilities 에 external_llm 이 붙는 것만 다르다(계약이다)."""
+    import test_card_review_contract as tc
+
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", switch)
+    monkeypatch.setattr(a.app.state, "external_board", None, raising=False)
+    if inject:
+        monkeypatch.setattr(tc, "TestClient", _GlmClient)
+    got = tc.produce(monkeypatch)
+    diffs = sorted(name for name, text in got.items() if (tc.OUT / name).read_text(encoding="utf-8") != text)
+    assert diffs == (["drain_health.json"] if switch == "1" else []), diffs
+    if switch == "1":
+        have = json.loads((tc.OUT / "drain_health.json").read_text(encoding="utf-8"))
+        now = json.loads(got["drain_health.json"])
+        assert now["capabilities"] == [*have["capabilities"], "external_llm"]
+        assert {**now, "capabilities": have["capabilities"]} == have, "capabilities 밖의 칸이 바뀌었다"
+
+
+_MASK = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ][\d:.+Z-]+|\b\d{10,13}\b|delib-[0-9a-f]{12}|[0-9a-f]{6}\b|지식카드 \d+/")
+
+
+def _norm(v) -> str:
+    s = _MASK.sub("#", json.dumps(v, ensure_ascii=False, sort_keys=True))
+    return re.sub(r'"(ts|elapsed_s|idle_s|ms|took_s|t)": [\d.]+', r'"\1": #', s)
+
+
+def test_GLM_심의_프레임은_스위치와_llm_glm_에_상관없이_같다(monkeypatch, tmp_path):
+    """탐침 p07 — 리스크 패널 하나(MCP deliberate_start → 실제 엔진)의 프레임 전부를 꺼진 서버·켜진 서버·켜진 서버에 llm=glm 으로 떠
+    시각·id 만 가리고 견준다. 리스크 앱이 읽는 일곱 종류는 예제 파일(risk_contract/panel_frames.jsonl)과도 같아야 한다."""
+    import test_risk_contract_frames as t
+
+    monkeypatch.setitem(a._ctx_cache, "n", 128000)     # test_delib_silent_drops._pin_context 와 같은 창(그 예제를 뜬 창)
+    d._evid_cache.clear()
+
+    def frames(mode):
+        mp = pytest.MonkeyPatch()
+        try:
+            if mode == "off":
+                mp.delenv("EXTERNAL_LLM_ENABLED", raising=False)
+            else:
+                mp.setenv("EXTERNAL_LLM_ENABLED", "1")
+            if mode == "on_glm":
+                real = m.deliberate_start
+
+                async def start(*args, advanced=None, **kw):
+                    return await real(*args, advanced={**(advanced or {}), "llm": "glm"}, **kw)
+
+                mp.setattr(m, "deliberate_start", start)
+            (tmp_path / mode).mkdir()
+            got = t._panel_frames(mp, tmp_path / mode)
+        finally:
+            mp.undo()
+        return got
+
+    try:
+        runs = {mode: frames(mode) for mode in ("off", "on", "on_glm")}
+    finally:
+        d._evid_cache.clear()
+    lines = {mode: sorted(f"{e}\t{_norm(dd)}" for e, dd in fr) for mode, fr in runs.items()}
+    assert lines["off"] == lines["on"] == lines["on_glm"]
+    assert t._lines(runs["on_glm"]) == t.FIXTURE.read_text(encoding="utf-8").splitlines()
