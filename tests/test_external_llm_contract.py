@@ -358,8 +358,8 @@ def test_예제가_계약의_칸을_싣는다():
     assert (ok["meta"]["llm"], ok["meta"]["limits_rev_kind"]) == ("external", lim["limits_rev_by_kind"]["verdict"])
     assert _load("result_verdict_repaired.json")["quality"]["attempts"] == 2
     head = _load("mcp_examples.json")["next_head"]
-    assert set(head) == {"task_id", "lease", "kind", "max_tokens", "chars", "parts", "answer_deadline", "answer_s",
-                         "claim", "created_at", "target_key", "label"}
+    assert set(head) == {"task_id", "lease", "kind", "max_tokens", "max_chars", "chars", "parts", "answer_deadline",
+                         "answer_s", "claim", "created_at", "target_key", "label"}
     ex = _load("mcp_examples.json")
     assert ex["read_task_not_found"] == ex["submit_other_owner"], "남의 과제와 없는 과제는 같은 답이다"
     assert ex["next_head_claim2"]["lease"] != head["lease"] and ex["submit_stale_lease"]["code"] == "not_claimed"

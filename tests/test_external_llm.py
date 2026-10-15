@@ -358,7 +358,7 @@ def test_꺼진_서버에는_과제_도구가_없고_켜진_서버에만_셋이_
         "review_task_submit": {"task_id", "lease", "text"}}, "lease 는 빼고 부를 수 없다"
     assert set(listed) == set(x.TASK_TOOLS), "등록한 이름과 에이전트 거부 목록(app._AGENT_DENY_TOOLS)의 이름이 같아야 한다"
     desc = " ".join(t.description for t in listed.values())
-    for must in ("JSON Lines", "max_tokens", "lease", "consent_external", "risk_spec",
+    for must in ("JSON Lines", "max_tokens", "max_chars", "lease", "유니코드 코드 포인트", "consent_external", "risk_spec",
                  "반출", "동의", "external_worker_absent", "external_answer_timeout",
                  "task_not_found", "offset_mismatch"):
         assert must in desc, must

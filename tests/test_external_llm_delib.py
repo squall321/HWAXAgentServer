@@ -66,8 +66,8 @@ def on(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
 
 
-def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None):
-    """쟁점 패널 하나를 끝까지 — (사건, 일꾼, create_react_agent 에 묶인 도구, 도구 사전, 줄)."""
+def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None, brain=None):
+    """쟁점 패널 하나를 끝까지 — (사건, 일꾼, create_react_agent 에 묶인 도구, 도구 사전, 줄). brain 을 주면 일꾼이 그것으로 답한다."""
     import langgraph.prebuilt
 
     tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
@@ -84,7 +84,7 @@ def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry
     monkeypatch.setattr(m, "_APP", stub)
 
     async def go():
-        w = FakeWorker(user or "nobody@x.com", poll_s=0.05) if worker else None
+        w = FakeWorker(user or "nobody@x.com", poll_s=0.05, **({"brain": brain} if brain else {})) if worker else None
         serve = asyncio.ensure_future(w.serve()) if w else None
         out = []
         gen = (entry or d.run_deliberation)(stub, Q, [], {**PANEL, **(opts or {})}, user)

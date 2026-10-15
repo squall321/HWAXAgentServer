@@ -331,7 +331,7 @@ def test_도구_설명은_서버가_표지_밖의_동의를_본다고_말하지_
     on = FastMCP(name="on")
     assert m._register_external(on, env={"EXTERNAL_LLM_ENABLED": "1"}) is True
     for t in asyncio.run(on.list_tools()):
-        assert "consent_external" in t.description, t.name
+        assert "consent_external" in t.description and "유니코드 코드 포인트" in t.description, t.name
 
 
 # ── 5. 이 서버의 에이전트는 과제 도구를 묶지도 부르지도 않는다 ────────────────────────────
@@ -457,6 +457,87 @@ def test_없다_판정은_WAIT_S_동안만_서고_그_뒤의_새_과제는_다�
     assert fast.code == "external_worker_absent" and "300초가 지날 때까지" in fast.message
     assert queued, "판정이 풀린 뒤의 새 과제가 줄을 서지 못했다"
     assert msg.content == "늦게 켠 워크플로의 답"
+
+
+# ── L3. 글자 단위(유니코드 코드 포인트)와 max_chars ──────────────────────────────────
+def test_머리의_max_chars_는_어떤_글자로_써도_잘리지_않는_글자_수다(stub):
+    for mt in (1, 50, 32_000, 128_000):
+        mc = x.max_chars(mt)
+        assert mc == int(mt * d._EVID_KO_CPT)
+        for ch in ("가", "a", "𝜎", "한a\n"):
+            s = (ch * mc)[:mc]
+            assert x.fit_answer(s, mt) == (s, "stop"), (mt, ch)
+    assert x.max_chars(None) is None and x.max_chars(0) is None
+
+    async def go():
+        call = _call(stub.app, max_tokens=50)
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        h = await m.review_task_next(ctx=ctx_of(OWNER))
+        await m.review_task_submit(h["task_id"], h["lease"], "가" * h["max_chars"], final=True, ctx=ctx_of(OWNER))
+        return h, await call
+
+    h, msg = asyncio.run(go())
+    assert (h["max_tokens"], h["max_chars"]) == (50, 52)
+    assert msg.response_metadata["finish_reason"] == "stop" and len(msg.content) == 52
+
+
+def test_길이와_자리는_유니코드_코드_포인트다_JS_의_UTF16_단위가_아니다(stub):
+    """탐침 p09 — 수식 기호(𝜎 U+1D70E 등)는 BMP 밖이라 JS String.length 가 2로 센다. 서버는 코드 포인트로 센다(설명·README 가 그렇게
+    말한다) — 코드 포인트로 낸 offset 은 받고 UTF-16 으로 센 offset 은 offset_mismatch 로 돌려보낸다."""
+    def js_len(s):
+        return len(s.encode("utf-16-le")) // 2
+
+    system, human = "응력 𝜎_max 와 변형률 𝜀 를 본다.", "판정하라"
+    ans1, ans2 = '{"ref":"c1","why":"𝜎 초과"}\n', '{"ref":"c2","why":"ok"}\n'
+
+    async def go():
+        call = _call(stub.app, system=system, human=human)
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        me = ctx_of(OWNER)
+        h = await m.review_task_next(ctx=me)
+        page = await m.review_task_read(h["task_id"], h["lease"], 0, ctx=me)
+        r1 = await m.review_task_submit(h["task_id"], h["lease"], ans1, offset=0, ctx=me)
+        r_js = await m.review_task_submit(h["task_id"], h["lease"], ans2, offset=js_len(ans1), final=True, ctx=me)
+        r2 = await m.review_task_submit(h["task_id"], h["lease"], ans2, offset=len(ans1), final=True, ctx=me)
+        return h, page, r1, r_js, r2, await call
+
+    h, page, r1, r_js, r2, msg = asyncio.run(go())
+    text = page["text"]
+    assert h["chars"] == len(system) + len(human) == len(text) == js_len(text) - 2
+    hp = next(p for p in h["parts"] if p["role"] == "human")
+    assert text[hp["start"]:hp["start"] + hp["chars"]] == human
+    assert r1["received_chars"] == len(ans1) and (r_js["code"], r_js["received_chars"]) == ("offset_mismatch", len(ans1))
+    assert r2["done"] is True and msg.content == ans1 + ans2
+
+
+# ── L4. 절단의 손잡이 — 외부 길은 EXTERNAL_LLM_MAX_TOKENS ─────────────────────────────
+def test_외부_길의_truncated_empty_는_EXTERNAL_LLM_MAX_TOKENS_를_가리킨다(env):
+    """탐침 p02 둘째 — 외부 답이 출력 상한에서 잘려 행이 하나도 없으면 손잡이가 DELIB_MAX_TOKENS 였다(외부 길에 걸리지 않는 값)."""
+    prose = "이 단위는 다음과 같이 판단합니다. " * 6000        # 앞이 산문이라 잘린 앞부분(출력 상한 32,000 토큰)에 JSON 줄이 없다
+    with FakeWorker(OWNER, brain=lambda *_: prose + '\n{"ref":"c1"}').thread() as w:
+        r = env.client.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, **EXT})
+    err = next(dd for e, dd in _frames(r) if e == "error")
+    assert (err["code"], err["knob"]) == ("truncated_empty", "EXTERNAL_LLM_MAX_TOKENS")
+    assert w.seen[0]["submits"][-1]["finish_reason"] == "length"
+
+
+def test_외부_심의의_의장_결정문_절단_경고는_EXTERNAL_LLM_MAX_TOKENS_를_가리킨다(monkeypatch):
+    from test_external_llm_delib import _panel
+
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    d._evid_cache.clear()
+
+    def brain(_head, system, human):              # 의장만 출력 상한(32,000 토큰)을 넘게 쓴다 — 엔진이 그 자리에서 자른다
+        out = delib_respond(system, human)
+        return out + "\n" + "덧붙인 긴 설명 " * 9000 if system.startswith("당신은 심의체 의장입니다") else out
+
+    try:
+        events, *_ = _panel(monkeypatch, brain=brain)
+    finally:
+        d._evid_cache.clear()
+    cut = [dd for e, dd in events if e == "warning" and dd.get("code") == "chair_output_cut"]
+    assert cut and cut[0]["knob"] == "EXTERNAL_LLM_MAX_TOKENS", [dd for e, dd in events if e == "warning"]
 
 
 # ── L8. 주인 칸 정리 ─────────────────────────────────────────────────────────────

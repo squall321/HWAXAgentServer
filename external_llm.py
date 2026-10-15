@@ -16,6 +16,7 @@
    `external_answer_timeout`. 둘 다 인프라 실패라 엔진의 기존 오류 길(카드 대조 error 프레임·심의 좌석 유실/의장 실패)로 나간다.
 5. 본문은 남기지 않는다 — 로그에는 과제 id·종류·크기만 적는다(프롬프트·답 글은 적지 않는다).
 6. 줄은 메모리에만 있다 — 재기동하면 사라진다(도는 호출의 스트림이 끊기므로 앱이 인프라로 다시 낸다).
+7. 길이·자리는 전부 유니코드 코드 포인트(파이썬 글자)로 센다 — JS 의 String.length(UTF-16 단위)와 BMP 밖 글자에서 갈린다.
 
 시간 한도 사슬(안쪽이 먼저) — 과제 하나의 최악은 기다림 + 답 + (되돌린 뒤) 기다림 + 답 = 2×WAIT_S + 2×ANSWER_S 이고, 이것이
 엔진의 LLM 논리 호출 1회 최악((1 + DELIB_LLM_MAX_RETRIES) × DELIB_TIMEOUT_S + 8 = 3,608초)보다 작아야 바깥 한도(리스크 앱의 호출
@@ -357,7 +358,8 @@ class Board:
 
     def read(self, owner: str, task_id: str, lease: str, offset: int, page_max: int = READ_PAGE_MAX,
              wire=_wire) -> dict:
-        """집은 과제의 프롬프트 한 쪽 — {task_id, offset, next_offset, chars, text}. 응답 글(wire)이 page_max 자 안에 들게 자른다."""
+        """집은 과제의 프롬프트 한 쪽 — {task_id, offset, next_offset, chars, text}. 응답 글(wire)이 page_max 자 안에 들게 자른다.
+        자리·길이는 유니코드 코드 포인트다."""
         owner = _norm_owner(owner)
         with self._lock:
             t = self._held(owner, task_id, lease, self._clock())
@@ -395,7 +397,8 @@ class Board:
                 return t
             if offset is not None and offset not in (0, t.received):
                 return {"ok": False, "code": "offset_mismatch", "received_chars": t.received,
-                        "message": f"서버가 받은 답은 {t.received:,}자다 — offset={t.received} 부터 다시 낸다(0 이면 처음부터)"}
+                        "message": f"서버가 받은 답은 {t.received:,}자(유니코드 코드 포인트)다 — offset={t.received} 부터 다시 "
+                                   "낸다(0 이면 처음부터)"}
             if offset == 0:
                 t.buf, t.received = [], 0
             if t.received + len(text) > ANSWER_HARD_MAX:
@@ -488,8 +491,8 @@ class Board:
         for role, txt in t.parts:
             parts.append({"role": role, "start": at, "chars": len(txt)})
             at += len(txt)
-        head = {"task_id": t.id, "lease": t.lease, "kind": t.kind, "max_tokens": t.max_tokens, "chars": len(t.text),
-                "parts": parts,
+        head = {"task_id": t.id, "lease": t.lease, "kind": t.kind, "max_tokens": t.max_tokens,
+                "max_chars": max_chars(t.max_tokens), "chars": len(t.text), "parts": parts,
                 "answer_deadline": int(self._wall() + left), "answer_s": int(left), "claim": t.claims,
                 "created_at": int(t.created_wall)}
         for k in ("run_id", "target_key", "label"):
@@ -504,6 +507,16 @@ _NOT_FOUND = {"ok": False, "code": "task_not_found",
 _NOT_CLAIMED = {"ok": False, "code": "not_claimed",
                 "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 "
                            "임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"}
+
+
+def max_chars(max_tokens: int | None) -> int | None:
+    """max_tokens 를 엔진의 글자 어림으로 — 한국어 최악 1.05자/토큰(deliberation._EVID_KO_CPT, fit_answer 가 쓰는 토큰 어림
+    app._est_tokens_all 의 한글 환산과 같은 수). 이 글자 수(유니코드 코드 포인트) 안의 답은 어떤 글자로 써도 잘리지 않는다."""
+    if not max_tokens or max_tokens <= 0:
+        return None
+    from deliberation import _EVID_KO_CPT  # noqa: PLC0415 — deliberation 이 이 모듈을 붙이므로 부를 때 가져온다
+
+    return int(max_tokens * _EVID_KO_CPT)
 
 
 def _resolve(t: _Task, out: tuple) -> None:

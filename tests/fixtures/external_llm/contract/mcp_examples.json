@@ -9,6 +9,7 @@
   "lease": "ls-0001",
   "kind": "verdict",
   "max_tokens": 32000,
+  "max_chars": 33600,
   "chars": 146,
   "parts": [
    {
@@ -46,7 +47,7 @@
   "ok": false,
   "code": "offset_mismatch",
   "received_chars": 93,
-  "message": "서버가 받은 답은 93자다 — offset=93 부터 다시 낸다(0 이면 처음부터)"
+  "message": "서버가 받은 답은 93자(유니코드 코드 포인트)다 — offset=93 부터 다시 낸다(0 이면 처음부터)"
  },
  "read_not_claimed": {
   "ok": false,
@@ -58,6 +59,7 @@
   "lease": "ls-0002",
   "kind": "verdict",
   "max_tokens": 32000,
+  "max_chars": 33600,
   "chars": 146,
   "parts": [
    {
@@ -113,6 +115,7 @@
    "lease": "ls-0003",
    "kind": "sweep",
    "max_tokens": 32000,
+   "max_chars": 33600,
    "chars": 114064,
    "parts": [
     {

@@ -5939,7 +5939,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("warning", {"code": "chair_output_cut",
                                "message": f"의장 결정문({len(decision):,}자)이 모델 출력 상한에서 끊겼다 — 결정문 뒤쪽 "
                                           "항목이 빠졌을 수 있다. 이어하기로 다시 수렴시키거나 출력 상한을 올린다.",
-                               "knob": "DELIB_MAX_TOKENS · LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
+                               # 외부 응답자 길의 출력 상한은 그 손잡이다(엔진이 그 값으로 답을 자른다 — external_llm.fit_answer).
+                               "knob": (external_llm.MAX_TOKENS_ENV if _ext else
+                                        "DELIB_MAX_TOKENS · LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)")})
 
     # 4a-2) 인용 후검증(결정적, LLM 아님) — JS 파이프라인 citationAudit 파리티(감사 원장 (3)).
     #        결정문의 유의미 수치를 근거·발언 원문과 대조한다. unmatched 는 의장 신규 산술일 수도

@@ -3318,7 +3318,10 @@ async def run(app, prep: dict):
                 # 첫 시도가 출력 상한에 걸려 한 행도 못 읽었다 — 다시 물어도 같다.
                 st.update(outcome="truncated_empty", truncated=True)
                 yield frame("error", _err("truncated_empty", "첫 시도가 출력 상한에 걸려(finish_reason=length) 읽힌 행이 "
-                                          "없다 — 다시 물어도 같다", knob="DELIB_MAX_TOKENS", attempt=n))
+                                          "없다 — 다시 물어도 같다",
+                                          # 외부 응답자 길의 출력 상한은 그 손잡이다(엔진이 그 값으로 답을 자른다).
+                                          knob=external_llm.MAX_TOKENS_ENV if external else "DELIB_MAX_TOKENS",
+                                          attempt=n))
                 yield frame("done", {})
                 return
             if not (settled["repair"] or pstats["bad_lines"]):
