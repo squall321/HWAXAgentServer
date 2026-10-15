@@ -349,8 +349,8 @@ def test_예제가_계약의_칸을_싣는다():
     h = _load("health_on.json")
     assert h["capabilities"][-1] == "external_llm" and _load("health_off.json") == {
         "capabilities": ["card_review", "drain"], "external_llm_present": False}
-    assert set(h["external_llm"]) == {"ctx_tokens", "max_tokens", "wait_s", "answer_s", "call_worst_s", "queued",
-                                      "claimed", "evid_budget"}
+    assert set(h["external_llm"]) == {"ctx_tokens", "max_tokens", "wait_s", "answer_s", "call_worst_s", "max_inflight",
+                                      "inflight", "queued", "claimed", "evid_budget"}
     lim = _load("limits_external.json")
     assert (lim["llm"], lim["ctx_source"], lim["max_tokens_source"]) == ("external", "external", "external")
     assert _load("plan_external.json")["limits_rev"] == lim["limits_rev"]
@@ -373,3 +373,4 @@ def test_예제가_계약의_칸을_싣는다():
             frames["refused_consent_required"]["code"]) == (
         "external_llm_disabled", "external_owner_missing", "external_consent_required")
     assert _load("req_verdict_ok.json")["consent_external"] is True, "외부 run 예제 본문에 반출 동의 표지가 있어야 한다"
+    assert (lim["gate"]["limit_reason"], lim["gate"]["limit"]) == ("external_per_owner", 8)

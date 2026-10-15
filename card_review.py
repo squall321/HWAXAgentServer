@@ -3139,6 +3139,29 @@ def _usage(per: list) -> dict | None:
             "per_attempt": [dict(p) for p in per]}
 
 
+# review_busy.reason — 그 사람의 도는 외부 응답자 카드 대조 호출이 EXTERNAL_LLM_MAX_INFLIGHT 에 찼다(limits(llm=external).gate 의
+# limit_reason 도 이 이름이다).
+_EXT_BUSY = "external_per_owner"
+
+
+def _external_admit(gate, board, req: dict):
+    """외부 응답자 호출의 자리 — GLM 관문 자리를 잡지 않는다. 비우기(scope all)면 GLM 길과 같은 review_busy{draining}, 그 사람의
+    도는 외부 호출이 EXTERNAL_LLM_MAX_INFLIGHT 에 찼으면 review_busy{external_per_owner} 를 Busy 로 돌려준다. 들면 그 주인(run 이
+    끝에 board.call_end 로 돌려준다). 줄이 없으면(꺼진 서버 — 라우트가 먼저 409 로 거절한다) 주인만 돌려주고 run 이
+    llm_misconfigured 로 끝낸다. 도는 수는 /health 의 review_active 에 든다(update-all 비우기가 기다린다 — 재기동은 줄을 잃는다)."""
+    from review_gate import DRAIN_RETRY_AFTER_S  # noqa: PLC0415
+
+    owner = str(req.get("user_email") or "")
+    if board is None:
+        return owner
+    if gate.limit()[1] == "draining":
+        return Busy("draining", 0, board.calls_of(owner), DRAIN_RETRY_AFTER_S)
+    n = board.call_begin(owner)
+    if n is not None:
+        return Busy(_EXT_BUSY, board.settings.max_inflight, n, gate.retry_after_s)
+    return owner
+
+
 async def run(app, prep: dict):
     """`POST /card-review/run` 의 SSE 본체 — prepare() 를 지난 요청만 받는다.
 
@@ -3174,22 +3197,27 @@ async def run(app, prep: dict):
         last = time.monotonic()
         return _sse(event, data)
 
-    got = gate.try_acquire(tag)
+    external = req.get("llm") == "external"
+    board = external_llm.board_of(app) if external else None
+    # 외부 응답자 호출은 GLM 관문 자리를 잡지 않는다 — 사람 속도의 일꾼을 기다리는 동안 그 자리를 쥐면 남의 GLM 카드 대조가
+    # review_busy 로 굶었다. 대신 사람별 동시 수(EXTERNAL_LLM_MAX_INFLIGHT)로 묶고, 비우기(update-all)면 GLM 길과 같이 받지 않는다.
+    got = _external_admit(gate, board, req) if external else gate.try_acquire(tag)
     if isinstance(got, Busy):
         why = ("리스크 검토 비우기 중이다(update-all) — 새 호출을 받지 않는다" if got.reason == "draining"
+               else f"이 사람의 외부 응답자 카드 대조 호출이 이미 {got.active}/{got.limit} 이다" if got.reason == _EXT_BUSY
                else f"카드 대조 자리가 없다(지금 {got.active}/{got.limit} — {got.reason})")
         yield _sse("error", _err("review_busy", f"{why}. {got.retry_after_s}초 뒤 같은 호출을 다시 낸다(아무것도 세지 않는다)",
-                                 knob="CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB",
+                                 knob=(external_llm.MAX_INFLIGHT_ENV if got.reason == _EXT_BUSY else
+                                       "CARD_REVIEW_CONCURRENCY · CARD_REVIEW_CONCURRENCY_WITH_DELIB"),
                                  reason=got.reason, retry_after_s=got.retry_after_s, limit=got.limit, active=got.active))
         yield _sse("done", {})
         print(f"[card_review] {tag} → review_busy ({got.active}/{got.limit} {got.reason})")
         return
 
     try:
-        external = req.get("llm") == "external"
         if external:
             # 외부 응답자 길 — 이 호출 하나의 외부 모델(주인·종류를 실었다). 출력 상한은 limits 가 셈한 그 값을 건다(예산과 같은
-            # 수 — CARD_REVIEW_MAX_TOKENS 는 GLM 박스의 손잡이라 여기 걸지 않는다). 관문(자리)은 GLM 길과 같이 잡는다.
+            # 수 — CARD_REVIEW_MAX_TOKENS 는 GLM 박스의 손잡이라 여기 걸지 않는다).
             llm = external_llm.model_for(app, owner=req.get("user_email") or "", kind=kind,
                                          target_key=str(req.get("target_key") or ""), label=tag)
             ask_llm = (llm.bind(max_tokens=lim["llm_max_tokens"]) if llm is not None and lim.get("llm_max_tokens")
@@ -3355,10 +3383,14 @@ async def run(app, prep: dict):
     finally:
         # 사용량을 아는 시도만 합에 넣고, 모르는 시도(실패·도중 취소 포함)는 '모름' 으로 센다 — 0 토큰으로 치지 않는다.
         known = [p for p in per if p["tokens_in"] is not None or p["tokens_out"] is not None]
-        gate.release(got, st["outcome"],
-                     {"tokens_in": sum(p["tokens_in"] or 0 for p in known),
-                      "tokens_out": sum(p["tokens_out"] or 0 for p in known)} if known else None,
-                     unknown_calls=st["launched"] - len(known), truncated=st["truncated"], repaired=st["repaired"])
+        if external:
+            if board is not None:
+                board.call_end(got)          # 외부 응답자 호출은 GLM 관문 자리를 잡지 않았다 — 그 사람의 동시 수만 돌려준다
+        else:
+            gate.release(got, st["outcome"],
+                         {"tokens_in": sum(p["tokens_in"] or 0 for p in known),
+                          "tokens_out": sum(p["tokens_out"] or 0 for p in known)} if known else None,
+                         unknown_calls=st["launched"] - len(known), truncated=st["truncated"], repaired=st["repaired"])
         # 호출당 한 줄 — 본문(카드·변경 줄)은 찍지 않는다.
         print(f"[card_review] {tag} chars={ctx['prompt_chars']:,} attempts={len(per)} "
               f"{time.monotonic() - t0:.1f}s → {st['outcome']}")
@@ -3600,7 +3632,9 @@ async def limits_now(app, llm: str | None = None) -> dict:
     싣는다. 끝에 관문 칸 gate{limit, limit_reason, active} 를 더한다(limits_rev 에는 들지 않는다).
 
     llm=external 이면 외부 응답자의 창·출력 상한(EXTERNAL_LLM_CTX_TOKENS·EXTERNAL_LLM_MAX_TOKENS)으로 셈한다 — 창을 묻지 않고
-    출처(ctx_source·max_tokens_source)가 external, model 이 external 이고 llm 칸이 붙는다. 꺼진 박스면 부르기 전에
+    출처(ctx_source·max_tokens_source)가 external, model 이 external 이고 llm 칸이 붙는다. 외부 호출은 GLM 관문 자리를 잡지 않으므로
+    gate 칸은 그 길의 것이다 — limit 은 한 사람의 동시 수(EXTERNAL_LLM_MAX_INFLIGHT, 비우기면 0), limit_reason 은
+    external_per_owner(비우기면 draining), active 는 도는 외부 응답자 카드 대조 호출 수(모든 사람)다. 꺼진 박스면 부르기 전에
     refuse_external 이 거절한다."""
     if llm == "external":
         board = external_llm.board_of(app)
@@ -3610,6 +3644,10 @@ async def limits_now(app, llm: str | None = None) -> dict:
         lim = limits(s.ctx_tokens, "external", s.max_tokens, model="external", max_tokens_source="external",
                      llm="external")
         lim["llm"] = "external"
+        draining = gate_of(app).limit()[1] == "draining"
+        lim["gate"] = {"limit": 0 if draining else s.max_inflight, "limit_reason": "draining" if draining else _EXT_BUSY,
+                       "active": board.calls_active()}
+        return lim
     else:
         import app as _a  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
 

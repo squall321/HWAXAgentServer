@@ -48,6 +48,7 @@ log = logging.getLogger("agent.external_llm")
 ENABLED_ENV = "EXTERNAL_LLM_ENABLED"
 CTX_ENV, MAX_TOKENS_ENV = "EXTERNAL_LLM_CTX_TOKENS", "EXTERNAL_LLM_MAX_TOKENS"
 WAIT_ENV, ANSWER_ENV = "EXTERNAL_LLM_WAIT_S", "EXTERNAL_LLM_ANSWER_S"
+MAX_INFLIGHT_ENV = "EXTERNAL_LLM_MAX_INFLIGHT"
 # 외부 모델의 창·출력 상한(토큰) — 카드 대조의 예산(limits·plan)과 외부 심의의 창 유도가 이 값으로 셈한다. 실제 모델(사용자가 돌리는
 # Claude)보다 크게 잡으면 그 모델이 못 받는 프롬프트가 나간다 — 작게 잡는 쪽이 안전하다.
 CTX_DEFAULT = 200_000
@@ -55,6 +56,9 @@ MAX_TOKENS_DEFAULT = 32_000
 # 집히지 않은 채(주인의 워크플로가 아무 과제도 집거나 내지 않는 동안) 기다리는 한도(초)와, 집은 뒤 답을 다 내는 한도(초).
 WAIT_DEFAULT = 300.0
 ANSWER_DEFAULT = 1200.0
+# 한 사람이 동시에 낼 수 있는 외부 응답자 카드 대조 호출 수 — 외부 호출은 GLM 관문 자리를 잡지 않으므로(사람 속도의 일꾼을 기다리는
+# 동안 남의 GLM 카드 대조를 막지 않게) 이것이 그 길의 상한이다. 넘으면 review_busy{reason: external_per_owner}.
+MAX_INFLIGHT_DEFAULT = 8
 NEXT_WAIT_MAX = 25.0              # review_task_next 의 긴 폴링 상한(초) — 게이트웨이 호출 한도(600)보다 훨씬 짧게
 POLL_S = 0.5                      # 긴 폴링이 다시 집어 보는 간격(초)
 READ_PAGE_MAX = 20_000            # review_task_read 응답 하나의 글자 상한(FastMCP 가 내보내는 JSON 글 그대로 잰다)
@@ -124,13 +128,15 @@ class Settings:
     max_tokens: int = MAX_TOKENS_DEFAULT
     wait_s: float = WAIT_DEFAULT
     answer_s: float = ANSWER_DEFAULT
+    max_inflight: int = MAX_INFLIGHT_DEFAULT
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Settings":
         return cls(ctx_tokens=int(_num(env, CTX_ENV, CTX_DEFAULT, floor=1024, integer=True)),
                    max_tokens=int(_num(env, MAX_TOKENS_ENV, MAX_TOKENS_DEFAULT, floor=1, integer=True)),
                    wait_s=_num(env, WAIT_ENV, WAIT_DEFAULT, floor=0.001, integer=False),
-                   answer_s=_num(env, ANSWER_ENV, ANSWER_DEFAULT, floor=0.001, integer=False))
+                   answer_s=_num(env, ANSWER_ENV, ANSWER_DEFAULT, floor=0.001, integer=False),
+                   max_inflight=int(_num(env, MAX_INFLIGHT_ENV, MAX_INFLIGHT_DEFAULT, floor=1, integer=True)))
 
     @property
     def call_worst_s(self) -> float:
@@ -213,7 +219,7 @@ class Board:
 
     상태는 잠금 하나로 지킨다(일꾼 쪽은 다른 스레드에서 불러도 된다 — 시험의 가짜 일꾼이 그렇게 돈다). 답·실패는 그 과제를 연
     이벤트 루프에 call_soon_threadsafe 로 넘긴다. 시계(clock — 단조, wall — 유닉스 초)와 id·임대는 바꿔 끼울 수 있다(시험·계약
-    예제)."""
+    예제). 카드 대조 외부 호출의 사람별 동시 수(call_begin·call_end — EXTERNAL_LLM_MAX_INFLIGHT)도 여기서 센다."""
 
     def __init__(self, settings: Settings | None = None, *, clock=time.monotonic, wall=time.time, new_id=None,
                  new_lease=None, tick: float | None = None):
@@ -224,6 +230,7 @@ class Board:
         self._lock = threading.Lock()
         self._tasks: dict[str, _Task] = {}
         self._owners: dict[str, _Owner] = {}
+        self._calls: dict[str, int] = {}
         self._seq = 0
         s = self.settings
         # 기다리는 쪽이 한도를 다시 보는 간격(실제 초) — 한도의 1/4(바닥 0.05초, 위 1초). 시계를 바꿔 끼운 시험은 따로 준다.
@@ -270,6 +277,35 @@ class Board:
             if self._tasks.get(task.id) is task:
                 del self._tasks[task.id]
                 log.info("[external] 과제 %s 취소 — 부른 쪽이 떠났다(%s · 집힘 %d번)", task.id, task.state, task.claims)
+
+    # ── 카드 대조 외부 호출의 사람별 동시 수 ──
+    def call_begin(self, owner: str) -> int | None:
+        """외부 응답자 카드 대조 호출 하나가 든다 — 그 주인의 도는 호출이 max_inflight 미만이면 하나 늘리고 None, 찼으면 지금 수."""
+        owner = _norm_owner(owner)
+        with self._lock:
+            n = self._calls.get(owner, 0)
+            if n >= self.settings.max_inflight:
+                return n
+            self._calls[owner] = n + 1
+            return None
+
+    def call_end(self, owner: str) -> None:
+        owner = _norm_owner(owner)
+        with self._lock:
+            n = self._calls.get(owner, 0) - 1
+            if n > 0:
+                self._calls[owner] = n
+            else:
+                self._calls.pop(owner, None)
+
+    def calls_of(self, owner: str) -> int:
+        with self._lock:
+            return self._calls.get(_norm_owner(owner), 0)
+
+    def calls_active(self) -> int:
+        """도는 외부 응답자 카드 대조 호출 수(모든 주인) — /health 의 review_active 에 더한다(update-all 비우기가 이것을 기다린다)."""
+        with self._lock:
+            return sum(self._calls.values())
 
     # ── 워크플로 쪽 ──
     def claim(self, owner: str) -> dict | None:
@@ -493,16 +529,19 @@ def model_for(app, *, owner: str, kind: str, run_id: str = "", target_key: str =
 
 
 def health_fields(board: Board) -> dict:
-    """/health.external_llm — 설정과 수만(과제 글·주인은 싣지 않는다). evid_budget 은 app 이 외부 창으로 셈해 더한다."""
+    """/health.external_llm — 설정과 수만(과제 글·주인은 싣지 않는다). inflight 는 도는 외부 응답자 카드 대조 호출 수(모든 주인 —
+    max_inflight 는 한 사람의 상한)이고 app 이 review_active 에도 더한다. evid_budget 은 app 이 외부 창으로 셈해 더한다."""
     s = board.settings
     return {"ctx_tokens": s.ctx_tokens, "max_tokens": s.max_tokens, "wait_s": s.wait_s, "answer_s": s.answer_s,
-            "call_worst_s": s.call_worst_s, **board.counts()}
+            "call_worst_s": s.call_worst_s, "max_inflight": s.max_inflight, "inflight": board.calls_active(),
+            **board.counts()}
 
 
 def startup_note(s: Settings, delib_read: float, delib_tries: int) -> str:
     """기동 줄 — 켜졌다는 것과 시간 한도 사슬. 과제 하나의 최악이 심의 LLM 논리 호출 1회의 최악 이상이면 경고를 붙인다."""
     line = (f"[agent] 외부 응답자(EXTERNAL_LLM_ENABLED) 켜짐 — 창 {s.ctx_tokens:,} · 출력 {s.max_tokens:,} 토큰, 기다림 "
-            f"{s.wait_s:g}초 · 답 {s.answer_s:g}초(과제 하나 최악 {s.call_worst_s:,.0f}초)")
+            f"{s.wait_s:g}초 · 답 {s.answer_s:g}초(과제 하나 최악 {s.call_worst_s:,.0f}초) · 카드 대조 동시 호출 한 사람당 "
+            f"{s.max_inflight}건({MAX_INFLIGHT_ENV})")
     if delib_read > 0 and delib_tries > 0:
         outer = delib_tries * delib_read + 8
         if s.call_worst_s >= outer:

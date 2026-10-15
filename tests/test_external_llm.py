@@ -386,7 +386,9 @@ def test_켜진_서버의_health_는_capabilities_와_external_llm_칸을_싣는
     h = client.get("/health").json()
     assert h["capabilities"] == ["card_review", "drain", "external_llm"]
     xh = h["external_llm"]
-    assert set(xh) == {"ctx_tokens", "max_tokens", "wait_s", "answer_s", "call_worst_s", "queued", "claimed", "evid_budget"}
+    assert set(xh) == {"ctx_tokens", "max_tokens", "wait_s", "answer_s", "call_worst_s", "max_inflight", "inflight", "queued",
+                       "claimed", "evid_budget"}
+    assert (xh["max_inflight"], xh["inflight"]) == (8, 0)
     assert (xh["ctx_tokens"], xh["max_tokens"], xh["queued"], xh["claimed"]) == (200_000, 32_000, 0, 0)
     assert (xh["wait_s"], xh["answer_s"], xh["call_worst_s"]) == (300.0, 1200.0, 3000.0)
     assert 2_000 <= xh["evid_budget"] < h["evid_budget"], "외부 창으로 셈한 근거 몫은 1백만 토큰 창의 몫보다 작다"

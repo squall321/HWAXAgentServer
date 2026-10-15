@@ -89,7 +89,7 @@ def stub(monkeypatch):
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    """실제 앱의 카드 대조 라우트 — GLM 관문 상한 2(탐침 p02), 시계가 멈춘 줄(일꾼이 없어도 시험이 시계를
+    """실제 앱의 카드 대조 라우트 — GLM 관문 상한 2(탐침 p02), 외부 응답자 사람별 상한 2, 시계가 멈춘 줄(일꾼이 없어도 시험이 시계를
     밀기 전에는 '없다' 로 끝나지 않는다)."""
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
     monkeypatch.setenv("DRAIN_STATE_PATH", str(tmp_path / "drain.json"))
@@ -103,7 +103,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(a.app.state, "delib_llm", FakeLLM(["oracle"], max_tokens=MT), raising=False)
     monkeypatch.setattr(m, "_APP", a.app)
     clock = Clock()
-    board = x.Board(x.Settings(ctx_tokens=CTX, max_tokens=MT), clock=clock, tick=0.02)
+    board = x.Board(x.Settings(ctx_tokens=CTX, max_tokens=MT, max_inflight=2), clock=clock, tick=0.02)
     monkeypatch.setattr(a.app.state, "external_board", board, raising=False)
     return SimpleNamespace(client=TestClient(a.app), board=board, clock=clock)
 
@@ -235,6 +235,62 @@ def test_MCP_로_연_외부_심의는_게이트웨이_헤더를_풀어_과제_�
     assert owners and set(owners) == {"first+tag@x.com"} and w.seen
 
 
+# ── 3. GLM 관문 — 외부 호출은 자리를 잡지 않고 사람별 상한·비우기·review_active ───────────────
+def test_외부_호출은_GLM_관문_자리를_잡지_않고_사람별_상한과_비우기를_따르며_review_active_에_든다(env):
+    """탐침 p02 — CARD_REVIEW_CONCURRENCY=2 에서 A 의 외부 호출 둘이 사람 속도의 일꾼을 기다리는 동안 B 의 GLM 카드 대조가
+    review_busy 였다. 이제 외부 호출은 GLM 관문 밖이고 한 사람당 EXTERNAL_LLM_MAX_INFLIGHT(여기 2)로 묶인다. 비우기면 받지 않고,
+    도는 수는 update-all 비우기가 기다리는 review_active 에 든다(재기동은 과제 줄을 잃는다)."""
+    c, board = env.client, env.board
+    results: dict = {}
+
+    def ext(i, who):
+        r = c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": who, **EXT})
+        results[i] = [(e, dd.get("code")) for e, dd in _frames(r) if e in ("error", "result")]
+
+    ths = [threading.Thread(target=ext, args=(i, "a@x.com")) for i in range(2)]
+    for t in ths:
+        t.start()
+    try:
+        _wait_until(lambda: board.counts()["queued"] == 2)
+        gate = cr.gate_of(a.app)
+        assert (gate.active, board.calls_active()) == (0, 2), "외부 호출이 GLM 관문 자리를 쥐었다"
+        h = c.get("/health").json()
+        assert (h["review_active"], h["card_review"]["active"], h["external_llm"]["inflight"],
+                h["external_llm"]["max_inflight"]) == (2, 0, 2, 2)
+        assert c.get("/drain").json()["review_active"] == 2
+        # B 의 GLM 카드 대조는 막히지 않는다
+        rb = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": "b@x.com"}))
+        assert [e for e, _ in rb][-2:] == ["result", "done"], rb[-2:]
+        assert len(a.app.state.delib_llm.calls) == 1
+        # A 의 셋째 외부 호출은 그 사람의 상한(2)에 걸린다 — 과제를 만들지 않는다
+        r3 = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": "a@x.com", **EXT}))
+        err = next(dd for e, dd in r3 if e == "error")
+        assert {k: err[k] for k in ("code", "reason", "knob", "limit", "active", "infra", "retryable")} == {
+            "code": "review_busy", "reason": "external_per_owner", "knob": "EXTERNAL_LLM_MAX_INFLIGHT", "limit": 2,
+            "active": 2, "infra": True, "retryable": True}
+        assert board.counts()["queued"] == 2
+        lim = c.get("/card-review/limits", params={"llm": "external"}).json()["gate"]
+        assert lim == {"limit": 2, "limit_reason": "external_per_owner", "active": 2}
+        # 비우기(scope all)면 다른 사람의 외부 호출도 받지 않는다
+        gate.drain.set_on(scope="all", by="update-all", ttl_s=600)
+        try:
+            r4 = _frames(c.post("/card-review/run", json={**REQUESTS["verdict_one"], **IDENT, "user_email": "c@x.com",
+                                                           **EXT}))
+            lim = c.get("/card-review/limits", params={"llm": "external"}).json()["gate"]
+        finally:
+            gate.drain.set_off(by="update-all")
+        err4 = next(dd for e, dd in r4 if e == "error")
+        assert (err4["code"], err4["reason"], board.calls_active(), board.counts()["queued"]) == (
+            "review_busy", "draining", 2, 2)
+        assert (lim["limit"], lim["limit_reason"]) == (0, "draining")
+    finally:
+        env.clock.t += 301                                 # 일꾼이 없다 — A 의 둘은 '없다' 로 끝난다
+        for t in ths:
+            t.join(30)
+    assert results == {0: [("error", "external_worker_absent")], 1: [("error", "external_worker_absent")]}
+    assert (board.calls_active(), c.get("/health").json()["review_active"]) == (0, 0)
+
+
 # ── 4. 반출 동의 표지(엔진의 겹 방어) ─────────────────────────────────────────────
 def test_카드_대조_run_은_consent_external_true_가_없으면_과제를_만들기_전에_422_다(env):
     c, board = env.client, env.board
@@ -245,7 +301,7 @@ def test_카드_대조_run_은_consent_external_true_가_없으면_과제를_만
         assert (r.status_code, r.json()["code"]) == (422, "external_consent_required"), (consent, r.text[:200])
     r = c.post("/card-review/run", json={**one, "user_email": ""})
     assert r.json()["code"] == "external_consent_required", "동의 표지를 신원보다 먼저 본다"
-    assert board.counts() == {"queued": 0, "claimed": 0}
+    assert board.counts() == {"queued": 0, "claimed": 0} and board.calls_active() == 0
     # limits·plan 은 글이 나가지 않아 묻지 않는다 · GLM 길은 표지와 상관없다
     assert c.get("/card-review/limits", params={"llm": "external"}).status_code == 200
     assert c.post("/card-review/plan", json={"cards": [], "units": [], "llm": "external"}).status_code == 200

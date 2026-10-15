@@ -123,7 +123,7 @@
  "llm": "external",
  "gate": {
   "limit": 8,
-  "limit_reason": "normal",
+  "limit_reason": "external_per_owner",
   "active": 0
  }
 }

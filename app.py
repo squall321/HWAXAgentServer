@@ -4880,7 +4880,15 @@ def _echo(v) -> str:
 
 def _drain_view(gate) -> dict:
     a, q = _delib_load()
-    return {**gate.drain.snapshot(), "review_active": gate.active, "delib_active": a, "delib_queued": q}
+    return {**gate.drain.snapshot(), "review_active": gate.active + _external_review_active(), "delib_active": a,
+            "delib_queued": q}
+
+
+def _external_review_active() -> int:
+    """도는 외부 응답자 카드 대조 호출 수 — GLM 관문 자리를 잡지 않으므로 관문의 active 에 없다. review_active 에 더한다(update-all
+    비우기가 그 수가 0 이 되기를 기다린다 — 재기동하면 과제 줄을 잃는다). 꺼진 박스는 0 이다."""
+    board = _external_llm.board_of(app)
+    return board.calls_active() if board is not None else 0
 
 
 @app.get("/drain")
@@ -4945,6 +4953,8 @@ def health() -> dict:
     if _external:
         # 외부 응답자가 켜진 박스만 capabilities 에 external_llm 이 붙는다 — 리스크 앱은 이것을 보고 llm=claude 잡을 받는다(X-2).
         _review["capabilities"] = [*_review["capabilities"], "external_llm"]
+        # 도는 외부 응답자 카드 대조 호출도 review_active 에 든다(GLM 관문 밖이다 — update-all 비우기가 이 수를 기다린다).
+        _review["review_active"] = _review["review_active"] + _external["external_llm"]["inflight"]
     return {
         "status": "ok",
         # 지금 도는 심의·줄 선 심의 수. 재기동은 이것들을 전부 끊는다 — start.sh 와 update-all 이 이 수를 보고

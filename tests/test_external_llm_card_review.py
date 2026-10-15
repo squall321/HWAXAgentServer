@@ -132,7 +132,7 @@ def test_일꾼이_없으면_첫_시도가_external_worker_absent_error_프레�
         "code": "external_worker_absent", "infra": True, "retryable": True, "knob": "EXTERNAL_LLM_WAIT_S", "attempt": 1}
     assert "300초" in err["message"]
     assert board.counts() == {"queued": 0, "claimed": 0}
-    assert cr.gate_of(a.app).active == 0, "자리를 돌려주지 않았다"
+    assert (cr.gate_of(a.app).active, board.calls_active()) == (0, 0), "자리를 돌려주지 않았다"
 
 
 def test_집고_답하지_않으면_한_번_되돌린_뒤_external_answer_timeout_이다(env):
@@ -171,7 +171,7 @@ def test_보충_중의_외부_한도는_받은_행을_버리지_않고_repair_er
 
 
 # ── 관문·취소 ────────────────────────────────────────────────────────────────
-def test_외부_호출도_관문을_지나고_비우기면_과제를_만들지_않고_review_busy_다(env):
+def test_외부_호출은_GLM_관문_자리를_잡지_않아도_비우기면_과제를_만들지_않고_review_busy_다(env):
     board = a.app.state.external_board
     cr.gate_of(a.app).drain.set_on(scope="all", by="update-all", ttl_s=600)
     try:
@@ -179,7 +179,7 @@ def test_외부_호출도_관문을_지나고_비우기면_과제를_만들지_�
     finally:
         cr.gate_of(a.app).drain.set_off(by="update-all")
     assert (ev, err["code"], err["reason"]) == ("error", "review_busy", "draining")
-    assert board.counts() == {"queued": 0, "claimed": 0}
+    assert board.counts() == {"queued": 0, "claimed": 0} and board.calls_active() == 0
 
 
 def test_스트림이_닫히면_과제가_줄에서_빠지고_자리를_돌려준다(env):
@@ -202,16 +202,17 @@ def test_스트림이_닫히면_과제가_줄에서_빠지고_자리를_돌려�
                 break
             await asyncio.sleep(0.01)
         queued = board.counts()
-        active = cr.gate_of(a.app).active
+        active = (cr.gate_of(a.app).active, board.calls_active())
         consumer.cancel()                                   # 끊김 — 스트리밍 응답 태스크가 취소된다
         await asyncio.gather(consumer, return_exceptions=True)
         await gen.aclose()
         await asyncio.sleep(0.05)
-        return queued, active, board.counts(), cr.gate_of(a.app).active, frames
+        return queued, active, board.counts(), (cr.gate_of(a.app).active, board.calls_active()), frames
 
     queued, active, after, active_after, frames = asyncio.run(go())
-    assert (queued, active) == ({"queued": 1, "claimed": 0}, 1)
-    assert (after, active_after) == ({"queued": 0, "claimed": 0}, 0)
+    # GLM 관문 자리는 잡지 않고(0) 그 사람의 외부 호출 수만 하나 든다 — 끊기면 둘 다 0 이다.
+    assert (queued, active) == ({"queued": 1, "claimed": 0}, (0, 1))
+    assert (after, active_after) == ({"queued": 0, "claimed": 0}, (0, 0))
     assert [e for e, _ in frames] == ["status"]
 
 
