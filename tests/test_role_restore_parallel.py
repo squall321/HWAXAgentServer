@@ -26,13 +26,20 @@ _SEATS = [{"key": f"dom{i:02d}-seat", "role": f"호출자가 준 역할 {i}"} fo
 _DELAY = 0.05
 
 
-class _Roles(_Tool):
-    """역할 원문 도구 — 건마다 _DELAY 만큼 걸리고, 겹쳐 도는 수의 최대값을 적는다. broken 의 좌석은 호출이 실패한다."""
+_HUB_TMPL = ('You are an assistant for "{k}" (`{k}`) inside the hub.\n- Help the user with: (no description)\n\n'
+             '## How to access this hub — use the MCP tools (NOT web fetch)\n- get_agent_session("{k}") — call FIRST\n'
+             '## CRITICAL — do NOT use WebFetch / browser fetch on this hub\n  curl -s "http://127.0.0.1:8001/api/discover"\n')
 
-    def __init__(self, broken=()):
+
+class _Roles(_Tool):
+    """역할 원문 도구 — 건마다 _DELAY 만큼 걸리고, 겹쳐 도는 수의 최대값을 적는다. broken 의 좌석은 호출이 실패한다.
+    blank 의 좌석은 원문은 오지만 역할 문서가 비었다 — 설명 0자에 허브 자동 틀(system_prompt)뿐인 전문가(실측 둘)."""
+
+    def __init__(self, broken=(), blank=()):
         super().__init__("get_agent_session")
         self.now = self.peak = 0
         self.broken = set(broken)
+        self.blank = set(blank)
 
     async def ainvoke(self, args):
         self.calls.append(args)
@@ -46,6 +53,9 @@ class _Roles(_Tool):
         if key in self.broken:
             return (a._TOOL_FAIL_MARK + " 도구 get_agent_session 호출 실패: 900초 안에 답하지 않았다"
                     "(MCP_CALL_TIMEOUT_S) — 게이트웨이 무응답이다.")
+        if key in self.blank:
+            return json.dumps({"data": {"agent_type": key, "name": key, "description": "",
+                                        "system_prompt": _HUB_TMPL.format(k=key)}}, ensure_ascii=False)
         return json.dumps({"data": {"description": f"{key} 의 역할 원문"}}, ensure_ascii=False)
 
 
@@ -126,3 +136,51 @@ def test_리스크_심사_좌석_계약은_받은_역할_뒤에_붙는다(monkey
     asyncio.run(go())
     role = next(p["role"] for p in out["personas"] if p["key"] == "mech-housing")
     assert role.startswith("mech-housing 의 역할 원문\n") and d._RISK_SEAT_CONTRACT["mech"] in role, role[:120]
+
+
+def _seated(events):
+    return next(data for ev, data in events if ev == "delib" and data.get("kind") == "personas")["personas"]
+
+
+def test_역할_문서가_빈_좌석은_허브_자동_틀_대신_역할·이름·키로_앉고_한_번_알린다(monkeypatch):
+    """설명이 빈 전문가는 허브가 영문 자동 틀('You are an assistant for …' + 허브 사용 안내 3천 자)을 system_prompt 로 준다.
+    그게 그대로 좌석 역할이 됐고 경고도 없었다(챗은 _role_doc 으로 거르고 persona_role_empty 를 낸다)."""
+    seats = [{"key": "blank-a", "role": "호출자가 준 역할"},
+             {"key": "blank-b", "role": ""},                                       # 좌석 고르기로 앉힘 — 풀은 역할을 안 싣는다
+             {"key": "blank-c", "role": _HUB_TMPL.format(k="blank-c")[:280]},     # 이어하기가 되넘긴 소개용 역할(앞 280자)
+             {"key": "dom01-seat", "role": "x"}]
+    monkeypatch.setattr(d, "_KN_CONC", 6)
+    events = _stream(monkeypatch, {"personas": seats, "persona_knowledge": 0},
+                     tools={"get_agent_session": _Roles(blank={"blank-a", "blank-b", "blank-c"})})
+    by = {p["key"]: p["role"] for p in _seated(events)}
+    assert by == {"blank-a": "호출자가 준 역할", "blank-b": "blank-b", "blank-c": "blank-c",
+                  "dom01-seat": "dom01-seat 의 역할 원문"}, by
+    assert not any("You are an assistant" in r or "this hub" in r for r in by.values())
+    flagged = [ln for ln in _lines(events) if "역할 문서가 비었다" in ln]
+    assert sorted(ln.split(" — ")[1].split(" · ")[0] for ln in flagged) == ["blank-a", "blank-b", "blank-c"], flagged
+    assert not any("받지 못해" in ln for ln in _lines(events)), "원문은 받았다 — 호출 실패가 아니다"
+    warns = [data for ev, data in events if ev == "warning" and data.get("code") == "persona_role_empty"]
+    assert len(warns) == 1 and all(k in warns[0]["message"] for k in ("blank-a", "blank-b", "blank-c")), warns
+    assert "dom01-seat" not in warns[0]["message"]
+
+
+def test_관리자_프롬프트_뒤의_허브_안내는_떼고_앉고_빈_역할로_세지_않는다():
+    """설명은 비었지만 관리자가 쓴 역할이 system_prompt 앞에 있고 허브 안내가 뒤에 붙은 좌석 — 안내를 뗀 본문으로 앉는다."""
+    from test_persona_inject import RAW_ROLE
+
+    def tools(**sd):
+        return {"get_agent_session": _Tool("get_agent_session", json.dumps({"data": sd}, ensure_ascii=False))}
+
+    t = tools(agent_type="sim-pcb-warpage", name="PCB 휨", description="", system_prompt=RAW_ROLE)
+    role = asyncio.run(d._restore_role(t, "sim-pcb-warpage", "호출자 역할"))
+    assert role == a._role_doc(RAW_ROLE) and "기판 휨 해석 전문가" in role, role[:200]
+    empty, why = set(), {}
+    asyncio.run(d._restore_role(t, "sim-pcb-warpage", "", why=why, empty=empty))
+    assert empty == set() and why == {}, "역할이 있는 좌석을 빈 역할로 셌다"
+    # 설명이 있으면 설명이 먼저다(카드 대조와 같은 순서) — 설명이 있는 좌석의 역할은 종전과 같다.
+    both = tools(agent_type="sim-pcb-warpage", name="PCB 휨", description="설명 역할", system_prompt=RAW_ROLE)
+    assert asyncio.run(d._restore_role(both, "sim-pcb-warpage")) == "설명 역할"
+    # 호출자 역할이 없으면 이름, 이름도 없으면 키로 앉는다(발굴·시뮬 좌석·띵킹처럼 empty 를 안 넘기는 길도 같다).
+    blank = dict(agent_type="kk", description="", system_prompt=_HUB_TMPL.format(k="kk"))
+    assert asyncio.run(d._restore_role(tools(**blank, name="빈 전문가"), "kk")) == "빈 전문가"
+    assert asyncio.run(d._restore_role(tools(**blank, name=""), "kk")) == "kk"

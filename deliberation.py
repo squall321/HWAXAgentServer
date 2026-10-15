@@ -3840,20 +3840,31 @@ def is_operator(key: str) -> bool:
     return _dom_of(key) in OPERATOR_DOMAINS
 
 
-async def _restore_role(tools: dict, key: str, fallback: str = "", why: dict | None = None) -> str:
+async def _restore_role(tools: dict, key: str, fallback: str = "", why: dict | None = None,
+                        empty: set | None = None) -> str:
     """페르소나 역할 원본을 get_agent_session 으로 복원한다(실패 시 fallback).
 
     why 를 주면 **호출이 실패해** 원본을 못 받은 좌석의 사유를 {좌석 키: 사유} 로 적는다(호출부가 알린다).
-    도구 실패는 예외가 아니라 문자열로 온다(✖ · "(tool … error"). 역할 문서가 그냥 빈 전문가는 적지 않는다."""
+    도구 실패는 예외가 아니라 문자열로 온다(✖ · "(tool … error"). 역할 문서가 그냥 빈 전문가는 why 가 아니라
+    empty 에 적는다(주면). 그 좌석은 fallback, 그것도 비면 이름·키로 앉는다."""
+    from app import _role_doc  # noqa: PLC0415 — 순환 방지용 늦은 import(card_review 와 같은 방식)
     try:
         raw = await _call(tools, "get_agent_session", {"agent_type": key})
         if why is not None and isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
             why[key] = _RA_FAIL_WRAP.sub("", raw.strip(), count=1)[:200]
         sess = _first_dict(_parse_json(raw))
         sd = _first_dict(sess.get("data", sess))
-        full = sd.get("description") or sd.get("system_prompt") or ""
+        # ⚠ system_prompt 를 그대로 쓰지 않는다. 설명이 빈 전문가는 허브 자동 틀('You are an assistant for "…"')과 허브
+        #   사용 안내(영문 3천 자)를 받는다. 챗(_persona_meta)·카드 대조(card_review)와 같은 _role_doc 으로 거른다.
+        #   설명을 먼저 쓰는 순서는 그대로 둔다(card_review 와 같다) — 설명이 있는 좌석의 역할은 바뀌지 않는다.
+        full = sd.get("description") or _role_doc(str(sd.get("system_prompt") or ""))
         if full:
             return full[:_ROLE_CLIP] if _ROLE_CLIP > 0 else full
+        if sd.get("agent_type"):      # 원문은 받았다 — 호출 실패가 아니라 역할 문서가 빈 전문가다
+            if empty is not None:
+                empty.add(key)
+            # 이어하기는 이전 회차의 소개용 역할(앞 280자)을 되넘긴다 — 거기 영문 틀이 실려 올 수 있어 같이 거른다.
+            return _role_doc(fallback) or str(sd.get("name") or "") or key
     except Exception as exc:  # noqa: BLE001 — 실패해도 제공된 role/key 로 참여
         if why is not None:
             why[key] = type(exc).__name__
@@ -4802,11 +4813,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         #   22석이면 22건이 조용히 돌고, 게이트웨이가 느린 날에는 호출 한도(600초)가 좌석 수만큼 곱해진다.
         #   시간 한도는 만들지 않는다. 지식카드 조회와 같은 수(_KN_CONC)로 한꺼번에 돌리고 좌석마다 줄을 낸다.
         _rr_par = min(len(personas), _KN_CONC) if _KN_CONC > 0 else len(personas)
-        _rr_sem, _rr_why = asyncio.Semaphore(max(1, _rr_par)), {}      # 세마포어는 여기서 만든다(_kn_sem 과 같은 까닭)
+        _rr_sem, _rr_why, _rr_empty = asyncio.Semaphore(max(1, _rr_par)), {}, set()   # 세마포어는 여기서 만든다(_kn_sem 과 같은 까닭)
 
         async def _rr_one(p):
             async with _rr_sem:
-                p["role"] = await _restore_role(tools, p["key"], p.get("role") or "", why=_rr_why)
+                p["role"] = await _restore_role(tools, p["key"], p.get("role") or "", why=_rr_why, empty=_rr_empty)
             # 리스크 심사 좌석 계약 — _restore_role 이 원본 role 로 덮으므로 복원 **뒤**에
             # 접미로 붙인다(role 접미로 보내면 여기서 통째로 유실된다). 합성 지정석은 이
             # 루프 뒤에 append 되어 붙지 않는다(도메인 delib 은 계약표에 없다).
@@ -4829,12 +4840,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _rr_done += 1
                 yield _sse("status", {
                     "step": f"역할 복원 {_rr_done}/{len(personas)} — {_rk}"
-                            + (f" · 원문을 받지 못해 호출자가 준 역할로 간다({_rr_why[_rk]})" if _rk in _rr_why else ""),
+                            + (f" · 원문을 받지 못해 호출자가 준 역할로 간다({_rr_why[_rk]})" if _rk in _rr_why else "")
+                            + (" · 등록된 역할 문서가 비었다" if _rk in _rr_empty else ""),
                     "tool": None})
         finally:
             for _t in _rr_tasks:
                 if not _t.done():
                     _t.cancel()
+        if _rr_empty:
+            # 챗의 persona_role_empty 와 같은 알림 — 종전엔 허브 영문 자동 틀이 역할로 조용히 앉았다.
+            yield _sse("warning", {"code": "persona_role_empty",
+                                   "message": f"{', '.join(sorted(_rr_empty))} 에 등록된 역할 문서가 비어 있습니다 "
+                                              "— 전문가 말투·범위가 적용되지 않습니다."})
         if getattr(opts, "seats_clamped", None):
             yield _sse("status", {"step": f"⚠ 좌석 상한 {MAX_REQ_SEATS}석 초과 — 제외: "
                                           + ", ".join(opts.seats_clamped), "tool": None})
