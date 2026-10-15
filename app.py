@@ -96,6 +96,7 @@ from deliberation import (
     strip_test_plan_trigger,
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
+import external_llm as _external_llm
 import review_gate as _review_gate
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
@@ -382,6 +383,11 @@ async def lifespan(app: FastAPI):
     app.state.llm_nostream = disable_stream
     if _card_review is not None:
         _card_review.gate_of(app)    # 카드 대조 관문 — 평소 CARD_REVIEW_CONCURRENCY, 심의가 돌면 _WITH_DELIB(수만 센다)
+    # 외부 응답자(EXTERNAL_LLM_ENABLED=1) — 과제 줄을 기동 때 만들고(설정을 한 번 읽는다) 시간 한도 사슬을 적는다. 꺼져 있으면 없다.
+    _ext_board = _external_llm.board_of(app)
+    if _ext_board is not None:
+        _x_read, _x_tries = _llm_limit(app.state.delib_llm)
+        print(_external_llm.startup_note(_ext_board.settings, _x_read, _x_tries))
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
     app.state.connections = _load_mcp_config()
@@ -2331,7 +2337,13 @@ def _model_context_tokens() -> int:
 
     박스마다 모델이 다르다(dev 16K · 운영 GLM). env 로 박아 두면 한쪽에서 반드시 틀리고,
     틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다.
-    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다."""
+    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다.
+
+    외부 응답자 심의를 도는 태스크(문맥) 안에서는 그 응답자의 창(EXTERNAL_LLM_CTX_TOKENS)이다 — 심의 입구가 세운다
+    (deliberation._external_entry). 그 밖(챗·카드 대조·다른 심의·/health)은 종전 그대로 이 서버 모델의 창이다."""
+    _ov = _external_llm.ctx_override.get()
+    if _ov:
+        return _ov
     if "n" in _ctx_cache:
         return _ctx_cache["n"]
     n = _CTX_FALLBACK
@@ -4837,6 +4849,21 @@ def _card_review_health() -> dict:
             "drain": drain, "capabilities": ["card_review", "drain"], "card_review": fields}
 
 
+def _external_llm_health() -> dict:
+    """/health 의 외부 응답자 칸 — 꺼져 있으면 {}(종전 응답 그대로). 켜져 있으면 external_llm{ctx_tokens, max_tokens, wait_s,
+    answer_s, call_worst_s, queued, claimed, evid_budget}. 수와 설정만 싣는다(과제 글·주인은 싣지 않는다 — /health 는 인증이
+    없다). evid_budget 은 외부 응답자 창으로 셈한 심의 근거 몫(자)이다 — 리스크 앱이 외부 심의의 브리프를 이 값에 맞춘다."""
+    board = _external_llm.board_of(app)
+    if board is None:
+        return {}
+    token = _external_llm.ctx_override.set(board.settings.ctx_tokens)
+    try:
+        evid = _evid_budget()
+    finally:
+        _external_llm.ctx_override.reset(token)
+    return {"external_llm": {**_external_llm.health_fields(board), "evid_budget": evid}}
+
+
 # ── 비우기(update-all 동안 — M3.md 4.7) ─────────────────────────────────────────
 # POST /drain {on, scope: all|panels, ttl_s | until_idle{grace_s, max_s}, hold?, by, reason, force?} · GET /drain. 깃발은
 # review_gate.DrainState(파일 하나 — 재기동을 넘긴다)이고 규칙도 거기 있다. 인증은 없다 — 서버는 루프백에만 묶이고 /chat 도
@@ -4913,6 +4940,11 @@ async def post_drain(request: Request):
 @app.get("/health")
 def health() -> dict:
     _active, _queued = _delib_load()
+    _review = _card_review_health()
+    _external = _external_llm_health()
+    if _external:
+        # 외부 응답자가 켜진 박스만 capabilities 에 external_llm 이 붙는다 — 리스크 앱은 이것을 보고 llm=claude 잡을 받는다(X-2).
+        _review["capabilities"] = [*_review["capabilities"], "external_llm"]
     return {
         "status": "ok",
         # 지금 도는 심의·줄 선 심의 수. 재기동은 이것들을 전부 끊는다 — start.sh 와 update-all 이 이 수를 보고
@@ -4920,7 +4952,9 @@ def health() -> dict:
         "delib_active": _active,
         "delib_queued": _queued,
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
-        **_card_review_health(),
+        **_review,
+        # 외부 응답자(켜진 박스만) — 과제 줄의 수. 재기동하면 줄을 잃는다(도는 호출은 앱이 인프라로 다시 낸다).
+        **_external,
         # 챗 첫 조각 지연 — idle(카드 대조 0)·review(1 이상) 고리와 slow(review.p50 > 2 × idle.p50, 두 고리 10턴 이상).
         "load": {"chat": _CHAT_LOAD.snapshot()},
         "model": VLLM_MODEL,
