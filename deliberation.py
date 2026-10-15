@@ -396,13 +396,16 @@ def _pre_budget() -> int:
     # 어느 창에서 유도했는지 함께 적어 두고, 창이 같을 때만 꺼내 쓴다. 창 조회가 실패하면 기본값을 잠깐
     # 가정하다가 다시 묻는데(app._model_context_tokens), 여기가 그 가정값으로 굳어 있으면 창이 바로잡혀도
     # 좌석 예산은 내내 틀린 창 기준이다.
-    if _evid_cache.get("pre_ctx") == ctx and "pre" in _evid_cache:
-        return _evid_cache["pre"]
+    # 창과 값은 한 칸에 한 덩이로 둔다 — 두 칸에 나눠 적으면 다른 창으로 셈하는 스레드(/health 의 외부 응답자 근거 몫)와 엇갈려
+    # 한 창의 판정에 다른 창의 값을 읽었다(1백만 토큰 심의가 20만 토큰 몫으로, 또는 그 반대로).
+    hit = _evid_cache.get("pre")
+    if hit is not None and hit[0] == ctx:
+        return hit[1]
     # 안전 계수 — 이 계산은 구조상 **정확히 컨텍스트에 딱 맞게** 떨어진다(실측 128,000/128,000).
     # 여유 0 이면 토큰 추정 오차 한 번에 넘치고, 심의는 좌석이 동시에 죽는다. 조금 손해 본다.
     avail = ctx - int(_seat_ctx() / _EVID_KO_CPT) - _EVID_RESERVE
     n = max(2000, int(avail * _EVID_KO_CPT * _PRE_SAFETY) - _room_extra())
-    _evid_cache["pre"], _evid_cache["pre_ctx"] = n, ctx
+    _evid_cache["pre"] = (ctx, n)
     return n
 
 

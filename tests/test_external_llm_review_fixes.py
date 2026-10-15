@@ -384,3 +384,46 @@ def test_상시_묶이는_invoke_tool_로도_과제_도구를_부르지_못한�
     assert calls == ["list_materials"], "막아야 할 이름이 게이트웨이까지 갔다"
     assert all(o.startswith(a._TOOL_FAIL_MARK) and "Claude Code 워크플로만" in o for o in out[:3]), out
     assert out[3] == "called list_materials"
+
+
+# ── L1. 근거 몫 캐시 — 창과 값을 한 덩이로 ──────────────────────────────────────────
+def test_근거_몫_캐시는_창과_값을_한_덩이로_두어_다른_창의_값을_읽지_않는다(monkeypatch):
+    """탐침 p05 — /health(스레드)가 외부 창으로 근거 몫을 셈하는 동안 이벤트 루프의 GLM 심의가 같은 캐시를 읽었다. 값과 창을 두 칸에
+    나눠 적어 그 사이에 읽으면 한 창의 판정에 다른 창의 값을 받았다(1초에 수백 번)."""
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    d._evid_cache.clear()
+    glm = d._evid_budget()
+    assert set(d._evid_cache) == {"pre"} and d._evid_cache["pre"][0] == 1_048_576
+    tok = x.ctx_override.set(200_000)
+    try:
+        ext = d._evid_budget()
+    finally:
+        x.ctx_override.reset(tok)
+    assert ext < glm and d._evid_budget() == glm
+    old, stop, bad = sys.getswitchinterval(), threading.Event(), []
+
+    def health():
+        while not stop.is_set():
+            t = x.ctx_override.set(200_000)
+            try:
+                v = d._evid_budget()
+            finally:
+                x.ctx_override.reset(t)
+            if v != ext:
+                bad.append(("health", v))
+
+    th = threading.Thread(target=health, daemon=True)
+    sys.setswitchinterval(1e-6)
+    try:
+        th.start()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 1.0:
+            v = d._evid_budget()
+            if v != glm:
+                bad.append(("glm", v))
+    finally:
+        stop.set()
+        th.join(10)
+        sys.setswitchinterval(old)
+        d._evid_cache.clear()
+    assert not bad, bad[:5]
