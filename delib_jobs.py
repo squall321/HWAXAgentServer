@@ -543,7 +543,7 @@ async def _drive(job: dict, gen) -> None:
 
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
-          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "") -> dict:
+          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "") -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
@@ -553,7 +553,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     deliberation 모듈이 app.py 를 다시 부르는 순환을 피한다.
 
     ⚠ 웹과 같은 조합을 만든다 — 트리거(어느 run_*)와 chair_template 을 한 곳에서 세운다.
-    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본)."""
+    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본).
+
+    owner 는 외부 응답자 심의(delib_opts.llm=external)의 과제 주인이다 — MCP 호출자 길이 게이트웨이 헤더를 푼 이름을 준다
+    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
@@ -621,7 +624,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
     # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·신원 없음) 잡을 만들기 전에 거절한다. 받으면 잡 기록에 판단
     # LLM 과 실제로 걸린 free_tools(evidence_only 라 0)를 적는다 — 보낸 값이 아니라 걸린 값이다(위와 같은 규칙).
-    _refused = _external_refusal(app, applied, user_email)
+    _refused = _external_refusal(app, applied, owner or user_email)
     if _refused:
         raise ValueError(f"{_refused['code']}: {_refused['message']}")
     if _read.llm == "external":
@@ -659,9 +662,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   잡은 앞 심의의 뒷정리 안에서 뜬다 — 그대로 만들면 앞 심의가 세운 요청 단위 표식(자격 강등
     #   _pat_degraded · 유령 ID 출처 _turn_ids)을 달고 돈다. 곧바로 뜨는 잡은 종전과 같은 컨텍스트다.
     groups, ctx = list(groups or []), contextvars.copy_context()
+    # 외부 응답자 잡만 과제 주인을 따로 넘긴다(GLM 잡의 진입 호출은 종전 그대로다).
+    ext_kw = {"owner": owner or user_email} if _read.llm == "external" else {}
 
     def spawn() -> asyncio.Task:
-        gen = entry(app, q, groups, opts or None, user_email, user_pat, None)
+        gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job_id}")
 
     _PENDING[job_id] = (job, spawn)

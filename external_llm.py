@@ -8,7 +8,8 @@
 
 규칙.
 1. 기본 꺼짐 — `EXTERNAL_LLM_ENABLED=1` 이 아니면 줄도 도구도 없고, `llm: "external"` 요청은 거절된다(사용자 결정 X-D1).
-2. 주인만 — 과제는 그 호출을 낸 사람(owner)의 워크플로만 본다. 남의 과제 id 는 없는 id 와 같은 답을 받는다.
+2. 주인만 — 과제는 그 호출을 낸 사람(owner)의 워크플로만 본다. 남의 과제 id 는 없는 id 와 같은 답을 받는다. 주인 이름은
+   앞뒤 공백을 떼고 소문자로만 맞춘다 — 퍼센트 인코딩을 푸는 것은 게이트웨이 신원 헤더(MCP 호출자 길)뿐이다(header_owner).
 3. 집기마다 임대(lease)가 붙는다 — 읽기·내기는 그 임대를 실어야 하고, 되돌려졌다 다시 집힌 과제에 묵은 임대로 낸 조각은
    버퍼에 닿지 않고 not_claimed 다(두 일꾼의 답이 한 답으로 이어 붙지 않는다).
 4. 끝없이 기다리지 않는다 — 집히지 않으면 `external_worker_absent`, 집고 답이 없으면 한 번 줄로 되돌리고 그다음
@@ -73,6 +74,9 @@ REFUSALS = {"external_llm_disabled": 409, "external_owner_missing": 422}
 # 외부 응답자 심의의 창 — 그 심의를 도는 태스크(문맥) 안에서만 app._model_context_tokens() 가 이 값을 돌려준다. 심의의 예산(근거·
 # 전사·역할 몫)은 전부 창에서 유도되는데 GLM 창(1백만 토큰)으로 짠 프롬프트는 외부 모델이 받지 못한다.
 ctx_override: contextvars.ContextVar[int | None] = contextvars.ContextVar("external_llm_ctx", default=None)
+# 외부 응답자 심의의 과제 주인 — 심의 입구(deliberation._external_entry)가 세운다. MCP 로 연 심의는 게이트웨이 헤더를 푼 이름
+# (header_owner), 포털 /chat 심의는 원문 신원이다. 잡 기록·도구 호출 신원(user)은 종전 그대로 두고 과제의 주인만 이것으로 맞춘다.
+task_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("external_llm_owner", default=None)
 
 _ON_WORDS = ("1", "true", "yes", "on")
 _OFF_WORDS = ("", "0", "false", "no", "off")
@@ -159,9 +163,16 @@ def _answer_timeout(s: Settings) -> ExternalLLMError:
 
 
 def _norm_owner(owner) -> str:
-    """주인 이름 맞추기 — 퍼센트 인코딩을 풀고 앞뒤 공백을 떼고 소문자로. 게이트웨이는 x-hwax-user 를 quote(user, safe="@.") 로
-    싣는다('+' 가 든 이메일은 %2B 로 온다). 카드 대조의 user_email(포털이 덮어쓴 원문)과 양쪽을 같은 규칙으로 맞춘다."""
-    return unquote(str(owner or "")).strip().lower()
+    """주인 이름 맞추기 — 앞뒤 공백을 떼고 소문자로만. 원문 신원(카드 대조의 user_email — 포털이 검증된 주체로 덮어쓴 이메일,
+    포털 /chat 심의의 호출자)은 이것만 거친다. 퍼센트 인코딩을 여기서 풀면 '%41' 이 든 원문 주소가 다른 사람('A')의 이름이 된다
+    (ev%41l@ → evAl@ — 남의 워크플로가 그 과제를 집었다). 푸는 것은 header_owner 다."""
+    return str(owner or "").strip().lower()
+
+
+def header_owner(raw) -> str:
+    """게이트웨이 신원 헤더(x-hwax-user)의 주인 이름 — 게이트웨이는 quote(user, safe="@.") 로 싣는다('+' 가 든 이메일은 %2B,
+    '%' 는 %25 로 온다). 한 번 풀어 _norm_owner 와 같은 규칙으로 맞춘다. MCP 호출자 길(과제 도구·MCP 로 연 심의)만 쓴다."""
+    return _norm_owner(unquote(str(raw or "")))
 
 
 # ── 과제 줄 ───────────────────────────────────────────────────────────────────

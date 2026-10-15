@@ -158,3 +158,78 @@ def test_임대가_없거나_다르면_지금_집힌_과제라도_읽기_내기�
     bad, ok, msg = asyncio.run(go())
     assert [r["code"] for r in bad] == ["not_claimed"] * 4
     assert ok["done"] is True and msg.content == "진짜 답"
+
+
+# ── 2. 주인 이름 — 원문은 풀지 않고 게이트웨이 헤더만 푼다 ──────────────────────────────
+def test_원문_이메일의_퍼센트는_풀지_않아_남의_워크플로가_그_과제를_집지_못한다(stub):
+    """탐침 p01 percent_owner — 카드 대조의 주인은 포털이 덮어쓴 원문 이메일이다. 종전엔 원문도 퍼센트를 풀어 'ev%41l@' 이
+    'evAl@' 이 됐고 eval@ 의 워크플로가 그 과제를 집어 카드 글을 읽고 답을 냈다."""
+    victim, other = "Ev%41l@Corp.com", "eval@corp.com"
+
+    async def go():
+        call = _call(stub.app, owner=victim, human="기밀 카드 글")
+        await _until(lambda: stub.board.counts()["queued"] == 1)
+        tid = next(iter(stub.board._tasks))
+        theirs = await m.review_task_next(ctx=gw(other))
+        theirs_read = await m.review_task_read(tid, "ls-x", 0, ctx=gw(other))
+        mine = await m.review_task_next(ctx=gw(victim))     # 주인의 워크플로 — 헤더는 'ev%2541l@corp.com' 으로 온다
+        theirs_submit = await m.review_task_submit(tid, mine["lease"], "남이 쓴 답", final=True, ctx=gw(other))
+        await m.review_task_submit(tid, mine["lease"], "주인의 답", final=True, ctx=gw(victim))
+        return theirs, theirs_read, mine, theirs_submit, await call
+
+    theirs, theirs_read, mine, theirs_submit, msg = asyncio.run(go())
+    assert theirs["empty"] is True and theirs_read["code"] == theirs_submit["code"] == "task_not_found"
+    assert mine["task_id"] and msg.content == "주인의 답"
+    assert x._norm_owner(" Ev%41l@Corp.com ") == "ev%41l@corp.com", "원문은 공백·대소문자만 맞춘다"
+    assert x.header_owner(quote("first+tag@x.com", safe="@.")) == "first+tag@x.com"
+
+
+def test_MCP_로_연_외부_심의는_게이트웨이_헤더를_풀어_과제_주인으로_삼고_잡_주인은_원문_그대로다(monkeypatch, tmp_path):
+    """'+' 가 든 이메일은 헤더에 %2B 로 온다. 과제 주인은 푼 이름이라 같은 헤더로 붙은 워크플로가 그 과제를 집는다. 잡 기록의
+    주인(user)은 헤더 원문 그대로다(접기·이어하기·목록이 같은 원문으로 견준다). 시계는 멈춰 둔다 — 주인이 어긋나면 아무도 못 집어
+    심의가 끝나지 않고(시간 상한에서 실패), 맞으면 곧 끝난다."""
+    import langgraph.prebuilt
+
+    from test_external_llm_delib import Q, SEATS, _Tool
+
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
+
+    async def fake_tools(*_a, **_k):
+        return tools
+
+    monkeypatch.setattr(d, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda *_a, **_k: pytest.fail("도구를 묶었다"))
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    board = x.Board(x.Settings(), clock=Clock(), tick=0.02)
+    owners = []
+    real_open = board.open
+
+    def open_(**kw):
+        owners.append(kw["owner"])
+        return real_open(**kw)
+
+    board.open = open_
+    monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None,
+                                                                          external_board=board)))
+    hdr = quote("first+tag@x.com", safe="@.")
+    assert hdr == "first%2Btag@x.com"
+
+    async def go():
+        w = FakeWorker(hdr, poll_s=0.02)
+        serve = asyncio.ensure_future(w.serve())
+        try:
+            out = await m.deliberate_start(Q, job="risk-review", rounds=2, personas=SEATS, save_report=False,
+                                           advanced={**EXT, "voc": "off"}, ctx=ctx_of(hdr))
+            await asyncio.wait_for(asyncio.shield(delib_jobs._TASKS[out["job_id"]]), 60)
+            return delib_jobs._JOBS[out["job_id"]], w
+        finally:
+            w.stop()
+            await serve
+
+    job, w = asyncio.run(go())
+    assert job["status"] == "done", job.get("error")
+    assert job["user"] == hdr, "잡 주인은 헤더 원문 그대로다"
+    assert owners and set(owners) == {"first+tag@x.com"} and w.seen

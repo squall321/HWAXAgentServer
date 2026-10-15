@@ -407,8 +407,10 @@ async def deliberate_start(
                        search_sources=search_sources, stop_after_round=stop_after_round,
                        save_report=save_report, advanced=advanced)
     user, groups = _caller(ctx)
+    # owner — 외부 응답자 심의(advanced.llm=external)의 과제 주인은 게이트웨이 헤더를 푼 이름이다(과제 도구 쪽과 같은 규칙). 잡 기록의
+    # 주인(user)은 종전 그대로 헤더 원문이다(접기·이어하기·목록이 같은 원문으로 견준다).
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
-                           groups=groups, user_email=user)
+                           groups=groups, user_email=user, owner=external_llm.header_owner(user))
     out = delib_jobs.summary(rec)
     out["caller"] = user or "(서비스 계정 — 게이트웨이가 신원 헤더를 안 보냈다)"
     out["note"] = (_queued_note(out["queue"]) if out.get("queue") else
@@ -548,7 +550,7 @@ async def deliberate_continue(
     )
     rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
-                           groups=groups, user_email=user)
+                           groups=groups, user_email=user, owner=external_llm.header_owner(user))
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
@@ -732,7 +734,8 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
 
 # ── 외부 응답자 과제(리스크 심사 Claude 길 X-1) — EXTERNAL_LLM_ENABLED=1 인 서버에서만 등록한다 ─────────────────────────
 # 엔진의 판단 호출(카드 대조·심의 좌석/의장)이 LLM 대신 과제로 줄을 서면, 잡 주인의 Claude Code 워크플로가 이 셋으로 집어 읽고
-# 답을 낸다(external_llm.py). 주인만 — 신원은 게이트웨이가 검증된 PAT 로 싣는 x-hwax-user 다(_caller). 꺼진 서버에는 도구가 없다.
+# 답을 낸다(external_llm.py). 주인만 — 신원은 게이트웨이가 검증된 PAT 로 싣는 x-hwax-user 다(_caller → header_owner 로 한 번
+# 푼다). 꺼진 서버에는 도구가 없다.
 _XS = external_llm.Settings.from_env()
 _TASK_FORMAT = (
     " 답의 꼴 — 그 프롬프트를 받은 모델이 낼 출력 그대로다. kind 가 sweep·verdict·offcard·noinput·summary(카드 대조)면 system 글이 "
@@ -777,7 +780,8 @@ _TASK_SUBMIT_DESC = (
 
 
 def _task_caller(ctx: Context | None) -> tuple[str, external_llm.Board]:
-    """과제 도구의 호출자와 줄 — 꺼진 서버·신원 없는 호출은 도구 오류다(과제는 주인에게만 보인다)."""
+    """과제 도구의 호출자와 줄 — 꺼진 서버·신원 없는 호출은 도구 오류다(과제는 주인에게만 보인다). 신원은 게이트웨이 헤더를 한 번
+    푼 이름이다(header_owner — 카드 대조의 원문 이메일과 같은 이름이 된다)."""
     board = external_llm.board_of(_need_app())
     if board is None:
         raise ValueError("이 서버는 외부 응답자 길을 열지 않았다(EXTERNAL_LLM_ENABLED) — 과제가 없다")
@@ -785,7 +789,7 @@ def _task_caller(ctx: Context | None) -> tuple[str, external_llm.Board]:
     if not user.strip():
         raise ValueError("신원 없는 호출이다 — 게이트웨이가 신원 헤더(x-hwax-user)를 싣지 않았다. 잡 주인의 PAT 로 게이트웨이를 거쳐 "
                          "부른다(과제는 그 주인에게만 보인다)")
-    return user, board
+    return external_llm.header_owner(user), board
 
 
 async def review_task_next(wait_s: float = 0, ctx: Context | None = None) -> dict:
