@@ -1242,7 +1242,16 @@ def _external_refusal(app, req_opts, user: str) -> dict | None:
     """외부 응답자 심의(delib_opts.llm=external)를 받을 수 없으면 오류 칸 {code, message, knob?}, 받으면(또는 external 이 아니면)
     None. 차례 — 꺼진 서버(설정 오류로 닫힌 서버 포함)는 external_llm_disabled, 반출 동의 표지(consent_external: true)가 없으면
     external_consent_required(글이 밖으로 나가는 요청마다 실어야 한다 — 엔진이 보는 것은 이 표지뿐이다), 신원 없는 호출은
-    external_owner_missing 이다(과제를 누구의 워크플로에 줄지 모른다)."""
+    external_owner_missing 이다(과제를 누구의 워크플로에 줄지 모른다).
+
+    그 앞에 — llm 이 모르는 값(없음·glm·external 밖 — 앞뒤 공백·대소문자는 맞춘다)이면 스위치와 상관없이 bad_request 다(카드 대조와
+    같다). 이 서버의 LLM 으로 조용히 돌리면 고른 엔진이 아닌 것으로 돈 결과가 고른 엔진의 것처럼 남는다."""
+    _llm = req_opts.get("llm") if isinstance(req_opts, dict) else None
+    if _llm is not None and str(_llm).strip().lower() not in ("", "glm", "external"):
+        return {"code": "bad_request",
+                "message": f"delib_opts.llm 에 모르는 값({_delib_preview(_llm, 40)})이 왔다 — 받는 값은 glm(이 서버의 LLM, 기본)과 "
+                           "external(외부 응답자)뿐이다(MCP 는 advanced.llm). 이 심의는 시작하지 않았다 — 모르는 값을 이 서버의 "
+                           "LLM 으로 조용히 돌리지 않는다."}
     if not _wants_external(req_opts):
         return None
     if external_llm.board_of(app) is None:
@@ -1380,7 +1389,8 @@ def _resolve_opts(req_opts):
     )
     if isinstance(req_opts, dict):
         o.started_by = _started_by(req_opts.get("started_by"))
-        # 판단 LLM — 못 읽는 값은 기본(glm)으로 돌고 그렇다고 알린다(다른 손잡이와 같다 — 안쪽 LLM 으로 도는 쪽은 반출이 없다).
+        # 판단 LLM — glm(기본·없음) | external. 모르는 값은 심의 입구와 MCP 잡 시작이 먼저 bad_request 로 거절한다
+        # (_external_refusal — 이 서버의 LLM 으로 조용히 돌지 않는다). 여기의 알림은 입구를 거치지 않고 읽는 쪽의 그물이다.
         _llm = req_opts.get("llm")
         _lv = str("" if _llm is None else _llm).strip().lower()
         if _lv == "external":

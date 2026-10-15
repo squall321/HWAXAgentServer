@@ -42,6 +42,10 @@
   "message": "이 서버는 외부 응답자 길(delib_opts.llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 된다(/health 의 capabilities 에 external_llm 이 있는지 본다). llm 을 빼면 이 서버의 LLM 으로 돈다.",
   "knob": "EXTERNAL_LLM_ENABLED"
  },
+ "refused_bad_request": {
+  "code": "bad_request",
+  "message": "delib_opts.llm 에 모르는 값(claude)이 왔다 — 받는 값은 glm(이 서버의 LLM, 기본)과 external(외부 응답자)뿐이다(MCP 는 advanced.llm). 이 심의는 시작하지 않았다 — 모르는 값을 이 서버의 LLM 으로 조용히 돌리지 않는다."
+ },
  "_how": {
   "request": {
    "question": "[리스크심사 S26 Ultra diff:abababababababababababababababab] 쟁점 패널 — 보스 간극",
@@ -81,6 +85,7 @@
    }
   },
   "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
-  "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)"
+  "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",
+  "bad_request": "llm 에 모르는 값('claude') — 스위치가 꺼진 서버에서도 bad_request 다(받는 값은 glm·external)"
  }
 }

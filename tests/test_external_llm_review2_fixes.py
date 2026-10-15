@@ -246,3 +246,52 @@ def test_스위치를_켠_셸에서_돌려도_시험은_꺼진_서버를_본다(
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node], cwd=str(ROOT), env=env,
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0 and "1 passed" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
+
+# ── L3. 모르는 delib_opts.llm 값은 스위치와 상관없이 bad_request(카드 대조와 같다) ─────────────────────
+OWNER = "owner@x.com"
+_UNKNOWN_LLM = ["claude", "GPT-4", "externals", 1, True, ["external"], {"llm": "external"}]
+
+
+@pytest.mark.parametrize("switch", ["0", "1"])
+@pytest.mark.parametrize("entry", ["run_deliberation", "run_sim_deliberation", "run_test_plan"])
+def test_모르는_llm_값은_스위치와_상관없이_심의를_열기_전에_bad_request_다(monkeypatch, switch, entry):
+    """종전엔 모르는 값이 이 서버의 LLM(GLM)으로 돌았다 — 꺼진 서버는 말없이, 켜진 서버는 알림 카드 한 장으로. 리스크 앱이 'claude'
+    를 엔진 이름('external')으로 바꾸지 않고 보내면 고른 엔진이 아닌 것으로 돈 결과가 Claude 결과처럼 원장에 남는다."""
+    from test_external_llm_delib import _panel, scaled
+
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", switch)
+    for v in _UNKNOWN_LLM:
+        events, _w, _bound, tools, board = _panel(monkeypatch, {"llm": v}, worker=False, entry=getattr(d, entry),
+                                                  board=x.Board(x.Settings(), clock=scaled(), tick=0.02))
+        assert [ev for ev, _ in events] == ["error", "done"], (entry, v, events[:3])
+        assert events[0][1]["code"] == "bad_request" and "glm" in events[0][1]["message"], events[0]
+        assert board.counts() == {"queued": 0, "claimed": 0} and all(t.calls == [] for t in tools.values())
+
+
+def test_받는_llm_값은_종전대로_거절하지_않는다():
+    for v in (None, "", "  ", "glm", " GLM ", "Glm"):
+        assert d._external_refusal(None, {"llm": v}, OWNER) is None, v
+    assert d._external_refusal(None, {}, OWNER) is None and d._external_refusal(None, None, OWNER) is None
+    assert d._external_refusal(None, {"llm": " External ", "consent_external": True}, OWNER)["code"] == \
+        "external_llm_disabled", "external 은 아는 값이다 — 꺼진 서버의 거절로 간다"
+
+
+@pytest.mark.parametrize("switch", ["0", "1"])
+def test_MCP_심의_시작과_이어하기도_모르는_llm_값이면_잡을_만들기_전에_bad_request_다(monkeypatch, tmp_path, switch):
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", switch)
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    prev = {"id": "default-prev", "job": "default", "kind": "default", "status": "done", "question": "앞 화두",
+            "decision": "앞 결정문", "opts": {}, "seats": [], "user": OWNER}
+    monkeypatch.setattr(delib_jobs, "_JOBS", {prev["id"]: prev})
+    monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None,
+                                                                          external_board=x.Board(x.Settings()))))
+    for v in ("claude", " gpt "):
+        adv = {"llm": v, "consent_external": True}
+        with pytest.raises(ValueError, match="^bad_request: "):
+            asyncio.run(m.deliberate_start("화두", advanced=adv, ctx=ctx_of(OWNER)))
+        with pytest.raises(ValueError, match="^bad_request: "):
+            asyncio.run(m.deliberate_continue(prev["id"], "사람 의견", advanced=adv, ctx=ctx_of(OWNER)))
+    assert list(delib_jobs._JOBS) == [prev["id"]] and delib_jobs._PENDING == {}

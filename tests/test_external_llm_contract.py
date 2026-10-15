@@ -304,9 +304,12 @@ def _delib_frames(monkeypatch) -> dict:
     monkeypatch.delenv("EXTERNAL_LLM_ENABLED")
     events, *_ = _panel(monkeypatch, worker=False)
     out["refused_disabled"] = events[0][1]
+    events, *_ = _panel(monkeypatch, {"llm": "claude"}, worker=False)      # 꺼진 서버에서도 — 모르는 값은 스위치보다 먼저 본다
+    out["refused_bad_request"] = events[0][1]
     out["_how"] = {"request": {"question": Q, "delib_opts": PANEL},
                    "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
-                   "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)"}
+                   "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",
+                   "bad_request": "llm 에 모르는 값('claude') — 스위치가 꺼진 서버에서도 bad_request 다(받는 값은 glm·external)"}
     return out
 
 
@@ -370,7 +373,7 @@ def test_예제가_계약의_칸을_싣는다():
     assert (frames["result"]["llm"], frames["result"]["tool_mode"]) == ("external", "evidence_only")
     assert frames["seat_lost_absent"]["cause"] == frames["chair_failed_absent"]["cause"] == "external_worker_absent"
     assert (frames["refused_disabled"]["code"], frames["refused_owner_missing"]["code"],
-            frames["refused_consent_required"]["code"]) == (
-        "external_llm_disabled", "external_owner_missing", "external_consent_required")
+            frames["refused_consent_required"]["code"], frames["refused_bad_request"]["code"]) == (
+        "external_llm_disabled", "external_owner_missing", "external_consent_required", "bad_request")
     assert _load("req_verdict_ok.json")["consent_external"] is True, "외부 run 예제 본문에 반출 동의 표지가 있어야 한다"
     assert (lim["gate"]["limit_reason"], lim["gate"]["limit"]) == ("external_per_owner", 8)
