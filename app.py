@@ -4595,17 +4595,68 @@ def _cell(v):
     return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:200]
 
 
+def _md_cell(c) -> str:
+    # 포털 md.ts 의 splitCells 는 ASCII '|' 로만 칸을 가른다 — 칸 속 '|' 는 전각으로.
+    return ("" if c is None else str(c)).replace("\n", " ").replace("|", "｜")[:200]
+
+
+def _block_md(b: dict, refs: dict) -> str:
+    """DocumentJSON 블록 한 개 → 마크다운. 표는 MXWhitePaper 가 블록 안에(headers·rows), 허브 변환기(kooremapper-iga)는
+    content.tables 에 두고 ref 로 가리킨다(실측). 칸 이름도 다르다 — 코드는 code·language(MX)와 text(변환기),
+    수식은 expression, 콜아웃은 title·text. MXWhitePaper 의 _render_blocks 는 이 이름들을 안 읽어 그대로 못 쓴다."""
+    t = str(b.get("type") or "")
+    if t in ("table", "figure") and isinstance(b.get("ref"), str) and b["ref"] in refs:
+        b = {**refs[b["ref"]], "type": t}
+    if t == "table":
+        hdr, rows = b.get("headers") or [], [r for r in b.get("rows") or [] if isinstance(r, list)]
+        if not hdr and rows:
+            hdr, rows = rows[0], rows[1:]
+        if not hdr:
+            return ""
+        md = ["| " + " | ".join(map(_md_cell, hdr)) + " |", "|" + " --- |" * len(hdr)]
+        md += ["| " + " | ".join(map(_md_cell, r)) + " |" for r in rows[:RECORD_ROWS_MAX]]
+        if len(rows) > RECORD_ROWS_MAX:  # 잘린 표를 전부인 척 보이지 않는다(위 RECORD_ROWS_MAX 주석과 같은 까닭)
+            md.append(f"\n*표 앞 {RECORD_ROWS_MAX}행만 싣는다 — 전체 {len(rows)}행.*")
+        return (f"**{b['caption']}**\n\n" if b.get("caption") else "") + "\n".join(md)
+    if t == "code":
+        return f"```{b.get('language') or ''}\n{b.get('code') or b.get('text') or ''}\n```"
+    if t == "math":
+        return f"$$\n{b.get('expression') or b.get('tex') or ''}\n$$"
+    if t == "figure":
+        return f"*[그림] {b['caption']}*" if b.get("caption") else ""
+    text = str(b.get("text") or "")
+    if t == "list_item":
+        return f"{b.get('marker') or '-'} {text}"
+    if t == "callout" and b.get("title"):
+        return f"**{b['title']}** {text}"
+    return f"> {text}" if t == "quote" else text
+
+
+def _flat_sections(secs, refs: dict):
+    """절 트리(MX 의 subsections · 변환기의 children) → (절, 본문) 깊이 우선.
+    content_text·text 가 비면 blocks 를 푼다 — 종전엔 최상위 절의 content_text 만 읽어 제목만 남았다."""
+    for s in secs or []:
+        s = _first_dict(s)
+        text = str(s.get("content_text") or s.get("text") or "")
+        if not text and isinstance(s.get("blocks"), list):
+            text = "\n\n".join(t for t in (_block_md(_first_dict(b), refs) for b in s["blocks"]) if t)
+        yield s, text
+        yield from _flat_sections(s.get("subsections") or s.get("children"), refs)
+
+
 def _record_view(rec: dict) -> dict:
     """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
-    그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다)."""
+    그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다).
+    DOC 절은 블록 구조(blocks·subsections·children)도 마크다운으로 풀어 싣는다(_flat_sections)."""
     content = rec.get("content") if isinstance(rec.get("content"), dict) else {}
     out = {**_record_row(rec), "agents": [str(a)[:120] for a in (rec.get("agents") or [])][:20],
            "sections": [], "table": None, "sources": [], "truncated": False}
     out["summary"] = str(rec.get("summary") or "")[:2000]
+    refs = {x["id"]: x for k in ("tables", "figures")
+            for x in (content.get(k) if isinstance(content.get(k), list) else [])
+            if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]}
     budget = RECORD_TEXT_MAX
-    for s in content.get("sections") or []:
-        s = _first_dict(s)
-        text = str(s.get("content_text") or s.get("text") or "")
+    for s, text in _flat_sections(content.get("sections"), refs):
         if budget <= 0:
             out["truncated"] = True
             break
@@ -4647,7 +4698,21 @@ async def catalog_record(req: RecordRequest) -> dict:
     rec = _first_dict(_parse_json(await _call(tools, "get_record", {"record_id": rid})))
     if not rec.get("id"):
         return {"error": "record_failed", "id": rid}
-    return _record_view(rec)
+    view = _record_view(rec)
+    if view["table"] is None and not any(s["text"] for s in view["sections"]):
+        # content 엔 빈 '본문' 자리표시뿐이고 글은 RAG 절에만 있는 카드가 있다(MX 자리표시 154장 중 149장, 실측).
+        raw = await _call(tools, "get_record_sections", {"record_id": rid})
+        # 조회 실패를 '빈 카드'로 보이지 않는다. 게이트웨이 도구의 실패는 _cap_tool 의 ✖ 로 오고(_result_ok 가 본다),
+        # _call 의 '(tool … error' 와 평문 'Error executing tool …' 은 _tool_text_ok 가 본다.
+        if isinstance(raw, str) and raw.strip() and not (_result_ok(raw) and _tool_text_ok(raw)):
+            return {"error": "record_failed", "id": rid}
+        # 목록 도구라 원소마다 content 하나로 와서 _call 이 이어 붙인다 — _parse_json 은 마지막 하나만 잡는다.
+        rows = [r for r in _parse_json_multi(raw) if isinstance(r, dict) and r.get("content_text")]
+        # 어디에도 글이 없으면 절을 비운다 — 제목만 늘어놓지 않고 읽기 칸이 '본문이 비어 있는 카드입니다.' 를 띄운다.
+        # 빈 목록을 _record_view 에 넘기면 원문(JSON) 폴백이 {"sections": []} 를 본문으로 띄우므로 넘기지 않는다.
+        alt = _record_view({**rec, "content": {"sections": rows}}) if rows else {"sections": [], "truncated": False}
+        view["sections"], view["truncated"] = alt["sections"], alt["truncated"]
+    return view
 
 
 @app.get("/artifacts/{name}")
