@@ -214,6 +214,61 @@ def test_운영자의_앱이_게이트웨이에_없으면_경고한다(monkeypat
     assert "연결돼 있지 않다" in sink["messages"][0][1]
 
 
+def _events(out: str) -> list:
+    """SSE 글 → [(이벤트, 페이로드)]."""
+    evs = []
+    for chunk in out.split("\n\n"):
+        lines = chunk.splitlines()
+        ev = next((ln[7:] for ln in lines if ln.startswith("event: ")), "")
+        if ev:
+            evs.append((ev, next((json.loads(ln[6:]) for ln in lines if ln.startswith("data: ")), {})))
+    return evs
+
+
+def _op_turn(monkeypatch, apps, mapping):
+    """운영자 한 턴 — (상태줄, 경고, 시스템 프롬프트). 앱 라벨은 게이트웨이가 아니라 이 리포의 표로 정한다."""
+    monkeypatch.setattr(a, "_gw_apps", lambda: {})
+    sess = dict(OP_SESSION, agent_type="he-sim-smarttwin",
+                response_config={"persona_kind": "mcp_operator", "mcp_apps": apps, "key_tools": []})
+    sink, out, _ = _run_stream(monkeypatch, sess, mapping)
+    evs = _events(out)
+    return ([d_["step"] for e, d_ in evs if e == "status"], [d_ for e, d_ in evs if e == "warning"],
+            sink["messages"][0][1])
+
+
+def test_앱이_다_빠진_운영자는_도구로_답한다고_말하지_않는다(monkeypatch):
+    """cae00 의 SmartTwin 운영자 — 두 앱 다 게이트웨이에 없는데 '도구 0개 우선'·'…도구로 답합니다'·'직접 호출해 답하라' 가
+    '연결돼 있지 않다' 와 한 턴에 같이 나갔다(서로 반대인 메시지 셋 · 모델에겐 반대인 지시 둘)."""
+    steps, warns, sp = _op_turn(monkeypatch, ["smart-twin-mcp", "smart-twin-cluster"], TS_MAP)
+    assert "지정 앱 2개 — 이 서버에는 그 앱 도구가 없습니다" in steps, steps
+    assert "he-sim-smarttwin — 모는 앱이 연결돼 있지 않아 도구 없이 답합니다" in steps, steps
+    assert not any("도구 0개 우선" in s or s.endswith("도구로 답합니다") for s in steps), steps
+    assert [w["code"] for w in warns] == ["operator_app_missing"], warns
+    assert warns[0]["message"] == ("he-sim-smarttwin 가 모는 앱(시뮬레이션 실행(SmartTwin), 시뮬레이션 클러스터)이 "
+                                   "이 게이트웨이에 연결돼 있지 않습니다 — 그 앱 도구 없이 답합니다.")
+    assert "직접 호출해 답하라" not in sp and "도구 없이 답할 수 있는 범위만 답하라" in sp
+    assert "아래 사전 지식으로 답할 수 있는 범위만 답하라" in sp and "역할 본문" in sp, "역할(사전 지식)은 그대로 싣는다"
+
+
+def test_앱이_일부만_빠지면_붙은_앱으로_답한다고_말한다(monkeypatch):
+    """stcx 를 개통한 뒤의 cae00 — cluster 만 빠진다. '그 앱 도구 없이' 라고 하면 붙은 앱 도구까지 쓰지 말라는 뜻으로 읽힌다."""
+    steps, warns, sp = _op_turn(monkeypatch, ["heax-thermal_shock_mcp", "smart-twin-cluster"], TS_MAP)
+    assert "지정 앱 2개 → 도구 3개 우선" in steps, steps
+    assert "he-sim-smarttwin — 열충격 해석 도구로 답합니다" in steps, steps
+    assert warns[0]["message"].endswith("앱(시뮬레이션 클러스터)이 이 게이트웨이에 연결돼 있지 않습니다 — 열충격 해석 도구로 답합니다.")
+    assert "연결된 열충격 해석 의 도구로 할 수 있는 범위에서 답하라" in sp and "도구 없이 답할 수 있는 범위만" not in sp
+    assert "열충격 해석 의 도구를 직접 호출해 답하라" in sp and "시뮬레이션 클러스터 의 도구를 직접" not in sp
+
+
+def test_도구_매핑을_못_받으면_앱이_없다고_단정하지_않는다(monkeypatch):
+    """/tools-map 을 못 받았으면(_tm 빈 값) 종전처럼 모든 앱 이름으로 답한다 — 없다고 단정하지 않는다."""
+    monkeypatch.setattr(a, "_tools_map", lambda: {})
+    steps, warns, sp = _op_turn(monkeypatch, ["smart-twin-mcp", "smart-twin-cluster"], TS_MAP)
+    assert "지정 앱 2개 → 도구 0개 우선" in steps and not warns, (steps, warns)
+    assert "he-sim-smarttwin — 시뮬레이션 실행(SmartTwin), 시뮬레이션 클러스터 도구로 답합니다" in steps, steps
+    assert "시뮬레이션 실행(SmartTwin), 시뮬레이션 클러스터 의 도구를 직접 호출해 답하라" in sp
+
+
 def test_일반_전문가는_종전대로_지식카드를_조회한다(monkeypatch):
     sink, _out, kcalls = _run_stream(monkeypatch, PLAIN_SESSION, TS_MAP)
     assert len(kcalls) == 1

@@ -1510,6 +1510,7 @@ _TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
+    "smart-twin-mcp": "시뮬레이션 실행(SmartTwin)",          # 연결 안 된 박스에서도 게이트웨이 라벨과 같은 이름으로
     "heax-thermal_shock_mcp": "열충격 해석", "heax-materialtwin_web": "재료 물성(MaterialTwin)",
     "heax-laminate_analyzer_mcp": "적층 복합재 해석", "heax-web_design_agents": "웹 디자인 에이전트",
     "_gateway": "게이트웨이 공통",
@@ -3001,7 +3002,11 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             _tm = _tools_map()
             _from_apps = [n for n, gk in _tm.items() if gk in apps and n not in pinned]
             pinned = list(dict.fromkeys([*pinned, *first, *sorted(_from_apps)]))
-            yield _sse("status", {"step": f"지정 앱 {len(apps)}개 → 도구 {len(_from_apps)}개 우선",
+            # 그 앱 도구가 정말 없을 때만 '0개 우선' 대신 없다고 말한다. 매핑을 못 받았으면(_tm 빈 값) 없다고 단정하지
+            # 않는다. _from_apps 는 콕 집은 도구를 빼고 세므로 판정은 매핑으로 한다.
+            _no_tools = bool(_tm) and not any(gk in apps for gk in _tm.values())
+            yield _sse("status", {"step": (f"지정 앱 {len(apps)}개 — 이 서버에는 그 앱 도구가 없습니다" if _no_tools
+                                           else f"지정 앱 {len(apps)}개 → 도구 {len(_from_apps)}개 우선"),
                                   "tool": None, "tools_used": apps})
             # 운영자의 앱이 이 게이트웨이에 없다 — cae00 전용 앱(arp·odb-hub)을 다른 박스에서 고른 경우.
             # 말없이 두면 모델은 역할에 적힌 도구를 부르겠다고 약속만 하고 아무것도 못 부른다.
@@ -3094,23 +3099,33 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
                              "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
+        # 붙어 있는 앱만 말한다 — 일부만 빠졌는데 '그 앱 도구 없이' 라고 하면 붙은 앱 도구까지 쓰지 말라는 뜻으로 읽힌다.
+        _op_ok = [a for a in op_apps if a not in _op_missing]
         if _op_missing:
             _ml = ", ".join(_app_label(a) for a in _op_missing)
+            _okl = ", ".join(_app_label(a) for a in _op_ok)
             yield _sse("warning", {"code": "operator_app_missing",
                                    "message": f"{agent_key} 가 모는 앱({_ml})이 이 게이트웨이에 연결돼 있지 않습니다 — "
-                                              "그 앱 도구 없이 답합니다."})
+                                              + (f"{_okl} 도구로 답합니다." if _okl else "그 앱 도구 없이 답합니다.")})
             sys_prompt += (f"\n\n[중요] 이 운영자가 모는 앱({_ml})의 도구가 지금 연결돼 있지 않다. 그 도구를 "
-                           "호출하겠다고 말하지 말고, 연결되지 않았다는 사실을 먼저 밝힌 뒤 도구 없이 답할 수 "
-                           "있는 범위만 답하라.")
+                           "호출하겠다고 말하지 말고, 연결되지 않았다는 사실을 먼저 밝힌 뒤 "
+                           + (f"연결된 {_okl} 의 도구로 할 수 있는 범위에서 답하라." if _okl
+                              else "도구 없이 답할 수 있는 범위만 답하라."))
         # 지정 전문가 페르소나 — 선택 패널에서 고른 전문가의 역할로 답하는 '전문가와 대화' 모드.
         if agent_key and operator:
             # HE팀 MCP 운영자 — 역할(사전 지식·작업 순서·함정)만 싣고 지식카드 선조회는 하지 않는다.
             # 이 역할의 근거는 앱 도구 결과다. 지식카드 0건이라고 "사내 지식카드에 없다"를 먼저
             # 밝히게 하면, 도구로 답할 질문에 엉뚱한 단서가 붙는다.
-            _opl = ", ".join(_app_label(a) for a in op_apps) or "지정 앱"
-            sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 아래 사전 지식과 "
-                           f"작업 순서를 따라 {_opl} 의 도구를 직접 호출해 답하라.\n{persona.get('role') or ''}")
-            yield _sse("status", {"step": f"{agent_key} — {_opl} 도구로 답합니다", "tool": None})
+            # 위 [중요] 와 반대로 말하지 않는다 — 모는 앱이 하나도 안 붙었으면 '직접 호출해 답하라' 를 싣지 않는다.
+            if op_apps and not _op_ok:
+                sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 모는 앱이 이 서버에 "
+                               f"연결돼 있지 않으니 아래 사전 지식으로 답할 수 있는 범위만 답하라.\n{persona.get('role') or ''}")
+                yield _sse("status", {"step": f"{agent_key} — 모는 앱이 연결돼 있지 않아 도구 없이 답합니다", "tool": None})
+            else:
+                _opl = ", ".join(_app_label(a) for a in _op_ok) or "지정 앱"
+                sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 아래 사전 지식과 "
+                               f"작업 순서를 따라 {_opl} 의 도구를 직접 호출해 답하라.\n{persona.get('role') or ''}")
+                yield _sse("status", {"step": f"{agent_key} — {_opl} 도구로 답합니다", "tool": None})
         elif agent_key:
             role = persona.get("role") or ""
             if role:
