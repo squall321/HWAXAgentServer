@@ -81,6 +81,7 @@ from deliberation import (
     _resolve_opts,
     _started_by,
     _tools_by_name,
+    _wants_external,
     is_deliberation,
     is_operator,
     is_sim_deliberation,
@@ -1077,6 +1078,21 @@ def _cap_tool(tool, result_max=None):
                            "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
                     return ((msg, None)
                             if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
+        # 외부 응답자 심의는 사람의 클라이언트에서만 연다(X-D6) — 심의 시작·이어하기에 외부 선택(advanced.llm=external)이나 반출 동의
+        # 칸(consent_external)을 실은 호출은 보내지 않는다. 직접 묶인 그 도구로도, invoke_tool 의 안쪽 이름으로도 같다.
+        _via_inv = getattr(tool, "name", "") == "invoke_tool"
+        for _args in (kw, *(x for x in a if isinstance(x, dict))):
+            _target, _targs = ((_args.get("name"), _args.get("arguments")) if _via_inv
+                               else (getattr(tool, "name", ""), _args))
+            if _agent_external_call(_target, _targs):
+                _target = str(_target)[:80]
+                print(f"[gate] {_target} 차단 — 이 서버의 에이전트는 외부 응답자 심의·반출 동의 칸을 싣지 못한다")
+                msg = (f"{_TOOL_FAIL_MARK} 도구 {_target} 호출 실패: 외부 응답자 심의(advanced.llm=external)와 반출 동의 표지"
+                       "(consent_external)는 사람이 자기 클라이언트에서 고른다 — 이 대화의 에이전트는 그 칸을 실을 수 없어 이 호출은 "
+                       "보내지 않았다. 사용자가 외부 응답자 심의를 원하면 리스크 앱이나 자기 Claude Code 에서 직접 열라고 알려라. 인자 "
+                       "문제가 아니다 — 그 칸을 실어 다시 부르지 마라")
+                return ((msg, None)
+                        if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         # 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
@@ -1838,6 +1854,35 @@ def _agent_denied(name: str) -> bool:
     """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
     n = str(name or "").strip().lower()
     return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS)
+
+
+# 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
+# 게이트웨이는 이 호출을 사용자 신원으로 중계하므로, 지식카드에 숨은 지시를 받은 GLM 턴이 advanced.llm=external 과
+# consent_external: true 를 스스로 달면 외부 심의가 서고 원장에 거짓 동의가 남는다(X-D6). 사람의 동의는 사람의 클라이언트에서만 온다.
+_AGENT_NO_EXTERNAL = ("deliberate_start", "deliberate_continue")
+
+
+def _arg_dict(v) -> dict | None:
+    """도구 인자의 객체 칸 — dict 이거나, FastMCP 가 도구에 넘기기 전에 풀어 주는 JSON 글(func_metadata.pre_parse_json)이면 푼 dict.
+    그 밖은 None 이다."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return None
+    return v if isinstance(v, dict) else None
+
+
+def _agent_external_call(name, args) -> bool:
+    """이 서버의 에이전트가 부르는 심의 시작·이어하기가 외부 응답자를 고르거나(advanced.llm — 엔진과 같은 읽기, _wants_external)
+    반출 동의 칸(consent_external — 값과 상관없이, 바깥 칸이든 advanced 안이든)을 싣는가."""
+    n = str(name or "").strip().lower()
+    if not any(n == t or n.endswith("_" + t) for t in _AGENT_NO_EXTERNAL):
+        return False
+    args = _arg_dict(args) or {}
+    adv = _arg_dict(args.get("advanced")) or {}
+    keys = {str(k).strip().lower() for k in (*args, *adv)}
+    return _wants_external(adv) or _external_llm.CONSENT_FIELD in keys
 
 
 async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
