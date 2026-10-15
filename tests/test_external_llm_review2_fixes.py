@@ -295,3 +295,135 @@ def test_MCP_심의_시작과_이어하기도_모르는_llm_값이면_잡을_만
         with pytest.raises(ValueError, match="^bad_request: "):
             asyncio.run(m.deliberate_continue(prev["id"], "사람 의견", advanced=adv, ctx=ctx_of(OWNER)))
     assert list(delib_jobs._JOBS) == [prev["id"]] and delib_jobs._PENDING == {}
+
+
+# ── L4. 외부 응답자 심의 잡은 GLM 자리를 쥐지 않는다 — 주인마다 하나씩 ─────────────────────────────
+class _Engine:
+    """가짜 진입 함수 — 화두마다 문이 하나 있고 문이 열릴 때까지 그 심의는 '도는 중' 이다(외부 응답자 잡은 owner 를 받는다)."""
+
+    def __init__(self):
+        self.started, self.owner, self._gates = [], {}, {}
+
+    def gate(self, q):
+        return self._gates.setdefault(q, asyncio.Event())
+
+    async def entry(self, _app, q, groups, opts, user_email, user_pat, _x, **kw):
+        self.started.append(q)
+        self.owner[q] = kw.get("owner")
+        yield d._sse("status", {"step": f"{q} 시작"})
+        await self.gate(q).wait()
+        yield d._sse("delib", {"kind": "decision", "text": f"{q} 결정문"})
+        yield d._sse("done", {})
+
+
+@pytest.fixture
+def lanes(monkeypatch, tmp_path):
+    """스위치를 켠 서버의 빈 원장과 빈 줄 — 전역 상한 1·사용자별 1·줄 20."""
+    e = _Engine()
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_TASKS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(delib_jobs, "_CLOSING", False)
+    monkeypatch.setattr(delib_jobs, "MAX_RUNNING", 1)
+    monkeypatch.setattr(delib_jobs, "MAX_RUNNING_PER_USER", 1)
+    monkeypatch.setattr(delib_jobs, "QUEUE_MAX", 20)
+    monkeypatch.setattr(d, "run_deliberation", e.entry)
+    e.app = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None, external_board=x.Board(x.Settings())))
+    return e
+
+
+def _glm(e, q, user):
+    return delib_jobs.start(e.app, "default", q, user_email=user)
+
+
+def _ext(e, q, user, owner=""):
+    return delib_jobs.start(e.app, "default", q, user_email=user, owner=owner,
+                            delib_opts={"llm": "external", "consent_external": True})
+
+
+def _lane_play(e, scenario):
+    """시나리오를 한 이벤트 루프에서 돌리고, 끝나면 남은 잡을 전부 접고 끝날 때까지 기다린다(루프가 닫힌 뒤에 태스크가 남지 않게)."""
+    async def go():
+        try:
+            return await scenario()
+        finally:
+            for jid in list(delib_jobs._PENDING):
+                delib_jobs.cancel(jid)
+            tasks = list(delib_jobs._TASKS.values())
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.wait(tasks)
+            for _ in range(6):
+                await asyncio.sleep(0)
+
+    return asyncio.run(go())
+
+
+async def _finish(e, job):
+    task = delib_jobs._TASKS[job["id"]]
+    e.gate(job["question"]).set()
+    await asyncio.wait([task])
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+def test_외부_응답자_심의는_GLM_전역_자리를_쥐지_않고_GLM_심의도_막지_않는다(lanes):
+    """검토 2라운드 — 사람 속도의 워커를 기다리는 외부 MCP 심의가 DELIB_JOB_MAX_RUNNING 자리를 쥐어, 그 몇 시간 동안 남의 GLM 심의가
+    줄에 묶였다. 외부 잡은 그 자리에 세지 않는다(도는 수 — /health 의 delib_active·재기동 미룸 — 에는 그대로 든다)."""
+    async def scenario():
+        xa = _ext(lanes, "외부-가", "a@x.com")
+        xb = _ext(lanes, "외부-나", "b@x.com")
+        g1 = _glm(lanes, "GLM-1", "c@x.com")
+        g2 = _glm(lanes, "GLM-2", "d@x.com")
+        xc = _ext(lanes, "외부-다", "c@x.com")              # GLM 줄이 막혀 있어도 뒤에 선 외부 잡은 뜬다
+        g3 = _glm(lanes, "GLM-3", "a@x.com")                # 외부 잡이 도는 사람의 GLM 잡은 사용자별 상한(GLM 몫)에 걸리지 않는다
+        await asyncio.sleep(0)
+        assert [j["status"] for j in (xa, xb, g1, g2, xc, g3)] == [
+            "running", "running", "running", "queued", "running", "queued"]
+        assert "전역 상한 1건" in delib_jobs.summary(g2)["queue"]["why"]
+        assert delib_jobs.running_count() == 4, "도는 수(delib_active)에는 외부 잡도 든다"
+        await _finish(lanes, g1)
+        assert (g2["status"], g3["status"]) == ("running", "queued"), "GLM 자리는 종전대로 하나씩 넘어간다"
+        await _finish(lanes, g2)
+        assert g3["status"] == "running", "외부 잡이 도는 사람의 GLM 잡이 그 외부 잡에 막혔다"
+        assert lanes.owner == {"외부-가": "a@x.com", "외부-나": "b@x.com", "GLM-1": None, "GLM-2": None, "외부-다": "c@x.com",
+                               "GLM-3": None}
+
+    _lane_play(lanes, scenario)
+
+
+def test_외부_응답자_심의는_주인마다_하나씩_돌고_나머지는_줄에서_그_주인의_것을_기다린다(lanes):
+    async def scenario():
+        x1 = _ext(lanes, "외부-1", "A@x.com", owner="a@x.com")
+        x2 = _ext(lanes, "외부-2", " a@x.com ")          # 같은 주인(공백·대소문자를 맞춘 이름)
+        x3 = _ext(lanes, "외부-3", "b@x.com")
+        await asyncio.sleep(0)
+        assert [j["status"] for j in (x1, x2, x3)] == ["running", "queued", "running"]
+        q = delib_jobs.summary(x2)["queue"]
+        assert q["position"] == 1 and "외부 응답자 심의는 주인마다 1건" in q["why"], q
+        await _finish(lanes, x3)
+        assert x2["status"] == "queued", "다른 주인의 외부 잡이 끝났는데 이 주인의 다음 잡이 떴다"
+        await _finish(lanes, x1)
+        assert x2["status"] == "running"
+        assert lanes.started == ["외부-1", "외부-3", "외부-2"]
+
+    _lane_play(lanes, scenario)
+
+
+def test_줄을_끈_박스에서는_주인의_외부_심의가_돌고_있으면_종전처럼_거절한다(lanes, monkeypatch):
+    monkeypatch.setattr(delib_jobs, "QUEUE_MAX", 0)
+
+    async def scenario():
+        x1 = _ext(lanes, "외부-1", "a@x.com")
+        g1 = _glm(lanes, "GLM-1", "a@x.com")
+        assert (x1["status"], g1["status"]) == ("running", "running")
+        with pytest.raises(RuntimeError, match="외부 응답자 심의 주인마다 1건"):
+            _ext(lanes, "외부-2", "a@x.com")
+        with pytest.raises(RuntimeError, match="DELIB_JOB_MAX_RUNNING"):
+            _glm(lanes, "GLM-2", "b@x.com")
+        assert _ext(lanes, "외부-3", "b@x.com")["status"] == "running"
+
+    _lane_play(lanes, scenario)
