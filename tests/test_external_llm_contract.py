@@ -57,6 +57,11 @@ def _ids():
     return lambda: f"xt-{next(n):04d}"
 
 
+def _leases():
+    n = itertools.count(1)
+    return lambda: f"ls-{next(n):04d}"
+
+
 def scaled(k: float = 1000.0):
     t0 = time.monotonic()
     return lambda: 1000.0 + (time.monotonic() - t0) * k
@@ -118,7 +123,7 @@ def produce(monkeypatch) -> dict:
     monkeypatch.setattr(a, "_delib_human", lambda: 0)
     monkeypatch.setattr(a.app.state, "delib_llm", FakeLLM(["oracle"]), raising=False)
     d._evid_cache.clear()
-    fixed = lambda: x.Board(x.Settings(), clock=Clock(), wall=lambda: T0, new_id=_ids())  # noqa: E731
+    fixed = lambda: x.Board(x.Settings(), clock=Clock(), wall=lambda: T0, new_id=_ids(), new_lease=_leases())  # noqa: E731
 
     # ── 도구 목록(켜진 서버의 tools/list) ──
     on = FastMCP(name="contract")
@@ -212,10 +217,12 @@ def produce(monkeypatch) -> dict:
 
 
 def _mcp_examples(monkeypatch) -> dict:
-    """한 과제로 도구 응답 모양 전부 — 머리 · 쪽 · 나눠 내기 · 어긋난 offset · 되돌린 과제 · 없는 과제 · 빈 줄 · 긴 프롬프트의 쪽 사슬."""
+    """한 과제로 도구 응답 모양 전부 — 머리 · 쪽 · 나눠 내기 · 어긋난 offset · 되돌린 과제 · 다시 집힌 과제에 묵은 임대로 낸 조각 ·
+    없는 과제 · 빈 줄 · 긴 프롬프트의 쪽 사슬."""
     clock = Clock()
     # 벽시계는 줄의 시계를 따라간다 — 되돌린 뒤 다시 집은 머리의 answer_deadline 이 실제처럼 뒤로 간다.
-    board = x.Board(x.Settings(), clock=clock, wall=lambda: T0 + (clock.t - 1000.0), new_id=_ids(), tick=0.02)
+    board = x.Board(x.Settings(), clock=clock, wall=lambda: T0 + (clock.t - 1000.0), new_id=_ids(), new_lease=_leases(),
+                    tick=0.02)
     stub = SimpleNamespace(state=SimpleNamespace(external_board=board))
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
     monkeypatch.setattr(m, "_APP", stub)
@@ -230,19 +237,23 @@ def _mcp_examples(monkeypatch) -> dict:
         while not board.counts()["queued"]:
             await asyncio.sleep(0.01)
         head = out["next_head"] = await m.review_task_next(ctx=me)
-        tid = head["task_id"]
-        out["read_page"] = await m.review_task_read(tid, 0, ctx=me)
+        tid, lease1 = head["task_id"], head["lease"]
+        out["read_page"] = await m.review_task_read(tid, lease1, 0, ctx=me)
         line = '{"t":"v","k":"K01","applies":"yes","judgement":"FAIL","cq":"보스 둘레 간극은 0.3 mm 이상","l":["L01"],'
-        out["submit_partial"] = await m.review_task_submit(tid, line, offset=0, ctx=me)
-        out["submit_offset_mismatch"] = await m.review_task_submit(tid, "…", offset=3, ctx=me)
-        clock.t += 1201                                   # 답 한도를 넘겼다 — 한 번 줄로 되돌아간다
-        out["read_not_claimed"] = await m.review_task_read(tid, 0, ctx=me)
+        out["submit_partial"] = await m.review_task_submit(tid, lease1, line, offset=0, ctx=me)
+        out["submit_offset_mismatch"] = await m.review_task_submit(tid, lease1, "…", offset=3, ctx=me)
+        clock.t += 1201                                   # 답 한도를 넘겼다 — 한 번 줄로 되돌아간다(임대가 지워진다)
+        out["read_not_claimed"] = await m.review_task_read(tid, lease1, 0, ctx=me)
         again = out["next_head_claim2"] = await m.review_task_next(ctx=me)
+        lease2 = again["lease"]
         rest = '"why":"간극 하한을 넘는다","need":""}'
-        await m.review_task_submit(again["task_id"], line, offset=0, ctx=me)
-        out["submit_final"] = await m.review_task_submit(again["task_id"], rest, offset=len(line), final=True, ctx=me)
-        out["read_task_not_found"] = await m.review_task_read(tid, 0, ctx=me)
-        out["submit_other_owner"] = await m.review_task_submit(tid, "x", final=True, ctx=ctx_of("other@x.com"))
+        await m.review_task_submit(again["task_id"], lease2, line, offset=0, ctx=me)
+        # 앞 집기(lease1)의 늦은 조각 — 다시 집힌 과제의 버퍼에 닿지 않는다(두 일꾼의 답이 이어 붙지 않는다).
+        out["submit_stale_lease"] = await m.review_task_submit(tid, lease1, '"v":"OK"}', final=True, ctx=me)
+        out["submit_final"] = await m.review_task_submit(again["task_id"], lease2, rest, offset=len(line), final=True,
+                                                         ctx=me)
+        out["read_task_not_found"] = await m.review_task_read(tid, lease2, 0, ctx=me)
+        out["submit_other_owner"] = await m.review_task_submit(tid, lease2, "x", final=True, ctx=ctx_of("other@x.com"))
         msg = await call
         out["engine_received"] = {"content": msg.content, "response_metadata": msg.response_metadata}
         # 긴 프롬프트(훑기 크기 — 약 12만 자)의 쪽 사슬 — 글은 빼고 쪽 머리만
@@ -253,12 +264,12 @@ def _mcp_examples(monkeypatch) -> dict:
         h2 = await m.review_task_next(ctx=me)
         chain, off = [], 0
         while off is not None:
-            p = await m.review_task_read(h2["task_id"], off, ctx=me)
+            p = await m.review_task_read(h2["task_id"], h2["lease"], off, ctx=me)
             chain.append({k: p[k] for k in ("offset", "next_offset", "chars")} | {"text_chars": len(p["text"])})
             off = p["next_offset"]
         out["read_chain_long"] = {"head": h2, "pages": chain}
         out["submit_answer_too_large"] = {k: v for k, v in (await m.review_task_submit(
-            h2["task_id"], "x" * (x.ANSWER_HARD_MAX + 1), ctx=me)).items()}
+            h2["task_id"], h2["lease"], "x" * (x.ANSWER_HARD_MAX + 1), ctx=me)).items()}
         long_call.cancel()
         await asyncio.gather(long_call, return_exceptions=True)
         return out
@@ -341,10 +352,12 @@ def test_예제가_계약의_칸을_싣는다():
     assert (ok["meta"]["llm"], ok["meta"]["limits_rev_kind"]) == ("external", lim["limits_rev_by_kind"]["verdict"])
     assert _load("result_verdict_repaired.json")["quality"]["attempts"] == 2
     head = _load("mcp_examples.json")["next_head"]
-    assert set(head) == {"task_id", "kind", "max_tokens", "chars", "parts", "answer_deadline", "answer_s", "claim",
-                         "created_at", "target_key", "label"}
+    assert set(head) == {"task_id", "lease", "kind", "max_tokens", "chars", "parts", "answer_deadline", "answer_s",
+                         "claim", "created_at", "target_key", "label"}
     ex = _load("mcp_examples.json")
     assert ex["read_task_not_found"] == ex["submit_other_owner"], "남의 과제와 없는 과제는 같은 답이다"
+    assert ex["next_head_claim2"]["lease"] != head["lease"] and ex["submit_stale_lease"]["code"] == "not_claimed"
+    assert ex["engine_received"]["content"].count('"t":"v"') == 1, "묵은 임대의 조각이 답에 이어 붙었다"
     assert [p["next_offset"] is None for p in ex["read_chain_long"]["pages"]].count(True) == 1
     assert {t["name"] for t in _load("mcp_tools.json")} == {"review_task_next", "review_task_read", "review_task_submit"}
     frames = _load("delib_frames.json")

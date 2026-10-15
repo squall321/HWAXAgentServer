@@ -9,10 +9,12 @@
 규칙.
 1. 기본 꺼짐 — `EXTERNAL_LLM_ENABLED=1` 이 아니면 줄도 도구도 없고, `llm: "external"` 요청은 거절된다(사용자 결정 X-D1).
 2. 주인만 — 과제는 그 호출을 낸 사람(owner)의 워크플로만 본다. 남의 과제 id 는 없는 id 와 같은 답을 받는다.
-3. 끝없이 기다리지 않는다 — 집히지 않으면 `external_worker_absent`, 집고 답이 없으면 한 번 줄로 되돌리고 그다음
+3. 집기마다 임대(lease)가 붙는다 — 읽기·내기는 그 임대를 실어야 하고, 되돌려졌다 다시 집힌 과제에 묵은 임대로 낸 조각은
+   버퍼에 닿지 않고 not_claimed 다(두 일꾼의 답이 한 답으로 이어 붙지 않는다).
+4. 끝없이 기다리지 않는다 — 집히지 않으면 `external_worker_absent`, 집고 답이 없으면 한 번 줄로 되돌리고 그다음
    `external_answer_timeout`. 둘 다 인프라 실패라 엔진의 기존 오류 길(카드 대조 error 프레임·심의 좌석 유실/의장 실패)로 나간다.
-4. 본문은 남기지 않는다 — 로그에는 과제 id·종류·크기만 적는다(프롬프트·답 글은 적지 않는다).
-5. 줄은 메모리에만 있다 — 재기동하면 사라진다(도는 호출의 스트림이 끊기므로 앱이 인프라로 다시 낸다).
+5. 본문은 남기지 않는다 — 로그에는 과제 id·종류·크기만 적는다(프롬프트·답 글은 적지 않는다).
+6. 줄은 메모리에만 있다 — 재기동하면 사라진다(도는 호출의 스트림이 끊기므로 앱이 인프라로 다시 낸다).
 
 시간 한도 사슬(안쪽이 먼저) — 과제 하나의 최악은 기다림 + 답 + (되돌린 뒤) 기다림 + 답 = 2×WAIT_S + 2×ANSWER_S 이고, 이것이
 엔진의 LLM 논리 호출 1회 최악((1 + DELIB_LLM_MAX_RETRIES) × DELIB_TIMEOUT_S + 8 = 3,608초)보다 작아야 바깥 한도(리스크 앱의 호출
@@ -164,10 +166,11 @@ def _norm_owner(owner) -> str:
 
 # ── 과제 줄 ───────────────────────────────────────────────────────────────────
 class _Task:
-    """과제 하나 — 기다림(waiting) 또는 집힘(claimed). 끝나면(답·실패·취소) 줄에서 빠진다."""
+    """과제 하나 — 기다림(waiting) 또는 집힘(claimed). 끝나면(답·실패·취소) 줄에서 빠진다. lease 는 지금 집기의 임대다(집힐 때마다
+    새로, 되돌리면 지운다)."""
 
     __slots__ = ("id", "owner", "kind", "seq", "parts", "text", "max_tokens", "run_id", "target_key", "label",
-                 "created", "created_wall", "state", "unclaimed_since", "claimed_at", "deadline", "claims", "buf",
+                 "created", "created_wall", "state", "unclaimed_since", "claimed_at", "deadline", "claims", "lease", "buf",
                  "received", "fut", "loop")
 
     def __init__(self, **kw):
@@ -196,13 +199,15 @@ class Board:
     """사람별 과제 줄 — 엔진 쪽(open·wait·drop)은 이벤트 루프에서, 워크플로 쪽(claim·read·submit)은 MCP 도구에서 부른다.
 
     상태는 잠금 하나로 지킨다(일꾼 쪽은 다른 스레드에서 불러도 된다 — 시험의 가짜 일꾼이 그렇게 돈다). 답·실패는 그 과제를 연
-    이벤트 루프에 call_soon_threadsafe 로 넘긴다. 시계(clock — 단조, wall — 유닉스 초)와 id 는 바꿔 끼울 수 있다(시험·계약 예제)."""
+    이벤트 루프에 call_soon_threadsafe 로 넘긴다. 시계(clock — 단조, wall — 유닉스 초)와 id·임대는 바꿔 끼울 수 있다(시험·계약
+    예제)."""
 
     def __init__(self, settings: Settings | None = None, *, clock=time.monotonic, wall=time.time, new_id=None,
-                 tick: float | None = None):
+                 new_lease=None, tick: float | None = None):
         self.settings = settings or Settings()
         self._clock, self._wall = clock, wall
         self._new_id = new_id or (lambda: f"xt-{uuid.uuid4().hex[:16]}")
+        self._new_lease = new_lease or (lambda: uuid.uuid4().hex[:16])
         self._lock = threading.Lock()
         self._tasks: dict[str, _Task] = {}
         self._owners: dict[str, _Owner] = {}
@@ -230,7 +235,7 @@ class Board:
             task = _Task(id=self._new_id(), owner=owner, kind=kind, seq=self._seq, parts=list(parts), text=text,
                          max_tokens=max_tokens, run_id=run_id or "", target_key=target_key or "", label=label or "",
                          created=now, created_wall=self._wall(), state="waiting", unclaimed_since=now, claimed_at=None,
-                         deadline=None, claims=0, buf=[], received=0, fut=loop.create_future(), loop=loop)
+                         deadline=None, claims=0, lease=None, buf=[], received=0, fut=loop.create_future(), loop=loop)
             self._tasks[task.id] = task
         log.debug("[external] 과제 %s 줄 섬 kind=%s chars=%d max_tokens=%s", task.id, kind, len(text), max_tokens)
         return task
@@ -255,7 +260,7 @@ class Board:
 
     # ── 워크플로 쪽 ──
     def claim(self, owner: str) -> dict | None:
-        """그 주인의 가장 오래된 기다리는 과제를 집는다 — 머리를 돌려준다. 없으면 None."""
+        """그 주인의 가장 오래된 기다리는 과제를 집는다 — 새 임대(lease)를 실은 머리를 돌려준다. 없으면 None."""
         owner = _norm_owner(owner)
         with self._lock:
             now = self._clock()
@@ -267,6 +272,7 @@ class Board:
             t = min(waiting, key=lambda x: x.seq)
             t.state, t.claimed_at, t.deadline = "claimed", now, now + self.settings.answer_s
             t.claims += 1
+            t.lease = str(self._new_lease())
             t.buf, t.received = [], 0
             head = self._head(t, now)
         log.debug("[external] 과제 %s 집힘 kind=%s chars=%d claim=%d", t.id, t.kind, len(t.text), t.claims)
@@ -277,18 +283,26 @@ class Board:
         with self._lock:
             return sum(1 for t in self._tasks.values() if t.owner == owner and t.state == "claimed")
 
-    def read(self, owner: str, task_id: str, offset: int, page_max: int = READ_PAGE_MAX, wire=_wire) -> dict:
+    def _held(self, owner: str, task_id, lease, now: float) -> _Task | dict:
+        """읽기·내기의 문 — 그 과제가 내 것이고 지금 이 임대로 집혀 있으면 과제, 아니면 실패 답(task_not_found · not_claimed).
+        잠금을 쥔 채 부른다."""
+        self._touch(owner, now)
+        self._sweep(now)
+        t = self._tasks.get(str(task_id or ""))
+        if t is None or t.owner != owner:
+            return dict(_NOT_FOUND)
+        if t.state != "claimed" or not lease or str(lease) != t.lease:
+            return dict(_NOT_CLAIMED)
+        return t
+
+    def read(self, owner: str, task_id: str, lease: str, offset: int, page_max: int = READ_PAGE_MAX,
+             wire=_wire) -> dict:
         """집은 과제의 프롬프트 한 쪽 — {task_id, offset, next_offset, chars, text}. 응답 글(wire)이 page_max 자 안에 들게 자른다."""
         owner = _norm_owner(owner)
         with self._lock:
-            now = self._clock()
-            self._touch(owner, now)
-            self._sweep(now)
-            t = self._tasks.get(str(task_id or ""))
-            if t is None or t.owner != owner:
-                return dict(_NOT_FOUND)
-            if t.state != "claimed":
-                return dict(_NOT_CLAIMED)
+            t = self._held(owner, task_id, lease, self._clock())
+            if isinstance(t, dict):
+                return t
             text = t.text
         total = len(text)
         if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= total:
@@ -309,20 +323,16 @@ class Board:
             out = page(n)
         return out
 
-    def submit(self, owner: str, task_id: str, text: str, offset: int | None, final: bool) -> dict:
+    def submit(self, owner: str, task_id: str, lease: str, text: str, offset: int | None, final: bool) -> dict:
         """답 조각을 받는다. offset — None 이면 끝에 붙인다, 0 이면 처음부터 다시, 받은 길이와 같으면 이어 붙인다(그 밖은
-        offset_mismatch + received_chars). final 이면 답을 엔진에 넘기고 과제를 끝낸다."""
+        offset_mismatch + received_chars). final 이면 답을 엔진에 넘기고 과제를 끝낸다. 임대가 지금 집기의 것이 아니면 버퍼를
+        건드리지 않고 not_claimed 다(되돌려졌다 다시 집힌 과제에 묵은 집기가 낸 조각 — 지우기·붙이기·끝내기 모두)."""
         owner = _norm_owner(owner)
         text = "" if text is None else str(text)
         with self._lock:
-            now = self._clock()
-            self._touch(owner, now)
-            self._sweep(now)
-            t = self._tasks.get(str(task_id or ""))
-            if t is None or t.owner != owner:
-                return dict(_NOT_FOUND)
-            if t.state != "claimed":
-                return dict(_NOT_CLAIMED)
+            t = self._held(owner, task_id, lease, self._clock())
+            if isinstance(t, dict):
+                return t
             if offset is not None and offset not in (0, t.received):
                 return {"ok": False, "code": "offset_mismatch", "received_chars": t.received,
                         "message": f"서버가 받은 답은 {t.received:,}자다 — offset={t.received} 부터 다시 낸다(0 이면 처음부터)"}
@@ -367,7 +377,8 @@ class Board:
 
     def _sweep(self, now: float) -> None:
         """한도를 적용한다 — ① 집힌 과제가 있는 주인은 바쁘다(있다) ② 답 한도를 넘긴 집힘은 한 번 되돌리고 두 번째면 실패
-        ③ 주인이 WAIT_S 동안 아무것도 집거나 내지 않은 채 기다린 과제는 '없다' 로 실패(그 주인의 기다리는 과제 전부)."""
+        ③ 주인이 WAIT_S 동안 아무것도 집거나 내지 않은 채 기다린 과제는 '없다' 로 실패(그 주인의 기다리는 과제 전부). 되돌린 집힘은
+        임대를 지운다."""
         s = self.settings
         for t in self._tasks.values():
             if t.state == "claimed":
@@ -377,7 +388,7 @@ class Board:
                 if t.claims >= 2:
                     self._fail(t, _answer_timeout(s))
                 else:
-                    t.state, t.unclaimed_since, t.deadline, t.buf, t.received = "waiting", now, None, [], 0
+                    t.state, t.unclaimed_since, t.deadline, t.lease, t.buf, t.received = "waiting", now, None, None, [], 0
                     log.info("[external] 과제 %s 답 한도 %gs 초과 — 줄로 되돌렸다(한 번)", t.id, s.answer_s)
         for t in sorted((x for x in self._tasks.values() if x.state == "waiting"), key=lambda x: x.seq):
             st = self._owners.setdefault(t.owner, _Owner())
@@ -397,7 +408,8 @@ class Board:
         for role, txt in t.parts:
             parts.append({"role": role, "start": at, "chars": len(txt)})
             at += len(txt)
-        head = {"task_id": t.id, "kind": t.kind, "max_tokens": t.max_tokens, "chars": len(t.text), "parts": parts,
+        head = {"task_id": t.id, "lease": t.lease, "kind": t.kind, "max_tokens": t.max_tokens, "chars": len(t.text),
+                "parts": parts,
                 "answer_deadline": int(self._wall() + left), "answer_s": int(left), "claim": t.claims,
                 "created_at": int(t.created_wall)}
         for k in ("run_id", "target_key", "label"):
@@ -410,7 +422,8 @@ class Board:
 _NOT_FOUND = {"ok": False, "code": "task_not_found",
               "message": "그런 과제가 없다 — 끝났거나 취소됐거나 내 과제가 아니다. review_task_next 로 다음 과제를 집는다"}
 _NOT_CLAIMED = {"ok": False, "code": "not_claimed",
-                "message": "이 과제는 지금 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔다. review_task_next 로 다시 집는다"}
+                "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 "
+                           "임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"}
 
 
 def _resolve(t: _Task, out: tuple) -> None:

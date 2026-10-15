@@ -26,7 +26,7 @@ def oracle_brain(head: dict, system: str, human: str) -> str:
 
 
 class FakeWorker:
-    """review_task_next → review_task_read(쪽) → review_task_submit(조각) 을 되풀이한다.
+    """review_task_next → review_task_read(쪽) → review_task_submit(조각) 을 되풀이한다 — 읽기·내기에 머리의 임대(lease)를 싣는다.
 
     seen — 집은 과제마다 {head, system, human, answer, pages, submits}. brain(head, system, human) → 답 글. chunk — 답 조각 크기(자).
     hold — 참이면 집기만 하고 답하지 않는다(답 한도 시험). stop() 으로 멈춘다."""
@@ -45,7 +45,7 @@ class FakeWorker:
         """프롬프트 전문을 쪽으로 받아 머리의 parts 로 system·human 을 가른다 — (system, human, 쪽 머리들)."""
         text, pages, offset = "", [], 0
         while offset is not None:
-            page = await self.m.review_task_read(head["task_id"], offset, ctx=self.ctx)
+            page = await self.m.review_task_read(head["task_id"], head["lease"], offset, ctx=self.ctx)
             assert page.get("ok", True), page
             pages.append({k: page[k] for k in ("offset", "next_offset", "chars")} | {"text_chars": len(page["text"])})
             text += page["text"]
@@ -54,12 +54,13 @@ class FakeWorker:
         by = {p["role"]: text[p["start"]:p["start"] + p["chars"]] for p in head["parts"]}
         return by.get("system", ""), by.get("human", ""), pages
 
-    async def submit_all(self, task_id: str, answer: str) -> list:
+    async def submit_all(self, task_id: str, lease: str, answer: str) -> list:
         """답을 chunk 자씩 offset 을 달아 낸다 — 마지막 조각에 final."""
         out, at = [], 0
         pieces = [answer[i:i + self.chunk] for i in range(0, len(answer), self.chunk)] or [""]
         for i, piece in enumerate(pieces):
-            r = await self.m.review_task_submit(task_id, piece, offset=at, final=i == len(pieces) - 1, ctx=self.ctx)
+            r = await self.m.review_task_submit(task_id, lease, piece, offset=at, final=i == len(pieces) - 1,
+                                                ctx=self.ctx)
             out.append(r)
             if not r.get("ok"):
                 break
@@ -73,7 +74,7 @@ class FakeWorker:
         if self.hold:
             return
         rec["answer"] = self.brain(head, system, human)
-        rec["submits"] = await self.submit_all(head["task_id"], rec["answer"])
+        rec["submits"] = await self.submit_all(head["task_id"], head["lease"], rec["answer"])
 
     async def serve(self) -> None:
         """멈출 때까지 집고 답한다(같은 루프의 태스크로 돌릴 때)."""

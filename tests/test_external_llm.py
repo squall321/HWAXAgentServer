@@ -127,11 +127,12 @@ def test_남의_과제는_보이지도_집히지도_읽히지도_내지지도_�
         tid = next(iter(stub.board._tasks))
         empty = await m.review_task_next(ctx=other)
         mine = await m.review_task_next(ctx=ctx_of(OWNER))           # 주인이 집은 뒤에도 남은 남의 손을 막는다
+        lease = mine["lease"]                                        # 주인의 임대를 알아도 남은 못 쓴다
         got = {}
-        for name, fn in (("read", lambda t: m.review_task_read(t, 0, ctx=other)),
-                         ("submit", lambda t: m.review_task_submit(t, "가로챈 답", offset=0, final=True, ctx=other))):
+        for name, fn in (("read", lambda t: m.review_task_read(t, lease, 0, ctx=other)),
+                         ("submit", lambda t: m.review_task_submit(t, lease, "가로챈 답", offset=0, final=True, ctx=other))):
             got[name] = (await fn(tid), await fn(f"xt-{uuid.uuid4().hex[:16]}"))
-        done = await m.review_task_submit(tid, "주인의 답", offset=0, final=True, ctx=ctx_of(OWNER))
+        done = await m.review_task_submit(tid, lease, "주인의 답", offset=0, final=True, ctx=ctx_of(OWNER))
         return empty, mine, got, done, await call
 
     empty, mine, got, done, msg = asyncio.run(go())
@@ -151,7 +152,7 @@ def test_게이트웨이가_퍼센트_인코딩한_신원도_같은_주인이다
         await _until(lambda: stub.board.counts()["queued"] == 1)
         enc = ctx_of("first%2Btag@x.com")
         head = await m.review_task_next(ctx=enc)
-        await m.review_task_submit(head["task_id"], "인코딩된 신원의 답", final=True, ctx=enc)
+        await m.review_task_submit(head["task_id"], head["lease"], "인코딩된 신원의 답", final=True, ctx=enc)
         return await call
 
     assert asyncio.run(go()).content == "인코딩된 신원의 답"
@@ -184,7 +185,7 @@ def test_아무도_집지_않으면_WAIT_S_뒤에_absent_이고_그_뒤로는_�
         again = asyncio.ensure_future(_model(stub.app).ainvoke([("system", "s"), ("human", "h")]))
         await _until(lambda: stub.board.counts()["queued"] == 1)
         head = await m.review_task_next(ctx=ctx_of(OWNER))
-        await m.review_task_submit(head["task_id"], "다시 붙은 답", final=True, ctx=ctx_of(OWNER))
+        await m.review_task_submit(head["task_id"], head["lease"], "다시 붙은 답", final=True, ctx=ctx_of(OWNER))
         return first.value, fast.value, await again
 
     first, fast, msg = asyncio.run(go())
@@ -204,9 +205,9 @@ def test_주인의_워크플로가_다른_과제를_쓰는_동안에는_기다�
         stub.clock.t += 1000                                 # WAIT_S(300)를 훨씬 넘겼지만 첫 과제를 쓰는 중이다(답 한도 1200 안)
         await asyncio.sleep(0.1)
         alive = not waiting.done()
-        await m.review_task_submit(head["task_id"], "첫 답", final=True, ctx=ctx_of(OWNER))
+        await m.review_task_submit(head["task_id"], head["lease"], "첫 답", final=True, ctx=ctx_of(OWNER))
         h2 = await m.review_task_next(ctx=ctx_of(OWNER))
-        await m.review_task_submit(h2["task_id"], "둘째 답", final=True, ctx=ctx_of(OWNER))
+        await m.review_task_submit(h2["task_id"], h2["lease"], "둘째 답", final=True, ctx=ctx_of(OWNER))
         return alive, (await busy).content, (await waiting).content
 
     assert asyncio.run(go()) == (True, "첫 답", "둘째 답")
@@ -218,16 +219,16 @@ def test_집고_답이_없으면_한_번_줄로_되돌리고_두_번째는_answe
         call = asyncio.ensure_future(_model(stub.app).ainvoke([("system", "s"), ("human", "h")]))
         await _until(lambda: stub.board.counts()["queued"] == 1)
         h1 = await m.review_task_next(ctx=ctx_of(OWNER))
-        part = await m.review_task_submit(h1["task_id"], "반쯤", offset=0, ctx=ctx_of(OWNER))
+        part = await m.review_task_submit(h1["task_id"], h1["lease"], "반쯤", offset=0, ctx=ctx_of(OWNER))
         stub.clock.t += 1201
         await asyncio.sleep(0.1)
-        stale = await m.review_task_submit(h1["task_id"], "나머지", offset=part["received_chars"], final=True,
+        stale = await m.review_task_submit(h1["task_id"], h1["lease"], "나머지", offset=part["received_chars"], final=True,
                                            ctx=ctx_of(OWNER))
         h2 = await m.review_task_next(ctx=ctx_of(OWNER))
         stub.clock.t += 1201
         with pytest.raises(x.ExternalLLMError) as err:
             await call
-        gone = await m.review_task_read(h1["task_id"], 0, ctx=ctx_of(OWNER))
+        gone = await m.review_task_read(h1["task_id"], h2["lease"], 0, ctx=ctx_of(OWNER))
         return part, stale, h1, h2, err.value, gone
 
     part, stale, h1, h2, err, gone = asyncio.run(go())
@@ -246,7 +247,7 @@ def test_부른_쪽이_취소하면_과제가_줄에서_빠지고_일꾼은_없�
         head = await m.review_task_next(ctx=ctx_of(OWNER))
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
-        return head, stub.board.counts(), await m.review_task_submit(head["task_id"], "늦은 답", final=True,
+        return head, stub.board.counts(), await m.review_task_submit(head["task_id"], head["lease"], "늦은 답", final=True,
                                                                     ctx=ctx_of(OWNER))
 
     head, counts, late = asyncio.run(go())
@@ -259,8 +260,9 @@ def test_나눠_내기의_offset_규칙(stub):
     async def go():
         call = asyncio.ensure_future(_model(stub.app).ainvoke([("system", "s"), ("human", "h")]))
         await _until(lambda: stub.board.counts()["queued"] == 1)
-        tid = (await m.review_task_next(ctx=ctx_of(OWNER)))["task_id"]
-        sub = lambda text, **k: m.review_task_submit(tid, text, ctx=ctx_of(OWNER), **k)  # noqa: E731
+        head = await m.review_task_next(ctx=ctx_of(OWNER))
+        tid, lease = head["task_id"], head["lease"]
+        sub = lambda text, **k: m.review_task_submit(tid, lease, text, ctx=ctx_of(OWNER), **k)  # noqa: E731
         out = [await sub("가나", offset=0), await sub("다라"),               # 안 주면 끝에 붙인다
                await sub("마", offset=2),                                    # 받은 길이(4)가 아니다 — 맞추라고 알린다
                await sub("가나다라", offset=0),                               # 0 이면 처음부터(같은 조각을 다시 낸 것도 이 길)
@@ -299,16 +301,16 @@ def test_긴_프롬프트는_20000자_안의_쪽으로_나뉘고_이어_붙이�
         head = await m.review_task_next(ctx=ctx_of(OWNER))
         out, off = [], 0
         while off is not None:
-            p = await m.review_task_read(head["task_id"], off, ctx=ctx_of(OWNER))
+            p = await m.review_task_read(head["task_id"], head["lease"], off, ctx=ctx_of(OWNER))
             out.append(len(mcp_pages.wire(p)))
             off = p["next_offset"]
-        await m.review_task_submit(head["task_id"], "", final=True, ctx=ctx_of(OWNER))
+        await m.review_task_submit(head["task_id"], head["lease"], "", final=True, ctx=ctx_of(OWNER))
         await call
         return out
 
     got = asyncio.run(sizes())
     assert max(got) <= page_max and min(got[:-1]) > page_max * 0.5, got
-    bad = asyncio.run(m.review_task_read("xt-none", -1, ctx=ctx_of(OWNER)))
+    bad = asyncio.run(m.review_task_read("xt-none", "lease", -1, ctx=ctx_of(OWNER)))
     assert bad["code"] == "task_not_found"
 
 
@@ -349,10 +351,13 @@ def test_꺼진_서버에는_과제_도구가_없고_켜진_서버에만_셋이_
     listed = {t.name: t for t in asyncio.run(on.list_tools())}
     assert set(listed) == TOOLS
     props = {n: set(t.inputSchema["properties"]) for n, t in listed.items()}
-    assert props == {"review_task_next": {"wait_s"}, "review_task_read": {"task_id", "offset"},
-                     "review_task_submit": {"task_id", "text", "offset", "final"}}
+    assert props == {"review_task_next": {"wait_s"}, "review_task_read": {"task_id", "lease", "offset"},
+                     "review_task_submit": {"task_id", "lease", "text", "offset", "final"}}
+    assert {n: set(t.inputSchema.get("required") or []) for n, t in listed.items()} == {
+        "review_task_next": set(), "review_task_read": {"task_id", "lease"},
+        "review_task_submit": {"task_id", "lease", "text"}}, "lease 는 빼고 부를 수 없다"
     desc = " ".join(t.description for t in listed.values())
-    for must in ("JSON Lines", "max_tokens", "반출", "동의", "external_worker_absent", "external_answer_timeout",
+    for must in ("JSON Lines", "max_tokens", "lease", "반출", "동의", "external_worker_absent", "external_answer_timeout",
                  "task_not_found", "offset_mismatch"):
         assert must in desc, must
 

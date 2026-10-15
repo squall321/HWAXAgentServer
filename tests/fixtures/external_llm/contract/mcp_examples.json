@@ -6,6 +6,7 @@
  },
  "next_head": {
   "task_id": "xt-0001",
+  "lease": "ls-0001",
   "kind": "verdict",
   "max_tokens": 32000,
   "chars": 146,
@@ -50,10 +51,11 @@
  "read_not_claimed": {
   "ok": false,
   "code": "not_claimed",
-  "message": "이 과제는 지금 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔다. review_task_next 로 다시 집는다"
+  "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"
  },
  "next_head_claim2": {
   "task_id": "xt-0001",
+  "lease": "ls-0002",
   "kind": "verdict",
   "max_tokens": 32000,
   "chars": 146,
@@ -75,6 +77,11 @@
   "created_at": 1760400000,
   "target_key": "t-ab12",
   "label": "verdict/fwd mech-a u-01"
+ },
+ "submit_stale_lease": {
+  "ok": false,
+  "code": "not_claimed",
+  "message": "이 과제는 지금 이 임대(lease)로 집혀 있지 않다 — 답 한도가 지나 줄로 되돌아갔거나 그 뒤 다시 집혔다(새 임대). 이 집기로 낸 조각은 버려졌다. review_task_next 로 다시 집는다"
  },
  "submit_final": {
   "ok": true,
@@ -103,6 +110,7 @@
  "read_chain_long": {
   "head": {
    "task_id": "xt-0002",
+   "lease": "ls-0003",
    "kind": "sweep",
    "max_tokens": 32000,
    "chars": 114064,

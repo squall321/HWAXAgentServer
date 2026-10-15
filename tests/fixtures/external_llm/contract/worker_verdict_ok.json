@@ -2,6 +2,7 @@
  {
   "head": {
    "task_id": "xt-0001",
+   "lease": "ls-0001",
    "kind": "verdict",
    "max_tokens": 32000,
    "chars": 5518,
