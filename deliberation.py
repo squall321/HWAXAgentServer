@@ -9,9 +9,11 @@ import os
 import re
 import asyncio
 import contextvars
+import uuid
 from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 
+import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -1222,6 +1224,44 @@ _ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cros
 _ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
 
 
+# 외부 응답자 실행 표지 — 결정문 머리(코드가 찍는다 — 봉인 표지와 같은 까닭)와 시작 상태줄.
+_EXTERNAL_LINE = ("판단 LLM 은 외부 응답자(잡 주인이 돌린 Claude Code 워크플로 — 모델은 그 사람이 고른 것)였고, 좌석 도구 호출이 없는 "
+                  "evidence_only 로 돌았다(좌석은 [근거]와 지식카드만으로 발언했다).")
+_EXTERNAL_START = ("판단 LLM 이 외부 응답자(잡 주인이 돌리는 Claude Code 워크플로)다 — 좌석 도구 호출이 없는 evidence_only 로 돈다"
+                   "(좌석은 [근거]와 지식카드만으로 발언한다).")
+
+
+def _wants_external(req_opts) -> bool:
+    return isinstance(req_opts, dict) and str(req_opts.get("llm") or "").strip().lower() == "external"
+
+
+def _external_refusal(app, req_opts, user: str) -> dict | None:
+    """외부 응답자 심의(delib_opts.llm=external)를 받을 수 없으면 오류 칸 {code, message, knob?}, 받으면(또는 external 이 아니면)
+    None. 꺼진 서버는 external_llm_disabled, 신원 없는 호출은 external_owner_missing 이다(과제를 누구의 워크플로에 줄지 모른다)."""
+    if not _wants_external(req_opts):
+        return None
+    if external_llm.board_of(app) is None:
+        return {"code": "external_llm_disabled",
+                "message": "이 서버는 외부 응답자 길(delib_opts.llm=external)을 열지 않았다 — EXTERNAL_LLM_ENABLED=1 인 에이전트 서버에서만 "
+                           "된다(/health 의 capabilities 에 external_llm 이 있는지 본다). llm 을 빼면 이 서버의 LLM 으로 돈다.",
+                "knob": external_llm.ENABLED_ENV}
+    if not str(user or "").strip():
+        return {"code": "external_owner_missing",
+                "message": "외부 응답자 과제를 줄 사람(호출자 신원)이 없다 — 포털이나 게이트웨이를 지나 잡 주인의 신원으로 부른다."}
+    return None
+
+
+def _external_entry(app, req_opts, user: str) -> dict | None:
+    """심의 입구(run_deliberation·run_sim_deliberation·run_test_plan) — 거절이면 그 오류 칸을 돌려주고, 받으면 이 심의를 도는
+    태스크(문맥)의 창을 외부 응답자 창으로 세운다. 요청 값 읽기(_resolve_opts 의 근거·요약·역할 몫)부터 라운드·의장 프롬프트의
+    예산까지 전부 창에서 유도되는데, GLM 창(1백만 토큰)으로 짠 프롬프트는 외부 모델이 받지 못한다. 문맥 변수라 다른 심의·카드
+    대조·챗에는 닿지 않는다(이 태스크가 띄우는 좌석 태스크는 물려받는다)."""
+    refused = _external_refusal(app, req_opts, user)
+    if refused is None and _wants_external(req_opts):
+        external_llm.ctx_override.set(external_llm.board_of(app).settings.ctx_tokens)
+    return refused
+
+
 def _started_by(v) -> str:
     """누가 띄운 심의인가(M3.md #26) — 리스크 앱 러너가 delib_opts.started_by 에 'app' 을 싣는다. 그 밖(없음·모르는 값)은
     사람(human)이다. 카드 대조 관문의 '심의가 돌면 절반' 판정만 이 값을 본다(delib_active·재기동 미룸은 그대로 전부 센다).
@@ -1319,9 +1359,19 @@ def _resolve_opts(req_opts):
         timeout_clamped=None,
         # 누가 띄운 심의인가 — human(기본) | app(리스크 앱 러너가 편성한 패널). _started_by 참고.
         started_by="human",
+        # 판단 LLM — glm(기본, 이 서버의 심의 LLM) | external(외부 응답자 — 좌석 도구 호출이 없는 evidence_only 로 돈다).
+        # external_closed 는 그 때문에 닫힌, 호출자가 열려던 손잡이다(스트림이 카드로 알린다 — 봉인의 sealed_reopen 과 같다).
+        llm="glm", external_closed=[],
     )
     if isinstance(req_opts, dict):
         o.started_by = _started_by(req_opts.get("started_by"))
+        # 판단 LLM — 못 읽는 값은 기본(glm)으로 돌고 그렇다고 알린다(다른 손잡이와 같다 — 안쪽 LLM 으로 도는 쪽은 반출이 없다).
+        _llm = req_opts.get("llm")
+        _lv = str("" if _llm is None else _llm).strip().lower()
+        if _lv == "external":
+            o.llm = "external"
+        elif _lv not in ("", "glm"):
+            o.req_unread["llm"] = f"llm={_delib_preview(_llm, 40)}(대신 glm 으로 돈다 — glm|external)"
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
         # 값이 딸려 켜는 것(웹 리서치가 강제하는 인용 계약 등)이 남는다.
         req_opts, o.sealed_reopen = _seal(req_opts)
@@ -1536,6 +1586,14 @@ def _resolve_opts(req_opts):
         o.timeout_s = max(_TIMEOUT_REQ_MIN_S, min(DELIB_TIMEOUT_MAX_S, o.timeout_s))
         if o.timeout_s != _asked:       # nan 도 여기로 온다(자기와도 같지 않다) — 상한으로 돈다
             o.timeout_clamped = (_asked, o.timeout_s)
+    if o.llm == "external" and o.free_tools:
+        # evidence_only — 외부 응답자는 엔진의 도구를 실행할 수 없다(도구를 묶는 자리는 좌석 자유 조회 하나다 — create_react_agent).
+        # 엔진이 부르는 단계(지정 도구·지식카드·VOC 환기·근거 선주입)는 그대로이고 그 LLM 몫은 외부 응답자에게 글 과제로 간다.
+        # 호출자가 열려던 값이면 알린다(서버 기본값 DELIB_FREE_TOOLS 로 켜져 있던 것은 호출자가 청한 것이 아니다).
+        _asked_ft = req_opts.get("free_tools") if isinstance(req_opts, dict) else None
+        if _asked_ft not in (None, ""):
+            o.external_closed.append(f"free_tools={_delib_preview(_asked_ft, 20)}")
+        o.free_tools = 0
     return o
 
 
@@ -2772,7 +2830,10 @@ def _llm_fail_note(exc: BaseException, llm) -> tuple[str, str]:
 
     좌석 유실과 의장 실패 알림이 함께 쓴다. 종전 문구는 '오류·시간초과' 뿐이라, 한도가 걸린 것인지 LLM 서버가
     죽은 것인지, 한도라면 얼마가 걸렸고 어느 값을 올려야 하는지 알 수 없었다. 설정 이름은 글에 넣지 않고 따로
-    돌려준다 — 화면에도 뜨는 글이고, 이름은 knob 으로 실려 잡 원장이 붙인다."""
+    돌려준다 — 화면에도 뜨는 글이고, 이름은 knob 으로 실려 잡 원장이 붙인다. 외부 응답자의 한도는 그 코드를 글에 싣는다
+    (프레임에는 cause 로도 실린다 — _ext_cause)."""
+    if isinstance(exc, external_llm.ExternalLLMError):
+        return f"{exc.message}({exc.code})", exc.knob
     chain, e = [], exc
     while e is not None and len(chain) < 6:
         chain.append(type(e).__name__)
@@ -2805,7 +2866,16 @@ def _skip_notice(code: str, what: str, after: str, exc: BaseException, llm) -> l
     kw = {"knob": knob} if knob else {}
     print(f"[deliberation] ⚠ {what}({code}): {exc!r}")
     return [_sse("status", {"step": f"⚠ {what} — {note}", "tool": None, **kw}),
-            _sse("warning", {"code": code, "message": f"{what} — {note}. {after}", **kw})]
+            _sse("warning", {"code": code, "message": f"{what} — {note}. {after}", **kw, **_ext_cause(exc)})]
+
+
+def _ext_cause(*excs) -> dict:
+    """외부 응답자의 한도에 걸린 실패면 {"cause": 그 코드} — 경고·오류 프레임에 붙여 앱이 글을 읽지 않고 가른다(인프라 — X-2 는 잡을
+    external_worker 로 멈춘다). 외부 응답자가 아니면 {} 라 GLM 길의 프레임은 종전 그대로다."""
+    for e in excs:
+        if isinstance(e, external_llm.ExternalLLMError):
+            return {"cause": e.code}
+    return {}
 
 
 async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple = (),
@@ -4227,6 +4297,10 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     좌석 설계가 핵심이다 — CAE 전문가만 모으면 틀린 물리를 아름답게 계산한다. 그래서 2단은
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
+    _refused = _external_entry(app, req_opts, user)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
+    if _refused:
+        yield _sse("error", _refused)
+        yield _sse("done", {}); return
     opts = _resolve_opts(req_opts)
     if opts.sealed:   # 닫지 못한 채 '봉인' 이라고 적힌 결정문을 내느니 서지 않는다(_SEALED_UNSUPPORTED)
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
@@ -4358,6 +4432,11 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
+    _refused = _external_entry(app, req_opts, user)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    if _refused:
+        yield _sse("error", _refused)
+        yield _sse("done", {})
+        return
     opts = _resolve_opts(req_opts)
     try:
         async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat, history):
@@ -4380,6 +4459,10 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     계측이 빠지면 측정할 수 없는 것을 계획에 넣고, 해석이 빠지면 결과에 영향 없는 물성을
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
+    _refused = _external_entry(app, req_opts, user)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    if _refused:
+        yield _sse("error", _refused)
+        yield _sse("done", {}); return
     opts = _resolve_opts(req_opts)
     if opts.sealed:   # 아래 물성 근거 현황 조회가 바깥 유입이다 — 봉인이 서지 않는다(_SEALED_UNSUPPORTED)
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
@@ -4440,8 +4523,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 조회 0건 심의가 확정 결론과 같은 모습으로 유통되는 것을 막는다.
     ev_count = {"tool": 0, "knowledge": 0, "voc": 0, "prepass": 0}
     llm = getattr(app.state, "delib_llm", None) or app.state.llm
+    # 외부 응답자(delib_opts.llm=external) — 이 심의의 판단 호출(좌석·의장·요약 등)을 잡 주인의 과제 줄로 보낸다. 입구
+    # (_external_entry)가 거절·창을 이미 맡았다. 이 단(stage)마다 run_id 가 새로 붙는다(워크플로가 과제를 묶어 보는 표지).
+    _ext = getattr(opts, "llm", "glm") == "external"
+    if _ext:
+        _qm = _RISK_Q_HEAD_RE.search(question or "")
+        llm = external_llm.model_for(app, owner=user, kind="deliberation", run_id=f"delib-{uuid.uuid4().hex[:12]}",
+                                     target_key=_qm.group(2) if _qm else "", label=str(opts.chair_template or ""))
+        if llm is None:
+            yield _sse("error", _external_refusal(app, {"llm": "external"}, user)
+                       or {"code": "external_llm_disabled", "message": "외부 응답자 길이 꺼져 있다"})
+            yield _sse("done", {}); return
     # 요청 단위 타임아웃 오버라이드(웹 토글) — 기동값과 다르면 같은 파라미터로 새 인스턴스(구성만, 저렴).
-    if opts.timeout_s is not None:
+    # 외부 응답자에는 걸리지 않는다(HTTP 호출이 아니다 — 한도는 EXTERNAL_LLM_WAIT_S·EXTERNAL_LLM_ANSWER_S).
+    if opts.timeout_s is not None and not _ext:
         cur_to = getattr(app.state, "delib_timeout_s", 0.0) or 0.0
         mk = getattr(app.state, "mk_delib_llm", None)
         if mk and opts.timeout_s != cur_to:
@@ -4474,6 +4569,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="봉인이 닫은 요청", included=False,
                          text="봉인 실행이라 호출자가 보낸 다음 손잡이를 닫았다 — "
                               + ", ".join(opts.sealed_reopen))
+    if _ext:
+        # 외부 응답자로 돈다는 것과 evidence_only 를 먼저 밝힌다 — 카드로도 남긴다(잡 원장의 evidence_omitted · 포털 근거 패널).
+        _ctx_ext = external_llm.ctx_override.get()
+        yield _sse("status", {"step": f"외부 응답자 실행 — {_EXTERNAL_START}", "tool": None})
+        yield _delib("evidence", source="외부 응답자 실행 — evidence_only", included=False, notice=True,
+                     knob=external_llm.ENABLED_ENV,
+                     text="판단 LLM 이 외부 응답자(잡 주인이 돌리는 Claude Code 워크플로)다 — 좌석·의장의 LLM 호출이 그 사람의 "
+                          "과제 줄로 가고, 좌석은 도구를 부를 수 없어 [근거]와 지식카드만으로 발언한다(evidence_only — 좌석 자유 "
+                          "조회를 닫았다)."
+                          + (f" 창은 외부 응답자의 창({_ctx_ext:,} 토큰)으로 셈했다." if _ctx_ext else "")
+                          + (f" 호출자가 보낸 {', '.join(opts.external_closed)} 는 닫혔다." if opts.external_closed else "")
+                          + (" 요청 timeout_s 는 외부 응답자에 걸리지 않는다 — 한도는 EXTERNAL_LLM_WAIT_S·"
+                             "EXTERNAL_LLM_ANSWER_S 다." if opts.timeout_s is not None else ""))
     yield _sse("status", {"step": "심의 시작 — 전문 페르소나 발굴 중", "tool": "recommend_agents"})
 
     # 심의는 도구를 LLM 에 바인딩하지 않는다 — 전부 _call 로 부르고 결과를 **코드가 JSON 으로
@@ -5657,7 +5765,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 좌석별 실패 카드가 자리를 채운 뒤의 늦은 유실도, 경고가 쌓인 뒤의 이른 유실도 한쪽에는 남는다.
             _lost_msg = (f"{_dr(rnd)}라운드 좌석 유실 — {', '.join(_lost_now)} 이(가) 이 라운드에 발언하지 "
                          f"못했다({_why_t}). 그 도메인의 판단이 빠진 채 진행한다.")
-            yield _sse("warning", {"code": "seat_lost", "message": _lost_msg, **_loss_kw})
+            yield _sse("warning", {"code": "seat_lost", "message": _lost_msg, **_loss_kw,
+                                   **_ext_cause(*(_fails[_lk] for _lk in _lost_now if _lk in _fails))})
             yield _delib("evidence", source="좌석 유실", included=False, notice=True, text=_lost_msg, **_loss_kw)
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
@@ -5669,7 +5778,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 out["decision"] = _cp
             yield _delib("decision", text=_cp)
             yield _sse("status", {"step": "체크포인트 — 사람 검토 대기(의견을 넣어 이어가기)", "tool": None})
-            yield _sse("result", {"type": "text", "content": _cp})
+            yield _sse("result", {"type": "text", "content": _cp,
+                                  **({"llm": "external", "tool_mode": "evidence_only"} if _ext else {})})
             yield _sse("done", {})
             return
 
@@ -5788,7 +5898,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 여기서 올라간 예외가 '심의 처리 중 오류' 한 줄이 되어 수 시간 돈 라운드가 보고서도 원장도 없이 사라졌다.
     # 결정문 자리에 좌석별 마지막 입장과 실패 사유를 내리고, 아래 보고서 저장까지 간 뒤 error 로 끝낸다
     # (결정문이 없는 것을 done 으로 끝내면 정상 심의와 똑같이 생긴다).
-    decision, _chair_failed, _chair_knob = "", "", ""
+    decision, _chair_failed, _chair_knob, _chair_exc = "", "", "", None
     for _ctry in range(1 + _CHAIR_RETRIES):
         try:
             decision = await _chair_once()
@@ -5796,6 +5906,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             break
         except Exception as exc:  # noqa: BLE001 — 취소(CancelledError)는 여기 안 걸린다
             _chair_failed, _chair_knob = _llm_fail_note(exc, llm)
+            _chair_exc = exc
             print(f"[deliberation] ⚠ 의장 결정문 합성 실패({_ctry + 1}/{1 + _CHAIR_RETRIES}): {exc!r}")
             if _ctry < _CHAIR_RETRIES:
                 yield _sse("status", {"step": f"⚠ 의장 결정문 합성 실패 — 다시 부른다({_ctry + 1}/"
@@ -5871,6 +5982,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 똑같이 생긴다. 결정문은 이 심의의 내구 기록(RA 보고서)이라 저장 전에, 맨 위에 찍는다.
     if opts.sealed:
         decision = f"■ 봉인 실행 — {_SEALED_LINE}\n\n{decision}"
+    if _ext:
+        # 외부 응답자 표지도 코드가 찍는다(봉인 표지와 같은 까닭 — 결정문은 RA 보고서·리스크 원장에 남는 내구 기록이다).
+        decision = f"■ 외부 응답자 실행 — {_EXTERNAL_LINE}\n\n{decision}"
 
     # 4c) 쉬운 설명 — 의사결정문은 전문 용어·수치로 촘촘해 비전문가·경영층이 '그래서 뭘 하라는
     #     건지' 못 읽는다. 맨 뒤에 한마디 결론 + 왜 그런지 + 당장/다음/금지 를 평이한 말로 붙인다.
@@ -6071,17 +6185,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
     yield _sse("token", {"delta": decision + report_note})
-    yield _sse("result", {"type": "text", "content": stream_head + decision + report_note})
+    # 외부 응답자로 돈 심의는 결과 칸에 그 사실을 싣는다(앱이 패널을 evidence_only 로 적는다) — GLM 길의 프레임은 종전 그대로다.
+    yield _sse("result", {"type": "text", "content": stream_head + decision + report_note,
+                          **({"llm": "external", "tool_mode": "evidence_only"} if _ext else {})})
     if _chair_failed:
         # 결정문 없이 끝났다 — error 로 끝낸다(잡은 error 로 남고, 리스크 앱은 종전처럼 실패로 받는다). 위에서
         # 내린 글과 저장한 보고서·전사는 그대로 남아 이어하기의 재료가 된다. 설정 이름은 knob 으로 싣는다.
+        # 외부 응답자의 한도에 걸린 것이면 cause 로 그 코드를 싣는다(인프라 — 앱이 내용 탓으로 세지 않는다).
         yield _sse("error", {"code": "chair_failed",
                              "message": (f"의장이 결정문을 내지 못했다 — {_chair_failed} (의장 호출 "
                                          f"{1 + _CHAIR_RETRIES}번). 라운드 발언은 버리지 않았다 — 좌석별 마지막 "
                                          "입장을 결과로 내렸고 회의록·전사가 남아 있다. 호출당 타임아웃을 늘려 "
                                          "이어하기로 다시 수렴시키면 결정문을 받는다."),
                              "knob": " · ".join(x for x in (_chair_knob,
-                                                           "의장 재호출 DELIB_CHAIR_RETRIES") if x)})
+                                                           "의장 재호출 DELIB_CHAIR_RETRIES") if x),
+                             **_ext_cause(_chair_exc)})
     yield _sse("done", {})
 
 

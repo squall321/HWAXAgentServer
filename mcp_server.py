@@ -219,6 +219,12 @@ _ADV_DESC = (
     f"경로가 잡 기록과 결정문 머리에 남는다. 닫지 않는 것: {_engine._SEALED_OPEN}. "
     "job='risk-review-sealed' 가 이것을 켠 리스크 심사다. 단발 심의에만 선다 — sim-plan·test-plan·"
     "build-plan 은 사내 자산 현황을 조회해 깔아야 해서 거절한다)."
+) + (
+    # 외부 응답자가 켜진 서버에서만 적는다 — 꺼진 서버에 적으면 못 쓰는 손잡이를 안내하는 셈이다(보내면 거절된다).
+    " · llm(판단 LLM: external — 좌석·의장의 LLM 호출을 잡 주인의 Claude Code 워크플로가 review_task_next·review_task_read·"
+    "review_task_submit 로 받아 답한다. 좌석 도구 호출이 없는 evidence_only 로 돌고(좌석 자유 조회를 닫는다) 그 사실이 결정문 "
+    "머리·잡 기록(llm·tool_mode)에 남는다. 근거·카드 글이 외부(Claude)로 나가므로 반출에 동의한 일에만 쓴다. 신원 없는 호출은 "
+    "거절한다)" if external_llm.enabled() else ""
 )
 
 # 잡 상태 안내 — 시작·진행 조회·메뉴가 같은 글을 쓴다. 종전 설명은 '즉시 시작한다' 뿐이었다. 줄을 세우기

@@ -213,11 +213,18 @@ def _list_path(job_id: str) -> Path:
 def _list_rec(job: dict) -> dict:
     """목록 한 행에 쓰는 칸만 — summary() 가 원장 대신 이것을 받아도 같은 행이 나온다(턴은 수, 좌석은 키, 체크포인트는 유무)."""
     rec = {k: job[k] for k in _LIST_KEYS if k in job}
-    rec["opts"] = {"sealed": (job.get("opts") or {}).get("sealed")}
+    rec["opts"] = {"sealed": (job.get("opts") or {}).get("sealed"),
+                   # 외부 응답자로 돈 잡만 그 표지를 싣는다(summary 의 llm·tool_mode) — 나머지 잡의 색인은 종전 모양이다.
+                   **({"llm": "external"} if _external(job) else {})}
     rec["seats"] = [{"key": s.get("key")} for s in (job.get("seats") or [])]
     rec["turn_count"] = len(job.get("turns") or [])
     rec["checkpoint"] = bool(job.get("checkpoint"))
     return rec
+
+
+def _external(job: dict) -> bool:
+    """외부 응답자(판단 LLM 이 잡 주인의 Claude Code 워크플로)로 돈 잡인가 — 잡 기록의 걸린 값으로 본다."""
+    return (job.get("opts") or {}).get("llm") == "external"
 
 
 def _stamp(st: os.stat_result) -> list:
@@ -588,8 +595,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
-    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _resolve_opts,  # noqa: PLC0415
-                              _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
+    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _external_refusal,  # noqa: PLC0415
+                              _resolve_opts, _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
                               run_sim_deliberation, run_test_plan)
     entry = {"general": run_deliberation, "sim": run_sim_deliberation,
              "test-plan": run_test_plan}[spec["engine"]]
@@ -612,6 +619,15 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
     applied = {**applied, **{k: getattr(_read, k) for k in applied
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
+    # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·신원 없음) 잡을 만들기 전에 거절한다. 받으면 잡 기록에 판단
+    # LLM 과 실제로 걸린 free_tools(evidence_only 라 0)를 적는다 — 보낸 값이 아니라 걸린 값이다(위와 같은 규칙).
+    _refused = _external_refusal(app, applied, user_email)
+    if _refused:
+        raise ValueError(f"{_refused['code']}: {_refused['message']}")
+    if _read.llm == "external":
+        applied = {**applied, "llm": "external", "free_tools": _read.free_tools}
+    elif "llm" in applied:
+        applied = {**applied, "llm": _read.llm}
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
@@ -756,6 +772,9 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "checkpoint": bool(job.get("checkpoint")),
         "error": job.get("error"),
     }
+    if _external(job):
+        # 판단 LLM 이 외부 응답자였다 — 좌석 도구 호출이 없는 evidence_only 등급이다(리스크 원장의 tool_mode 와 같은 말).
+        out["llm"], out["tool_mode"] = "external", "evidence_only"
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
         # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —
@@ -829,7 +848,8 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
     lim = max(1, min(200, int(limit)))
     page = [_turn_view(t, full) for t in rows[off:off + lim]]
     clipped = sum(1 for t in page if t.get("say_clipped"))
-    return {"job_id": job_id, "total": total, "offset": off, "limit": lim,
+    return {"job_id": job_id, **({"llm": "external", "tool_mode": "evidence_only"} if _external(job) else {}),
+            "total": total, "offset": off, "limit": lim,
             "next_offset": off + lim if off + lim < total else None,
             "remaining": max(0, total - off - lim),
             "turns": page,
