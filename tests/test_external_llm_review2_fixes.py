@@ -396,9 +396,10 @@ def test_외부_응답자_심의는_GLM_전역_자리를_쥐지_않고_GLM_심�
 
 
 def test_외부_응답자_심의는_주인마다_하나씩_돌고_나머지는_줄에서_그_주인의_것을_기다린다(lanes):
+    """주인은 과제를 받는 사람이다 — MCP 로 연 잡은 게이트웨이 헤더 원문(user)이 아니라 푼 이름(owner)으로 센다."""
     async def scenario():
-        x1 = _ext(lanes, "외부-1", "A@x.com", owner="a@x.com")
-        x2 = _ext(lanes, "외부-2", " a@x.com ")          # 같은 주인(공백·대소문자를 맞춘 이름)
+        x1 = _ext(lanes, "외부-1", "First%2Btag@x.com", owner="first+tag@x.com")   # MCP — 헤더 원문 · 푼 이름
+        x2 = _ext(lanes, "외부-2", " first+tag@X.com ")                            # 같은 주인(공백·대소문자를 맞춘 이름)
         x3 = _ext(lanes, "외부-3", "b@x.com")
         await asyncio.sleep(0)
         assert [j["status"] for j in (x1, x2, x3)] == ["running", "queued", "running"]
