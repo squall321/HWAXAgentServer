@@ -228,3 +228,21 @@ def test_셈할_수_없는_값이_있어도_import_는_넘어지지_않고_심�
     assert got["mcp"] and "deliberate_start" in got["tools"] and "review_task_next" not in got["tools"], got
     assert got["ext"] is False and got["board"] is False
     assert got["out"].count("⛔") == 1 and name in got["out"], got["out"]
+
+
+# ── L2. 셸이 내보낸 스위치는 시험에 닿지 않는다(conftest) ──────────────────────────────────────
+def test_셸의_외부_응답자_값은_시험_세션에_없다():
+    """아래 시험이 새 pytest 프로세스로 이 시험 하나를 스위치를 켠 셸에서 돌린다 — conftest 가 import 전에 지웠으면 과제 도구가
+    등록되지 않았고 서버는 꺼진 채로 판정한다. 평소 세션에서도 같아야 한다."""
+    assert [k for k in os.environ if k.startswith("EXTERNAL_LLM_") and k != "EXTERNAL_LLM_CONTRACT_UPDATE"] == []
+    assert m._EXTERNAL_TOOLS is False and x.enabled() is False and x.config() == x.Config(None)
+
+
+def test_스위치를_켠_셸에서_돌려도_시험은_꺼진_서버를_본다():
+    """검토 2라운드 — EXTERNAL_LLM_ENABLED=1 을 내보낸 셸에서 전체 시험을 돌리면 import 때 과제 도구가 등록되고 GLM 시험이 붉어지다
+    끝나지 않았다. 켜야 하는 시험은 제 손으로 켠다(monkeypatch.setenv)."""
+    env = {**os.environ, "EXTERNAL_LLM_ENABLED": "1", "EXTERNAL_LLM_WAIT_S": "1", "EXTERNAL_LLM_MAX_INFLIGHT": "여덟"}
+    node = f"{Path(__file__).relative_to(ROOT)}::test_셸의_외부_응답자_값은_시험_세션에_없다"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node], cwd=str(ROOT), env=env,
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and "1 passed" in r.stdout, (r.stdout + r.stderr)[-3000:]

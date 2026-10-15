@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게, 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*)을 지운다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -21,3 +21,9 @@ atexit.register(shutil.rmtree, _JOB_DIR, ignore_errors=True)
 _DRAIN_DIR = tempfile.mkdtemp(prefix="hwax-drain-test-")
 os.environ["DRAIN_STATE_PATH"] = os.path.join(_DRAIN_DIR, "review-drain.json")
 atexit.register(shutil.rmtree, _DRAIN_DIR, ignore_errors=True)
+
+# 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_ENABLED 와 그 손잡이)을 지운다 — 스위치를 켠 셸에서 돌리면 import 때 과제 도구가 등록되고 꺼진
+# 서버를 전제한 시험이 붉어지고 전체 시험이 끝나지 않았다(검토 2라운드). 켜야 하는 시험은 제 손으로 켠다(monkeypatch).
+# EXTERNAL_LLM_CONTRACT_UPDATE 는 서버 설정이 아니라 계약 예제를 다시 뜨라는 시험 손잡이라 남긴다.
+for _k in [k for k in os.environ if k.startswith("EXTERNAL_LLM_") and k != "EXTERNAL_LLM_CONTRACT_UPDATE"]:
+    del os.environ[_k]
