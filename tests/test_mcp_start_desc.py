@@ -153,3 +153,45 @@ def test_좌석_항목의_모양이_클라이언트가_받는_글에_있다():
         for want in ("personas", "`key`", "agent_type", "evidence_omitted"):
             assert want in text, (want, text[-400:])
     assert str(d.MAX_REQ_SEATS) + "석" not in desc, "좌석 상한을 설명에 손으로 박았다 — limits 를 가리킨다"
+
+
+# ── 인자 설명 — 클라이언트 LLM 은 도구 설명과 함께 인자마다 이 글을 본다(포털 docs/improvement-1015 6번 점수판) ──────────────
+_DELIB_TOOLS = ("deliberate_start", "deliberate_continue", "deliberate_status", "deliberate_result", "deliberate_list",
+                "deliberate_cancel", "deliberate_transcript")
+
+
+def _schemas() -> dict:
+    return {t.name: t.inputSchema for t in asyncio.run(m.mcp.list_tools()) if t.name in _DELIB_TOOLS}
+
+
+def test_심의_도구의_인자는_전부_설명이_있다():
+    """새 인자를 더하고 설명을 빼먹으면 여기서 걸린다 — 설명 없는 인자는 이름만으로 값을 짐작하게 된다."""
+    got = _schemas()
+    assert set(got) == set(_DELIB_TOOLS), sorted(got)
+    missing = [f"{n}.{k}" for n, s in got.items() for k, v in s["properties"].items() if not (v.get("description") or "").strip()]
+    assert not missing, missing
+
+
+def test_인자_설명의_상한은_엔진_상수에서_읽는다():
+    """손으로 적은 상한은 낡는다(위 근거 상한 사고와 같은 꼴) — 설명 글에 지금 상수 값이 들어 있다."""
+    start = _schemas()["deliberate_start"]["properties"]
+    assert f"최대 {d._TOOLS_MAX}개" in start["tools"]["description"]
+    assert f"최대 {d._APPS_MAX}개" in start["apps"]["description"]
+    assert f"최대 {d._OPTIONS_MAX}개" in start["options"]["description"]
+    assert f"최대 {d._EVID_ITEMS}건" in start["evidence"]["description"]
+    for job in m.delib_jobs.JOBS:
+        assert job in start["job"]["description"], job
+    cont = _schemas()["deliberate_continue"]["properties"]
+    assert f"최대 {d._NN_MAX}개" in cont["non_negotiables"]["description"]
+    assert all(k in cont["advanced"]["description"] for k in m._CONT_CARRY)
+
+
+def test_인자_설명을_더해도_필수_인자와_기본값은_그대로다():
+    """설명은 스키마의 글만 바꾼다 — 필수 · 기본값이 움직이면 기존 호출이 깨진다."""
+    s = _schemas()
+    assert s["deliberate_start"]["required"] == ["question"]
+    assert s["deliberate_continue"]["required"] == ["previous_job_id", "human_note"]
+    assert s["deliberate_list"].get("required", []) == []
+    assert s["deliberate_start"]["properties"]["job"]["default"] == "default"
+    assert s["deliberate_start"]["properties"]["save_report"]["default"] is True
+    assert s["deliberate_transcript"]["properties"]["limit"]["default"] == 40

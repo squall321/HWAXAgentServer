@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Annotated
 from urllib.parse import unquote
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 import delib_jobs
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
@@ -337,23 +339,74 @@ def _evid_limits() -> dict:
             "evidence_total_chars": total}
 
 
+# 인자 설명(inputSchema 의 description) — 클라이언트 LLM 은 도구 설명과 함께 인자마다 이 글을 본다(게이트웨이 인자 설명 점수판,
+# 포털 docs/improvement-1015 6번). 상한 숫자는 엔진 상수에서 읽는다 — 손으로 적은 수는 낡는다. 긴 규칙은 도구 설명의 절을 가리킨다.
+_A_QUESTION = "심의할 화두(필수). 구체적일수록 좌석 발굴이 정확하다. 응답에는 길면 머리만 되돌린다(question_chars)."
+_A_JOB = ("심의 종류 — " + " · ".join(delib_jobs.JOBS) + ". 기본은 default(자유 심의)이고, 언제 무엇을 고르나는 "
+          "deliberate_jobs 가 말한다.")
+_A_ROUNDS = "라운드 수 — 0 이면 기본 3, 2~8 로 클램프된다."
+_A_MODIFIERS = ("얹을 층(최대 5개) — voi(교착 정산) · premortem(사전부검) · toulmin(논증 엄밀) · eliminative(완결 기준) · "
+                "anon1r(익명 1R). 언제 쓰나는 deliberate_jobs 의 modifiers.")
+_A_EVIDENCE = (f"원천 근거 [{{source, tool, args, result, key}}](최대 {_engine._EVID_ITEMS}건) — 이미 도구로 뽑아 둔 결과를 좌석에 "
+               "'검증 대상' 으로 깐다. 본문은 result 에 넣는다. 항목 · 합계 글자 상한은 도구 설명의 evidence 절과 deliberate_jobs 의 "
+               "limits 다.")
+_A_PERSONAS = ("좌석 지정 [{key, role}] — key 는 전문가 키(recommend_agents 의 agent_type), role 은 비워도 된다. 비우면 서버가 "
+               "발굴한다. 상한과 다단 심의에서 앉는 자리는 도구 설명의 personas 절이다.")
+_A_TOOLS = (f"심의 전에 실제로 불러 정량 근거로 깔 도구 이름(최대 {_engine._TOOLS_MAX}개 — 넘친 것은 빼고 evidence_omitted 로 "
+            "알린다).")
+_A_APPS = f"좌석 자유 조회를 이 앱들로 좁힌다(앱 키, 최대 {_engine._APPS_MAX}개)."
+_A_NOTE_CAP = ("상한(자)은 모델 창에서 유도된다 — 지금 값은 deliberate_jobs 의 limits 이고, 넘으면 앞부분만 싣고 evidence_omitted "
+               "로 알린다. sim-plan · build-plan 은 1단에만 싣는다.")
+_A_HUMAN_NOTE = "사람 의견 — 매 라운드 모든 좌석에 싣는다. " + _A_NOTE_CAP
+_A_SEARCH = ("웹 리서치 소스 — scholar · web(최대 4개). 하나라도 켜면 인용 계약(rebut_quote · chair_cite)이 강제된다. null 이면 "
+             "종전대로(소스 제한 없음), 빈 목록이면 웹 리서치 도구를 다 끈다.")
+_A_OPTIONS = (f"후보안(안 선택용, 최대 {_engine._OPTIONS_MAX}개). 2개 이상이면 최종 라운드가 이 가운데서 고르는 표결을 요구하고, "
+              "없으면 표결을 강제하지 않는다.")
+_A_STOP = "1 이면 초기 라운드까지만 돌고 사람 검토를 기다린다(체크포인트). 기본 0 — 끝까지 돈다."
+_A_SAVE = "거짓이면 Report Archive 에 보고서를 남기지 않는다(탐색용 심의). 기본 참."
+_A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 이름과 뜻(timeout_s 는 LLM 호출 1회 한도 초 · 엔진의 최소~최대 범위로 죈다)은 도구 "
+               "설명의 advanced 절이다.")
+_A_JOB_ID = "심의 잡 id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
+_A_PART = "응답이 쪽으로 나뉘었을 때 받을 쪽(1부터 — page.next 가 다음 쪽을 알려 준다)."
+_A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
+_A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
+_A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
+_A_TR_SEAT = "이 좌석 키가 든 발언만. 비우면 전체다."
+_A_TR_OFFSET = "건너뛸 턴 수(0부터) — 앞 응답의 next_offset 을 그대로 준다."
+_A_TR_LIMIT = "한 묶음의 턴 수 — 1~200 으로 죈다(기본 40)."
+_A_TR_FULL = "참이면 화면용으로 줄이지 않은 발언을 준다(리스크 원장에 제출할 때). 기본 거짓 — 줄인 글과 say_clipped 표식."
+_A_PREV_JOB = "이어갈 심의의 job_id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
+_A_CONT_NOTE = "넣을 사람 의견(필수) — 이어하기의 핵심이다(패널이 갖지 못한 관측). " + _A_NOTE_CAP
+_A_CONT_QUESTION = "화두를 바꿀 때만 적는다. 비우면 이전 화두 그대로다."
+_A_CONT_JOB = ("심의 종류를 바꿀 때만 적는다(비우면 이전과 같다 — 값은 deliberate_start 의 job). 봉인으로 돈 심의는 무엇을 적어도 "
+               "봉인으로 이어지고, 다단 심의(sim-plan · test-plan · build-plan)를 적으면 거절한다.")
+_A_CONT_ROUNDS = "이번 회차 라운드 수 — 0 이면 기본, 2~8 로 클램프된다. 라운드 번호는 이전 회차에 이어 센다."
+_A_NN = f"이전 결정의 양보 불가 조항(최대 {_engine._NN_MAX}개) — 요약에 섞으면 사라지므로 따로 넘긴다."
+_A_KEEP_SEATS = "참(기본)이면 이전 좌석을 그대로 앉힌다(발굴 생략), 거짓이면 다시 발굴한다."
+_A_APPEND = ("참(기본)이면 이전 회차의 Report Archive 보고서에 페이지로 이어 붙인다(없으면 새로 만든다 — 저장하지 않고 돈 심의는 "
+             "이어가도 저장하지 않는다).")
+_A_CONT_MODIFIERS = "이번 회차에 얹을 층 — 값과 상한은 deliberate_start 의 modifiers 와 같다."
+_A_CONT_EVIDENCE = ("이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같은 모양 · 상한). 이전 회차의 근거 본문은 이어지지 "
+                    "않는다 — 다시 봐야 하면 여기 다시 싣는다.")
+
+
 @mcp.tool(title="심의 시작 (원인규명·안선택·신뢰판정·해석설계·시험설계·구축계획·자유)",
           description=_START_DESC)
 async def deliberate_start(
-    question: str,
-    job: str = "default",
-    rounds: int = 0,
-    modifiers: list[str] | None = None,
-    evidence: list[dict] | None = None,
-    personas: list[dict] | None = None,
-    tools: list[str] | None = None,
-    apps: list[str] | None = None,
-    human_note: str = "",
-    search_sources: list[str] | None = None,
-    options: list[str] | None = None,
-    stop_after_round: int = 0,
-    save_report: bool = True,
-    advanced: dict | None = None,
+    question: Annotated[str, Field(description=_A_QUESTION)],
+    job: Annotated[str, Field(description=_A_JOB)] = "default",
+    rounds: Annotated[int, Field(description=_A_ROUNDS)] = 0,
+    modifiers: Annotated[list[str] | None, Field(description=_A_MODIFIERS)] = None,
+    evidence: Annotated[list[dict] | None, Field(description=_A_EVIDENCE)] = None,
+    personas: Annotated[list[dict] | None, Field(description=_A_PERSONAS)] = None,
+    tools: Annotated[list[str] | None, Field(description=_A_TOOLS)] = None,
+    apps: Annotated[list[str] | None, Field(description=_A_APPS)] = None,
+    human_note: Annotated[str, Field(description=_A_HUMAN_NOTE)] = "",
+    search_sources: Annotated[list[str] | None, Field(description=_A_SEARCH)] = None,
+    options: Annotated[list[str] | None, Field(description=_A_OPTIONS)] = None,
+    stop_after_round: Annotated[int, Field(description=_A_STOP)] = 0,
+    save_report: Annotated[bool, Field(description=_A_SAVE)] = True,
+    advanced: Annotated[dict | None, Field(description=_A_ADVANCED)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """심의를 연다.
@@ -446,6 +499,8 @@ def _carry_seats(prev: dict) -> list:
 # 돌아가, 첫 회차에 멀쩡하던 좌석이 이어하기에서 시간 초과로 빠졌다. 원장에는 상한에서 죈 값이 적혀 있다.
 _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_prepass", "search_sources",
                "apps", "save_report", "timeout_s")
+_A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 advanced 와 같다). 비우면 이전 회차의 손잡이(" + "·".join(_CONT_CARRY)
+                    + ")를 이어받고 여기 적은 것이 그 위에 덮인다. sealed 는 풀 수 없다.")
 
 
 @mcp.tool(
@@ -463,17 +518,17 @@ _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_pre
                  "Claude Code 의 MCP 결과 상한을 넘으면 deliberate_start 처럼 머리만 싣는다(question_chars·note)."),
 )
 async def deliberate_continue(
-    previous_job_id: str,
-    human_note: str,
-    question: str = "",
-    job: str = "",
-    rounds: int = 0,
-    non_negotiables: list[str] | None = None,
-    keep_seats: bool = True,
-    append_report: bool = True,
-    modifiers: list[str] | None = None,
-    advanced: dict | None = None,
-    evidence: list[dict] | None = None,
+    previous_job_id: Annotated[str, Field(description=_A_PREV_JOB)],
+    human_note: Annotated[str, Field(description=_A_CONT_NOTE)],
+    question: Annotated[str, Field(description=_A_CONT_QUESTION)] = "",
+    job: Annotated[str, Field(description=_A_CONT_JOB)] = "",
+    rounds: Annotated[int, Field(description=_A_CONT_ROUNDS)] = 0,
+    non_negotiables: Annotated[list[str] | None, Field(description=_A_NN)] = None,
+    keep_seats: Annotated[bool, Field(description=_A_KEEP_SEATS)] = True,
+    append_report: Annotated[bool, Field(description=_A_APPEND)] = True,
+    modifiers: Annotated[list[str] | None, Field(description=_A_CONT_MODIFIERS)] = None,
+    advanced: Annotated[dict | None, Field(description=_A_CONT_ADVANCED)] = None,
+    evidence: Annotated[list[dict] | None, Field(description=_A_CONT_EVIDENCE)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """이전 심의를 이어 돌린다.
@@ -575,7 +630,8 @@ _JOB_TAIL = ("question",)
           description="HWAX 심의가 어디까지 갔는지 본다 — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지. "
                       + _STATE_DESC + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
                       "칸이 다 실린다.")
-async def deliberate_status(job_id: str, part: int = 1) -> dict:
+async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                            part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
     """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다.
 
     queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다.
@@ -601,7 +657,8 @@ async def deliberate_status(job_id: str, part: int = 1) -> dict:
           description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중(running)이면 현재 단계만, "
                       "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
                       "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
-async def deliberate_result(job_id: str, part: int = 1) -> dict:
+async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                            part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
     job = delib_jobs.get(job_id)
     if not job:
@@ -618,7 +675,8 @@ async def deliberate_result(job_id: str, part: int = 1) -> dict:
           description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다. 내가 시작한 "
                       "심의만 실린다(행의 mine 이 참이다 — 주인이 안 적힌 옛 잡은 mine 이 거짓인 채로 함께 "
                       "실린다). running·queued 는 전체 수다 — 남의 심의는 수로만 보인다. " + _PAGE_DESC)
-async def deliberate_list(limit: int = 20, part: int = 1, ctx: Context | None = None) -> dict:
+async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
+                          part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
     신원 있는 호출자에게는 제 잡(과 주인이 안 적힌 잡)만 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는
@@ -641,7 +699,7 @@ async def deliberate_list(limit: int = 20, part: int = 1, ctx: Context | None = 
           description="진행 중이거나 대기 중(queued)인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 "
                       "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다. 접을 수 있는 것은 내가 "
                       "시작한 심의뿐이다.")
-async def deliberate_cancel(job_id: str, ctx: Context | None = None) -> dict:
+async def deliberate_cancel(job_id: Annotated[str, Field(description=_A_CANCEL_JOB_ID)], ctx: Context | None = None) -> dict:
     """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다."""
     user, _groups = _caller(ctx)
     return delib_jobs.cancel(job_id, by=user)
@@ -666,8 +724,13 @@ _TRANSCRIPT_IDS = ("job_id", "total", "offset", "limit", "next_offset", "remaini
                  "턴은 offset 부터 limit 턴씩 묶음으로 준다 — 한 묶음을 다 받은 뒤 next_offset 이 null 이 아니면 "
                  "offset=next_offset 으로 다음 묶음을 받는다(remaining 은 그 뒤에 남은 턴 수). " + _PAGE_DESC),
 )
-async def deliberate_transcript(job_id: str, round: int = 0, seat: str = "",
-                                offset: int = 0, limit: int = 40, full: bool = False, part: int = 1) -> dict:
+async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                                round: Annotated[int, Field(description=_A_TR_ROUND)] = 0,
+                                seat: Annotated[str, Field(description=_A_TR_SEAT)] = "",
+                                offset: Annotated[int, Field(description=_A_TR_OFFSET)] = 0,
+                                limit: Annotated[int, Field(description=_A_TR_LIMIT)] = 40,
+                                full: Annotated[bool, Field(description=_A_TR_FULL)] = False,
+                                part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
     """좌석 발언 전사를 묶음으로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 주고, 묶음이 MCP 결과 상한보다 크면 쪽으로 나눈다.
 
     Args:
