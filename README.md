@@ -52,7 +52,10 @@ whole deliberation by wall clock. Values are read once at startup (restart to ap
 `AGENT_*` ones are read by `start.sh`.
 
 Chain (seconds, inner < outer): LLM connect 10 < one attempt 1800 < one logical call 3608 <
-chair worst case 7216. Tool calls: gateway 600 (outer 660) < `MCP_CALL_TIMEOUT_S` 900. The
+chair worst case 7216. On a box with the external responder on (`EXTERNAL_LLM_ENABLED=1`), one
+external call is bounded by 2×`EXTERNAL_LLM_WAIT_S` + 2×`EXTERNAL_LLM_ANSWER_S` = 3000 and must stay
+below one logical call (otherwise the path stays closed). Tool calls: gateway 600 (outer 660) <
+`MCP_CALL_TIMEOUT_S` 900. The
 knowledge lookup (180) is a fallback switch, not a layer. Limits that wrap this server — the
 risk app's panel wall clock and the portal / nginx / risk-app idle limits — live in those repos
 and must stay above one logical call at the request maximum (2×`DELIB_TIMEOUT_MAX_S`+8 = 28808).
@@ -83,6 +86,8 @@ Nothing is cut on this value. It matters to the outer idle limits only when the 
 | `AGENT_RESTART_FORCE` | `0` | `start.sh` will not stop a running instance that reports running or queued deliberations — a restart cuts all of them. It prints the counts and exits `3` (skipped), leaving the instance up. `1` restarts anyway. If the counts cannot be read (no answer, older build) it says so and restarts. |
 | `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. A value that is not a plain number (trailing comment or space, a unit) is read as the default, with a warning. |
 | `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. A value that is not a plain number is read as the default, with a warning — it no longer turns the guard off. |
+| `EXTERNAL_LLM_WAIT_S` | `300` | External responder only (`EXTERNAL_LLM_ENABLED=1`): how long a task waits while the owner's workflow shows no sign of life, then `external_worker_absent`. Full meaning under External responder. |
+| `EXTERNAL_LLM_ANSWER_S` | `1200` | External responder only: how long a claimed task may take to its final submit; requeued once, the second miss is `external_answer_timeout`. 2×this + 2×`EXTERNAL_LLM_WAIT_S` must stay below one logical deliberation call (3608 by default) or the path stays closed. |
 
 ### MCP result pages
 
@@ -289,8 +294,8 @@ past the float range) or is below its floor, or a broken time chain (below — i
 such a `DELIB_LLM_MAX_RETRIES`), keeps the path closed — nothing falls back to a default and nothing raises (startup and
 the deliberation MCP tools come up as on a disabled box). Startup prints one `⛔` line naming the setting; the
 box then answers as a disabled one (no capability, no MCP tools, 409 `external_llm_disabled` whose message carries that
-line and whose `knob` names the setting). These knobs are not in the Time limits table yet (the portal's env kit test
-reads that table; the kit and the table get them together in X-4).
+line and whose `knob` names the setting). The two time knobs are also rows of the Time limits table, and the portal's
+env kit (`infra/env-kits/agent-server.env`) lists all six.
 
 Time limits (inner first): the worst bounded case of one external call is wait + answer + (requeued) wait + answer
 = 2 × `EXTERNAL_LLM_WAIT_S` + 2 × `EXTERNAL_LLM_ANSWER_S` = 3000 s by default (`/health.external_llm.call_worst_s`),
