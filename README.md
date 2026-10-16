@@ -434,6 +434,37 @@ second (the agent's forged consent, values too large to compute with, the shell'
 `conftest.py` drops every `EXTERNAL_LLM_*` but `EXTERNAL_LLM_CONTRACT_UPDATE` — unknown `llm` values, and the external
 job slots) are `tests/test_external_llm_review2_fixes.py`.
 
+### Call trace (Phoenix — off by default)
+
+`call_trace.py` — one span per LLM call and per MCP tool call, sent to a Phoenix collector (portal
+`docs/improvement-1015/call-trace.md`, decision IM-D6 ③). **No text:** prompts, answers, stream chunks, tool arguments,
+tool results and exception messages are never read. The recorder takes timings, the token usage the server reports,
+the model name, the HTTP status, the LLM router's `x-hwax-llm-upstream` response header, and the ids the engine
+attaches with `call_trace.tag` (only short tokens without spaces are accepted). No setting turns text on.
+
+| var | default | meaning |
+|---|---|---|
+| `CALL_TRACE_URL` | _(unset)_ | Phoenix base URL, e.g. `http://127.0.0.1:8750` (`/v1/traces` is appended). Unset or empty = off: no callback on any LLM, tools unwrapped, no thread, no network. A value that is not an `http(s)://host:port` URL keeps it off with one `[call-trace] ⚠` line. Read once at startup (restart to apply). |
+
+A span carries — LLM: `hwax.llm.server` (host:port of `VLLM_BASE_URL`, or `external` for the external responder),
+`hwax.llm.upstream` (the server the LLM router actually used), `llm.model_name`, `llm.token_count.*` (when the server
+reports usage — streaming chat calls usually do not, and the request is not changed to ask for it),
+`hwax.llm.ttft_ms` / `hwax.llm.gen_ms` (streaming calls only: wait for the first chunk — queue plus prefill — and the
+rest), `hwax.llm.http_status`, `hwax.llm.attempts` (SDK retries show as more than 1), `error.type`. Tool: `tool.name`,
+start/end, `error.type` and `hwax.http_status` on failure (measured below `_cap_tool`, so gate refusals that never reach
+the gateway are not spans). Both: `hwax.kind` (`chat`, `delib`, `sim-delib`, `test-plan`, `thinking`,
+`card-review:<kind>`), `hwax.turn_id` or `hwax.job_id` (also `session.id`, so Phoenix groups them), `hwax.round`,
+`hwax.seat`, `hwax.unit`, `hwax.target`. Calls after the last round (chair, summary) keep that round number and carry no
+seat.
+
+Export is OTLP/HTTP protobuf — Phoenix 20.19's `/v1/traces` accepts only `application/x-protobuf`, so the few message
+types needed are encoded by hand (no new runtime dependency). One daemon thread drains a 2,000-span queue with a 2 s
+send timeout: a dead or slow collector drops spans and never makes a call wait. It logs one `⚠` line when sending
+fails or the queue fills and one `✓` line when sending resumes. `tests/test_call_trace.py` checks that the off state
+attaches nothing, that the LLM request bytes are the same with the recorder on, that a canary planted in every text
+position never reaches the exported bytes, and — when `requirements-dev.txt` is installed — decodes the bytes with the
+official `opentelemetry-proto`.
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the
