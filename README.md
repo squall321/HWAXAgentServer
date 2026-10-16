@@ -440,7 +440,8 @@ job slots) are `tests/test_external_llm_review2_fixes.py`.
 `docs/improvement-1015/call-trace.md`, decision IM-D6 ③). **No text:** prompts, answers, stream chunks, tool arguments,
 tool results and exception messages are never read. The recorder takes timings, the token usage the server reports,
 the model name, the HTTP status, the LLM router's `x-hwax-llm-upstream` response header, and the ids the engine
-attaches with `call_trace.tag` (only short tokens without spaces are accepted). No setting turns text on.
+attaches with `call_trace.tag` (only short ASCII tokens without spaces or `@` are accepted — a rejected value drops that
+id rather than keeping the previous one). No setting turns text on.
 
 | var | default | meaning |
 |---|---|---|
@@ -455,12 +456,15 @@ start/end, `error.type` and `hwax.http_status` on failure (measured below `_cap_
 the gateway are not spans). Both: `hwax.kind` (`chat`, `delib`, `sim-delib`, `test-plan`, `thinking`,
 `card-review:<kind>`), `hwax.turn_id` or `hwax.job_id` (also `session.id`, so Phoenix groups them), `hwax.round`,
 `hwax.seat`, `hwax.unit`, `hwax.target`. Calls after the last round (chair, summary) keep that round number and carry no
-seat.
+seat. A call that is cancelled before it ends (thinking seat timeout, job cancel, card-review stream closed, chat
+disconnect — LangChain then calls neither end nor error callback) is closed as `error.type=CancelledError` when its task
+ends or the next call starts in the same task; its end time is that moment.
 
 Export is OTLP/HTTP protobuf — Phoenix 20.19's `/v1/traces` accepts only `application/x-protobuf`, so the few message
 types needed are encoded by hand (no new runtime dependency). One daemon thread drains a 2,000-span queue with a 2 s
 send timeout: a dead or slow collector drops spans and never makes a call wait. It logs one `⚠` line when sending
-fails or the queue fills and one `✓` line when sending resumes. `tests/test_call_trace.py` checks that the off state
+fails and one `✓` line when sending resumes; a full queue logs one `⚠` line and stays quiet until the queue drains
+below half or sending resumes. The exporter is tested against a fixed golden byte string as well. `tests/test_call_trace.py` checks that the off state
 attaches nothing, that the LLM request bytes are the same with the recorder on, that a canary planted in every text
 position never reaches the exported bytes, and — when `requirements-dev.txt` is installed — decodes the bytes with the
 official `opentelemetry-proto`.

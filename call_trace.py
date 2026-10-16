@@ -18,6 +18,7 @@ langchain_core 는 기록기를 만들 때 읽고, 보내기는 http.client 다(
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import http.client
@@ -36,14 +37,16 @@ QUEUE_MAX = 2000                  # 보내기 전 줄의 상한(스팬 수) — 
 BATCH_MAX = 256                   # 한 번에 묶어 보내는 수
 TIMEOUT_S = 2.0                   # 한 번 보내기의 한도(연결·읽기·쓰기) — 보내는 스레드만 기다린다
 RETRY_S = 5.0                     # 보내지 못한 뒤 다음 묶음을 보내기까지 쉬는 시간(그사이 들어온 기록은 줄이 차면 버린다)
-OPEN_MAX = 4096                   # 끝을 못 본 LLM 호출 기록의 상한 — 취소된 호출은 끝 콜백이 오지 않는다(가장 오래된 것부터 버린다)
+OPEN_MAX = 4096                   # 끝을 못 본 LLM 호출 기록의 상한 — 취소는 태스크 끝 콜백이 닫지만(_abandon) 태스크 없이 도는 동기 호출이 끊기면 남는다(가장 오래된 것부터 버린다)
 UPSTREAM_HEADER = "x-hwax-llm-upstream"   # LLM 라우터(HWAXPortal infra/llm-router)가 실제로 보낸 서버를 알리는 응답 머리
 _SCOPE = "hwax.call_trace"
 _KIND_CLIENT = 3                  # OTLP SpanKind — 밖으로 부르는 호출
 _STATUS_OK, _STATUS_ERROR = 1, 2
 
-# id 자리에 받는 값 — 공백 없는 짧은 표지(잡 id · 좌석 키 · 모델 이름 · 호스트:포트). 글(질문·발언)이 id 자리로 새지 않게 이 꼴이 아니면 버린다.
-_ID = re.compile(r"[\w.:@/+-]{1,160}")
+# id 자리에 받는 값 — 공백 없는 짧은 ASCII 표지(잡 id · 좌석 키 · 모델 이름 · 호스트:포트). 글(질문·발언)이 id 자리로 새지 않게 이 꼴이
+# 아니면 버린다. 한글(\w 는 유니코드다)과 `@`(메일 주소)는 받지 않는다 — 좌석 키를 부르는 쪽이 정하므로(MCP personas[].key ·
+# 카드 대조의 unit_id) 낱말 문장이나 사람 주소가 그대로 실렸다(반대 검토 LOW-2). 실제 키는 전부 ASCII 다(dev AIDataHub 796개).
+_ID = re.compile(r"[A-Za-z0-9_.:/+-]{1,160}")
 # tag 가 받는 이름 → 스팬 속성 이름. 이 밖의 이름은 버린다.
 _KEYS = {"kind": "hwax.kind", "turn": "hwax.turn_id", "job": "hwax.job_id", "round": "hwax.round", "seat": "hwax.seat",
          "unit": "hwax.unit", "target": "hwax.target"}
@@ -109,7 +112,8 @@ def new_id() -> str:
 # ── 자리 id ───────────────────────────────────────────────────────────────────
 def tag(**ids) -> None:
     """지금 문맥(태스크)과 여기서 새로 만드는 태스크의 호출에 id 를 단다 — kind · turn · job · round · seat · unit · target.
-    None·빈 글은 그 id 를 뗀다. 공백 없는 짧은 표지가 아니면 버린다(글이 새지 않게). 꺼져 있으면 아무것도 하지 않는다."""
+    None·빈 글은 그 id 를 뗀다. 공백 없는 짧은 표지가 아니면 그 id 를 떼고 버린다 — 앞 값이 남아 엉뚱한 좌석에 붙지 않게.
+    꺼져 있으면 아무것도 하지 않는다."""
     if not enabled():
         return
     cur = dict(_IDS.get() or {})
@@ -122,6 +126,8 @@ def tag(**ids) -> None:
             cur[k] = v
         elif isinstance(v, str) and _ID.fullmatch(v):
             cur[k] = v
+        else:
+            cur.pop(k, None)
     _IDS.set(cur)
 
 
@@ -226,7 +232,7 @@ class _Exporter:
                 self.dropped += 1
                 first, self._full = not self._full, True
             if first:
-                _say(f"⚠ 보낼 줄이 찼다({QUEUE_MAX}건) — 넘치는 기록은 버린다(Phoenix 가 느리거나 내려갔다 · 다시 보내기까지 더 알리지 않는다)")
+                _say(f"⚠ 보낼 줄이 찼다({QUEUE_MAX}건) — 넘치는 기록은 버린다(Phoenix 가 느리거나 내려갔다 · 줄이 반 아래로 빠지기 전에는 더 알리지 않는다)")
 
     def _post(self, body: bytes) -> int:
         """한 묶음을 보내고 상태 코드를 돌려준다 — 표준 라이브러리 http.client 다. httpx 를 쓰면 이 서버의 로그 설정이 보낼 때마다 INFO 한 줄
@@ -260,7 +266,11 @@ class _Exporter:
             if why is None:
                 with self._lock:
                     self.sent += len(batch)
-                    back, self._down, self._full = self._down, False, False
+                    back, self._down = self._down, False
+                    # 줄이 찼다는 알림은 되살아났거나 줄이 반 아래로 빠졌을 때만 다시 무장한다 — 살아 있지만 느린 받는 곳이면 보낼 때마다
+                    # 한 줄씩 찍혔다(반대 검토 LOW-1).
+                    if back or self.q.qsize() < QUEUE_MAX // 2:
+                        self._full = False
                 if back:
                     _say(f"✓ 다시 보낸다 — 그동안 못 보낸 기록 {self.failed}건 · 줄이 차 버린 기록 {self.dropped}건(누적)")
             else:
@@ -291,17 +301,23 @@ def _emit(span: _Span) -> None:
     exp.put(span)
 
 
-def _exc_name(exc: BaseException) -> str:
-    """예외의 이름만(문구는 보지 않는다) — anyio TaskGroup 이 싼 것은 안쪽의 이름으로."""
+def _inner(exc: BaseException) -> BaseException:
+    """anyio TaskGroup 이 싼 예외는 안쪽 첫 예외로 — 이름과 HTTP 상태를 같은 예외에서 읽는다(반대 검토 LOW-3)."""
     for _ in range(8):
         inner = getattr(exc, "exceptions", None)
         if not isinstance(inner, (list, tuple)) or not inner or not isinstance(inner[0], BaseException):
             break
         exc = inner[0]
-    return type(exc).__name__
+    return exc
+
+
+def _exc_name(exc: BaseException) -> str:
+    """예외의 이름만(문구는 보지 않는다) — 싸인 것은 안쪽의 이름으로."""
+    return type(_inner(exc)).__name__
 
 
 def _http_status(exc: BaseException) -> int | None:
+    exc = _inner(exc)
     for v in (getattr(exc, "status_code", None), getattr(getattr(exc, "response", None), "status_code", None)):
         if isinstance(v, int) and not isinstance(v, bool):
             return v
@@ -355,7 +371,8 @@ def _tool_span(name: str, ids: dict, start_ns: int, t0: float, exc: BaseExceptio
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 class _Call:
-    __slots__ = ("server", "ids", "model", "start_ns", "t0", "first", "upstream", "status", "attempts", "done")
+    __slots__ = ("server", "ids", "model", "start_ns", "t0", "first", "upstream", "status", "attempts", "done", "owner", "run_id",
+                 "task", "cb")
 
     def __init__(self, server: str, ids: dict, model: str | None):
         self.server, self.ids, self.model = server, ids, model
@@ -365,6 +382,7 @@ class _Call:
         self.status = None
         self.attempts = 0
         self.done = False
+        self.owner = self.run_id = self.task = self.cb = None    # 기록기 · run_id · 그 호출을 돌린 태스크와 거기 단 끝 콜백
 
 
 def _clean_id(v) -> str | None:
@@ -440,6 +458,34 @@ def _llm_span(c: _Call, *, tokens: dict | None = None, model: str | None = None,
         pass
 
 
+def _settle(c: _Call) -> None:
+    """끝난 호출에서 태스크 끝 콜백을 뗀다(오래 사는 태스크에 쌓이지 않게)."""
+    if c.task is not None and c.cb is not None:
+        try:
+            c.task.remove_done_callback(c.cb)
+        except Exception:  # noqa: BLE001
+            pass
+    c.task = c.cb = None
+
+
+def _abandon(c: _Call) -> None:
+    """끝 콜백 없이 버려진 호출(취소 · 시간 초과로 태스크가 끊겼다)을 CancelledError 스팬으로 닫는다. 이미 끝났으면 아무것도 안 한다.
+    LangChain 의 agenerate 는 gather(return_exceptions=True) 를 기다리다 바깥에서 취소되면 on_llm_error 를 부르지 않는다 — 그래서
+    띵킹 좌석 시간 초과 · 심의 잡 취소 · 카드 대조 구독 닫힘 · 챗 연결 끊김 같은 가장 긴 대기가 기록에서 빠졌다(반대 검토 MEDIUM-1).
+    끝 시각은 이것을 안 때다(태스크가 끝난 때 · 같은 문맥에서 다음 호출이 시작된 때)."""
+    if c.done:
+        return
+    c.done = True
+    _settle(c)
+    if c.owner is not None:
+        c.owner._open.pop(c.run_id, None)
+    _llm_span(c, exc=asyncio.CancelledError())
+
+
+def _task_done(c: _Call, _task) -> None:
+    _abandon(c)
+
+
 @functools.lru_cache(maxsize=None)
 def _recorder_class():
     """기록기(LangChain 콜백) — 처음 쓸 때 짓는다(langchain_core 는 그때 읽는다). 스트리밍 콜백(_StreamingCallbackHandler)이 아니다 —
@@ -464,11 +510,22 @@ def _recorder_class():
                     model = _clean_id(ip.get("model")) or _clean_id(ip.get("model_name"))
                 if model is None and isinstance(metadata, dict):
                     model = _clean_id(metadata.get("ls_model_name"))
+                prev = _CUR.get()
+                if prev is not None and not prev.done:
+                    _abandon(prev)          # 같은 문맥(태스크)의 호출은 차례로 돈다 — 앞 호출이 끝나지 않았으면 버려진 것이다
                 c = _Call(self.server, dict(_IDS.get() or {}), model)
+                c.owner, c.run_id = self, run_id
                 if len(self._open) >= OPEN_MAX:
                     self._open.pop(next(iter(self._open)), None)
                 self._open[run_id] = c
                 _CUR.set(c)
+                try:
+                    task = asyncio.current_task()
+                except RuntimeError:        # 이벤트 루프 밖(동기 호출) — 끝 콜백을 달 태스크가 없다
+                    task = None
+                if task is not None:
+                    c.task, c.cb = task, functools.partial(_task_done, c)
+                    task.add_done_callback(c.cb)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -480,9 +537,10 @@ def _recorder_class():
 
         def on_llm_end(self, response, *, run_id, **kwargs):
             c = self._open.pop(run_id, None)
-            if c is None:
+            if c is None or c.done:
                 return
             c.done = True
+            _settle(c)
             try:
                 tokens, model = _usage(response)
             except Exception:  # noqa: BLE001
@@ -491,9 +549,10 @@ def _recorder_class():
 
         def on_llm_error(self, error, *, run_id, **kwargs):
             c = self._open.pop(run_id, None)
-            if c is None:
+            if c is None or c.done:
                 return
             c.done = True
+            _settle(c)
             _llm_span(c, exc=error)
 
     return CallTraceRecorder

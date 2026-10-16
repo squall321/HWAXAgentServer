@@ -293,6 +293,8 @@ def test_프롬프트_답_인자_결과_오류문구는_어디에도_실리지_�
     try:
         from opentelemetry.proto.collector.trace.v1 import trace_service_pb2 as pb  # noqa: PLC0415
     except ImportError:
+        # 건너뜀으로 바꾸지 않는다 — 이 시험의 본뜻(표식이 어디에도 없다)은 위에서 이미 통과했고, 인코더는 정의 없이도 고정 바이트
+        # 시험(test_인코더는_고정_바이트와_같다)이 늘 본다. 건너뜀이면 본문 가림 시험 전체가 안 돈 것처럼 읽힌다.
         return
     decoded = [s for _c, b in collector.bodies for rs in pb.ExportTraceServiceRequest.FromString(b).resource_spans
                for ss in rs.scope_spans for s in ss.spans]
@@ -305,12 +307,21 @@ def test_id_자리는_공백_없는_짧은_표지만_받는다(trace_on):
 
     async def go():
         ct.tag(kind="chat", turn="t-1", round=3, seat="he-team.stepforge", unknown="x")
+        first = dict(ct._IDS.get())
         ct.tag(seat="이 좌석의 역할 설명 문장", job="a" * 161)
         ids = dict(ct._IDS.get())
+        out = {}
+        for v in ("배터리팩_스웰링_원인을_찾아줘", "koo.park@example.com", "C-12/리브두께/감소", "rel-chemical-corrosion"):
+            ct.tag(seat=v)
+            out[v] = ct._IDS.get().get("seat")
         ct.tag(round=None, seat="")
-        return ids, dict(ct._IDS.get())
-    ids, after = asyncio.run(go())
-    assert ids == {"kind": "chat", "turn": "t-1", "round": 3, "seat": "he-team.stepforge"}, ids
+        return first, ids, out, dict(ct._IDS.get())
+    first, ids, out, after = asyncio.run(go())
+    assert first == {"kind": "chat", "turn": "t-1", "round": 3, "seat": "he-team.stepforge"}, first
+    # 거부된 값은 버리고 그 id 를 뗀다 — 앞 좌석이 남아 엉뚱한 호출에 붙지 않게(반대 검토 LOW-2)
+    assert ids == {"kind": "chat", "turn": "t-1", "round": 3}, ids
+    assert out == {"배터리팩_스웰링_원인을_찾아줘": None, "koo.park@example.com": None, "C-12/리브두께/감소": None,
+                   "rel-chemical-corrosion": "rel-chemical-corrosion"}, "한글 낱말 · 메일 주소는 id 자리에 실리지 않는다"
     assert after == {"kind": "chat", "turn": "t-1"}
 
 
@@ -519,3 +530,153 @@ def test_외부_응답자_모델도_켜져_있을_때만_기록기를_단다(tra
     trace_on(f"http://127.0.0.1:{_free_port()}")
     m = external_llm.model_for(app, owner="me@example.com", kind="verdict")
     assert [c.server for c in m.callbacks] == ["external"]
+
+
+# ── 반대 검토(10-16) 뒤 — 취소된 호출 · 알림 되풀이 · 싸인 오류 · 고정 바이트 ─────────────────────────────────────────
+GOLDEN = bytes.fromhex(
+    "0a87030a580a230a0c736572766963652e6e616d6512130a11687761782d6167656e742d7365727665720a310a1a6f70656e696e666572656e63652e70726f6a6563742e6e616d6512130a11687761782d6167656e742d73657276657212aa020a110a0f687761782e63616c6c5f747261636512b0010a100102030405060708090a0b0c0d0e0f10120811121314151617182a036c6c6d30033915cd0bdcacc66c184100ca4a10adc66c184a200a176f70656e696e666572656e63652e7370616e2e6b696e6412050a034c4c4d4a140a09687761782e7365617412070a0572656c2d614a070a0169120218124a120a036e6567120b18fbffffffffffffffff014a0e0a016612092100000000000029404a070a0174120210014a070a016512020a007a02180112620a101f202122232425262728292a2b2c2d2e12082f303132333435362a0e7365617263685f7265706f72747330033905000000000000004105000000000000004a1c0a0a6572726f722e74797065120e0a0c52756e74696d654572726f727a021802")
+
+
+def test_인코더는_고정_바이트와_같다():
+    """공식 정의(opentelemetry-proto)가 없는 venv 에서도 인코더를 본다 — 아래 값은 그 정의로 읽어 이름 · id · 시각 · 종류 · 상태 · 속성
+    (음수 · 실수 · 참거짓 · 빈 글)이 그대로인 것을 확인하고 박았다(반대 검토 LOW-4 — 공유 venv 에서는 대조가 늘 건너뛰어졌다)."""
+    a = ct._Span("llm", 1_760_000_000_123_456_789, 1_760_000_001_000_000_000,
+                 [("openinference.span.kind", "LLM"), ("hwax.seat", "rel-a"), ("i", 18), ("neg", -5), ("f", 12.5), ("t", True), ("e", "")],
+                 True)
+    b = ct._Span("search_reports", 5, 4, [("error.type", "RuntimeError")], False)
+    a.trace_id, a.span_id = bytes(range(1, 17)), bytes(range(17, 25))
+    b.trace_id, b.span_id = bytes(range(31, 47)), bytes(range(47, 55))
+    assert ct.encode([a, b]) == GOLDEN
+
+
+class _Slow(http.server.BaseHTTPRequestHandler):
+    """답하지 않고 매달리는 OpenAI 꼴 서버 — 호출이 바깥에서 취소되게 한다."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        time.sleep(3)
+
+    def log_message(self, *a):
+        pass
+
+
+def test_취소된_비스트리밍_호출도_스팬을_남긴다(trace_on, captured):
+    """LangChain 의 agenerate 는 바깥에서 취소되면 끝 · 오류 콜백을 부르지 않는다 — 시간 초과 · 잡 취소 · 연결 끊김의 가장 긴 대기가
+    기록에서 빠졌다(반대 검토 MEDIUM-1). 그 호출을 돌린 태스크가 끝날 때 CancelledError 로 닫는다."""
+    trace_on(f"http://127.0.0.1:{_free_port()}")
+    srv, port = _serve(_Slow)
+    try:
+        llm = ct.instrument_llm(_llm(port), "203.0.113.9:8000")
+        (rec,) = [cb for cb in llm.callbacks if type(cb).__name__ == "CallTraceRecorder"]
+
+        async def go():
+            ct.tag(kind="thinking", seat="s-slow")
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(llm.ainvoke("느린 질문"), 0.3)
+        asyncio.run(go())
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    (span,) = captured
+    a = _attrs(span)
+    assert a["error.type"] == "CancelledError" and not span.ok, a
+    assert a["hwax.kind"] == "thinking" and a["hwax.seat"] == "s-slow" and a["hwax.llm.server"] == "203.0.113.9:8000"
+    assert 0.2e9 <= span.end_ns - span.start_ns < 3e9, "끝 시각은 끊긴 때다(서버가 답한 때가 아니다)"
+    assert not rec._open, "끝을 못 본 기록이 남지 않는다"
+
+
+def test_같은_문맥에서_다음_호출이_시작되면_앞_호출을_닫고_끝난_호출은_두_번_닫지_않는다(trace_on, captured):
+    trace_on(f"http://127.0.0.1:{_free_port()}")
+    rec = ct._recorder_class()("203.0.113.9:8000")
+    done = SimpleNamespace(llm_output={"token_usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}, generations=[])
+
+    async def go():
+        ct.tag(seat="s-1")
+        rec.on_chat_model_start({}, [[]], run_id="r1", invocation_params={"model": "m"})
+        rec.on_chat_model_start({}, [[]], run_id="r2", invocation_params={"model": "m"})     # r1 은 끝 콜백 없이 버려졌다
+        rec.on_llm_end(done, run_id="r2")
+        last = ct._CUR.get()
+        assert last.done and last.task is None and last.cb is None, "끝난 호출은 태스크 끝 콜백을 놓는다(오래 사는 태스크에 쌓이지 않게)"
+        rec.on_llm_end(done, run_id="r1")                                                     # 늦게 온 끝 — 이미 닫았다
+    asyncio.run(go())                     # 태스크가 끝나도(끝 콜백) 더 내지 않는다
+    got = [(_attrs(s).get("error.type"), s.ok, _attrs(s).get("llm.token_count.total")) for s in captured]
+    assert got == [("CancelledError", False, None), (None, True, 3)], got
+    assert not rec._open
+
+
+def test_끝난_호출은_태스크가_끝나도_다시_내지_않는다(trace_on, captured):
+    trace_on(f"http://127.0.0.1:{_free_port()}")
+    srv, port = _serve(_OpenAI)
+    try:
+        llm = ct.instrument_llm(_llm(port), "203.0.113.9:8000")
+        asyncio.run(llm.ainvoke("질문"))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert [(_attrs(s).get("error.type"), s.ok) for s in captured] == [(None, True)]
+
+
+def test_줄이_찼다는_알림은_반_아래로_빠지기_전에는_되풀이되지_않는다(monkeypatch):
+    """받는 곳이 살아 있지만 느리면 보낼 때마다 알림이 풀려 묶음마다 한 줄씩 찍혔다(반대 검토 LOW-1, 실측 4초에 19줄)."""
+    said = []
+    monkeypatch.setattr(ct, "_say", said.append)
+    monkeypatch.setattr(ct, "QUEUE_MAX", 10)
+    monkeypatch.setattr(ct, "BATCH_MAX", 2)
+    gate = threading.Semaphore(0)
+
+    def post(self, body):
+        gate.acquire()                    # 한 묶음씩 풀어 준다 — 살아 있지만 느린 받는 곳
+        return 200
+    monkeypatch.setattr(ct._Exporter, "_post", post)
+    exp = ct._Exporter("http://127.0.0.1:1/v1/traces")
+
+    def until(cond, what):
+        end = time.monotonic() + 10
+        while not cond():
+            assert time.monotonic() < end, what
+            time.sleep(0.01)
+
+    def fill(n):
+        for _ in range(n):
+            exp.put(ct._Span("t", 1, 2, [], True))
+
+    def full():
+        return [m for m in said if "줄이 찼다" in m]
+    try:
+        fill(1)
+        until(lambda: exp.q.qsize() == 0, "보내는 스레드가 첫 묶음을 쥐지 않았다")
+        fill(12)                          # 줄 10 이 차고 둘이 넘친다
+        assert len(full()) == 1, said
+        gate.release()                    # 한 묶음 성공 — 줄은 아직 반 위다
+        until(lambda: exp.sent == 1 and exp.q.qsize() == 8, "다음 묶음을 쥐지 않았다")
+        fill(5)                           # 다시 넘친다 — 알리지 않는다
+        assert len(full()) == 1, said
+        for _ in range(4):
+            gate.release()
+        until(lambda: exp.sent == 9 and exp.q.qsize() == 2, "줄이 반 아래로 빠지지 않았다")
+        fill(9)                           # 반 아래로 빠진 뒤 다시 넘친다 — 한 줄 더
+        assert len(full()) == 2, said
+    finally:
+        for _ in range(64):
+            gate.release()
+        # 시험 안에서 줄을 다 비운다 — 남은 묶음을 시험 뒤에 원래 _post 로 보내면 빈 포트로 가 경고 한 줄이 시험 밖에 찍힌다
+        until(lambda: exp.q.qsize() == 0, "줄을 비우지 못했다")
+        time.sleep(0.2)
+
+
+class _Group(Exception):
+    """anyio TaskGroup 이 싼 예외의 꼴 — .exceptions 의 첫 예외가 안쪽이다."""
+
+    def __init__(self, excs):
+        super().__init__("group")
+        self.exceptions = excs
+
+
+def test_싸인_HTTP_오류도_안쪽에서_이름과_상태를_함께_읽는다(trace_on, captured):
+    trace_on(f"http://127.0.0.1:{_free_port()}")
+    req = httpx.Request("POST", "http://127.0.0.1/x")
+    err = httpx.HTTPStatusError("x", request=req, response=httpx.Response(502, request=req))
+    assert ct._exc_name(_Group([err])) == "HTTPStatusError" and ct._http_status(_Group([err])) == 502
+    ct._tool_span("get_material", {}, 1, time.monotonic(), _Group([err]))
+    (span,) = captured
+    assert _attrs(span)["error.type"] == "HTTPStatusError" and _attrs(span)["hwax.http_status"] == 502, _attrs(span)
