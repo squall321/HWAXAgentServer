@@ -226,7 +226,7 @@ class _Exporter:
                 self.dropped += 1
                 first, self._full = not self._full, True
             if first:
-                _say(f"⚠ 보낼 줄이 찼다({QUEUE_MAX}건) — 넘치는 기록은 버린다(Phoenix 가 느리거나 내려갔다 · 다시 알리지 않는다)")
+                _say(f"⚠ 보낼 줄이 찼다({QUEUE_MAX}건) — 넘치는 기록은 버린다(Phoenix 가 느리거나 내려갔다 · 다시 보내기까지 더 알리지 않는다)")
 
     def _post(self, body: bytes) -> int:
         """한 묶음을 보내고 상태 코드를 돌려준다 — 표준 라이브러리 http.client 다. httpx 를 쓰면 이 서버의 로그 설정이 보낼 때마다 INFO 한 줄
