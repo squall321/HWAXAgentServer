@@ -292,6 +292,102 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
             + "토큰을 보내지 않았습니다(LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S) — LLM 이 밀려 있거나 멈췄습니다")
 
 
+# ── 챗 전용 LLM(선택) — HWAXPortal docs/chat-llm-stcx ─────────────────────────────────────────────────────────────
+# CHAT_LLM_BASE_URL 이 비면 챗도 VLLM_* 클라이언트(app.state.llm)를 그대로 쓴다 — 아무것도 바뀌지 않는다. 채우면 챗 ReAct · 챗 안 도구
+# 계획만 그 서버로 간다. 띵킹 · 심의 준비(전문가 고르기 축 · VOC · 되묻기 · 주제 뽑기) · 심의 · 카드 대조는 VLLM_* 그대로다(CL-D2).
+# 넘김은 LLM 호출 단위다 — 턴 전체를 다시 돌리면 이미 실행한 도구가 두 번 돈다(CL-D3). 넘기는 것은 연결 실패 · 시간 초과 · 5xx 뿐이다 —
+# 400 은 VLLM_* 에서도 같은 까닭으로 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지 않는다. 토큰이 흐르기 시작한 뒤의 실패는
+# 넘기지 못한다(with_fallbacks 의 스트림 규칙).
+#   CHAT_LLM_BASE_URL · CHAT_LLM_MODEL       둘 다 있어야 켜진다. CHAT_LLM_API_KEY(기본 EMPTY)
+#   CHAT_LLM_ENABLE_THINKING   기본 0 — 생각 모드를 끈다(chat_template_kwargs.enable_thinking=false, 사용자 결정 10-17). 1 이면 모델 기본값.
+#                              LLM_REASONING_EFFORT 는 VLLM_* 서버 것이라 챗 서버에 보내지 않는다.
+#   CHAT_LLM_DISABLE_STREAMING 비우면 LLM_DISABLE_STREAMING 을 따른다 — GLM 의 스트리밍 tool_calls 유실 우회가 켜진 박스(cae00)는 챗
+#                              서버도 비스트리밍으로 시작한다. 그 서버의 스트리밍 도구 호출을 확인한 뒤 0 으로 연다. 챗 서버와 넘겨받는
+#                              VLLM_* 의 스트리밍이 달라도 글은 빠지지 않는다(_agent_stream_turn 이 호출마다 본다)
+#   CHAT_LLM_MAX_RETRIES       기본 1 — 챗 서버에 다시 보내는 횟수. 그다음은 넘긴다
+#   CHAT_LLM_FALLBACK          기본 1 — 0 이면 넘기지 않는다(실패가 그대로 챗에 보인다)
+#   CHAT_LLM_CONTEXT_TOKENS    챗 서버의 /v1/models 에서 창을 못 읽을 때 쓸 값(기본 LLM_CONTEXT_TOKENS, 없으면 128000)
+def _chat_fallback_errors() -> tuple:
+    """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다)."""
+    import openai  # noqa: PLC0415 — langchain_openai 가 이미 들인 의존성이다
+
+    return (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError)
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+from langchain_core.callbacks import BaseCallbackHandler  # noqa: E402 — 챗 전용 LLM 의 넘김 계수기만 쓴다
+
+
+class _ChatLLMWatch(BaseCallbackHandler):
+    """챗 전용 LLM 의 넘김을 센다 — 앞(챗 서버)의 마지막 실패 사유와 뒤(VLLM_*)가 넘겨받은 호출 수 · 시각. /health 의 chat_llm 이 읽는다.
+    뒤 인스턴스는 챗의 넘김에만 쓰는 따로 만든 것이라(app.state.llm 과 다르다) 그 시작이 곧 넘김 한 번이다."""
+
+    def __init__(self, info: dict, role: str) -> None:
+        self.info, self.role, self._said = info, role, 0.0
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        if self.role == "primary":
+            self.info["last_error"] = f"{type(error).__name__}: {str(error)[:160]}"
+            self.info["last_error_at"] = _now_iso()
+
+    def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+        if self.role != "fallback":
+            return
+        fb = self.info["fallback"]
+        fb["count"] += 1
+        fb["last_at"] = _now_iso()
+        now = time.monotonic()
+        if now - self._said >= 60:          # 챗 서버가 오래 죽어 있어도 로그를 호출마다 찍지 않는다
+            self._said = now
+            print(f"[agent] 챗 LLM 넘김 — {self.info.get('last_error') or '사유 모름'} → {VLLM_MODEL}(VLLM_*) · "
+                  f"지금까지 {fb['count']}회")
+
+
+def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeout_s: float, base_effort: str,
+                    base_retries: int, base_nostream: bool):
+    """(챗이 쓸 LLM, /health 에 실을 상태, 내부 설정). 꺼져 있으면 (base_llm, {"enabled": False}, None). mk 는 lifespan 의 _mk_llm."""
+    url = (os.environ.get("CHAT_LLM_BASE_URL") or "").strip().rstrip("/")
+    model = (os.environ.get("CHAT_LLM_MODEL") or "").strip()
+    if not url:
+        return base_llm, {"enabled": False}, None
+    if not model:
+        info = {"enabled": False, "error": "CHAT_LLM_BASE_URL 은 있는데 CHAT_LLM_MODEL 이 비었다 — 챗도 VLLM_* 를 쓴다"}
+        print(f"[agent] ⚠ {info['error']}")
+        return base_llm, info, None
+    key = os.environ.get("CHAT_LLM_API_KEY") or "EMPTY"
+    thinking = (os.environ.get("CHAT_LLM_ENABLE_THINKING") or "0").strip() == "1"
+    _ns = (os.environ.get("CHAT_LLM_DISABLE_STREAMING") or "").strip()
+    nostream = base_nostream if not _ns else _ns == "1"
+    fallback_on = (os.environ.get("CHAT_LLM_FALLBACK") or "1").strip() != "0"
+    info: dict = {"enabled": True, "server": _call_trace.server_label(url), "model": model, "thinking": thinking,
+                  "streaming": not nostream, "last_error": None, "last_error_at": None,
+                  "fallback": {"enabled": fallback_on, "to": VLLM_MODEL, "count": 0, "last_at": None}}
+    primary = mk(temperature, max_tokens, "", timeout_s, _env_int("CHAT_LLM_MAX_RETRIES", 1), base_url=url, model=model,
+                 api_key=key, nostream=nostream,
+                 chat_template_kwargs=None if thinking else {"enable_thinking": False},
+                 callbacks=[_ChatLLMWatch(info, "primary")])
+    chat = primary
+    if fallback_on:
+        fb = mk(temperature, max_tokens, base_effort, timeout_s, base_retries, callbacks=[_ChatLLMWatch(info, "fallback")])
+        chat = primary.with_fallbacks([fb], exceptions_to_handle=_chat_fallback_errors())
+    cfg = {"url": url, "model": model, "key": key,
+           "ctx_fallback": _env_int("CHAT_LLM_CONTEXT_TOKENS", 0) or _CTX_FALLBACK}
+    print(f"[agent] 챗 전용 LLM — {info['server']} · {model} · 생각 {'켬' if thinking else '끔'} · "
+          f"{'스트리밍' if not nostream else '비스트리밍'} · 넘김 {('→ ' + VLLM_MODEL) if fallback_on else '끔'}"
+          " (띵킹 · 심의 준비 · 심의 · 카드 대조는 VLLM_*)")
+    return chat, info, cfg
+
+
+def _chat_llm_of(app_) -> object:
+    """챗 흐름이 쓸 LLM — 챗 전용이 켜져 있으면 그것(넘김 포함), 아니면 app.state.llm(시험이 llm 만 꾸린 상태도 그대로 돈다)."""
+    return getattr(app_.state, "chat_llm", None) or app_.state.llm
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Build the LLM once. Tools are loaded per request (they depend on the caller's groups),
@@ -341,19 +437,26 @@ async def lifespan(app: FastAPI):
     conn_to = _env_float("LLM_CONNECT_TIMEOUT_S", 10.0)
 
     def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0,
-                retries: int = 2) -> ChatOpenAI:
-        kw: dict = dict(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY, model=VLLM_MODEL,
-                        temperature=temperature, disable_streaming=disable_stream,
+                retries: int = 2, *, base_url: str = "", model: str = "", api_key: str = "",
+                nostream: bool | None = None, chat_template_kwargs: dict | None = None,
+                callbacks: list | None = None) -> ChatOpenAI:
+        # 주소 · 모델 · 키를 주지 않으면 VLLM_* 다(챗 · 심의 클라이언트). 챗 전용 LLM(_build_chat_llm)만 다른 서버를 준다.
+        url = base_url or VLLM_BASE_URL
+        kw: dict = dict(base_url=url, api_key=api_key or VLLM_API_KEY, model=model or VLLM_MODEL,
+                        temperature=temperature, disable_streaming=disable_stream if nostream is None else nostream,
                         # read·write·pool 은 timeout_s(0 이하면 무제한), connect 는 따로 준다.
                         timeout=httpx.Timeout(timeout_s if timeout_s > 0 else None,
                                               connect=conn_to if conn_to > 0 else None),
                         max_retries=max(0, retries))
         if max_tokens > 0:
             kw["max_tokens"] = max_tokens
-        if effort:
-            kw["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": effort}}
+        tmpl = {**({"reasoning_effort": effort} if effort else {}), **(chat_template_kwargs or {})}
+        if tmpl:
+            kw["extra_body"] = {"chat_template_kwargs": tmpl}
+        if callbacks:
+            kw["callbacks"] = list(callbacks)
         # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py).
-        return _call_trace.instrument_llm(ChatOpenAI(**kw), _call_trace.server_label(VLLM_BASE_URL))
+        return _call_trace.instrument_llm(ChatOpenAI(**kw), _call_trace.server_label(url))
 
     base_t = _env_float("LLM_TEMPERATURE", 0.0)
     base_mt = _env_int("LLM_MAX_TOKENS", 0)
@@ -383,7 +486,14 @@ async def lifespan(app: FastAPI):
     # 바꿔 재구성하는 팩토리(구성만·연결 없음). 기본 타임아웃도 노출해 오버라이드 필요 판정에 쓴다.
     app.state.delib_timeout_s = d_to
     app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff, _r=d_rt: _mk_llm(_t, _m, _e, ts, _r))
-    app.state.llm_nostream = disable_stream
+    # 챗 전용 LLM(CHAT_LLM_*) — 비면 챗도 위 llm 을 쓴다(HWAXPortal docs/chat-llm-stcx). llm_nostream 은 챗 경로만 읽으므로
+    # (_timed_events · _agent_stream) 챗 클라이언트의 값이다.
+    app.state.chat_llm, app.state.chat_llm_info, app.state.chat_llm_cfg = _build_chat_llm(
+        app.state.llm, _mk_llm, temperature=base_t, max_tokens=base_mt, timeout_s=base_to,
+        base_effort=base_eff, base_retries=base_rt, base_nostream=disable_stream)
+    _chat_ctx_cache.clear()
+    app.state.llm_nostream = ((not app.state.chat_llm_info["streaming"]) if app.state.chat_llm_info.get("enabled")
+                              else disable_stream)
     if _card_review is not None:
         _card_review.gate_of(app)    # 카드 대조 관문 — 평소 CARD_REVIEW_CONCURRENCY, 심의가 돌면 _WITH_DELIB(수만 센다)
     # 외부 응답자(EXTERNAL_LLM_ENABLED=1) — 과제 줄을 기동 때 만들고(설정을 한 번 읽는다) 시간 한도 사슬을 적는다. 꺼져 있으면 없다.
@@ -2080,7 +2190,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
             app.state.tool_load_error.pop(frozenset(groups), None)
         # 모델 호출마다 쌓인 메시지를 재어 창을 넘으면 오래된 도구 결과부터 줄인다(_loop_fit_prompt — 넓은 창). agent 노드
         # 안에서 줄인다 — pre_model_hook 은 별도 노드라 왕복마다 그래프 단계를 하나 더 쓴다(AGENT_RECURSION_LIMIT 주석).
-        agent = create_react_agent(app.state.llm, tools, prompt=_loop_fit_prompt)
+        agent = create_react_agent(_chat_llm_of(app), tools, prompt=_loop_fit_prompt)   # 챗 전용 LLM(있으면)
         # 실제로 묶인 도구 이름을 달아 둔다. 호출부가 "N종 우선 바인딩" 같은 말을 하려면
         # **묶인 것**을 알아야 하는데, prefer 는 그룹 필터 없는 /tools-map(465종)에서 뽑은
         # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
@@ -2492,6 +2602,41 @@ def _model_context_tokens() -> int:
         return n
     _ctx_cache["n"] = n
     print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰")
+    return n
+
+
+_chat_ctx_cache: dict = {}
+
+
+def _chat_context_tokens() -> int | None:
+    """챗 전용 LLM(CHAT_LLM_*)의 창 — 꺼져 있으면 None. 그 서버 /v1/models 의 max_model_len 을 **답을 받았을 때만** 굳힌다
+    (_model_context_tokens 와 같은 규율 — 못 물어봤으면 _CTX_RETRY_S 뒤에 다시 묻고, 그동안은 CHAT_LLM_CONTEXT_TOKENS 또는
+    _CTX_FALLBACK). 그 서버가 설정한 모델을 내는지도 함께 적어 /health 가 보인다(served)."""
+    cfg = getattr(app.state, "chat_llm_cfg", None)
+    if not cfg:
+        return None
+    if "n" in _chat_ctx_cache:
+        return _chat_ctx_cache["n"]
+    fallback = cfg["ctx_fallback"]
+    if time.monotonic() < _chat_ctx_cache.get("retry_at", 0.0):
+        return fallback
+    try:
+        import httpx
+
+        r = httpx.get(f"{cfg['url']}/models", headers={"Authorization": f"Bearer {cfg['key']}"}, timeout=5.0)
+        data = [m for m in ((r.json() or {}).get("data") or []) if isinstance(m, dict)]
+    except Exception as e:      # 터널이 아직 안 열렸을 수 있다 — 굳히지 않고 기본값으로 간다
+        print(f"[agent] 챗 LLM 컨텍스트 조회 실패({type(e).__name__}) — {fallback:,} 토큰으로 가정한다"
+              f"({_CTX_RETRY_S:.0f}초 뒤 다시 묻는다)")
+        _chat_ctx_cache["retry_at"] = time.monotonic() + _CTX_RETRY_S
+        return fallback
+    pick = next((m for m in data if m.get("id") == cfg["model"]), data[0] if len(data) == 1 else None)
+    v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
+    n = v if isinstance(v, int) and v > 0 else fallback
+    _chat_ctx_cache.update(n=n, src="server" if n == v else "fallback",
+                           served=any(m.get("id") == cfg["model"] for m in data))
+    print(f"[agent] 챗 LLM 창 = {n:,} 토큰({_chat_ctx_cache['src']})"
+          + ("" if _chat_ctx_cache["served"] else f" — ⚠ 그 서버가 {cfg['model']} 를 내지 않는다(CHAT_LLM_MODEL)"))
     return n
 
 
@@ -3044,6 +3189,29 @@ async def _timed_events(events):
 
 
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
+    """챗 한 턴. 챗 전용 LLM(CHAT_LLM_*)이 켜져 있으면 이 턴의 문맥 예산을 그 서버 창과 VLLM_* 창 중 **작은 값**으로 잡는다 —
+    챗 경로의 예산(이력 · 문서 · 도구 결과 · 도구 설명)은 _model_context_tokens() 하나를 보는데 그 값은 VLLM_*(GLM 1M) 창이라,
+    그대로면 창이 작은 챗 서버(Qwen 262,144)에 넘치는 요청을 보낸다(400). 작은 값이면 VLLM_* 로 넘겨도 맞는다.
+    외부 응답자와 같은 문맥 변수(_external_llm.ctx_override)를 이 턴의 태스크에만 건다(HWAXPortal docs/chat-llm-stcx)."""
+    tok = None
+    chat_ctx = await asyncio.to_thread(_chat_context_tokens)
+    if chat_ctx:
+        base_ctx = await asyncio.to_thread(_model_context_tokens)
+        tok = _external_llm.ctx_override.set(min(chat_ctx, base_ctx))
+    turn = _agent_stream_turn(app, req)
+    try:
+        async for chunk in turn:
+            yield chunk
+    finally:
+        await turn.aclose()      # 연결이 끊겨 이 생성기가 닫혀도 턴의 finally 가 지금 돈다(종전과 같은 때)
+        if tok is not None:
+            try:
+                _external_llm.ctx_override.reset(tok)
+            except ValueError:   # 다른 문맥에서 닫혔다 — 그 문맥은 곧 버려진다
+                pass
+
+
+async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
@@ -3374,9 +3542,14 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
         _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
+        # 조각을 흘린 모델 호출 — 그 호출의 끝 이벤트에서는 글을 다시 내지 않는다. 조각 없이 끝난 호출은 끝 이벤트의 글을 낸다:
+        # 챗 전용 LLM 은 스트리밍인데 넘겨받은 VLLM_* 가 비스트리밍(GLM 우회)이면, 종전처럼 서버 전체 값(llm_nostream) 하나만
+        # 보면 넘겨받은 답의 글이 화면에 안 나갔다(docs/chat-llm-stcx).
+        _streamed_runs: set = set()
         async for event in _timed_events(agent.astream_events(inputs, version="v2", config=_cfg)):
             kind = event["event"]
             if kind == "on_chat_model_stream":
+                _streamed_runs.add(event.get("run_id"))
                 token = event["data"]["chunk"].content
                 if token:  # empty on tool-call delta chunks — guard
                     full.append(token)
@@ -3392,8 +3565,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                            "message": "답이 모델 출력 상한에서 끊겼습니다 — 뒷부분이 빠졌을 수 "
                                                       "있습니다. 범위를 나눠 다시 물어 주세요.",
                                            "knob": "LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
-                if getattr(app.state, "llm_nostream", False):
-                    # 비스트리밍 모드 — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
+                if getattr(app.state, "llm_nostream", False) or event.get("run_id") not in _streamed_runs:
+                    # 비스트리밍 모드(또는 이 호출만 조각 없이 끝났다) — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
                     # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip).
                     content = getattr(out_msg, "content", "") or ""
                     if isinstance(content, list):  # 멀티파트 content 방어
@@ -3687,7 +3860,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
             _brief = _tool_schema_brief(_tmap[_tn])
             try:
                 _argd = _parse_json(await _llm_text(
-                    app.state.llm, "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+                    _chat_llm_of(app), "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
                     f"[사용자 질문]\n{req.message}\n\n[도구]\n{_tn}: "
                     f"{(getattr(_tmap[_tn], 'description', '') or '')[:300]}\n"
                     + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
@@ -3724,7 +3897,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                                       **({"result_full": _hand3} if len(_hand3) > len(_prev3) else {})})
                 try:
                     _final = (await _llm_text(
-                        app.state.llm,
+                        _chat_llm_of(app),
                         "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
                         "호출하겠다고 말하지 말고, 아래 결과만으로 답하라. 결과가 오류라면 오류라고 "
                         "명확히 알리고 다음 행동을 제안하라.",
@@ -3805,7 +3978,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                     joined = "\n\n".join(f"[{n} 결과]\n{v}" for n, v in results)
                     try:
                         final = (await _llm_text(
-                            app.state.llm,
+                            _chat_llm_of(app),
                             "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
                             "호출하겠다고 말하지 말고, 아래 결과만으로 답하라.",
                             f"[사용자 질문]\n{req.message}\n\n{joined}")).strip()
@@ -4968,6 +5141,17 @@ def _card_review_health() -> dict:
             "drain": drain, "capabilities": ["card_review", "drain"], "card_review": fields}
 
 
+def _chat_llm_health() -> dict:
+    """/health 의 chat_llm — 꺼져 있으면 {"enabled": false}. 켜져 있으면 서버(호스트) · 모델 · 생각 · 스트리밍 · 넘김(켬 · 대상 · 횟수 ·
+    마지막 시각) · 챗 서버의 마지막 실패 · 창(ctx_tokens · 출처 · 그 서버가 모델을 내나). 키는 싣지 않는다 — /health 는 인증이 없다.
+    창은 이미 읽은 값만 보인다(None 이면 아직 첫 챗 턴 전) — 헬스 검사가 원격 서버를 두드리지 않게."""
+    info = getattr(app.state, "chat_llm_info", None) or {"enabled": False}
+    if not info.get("enabled"):
+        return dict(info)
+    return {**info, "fallback": dict(info.get("fallback") or {}), "ctx_tokens": _chat_ctx_cache.get("n"),
+            "ctx_source": _chat_ctx_cache.get("src"), "model_served": _chat_ctx_cache.get("served")}
+
+
 def _external_llm_health() -> dict:
     """/health 의 외부 응답자 칸 — 꺼져 있으면 {}(종전 응답 그대로). 켜져 있으면 external_llm{ctx_tokens, max_tokens, wait_s,
     answer_s, call_worst_s, queued, claimed, evid_budget}. 수와 설정만 싣는다(과제 글·주인은 싣지 않는다 — /health 는 인증이
@@ -5088,6 +5272,8 @@ def health() -> dict:
         "load": {"chat": _CHAT_LOAD.snapshot()},
         "model": VLLM_MODEL,
         "vllm": VLLM_BASE_URL,
+        # 챗 전용 LLM(CHAT_LLM_*) — 꺼져 있으면 {"enabled": false}(챗도 위 model · vllm). 켜져 있으면 넘김 횟수까지(docs/chat-llm-stcx).
+        "chat_llm": _chat_llm_health(),
         "mcp": list(getattr(app.state, "connections", {})),
         "tool_scoping": "gateway (X-HWAX-Groups)",
         "tool_desc_max": TOOL_DESC_MAX,

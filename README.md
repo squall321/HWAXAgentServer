@@ -447,7 +447,7 @@ id rather than keeping the previous one). No setting turns text on.
 |---|---|---|
 | `CALL_TRACE_URL` | _(unset)_ | Phoenix base URL, e.g. `http://127.0.0.1:8750` (`/v1/traces` is appended). Unset or empty = off: no callback on any LLM, tools unwrapped, no thread, no network. A value that is not an `http(s)://host:port` URL keeps it off with one `[call-trace] ⚠` line. Read once at startup (restart to apply). |
 
-A span carries — LLM: `hwax.llm.server` (host:port of `VLLM_BASE_URL`, or `external` for the external responder),
+A span carries — LLM: `hwax.llm.server` (host:port of `VLLM_BASE_URL` — or of `CHAT_LLM_BASE_URL` for the chat LLM — or `external` for the external responder),
 `hwax.llm.upstream` (the server the LLM router actually used), `llm.model_name`, `llm.token_count.*` (when the server
 reports usage — streaming chat calls usually do not, and the request is not changed to ask for it),
 `hwax.llm.ttft_ms` / `hwax.llm.gen_ms` (streaming calls only: wait for the first chunk — queue plus prefill — and the
@@ -468,6 +468,35 @@ below half or sending resumes. The exporter is tested against a fixed golden byt
 attaches nothing, that the LLM request bytes are the same with the recorder on, that a canary planted in every text
 position never reaches the exported bytes, and — when `requirements-dev.txt` is installed — decodes the bytes with the
 official `opentelemetry-proto`.
+
+### Chat LLM (separate server — off by default)
+
+Chat can use its own OpenAI-compatible server while thinking, deliberation prep (expert-axis pick, VOC preview,
+clarify, topic derivation), deliberation and card review stay on `VLLM_*` (portal `docs/chat-llm-stcx` — on cae00 the
+stcx GPU LLM `127.0.0.1:18700/v1`, Qwen3.8-Flash-Next). Changing `VLLM_BASE_URL` instead would move deliberation too —
+both clients read it. Only the chat ReAct agent and the chat-turn tool planners use the chat LLM.
+
+| var | default | meaning |
+|---|---|---|
+| `CHAT_LLM_BASE_URL` · `CHAT_LLM_MODEL` | _(unset)_ | both set = on. Unset = chat uses the `VLLM_*` client (nothing changes). A URL without a model stays off and says so in `/health` |
+| `CHAT_LLM_API_KEY` | `EMPTY` | bearer for the chat server |
+| `CHAT_LLM_ENABLE_THINKING` | `0` | `0` sends `chat_template_kwargs.enable_thinking=false` (fast answers). `1` = the model's default. `LLM_REASONING_EFFORT` is a `VLLM_*` setting and is not sent to the chat server |
+| `CHAT_LLM_DISABLE_STREAMING` | _(follows `LLM_DISABLE_STREAMING`)_ | a box that turned GLM streaming off (tool_calls lost) starts the chat server non-streaming too; set `0` once the chat server's streaming tool calls are verified |
+| `CHAT_LLM_MAX_RETRIES` | `1` | SDK retries on the chat server before falling back |
+| `CHAT_LLM_FALLBACK` | `1` | `0` = no fallback (the failure shows in chat) |
+| `CHAT_LLM_CONTEXT_TOKENS` | `LLM_CONTEXT_TOKENS` or 128000 | window to assume while the chat server's `/v1/models` cannot be read |
+
+**Fallback is per LLM call** (`with_fallbacks`): a connection error, timeout or 5xx sends that call to a dedicated
+`VLLM_*` client — never the whole turn, which would run tools a second time. 400 is not retried elsewhere (the same
+request fails there too) and 404 (wrong model name) is a configuration error that should show. A stream that already
+sent tokens cannot move. The fallback client keeps its own streaming setting; the chat turn emits text per model call
+(a call that ended without stream chunks has its text taken from the end event), so a streaming chat server with a
+non-streaming GLM fallback loses nothing. **Context:** a chat turn budgets with the smaller of the two windows
+(`_external_llm.ctx_override` for that task, reset when the turn ends), so a 262K chat server never receives a request
+sized for GLM's 1M — and the fallback still fits. **`/health` `chat_llm`:** server (host:port), model, thinking,
+streaming, fallback `{enabled, to, count, last_at}`, the chat server's last error, `ctx_tokens` / `ctx_source` /
+`model_served` once read (no key). Tests: `tests/test_chat_llm.py` (real lifespan, fake servers — closed port, 5xx,
+400, a streaming chat server falling back to a non-streaming GLM through a real chat turn, the window override).
 
 ## Status
 
