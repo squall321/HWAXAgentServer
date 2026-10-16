@@ -1860,6 +1860,28 @@ def _agent_denied(name: str) -> bool:
 # 게이트웨이는 이 호출을 사용자 신원으로 중계하므로, 지식카드에 숨은 지시를 받은 GLM 턴이 advanced.llm=external 과
 # consent_external: true 를 스스로 달면 외부 심의가 서고 원장에 거짓 동의가 남는다(X-D6). 사람의 동의는 사람의 클라이언트에서만 온다.
 _AGENT_NO_EXTERNAL = ("deliberate_start", "deliberate_continue")
+# 리스크 앱의 잡 시작 도구(X-D7 ④) — 같은 까닭이다. 판단 LLM 을 Claude 로 고르거나(앱의 이름 claude · 엔진의 이름 external) 반출 동의
+# 칸(consent_external — 값과 상관없이)을 실은 호출은 보내지 않는다. 그 도구의 인자는 평평하다(바깥 칸 — advanced 가 없다).
+_AGENT_NO_EXTERNAL_JOB = ("risk_start_job",)
+# 게이트웨이 REST 다리 — 본문에 반출 동의 칸이 있으면(어느 사이트 · 경로든) 보내지 않고, 리스크 앱의 잡 경로(…/targets/<key>/jobs ·
+# …/jobs/<id>/<action>)에 판단 LLM claude · external 을 실은 본문도 보내지 않는다(llm 은 흔한 칸 이름이라 그 경로에서만 본다).
+_AGENT_REST_BRIDGE = ("rest_call",)
+_EXTERNAL_LLM_NAMES = ("claude", "external")
+_RISK_JOB_PATH = re.compile(r"(?:^|/)(?:targets/[^/]+/jobs|jobs/[^/]+/[^/]+)/*$")
+
+
+def _named(name, tools) -> bool:
+    """도구 이름이 그 가운데 하나인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴(_agent_denied 와 같은 규칙)."""
+    n = str(name or "").strip().lower()
+    return any(n == t or n.endswith("_" + t) for t in tools)
+
+
+def _picks_external(fields: dict) -> bool:
+    """칸 이름이 llm 인 값이 claude · external 이거나(앞뒤 공백 · 대소문자는 맞춘다 — 엔진의 읽기와 같다) 반출 동의 칸이 있는가(값과
+    상관없이)."""
+    keys = {str(k).strip().lower(): v for k, v in fields.items()}
+    return (str(keys.get("llm") or "").strip().lower() in _EXTERNAL_LLM_NAMES
+            or _external_llm.CONSENT_FIELD in keys)
 
 
 def _arg_dict(v) -> dict | None:
@@ -1875,14 +1897,24 @@ def _arg_dict(v) -> dict | None:
 
 def _agent_external_call(name, args) -> bool:
     """이 서버의 에이전트가 부르는 심의 시작·이어하기가 외부 응답자를 고르거나(advanced.llm — 엔진과 같은 읽기, _wants_external)
-    반출 동의 칸(consent_external — 값과 상관없이, 바깥 칸이든 advanced 안이든)을 싣는가."""
-    n = str(name or "").strip().lower()
-    if not any(n == t or n.endswith("_" + t) for t in _AGENT_NO_EXTERNAL):
-        return False
-    args = _arg_dict(args) or {}
-    adv = _arg_dict(args.get("advanced")) or {}
-    keys = {str(k).strip().lower() for k in (*args, *adv)}
-    return _wants_external(adv) or _external_llm.CONSENT_FIELD in keys
+    반출 동의 칸(consent_external — 값과 상관없이, 바깥 칸이든 advanced 안이든)을 싣는가. 리스크 앱의 잡 시작(risk_start_job)이 llm
+    claude · external 이나 동의 칸을 싣는가(X-D7 ④). REST 다리(rest_call)의 본문이 동의 칸을 싣거나, 리스크 앱 잡 경로의 본문이 llm
+    claude · external 을 싣는가. 그 밖의 도구 · 그 칸이 없는 호출은 거짓이다(종전 그대로 간다)."""
+    if _named(name, _AGENT_NO_EXTERNAL):
+        args = _arg_dict(args) or {}
+        adv = _arg_dict(args.get("advanced")) or {}
+        keys = {str(k).strip().lower() for k in (*args, *adv)}
+        return _wants_external(adv) or _external_llm.CONSENT_FIELD in keys
+    if _named(name, _AGENT_NO_EXTERNAL_JOB):
+        return _picks_external(_arg_dict(args) or {})
+    if _named(name, _AGENT_REST_BRIDGE):
+        args = _arg_dict(args) or {}
+        body = _arg_dict(args.get("body")) or {}
+        if _external_llm.CONSENT_FIELD in {str(k).strip().lower() for k in body}:
+            return True
+        path = str(args.get("path") or "").strip().split("?", 1)[0].split("#", 1)[0]
+        return bool(_RISK_JOB_PATH.search(path)) and _picks_external(body)
+    return False
 
 
 async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):

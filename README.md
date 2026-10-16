@@ -325,8 +325,12 @@ work: a `deliberate_start`/`deliberate_continue` call of theirs (bound directly 
 included) whose `advanced.llm` reads as `external` (the engine's own reading) or that carries any `consent_external` key
 (top level or in `advanced`, whatever its value; JSON-string arguments are read the way FastMCP pre-parses them) is
 refused with a tool error and never sent — the gateway relays such a call under the user's identity, so a forged flag
-would start an external deliberation and record a consent nobody gave. Consent comes only from the person's own client.
-Calls without those fields are unchanged.
+would start an external deliberation and record a consent nobody gave. The same refusal covers the risk app's job start
+(X-D7 ④): a `risk_start_job` call of theirs (bound directly or through `invoke_tool`, aliases included) whose `llm`
+reads as `claude` or `external` (trimmed, case-insensitive) or that carries any `consent_external` key, and the gateway
+REST bridge: a `rest_call` whose `body` carries any `consent_external` key (any site or path), or whose `path` is one of
+the risk app's job routes (`…/targets/<key>/jobs`, `…/jobs/<id>/<action>`) with a `body.llm` of `claude`/`external`.
+Consent comes only from the person's own client. Calls without those fields are unchanged.
 
 **Card review.** `GET /card-review/limits?llm=external` and `llm: "external"` in the `plan`/`run` bodies select it
 (absent or `glm` = this server's LLM, unchanged; any other value is 422 `bad_request`). The external limits are
