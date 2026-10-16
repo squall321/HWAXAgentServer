@@ -375,6 +375,14 @@ the existing paths with `cause`: `warning{code: seat_lost, cause}`, skip warning
 anything runs (in that order; MCP: `ValueError` `"<code>: …"`, no job is created). `bad_request` is an `llm` value other
 than absent, `glm` or `external` (trimmed, case-insensitive) — refused whether the switch is on or off, as card review
 does; it never runs on this server's LLM instead. `delib_opts.timeout_s` does not apply to the external responder.
+**Target key** (X-D8 ⑦): an external deliberation may carry `delib_opts.target_key` (MCP `advanced.target_key`) — the risk
+app's target key, `diff:<id>` or `snap:<id>` (`<id>` letters, digits, `_`, `-`; at most 64). It is put on every task of
+that deliberation (`review_task_next`'s `target_key` and the task record) so the workflow can tell which job a task
+belongs to; the risk app's issue-panel questions start with `[쟁점 …]`, so the question head
+(`[리스크심사 <code> <target_key>]`) cannot supply it. When absent or empty the head is read as before; when both are
+present the field wins. Another shape is refused before anything runs with `bad_request` (switch on or off). It is used
+for nothing else (not the prior-report filter), and a GLM deliberation does not read it at all — sent or not, valid or
+not, the GLM path is unchanged.
 External MCP jobs (`deliberate_start`/`deliberate_continue`) take **no slot of `DELIB_JOB_MAX_RUNNING`** (nor of
 `DELIB_JOB_MAX_RUNNING_PER_USER` — both count GLM jobs only): a human-paced worker must not hold the GLM deliberation
 slots for hours. Instead one external deliberation runs per owner (the task owner); the owner's next ones wait in the

@@ -30,9 +30,12 @@ OWNER = "owner@x.com"
 SEATS = [{"key": "mech-a", "role": "기구"}, {"key": "rel-b", "role": "신뢰성"}, {"key": "pcb-c", "role": "보드"}]
 TK = "diff:" + "ab" * 16
 Q = f"[리스크심사 S26 Ultra {TK}] 쟁점 패널 — 보스 간극"
+# 리스크 앱 쟁점 패널의 질문 꼴(issues.issue_question) — '[쟁점 …]' 로 시작해 위 머리가 없다. 대상 열쇠는 delib_opts.target_key 로 온다.
+Q_ISSUE = ("[쟁점 iss-0123456789ab · held_fail] 부품 보스 의 치수 변경에서 메커니즘 낙하 응력(mechanical.drop_stress) 이 성립하는가."
+           " 결정문의 finding 은 mechanism·mechanism_detail·subject·change_kind 네 필드를 [근거] I1 의 값 그대로 쓴다.")
 PANEL = {"personas": SEATS, "free_tools": 1, "tool_budget": 3, "tools": [], "voc": "off", "rescreen": 0,
          "chair_template": "risk-review", "save_report": 0, "started_by": "app", "rounds": 3, "llm": "external",
-         "consent_external": True,
+         "consent_external": True, "target_key": TK,
          "evidence": [{"key": "I1", "source": "쟁점 닻", "result": f"{TK} · mechanical.drop_stress · ck:0123456789ab"}]}
 
 
@@ -66,8 +69,9 @@ def on(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
 
 
-def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None, brain=None):
-    """쟁점 패널 하나를 끝까지 — (사건, 일꾼, create_react_agent 에 묶인 도구, 도구 사전, 줄). brain 을 주면 일꾼이 그것으로 답한다."""
+def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None, brain=None, question=Q):
+    """쟁점 패널 하나를 끝까지 — (사건, 일꾼, create_react_agent 에 묶인 도구, 도구 사전, 줄). brain 을 주면 일꾼이 그것으로 답한다.
+    opts 의 값이 None 이면 PANEL 에서 그 칸을 뺀다(보내지 않은 것과 같다)."""
     import langgraph.prebuilt
 
     tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
@@ -87,7 +91,8 @@ def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry
         w = FakeWorker(user or "nobody@x.com", poll_s=0.05, **({"brain": brain} if brain else {})) if worker else None
         serve = asyncio.ensure_future(w.serve()) if w else None
         out = []
-        gen = (entry or d.run_deliberation)(stub, Q, [], {**PANEL, **(opts or {})}, user)
+        sent = {k: v for k, v in {**PANEL, **(opts or {})}.items() if not (k in (opts or {}) and v is None)}
+        gen = (entry or d.run_deliberation)(stub, question, [], sent, user)
         try:
             async for chunk in gen:
                 out.append(delib_jobs._parse_sse(chunk))
@@ -262,3 +267,65 @@ def test_심의_요청의_llm_읽기():
 
 def test_꺼진_서버의_심의_옵션_안내에는_llm_이_없다():
     assert "llm(판단 LLM" not in m._ADV_DESC
+
+
+# ── 대상 열쇠(delib_opts.target_key — X-D8 ⑦) ───────────────────────────────────────
+def test_쟁점_패널_꼴의_외부_심의는_delib_opts_의_대상_열쇠를_과제_머리에_싣는다(monkeypatch, ctx_1m, on):
+    """리스크 앱 쟁점 패널의 질문은 '[쟁점 …]' 로 시작해 리스크심사 머리가 없다 — 종전엔 그 심의의 과제 머리에 target_key 가 없어 제 대상의
+    과제만 답하는 워크플로가 그 과제를 알아보지 못했다. delib_opts.target_key 가 그 칸(과제 기록 · review_task_next 머리)을 채운다. 없으면
+    종전 그대로 비고, 질문 머리와 둘 다 있으면 그 칸이 이긴다."""
+    events, w, *_ = _panel(monkeypatch, question=Q_ISSUE)
+    assert not [data for ev, data in events if ev == "error"], events[-3:]
+    heads = [s["head"] for s in w.seen]
+    assert heads and {h.get("target_key") for h in heads} == {TK} and {h["kind"] for h in heads} == {"deliberation"}
+    events, w, *_ = _panel(monkeypatch, {"target_key": None}, question=Q_ISSUE)
+    assert w.seen and {s["head"].get("target_key", "") for s in w.seen} == {""}, "그 칸 없이는 쟁점 패널 과제에 대상 열쇠가 없다"
+    other = "snap:" + "cd" * 16
+    events, w, *_ = _panel(monkeypatch, {"target_key": other})            # 질문 머리(Q 의 TK)와 칸이 다르면 칸이다
+    assert w.seen and {s["head"].get("target_key") for s in w.seen} == {other}
+
+
+_BAD_TARGET_KEYS = ["diff:", "ab" * 16, "diff:ab cd", "x:abc", "diff:ab\n", " diff:ab", "diff:" + "a" * 65, "diff:a]b", 123,
+                    ["diff:ab"], {"k": "diff:ab"}, True]
+
+
+@pytest.mark.parametrize("bad", _BAD_TARGET_KEYS, ids=range(len(_BAD_TARGET_KEYS)))
+def test_꼴이_맞지_않는_대상_열쇠는_외부_심의를_열기_전에_bad_request_다(monkeypatch, ctx_1m, bad):
+    """리스크 앱 대상 열쇠('diff:<id>' · 'snap:<id>')의 꼴이 아니면 과제를 만들기 전에 bad_request → done 이다(엔진의 다른 bad_request 와
+    같은 꼴). 스위치를 끈 서버에서도 먼저 본다(모르는 llm 값과 같다). MCP 잡 시작도 잡을 만들기 전에 같은 코드로 거절한다."""
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    events, _w, _b, _t, board = _panel(monkeypatch, {"target_key": bad}, worker=False, question=Q_ISSUE)
+    assert [ev for ev, _ in events] == ["error", "done"] and events[0][1]["code"] == "bad_request", events
+    assert "target_key" in events[0][1]["message"] and board.counts() == {"queued": 0, "claimed": 0}
+    monkeypatch.delenv("EXTERNAL_LLM_ENABLED")
+    events, *_ = _panel(monkeypatch, {"target_key": bad}, worker=False, question=Q_ISSUE)
+    assert [ev for ev, _ in events] == ["error", "done"] and events[0][1]["code"] == "bad_request", events
+
+
+def test_MCP_심의_시작도_꼴이_맞지_않는_대상_열쇠면_잡을_만들기_전에_거절한다(monkeypatch, tmp_path, ctx_1m, on):
+    with pytest.raises(ValueError, match="^bad_request: delib_opts.target_key"):
+        _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "target_key": "diff:a b"})
+    assert delib_jobs._JOBS == {}
+
+
+@pytest.mark.parametrize("tk", [TK, "꼴이 틀린 값 ]", 123], ids=["valid", "bad_shape", "not_str"])
+def test_GLM_심의는_대상_열쇠를_읽지_않는다(monkeypatch, ctx_1m, on, tk):
+    """GLM 심의(llm 없음)는 target_key 를 보내도 — 꼴이 틀려도 — 읽지 않는다: 같은 심의를 그 칸 없이 돌린 것과 사건 · LLM 이 받은 글이
+    같다(거절도 없다)."""
+    def run(extra: dict):
+        seen = []
+
+        async def fake_llm(_llm, system, human):
+            seen.append((system, human))
+            return delib_respond(system, human)
+
+        monkeypatch.setattr(d, "_llm_text", fake_llm)
+        events, *_ = _panel(monkeypatch, {"llm": None, "consent_external": None, "free_tools": 0, **extra}, worker=False,
+                            question=Q_ISSUE)
+        return events, seen
+
+    base, base_seen = run({"target_key": None})
+    got, got_seen = run({"target_key": tk})
+    assert not [data for ev, data in got if ev == "error"]
+    assert got == base and got_seen == base_seen
+    assert d._resolve_opts({"target_key": tk}).target_key == "" and d._resolve_opts({"llm": "external", "target_key": TK}).target_key == TK

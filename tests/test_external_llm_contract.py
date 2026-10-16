@@ -282,7 +282,7 @@ def _mcp_examples(monkeypatch) -> dict:
 
 def _delib_frames(monkeypatch) -> dict:
     """쟁점 패널 모양의 심의를 실제로 돌려 외부 응답자에 걸린 프레임만 — 시작 상태줄 · 알림 카드 · 결과 칸 · 한도의 cause · 거절."""
-    from test_external_llm_delib import PANEL, Q, _panel  # noqa: PLC0415 — 같은 하네스를 쓴다
+    from test_external_llm_delib import PANEL, Q, Q_ISSUE, _panel  # noqa: PLC0415 — 같은 하네스를 쓴다
 
     out = {}
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
@@ -294,6 +294,9 @@ def _delib_frames(monkeypatch) -> dict:
     res = next(data for ev, data in events if ev == "result")
     out["result"] = {**{k: v for k, v in res.items() if k != "content"},
                      "content": res["content"].split("\n", 1)[0] + "\n…(결정문 — 줄임)"}
+    # 쟁점 패널 질문('[쟁점 …]' — 리스크심사 머리가 없다)의 외부 과제 머리 — delib_opts.target_key 가 대상 열쇠를 싣는다(X-D8 ⑦)
+    events, w, *_ = _panel(monkeypatch, question=Q_ISSUE)
+    out["issue_panel_task_head"] = {k: w.seen[0]["head"][k] for k in ("kind", "target_key", "label")}
     events, *_ = _panel(monkeypatch, worker=False, board=x.Board(x.Settings(wait_s=300.0), clock=scaled(), tick=0.02))
     out["seat_lost_absent"] = next(data for ev, data in events if ev == "warning" and data.get("code") == "seat_lost")
     out["chair_failed_absent"] = next(data for ev, data in events if ev == "error")
@@ -307,6 +310,8 @@ def _delib_frames(monkeypatch) -> dict:
     events, *_ = _panel(monkeypatch, {"llm": "claude"}, worker=False)      # 꺼진 서버에서도 — 모르는 값은 스위치보다 먼저 본다
     out["refused_bad_request"] = events[0][1]
     out["_how"] = {"request": {"question": Q, "delib_opts": PANEL},
+                   "issue_panel_task_head": {"question": Q_ISSUE, "delib_opts": "request.delib_opts 그대로(target_key 포함)",
+                                             "shows": "review_task_next 머리의 kind · target_key · label"},
                    "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
                    "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",
                    "bad_request": "llm 에 모르는 값('claude') — 스위치가 꺼진 서버에서도 bad_request 다(받는 값은 glm·external)"}
@@ -375,5 +380,9 @@ def test_예제가_계약의_칸을_싣는다():
     assert (frames["refused_disabled"]["code"], frames["refused_owner_missing"]["code"],
             frames["refused_consent_required"]["code"], frames["refused_bad_request"]["code"]) == (
         "external_llm_disabled", "external_owner_missing", "external_consent_required", "bad_request")
+    # 쟁점 패널 질문에는 리스크심사 머리가 없다 — 과제 머리의 대상 열쇠는 delib_opts.target_key 에서 온다(X-D8 ⑦)
+    tk = frames["_how"]["request"]["delib_opts"]["target_key"]
+    assert tk.startswith("diff:") and frames["issue_panel_task_head"] == {"kind": "deliberation", "target_key": tk,
+                                                                         "label": "risk-review"}
     assert _load("req_verdict_ok.json")["consent_external"] is True, "외부 run 예제 본문에 반출 동의 표지가 있어야 한다"
     assert (lim["gate"]["limit_reason"], lim["gate"]["limit"]) == ("external_per_owner", 8)

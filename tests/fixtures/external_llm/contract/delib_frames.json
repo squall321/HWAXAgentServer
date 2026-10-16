@@ -17,6 +17,11 @@
   "tool_mode": "evidence_only",
   "content": "■ 외부 응답자 실행 — 판단 LLM 은 외부 응답자(잡 주인이 돌린 Claude Code 워크플로 — 모델은 그 사람이 고른 것)였고, 좌석 도구 호출이 없는 evidence_only 로 돌았다(좌석은 [근거]와 지식카드만으로 발언했다).\n…(결정문 — 줄임)"
  },
+ "issue_panel_task_head": {
+  "kind": "deliberation",
+  "target_key": "diff:abababababababababababababababab",
+  "label": "risk-review"
+ },
  "seat_lost_absent": {
   "code": "seat_lost",
   "message": "1라운드 좌석 유실 — mech-a, rel-b, pcb-c, delib-baseline-defender 이(가) 이 라운드에 발언하지 못했다(mech-a, rel-b, pcb-c, delib-baseline-defender · 외부 응답자가 이 과제를 300초 동안 집지 않았다 — 그동안 잡 주인의 워크플로가 아무 과제도 집거나 내지 않았다(돌고 있지 않거나 다른 신원으로 붙었다). Claude Code 워크플로를 잡 주인의 PAT 로 다시 돌린 뒤 같은 호출을 다시 낸다(external_worker_absent)). 그 도메인의 판단이 빠진 채 진행한다.",
@@ -75,6 +80,7 @@
     "rounds": 3,
     "llm": "external",
     "consent_external": true,
+    "target_key": "diff:abababababababababababababababab",
     "evidence": [
      {
       "key": "I1",
@@ -83,6 +89,11 @@
      }
     ]
    }
+  },
+  "issue_panel_task_head": {
+   "question": "[쟁점 iss-0123456789ab · held_fail] 부품 보스 의 치수 변경에서 메커니즘 낙하 응력(mechanical.drop_stress) 이 성립하는가. 결정문의 finding 은 mechanism·mechanism_detail·subject·change_kind 네 필드를 [근거] I1 의 값 그대로 쓴다.",
+   "delib_opts": "request.delib_opts 그대로(target_key 포함)",
+   "shows": "review_task_next 머리의 kind · target_key · label"
   },
   "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
   "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",

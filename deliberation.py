@@ -1025,6 +1025,9 @@ def _ra_report_title(question: str) -> str:
 # 알림 없이 꺼졌다(m1 2차 AF2-D18-code-space). 코드에는 ']' 가 없다고 둔다 — 머리 뒤 본문의 대괄호까지 코드로 삼키지 않게.
 _RISK_Q_MARK = "[리스크심사"
 _RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 ([^\]]+) ([^\s\]]+)\]")
+# 외부 응답자 심의의 대상 열쇠(delib_opts.target_key — X-D8 ⑦) — 리스크 앱 대상 열쇠의 꼴('diff:<id>' · 'snap:<id>', id 는 앱 DB 의
+# uuid hex). 쟁점 패널 질문은 '[쟁점 …]' 로 시작해 위 머리가 없으므로 앱이 이 칸으로 준다 — 외부 과제 머리와 과제 기록에만 싣는다.
+_RISK_TARGET_KEY_RE = re.compile(r"(?:diff|snap):[0-9A-Za-z][0-9A-Za-z_-]{0,63}")
 _RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서 {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 "
                         "읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
 # 과제 코드를 모르는 리스크 심사(머리 없는 손수 길 · 머리를 읽지 못한 길) — 같은 과제를 가릴 수 없어 심의 보고서를 전부 뺀다.
@@ -1254,6 +1257,12 @@ def _external_refusal(app, req_opts, user: str) -> dict | None:
                            "LLM 으로 조용히 돌리지 않는다."}
     if not _wants_external(req_opts):
         return None
+    # 대상 열쇠(X-D8 ⑦) — 외부 심의에서만 본다(GLM 심의는 이 칸을 읽지 않는다). 없거나 빈 글이면 질문 머리에서 읽는다(종전).
+    _tk = req_opts.get("target_key")
+    if _tk not in (None, "") and not (isinstance(_tk, str) and _RISK_TARGET_KEY_RE.fullmatch(_tk)):
+        return {"code": "bad_request",
+                "message": f"delib_opts.target_key 의 꼴이 맞지 않다({_delib_preview(_tk, 60)}) — 리스크 앱 대상 열쇠('diff:<id>' · "
+                           "'snap:<id>')만 받는다(외부 응답자 과제 머리의 표지다). 이 심의는 시작하지 않았다(과제를 만들지 않았다)."}
     if external_llm.board_of(app) is None:
         cfg = external_llm.config()
         return {"code": "external_llm_disabled",
@@ -1386,6 +1395,8 @@ def _resolve_opts(req_opts):
         # 판단 LLM — glm(기본, 이 서버의 심의 LLM) | external(외부 응답자 — 좌석 도구 호출이 없는 evidence_only 로 돈다).
         # external_closed 는 그 때문에 닫힌, 호출자가 열려던 손잡이다(스트림이 카드로 알린다 — 봉인의 sealed_reopen 과 같다).
         llm="glm", external_closed=[],
+        # 외부 응답자 과제 머리의 대상 열쇠(X-D8 ⑦) — external 일 때만 읽는다(GLM 심의는 보내도 읽지 않는다). 비면 질문 머리에서.
+        target_key="",
     )
     if isinstance(req_opts, dict):
         o.started_by = _started_by(req_opts.get("started_by"))
@@ -1395,6 +1406,10 @@ def _resolve_opts(req_opts):
         _lv = str("" if _llm is None else _llm).strip().lower()
         if _lv == "external":
             o.llm = "external"
+            # 대상 열쇠 — 꼴이 맞는 것만(맞지 않으면 입구 _external_refusal 이 먼저 bad_request 로 거절한다)
+            _tk = req_opts.get("target_key")
+            if isinstance(_tk, str) and _RISK_TARGET_KEY_RE.fullmatch(_tk):
+                o.target_key = _tk
         elif _lv not in ("", "glm"):
             o.req_unread["llm"] = f"llm={_delib_preview(_llm, 40)}(대신 glm 으로 돈다 — glm|external)"
         # 봉인은 읽기 **전에** 덮는다 — 아래는 호출자 값이 아니라 닫힌 값을 읽는다. 읽은 뒤에 고치면
@@ -4553,9 +4568,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _ext = getattr(opts, "llm", "glm") == "external"
     if _ext:
         _qm = _RISK_Q_HEAD_RE.search(question or "")
+        # 대상 열쇠 — 앱이 준 delib_opts.target_key 가 먼저(X-D8 ⑦ — 쟁점 패널 질문은 '[쟁점 …]' 로 시작해 머리가 없다), 없으면 질문
+        # 머리('[리스크심사 <과제코드> <target_key>]'). 과제 머리 · 과제 기록에만 쓰고 다른 데(앞 패널 보고서 거름 따위)에는 쓰지 않는다.
         llm = external_llm.model_for(app, owner=external_llm.task_owner.get() or user, kind="deliberation",
                                      run_id=f"delib-{uuid.uuid4().hex[:12]}",
-                                     target_key=_qm.group(2) if _qm else "", label=str(opts.chair_template or ""))
+                                     target_key=getattr(opts, "target_key", "") or (_qm.group(2) if _qm else ""),
+                                     label=str(opts.chair_template or ""))
         if llm is None:
             yield _sse("error", _external_refusal(app, {"llm": "external"}, user)
                        or {"code": "external_llm_disabled", "message": "외부 응답자 길이 꺼져 있다"})
