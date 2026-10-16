@@ -327,6 +327,9 @@ class _ChatLLMWatch(BaseCallbackHandler):
     """챗 전용 LLM 의 넘김을 센다 — 앞(챗 서버)의 마지막 실패 사유와 뒤(VLLM_*)가 넘겨받은 호출 수 · 시각. /health 의 chat_llm 이 읽는다.
     뒤 인스턴스는 챗의 넘김에만 쓰는 따로 만든 것이라(app.state.llm 과 다르다) 그 시작이 곧 넘김 한 번이다."""
 
+    # 이벤트 루프 안에서 돈다(동기 처리기는 기본이면 스레드 풀로 가 계수가 겹칠 수 있다) — 하는 일은 수 세기와 한 줄뿐이다.
+    run_inline = True
+
     def __init__(self, info: dict, role: str) -> None:
         self.info, self.role, self._said = info, role, 0.0
 
@@ -3194,7 +3197,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     그대로면 창이 작은 챗 서버(Qwen 262,144)에 넘치는 요청을 보낸다(400). 작은 값이면 VLLM_* 로 넘겨도 맞는다.
     외부 응답자와 같은 문맥 변수(_external_llm.ctx_override)를 이 턴의 태스크에만 건다(HWAXPortal docs/chat-llm-stcx)."""
     tok = None
-    chat_ctx = await asyncio.to_thread(_chat_context_tokens)
+    # 챗 전용 LLM 이 없는 박스(dev 등)는 스레드를 오가지 않는다 — 종전 턴과 똑같다.
+    chat_ctx = await asyncio.to_thread(_chat_context_tokens) if getattr(app.state, "chat_llm_cfg", None) else None
     if chat_ctx:
         base_ctx = await asyncio.to_thread(_model_context_tokens)
         tok = _external_llm.ctx_override.set(min(chat_ctx, base_ctx))
