@@ -1299,7 +1299,10 @@ _PERSONA_PREFER_N = _env_int("CHAT_PERSONA_PREFER_N", 12)
 # 강하다 → 둘을 RRF 로 합친다. e5 는 절대 유사도가 전반적으로 높아(무관 쌍도 0.8+) 임계값이
 # 아니라 상대 순위로만 쓴다.
 AIDH_HTTP = os.environ.get("AIDH_HTTP_BASE", "http://127.0.0.1:8001")
-_TOOL_VEC: dict = {"sig": "", "names": [], "vecs": []}
+_TOOL_VEC: dict = {"sig": "", "names": [], "vecs": [], "space": None}
+# AIDataHub /api/embed 가 마지막으로 낸 임베딩 공간 — (모델 이름, 차원). 임베더가 바뀌면(예 e5-base 768 → BGE-M3 1024) 옛 공간의 도구
+# 벡터와 견주지 않게 캐시가 이것을 함께 본다(포털 docs/embedder-bge-m3).
+_EMBED_SPACE: dict = {"space": None}
 
 
 # 임베딩 배치 크기 — 한 요청에 전량(도구 196개)을 보내면 GPU 여유에 따라 터진다. 실측은
@@ -1322,7 +1325,11 @@ def _embed(texts: list, kind: str = "passage") -> list:
         req = urllib.request.Request(f"{AIDH_HTTP}/api/embed", data=body,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
-            out.extend((json.loads(r.read()) or {}).get("vectors") or [])
+            data = json.loads(r.read()) or {}
+        vecs = data.get("vectors") or []
+        out.extend(vecs)
+        if vecs:
+            _EMBED_SPACE["space"] = (str(data.get("model") or ""), len(vecs[0]))
     return out
 
 
@@ -1332,7 +1339,7 @@ def _ensure_tool_vecs(tools: list) -> None:
     names = sorted(getattr(t, "name", "") for t in tools)
     # 개수+첫/끝만 보면 중간 교체를 놓친다 — 전체 이름 해시로 정확히 무효화.
     sig = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
-    if _TOOL_VEC["sig"] == sig and _TOOL_VEC["vecs"]:
+    if _TOOL_VEC["sig"] == sig and _TOOL_VEC["vecs"] and _TOOL_VEC["space"] == _EMBED_SPACE["space"]:
         return
     by = {getattr(t, "name", ""): t for t in tools}
     texts = [f"{n}: {(getattr(by[n], 'description', '') or '')[:400]}" for n in names]
@@ -1342,7 +1349,7 @@ def _ensure_tool_vecs(tools: list) -> None:
         print(f"[tools] embed failed: {exc!r}")
         return
     if len(vecs) == len(names):
-        _TOOL_VEC.update({"sig": sig, "names": names, "vecs": vecs})
+        _TOOL_VEC.update({"sig": sig, "names": names, "vecs": vecs, "space": _EMBED_SPACE["space"]})
         print(f"[tools] semantic index: {len(names)}개")
 
 
@@ -1359,6 +1366,12 @@ def _semantic_order(query: str, tools: list) -> list:
         return []
     if not qv:
         return []
+    if _TOOL_VEC["space"] != _EMBED_SPACE["space"]:
+        # 질의가 다른 공간에서 왔다(AIDataHub 임베더가 바뀌었다) — 옛 도구 벡터와 견주면 zip 이 차원을 말없이 잘라 엉뚱한 순서가
+        # 된다. 다시 짓고, 그래도 공간이 다르면 의미 순서를 내지 않는다(어휘 순서만 쓴다).
+        _ensure_tool_vecs(tools)
+        if _TOOL_VEC["space"] != _EMBED_SPACE["space"] or not _TOOL_VEC["vecs"]:
+            return []
     import math
     q = qv[0]
     qn = math.sqrt(sum(x * x for x in q)) or 1.0
