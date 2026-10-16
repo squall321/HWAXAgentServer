@@ -29,6 +29,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+import call_trace
 import external_llm
 from deliberation import (
     _CHAIR_RESERVE,
@@ -3178,6 +3179,9 @@ async def run(app, prep: dict):
     t0 = time.monotonic()
     tag = (f"summary/- synth {_frame_safe(ctx['scope'].get('key'))[:80]}" if kind == "summary" else
            f"{kind}/{variant or '-'} {ctx['expert'].get('key', '')} {ctx['unit_id'] or '-'}")
+    # 호출 추적의 자리 id — 이 제너레이터를 돌리는 태스크와 아래 LLM 태스크에 붙는다(꺼져 있으면 아무것도 안 한다).
+    call_trace.tag(kind=f"card-review:{kind}", seat=(ctx.get("expert") or {}).get("key"), unit=ctx.get("unit_id"),
+                   target=req.get("target_key"))
     st = {"outcome": "cancelled", "truncated": False, "repaired": False, "launched": 0}
     per: list = []                       # 시도마다 {n, tokens_in, tokens_out} — 실패한 시도는 None 둘
     llm_ms: list = []

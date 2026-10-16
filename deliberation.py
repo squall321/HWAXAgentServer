@@ -13,6 +13,7 @@ import uuid
 from types import SimpleNamespace
 from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
 
+import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
@@ -2928,6 +2929,7 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
     fails: 주면 실패한 좌석의 예외를 {좌석 키: 예외} 로 적는다 — 호출부가 유실 사유를 알린다
     (as_completed 는 어느 좌석의 태스크였는지 돌려주지 않는다)."""
     async def _one(p, prompt, validator):
+        call_trace.tag(round=rnd, seat=p.get("key"))   # 좌석마다 제 태스크라 그 좌석의 호출에만 붙는다
         try:
             return await _persona_round(llm, p, prompt, required, validator, opts=opts)
         except Exception as exc:  # noqa: BLE001 — 다시 올린다. 누구의 실패인지만 적어 둔다
@@ -3779,6 +3781,7 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
     """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록, 실패사유) 반환.
     발언(JSON 계약)과 분리된 이유: 도구 호출 모델은 왕복 후 스키마 계약을 곧잘 어긴다(실측) —
     조회는 여기서, 발언은 종전대로 도구 없는 텍스트 턴에서."""
+    call_trace.tag(seat=persona.get("key"))   # 좌석마다 제 태스크(ensure_future)로 돈다 — 라운드는 심의 태스크가 단 것을 물려받는다
     # 조회 지침 — 리스크 심사 좌석에만 있다(_rr_one 이 단다). 역할은 앞 280자만 실려 계약의 '필수 도구' 줄이 이
     # 단계에 닿지 않았다. 지침이 없는 좌석은 글이 한 글자도 바뀌지 않는다.
     _hint = str(persona.get("lookup_hint") or "")
@@ -4337,6 +4340,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     좌석 설계가 핵심이다 — CAE 전문가만 모으면 틀린 물리를 아름답게 계산한다. 그래서 2단은
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
+    call_trace.tag(kind="sim-delib")
     _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
@@ -4472,6 +4476,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
+    call_trace.tag(kind="delib")      # 호출 추적의 자리 — 이 제너레이터를 돌리는 태스크(웹 _detach_stream · MCP 잡)에 붙는다
     _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
@@ -4499,6 +4504,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     계측이 빠지면 측정할 수 없는 것을 계획에 넣고, 해석이 빠지면 결과에 영향 없는 물성을
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
+    call_trace.tag(kind="test-plan")
     _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
@@ -5392,6 +5398,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _nv_told = False          # 리스크 앱 읽기 도구의 not_visible 을 알렸나 — 심의에 한 번(라운드마다 같은 말을 되풀이하지 않는다)
 
     for rnd in range(1, N + 1):
+        call_trace.tag(round=rnd)      # 이 라운드에서 만드는 좌석 태스크가 물려받는다(마지막 라운드 뒤의 의장·요약 호출에도 남는다)
         kind = _kind(rnd)
         prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
         prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")

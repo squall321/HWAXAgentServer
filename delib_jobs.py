@@ -25,6 +25,8 @@ import time
 import uuid
 from pathlib import Path
 
+import call_trace
+
 log = logging.getLogger("agent.delib_jobs")
 
 
@@ -713,6 +715,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
 
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
+        ctx.run(call_trace.tag, job=job_id)      # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
         return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job_id}")
 
     _PENDING[job_id] = (job, spawn)

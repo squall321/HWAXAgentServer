@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
+import call_trace
+
 
 log = logging.getLogger("agent.external_llm")
 
@@ -651,8 +653,9 @@ def model_for(app, *, owner: str, kind: str, run_id: str = "", target_key: str =
     b = board_of(app)
     if b is None:
         return None
-    return _model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
-                          run_id=run_id, target_key=target_key, label=label)
+    # 호출 추적(CALL_TRACE_URL)이 켜져 있으면 과제 하나의 기다림을 'external' 서버의 호출로 남긴다(꺼져 있으면 그대로).
+    return call_trace.instrument_llm(_model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
+                                                    run_id=run_id, target_key=target_key, label=label), "external")
 
 
 def health_fields(board: Board) -> dict:
