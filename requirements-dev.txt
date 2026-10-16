@@ -1,2 +1,5 @@
 # 개발용 — 권한 필터링 단위 테스트 실행 (pytest test_app.py)
 pytest==8.3.4
+# 호출 추적 시험이 보낸 바이트를 공식 OTLP 정의로 읽어 맞댄다(tests/test_call_trace.py — 없으면 그 대조만 건너뛴다). 운영 박스에는 깔지 않는다.
+opentelemetry-proto==1.45.0
+protobuf==7.36.2

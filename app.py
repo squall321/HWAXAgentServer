@@ -97,6 +97,7 @@ from deliberation import (
     strip_test_plan_trigger,
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
+import call_trace as _call_trace
 import external_llm as _external_llm
 import review_gate as _review_gate
 from langgraph.errors import GraphRecursionError
@@ -351,7 +352,8 @@ async def lifespan(app: FastAPI):
             kw["max_tokens"] = max_tokens
         if effort:
             kw["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": effort}}
-        return ChatOpenAI(**kw)
+        # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py).
+        return _call_trace.instrument_llm(ChatOpenAI(**kw), _call_trace.server_label(VLLM_BASE_URL))
 
     base_t = _env_float("LLM_TEMPERATURE", 0.0)
     base_mt = _env_int("LLM_MAX_TOKENS", 0)
@@ -391,6 +393,8 @@ async def lifespan(app: FastAPI):
         print(_external_llm.startup_note(_ext_board.settings, _x_read, _x_tries))
     if disable_stream:
         print("[agent] LLM_DISABLE_STREAMING=1 — 토큰 스트리밍 비활성(도구호출 우선 모드)")
+    if _call_trace.startup_note():
+        print(_call_trace.startup_note())
     app.state.connections = _load_mcp_config()
     # 삽입 순서를 LRU 로 쓴다(dict 는 순서를 보존한다). 상한은 _agent_for 가 강제한다.
     app.state.agent_cache = {}  # (groups, pins, query, sources, user, cred) -> ReAct agent
@@ -1931,7 +1935,7 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
             # 받으면 도구 없는 에이전트가 만들어진다. 마지막 시도가 아니면 재시도.
             if not got and i < tries - 1:
                 raise RuntimeError("empty tool list")
-            return got
+            return _call_trace.wrap_tools(got)     # 호출 추적이 켜져 있을 때만 도구마다 시간·성패를 잰다(꺼져 있으면 그 목록 그대로)
         except Exception as e:  # noqa: BLE001
             last = e
             s = repr(e) + " " + str(e)
@@ -3885,6 +3889,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if denied:
         # 메뉴를 숨겨도 슬래시 명령은 손으로 칠 수 있다 — 트리거를 아는 이쪽이 마지막으로 막는다.
         return StreamingResponse(_deny_stream(denied), media_type="text/event-stream", headers=SSE_HEADERS)
+    # 호출 추적의 자리 id — 이 턴의 LLM·도구 호출이 한 묶음이 된다(심의·띵킹은 엔진이 kind 를 고쳐 단다). 꺼져 있으면 아무것도 안 한다.
+    _call_trace.tag(kind="chat", turn=_call_trace.new_id())
     # 누가 띄운 심의인가 — 리스크 앱 러너의 패널은 app(카드 대조 관문의 절반 판정에 세지 않는다 — M3.md #26).
     started_by = _started_by(req.delib_opts.get("started_by") if isinstance(req.delib_opts, dict) else None)
     if is_sim_deliberation(req.message):

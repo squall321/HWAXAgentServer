@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 
+import call_trace
 from deliberation import (
     _KN_CONC,
     _room,
@@ -234,6 +235,7 @@ def _judge_prompt(seat: dict, question: str, docs: str = "") -> str:
 async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
                      docs: str = "") -> dict:
     """좌석 1명의 자기판정 + (가능하면) 답변. 실패·시간초과는 pass 가 아니라 error 로 남긴다."""
+    call_trace.tag(seat=seat.get("key"))      # 호출 추적 — 좌석마다 제 태스크(ensure_future)라 그 좌석의 호출에만 붙는다
     async with sem:
         try:
             raw = await asyncio.wait_for(
@@ -336,6 +338,7 @@ THINK_DOC_SHARE = float(os.environ.get("THINK_DOC_SHARE", "0.5"))
 async def run_thinking(app, question: str, groups: list, user: str = "", user_pat: str = "",
                        history: list | None = None, documents: list | None = None):
     """띵킹 모드 SSE 제너레이터. 어떤 경로로 끝나든 result → done 으로 닫는다."""
+    call_trace.tag(kind="thinking")
     q = str(question or "").strip()
     if not q:
         yield _sse("token", {"delta": "질문을 함께 적어 주세요."})
