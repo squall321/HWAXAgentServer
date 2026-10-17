@@ -456,3 +456,68 @@ def test_창_조회는_200_만_받고_실패해도_굳히지_않으며_주기적
     clock[0] += a._CHAT_CTX_TTL_S + 1
     assert a._chat_context_tokens() == 262_144, "주기가 지나 다시 물어 실패해도 앞서 받은 창을 쓴다"
     assert len(calls) == 3 and a._chat_ctx_cache["probe_error"].endswith("HTTP 401"), "키가 바뀐 것을 다음 주기에 본다"
+
+
+def test_생각_글은_조각과_완결_응답_둘_다에서_꺼낸다():
+    """langchain-openai 는 OpenAI 규격 밖의 칸(vLLM 의 reasoning · 옛 이름 reasoning_content)을 버린다 — 챗 서버 클라이언트가 꺼내
+    additional_kwargs.reasoning_content 에 둔다(챗 화면의 접힌 '생각 중' 칸 — HWAXPortal docs/chat-depth-context C2)."""
+    llm = a._ChatServerLLM(model="q", api_key="k", base_url="http://127.0.0.1:1/v1")
+    from langchain_core.messages import AIMessageChunk
+    for key in ("reasoning", "reasoning_content"):
+        gen = llm._convert_chunk_to_generation_chunk(
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "", key: "생각 1"}}]}, AIMessageChunk, None)
+        assert gen.message.additional_kwargs.get("reasoning_content") == "생각 1", key
+        res = llm._create_chat_result({"id": "x", "object": "chat.completion", "created": 0, "model": "q",
+                                       "choices": [{"index": 0, "finish_reason": "stop",
+                                                    "message": {"role": "assistant", "content": "답", key: "생각 2"}}]})
+        assert res.generations[0].message.additional_kwargs.get("reasoning_content") == "생각 2", key
+    plain = llm._convert_chunk_to_generation_chunk({"choices": [{"index": 0, "delta": {"content": "x"}}]}, AIMessageChunk, None)
+    assert "reasoning_content" not in plain.message.additional_kwargs
+
+
+def test_챗_턴은_생각_글을_reasoning_사건으로_내고_답한_모델을_meta_로_낸다(monkeypatch, fake_server):
+    """스트리밍 · 비스트리밍 둘 다 — 생각 글은 화면의 접힌 칸으로(다음 턴 이력엔 안 넣는다), 턴 끝 meta 에 이 턴의 모델 호출 수 · 강도(C3)."""
+    glm = fake_server(model="fake-glm")
+    _glm(monkeypatch, glm)
+    chat = fake_server(model="qwen3.8-flash-next", ctx=262_144)
+    for nostream in ("0", "1"):
+        st = _boot(monkeypatch, CHAT_LLM_BASE_URL=f"{chat}/v1", CHAT_LLM_MODEL="qwen3.8-flash-next",
+                   CHAT_LLM_DISABLE_STREAMING=nostream, CHAT_LLM_MAX_RETRIES="0")
+
+        class _StubClient:
+            def __init__(self, _connections):
+                pass
+
+            async def get_tools(self):
+                return [noop]
+
+        monkeypatch.setattr(a, "MultiServerMCPClient", _StubClient)
+        state = types.SimpleNamespace(
+            llm=st.llm, chat_llm=st.chat_llm, connections={"gateway": {"url": "http://gw/mcp", "headers": {"Authorization": "Bearer x"}}},
+            agent_cache={}, tool_degraded={}, tool_load_error={}, tool_snapshot={})
+        agent = asyncio.run(a._agent_for(types.SimpleNamespace(state=state), ["admin"]))
+
+        async def built(*_a, **_k):
+            return agent
+
+        monkeypatch.setattr(a, "_agent_for", built)
+        monkeypatch.setattr(a, "_CHAT_LOAD", rg.ChatLoad())
+        monkeypatch.setattr(a.app.state, "review_gate", None, raising=False)
+        monkeypatch.setattr(a.app.state, "llm_nostream", st.llm_nostream, raising=False)
+        monkeypatch.setattr(a.app.state, "chat_llm_cfg", None, raising=False)
+        monkeypatch.setattr(a.app.state, "chat_llm_info", st.chat_llm_info, raising=False)
+        monkeypatch.setenv("CHAT_AUTO_RETRY", "0")
+
+        async def turn():
+            req = a.ChatRequest(message="안녕 생각해 줘", groups=["portal-admin"], history=[])
+            return [c async for c in a._agent_stream(a.app, req)]
+
+        chunks = asyncio.run(turn())
+        evs = [(c.decode().split("\n", 1)[0][7:], json.loads(c.decode().split("data: ", 1)[1])) for c in chunks
+               if c.startswith(b"event: ")]
+        reasoning = "".join(d.get("delta", "") for e, d in evs if e == "reasoning")
+        assert reasoning.startswith("생각: "), (nostream, evs[:6])
+        meta = [d for e, d in evs if e == "meta"]
+        assert meta and meta[-1]["models"] == {"qwen3.8-flash-next": 1} and meta[-1]["effort"] == "xhigh", meta
+        text = "".join(d.get("delta", "") for e, d in evs if e == "token")
+        assert "생각: " not in text, "생각 글은 답(token)에 섞지 않는다"

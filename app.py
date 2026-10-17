@@ -359,6 +359,33 @@ class _ChatServerLLM(ChatOpenAI):
             async for chunk in super()._astream(*a, **k):
                 yield chunk
 
+    # 생각 글 — langchain-openai 는 OpenAI 규격 밖의 칸(vLLM 의 reasoning · 옛 이름 reasoning_content)을 버린다(그 모듈의 'API scope'
+    # 주의). 챗 서버(Qwen)는 생각을 켜면 그 칸에 생각을 흘리므로, 조각 · 완결 응답에서 꺼내 additional_kwargs.reasoning_content 에 둔다 —
+    # 챗 루프가 'reasoning' 사건으로 화면의 접힌 '생각 중' 칸에 낸다(사용자 결정 10-18). 다음 턴 이력에는 넣지 않는다.
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        gen = super()._convert_chunk_to_generation_chunk(chunk, default_chunk_class, base_generation_info)
+        rc = _reasoning_in(chunk, "delta")
+        if gen is not None and rc:
+            gen.message.additional_kwargs["reasoning_content"] = rc
+        return gen
+
+    def _create_chat_result(self, response, generation_info=None):
+        res = super()._create_chat_result(response, generation_info)
+        rc = _reasoning_in(response, "message")
+        if rc and res.generations:
+            res.generations[0].message.additional_kwargs["reasoning_content"] = rc
+        return res
+
+
+def _reasoning_in(obj, part: str) -> str:
+    """OpenAI 호환 응답(조각이면 part='delta', 완결이면 'message')에서 생각 글 — vLLM 0.23 은 reasoning, 그 전 판 · 파생판은 reasoning_content."""
+    try:
+        d = obj if isinstance(obj, dict) else obj.model_dump()
+        m = ((d.get("choices") or [{}])[0] or {}).get(part) or {}
+        return str(m.get("reasoning") or m.get("reasoning_content") or "")
+    except Exception:  # noqa: BLE001 — 생각 글을 못 꺼내도 답은 그대로다
+        return ""
+
 
 def _chat_fallback_errors() -> tuple:
     """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다) · 401/403 · 첫 조각 전 스트림 침묵 ·
@@ -3434,6 +3461,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
 
 async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
+    _turn_models: dict = {}     # 이 턴의 모델 호출 수(모델 이름 → 횟수) — 턴 끝 'meta' 사건(C3)
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
     # 근거 블록·수치 대조용 — 이번 턴에 실제로 실행된 도구와 그 출력 원문.
@@ -3778,8 +3806,15 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
         _streamed_runs: set = set()
         async for event in _timed_events(agent.astream_events(inputs, version="v2", config=_cfg)):
             kind = event["event"]
-            if kind == "on_chat_model_stream":
+            if kind == "on_chat_model_start":
+                # 이 턴의 호출마다 답한 모델 — 넘김(챗 서버 → VLLM_*)이 일어나면 같은 질문에 답의 깊이가 달라지므로 메시지마다 보인다(C3).
+                _mn = str((event.get("metadata") or {}).get("ls_model_name") or event.get("name") or "?")
+                _turn_models[_mn] = _turn_models.get(_mn, 0) + 1
+            elif kind == "on_chat_model_stream":
                 _streamed_runs.add(event.get("run_id"))
+                _rc = (getattr(event["data"]["chunk"], "additional_kwargs", None) or {}).get("reasoning_content")
+                if _rc:
+                    yield _sse("reasoning", {"delta": _rc})
                 token = event["data"]["chunk"].content
                 if token:  # empty on tool-call delta chunks — guard
                     full.append(token)
@@ -3797,7 +3832,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
                                            "knob": "LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
                 if getattr(app.state, "llm_nostream", False) or event.get("run_id") not in _streamed_runs:
                     # 비스트리밍 모드(또는 이 호출만 조각 없이 끝났다) — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
-                    # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip).
+                    # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip). 생각 글도 그 호출이 끝난 뒤 한 번에.
+                    _rc = (getattr(out_msg, "additional_kwargs", None) or {}).get("reasoning_content")
+                    if _rc:
+                        yield _sse("reasoning", {"delta": _rc})
                     content = getattr(out_msg, "content", "") or ""
                     if isinstance(content, list):  # 멀티파트 content 방어
                         content = "".join(
@@ -4293,6 +4331,11 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
                 yield _sse("token", {"delta": _ev})
         except Exception as exc:  # noqa: BLE001 — 근거 표기 실패가 답변을 못 죽인다
             print(f"[agent] evidence block failed: {exc!r}")
+    if _turn_models:
+        # 답한 모델 · 생각 설정 — 화면이 메시지 아래에 보인다(C3). 챗 서버가 아닌 모델이 섞였으면 넘김이 일어났다.
+        _ci = getattr(app.state, "chat_llm_info", None) or {}
+        yield _sse("meta", {"models": dict(_turn_models), "chat_model": _ci.get("model"), "thinking": _ci.get("thinking"),
+                            "effort": _ci.get("effort"), "fallback_to": (_ci.get("fallback") or {}).get("to")})
     yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
 

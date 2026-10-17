@@ -108,8 +108,9 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
              "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
         return f"data: {json.dumps(c, ensure_ascii=False)}\n\n".encode()
 
-    async def stream(a, system: str, human: str):
-        """stream:true — 자리를 잡고(줄 서기 포함), 대본의 지연 뒤 본문을 조각으로 흘린다. 자리는 다 흘린 뒤 돌려준다."""
+    async def stream(a, system: str, human: str, think: str = ""):
+        """stream:true — 자리를 잡고(줄 서기 포함), 대본의 지연 뒤 본문을 조각으로 흘린다. 자리는 다 흘린 뒤 돌려준다.
+        think 가 있으면 본문 앞에 생각 조각(vLLM 0.23 의 delta.reasoning — 진짜 꼴)을 먼저 흘린다."""
         await take()
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
@@ -119,6 +120,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
             text, finish = respond(a, system, human)
             i = state["calls"]
             yield chunk(i, {"role": "assistant", "content": ""})
+            for k in range(0, len(think), 40):
+                yield chunk(i, {"reasoning": think[k:k + 40]})
             for k in range(0, len(text), 40):
                 yield chunk(i, {"content": text[k:k + 40]})
             yield chunk(i, {}, finish or "stop")
@@ -134,11 +137,13 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
         system = "".join(_text(m.get("content")) for m in msgs if m.get("role") == "system")
         human = "".join(_text(m.get("content")) for m in msgs if m.get("role") != "system")
         a = state["script"][min(state["calls"], len(state["script"]) - 1)]
+        # 생각을 켠 요청(chat_template_kwargs.enable_thinking=true)이면 생각 글을 낸다 — vLLM 0.23 은 message.reasoning · delta.reasoning 칸이다
+        think = ("생각: " + human[:60]) if (body.get("chat_template_kwargs") or {}).get("enable_thinking") is True else ""
         state["calls"] += 1
         state["behaviors"].append(a.behavior)
         if body.get("stream") and not (a.text is None and (a.behavior in HTTP_ERRORS or a.behavior
                                                            in ("unreachable", "timeout", "ctx_overflow"))):
-            return StreamingResponse(stream(a, system, human), media_type="text/event-stream")
+            return StreamingResponse(stream(a, system, human, think), media_type="text/event-stream")
         await take()
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
@@ -156,7 +161,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
             text, finish = respond(a, system, human)
             out = {"id": f"fake-{state['calls']}", "object": "chat.completion", "created": int(time.time()),
                    "model": model,
-                   "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                   "choices": [{"index": 0, "message": {"role": "assistant", "content": text,
+                                                        **({"reasoning": think} if think else {})},
                                 "finish_reason": finish}]}
             if a.usage:
                 out["usage"] = usage_of(system, human, text)
