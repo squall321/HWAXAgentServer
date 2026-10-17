@@ -39,7 +39,9 @@ import review_gate as rg  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 _KNOBS = ("CHAT_LLM_BASE_URL", "CHAT_LLM_MODEL", "CHAT_LLM_API_KEY", "CHAT_LLM_ENABLE_THINKING", "CHAT_LLM_DISABLE_STREAMING",
-          "CHAT_LLM_MAX_RETRIES", "CHAT_LLM_FALLBACK", "CHAT_LLM_CONTEXT_TOKENS", "LLM_DISABLE_STREAMING",
+          "CHAT_LLM_MAX_RETRIES", "CHAT_LLM_FALLBACK", "CHAT_LLM_CONTEXT_TOKENS", "CHAT_LLM_REASONING_EFFORT", "CHAT_LLM_MAX_TOKENS",
+          "CHAT_LLM_OUTPUT_RESERVE",
+          "LLM_MAX_TOKENS", "LLM_DISABLE_STREAMING",
           "LLM_REASONING_EFFORT", "LLM_TIMEOUT_S", "LLM_CONNECT_TIMEOUT_S", "LLM_MAX_RETRIES")
 
 
@@ -138,21 +140,35 @@ def test_비면_챗도_VLLM_클라이언트다(monkeypatch):
     assert st.chat_llm_info == {"enabled": False} and st.chat_llm_cfg is None
 
 
-def test_채우면_챗만_그_서버이고_생각을_끄며_심의는_그대로다(monkeypatch):
+def test_채우면_챗만_그_서버이고_생각은_최고_강도로_켜며_심의는_그대로다(monkeypatch):
+    """사용자 결정(10-18) — 기본 챗은 Qwen 의 최고 강도(xhigh). 10-17 의 '생각 끔' 을 뒤집었다(HWAXPortal docs/chat-depth-context)."""
     st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1/", CHAT_LLM_MODEL="qwen3.8-flash-next",
                LLM_REASONING_EFFORT="high")
     assert isinstance(st.chat_llm, RunnableWithFallbacks)
     primary, (fallback,) = st.chat_llm.runnable, st.chat_llm.fallbacks
     assert primary.model_name == "qwen3.8-flash-next" and primary.openai_api_base == "http://127.0.0.1:1/v1"
-    assert primary.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}, \
-        "생각 끔 · GLM 의 reasoning_effort 는 챗 서버에 보내지 않는다"
+    assert primary.extra_body == {"chat_template_kwargs": {"reasoning_effort": "xhigh", "enable_thinking": True}}, \
+        "생각 켬 · 강도는 CHAT_LLM_REASONING_EFFORT(기본 xhigh) — GLM 의 reasoning_effort 는 챗 서버에 보내지 않는다"
+    assert primary.max_tokens is None and fallback.max_tokens is None, \
+        "생각을 켜도 출력 상한은 보내지 않는다 — stcx 서버가 131,072 로 막는다(요청서 v1.1 0장, CD-D6)"
     assert fallback.model_name == a.VLLM_MODEL and fallback.openai_api_base == a.VLLM_BASE_URL
     assert fallback.extra_body == {"chat_template_kwargs": {"reasoning_effort": "high"}}, "넘겨받는 쪽은 VLLM_* 설정 그대로"
     assert st.llm.model_name == a.VLLM_MODEL and st.delib_llm.model_name == a.VLLM_MODEL, "띵킹 · 심의 준비 · 심의는 그대로"
     assert st.chat_llm_info["enabled"] and st.chat_llm_info["fallback"] == {"enabled": True, "to": a.VLLM_MODEL,
                                                                            "count": 0, "last_at": None}
-    st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1", CHAT_LLM_MODEL="q", CHAT_LLM_ENABLE_THINKING="1")
-    assert st.chat_llm.runnable.extra_body is None, "켜면 모델 기본값(아무것도 보내지 않는다)"
+    assert st.chat_llm_info["thinking"] is True and st.chat_llm_info["effort"] == "xhigh"
+    assert st.chat_llm_info["max_tokens"] is None and st.chat_llm_cfg["max_tokens"] == 0
+    assert st.chat_llm_cfg["output_reserve"] == 65536 and st.chat_llm_info["output_reserve"] == 65536, "대신 출력 몫을 비운다"
+    st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1", CHAT_LLM_MODEL="q", CHAT_LLM_ENABLE_THINKING="0",
+               LLM_MAX_TOKENS="4096")
+    assert st.chat_llm.runnable.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}, "끄면 종전 그대로"
+    assert st.chat_llm.runnable.max_tokens == 4096 and st.chat_llm_info["effort"] is None, "끄면 상한도 공용 값"
+    assert st.chat_llm_cfg["output_reserve"] == 4096, "보내는 상한이 있으면 출력 몫은 적어도 그 값(입력 + max_tokens ≤ 창)"
+    st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1", CHAT_LLM_MODEL="q", CHAT_LLM_REASONING_EFFORT="medium",
+               CHAT_LLM_MAX_TOKENS="100000", CHAT_LLM_OUTPUT_RESERVE="20000")
+    assert st.chat_llm.runnable.extra_body == {"chat_template_kwargs": {"reasoning_effort": "medium", "enable_thinking": True}}
+    assert st.chat_llm.runnable.max_tokens == 100000 and st.chat_llm_cfg["output_reserve"] == 100000, \
+        "손잡이로 상한을 보내면 그 값을 보내고, 출력 몫은 그보다 작을 수 없다"
     st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1", CHAT_LLM_MODEL="q", CHAT_LLM_FALLBACK="0")
     assert isinstance(st.chat_llm, ChatOpenAI), "넘김을 끄면 챗 서버 하나"
     st = _boot(monkeypatch, CHAT_LLM_BASE_URL="http://127.0.0.1:1/v1")
@@ -338,6 +354,31 @@ def test_챗_턴의_창은_두_서버_중_작은_쪽이고_끝나면_되돌린�
     seen.clear()
     asyncio.run(run())
     assert seen == [128_000] and "n" not in a._chat_ctx_cache
+
+
+def test_챗_턴의_창에서_출력_몫을_뗀다(monkeypatch, fake_server):
+    """보내지 않아도 입력이 창을 채우면 생각할 자리가 없어 답이 잘린다 — 상한을 보내면 vLLM 은 입력 + max_tokens 가 창을 넘을 때 400 이고
+    그 400 은 GLM 으로 넘어가 Qwen 대신 GLM 이 조용히 답한다(HWAXPortal docs/chat-depth-context CD-D4 · CD-D6). 창의 절반보다 크게는 떼지 않는다."""
+    chat = fake_server(model="qwen3.8-flash-next", ctx=262_144)
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    seen = []
+
+    async def stub(_app, _req):
+        seen.append(a._model_context_tokens())
+        yield b"x"
+
+    monkeypatch.setattr(a, "_agent_stream_turn", stub)
+    for out, want in ((65_536, 262_144 - 65_536), (0, 262_144), (400_000, 262_144 // 2)):
+        monkeypatch.setattr(a.app.state, "chat_llm_cfg", {"url": f"{chat}/v1", "model": "qwen3.8-flash-next", "key": "EMPTY",
+                                                          "ctx_fallback": 128_000, "max_tokens": 0, "output_reserve": out},
+                            raising=False)
+        monkeypatch.setattr(a, "_chat_ctx_cache", {})
+        seen.clear()
+
+        async def run():
+            return [c async for c in a._agent_stream(a.app, types.SimpleNamespace())]
+        asyncio.run(run())
+        assert seen == [want], (out, seen)
 
 
 def test_health_의_chat_llm_은_키를_싣지_않는다(monkeypatch):

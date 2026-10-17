@@ -300,8 +300,14 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
 # 안이다, CL-D9)이다(_chat_fallback_errors). 다른 400 은 VLLM_* 에서도 같은 까닭으로 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지
 # 않는다. 토큰이 흐르기 시작한 뒤의 실패는 넘기지 못한다(with_fallbacks 의 스트림 규칙).
 #   CHAT_LLM_BASE_URL · CHAT_LLM_MODEL       둘 다 있어야 켜진다. CHAT_LLM_API_KEY(기본 EMPTY)
-#   CHAT_LLM_ENABLE_THINKING   기본 0 — 생각 모드를 끈다(chat_template_kwargs.enable_thinking=false, 사용자 결정 10-17). 1 이면 모델 기본값.
+#   CHAT_LLM_ENABLE_THINKING   기본 1 — 생각을 켠다(사용자 결정 10-18 — 10-17 의 '끔' 을 뒤집었다, HWAXPortal docs/chat-depth-context).
+#                              0 이면 끈다(chat_template_kwargs.enable_thinking=false).
+#   CHAT_LLM_REASONING_EFFORT  생각 강도 — 기본 xhigh(모델 최고). medium · low. 생각을 켰을 때만 보낸다.
 #                              LLM_REASONING_EFFORT 는 VLLM_* 서버 것이라 챗 서버에 보내지 않는다.
+#   CHAT_LLM_MAX_TOKENS        챗 서버에 보내는 출력 상한(생각 + 답) — 생각을 켜면 기본 0(보내지 않는다: stcx 서버가 131,072 로 막는다 —
+#                              요청서 v1.1 0장, CD-D6), 끄면 LLM_MAX_TOKENS 를 따른다.
+#   CHAT_LLM_OUTPUT_RESERVE    챗 턴의 창에서 비워 둘 출력 몫 — 생각을 켜면 기본 65536(실측 xhigh 출력의 두 배), 끄면 0. 보내는 상한이 더
+#                              크면 그 값이다(vLLM 은 입력 + max_tokens > 창이면 400). 창의 절반까지만 뗀다(_agent_stream — CD-D4).
 #   CHAT_LLM_DISABLE_STREAMING 비우면 LLM_DISABLE_STREAMING 을 따른다 — GLM 의 스트리밍 tool_calls 유실 우회가 켜진 박스(cae00)는 챗
 #                              서버도 비스트리밍으로 시작한다. 그 서버의 스트리밍 도구 호출을 확인한 뒤 0 으로 연다. 챗 서버와 넘겨받는
 #                              VLLM_* 의 스트리밍이 달라도 글은 빠지지 않는다(_agent_stream_turn 이 호출마다 본다)
@@ -420,24 +426,32 @@ def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeou
         print(f"[agent] ⚠ {info['error']}")
         return base_llm, info, None
     key = os.environ.get("CHAT_LLM_API_KEY") or "EMPTY"
-    thinking = (os.environ.get("CHAT_LLM_ENABLE_THINKING") or "0").strip() == "1"
+    thinking = (os.environ.get("CHAT_LLM_ENABLE_THINKING") or "1").strip() == "1"
+    effort = (os.environ.get("CHAT_LLM_REASONING_EFFORT") or "xhigh").strip() if thinking else ""
+    # 생각을 켜면 출력 상한은 보내지 않는다 — 끝없이 길어지는 회차는 stcx 서버가 131,072 로 끊는다(요청서 v1.1 0장). 공용
+    # LLM_MAX_TOKENS 는 GLM 길에도 걸리는 값이라 챗 서버에 그대로 쓰지 않는다. 끄면 종전대로 공용 값이다.
+    chat_mt = _env_int("CHAT_LLM_MAX_TOKENS", 0 if thinking else max_tokens)
+    # 출력 몫 — 보내지 않아도 입력이 창을 다 채우면 생각할 자리가 없어 답이 서버 상한 전에 창에서 잘린다(CD-D6).
+    out_reserve = max(_env_int("CHAT_LLM_OUTPUT_RESERVE", 65536 if thinking else 0), chat_mt)
     _ns = (os.environ.get("CHAT_LLM_DISABLE_STREAMING") or "").strip()
     nostream = base_nostream if not _ns else _ns == "1"
     fallback_on = (os.environ.get("CHAT_LLM_FALLBACK") or "1").strip() != "0"
     info: dict = {"enabled": True, "server": _call_trace.server_label(url), "model": model, "thinking": thinking,
+                  "effort": effort or None, "max_tokens": chat_mt or None, "output_reserve": out_reserve or None,
                   "streaming": not nostream, "last_error": None, "last_error_at": None,
                   "fallback": {"enabled": fallback_on, "to": VLLM_MODEL, "count": 0, "last_at": None}}
-    primary = mk(temperature, max_tokens, "", timeout_s, _env_int("CHAT_LLM_MAX_RETRIES", 1), base_url=url, model=model,
+    primary = mk(temperature, chat_mt, effort, timeout_s, _env_int("CHAT_LLM_MAX_RETRIES", 1), base_url=url, model=model,
                  api_key=key, nostream=nostream, cls=_ChatServerLLM,
-                 chat_template_kwargs=None if thinking else {"enable_thinking": False},
+                 chat_template_kwargs={"enable_thinking": thinking},
                  callbacks=[_ChatLLMWatch(info, "primary")])
     chat = primary
     if fallback_on:
         fb = mk(temperature, max_tokens, base_effort, timeout_s, base_retries, callbacks=[_ChatLLMWatch(info, "fallback")])
         chat = primary.with_fallbacks([fb], exceptions_to_handle=_chat_fallback_errors())
-    cfg = {"url": url, "model": model, "key": key,
+    cfg = {"url": url, "model": model, "key": key, "max_tokens": chat_mt, "output_reserve": out_reserve,
            "ctx_fallback": _env_int("CHAT_LLM_CONTEXT_TOKENS", 0) or _CTX_FALLBACK}
-    print(f"[agent] 챗 전용 LLM — {info['server']} · {model} · 생각 {'켬' if thinking else '끔'} · "
+    print(f"[agent] 챗 전용 LLM — {info['server']} · {model} · 생각 {('켬(' + effort + ')') if thinking else '끔'} · "
+          f"출력 상한 {f'{chat_mt:,} 토큰' if chat_mt else '서버 기본(보내지 않음)'} · 출력 몫 {out_reserve:,} 토큰 · "
           f"{'스트리밍' if not nostream else '비스트리밍'} · 넘김 {('→ ' + VLLM_MODEL) if fallback_on else '끔'}"
           " (띵킹 · 심의 준비 · 심의 · 카드 대조는 VLLM_*)")
     return chat, info, cfg
@@ -3263,13 +3277,19 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     """챗 한 턴. 챗 전용 LLM(CHAT_LLM_*)이 켜져 있으면 이 턴의 문맥 예산을 그 서버 창과 VLLM_* 창 중 **작은 값**으로 잡는다 —
     챗 경로의 예산(이력 · 문서 · 도구 결과 · 도구 설명)은 _model_context_tokens() 하나를 보는데 그 값은 VLLM_*(GLM 1M) 창이라,
     그대로면 창이 작은 챗 서버(Qwen 262,144)에 넘치는 요청을 보낸다(400). 작은 값이면 VLLM_* 로 넘겨도 맞는다.
+    출력 몫(CHAT_LLM_OUTPUT_RESERVE — 생각을 켜면 65,536, 보내는 상한이 더 크면 그 값)만큼 뗀다. 상한을 보내면 vLLM 은 입력 + max_tokens 가
+    창을 넘을 때 400 이고 그 400 은 VLLM_* 로 넘어가 Qwen 대신 GLM 이 조용히 답한다. 보내지 않아도 입력이 창을 채우면 생각할 자리가 없어 답이
+    잘린다(HWAXPortal docs/chat-depth-context CD-D4 · CD-D6). 창의 절반보다 크게는 떼지 않는다.
     외부 응답자와 같은 문맥 변수(_external_llm.ctx_override)를 이 턴의 태스크에만 건다(HWAXPortal docs/chat-llm-stcx)."""
     tok = None
     # 챗 전용 LLM 이 없는 박스(dev 등)는 스레드를 오가지 않는다 — 종전 턴과 똑같다.
-    chat_ctx = await asyncio.to_thread(_chat_context_tokens) if getattr(app.state, "chat_llm_cfg", None) else None
+    chat_cfg = getattr(app.state, "chat_llm_cfg", None)
+    chat_ctx = await asyncio.to_thread(_chat_context_tokens) if chat_cfg else None
     if chat_ctx:
         base_ctx = await asyncio.to_thread(_model_context_tokens)
-        tok = _external_llm.ctx_override.set(min(chat_ctx, base_ctx))
+        win = min(chat_ctx, base_ctx)
+        out = max(0, int(chat_cfg.get("output_reserve") or chat_cfg.get("max_tokens") or 0))
+        tok = _external_llm.ctx_override.set(win - min(out, win // 2))
     turn = _agent_stream_turn(app, req)
     try:
         async for chunk in turn:
