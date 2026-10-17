@@ -36,7 +36,7 @@ import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 �
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
@@ -1608,23 +1608,74 @@ def _tool_schema_cost(t) -> int:
     return (len(getattr(t, "name", "")) + len(getattr(t, "description", "") or "") + len(sch)) // 3 + 8
 
 
-def _fit_schema(tools: list, budget: int) -> list:
+# 안내대 — 관련도가 빗나갔을 때의 폴백 입구(_TOOL_PRIORITY 첫 셋). 스키마 예산과 상관없이 맨 앞에 남긴다 — 예산 밖으로 잘린 도구는 이
+# 셋으로 닿는다(search_tools 가 찾고 invoke_tool 이 바인딩에 없는 것을 그 턴에 부른다). 종전엔 무캡 경로가 게이트웨이 순서 뒤에서부터
+# 잘라 이 셋이 맨 먼저 빠졌다 — 게이트웨이 자체 도구가 목록 맨 끝이다(HWAXPortal docs/chat-depth-context F1).
+_GUIDE_FRONT = _TOOL_PRIORITY[:3]
+# 마지막 절단 — /health 가 싣는다(앞뒤 개수 · 상한 · 추정 토큰 · 뺀 앱별 수). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다.
+_TOOL_CUT: dict = {}
+
+
+def _fit_schema(tools: list, budget: int, keep: tuple = ()) -> list:
     """추정 토큰 합계가 budget 을 넘지 않도록 **뒤에서부터** 떨어뜨린다(앞이 더 관련).
 
     캡 경로와 무캡 경로가 **같은 계산**을 쓰게 하려고 떼어 냈다. 둘이 갈리면 한쪽만
     예산을 안 보게 되고, 실제로 무캡 경로가 검사를 통째로 건너뛰고 있었다.
-    떨어뜨린 것은 로그로 남긴다 — 조용히 자르면 '도구가 있는데 안 부른다' 로 보인다.
+    떨어뜨린 것은 로그로 남긴다 — 조용히 자르면 '도구가 있는데 안 부른다' 로 보인다. 어느 앱이 몇 개 빠졌는지까지
+    적는다(종전엔 개수만이라 'MaterialTwin 34종이 통째로 없다' 를 로그로 못 읽었다). keep 의 이름은 예산과 상관없이 남긴다.
     """
     total, kept = 0, []
     for t in tools:
         c = _tool_schema_cost(t)
-        if kept and total + c > budget:
+        if kept and total + c > budget and getattr(t, "name", "") not in keep:
             continue
         kept.append(t)
         total += c
     if len(kept) < len(tools):
-        print(f"[agent] tool budget: {len(tools)}개 → {len(kept)}개 (추정 {total}토큰 / 상한 {budget})")
+        ids = {id(t) for t in kept}
+        dropped = Counter((_group_of(getattr(t, "name", ""))[1] or "기타") for t in tools if id(t) not in ids)
+        apps = " · ".join(f"{a} {n}" for a, n in dropped.most_common())
+        print(f"[agent] tool budget: {len(tools)}개 → {len(kept)}개 (추정 {total}토큰 / 상한 {budget}) — 뺀 것: {apps}")
+        _TOOL_CUT.clear()
+        _TOOL_CUT.update(at=_now_iso(), before=len(tools), after=len(kept), budget=budget, est_tokens=total,
+                         dropped_apps=dict(dropped.most_common(30)))
     return kept
+
+
+def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, prefer) -> list[tuple]:
+    """[(도구, 어휘 관련도)] — 콕 집은 것 → 핀 → 지목한 전문가의 분야 도구 → 어휘 + 시맨틱 융합 순위 → 어휘 관련도 → 상시 핵심 → 이름.
+    캡 경로와 무캡 경로가 같은 순서를 쓴다(종전엔 무캡 경로가 이 정렬 없이 게이트웨이 순서 그대로 뒤에서부터 잘랐다 — F1)."""
+    pin = set(pinned or []) | set(first or [])
+    top = set(first or [])
+    pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
+    core = {n: i for i, n in enumerate(core_list)}
+    # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
+    qtok = _tok_query(query)
+
+    def rel(t) -> float:
+        if not qtok:
+            return 0.0
+        prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
+        hit = sum(1 for k in qtok if k in prof)
+        return hit / len(qtok)
+    # ⚠ 어휘 무매치(rel=0) 도구는 lex_order 에 넣지 않는다. 넣으면 '알파벳 순 전체 순열'이
+    # 정상 랭킹인 척 RRF 에 들어가, 이름이 앞선 무관 도구가 진짜 관련 도구를 캡 밖으로 밀어낸다
+    # (감사 실측: query_voc/search_voc 가 탈락해 모델이 product_code 를 지어내고 다른 제품
+    # 통계를 답으로 내놓음 — 빈 결과보다 나쁜 '확신에 찬 오답').
+    lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools if rel(t) > 0))]
+    sem_order = _semantic_order(query, tools)
+    fused = _rrf(lex_order, sem_order) if sem_order else {}
+    scored = [(t, rel(t)) for t in tools]
+    return sorted(scored, key=lambda x: (
+        # 콕 집은 것 → 핀 → 전문가 분야 도구 → 나머지
+        0 if getattr(x[0], "name", "") in top else 1 if getattr(x[0], "name", "") in pin
+        else 2 if getattr(x[0], "name", "") in pref else 3,
+        pref.get(getattr(x[0], "name", ""), 0),                   # 분야 도구끼리는 전문가 점수 순
+        -round(fused.get(getattr(x[0], "name", ""), 0.0), 6),    # 어휘+시맨틱 융합 순위
+        -round(x[1], 3),                                          # 어휘 관련도(융합 미가용 시)
+        core.get(getattr(x[0], "name", ""), len(core)),           # 상시 핵심
+        getattr(x[0], "name", ""),
+    ))
 
 
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
@@ -1643,50 +1694,30 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     운영자의 입구 도구(get_guide·list_projects 등)가 캡 밖으로 밀려났다.
 
     core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
+    core_list = _TOOL_PRIORITY if core_names is None else core_names
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
-        # 캡이 없거나 안 걸리면 **아무것도 떨어뜨리지 않는다.** 다만 순서는 바꾼다 —
+        # 캡이 없거나 안 걸리면 **아무것도 떨어뜨리지 않는다** — 스키마 총량이 예산 안이면. 다만 순서는 바꾼다 —
         # 전문가 도구를 465종 한가운데 묻어 두면 모델이 못 찾고, 상태줄이 "우선" 이라고
         # 말한 것이 거짓이 된다. 운영(cae00)은 원격 GLM 이라 update-all 이 TOOL_MAX=0 을
         # 박으므로, 여기를 안 고치면 이 기능은 **운영에서 100% 무효**다(실측).
-        if prefer:
-            _r = {n: i for i, n in enumerate(prefer)}
-            tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
         # 캡이 없어도 **스키마 총량**은 본다. 종전엔 이 경로가 예산 검사를 통째로 건너뛰어
         # TOOL_MAX=0(운영 cae00)에서 465종이 무제한으로 붙었다 — 1M 창이라 지금은 넉넉하지만
         # 창 작은 모델로 바꾸면 조용히 400 이 된다. 상한은 env(TOOL_SCHEMA_BUDGET)가 아니라
         # **컨텍스트에서** 유도한다 — env 40,000 을 쓰면 cae00 의 의도된 전량 바인딩이 깨진다.
-        return _fit_schema(tools, max(4000, int(_model_context_tokens() * 0.45)))
+        budget = max(4000, int(_model_context_tokens() * 0.45))
+        if sum(_tool_schema_cost(t) for t in tools) > budget:
+            # 다 못 싣는다 — 캡 경로와 같은 순서로 세워 관련도 낮은 것부터 뺀다. 종전엔 게이트웨이 순서 그대로 뒤에서부터 잘라, 챗이
+            # stcx(창 262,144 — 상한 117,964)로 바뀐 뒤 대화마다 678개 중 226개가 관련도와 상관없이 빠졌다(MaterialTwin 34종 전부 ·
+            # 안내대까지 — 운영 10-18 실측, HWAXPortal docs/chat-depth-context F1). 예산 안이면 이 정렬(임베딩 조회)을 하지 않는다.
+            tools = [t for t, _ in _relevance_order(tools, query, pinned, first, core_list, prefer)]
+        elif prefer:
+            _r = {n: i for i, n in enumerate(prefer)}
+            tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
+        front = [t for t in tools if getattr(t, "name", "") in _GUIDE_FRONT]
+        tools = front + [t for t in tools if getattr(t, "name", "") not in _GUIDE_FRONT]
+        return _fit_schema(tools, budget, keep=_GUIDE_FRONT)
     pin = set(pinned or []) | set(first or [])
-    top = set(first or [])
-    pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
-    core_list = _TOOL_PRIORITY if core_names is None else core_names
-    core = {n: i for i, n in enumerate(core_list)}
-    # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
-    qtok = _tok_query(query)
-    def rel(t) -> float:
-        if not qtok:
-            return 0.0
-        prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
-        hit = sum(1 for k in qtok if k in prof)
-        return hit / len(qtok)
-    # ⚠ 어휘 무매치(rel=0) 도구는 lex_order 에 넣지 않는다. 넣으면 '알파벳 순 전체 순열'이
-    # 정상 랭킹인 척 RRF 에 들어가, 이름이 앞선 무관 도구가 진짜 관련 도구를 캡 밖으로 밀어낸다
-    # (감사 실측: query_voc/search_voc 가 탈락해 모델이 product_code 를 지어내고 다른 제품
-    # 통계를 답으로 내놓음 — 빈 결과보다 나쁜 '확신에 찬 오답').
-    lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools if rel(t) > 0))]
-    sem_order = _semantic_order(query, tools)
-    fused = _rrf(lex_order, sem_order) if sem_order else {}
-    scored = [(t, rel(t)) for t in tools]
-    ordered = sorted(scored, key=lambda x: (
-        # 콕 집은 것 → 핀 → 전문가 분야 도구 → 나머지
-        0 if getattr(x[0], "name", "") in top else 1 if getattr(x[0], "name", "") in pin
-        else 2 if getattr(x[0], "name", "") in pref else 3,
-        pref.get(getattr(x[0], "name", ""), 0),                   # 분야 도구끼리는 전문가 점수 순
-        -round(fused.get(getattr(x[0], "name", ""), 0.0), 6),    # 어휘+시맨틱 융합 순위
-        -round(x[1], 3),                                          # 어휘 관련도(융합 미가용 시)
-        core.get(getattr(x[0], "name", ""), len(core)),           # 상시 핵심
-        getattr(x[0], "name", ""),
-    ))
+    ordered = _relevance_order(tools, query, pinned, first, core_list, prefer)
     kept = [t for t, _ in ordered[:TOOL_MAX]]
     # 토큰 예산 — TOOL_MAX 는 '개수' 캡이라 실제 프롬프트 비용을 전혀 보장하지 못한다.
     # 스키마가 큰 도구가 몰리면 캡을 지켜도 컨텍스트 초과 400 으로 챗이 죽고, 사용자는
@@ -5349,7 +5380,7 @@ def _chat_llm_health() -> dict:
         return dict(info)
     return {**info, "fallback": dict(info.get("fallback") or {}), "ctx_tokens": _chat_ctx_cache.get("n"),
             "ctx_source": _chat_ctx_cache.get("src"), "model_served": _chat_ctx_cache.get("served"),
-            "ctx_probe_error": _chat_ctx_cache.get("probe_error")}
+            "ctx_probe_error": _chat_ctx_cache.get("probe_error"), "tool_cut": dict(_TOOL_CUT) or None}
 
 
 def _external_llm_health() -> dict:
@@ -5476,6 +5507,9 @@ def health() -> dict:
         "sampling": getattr(app.state, "delib_sampling", None),
         # 챗 전용 LLM(CHAT_LLM_*) — 꺼져 있으면 {"enabled": false}(챗도 위 model · vllm). 켜져 있으면 넘김 횟수까지(docs/chat-llm-stcx).
         "chat_llm": _chat_llm_health(),
+        # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
+        # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
+        "tool_cut": dict(_TOOL_CUT) or None,
         "mcp": list(getattr(app.state, "connections", {})),
         "tool_scoping": "gateway (X-HWAX-Groups)",
         "tool_desc_max": TOOL_DESC_MAX,
