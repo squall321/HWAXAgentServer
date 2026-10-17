@@ -7,7 +7,7 @@
 
 거동(WP5b 3.6.2 의 이름) — oracle · broken_line · array_collapse · truncate · truncate_empty · skip_middle ·
 all_ok_noquote · all_ok_fakequote · fabricate_alias · duplicate_rows · prose_only · wrong_enum · cross_card_quote ·
-invented_number · obey_injection · empty · slow · timeout · unreachable · http_400 · http_401 · http_404 · http_413 ·
+invented_number · obey_injection · empty · slow · timeout · unreachable · http_400 · http_401 · http_403 · http_404 · http_413 ·
 http_422 · http_429 · http_500 · http_503. M3 에서 더한 것 — flag_fail(전부 FAIL·첫 메커니즘) · mech_mix(메커니즘 세 갈래) ·
 sweep_no(훑기 전부 무관) · noinput_flawed(more 없음·인용 하나 지어냄) · noinput_many(영향 줄이 상한 + 2) ·
 summary_skip_cover(꼭 다룰 행 둘을 빠뜨림) · summary_skip_one(가리킨 것 가운데 하나를 끝내 빠뜨리고 없는 수를 씀). 적대 검토
@@ -24,7 +24,7 @@ import json
 import re
 from dataclasses import dataclass
 
-HTTP_ERRORS = {f"http_{c}": c for c in (400, 401, 404, 413, 422, 429, 500, 503)}
+HTTP_ERRORS = {f"http_{c}": c for c in (400, 401, 403, 404, 413, 422, 429, 500, 503)}
 ERROR_BEHAVIORS = ("timeout", "unreachable", *HTTP_ERRORS)
 TEXT_BEHAVIORS = ("oracle", "broken_line", "array_collapse", "truncate", "truncate_empty", "skip_middle",
                   "all_ok_noquote", "all_ok_fakequote", "fabricate_alias", "duplicate_rows", "prose_only",
@@ -431,7 +431,7 @@ def _status_error(code: int):
 
     req = httpx.Request("POST", "http://fake-llm/v1/chat/completions")
     resp = httpx.Response(code, request=req, json={"error": {"message": f"fake {code}"}})
-    cls = {400: openai.BadRequestError, 401: openai.AuthenticationError, 404: openai.NotFoundError,
+    cls = {400: openai.BadRequestError, 401: openai.AuthenticationError, 403: openai.PermissionDeniedError, 404: openai.NotFoundError,
            409: openai.ConflictError, 422: openai.UnprocessableEntityError, 429: openai.RateLimitError}.get(code)
     if cls is None:
         cls = openai.InternalServerError if code >= 500 else openai.APIStatusError

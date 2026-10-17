@@ -295,9 +295,9 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
 # ── 챗 전용 LLM(선택) — HWAXPortal docs/chat-llm-stcx ─────────────────────────────────────────────────────────────
 # CHAT_LLM_BASE_URL 이 비면 챗도 VLLM_* 클라이언트(app.state.llm)를 그대로 쓴다 — 아무것도 바뀌지 않는다. 채우면 챗 ReAct · 챗 안 도구
 # 계획만 그 서버로 간다. 띵킹 · 심의 준비(전문가 고르기 축 · VOC · 되묻기 · 주제 뽑기) · 심의 · 카드 대조는 VLLM_* 그대로다(CL-D2).
-# 넘김은 LLM 호출 단위다 — 턴 전체를 다시 돌리면 이미 실행한 도구가 두 번 돈다(CL-D3). 넘기는 것은 연결 실패 · 시간 초과 · 5xx 뿐이다 —
-# 400 은 VLLM_* 에서도 같은 까닭으로 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지 않는다. 토큰이 흐르기 시작한 뒤의 실패는
-# 넘기지 못한다(with_fallbacks 의 스트림 규칙).
+# 넘김은 LLM 호출 단위다 — 턴 전체를 다시 돌리면 이미 실행한 도구가 두 번 돈다(CL-D3). 넘기는 것은 연결 실패 · 시간 초과 · 5xx ·
+# 401/403(그 서버의 키 — VLLM_* 는 자격이 따로다) · 첫 조각 전 스트림 침묵이다(_chat_fallback_errors). 400 은 VLLM_* 에서도 같은 까닭으로
+# 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지 않는다. 토큰이 흐르기 시작한 뒤의 실패는 넘기지 못한다(with_fallbacks 의 스트림 규칙).
 #   CHAT_LLM_BASE_URL · CHAT_LLM_MODEL       둘 다 있어야 켜진다. CHAT_LLM_API_KEY(기본 EMPTY)
 #   CHAT_LLM_ENABLE_THINKING   기본 0 — 생각 모드를 끈다(chat_template_kwargs.enable_thinking=false, 사용자 결정 10-17). 1 이면 모델 기본값.
 #                              LLM_REASONING_EFFORT 는 VLLM_* 서버 것이라 챗 서버에 보내지 않는다.
@@ -308,10 +308,21 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
 #   CHAT_LLM_FALLBACK          기본 1 — 0 이면 넘기지 않는다(실패가 그대로 챗에 보인다)
 #   CHAT_LLM_CONTEXT_TOKENS    챗 서버의 /v1/models 에서 창을 못 읽을 때 쓸 값(기본 LLM_CONTEXT_TOKENS, 없으면 128000)
 def _chat_fallback_errors() -> tuple:
-    """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다)."""
+    """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다) · 401/403 · 첫 조각 전 스트림 침묵.
+
+    401 · 403 은 챗 서버의 키 문제다 — VLLM_* 는 자기 자격이 따로 있어 같은 까닭으로 실패하지 않는다. 넘기지 않으면 키 없이 켜거나 키를
+    바꾸는 동안(stcx rolling 약 20분 — 옛 키 · 새 키가 섞인다) 챗이 그대로 실패했다(10-17 cae00 리뷰 A1). 설정 오류가 숨지 않게 /health 의
+    chat_llm.last_error · 넘김 횟수 · update-all 3.5c 의 '키를 거절했다' 가 말한다.
+    스트림이 첫 조각을 내기 전에 멈추면(LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S, start.sh 기본 300초) langchain-openai 가
+    StreamChunkTimeoutError 를 올린다 — openai SDK 예외가 아니라 넘기지 못했고, stcx 복제본 하나가 받고 멈추면 그 사용자가 300초 뒤 오류를
+    봤다(A2). 그 예외는 TimeoutError 계열이다(3.10 에서는 asyncio.TimeoutError 와 TimeoutError 둘 다). 조각이 흐른 뒤의 실패는 여전히
+    넘기지 못한다(with_fallbacks 의 스트림 규칙)."""
+    import asyncio  # noqa: PLC0415
+
     import openai  # noqa: PLC0415 — langchain_openai 가 이미 들인 의존성이다
 
-    return (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError)
+    return (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError,
+            openai.AuthenticationError, openai.PermissionDeniedError, asyncio.TimeoutError, TimeoutError)
 
 
 def _now_iso() -> str:
@@ -2612,35 +2623,43 @@ def _model_context_tokens() -> int:
 
 
 _chat_ctx_cache: dict = {}
+_CHAT_CTX_TTL_S = 600.0     # 받은 답(창 · 모델 · 키 상태)을 다시 묻기까지(초) — 처음 답을 영원히 굳히면 키를 바꿔도 /health 가 옛 답이었다(A3)
 
 
 def _chat_context_tokens() -> int | None:
-    """챗 전용 LLM(CHAT_LLM_*)의 창 — 꺼져 있으면 None. 그 서버 /v1/models 의 max_model_len 을 **답을 받았을 때만** 굳힌다
-    (_model_context_tokens 와 같은 규율 — 못 물어봤으면 _CTX_RETRY_S 뒤에 다시 묻고, 그동안은 CHAT_LLM_CONTEXT_TOKENS 또는
-    _CTX_FALLBACK). 그 서버가 설정한 모델을 내는지도 함께 적어 /health 가 보인다(served)."""
+    """챗 전용 LLM(CHAT_LLM_*)의 창 — 꺼져 있으면 None. 그 서버 /v1/models 의 max_model_len 을 **200 으로 답했을 때만** 받아
+    _CHAT_CTX_TTL_S 동안 쓴다(_model_context_tokens 와 같은 규율 — 못 물어봤으면 _CTX_RETRY_S 뒤에 다시 묻고, 그동안은 앞서 받은 값 또는
+    CHAT_LLM_CONTEXT_TOKENS · _CTX_FALLBACK). 그 서버가 설정한 모델을 내는지(served)와 마지막 조회 실패(probe_error)도 적어 /health 가 보인다.
+
+    ⚠ 예전엔 상태 코드를 안 보고 401 본문까지 r.json() 으로 읽어 '모델 없음' 으로 영원히 굳혔다 — 키가 틀린 것이 모델 이름 문제로 보였고,
+    키를 고쳐도 재기동 전까지 그대로였다(10-17 cae00 리뷰 A3)."""
     cfg = getattr(app.state, "chat_llm_cfg", None)
     if not cfg:
         return None
-    if "n" in _chat_ctx_cache:
+    now = time.monotonic()
+    if "n" in _chat_ctx_cache and now < _chat_ctx_cache.get("fresh_until", 0.0):
         return _chat_ctx_cache["n"]
-    fallback = cfg["ctx_fallback"]
-    if time.monotonic() < _chat_ctx_cache.get("retry_at", 0.0):
+    fallback = _chat_ctx_cache.get("n", cfg["ctx_fallback"])
+    if now < _chat_ctx_cache.get("retry_at", 0.0):
         return fallback
     try:
         import httpx
 
         r = httpx.get(f"{cfg['url']}/models", headers={"Authorization": f"Bearer {cfg['key']}"}, timeout=5.0)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
         data = [m for m in ((r.json() or {}).get("data") or []) if isinstance(m, dict)]
-    except Exception as e:      # 터널이 아직 안 열렸을 수 있다 — 굳히지 않고 기본값으로 간다
-        print(f"[agent] 챗 LLM 컨텍스트 조회 실패({type(e).__name__}) — {fallback:,} 토큰으로 가정한다"
+    except Exception as e:      # 터널이 아직 안 열렸을 수 있다 · 키가 틀렸을 수 있다 — 굳히지 않고 앞 값(없으면 기본값)으로 간다
+        print(f"[agent] 챗 LLM 컨텍스트 조회 실패({type(e).__name__}: {str(e)[:60]}) — {fallback:,} 토큰으로 간다"
               f"({_CTX_RETRY_S:.0f}초 뒤 다시 묻는다)")
-        _chat_ctx_cache["retry_at"] = time.monotonic() + _CTX_RETRY_S
+        _chat_ctx_cache.update(retry_at=now + _CTX_RETRY_S, probe_error=f"{type(e).__name__}: {str(e)[:80]}")
         return fallback
     pick = next((m for m in data if m.get("id") == cfg["model"]), data[0] if len(data) == 1 else None)
     v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
-    n = v if isinstance(v, int) and v > 0 else fallback
+    n = v if isinstance(v, int) and v > 0 else cfg["ctx_fallback"]
     _chat_ctx_cache.update(n=n, src="server" if n == v else "fallback",
-                           served=any(m.get("id") == cfg["model"] for m in data))
+                           served=any(m.get("id") == cfg["model"] for m in data),
+                           fresh_until=now + _CHAT_CTX_TTL_S, probe_error=None)
     print(f"[agent] 챗 LLM 창 = {n:,} 토큰({_chat_ctx_cache['src']})"
           + ("" if _chat_ctx_cache["served"] else f" — ⚠ 그 서버가 {cfg['model']} 를 내지 않는다(CHAT_LLM_MODEL)"))
     return n
@@ -5156,7 +5175,8 @@ def _chat_llm_health() -> dict:
     if not info.get("enabled"):
         return dict(info)
     return {**info, "fallback": dict(info.get("fallback") or {}), "ctx_tokens": _chat_ctx_cache.get("n"),
-            "ctx_source": _chat_ctx_cache.get("src"), "model_served": _chat_ctx_cache.get("served")}
+            "ctx_source": _chat_ctx_cache.get("src"), "model_served": _chat_ctx_cache.get("served"),
+            "ctx_probe_error": _chat_ctx_cache.get("probe_error")}
 
 
 def _external_llm_health() -> dict:

@@ -297,3 +297,65 @@ def test_health_의_chat_llm_은_키를_싣지_않는다(monkeypatch):
     assert h["model"] == "qwen3.8-flash-next" and h["fallback"]["count"] == 2 and h["ctx_tokens"] == 262_144
     monkeypatch.setattr(a.app.state, "chat_llm_info", {"enabled": False}, raising=False)
     assert a._chat_llm_health() == {"enabled": False}
+
+
+def test_401_403_은_그_서버의_키라_넘기고_사유를_남긴다(monkeypatch, fake_server):
+    """키 없이 켜거나 키를 바꾸는 동안(stcx rolling — 옛 키 · 새 키가 섞인다) 챗이 그대로 실패했다(10-17 cae00 리뷰 A1).
+    VLLM_* 는 자격이 따로라 같은 까닭으로 실패하지 않는다 — 넘기되 사유는 /health 의 last_error 로 남긴다."""
+    glm = fake_server(model="fake-glm")
+    _glm(monkeypatch, glm)
+    for script, err in (("http_401", "AuthenticationError"), ("http_403", "PermissionDeniedError")):
+        chat = fake_server(model="qwen3.8-flash-next", ctx=262_144, script=script)
+        st = _boot(monkeypatch, CHAT_LLM_BASE_URL=f"{chat}/v1", CHAT_LLM_MODEL="qwen3.8-flash-next", CHAT_LLM_MAX_RETRIES="0")
+        before = _calls(glm)
+        assert asyncio.run(st.chat_llm.ainvoke([("human", "안녕")])).content, script
+        assert _calls(glm) == before + 1 and st.chat_llm_info["fallback"]["count"] == 1, script
+        assert st.chat_llm_info["last_error"].startswith(err), st.chat_llm_info["last_error"]
+
+
+def test_스트림이_첫_조각_전에_멈추면_넘긴다(monkeypatch, fake_server):
+    """StreamChunkTimeoutError 는 openai SDK 예외가 아니라 넘기지 못했다 — stcx 복제본 하나가 받고 멈추면 그 사용자가 300초 뒤 챗 오류를
+    봤다(10-17 cae00 리뷰 A2). 한도를 0.1초로 줄이고 첫 조각 전 0.3초 침묵하는 서버(slow)로 본다."""
+    glm = fake_server(model="fake-glm")
+    _glm(monkeypatch, glm)
+    chat = fake_server(model="qwen3.8-flash-next", ctx=262_144, script="slow")
+    monkeypatch.setenv("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S", "0.1")
+    st = _boot(monkeypatch, CHAT_LLM_BASE_URL=f"{chat}/v1", CHAT_LLM_MODEL="qwen3.8-flash-next",
+               CHAT_LLM_MAX_RETRIES="0", CHAT_LLM_DISABLE_STREAMING="0")
+
+    async def go():
+        return "".join([str(c.content) async for c in st.chat_llm.astream([("human", "안녕")])])
+    assert asyncio.run(go()), "넘겨받은 VLLM_* 가 답해야 한다"
+    assert st.chat_llm_info["fallback"]["count"] == 1, st.chat_llm_info
+    assert "Timeout" in (st.chat_llm_info["last_error"] or ""), st.chat_llm_info["last_error"]
+
+
+def test_창_조회는_200_만_받고_실패해도_굳히지_않으며_주기적으로_다시_묻는다(monkeypatch):
+    """401 본문까지 r.json() 으로 읽어 '모델 없음' 으로 영원히 굳혔다 — 키가 틀린 것이 모델 이름 문제로 보였고, 키를 고쳐도 재기동 전까지
+    /health 가 옛 답이었다(10-17 cae00 리뷰 A3)."""
+    cfg = {"url": "http://chat.test/v1", "model": "qwen", "key": "k", "ctx_fallback": 128_000}
+    monkeypatch.setattr(a.app.state, "chat_llm_cfg", cfg, raising=False)
+    monkeypatch.setattr(a.app.state, "chat_llm_info", {"enabled": True, "fallback": {}}, raising=False)
+    monkeypatch.setattr(a, "_chat_ctx_cache", {})
+    replies = [httpx.Response(401, json={"error": "Unauthorized"}),
+               httpx.Response(200, json={"data": [{"id": "qwen", "max_model_len": 262_144}]}),
+               httpx.Response(401, json={"error": "Unauthorized"})]
+    calls: list = []
+
+    def fake_get(url, **kw):
+        calls.append(url)
+        return replies.pop(0)
+    monkeypatch.setattr(httpx, "get", fake_get)
+    clock = [1000.0]
+    monkeypatch.setattr(a.time, "monotonic", lambda: clock[0])
+
+    assert a._chat_context_tokens() == 128_000
+    assert a._chat_ctx_cache["probe_error"].endswith("HTTP 401") and "served" not in a._chat_ctx_cache, "401 을 '모델 없음' 으로 굳혔다"
+    assert a._chat_llm_health()["ctx_probe_error"].endswith("HTTP 401"), "/health 가 키 거절을 보인다"
+    assert a._chat_context_tokens() == 128_000 and len(calls) == 1, "다시 묻는 간격 전에는 묻지 않는다"
+    clock[0] += a._CTX_RETRY_S + 1
+    assert a._chat_context_tokens() == 262_144 and a._chat_ctx_cache["served"] and a._chat_ctx_cache["probe_error"] is None
+    assert a._chat_context_tokens() == 262_144 and len(calls) == 2, "받은 답은 주기 동안 쓴다"
+    clock[0] += a._CHAT_CTX_TTL_S + 1
+    assert a._chat_context_tokens() == 262_144, "주기가 지나 다시 물어 실패해도 앞서 받은 창을 쓴다"
+    assert len(calls) == 3 and a._chat_ctx_cache["probe_error"].endswith("HTTP 401"), "키가 바뀐 것을 다음 주기에 본다"
