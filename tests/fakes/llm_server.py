@@ -44,7 +44,7 @@ def _text(content) -> str:
     return str(content or "")
 
 
-def make_app(*, ctx: int, model: str, script, capacity: int = 0):
+def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = True):
     # Request 를 모듈에서 가져와야 한다 — from __future__ annotations 아래에서 함수 안에서 가져오면 FastAPI 가 그 주석을
     # 풀지 못해 request 를 쿼리 인자로 읽는다(모든 호출이 422).
     state = {"script": [act(x) for x in script] or [act("oracle")], "calls": 0, "active": 0, "peak": 0,
@@ -101,7 +101,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
 
     @app.get("/_stats")
     def stats():
-        return {k: state[k] for k in ("calls", "active", "peak", "behaviors", "capacity", "waiting", "waited_peak")}
+        return {**{k: state[k] for k in ("calls", "active", "peak", "behaviors", "capacity", "waiting", "waited_peak")},
+                "images": state.get("images", []), "humans": state.get("humans", [])}
 
     def chunk(i: int, delta: dict, finish=None) -> bytes:
         c = {"id": f"fake-{i}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
@@ -136,6 +137,15 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
         msgs = body.get("messages") or []
         system = "".join(_text(m.get("content")) for m in msgs if m.get("role") == "system")
         human = "".join(_text(m.get("content")) for m in msgs if m.get("role") != "system")
+        # 그림 조각 — 받은 그림 수를 세고(시험이 본다), 그림을 못 받는 서버(--vision 0)면 vLLM 처럼 400 으로 거절한다
+        n_img = sum(1 for m in msgs if isinstance(m.get("content"), list)
+                    for p in m["content"] if isinstance(p, dict) and p.get("type") == "image_url")
+        state.setdefault("images", []).append(n_img)
+        state.setdefault("humans", []).append(human[-4000:])       # 요청마다 사람 쪽 글(최근 20건) — 무엇이 실렸는지 시험이 본다
+        del state["humans"][:-20]
+        if n_img and not vision:
+            return JSONResponse({"error": {"message": f"{model} is not a multimodal model", "type": "BadRequestError",
+                                           "param": None, "code": 400}}, status_code=400)
         a = state["script"][min(state["calls"], len(state["script"]) - 1)]
         # 생각을 켠 요청(chat_template_kwargs.enable_thinking=true)이면 생각 글을 낸다 — vLLM 0.23 은 message.reasoning · delta.reasoning 칸이다
         think = ("생각: " + human[:60]) if (body.get("chat_template_kwargs") or {}).get("enable_thinking") is True else ""
@@ -182,6 +192,7 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default="fake-glm")
     ap.add_argument("--script", default="oracle", help="거동 이름을 쉼표로")
     ap.add_argument("--capacity", type=int, default=0, help="동시 처리 수(0 = 무제한) — 넘치면 줄 서서 기다린다")
+    ap.add_argument("--vision", type=int, default=1, help="1 이면 그림 조각을 받는다, 0 이면 vLLM 처럼 400(텍스트 전용 모델)")
     args = ap.parse_args(argv)
     if args.port == 9009:
         print("9009 는 떠 있는 에이전트 서버의 포트다 — 빈 포트를 고른다", file=sys.stderr)
@@ -189,7 +200,7 @@ def main(argv=None) -> int:
     import uvicorn
 
     app = make_app(ctx=args.ctx, model=args.model, script=[s.strip() for s in args.script.split(",") if s.strip()],
-                   capacity=args.capacity)
+                   capacity=args.capacity, vision=bool(args.vision))
     print(f"[fake-llm] http://{args.host}:{args.port}/v1 model={args.model} ctx={args.ctx:,} script={args.script} "
           f"capacity={args.capacity or '무제한'}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

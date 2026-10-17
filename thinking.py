@@ -22,6 +22,7 @@ import os
 
 import call_trace
 import external_llm
+import vision
 from deliberation import (
     _KN_CONC,
     _room,
@@ -255,13 +256,16 @@ def _judge_prompt(seat: dict, question: str, docs: str = "", session: str = "", 
 
 
 async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
-                     docs: str = "", session: str = "", topic: str = "") -> dict:
+                     docs: str = "", session: str = "", topic: str = "", images: list | None = None) -> dict:
     """좌석 1명의 자기판정 + (가능하면) 답변. 실패·시간초과는 pass 가 아니라 error 로 남긴다."""
     call_trace.tag(seat=seat.get("key"))      # 호출 추적 — 좌석마다 제 태스크(ensure_future)라 그 좌석의 호출에만 붙는다
     async with sem:
         try:
+            # images — 좌석 모델이 그림을 받을 때만 온다(_session_images). 그림이 글 앞이라 좌석들의 앞부분(시스템 글 + 그림)이 같다.
+            # 그림이 없으면 인자 셋 — 호출 모양이 종전과 같다(시험의 가짜 _llm_text 들).
             raw = await asyncio.wait_for(
-                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs, session, topic)), SEAT_TIMEOUT_S)
+                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs, session, topic), *([images] if images else [])),
+                SEAT_TIMEOUT_S)
         except asyncio.TimeoutError:
             return {**seat, "verdict": "error", "scope": "", "answer": "",
                     # 어느 값을 올리면 되는지 같이 적는다 — 띵킹에는 설정 이름을 따로 싣는 자리가 없다.
@@ -362,6 +366,39 @@ def _session_block(history: list | None, cap: int) -> tuple[str, dict]:
         out.append(f"(앞 대화에서 조회한 근거 {len(evid)}건은 예산 밖이라 싣지 못했다)")
     return "\n".join(out), {"conv": len(conv_lines), "conv_gone": conv_gone, "ev": len(ev_lines),
                             "ev_gone": len(evid) - len(ev_lines), "trimmed": _trimmed(conv_lines + ev_lines)}
+
+
+async def _session_images(app, llm, imgs: list, question: str, box: dict):
+    """앞 대화의 그림을 좌석에 — 좌석 모델(llm)이 그림을 받으면 box["parts"](최근 vision.HISTORY_IMAGES 장), 못 받으면 그림을 읽는 모델이
+    옮긴 판독문을 box["text"](최근 vision.TRANSCRIBE_MAX 장, 그림 해시로 디스크에 남아 다시 읽지 않는다). 상태 줄을 낸다."""
+    from app import AIDH_HTTP, ARTIFACT_DIR, _base_vision, _chat_llm_of, _chat_vision, _transcriber  # noqa: PLC0415
+
+    seat_sees = await asyncio.to_thread(_chat_vision if llm is _chat_llm_of(app) else (lambda _a: _base_vision()), app)
+    if seat_sees:
+        pick = imgs[-vision.HISTORY_IMAGES:] if vision.HISTORY_IMAGES > 0 else []
+        ps, miss = await asyncio.to_thread(vision.parts, [u for u, _ in pick], ARTIFACT_DIR, AIDH_HTTP, len(pick))
+        if ps:
+            box["parts"] = ps
+        yield _sse("status", {"step": f"앞 대화의 그림 {len(ps)}장을 좌석마다 실었다(전체 {len(imgs)}장 중 최근부터"
+                                      + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "") + ")", "tool": None})
+        return
+    tr = await asyncio.to_thread(_transcriber, app)
+    if tr is None:
+        yield _sse("status", {"step": f"앞 대화의 그림 {len(imgs)}장 — 좌석 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다",
+                              "tool": None})
+        return
+    pick = imgs[-vision.TRANSCRIBE_MAX:] if vision.TRANSCRIBE_MAX > 0 else []
+    yield _sse("status", {"step": f"앞 대화의 그림 {len(pick)}장을 판독한다(좌석 모델이 그림을 받지 않는다)", "tool": None})
+    got = await vision.transcribe_all(tr, pick, ARTIFACT_DIR, AIDH_HTTP, hint=question[:300])
+    lines = [f"· [g:{k}] ({why}) {t}" for k, (_u, why, t) in enumerate(got, start=1) if t]
+    fail = len(got) - len(lines)
+    if lines:
+        box["text"] = ("[앞 대화의 그림 — 그림을 읽는 모델이 옮긴 판독문이다. 그림 자체가 아니므로 판독문에 없는 수치를 지어내지 마라. "
+                       "쓰거든 [g:N] 표지를 basis 에 적어라]\n" + "\n".join(lines))
+    yield _sse("status", {"step": f"앞 대화의 그림 판독문 {len(lines)}장을 좌석마다 실었다"
+                                  + (f" · {fail}장은 판독하지 못했다" if fail else "")
+                                  + (f" · 오래된 {len(imgs) - len(pick)}장은 상한(VISION_TRANSCRIBE_MAX) 밖" if len(imgs) > len(pick) else ""),
+                          "tool": None})
 
 
 def _session_note(st: dict) -> str:
@@ -504,6 +541,7 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
     # 길어지면 전문가 발굴이 망가진다(붙인 문서를 검색어에 섞지 않는 위 규칙과 같은 까닭).
     _hn = sum(1 for m in (history or []) if isinstance(m, dict) and str(m.get("content") or "").strip())
     _session, _sess_st, _topic, sq = "", {}, "", q
+    _img_box: dict = {}             # 앞 대화의 그림 — {"parts": 좌석에 실을 그림 조각들} 또는 {"text": 판독문 덩이}
     if _hn and WITH_HISTORY:
         from app import _chars_for_tokens, _derive_topic, _fit_tokens  # noqa: PLC0415 — 순환 import 회피
         from app import _doc_budget_tokens as _dbt  # noqa: PLC0415
@@ -518,6 +556,14 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
         _session = _fit_tokens(_build, _chars_for_tokens(_sample, _stok), _stok, 2000)[0]
         if _session:
             yield _sse("status", {"step": "세션 맥락 — " + _session_note(_sess_st), "tool": None})
+        # 앞 대화의 그림(사람이 올린 것 · 도구가 낸 것) — 좌석 모델이 그림을 받으면 그림 조각으로, 못 받으면 그림을 읽는 모델(Qwen)이 옮긴
+        # 판독문을 세션 맥락에 [g:N] 으로(사용자 결정 10-18 — 탐침 뒤 자동, HWAXPortal docs/chat-depth-context T5).
+        _imgs = vision.history_images(history)
+        if _imgs:
+            async for _ev in _session_images(app, llm, _imgs, q, _img_box):
+                yield _ev
+            if _img_box.get("text"):
+                _session = (_session + "\n\n" if _session else "") + _img_box["text"]
         _tp = await _derive_topic(history, q)
         _topic = str(_tp.get("topic") or "").strip()
         if _topic and _topic != q:
@@ -591,7 +637,8 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
             s["role"] = r
 
         yield _sse("status", {"step": f"본심 — 좌석별 자기판정·답변({len(live)}명)", "tool": None})
-        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem, _docs, _session, _topic)) for s in live]
+        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem, _docs, _session, _topic, _img_box.get("parts")))
+                 for s in live]
         try:
             for fut in asyncio.as_completed(tasks):
                 r = await fut

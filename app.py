@@ -99,6 +99,8 @@ from deliberation import (
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
 import call_trace as _call_trace
 import external_llm as _external_llm
+import vision as _vision
+import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 — 이름으로 가져오면 엔진을 다시 읽은 뒤(시험의 reload) 다른 문맥 변수를 쥔다
 import review_gate as _review_gate
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
@@ -387,6 +389,142 @@ def _reasoning_in(obj, part: str) -> str:
         return ""
 
 
+class _VisionGuardLLM(ChatOpenAI):
+    """챗의 넘김 받는 VLLM_*(GLM) 클라이언트 — 그 서버가 그림을 못 받으면(LLM_VISION 판정 — 모르면 못 받는 것으로) 그림 조각을 빼고
+    '[그림 N장 — 이 모델은 그림을 읽지 못해 뺐다]' 한 줄로 바꿔 보낸다. 빼지 않으면 그림이 실린 챗이 넘어가는 순간 400 으로 죽는다.
+    판정(탐침)은 그림이 실린 호출이 실제로 올 때 한 번 — 그림 없는 넘김은 묻지 않는다."""
+
+    @staticmethod
+    def _keep(messages):
+        if not _vision.has_images(messages):
+            return messages
+        return messages if _base_vision() else _vision.strip_images(messages)
+
+    def _generate(self, messages, *a, **k):
+        return super()._generate(self._keep(messages), *a, **k)
+
+    async def _agenerate(self, messages, *a, **k):
+        return await super()._agenerate(await asyncio.to_thread(self._keep, messages), *a, **k)
+
+    def _stream(self, messages, *a, **k):
+        yield from super()._stream(self._keep(messages), *a, **k)
+
+    async def _astream(self, messages, *a, **k):
+        async for chunk in super()._astream(await asyncio.to_thread(self._keep, messages), *a, **k):
+            yield chunk
+
+
+def _chat_vision(app_) -> bool:
+    """챗이 쓰는 모델이 그림을 받는가 — 챗 전용 LLM 이 켜져 있으면 그 서버(CHAT_LLM_VISION), 아니면 VLLM_*(LLM_VISION). 막히는 호출이다
+    (첫 판정에 탐침 한 번) — 이벤트 루프에서는 to_thread 로 부른다."""
+    cfg = getattr(app_.state, "chat_llm_cfg", None)
+    if cfg:
+        return _vision.supports(os.environ.get("CHAT_LLM_VISION", "auto"), cfg["url"], cfg["key"], cfg["model"])
+    return _vision.supports(os.environ.get("LLM_VISION", "auto"), VLLM_BASE_URL, VLLM_API_KEY, VLLM_MODEL)
+
+
+def _chat_vision_known(app_) -> bool | None:
+    """_chat_vision 의 막히지 않는 판 — 지금 아는 값(아직 안 물었으면 None). 그림이 안 걸린 턴이 탐침을 기다리지 않게. None 이면 도구가
+    그림을 실제로 낸 그 호출에서 묻는다(_loop_fit_prompt). 기동 때 미리 묻지 않는다 — 서버를 띄우기만 하는 도구(m0b 탐침 --dry-run)가
+    LLM 을 부르지 않는다는 약속이 있다."""
+    cfg = getattr(app_.state, "chat_llm_cfg", None)
+    if cfg:
+        return _vision.cached(os.environ.get("CHAT_LLM_VISION", "auto"), cfg["url"], cfg["model"])
+    return _vision.cached(os.environ.get("LLM_VISION", "auto"), VLLM_BASE_URL, VLLM_MODEL)
+
+
+def _base_vision() -> bool:
+    """VLLM_*(띵킹 · 심의 — GLM)가 그림을 받는가(LLM_VISION). 막히는 호출 — to_thread 로."""
+    return _vision.supports(os.environ.get("LLM_VISION", "auto"), VLLM_BASE_URL, VLLM_API_KEY, VLLM_MODEL)
+
+
+def _transcriber(app_):
+    """그림 판독에 쓸 LLM — 그림을 받는 챗 서버(넘김 없이 그 서버만), 아니면 그림을 받는 VLLM_*, 둘 다 아니면 None. 막히는 호출 — to_thread 로."""
+    cfg = getattr(app_.state, "chat_llm_cfg", None)
+    if cfg and _vision.supports(os.environ.get("CHAT_LLM_VISION", "auto"), cfg["url"], cfg["key"], cfg["model"]):
+        chat = getattr(app_.state, "chat_llm", None)
+        return getattr(chat, "runnable", None) or chat
+    if _base_vision():
+        return app_.state.llm
+    return None
+
+
+def _stash_uploads(items) -> tuple[list, int]:
+    """챗에 올린 그림 → (아티팩트 주소들, 건너뛴 수). 해시 이름이라 같은 그림은 한 파일이다. 그림 꼴이 아니거나 깨졌거나 크면
+    (VISION_MAX_BYTES) · 장수 상한(VISION_MAX_IMAGES) 밖이면 건너뛰고 센다 — 호출부가 화면에 알린다(조용히 빼지 않는다)."""
+    import base64
+    import hashlib
+    items = [it for it in (items or []) if isinstance(it, dict)]
+    urls: list = []
+    skipped = max(0, len(items) - _vision.MAX_IMAGES)
+    for it in items[:_vision.MAX_IMAGES]:
+        data, mime = str(it.get("data") or ""), str(it.get("mime") or "")
+        if data.startswith("data:"):
+            head, _, data = data.partition(",")
+            mime = mime or head[5:].split(";", 1)[0]
+        if mime not in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+            skipped += 1
+            continue
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except Exception:  # noqa: BLE001 — 깨진 base64 는 건너뛴다(센다)
+            raw = b""
+        real = _vision.sniff(raw) if raw else None      # 확장자는 내용으로 — 선언된 mime 과 달라도 내용이 그림이면 받는다
+        if not real or len(raw) > _vision.MAX_BYTES:
+            skipped += 1
+            continue
+        name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT[real]
+        with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
+            f.write(raw)
+        u = f"/agent/artifacts/{name}"
+        if u not in urls:
+            urls.append(u)
+    if urls:
+        _prune_artifacts()
+    return urls, skipped
+
+
+def _with_tool_images(msgs: list, limit: int) -> list:
+    """도구 결과에 나온 그림을 그 결과 묶음(한 번의 도구 호출들) 바로 뒤에 사람 쪽 '시스템 첨부' 로 — 모델이 그림을 직접 본다. 최근
+    그림부터 limit 장. 도구 결과 사이에는 끼우지 않는다(한 호출의 도구 답들은 붙어 있어야 한다)."""
+    from langchain_core.messages import HumanMessage, ToolMessage  # noqa: PLC0415
+
+    groups: list = []                 # [(마지막 도구 결과 위치, 그림 주소들)]
+    i = 0
+    while i < len(msgs):
+        if isinstance(msgs[i], ToolMessage):
+            j, urls = i, []
+            while j < len(msgs) and isinstance(msgs[j], ToolMessage):
+                c = msgs[j].content
+                for u in _vision.image_urls(c if isinstance(c, str) else json.dumps(c, ensure_ascii=False, default=str)):
+                    if u not in urls:
+                        urls.append(u)
+                j += 1
+            if urls:
+                groups.append((j - 1, urls))
+            i = j
+        else:
+            i += 1
+    if not groups:
+        return msgs
+    plan, left = {}, limit
+    for end, urls in reversed(groups):
+        if left <= 0:
+            break
+        take = urls[-left:]
+        plan[end], left = take, left - len(take)
+    out = []
+    for k, m in enumerate(msgs):
+        out.append(m)
+        if k in plan:
+            ps, miss = _vision.parts(plan[k], ARTIFACT_DIR, AIDH_HTTP, limit=len(plan[k]))
+            if ps:
+                out.append(HumanMessage(content=[{"type": "text", "text": (
+                    f"[시스템 첨부 — 방금 도구가 낸 그림 {len(ps)}장" + (f"(그 밖의 {miss}장은 서버에 없거나 커서 못 실었다)" if miss else "")
+                    + ". 그림을 직접 보고 수치 · 분포를 판단하라]")}, *ps]))
+    return out
+
+
 def _chat_fallback_errors() -> tuple:
     """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다) · 401/403 · 첫 조각 전 스트림 침묵 ·
     '창이 모자라다' 400(ChatCtxOverflow — _ChatServerLLM 이 다른 400 과 갈라 올린다, CL-D9).
@@ -473,7 +611,8 @@ def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeou
                  callbacks=[_ChatLLMWatch(info, "primary")])
     chat = primary
     if fallback_on:
-        fb = mk(temperature, max_tokens, base_effort, timeout_s, base_retries, callbacks=[_ChatLLMWatch(info, "fallback")])
+        fb = mk(temperature, max_tokens, base_effort, timeout_s, base_retries, callbacks=[_ChatLLMWatch(info, "fallback")],
+                cls=_VisionGuardLLM)
         chat = primary.with_fallbacks([fb], exceptions_to_handle=_chat_fallback_errors())
     cfg = {"url": url, "model": model, "key": key, "max_tokens": chat_mt, "output_reserve": out_reserve,
            "ctx_fallback": _env_int("CHAT_LLM_CONTEXT_TOKENS", 0) or _CTX_FALLBACK}
@@ -729,6 +868,9 @@ class ChatRequest(BaseModel):
     # 붙인 문서의 추출문 [{name, kind, text}, …]. 원본 파일은 오지 않는다 — 포털이 브라우저에서
     # 읽어 글만 싣는다(DRM 전제). 검증·절단은 _doc_block 이 한다.
     documents: list[dict] = []
+    # 이 발화에 올린 그림 — [{name, mime, data(base64 또는 data URL)}]. 아티팩트로 저장해 'user_images' 사건으로 주소를 돌려주고, 챗 서버가
+    # 그림을 받으면 이 발화의 그림 조각으로 싣는다(HWAXPortal docs/chat-depth-context T5). 이력 항목은 주소(images)로 다시 온다.
+    images: list[dict] = []
     # 요청 시점 권한(feat:·plat:) — 포털이 원장으로 계산해 준다(HWAXPortal docs/access-control).
     # 심의·Thinking 트리거 판정은 여기 있으므로 포털이 아니라 이쪽이 막는다. None 은 권한을 모르는
     # 옛 호출이라 막지 않는다(포털은 늘 보낸다) — '안 보냄'과 '권한 없음'을 구분해야 해서다.
@@ -2446,6 +2588,13 @@ async def _loop_fit_prompt(state, config):
         print(f"[agent] 루프 메시지 {info['before']:,}토큰이 창 몫 {info['limit']:,}토큰을 넘어 오래된 도구 결과 "
               f"{info['n']}건을 줄였다(→ {info['after']:,}토큰)")
         await adispatch_custom_event(_LOOP_FIT_EVENT, info, config=config)
+    # 도구 그림 — 챗 모델이 그림을 받으면(턴이 run config 로 알린다 — 문맥 변수는 LangGraph 실행 맥락을 넘지 못한다) 그 결과 뒤에 그림을 싣는다.
+    # 턴이 모르면(None — 아직 안 물었다) 도구가 그림을 실제로 낸 지금 묻는다(한 번 — 판정은 서버마다 남는다).
+    hv = ((config or {}).get("configurable") or {}).get("hwax_vision")
+    if hv is None and _vision.tool_image_urls(fitted):
+        hv = await asyncio.to_thread(_chat_vision, app)
+    if hv:
+        fitted = await asyncio.to_thread(_with_tool_images, fitted, _vision.MAX_IMAGES)
     return fitted
 
 
@@ -3459,11 +3608,87 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 pass
 
 
+async def _turn_image_messages(app_, req, vision_ok: bool):
+    """(이 발화의 사람 메시지, 앞 대화의 그림 메시지 또는 None). 화면 사건은 _TURN_IMAGE_EVENTS 에 쌓는다(호출부가 흘린다).
+    챗 모델이 그림을 받으면 그림 조각, 못 받으면 그림을 받는 다른 모델이 옮긴 판독문, 그것도 없으면 싣지 못했다고 적는다 — 어느 갈래든
+    화면에 한 줄로 알린다(조용히 빼지 않는다)."""
+    from langchain_core.messages import HumanMessage  # noqa: PLC0415
+
+    events = _TURN_IMAGE_EVENTS.get()
+
+    def say(step: str) -> None:
+        if events is not None:
+            events.append(_sse("status", {"step": step, "tool": None}))
+    up, skipped = await asyncio.to_thread(_stash_uploads, req.images)
+    if up and events is not None:
+        events.append(_sse("user_images", {"urls": up}))
+    if skipped:
+        say(f"올린 그림 {skipped}장은 싣지 못했다 — 그림(png · jpg · gif · webp)이 아니거나 깨졌거나 "
+            f"{_vision.MAX_BYTES // (1024 * 1024)}MB 를 넘거나 한 번에 {_vision.MAX_IMAGES}장 상한 밖이다")
+    hist = _vision.history_images(req.history)
+    pick = hist[-_vision.HISTORY_IMAGES:] if _vision.HISTORY_IMAGES > 0 else []
+    tr = await asyncio.to_thread(_transcriber, app_) if not vision_ok and (up or pick) else None
+    hint = req.message[:300]
+    user_msg, recap = ("user", req.message), None
+    if up and vision_ok:
+        ps, miss = await asyncio.to_thread(_vision.parts, up, ARTIFACT_DIR, AIDH_HTTP, _vision.MAX_IMAGES)
+        text = req.message + (f"\n\n[올린 그림 {len(up)}장 중 {miss}장은 커서 싣지 못했다]" if miss else "")
+        user_msg = HumanMessage(content=[{"type": "text", "text": text}, *ps])
+    elif up and tr is not None:
+        got = await _vision.transcribe_all(tr, [(u, f"올린 그림 {i}") for i, u in enumerate(up, start=1)],
+                                           ARTIFACT_DIR, AIDH_HTTP, hint=hint)
+        user_msg = ("user", req.message + "\n\n[시스템 첨부 — 올린 그림을 이 챗 모델은 읽지 못해 그림을 읽는 모델이 판독문으로 옮겼다. "
+                    "판독문에 없는 수치를 지어내지 마라]\n"
+                    + "\n".join(f"· [그림 {i}] {t or '판독하지 못했다'}" for i, (_u, _w, t) in enumerate(got, start=1)))
+        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 판독문으로 실었다")
+    elif up:
+        user_msg = ("user", f"{req.message}\n\n[시스템 첨부 — 그림 {len(up)}장을 올렸지만 이 서버의 모델은 그림을 읽지 못하고, "
+                            "판독할 모델도 없다]")
+        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 모델에 싣지 못했다(판독할 모델도 없다)")
+    if pick and vision_ok:
+        ps, labels = [], []
+        for u, why in pick:     # 한 장씩 — 지워진 그림이 끼어도 설명 번호가 실린 그림 순서와 맞게
+            one, _m = await asyncio.to_thread(_vision.parts, [u], ARTIFACT_DIR, AIDH_HTTP, 1)
+            if one:
+                ps += one
+                labels.append(f"{len(ps)}) {why}")
+        miss = len(pick) - len(ps)
+        if ps:
+            recap = HumanMessage(content=[{"type": "text", "text": (
+                f"[시스템 첨부 — 앞 대화에 나온 그림 {len(ps)}장(전체 {len(hist)}장 중 최근부터): " + "; ".join(labels)
+                + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "")
+                + ". 질문에 이 그림이 걸리면 직접 보고 판단하라]")}, *ps])
+        say(f"앞 대화의 그림 {len(ps)}장을 다시 실었습니다" + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "")
+            + (f" · 오래된 {len(hist) - len(pick)}장은 상한(VISION_HISTORY_IMAGES) 밖" if len(hist) > len(pick) else ""))
+    elif pick and tr is not None:
+        got = await _vision.transcribe_all(tr, pick, ARTIFACT_DIR, AIDH_HTTP, hint=hint)
+        lines = [f"· {k}) ({why}) {t}" for k, (_u, why, t) in enumerate(got, start=1) if t]
+        if lines:
+            recap = HumanMessage(content="[시스템 첨부 — 앞 대화에 나온 그림의 판독문이다(그림을 읽는 모델이 옮긴 글 — 그림 자체가 아니다). "
+                                         "판독문에 없는 수치를 지어내지 마라]\n" + "\n".join(lines))
+        say(f"앞 대화의 그림 판독문 {len(lines)}장을 실었습니다(챗 모델이 그림을 읽지 못한다)"
+            + (f" · {len(got) - len(lines)}장은 판독하지 못했다" if len(got) > len(lines) else ""))
+    elif pick:
+        say(f"앞 대화의 그림 {len(hist)}장 — 챗 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다")
+    return user_msg, recap
+
+
+async def _drain_image_events(events: list):
+    for ev in list(events):
+        yield ev
+    events.clear()
+
+
+_TURN_IMAGE_EVENTS: contextvars.ContextVar = contextvars.ContextVar("turn_image_events", default=None)
+
+
 async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     full: list[str] = []
     _turn_models: dict = {}     # 이 턴의 모델 호출 수(모델 이름 → 횟수) — 턴 끝 'meta' 사건(C3)
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
+    _turn_image_events: list = []   # 그림 손질이 낸 화면 사건(올린 그림 주소 · 상태 줄) — 메시지를 짓기 전에 흘린다
+    _TURN_IMAGE_EVENTS.set(_turn_image_events)
     # 근거 블록·수치 대조용 — 이번 턴에 실제로 실행된 도구와 그 출력 원문.
     # contextvar 가 아니라 지역 리스트인 이유는 turn_imgs 와 같다: LangGraph 실행 컨텍스트를
     # 넘지 못해 스트림 쪽에서 직접 회수해야 한다(실측 빈 값).
@@ -3791,7 +4016,15 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
             sys_prompt += _docs
             yield _sse("status", {"step": _doc_status(_docs, min(len(req.documents), DOC_MAX_FILES),
                                                       _hist_tokens), "tool": None})
-        messages = [("system", sys_prompt), *_hist_msgs, ("user", req.message)]
+        # 그림 — 올린 그림은 아티팩트로 저장해 주소를 화면에 돌려준다(이력에 다시 실린다). 챗 모델이 그림을 받으면 이 발화의 그림 조각으로,
+        # 앞 대화의 그림(사람이 올린 것 · 도구가 낸 것)은 최근 VISION_HISTORY_IMAGES 장을 '앞 대화의 그림' 으로 다시 싣는다. 못 받으면
+        # 판독문(그림을 받는 다른 모델)으로, 그것도 없으면 못 실었다고 말한다(HWAXPortal docs/chat-depth-context T5).
+        _turn_vision = (await asyncio.to_thread(_chat_vision, app)
+                        if (req.images or _vision.history_images(req.history)) else _chat_vision_known(app))
+        _user_msg, _recap = await _turn_image_messages(app, req, _turn_vision)
+        async for _ev in _drain_image_events(_turn_image_events):
+            yield _ev
+        messages = [("system", sys_prompt), *_hist_msgs, *([_recap] if _recap else []), _user_msg]
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
@@ -3799,7 +4032,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
         # blocked: 유령 ID 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
         _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
-        _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT}
+        _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT,
+                # 도구 그림을 그 결과 뒤에 실을지 — 프롬프트 갈고리(_loop_fit_prompt)가 읽는다(문맥 변수는 LangGraph 실행 맥락을 넘지 못한다).
+                # 값은 셋 — True · False · None(아직 모름 — 도구가 그림을 낸 호출에서 묻는다).
+                "configurable": {"hwax_vision": locals().get("_turn_vision")}}
         # 조각을 흘린 모델 호출 — 그 호출의 끝 이벤트에서는 글을 다시 내지 않는다. 조각 없이 끝난 호출은 끝 이벤트의 글을 낸다:
         # 챗 전용 LLM 은 스트리밍인데 넘겨받은 VLLM_* 가 비스트리밍(GLM 우회)이면, 종전처럼 서버 전체 값(llm_nostream) 하나만
         # 보면 넘겨받은 답의 글이 화면에 안 나갔다(docs/chat-llm-stcx).
@@ -4005,7 +4241,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
                 try:
                     _msgs = [("system", sys_prompt),
                              *_history_messages(req.history, has_docs=bool(req.documents)),
-                             ("user", req.message)]
+                             *([locals()["_recap"]] if locals().get("_recap") else []),
+                             locals().get("_user_msg") or ("user", req.message)]
                     # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
                     _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
                     _r4 = await agent.ainvoke({"messages": _msgs}, config=_cfg4)
@@ -4081,7 +4318,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
                         "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
                         "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라. "
                         "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라."),
-                       *_history_messages(req.history, has_docs=bool(req.documents)), ("user", req.message)]
+                       *_history_messages(req.history, has_docs=bool(req.documents)),
+                       *([locals()["_recap"]] if locals().get("_recap") else []),
+                       locals().get("_user_msg") or ("user", req.message)]
             _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
             for m in reversed((_r2 or {}).get("messages") or []):
                 if getattr(m, "type", "") != "ai":
@@ -4355,15 +4594,15 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
-        stream = _detach_stream(run_sim_deliberation(app, strip_sim_trigger(req.message), req.groups,
-                                                     req.delib_opts, req.user_email, req.user_pat,
-                                                     req.history), "sim", started_by)
+        _q = strip_sim_trigger(req.message)
+        stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_sim_deliberation(
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history)), "sim", started_by)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
-        stream = _detach_stream(run_test_plan(app, strip_test_plan_trigger(req.message), req.groups,
-                                              req.delib_opts, req.user_email, req.user_pat,
-                                              req.history), "test-plan", started_by)
+        _q = strip_test_plan_trigger(req.message)
+        stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_test_plan(
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history)), "test-plan", started_by)
     elif is_deliberation(req.message):
         # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
         # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
@@ -4905,9 +5144,74 @@ async def _delib_with_topic(req):
             yield _sse("result", {"type": "text", "content": msg})
             yield _sse("done", {})
             return
-    async for chunk in run_deliberation(app, q, req.groups, req.delib_opts,
-                                        req.user_email, req.user_pat, req.history):
+    async for chunk in _with_delib_images(req, q, lambda o: run_deliberation(
+            app, q, req.groups, o, req.user_email, req.user_pat, req.history)):
         yield chunk
+
+
+def _delib_image_list(req) -> list:
+    """심의에 걸리는 그림 — [(주소, 출처 설명)] 시간순. 앞 대화의 그림(사람이 올린 것 · 도구가 낸 것) 뒤에 심의로 넘긴 근거에 나온 그림."""
+    imgs = _vision.history_images(req.history)
+    seen = {u for u, _ in imgs}
+    for e in ((req.delib_opts or {}).get("evidence") or []):
+        if isinstance(e, dict):
+            for u in _vision.image_urls(e.get("result")):
+                if u not in seen:
+                    seen.add(u)
+                    imgs.append((u, f"심의로 넘긴 근거({str(e.get('tool') or e.get('source') or '')[:60]})에 나온 그림"))
+    return imgs
+
+
+async def _with_delib_images(req, q: str, start):
+    """심의 엔진 앞 — 그림을 자료로 싣는다(사용자 지시 10-18 '자료를 기반으로 판단', 결정 '탐침 뒤 자동', HWAXPortal docs/chat-depth-context T5).
+      (1) 판독문 — 그림을 읽는 모델(Qwen)이 옮긴 글을 원천 근거(delib_opts.evidence)에 덧붙인다. 좌석 · 의장이 [e:N] 으로 짚고, 결정문의
+          근거 목록에 남는다. 심의 LLM 이 그림을 받아도 싣는다 — 그림은 짚을 번호가 없다.
+      (2) 그림 조각 — 심의 LLM(VLLM_*)이 그림을 받는다고 판정되면 최근 VISION_HISTORY_IMAGES 장을 좌석 · 의장 호출마다(DELIB_IMAGES).
+    start(opts) 가 엔진 생성기를 만든다 — 근거를 덧붙인 opts 를 받아야 해서 미리 만들어 두지 않는다."""
+    imgs = _delib_image_list(req)
+    tok = None
+    if imgs:
+        async for chunk in _delib_image_evidence(req, q, imgs):
+            yield chunk
+        if await asyncio.to_thread(_base_vision):
+            pick = imgs[-_vision.HISTORY_IMAGES:] if _vision.HISTORY_IMAGES > 0 else []
+            ps, miss = await asyncio.to_thread(_vision.parts, [u for u, _ in pick], ARTIFACT_DIR, AIDH_HTTP, len(pick))
+            if ps:
+                tok = (_delib_engine.DELIB_IMAGES, _delib_engine.DELIB_IMAGES.set(ps))
+            yield _sse("status", {"step": f"심의 LLM 이 그림을 받는다 — 그림 {len(ps)}장을 좌석 · 의장 호출마다 싣는다"
+                                          + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "")
+                                          + (f" · 오래된 {len(imgs) - len(pick)}장은 상한(VISION_HISTORY_IMAGES) 밖"
+                                             if len(imgs) > len(pick) else ""), "tool": None})
+    try:
+        async for chunk in start(req.delib_opts):
+            yield chunk
+    finally:
+        if tok is not None:
+            try:
+                tok[0].reset(tok[1])
+            except ValueError:   # 다른 문맥에서 닫혔다 — 그 문맥(심의 태스크)은 곧 끝난다
+                pass
+
+
+async def _delib_image_evidence(req, q: str, imgs: list):
+    """그림을 판독해 req.delib_opts.evidence 에 덧붙인다(그림 해시로 디스크에 남아 같은 그림은 다시 읽지 않는다). 상태 줄을 낸다."""
+    tr = await asyncio.to_thread(_transcriber, app)
+    if tr is None:
+        yield _sse("status", {"step": f"그림 {len(imgs)}장 — 판독할 모델이 없어(그림을 받는 모델 없음) 심의 근거에 싣지 못했다",
+                              "tool": None})
+        return
+    pick = imgs[-_vision.TRANSCRIBE_MAX:] if _vision.TRANSCRIBE_MAX > 0 else []
+    yield _sse("status", {"step": f"그림 {len(pick)}장을 판독해 심의 근거로 싣는다", "tool": None})
+    got = await _vision.transcribe_all(tr, pick, ARTIFACT_DIR, AIDH_HTTP, hint=q[:300])
+    items = [{"source": f"그림 판독 · {why}", "tool": "vision_transcribe", "args": u, "result": t} for u, why, t in got if t]
+    if items:
+        opts = dict(req.delib_opts or {})
+        opts["evidence"] = list(opts.get("evidence") or []) + items
+        req.delib_opts = opts
+    yield _sse("status", {"step": f"그림 판독문 {len(items)}장을 심의 근거로 실었다"
+                                  + (f" · {len(got) - len(items)}장은 판독하지 못했다" if len(got) > len(items) else "")
+                                  + (f" · 오래된 {len(imgs) - len(pick)}장은 상한(VISION_TRANSCRIBE_MAX) 밖" if len(imgs) > len(pick) else ""),
+                          "tool": None})
 
 
 async def _derive_topic(history: list, fallback: str = "") -> dict:
@@ -5553,6 +5857,8 @@ def health() -> dict:
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
+        # 그림을 받는가 — 서버(호스트 · 모델)마다 탐침 결과(None 은 아직 모름 — 첫 그림 턴에 묻는다). docs/chat-depth-context T5.
+        "vision": _vision.state(),
         "mcp": list(getattr(app.state, "connections", {})),
         "tool_scoping": "gateway (X-HWAX-Groups)",
         "tool_desc_max": TOOL_DESC_MAX,

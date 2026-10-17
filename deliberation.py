@@ -2248,8 +2248,27 @@ def _parse_json(text: str):
 _OUT_CUT_MARK = "…[출력 상한(max_tokens) 절단 — 이 응답은 불완전하다]"
 
 
-async def _llm_text(llm, system: str, human: str) -> str:
-    r = await llm.ainvoke([("system", system), ("human", human)])
+# 심의 좌석 · 의장 호출에 실을 그림 조각(image_url) — 심의 LLM 이 그림을 받는다고 판정됐을 때만 app._with_delib_images 가 채운다
+# (HWAXPortal docs/chat-depth-context T5, 사용자 결정 10-18 '탐침 뒤 자동'). 좌석은 제 태스크(ensure_future)로 돌아 이 값을 물려받는다.
+DELIB_IMAGES: contextvars.ContextVar = contextvars.ContextVar("delib_images", default=None)
+
+
+def _img_arg() -> tuple:
+    """_llm_text 에 덧붙일 그림 인자 — 그림이 없으면 빈 튜플이라 호출 모양이 종전과 같다(시험의 가짜 _llm_text 들이 인자 셋을 받는다)."""
+    imgs = DELIB_IMAGES.get()
+    return (imgs,) if imgs else ()
+
+
+async def _llm_text(llm, system: str, human: str, images: list | None = None) -> str:
+    # images — 그림 조각들. 사람 메시지를 [그림들, 글] 로 보낸다 — 그림이 글 앞이라 같은 시스템 글을 쓰는 호출들(띵킹 좌석 · 한 좌석의
+    # 라운드들)의 앞부분이 같아 서버의 앞부분 캐시가 듣는다.
+    if images:
+        from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
+
+        r = await llm.ainvoke([SystemMessage(content=system),
+                               HumanMessage(content=[*images, {"type": "text", "text": human}])])
+    else:
+        r = await llm.ainvoke([("system", system), ("human", human)])
     text = r.content if hasattr(r, "content") else str(r)
     # ⚠ max_tokens 절단 검출 — finish_reason 을 아무도 안 읽어서, 의장 결정문이 출력 상한에서
     #   문장 중간에 잘려도 정상 반환으로 흘렀다(감사 비판자 1-D). 잘렸으면 표식을 붙인다 —
@@ -2295,7 +2314,7 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
                 return f"직전 JSON 에 요구 키({', '.join(missing)})의 내용이 비어 있었습니다."
         return validator(x) if validator else None
 
-    txt = await _llm_text(llm, sysmsg, prompt)
+    txt = await _llm_text(llm, sysmsg, prompt, *_img_arg())
     d = _parse_json(txt)
     for attempt in range(max(0, opts.parse_retries)):
         hint = problem_of(d)
@@ -2303,7 +2322,8 @@ async def _persona_round(llm, persona: dict, prompt: str, required: tuple = (),
             break
         txt = await _llm_text(llm, sysmsg, prompt +
                               f"\n\n(재시도 {attempt + 1}/{opts.parse_retries} — {hint} "
-                              f"다른 설명 없이, 요구된 키를 실제 내용으로 채운 JSON 객체 하나만 출력하세요.)")
+                              f"다른 설명 없이, 요구된 키를 실제 내용으로 채운 JSON 객체 하나만 출력하세요.)",
+                              *_img_arg())
         d = _parse_json(txt)
     if not isinstance(d, dict):
         # 파싱 재시도 소진 — 발언을 통째로 버리지 않되 **강등 사실을 표식으로 남긴다**(감사 C28:
@@ -5919,9 +5939,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     async def _chair_once() -> str:
         if n_cand == 1:
-            return await _llm_text(llm, chair_sys, chair_human)
+            return await _llm_text(llm, chair_sys, chair_human, *_img_arg())
         raw_cands = await asyncio.gather(
-            *[_llm_text(llm, chair_sys, chair_human) for _ in range(n_cand)],
+            *[_llm_text(llm, chair_sys, chair_human, *_img_arg()) for _ in range(n_cand)],
             return_exceptions=True)
         cands = [c for c in raw_cands if isinstance(c, str) and c.strip()]
         if not cands:
