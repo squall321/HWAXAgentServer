@@ -144,3 +144,17 @@ def test_기동_로그에_걸린_한도와_손잡이_이름이_나온다(monkeyp
                  "LLM_MAX_RETRIES", "DELIB_LLM_MAX_RETRIES"):
         assert want in line, (want, line)
     assert "=0 — LLM 호출에 시간 한도가 없다" not in out
+
+
+def test_health_의_sampling_은_심의_LLM_이_실제로_보내는_값이다(monkeypatch):
+    """리스크 앱이 패널의 모델 출처에 도장으로 남긴다(HWAXPortal docs/design-risk-review §8.4.1 — 없으면 null 로 진행).
+    None 은 '보내지 않는다'(top_p 는 서버 기본값, max_tokens 는 상한 없음). 도장이 실제 클라이언트와 어긋나지 않는지도 본다."""
+    for k in ("LLM_TEMPERATURE", "LLM_MAX_TOKENS"):
+        monkeypatch.delenv(k, raising=False)
+    st = _boot(monkeypatch)
+    assert st.delib_sampling == {"temperature": 0.0, "top_p": None, "max_tokens": None}
+    st = _boot(monkeypatch, DELIB_TEMPERATURE="0.3", DELIB_MAX_TOKENS="8192")
+    assert st.delib_sampling == {"temperature": 0.3, "top_p": None, "max_tokens": 8192}
+    assert (st.delib_llm.temperature, st.delib_llm.max_tokens) == (0.3, 8192)
+    st = _boot(monkeypatch, LLM_TEMPERATURE="0.1")
+    assert st.delib_sampling["temperature"] == 0.1, "심의는 DELIB_TEMPERATURE 가 없으면 LLM_TEMPERATURE 를 따른다"

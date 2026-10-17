@@ -476,6 +476,9 @@ async def lifespan(app: FastAPI):
     d_to = _env_float("DELIB_TIMEOUT_S", 1800.0)
     d_rt = _env_int("DELIB_LLM_MAX_RETRIES", 1)
     app.state.delib_llm = _mk_llm(d_t, d_mt, d_eff, d_to, d_rt)
+    # /health 의 sampling — 심의가 실제로 쓰는 생성 파라미터(리스크 앱이 패널의 모델 출처에 도장으로 남긴다 — 없으면 null 로 진행).
+    # None 은 '보내지 않는다'(top_p 는 서버 기본값, max_tokens 는 상한 없음). seed 는 보내지 않아 싣지 않는다.
+    app.state.delib_sampling = {"temperature": d_t, "top_p": None, "max_tokens": d_mt or None}
     print(f"[agent] LLM 한도 — 챗: 호출 1회 {base_to or '무제한'}초·재시도 {base_rt}회(LLM_TIMEOUT_S·"
           f"LLM_MAX_RETRIES) / 심의: 호출 1회 {d_to or '무제한'}초·재시도 {d_rt}회(DELIB_TIMEOUT_S·"
           f"DELIB_LLM_MAX_RETRIES) / 연결 {conn_to or '무제한'}초(LLM_CONNECT_TIMEOUT_S)")
@@ -5276,6 +5279,8 @@ def health() -> dict:
         "load": {"chat": _CHAT_LOAD.snapshot()},
         "model": VLLM_MODEL,
         "vllm": VLLM_BASE_URL,
+        # 심의 LLM 의 생성 파라미터 {temperature, top_p, max_tokens} — None 은 보내지 않는 값(HWAXPortal docs/design-risk-review §8.4.1).
+        "sampling": getattr(app.state, "delib_sampling", None),
         # 챗 전용 LLM(CHAT_LLM_*) — 꺼져 있으면 {"enabled": false}(챗도 위 model · vllm). 켜져 있으면 넘김 횟수까지(docs/chat-llm-stcx).
         "chat_llm": _chat_llm_health(),
         "mcp": list(getattr(app.state, "connections", {})),

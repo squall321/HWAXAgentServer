@@ -56,6 +56,12 @@ def test_health_의_M3_칸(client):
     assert (c["limit"], c["limit_reason"], c["delib_human"]) == (8, "normal", 0)
 
 
+def test_health_의_sampling_은_기동이_적은_심의_생성_파라미터다(client, monkeypatch):
+    """리스크 앱 engine_client 가 info.get("sampling") 으로 읽는다 — 이름을 바꾸면 그쪽이 조용히 null 로 남긴다."""
+    monkeypatch.setattr(a.app.state, "delib_sampling", {"temperature": 0.2, "top_p": None, "max_tokens": None}, raising=False)
+    assert client.get("/health").json()["sampling"] == {"temperature": 0.2, "top_p": None, "max_tokens": None}
+
+
 def test_비우기가_서면_health_가_draining_과_limit_0_을_싣는다(client):
     client.post("/drain", json={"on": True, "scope": "all", "ttl_s": 600, "by": "update-all", "reason": "§2"})
     h = client.get("/health").json()
