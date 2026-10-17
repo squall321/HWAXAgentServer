@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # tests/ — fakes 패키지
 
-from fakes.llm import HTTP_ERRORS, act, respond, usage_of  # noqa: E402
+from fakes.llm import HTTP_ERRORS, act, ctx_overflow_body, respond, usage_of  # noqa: E402
 
 HANG_S = 24 * 3600
 
@@ -137,7 +137,7 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
         state["calls"] += 1
         state["behaviors"].append(a.behavior)
         if body.get("stream") and not (a.text is None and (a.behavior in HTTP_ERRORS or a.behavior
-                                                           in ("unreachable", "timeout"))):
+                                                           in ("unreachable", "timeout", "ctx_overflow"))):
             return StreamingResponse(stream(a, system, human), media_type="text/event-stream")
         await take()
         state["active"] += 1
@@ -147,6 +147,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0):
                 await asyncio.sleep(a.delay)
             if a.text is None and a.behavior == "timeout":
                 await asyncio.sleep(HANG_S)
+            if a.text is None and a.behavior == "ctx_overflow":   # vLLM 은 스트리밍 요청도 흘리기 전에 이 400(JSON)으로 거절한다
+                return JSONResponse(ctx_overflow_body(ctx, ctx + 1, int(body.get("max_tokens") or 1)), status_code=400)
             if a.text is None and (a.behavior in HTTP_ERRORS or a.behavior == "unreachable"):
                 code = HTTP_ERRORS.get(a.behavior, 503)
                 return JSONResponse({"error": {"message": f"fake {code}", "type": "fake", "code": code}},

@@ -13,7 +13,8 @@ sweep_no(훑기 전부 무관) · noinput_flawed(more 없음·인용 하나 지�
 summary_skip_cover(꼭 다룰 행 둘을 빠뜨림) · summary_skip_one(가리킨 것 가운데 하나를 끝내 빠뜨리고 없는 수를 씀). 적대 검토
 4라운드(RB3B)에서 더한 것 — first_fail_fakequote(첫 카드만 FAIL·지어낸 인용) · noinput_retract(가리킨 영향 줄을 검증된 인용의
 '영향 없음' 으로 다시 냄). 6라운드(RB3D)에서 더한 것 — alias_words(판정을 별칭 표의 낱말로 — 'FAILED'·'통과') ·
-coerced_clash(첫 카드에 표 밖 낱말 '보류중' 의 줄을 하나 더).
+coerced_clash(첫 카드에 표 밖 낱말 '보류중' 의 줄을 하나 더). 10-18 에 더한 것 — ctx_overflow(vLLM 의 '창이 모자라다' 400 — 본문은
+vLLM 0.23.0 원문 꼴, ctx_overflow_body).
 카드 대조가 아닌 프롬프트(심의 좌석·의장 등 — 쟁점 패널)는 거동과 상관없이 심의 대본(delib_respond)으로 답한다. position_bias · flip_on_solo(계측기 검증, 리스크 앱 품질 수치 몫)는 아직 없다.
 대본이 다 떨어지면 마지막 거동을 되풀이한다.
 """
@@ -25,7 +26,7 @@ import re
 from dataclasses import dataclass
 
 HTTP_ERRORS = {f"http_{c}": c for c in (400, 401, 403, 404, 413, 422, 429, 500, 503)}
-ERROR_BEHAVIORS = ("timeout", "unreachable", *HTTP_ERRORS)
+ERROR_BEHAVIORS = ("timeout", "unreachable", "ctx_overflow", *HTTP_ERRORS)
 TEXT_BEHAVIORS = ("oracle", "broken_line", "array_collapse", "truncate", "truncate_empty", "skip_middle",
                   "all_ok_noquote", "all_ok_fakequote", "fabricate_alias", "duplicate_rows", "prose_only",
                   "wrong_enum", "cross_card_quote", "invented_number", "obey_injection", "empty", "slow",
@@ -424,6 +425,15 @@ def _split(msgs) -> tuple[str, str]:
     return system, human
 
 
+def ctx_overflow_body(ctx: int, prompt_tokens: int, max_tokens: int) -> dict:
+    """vLLM 0.23.0 이 창보다 긴 요청에 내는 400 본문 그대로(renderers/params.py 의 문구 · ErrorResponse 꼴 — 10-18 원문 대조)."""
+    return {"error": {"message": f"This model's maximum context length is {ctx} tokens. However, you requested {max_tokens} output "
+                                 f"tokens and your prompt contains {prompt_tokens} input tokens, for a total of "
+                                 f"{prompt_tokens + max_tokens} tokens. Please reduce the length of the input prompt or the number "
+                                 "of requested output tokens.",
+                      "type": "BadRequestError", "param": "input_tokens", "code": 400}}
+
+
 def _status_error(code: int):
     """openai 가 그 상태 코드에 올리는 예외 그대로(ChatOpenAI 를 지난 것과 같은 모양)."""
     import httpx
@@ -451,6 +461,10 @@ def raise_for(a: Act):
             raise httpx.ConnectError("[Errno 111] Connection refused", request=req)
         except httpx.ConnectError as e:
             raise openai.APIConnectionError(request=req) from e
+    if a.behavior == "ctx_overflow":
+        body = ctx_overflow_body(262_144, 262_145, 1)
+        raise openai.BadRequestError(f"Error code: 400 - {body}", response=httpx.Response(400, request=req, json=body),
+                                     body=body["error"])
     raise _status_error(HTTP_ERRORS[a.behavior])
 
 

@@ -38,7 +38,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
 from fastapi import FastAPI, HTTPException, Request
@@ -296,8 +296,9 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
 # CHAT_LLM_BASE_URL 이 비면 챗도 VLLM_* 클라이언트(app.state.llm)를 그대로 쓴다 — 아무것도 바뀌지 않는다. 채우면 챗 ReAct · 챗 안 도구
 # 계획만 그 서버로 간다. 띵킹 · 심의 준비(전문가 고르기 축 · VOC · 되묻기 · 주제 뽑기) · 심의 · 카드 대조는 VLLM_* 그대로다(CL-D2).
 # 넘김은 LLM 호출 단위다 — 턴 전체를 다시 돌리면 이미 실행한 도구가 두 번 돈다(CL-D3). 넘기는 것은 연결 실패 · 시간 초과 · 5xx ·
-# 401/403(그 서버의 키 — VLLM_* 는 자격이 따로다) · 첫 조각 전 스트림 침묵이다(_chat_fallback_errors). 400 은 VLLM_* 에서도 같은 까닭으로
-# 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지 않는다. 토큰이 흐르기 시작한 뒤의 실패는 넘기지 못한다(with_fallbacks 의 스트림 규칙).
+# 401/403(그 서버의 키 — VLLM_* 는 자격이 따로다) · 첫 조각 전 스트림 침묵 · '창이 모자라다' 400(ChatCtxOverflow — 챗 턴의 창은 GLM 창
+# 안이다, CL-D9)이다(_chat_fallback_errors). 다른 400 은 VLLM_* 에서도 같은 까닭으로 실패할 수 있고 404(모델 이름)는 설정 오류라 숨기지
+# 않는다. 토큰이 흐르기 시작한 뒤의 실패는 넘기지 못한다(with_fallbacks 의 스트림 규칙).
 #   CHAT_LLM_BASE_URL · CHAT_LLM_MODEL       둘 다 있어야 켜진다. CHAT_LLM_API_KEY(기본 EMPTY)
 #   CHAT_LLM_ENABLE_THINKING   기본 0 — 생각 모드를 끈다(chat_template_kwargs.enable_thinking=false, 사용자 결정 10-17). 1 이면 모델 기본값.
 #                              LLM_REASONING_EFFORT 는 VLLM_* 서버 것이라 챗 서버에 보내지 않는다.
@@ -307,8 +308,55 @@ def _stream_chunk_limit_note(exc: BaseException) -> str:
 #   CHAT_LLM_MAX_RETRIES       기본 1 — 챗 서버에 다시 보내는 횟수. 그다음은 넘긴다
 #   CHAT_LLM_FALLBACK          기본 1 — 0 이면 넘기지 않는다(실패가 그대로 챗에 보인다)
 #   CHAT_LLM_CONTEXT_TOKENS    챗 서버의 /v1/models 에서 창을 못 읽을 때 쓸 값(기본 LLM_CONTEXT_TOKENS, 없으면 128000)
+import openai  # noqa: E402 — 챗 서버의 '창이 모자라다' 400 을 넘김 대상으로 바꾸는 데만 쓴다(langchain_openai 가 이미 들인 의존성이다)
+
+# vLLM 이 '이 요청은 내 창보다 길다' 로 거절하는 문구 — OpenAI 호환 서버의 검사(renderers/params.py)와 엔진의 검사(input_processor.py,
+# 'longer than the maximum model length'), 그리고 OpenAI 의 오류 코드. vLLM 0.23.0 원문으로 확인했다(10-18).
+_CTX_OVERFLOW_MARKS = ("maximum context length", "maximum model length", "context_length_exceeded")
+
+
+class ChatCtxOverflow(openai.BadRequestError):
+    """챗 서버가 '이 요청은 내 창보다 길다' 로 거절한 400(CL-D9). 다른 400 과 달리 VLLM_* 는 같은 까닭으로 실패하지 않는다 — 챗 턴의 창은
+    두 서버 중 작은 값이라(CL-D5) 그 요청은 GLM 창 안에 든다. 이런 거절은 챗 서버 복제본들의 창이 섞일 때 난다 — stcx 를 1M(YaRN)으로
+    올리는 시범 · rolling 동안 에이전트가 새 복제본에서 1M 을 읽고 만든 긴 요청을 부하분산기가 옛 262,144 복제본에 보낸다."""
+
+
+@contextmanager
+def _ctx_overflow_falls_back():
+    """그 안에서 난 '창이 모자라다' 400 만 ChatCtxOverflow 로 바꿔 올린다 — 나머지 예외는 그대로다."""
+    try:
+        yield
+    except openai.BadRequestError as e:
+        if not isinstance(e, ChatCtxOverflow) and any(m in str(e).lower() for m in _CTX_OVERFLOW_MARKS):
+            raise ChatCtxOverflow(e.message, response=e.response, body=e.body) from e
+        raise
+
+
+class _ChatServerLLM(ChatOpenAI):
+    """챗 전용 LLM 의 앞(챗 서버) 클라이언트 — ChatOpenAI 그대로이되 '창이 모자라다' 400 을 ChatCtxOverflow 로 올려 with_fallbacks 가
+    넘기게 한다. 비스트리밍(_generate · _agenerate) · 스트리밍(_stream · _astream) 네 길을 다 덮는다 — 400 은 첫 조각 전에 난다."""
+
+    def _generate(self, *a, **k):
+        with _ctx_overflow_falls_back():
+            return super()._generate(*a, **k)
+
+    async def _agenerate(self, *a, **k):
+        with _ctx_overflow_falls_back():
+            return await super()._agenerate(*a, **k)
+
+    def _stream(self, *a, **k):
+        with _ctx_overflow_falls_back():
+            yield from super()._stream(*a, **k)
+
+    async def _astream(self, *a, **k):
+        with _ctx_overflow_falls_back():
+            async for chunk in super()._astream(*a, **k):
+                yield chunk
+
+
 def _chat_fallback_errors() -> tuple:
-    """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다) · 401/403 · 첫 조각 전 스트림 침묵.
+    """넘기는 예외 — 연결 실패 · 시간 초과 · 5xx(openai SDK 는 500 이상을 InternalServerError 로 낸다) · 401/403 · 첫 조각 전 스트림 침묵 ·
+    '창이 모자라다' 400(ChatCtxOverflow — _ChatServerLLM 이 다른 400 과 갈라 올린다, CL-D9).
 
     401 · 403 은 챗 서버의 키 문제다 — VLLM_* 는 자기 자격이 따로 있어 같은 까닭으로 실패하지 않는다. 넘기지 않으면 키 없이 켜거나 키를
     바꾸는 동안(stcx rolling 약 20분 — 옛 키 · 새 키가 섞인다) 챗이 그대로 실패했다(10-17 cae00 리뷰 A1). 설정 오류가 숨지 않게 /health 의
@@ -319,10 +367,8 @@ def _chat_fallback_errors() -> tuple:
     넘기지 못한다(with_fallbacks 의 스트림 규칙)."""
     import asyncio  # noqa: PLC0415
 
-    import openai  # noqa: PLC0415 — langchain_openai 가 이미 들인 의존성이다
-
     return (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError,
-            openai.AuthenticationError, openai.PermissionDeniedError, asyncio.TimeoutError, TimeoutError)
+            openai.AuthenticationError, openai.PermissionDeniedError, asyncio.TimeoutError, TimeoutError, ChatCtxOverflow)
 
 
 def _now_iso() -> str:
@@ -382,7 +428,7 @@ def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeou
                   "streaming": not nostream, "last_error": None, "last_error_at": None,
                   "fallback": {"enabled": fallback_on, "to": VLLM_MODEL, "count": 0, "last_at": None}}
     primary = mk(temperature, max_tokens, "", timeout_s, _env_int("CHAT_LLM_MAX_RETRIES", 1), base_url=url, model=model,
-                 api_key=key, nostream=nostream,
+                 api_key=key, nostream=nostream, cls=_ChatServerLLM,
                  chat_template_kwargs=None if thinking else {"enable_thinking": False},
                  callbacks=[_ChatLLMWatch(info, "primary")])
     chat = primary
@@ -453,8 +499,8 @@ async def lifespan(app: FastAPI):
     def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0,
                 retries: int = 2, *, base_url: str = "", model: str = "", api_key: str = "",
                 nostream: bool | None = None, chat_template_kwargs: dict | None = None,
-                callbacks: list | None = None) -> ChatOpenAI:
-        # 주소 · 모델 · 키를 주지 않으면 VLLM_* 다(챗 · 심의 클라이언트). 챗 전용 LLM(_build_chat_llm)만 다른 서버를 준다.
+                callbacks: list | None = None, cls: type = ChatOpenAI) -> ChatOpenAI:
+        # 주소 · 모델 · 키를 주지 않으면 VLLM_* 다(챗 · 심의 클라이언트). 챗 전용 LLM(_build_chat_llm)만 다른 서버와 cls(_ChatServerLLM)를 준다.
         url = base_url or VLLM_BASE_URL
         kw: dict = dict(base_url=url, api_key=api_key or VLLM_API_KEY, model=model or VLLM_MODEL,
                         temperature=temperature, disable_streaming=disable_stream if nostream is None else nostream,
@@ -470,7 +516,7 @@ async def lifespan(app: FastAPI):
         if callbacks:
             kw["callbacks"] = list(callbacks)
         # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py).
-        return _call_trace.instrument_llm(ChatOpenAI(**kw), _call_trace.server_label(url))
+        return _call_trace.instrument_llm(cls(**kw), _call_trace.server_label(url))
 
     base_t = _env_float("LLM_TEMPERATURE", 0.0)
     base_mt = _env_int("LLM_MAX_TOKENS", 0)

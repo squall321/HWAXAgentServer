@@ -4,7 +4,7 @@
 챗 전용 클라이언트를 따로 둔다.
 
   · 비면 챗도 VLLM_* 클라이언트 그대로(바뀌는 것 없음). 채우면 챗만 그 서버 · 생각 끔 · 심의 · 띵킹 · 심의 준비는 VLLM_*.
-  · 넘김은 LLM 호출 단위 — 연결 실패 · 5xx 만. 400 은 넘기지 않는다.
+  · 넘김은 LLM 호출 단위 — 연결 실패 · 5xx · 401/403 · 첫 조각 전 침묵 · '창이 모자라다' 400. 다른 400 은 넘기지 않는다.
   · 챗 서버는 스트리밍인데 넘겨받은 VLLM_* 는 비스트리밍이어도 그 답의 글이 화면에 나간다(호출마다 본다).
   · 챗 턴의 문맥 예산은 두 서버 창 중 작은 값 — 턴이 끝나면 되돌린다.
   · /health 의 chat_llm 은 키를 싣지 않는다.
@@ -202,6 +202,62 @@ def test_5xx_는_넘기고_400_은_넘기지_않는다(monkeypatch, fake_server)
 def noop(q: str) -> str:
     """아무것도 하지 않는 도구 — 에이전트를 앱이 만드는 길로 만들기 위한 자리."""
     return "ok"
+
+
+def test_창이_모자라다는_400_은_넘긴다_비스트리밍_스트리밍_도구_묶음(monkeypatch, fake_server):
+    """stcx 를 1M(YaRN)으로 올리는 시범 · rolling 동안 복제본 창이 섞인다(262,144 와 1,010,000). 에이전트가 새 복제본에서 1M 을 읽고 만든
+    긴 요청을 부하분산기가 옛 복제본에 보내면 vLLM 이 '창이 모자라다' 400 을 낸다 — 챗 턴의 창은 두 서버 중 작은 값이라 GLM 은 같은
+    까닭으로 실패하지 않는다(HWAXPortal docs/chat-llm-stcx CL-D9). 챗 에이전트는 bind_tools 로 묶은 것을 부르므로 그 길도 본다."""
+    glm = fake_server(model="fake-glm")
+    _glm(monkeypatch, glm)
+    chat = fake_server(model="qwen3.8-flash-next", ctx=262_144, script="ctx_overflow")
+    for nostream in ("1", "0"):              # 1 — 비스트리밍(cae00 기본) · bind_tools 길, 0 — 스트리밍
+        st = _boot(monkeypatch, CHAT_LLM_BASE_URL=f"{chat}/v1", CHAT_LLM_MODEL="qwen3.8-flash-next", CHAT_LLM_MAX_RETRIES="0",
+                   CHAT_LLM_DISABLE_STREAMING=nostream)
+        before = _calls(glm)
+
+        async def go():
+            if nostream == "1":
+                return (await st.chat_llm.bind_tools([noop]).ainvoke([("human", "안녕")])).content
+            return "".join([str(c.content) async for c in st.chat_llm.astream([("human", "안녕")])])
+        assert asyncio.run(go()), f"넘겨받은 VLLM_* 가 답해야 한다(CHAT_LLM_DISABLE_STREAMING={nostream})"
+        assert _calls(glm) == before + 1 and st.chat_llm_info["fallback"]["count"] == 1, nostream
+        err = st.chat_llm_info["last_error"] or ""
+        assert err.startswith("ChatCtxOverflow") and "maximum context length is 262144" in err, err
+
+
+def test_창이_모자라다는_vLLM_의_두_문구만이고_다른_400_은_그대로_올린다():
+    """vLLM 0.23.0 원문 — OpenAI 호환 서버의 검사(renderers/params.py)와 엔진의 검사(input_processor.py). 도구 스키마 · 인자 같은 다른 400 은
+    GLM 에서도 같은 까닭으로 실패할 수 있어 그대로 올린다(test_5xx_는_넘기고_400_은_넘기지_않는다)."""
+    import httpx as _httpx
+
+    req = _httpx.Request("POST", "http://chat.test/v1/chat/completions")
+
+    def bad(msg: str) -> openai.BadRequestError:
+        body = {"error": {"message": msg, "type": "BadRequestError", "param": None, "code": 400}}
+        return openai.BadRequestError(f"Error code: 400 - {body}", response=_httpx.Response(400, request=req, json=body),
+                                      body=body["error"])
+
+    def raised(msg: str) -> BaseException:
+        try:
+            with a._ctx_overflow_falls_back():
+                raise bad(msg)
+        except BaseException as e:  # noqa: BLE001
+            return e
+        raise AssertionError("올리지 않았다")
+
+    for msg in ("This model's maximum context length is 262144 tokens. However, you requested 1 output tokens and your prompt "
+                "contains 300000 input tokens, for a total of 300001 tokens. Please reduce the length of the input prompt or the "
+                "number of requested output tokens.",
+                "The decoder prompt (length 300000) is longer than the maximum model length of 262144. Make sure that "
+                "`max_model_len` is no smaller than the number of text tokens."):
+        e = raised(msg)
+        assert isinstance(e, a.ChatCtxOverflow) and isinstance(e, openai.BadRequestError), msg
+        assert isinstance(e.__cause__, openai.BadRequestError) and e.status_code == 400
+    for msg in ("fake 400", "Invalid 'tools': schema of tool 'x' is not valid JSON Schema"):
+        e = raised(msg)
+        assert type(e) is openai.BadRequestError, f"다른 400 은 그대로 — {msg}"
+    assert a.ChatCtxOverflow in a._chat_fallback_errors() and openai.BadRequestError not in a._chat_fallback_errors()
 
 
 def test_스트리밍_챗_서버가_죽어_비스트리밍_GLM_이_답해도_그_글이_화면에_나간다(monkeypatch, fake_server):
