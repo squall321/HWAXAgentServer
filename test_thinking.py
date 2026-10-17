@@ -192,13 +192,18 @@ def test_judge_timeout_names_the_knob(monkeypatch):
     assert "THINK_SEAT_TIMEOUT_S" in out and "기권이 아니라" in out, out
 
 
-def test_seat_timeout_default_is_600():
-    """환경값이 아니라 소스의 기본값을 본다. 챗 LLM 호출 한도(900초)보다 짧아야 좌석 상한이 먼저 걸린다."""
+def test_seat_timeout_default_is_1800_like_deliberation():
+    """환경값이 아니라 소스의 기본값을 본다. 600 → 1800(사용자 결정 10-18 — 지연보다 내용): 좌석마다 세션 맥락을 싣게 되어 프롬프트가
+    커졌고 GLM 은 호출마다 평균 1.3만 토큰을 생각한다(HWAXPortal docs/chat-depth-context CD-D7 ③). 심의 좌석의 호출 한도
+    (DELIB_TIMEOUT_S 기본 1800)와 같다 — 같은 GLM 에서 같은 크기의 일을 하는 좌석이다."""
     import re
 
     src = open(t.__file__, encoding="utf-8").read()
     m = re.search(r'^SEAT_TIMEOUT_S = float\(os\.environ\.get\("THINK_SEAT_TIMEOUT_S", "(\d+)"\)\)$', src, re.M)
-    assert m and int(m.group(1)) == 600 and int(m.group(1)) < 900, m and m.group(0)
+    app_src = open(t.__file__.replace("thinking.py", "app.py"), encoding="utf-8").read()
+    d = re.search(r'd_to = _env_float\("DELIB_TIMEOUT_S", (\d+)\.0\)', app_src)
+    assert m and int(m.group(1)) == 1800, m and m.group(0)
+    assert d and int(d.group(1)) == int(m.group(1)), "심의 좌석 호출 한도와 같다"
 
 
 # ── 종합 문구 — 기권과 장애를 섞지 않는다 ─────────────────────────────────────

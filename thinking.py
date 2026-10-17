@@ -21,12 +21,15 @@ import json
 import os
 
 import call_trace
+import external_llm
 from deliberation import (
     _KN_CONC,
     _room,
     _wide,
     _agent_search_hits,
     _call,
+    _cut_mark,
+    _fit_recent,
     _first_dict,
     _llm_text,
     _parse_json,
@@ -64,9 +67,20 @@ def _knowledge_budget() -> int:
     return min(KNOWLEDGE_BUDGET, got) if _KNOWLEDGE_BUDGET_SET else got
 # 좌석 1콜 상한(초). 넘으면 그 좌석만 빠지고 나머지는 진행한다.
 # 180 → 600 (2026-10-08). 심의와 같은 공유 LLM 을 쓴다 — 20석 넘는 심의가 LLM 을 차지한 동안에는 띵킹 좌석
-# 호출이 큐에서 180초를 넘겨 전 좌석이 '초과' 로 빠졌다. 챗 LLM 의 호출 한도(LLM_TIMEOUT_S 900초)보다 짧은
-# 것은 의도다 — 좌석 하나가 답을 붙들 수 있는 상한이다.
-SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "600"))
+# 호출이 큐에서 180초를 넘겨 전 좌석이 '초과' 로 빠졌다.
+# 600 → 1800 (2026-10-18, 사용자 결정 — 지연보다 내용). 좌석마다 세션 맥락(앞 대화 · 조회 근거)을 싣게 되어 프롬프트가 커졌고, GLM 은
+# 호출마다 평균 1.3만 토큰을 생각한다(요청서 v1.1 P6 — 평균 114초, 꼬리 16분). 심의 좌석 한도(DELIB_TIMEOUT_S)와 같다.
+SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "1800"))
+# 세션 맥락 — 앞 대화([c:N] 사람 · [a:N] 챗)와 그때 도구가 조회한 근거([e:N])를 좌석 본심 프롬프트에 싣는다(사용자 결정 10-18 —
+# "thinking 을 켜면 전문가 자문 모드이고 각자 맥락을 다 가지고 와야 한다", HWAXPortal docs/chat-depth-context). 0 이면 종전(질문만).
+WITH_HISTORY = os.environ.get("THINK_WITH_HISTORY", "1").strip() != "0"
+# 세션 맥락 몫 — 문서 예산(_doc_budget_tokens)의 비율. 문서를 붙였으면 문서 몫(THINK_DOC_SHARE)과 나눠 쓴다(합 0.9 — 나머지는 역할 ·
+# 지식카드 · 지시). 안 붙였으면 거의 다 쓴다.
+SESSION_SHARE = float(os.environ.get("THINK_SESSION_SHARE", "0.4"))
+SESSION_SHARE_SOLO = float(os.environ.get("THINK_SESSION_SHARE_SOLO", "0.85"))
+_SESSION_CONV_MIN = 0.35    # 세션 몫 가운데 대화가 적어도 가져가는 비율 — 근거가 적으면 대화가 그만큼 더 쓴다
+# 좌석 본심 LLM — base(VLLM_* = GLM, 기본) | chat(챗 전용 LLM — Qwen, 넘김 포함). 사용자 결정 10-18: GLM 유지, 바꿀 손잡이만 둔다.
+THINK_LLM = (os.environ.get("THINK_LLM") or "base").strip().lower()
 # 위임 명사구 상한(좌석당).
 REFER_MAX = 3
 
@@ -202,21 +216,29 @@ _JUDGE_SYS = (
 )
 
 
-def _judge_prompt(seat: dict, question: str, docs: str = "") -> str:
+def _judge_prompt(seat: dict, question: str, docs: str = "", session: str = "", topic: str = "") -> str:
+    """좌석 본심 프롬프트. 세션 맥락(session)은 맨 앞에 둔다 — 좌석마다 같은 글이라 앞에 두면 서버가 같은 머리를 다시 쓸 수 있고
+    (앞부분 캐시), '이 질문 앞에 무엇이 오갔나' 를 읽은 뒤 자기 역할 · 지식카드 · 질문으로 간다."""
     kn = seat.get("knowledge") or ""
     ev = (f"[당신의 지식카드 — 이 질문 관련 발췌]\n{kn}\n"
           if kn else
           "[당신의 지식카드]\n이 질문에 걸리는 보유 지식이 없습니다.\n")
     return (
-        f"[당신]\n{seat['key']} — {seat.get('role') or seat.get('name') or ''}\n\n"
+        (f"{session}\n\n" if session else "")
+        + f"[당신]\n{seat['key']} — {seat.get('role') or seat.get('name') or ''}\n\n"
         f"{ev}\n"
         f"[질문]\n{question}\n"
+        + (f"[대화의 화두 — 앞 대화에서 뽑은 물음]\n{topic}\n" if topic else "")
         + (f"{docs}\n" if docs else "")
         + "\n"
-        "먼저 스스로 판정하세요. **이 질문이 당신 도메인의 질문이고, 위 발췌나 당신의 전문 지식으로 "
+        "먼저 스스로 판정하세요. **이 질문이 당신 도메인의 질문이고, 위 발췌"
+        + (" · 세션 맥락" if session else "") + "이나 당신의 전문 지식으로 "
         "실질적인 답을 줄 수 있습니까?** 어휘가 익숙하다는 것과 답할 수 있다는 것은 다릅니다. "
         "인접 도메인이라 겉핥기만 가능하다면 그것은 답할 수 없는 것입니다.\n\n"
-        "답할 수 있으면 verdict=\"answer\" 로, 답을 본문에 쓰세요. 발췌에 없는 수치를 지어내지 말고, "
+        + ("세션 맥락이 있으니 그 위에서 판단하세요 — 앞 대화에서 이미 조회된 값은 다시 지어내지 말고 [e:N] 으로 인용하고, "
+           "당신의 지식카드와 다르면 다르다고 말하세요. 챗의 답([a:N])은 그때의 잠정 해석이지 결론이 아닙니다.\n"
+           if session else "")
+        + "답할 수 있으면 verdict=\"answer\" 로, 답을 본문에 쓰세요. 발췌에 없는 수치를 지어내지 말고, "
         "당신의 일반 전문 지식으로 말하는 부분은 (경험칙) 이라고 표기하세요.\n"
         "답할 수 없으면 verdict=\"pass\" 로, **답을 쓰지 말고** 왜 당신 소관이 아닌지를 밝히세요.\n"
         "refer 는 **이 질문을 다룰 분야**를 적는 자리입니다. 당신 전문 분야의 인접 주제를 적지 마세요 — "
@@ -227,19 +249,19 @@ def _judge_prompt(seat: dict, question: str, docs: str = "") -> str:
         '{"verdict":"answer"|"pass",'
         ' "scope":"당신이 이 질문에서 맡을 수 있는 범위 한 문장",'
         ' "answer":"verdict=answer 일 때만. 6~15문장.",'
-        ' "basis":["인용한 발췌의 제목", "..."],'
+        ' "basis":["인용한 발췌의 제목 또는 세션 표지([e:N] · [c:N] · [a:N])", "..."],'
         f' "refer":["verdict=pass 일 때만. 봐야 할 분야를 **한국어** 8단어 이내 명사구로 최대 {REFER_MAX}개"]}}'
     )
 
 
 async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
-                     docs: str = "") -> dict:
+                     docs: str = "", session: str = "", topic: str = "") -> dict:
     """좌석 1명의 자기판정 + (가능하면) 답변. 실패·시간초과는 pass 가 아니라 error 로 남긴다."""
     call_trace.tag(seat=seat.get("key"))      # 호출 추적 — 좌석마다 제 태스크(ensure_future)라 그 좌석의 호출에만 붙는다
     async with sem:
         try:
             raw = await asyncio.wait_for(
-                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs)), SEAT_TIMEOUT_S)
+                _llm_text(llm, _JUDGE_SYS, _judge_prompt(seat, question, docs, session, topic)), SEAT_TIMEOUT_S)
         except asyncio.TimeoutError:
             return {**seat, "verdict": "error", "scope": "", "answer": "",
                     # 어느 값을 올리면 되는지 같이 적는다 — 띵킹에는 설정 이름을 따로 싣는 자리가 없다.
@@ -273,10 +295,98 @@ async def _judge_one(llm, seat: dict, question: str, sem: asyncio.Semaphore,
             "raw": raw if verdict == "error" else ""}
 
 
+# ── 세션 맥락 — 앞 대화와 그때 도구가 조회한 근거 ─────────────────────────────
+_SESSION_HEAD = (
+    "[세션 맥락 — 이 질문 앞에 사용자가 챗에서 나눈 대화와, 그때 도구로 실제로 조회한 결과다. 이 맥락 위에서 판단하라.\n"
+    " · 조회 근거([e:N])는 도구가 낸 사실이다 — 그 위에서 판단하되 당신의 지식카드와 다르면 다르다고 말하라.\n"
+    " · 챗의 답([a:N])은 그때의 잠정 해석이다 — 결론으로 받아들이지 말고, 근거가 없거나 틀렸으면 그렇게 말하라.\n"
+    " · 사람의 말([c:N])에 원하는 것과 제약이 있다.]")
+_CUT_RE = None   # 늦게 만든다(아래 _trimmed)
+
+
+def _trimmed(lines: list) -> int:
+    """줄 끝에 줄임 표식(' …[N자 중 앞 M자]')이 붙은 줄 수 — _fit_recent 는 마지막 하나를 줄여 싣는다."""
+    import re  # noqa: PLC0415
+    global _CUT_RE
+    if _CUT_RE is None:
+        _CUT_RE = re.compile(r" …\[[\d,]+자 중 앞 [\d,]+자\]$")
+    return sum(1 for ln in lines if _CUT_RE.search(ln))
+
+
+def _session_block(history: list | None, cap: int) -> tuple[str, dict]:
+    """앞 대화([c:N] 사람 · [a:N] 챗)와 그때 도구가 조회한 근거([e:N] — 포털 이력 항목의 evidence)를 좌석 본심에 실을 한 덩이로,
+    cap(자) 안에서. 근거를 먼저 셈해 몫을 정한다 — 대화는 cap 의 _SESSION_CONV_MIN 이상(근거가 적으면 그만큼 더), 근거는 남는 만큼.
+    둘 다 **최근부터** 담는다(_fit_recent — 심의의 챗 맥락과 같은 함수). (글, {conv, conv_gone, ev, ev_gone, trimmed}) 을 돌려준다 —
+    상태 줄과 종합이 '실은 수 · 뺀 수' 를 말한다(조용히 빼지 않는다)."""
+    conv, evid = [], []
+    ci = ai = 0
+    for m in history or []:
+        if not isinstance(m, dict):
+            continue
+        role, text = m.get("role"), str(m.get("content") or "").strip()
+        if role == "user" and text:
+            ci += 1
+            conv.append(f"[c:{ci}] 사람 — {text}")
+        elif role == "assistant":
+            if text:
+                ai += 1
+                conv.append(f"[a:{ai}] 챗 — {text}")
+            ev = m.get("evidence")
+            for e in (ev if isinstance(ev, list) else []):
+                if not isinstance(e, dict):
+                    continue
+                tool, res = str(e.get("tool") or "").strip()[:200], str(e.get("result") or "").strip()
+                if not tool or not res:
+                    continue
+                args = " ".join(str(e.get("args") or "").split())[:2000]
+                evid.append(f"[e:{len(evid) + 1}] [{tool}{f'({args})' if args else ''}] {res}")
+    if not conv and not evid:
+        return "", {}
+    room = max(0, cap - len(_SESSION_HEAD) - 40)          # 머리 · 소제목 몫을 먼저 뗀다
+    ev_total = sum(len(x) + 3 for x in evid)
+    conv_budget = max(int(room * _SESSION_CONV_MIN), room - ev_total)
+    conv_lines, conv_left, conv_gone = _fit_recent(conv, conv_budget, 0, lambda _i, t: f"· {t}")
+    ev_lines, _ev_left, ev_gone = _fit_recent(evid, max(0, room - (conv_budget - conv_left)), 0, lambda _i, t: f"· {t}")
+    out = [_SESSION_HEAD]
+    if conv_lines:
+        out.append("[앞 대화]")
+        if conv_gone:
+            out.append(f"(앞선 발화 {conv_gone}건은 예산 밖이라 뺐다 — 오래된 순으로)")
+        out.extend(conv_lines)
+    if ev_lines:
+        out.append("[앞 대화에서 조회한 근거]")
+        if ev_gone:
+            out.append(f"(앞선 근거 {ev_gone}건은 예산 밖이라 뺐다 — 오래된 순으로)")
+        out.extend(ev_lines)
+    elif evid:
+        out.append(f"(앞 대화에서 조회한 근거 {len(evid)}건은 예산 밖이라 싣지 못했다)")
+    return "\n".join(out), {"conv": len(conv_lines), "conv_gone": conv_gone, "ev": len(ev_lines),
+                            "ev_gone": len(evid) - len(ev_lines), "trimmed": _trimmed(conv_lines + ev_lines)}
+
+
+def _session_note(st: dict) -> str:
+    """세션 맥락을 얼마나 실었나 — 상태 줄 · 종합이 같은 글을 쓴다."""
+    if not st:
+        return ""
+    parts = [f"앞선 대화 {st['conv']}건"]
+    if st.get("ev"):
+        parts.append(f"조회 근거 {st['ev']}건")
+    gone = []
+    if st.get("conv_gone"):
+        gone.append(f"오래된 발화 {st['conv_gone']}건")
+    if st.get("ev_gone"):
+        gone.append(f"오래된 근거 {st['ev_gone']}건")
+    return (" · ".join(parts) + "을 좌석마다 실었다"
+            + (f"({' · '.join(gone)}은 예산 밖이라 뺐다)" if gone else "")
+            + (f" — {st['trimmed']}건은 앞부분만" if st.get("trimmed") else ""))
+
+
 # ── (4) 종합 — 코드가 조립한다. LLM 을 부르지 않는다 ──────────────────────────
 def _summary_text(question: str, answered: list, passed: list, screened: list,
-                  errored: list, capped: list, hops: int) -> str:
+                  errored: list, capped: list, hops: int, session: str = "") -> str:
     out = [f"## Thinking — {len(answered)}명 답변 · {len(passed)}명 기권"]
+    if session:
+        out.append(f"_세션 맥락 — {session}_")
     if not answered:
         out.append("")
         # 기권과 오류를 섞어 말하지 않는다. '아무도 답할 수 없다' 는 판정 결과이고
@@ -335,9 +445,42 @@ def _summary_text(question: str, answered: list, passed: list, screened: list,
 THINK_DOC_SHARE = float(os.environ.get("THINK_DOC_SHARE", "0.5"))
 
 
+async def _think_llm(app):
+    """(좌석 본심 LLM, 창 덮어쓰기 토큰). THINK_LLM=chat 이고 챗 전용 LLM 이 켜져 있으면 그것(Qwen — GLM 넘김 포함)이고, 예산은 그 창으로
+    잡는다(챗 턴과 같은 셈 — 두 서버 중 작은 창 − 출력 몫, app._agent_stream). 아니면 VLLM_*(GLM — 사용자 결정 10-18) 그대로다."""
+    if THINK_LLM != "chat" or not getattr(app.state, "chat_llm_cfg", None):
+        return app.state.llm, None
+    from app import _chat_context_tokens, _chat_llm_of, _model_context_tokens  # noqa: PLC0415 — 순환 import 회피
+    llm, tok = _chat_llm_of(app), None
+    cc = await asyncio.to_thread(_chat_context_tokens)
+    if cc:
+        win = min(cc, await asyncio.to_thread(_model_context_tokens))
+        out = int(app.state.chat_llm_cfg.get("output_reserve") or 0)
+        tok = external_llm.ctx_override.set(win - min(out, win // 2))
+    return llm, tok
+
+
 async def run_thinking(app, question: str, groups: list, user: str = "", user_pat: str = "",
                        history: list | None = None, documents: list | None = None):
-    """띵킹 모드 SSE 제너레이터. 어떤 경로로 끝나든 result → done 으로 닫는다."""
+    """띵킹 모드 SSE 제너레이터. 어떤 경로로 끝나든 result → done 으로 닫는다. 좌석 LLM 과 그 창을 먼저 정한다 — 문서 · 세션 맥락
+    예산이 그 창에서 나온다(THINK_LLM)."""
+    llm, tok = await _think_llm(app)
+    run = _run_thinking(app, llm, question, groups, user, user_pat, history, documents)
+    try:
+        async for ev in run:
+            yield ev
+    finally:
+        await run.aclose()      # 연결이 끊겨 이 생성기가 닫혀도 본체의 정리(남은 좌석 취소)가 지금 돈다
+        if tok is not None:
+            try:
+                external_llm.ctx_override.reset(tok)
+            except ValueError:   # 다른 문맥에서 닫혔다 — 그 문맥은 곧 버려진다
+                pass
+
+
+async def _run_thinking(app, llm, question: str, groups: list, user: str, user_pat: str,
+                        history: list | None, documents: list | None):
+    """run_thinking 의 본체 — llm 은 좌석 본심 LLM 이다."""
     call_trace.tag(kind="thinking")
     q = str(question or "").strip()
     if not q:
@@ -356,12 +499,36 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
         from app import _doc_block, _doc_budget_tokens  # noqa: PLC0415
         _docs = _doc_block(documents,
                            budget_tokens=max(2000, int(_doc_budget_tokens(0) * THINK_DOC_SHARE)))
-    # 앞선 대화는 좌석에 싣지 않는다(좌석은 질문 하나로 자기판정한다). 말없이 버리면 사용자는 앞 대화가 반영된 줄
-    # 안다 — 그렇다고 한 줄 남긴다.
+    # 앞선 대화 — 좌석 본심에 세션 맥락으로 싣는다(사용자 결정 10-18 — 종전엔 세기만 하고 버려, 챗에서 파헤친 내용 없이 전문가가
+    # 질문 한 줄만 보고 처음부터 검색했다). 소집 · 예심 · 위임 검색어에는 맥락을 싣지 않고 대화의 화두 한 문장만 더한다 — 검색어가
+    # 길어지면 전문가 발굴이 망가진다(붙인 문서를 검색어에 섞지 않는 위 규칙과 같은 까닭).
     _hn = sum(1 for m in (history or []) if isinstance(m, dict) and str(m.get("content") or "").strip())
-    if _hn:
+    _session, _sess_st, _topic, sq = "", {}, "", q
+    if _hn and WITH_HISTORY:
+        from app import _chars_for_tokens, _derive_topic, _fit_tokens  # noqa: PLC0415 — 순환 import 회피
+        from app import _doc_budget_tokens as _dbt  # noqa: PLC0415
+        _stok = max(2000, int(_dbt(0) * (SESSION_SHARE if documents else SESSION_SHARE_SOLO)))
+        _sample = "".join(str((m or {}).get("content") or "")[:20000] for m in (history or [])[-6:]) or "가나다"
+
+        def _build(c: int) -> str:
+            t, st = _session_block(history, c)
+            _sess_st.clear()
+            _sess_st.update(st)
+            return t
+        _session = _fit_tokens(_build, _chars_for_tokens(_sample, _stok), _stok, 2000)[0]
+        if _session:
+            yield _sse("status", {"step": "세션 맥락 — " + _session_note(_sess_st), "tool": None})
+        _tp = await _derive_topic(history, q)
+        _topic = str(_tp.get("topic") or "").strip()
+        if _topic and _topic != q:
+            sq = f"{_topic}\n{q}"
+            yield _sse("status", {"step": f"대화 화두 — “{_topic[:160]}” (전문가 소집 · 지식카드 검색어에 더했다)",
+                                  "tool": None})
+        else:
+            _topic = ""
+    elif _hn:
         yield _sse("status", {"step": f"띵킹은 질문만 좌석에 준다 — 앞선 대화 {_hn}건은 싣지 않는다"
-                                      "(필요한 맥락은 질문에 적어 주세요)", "tool": None})
+                                      "(THINK_WITH_HISTORY=0)", "tool": None})
     yield _sse("status", {"step": "전문가 소집", "tool": "recommend_agents"})
     tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, user=user, user_pat=user_pat)
     if not tools or "recommend_agents" not in tools:
@@ -372,7 +539,6 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
         yield _sse("done", {})
         return
 
-    llm = app.state.llm
     sem = asyncio.Semaphore(max(1, CONCURRENCY))
     answered: list[dict] = []
     passed: list[dict] = []
@@ -401,7 +567,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
 
         async def _screen_gated(s: dict) -> dict:
             async with _scr_sem:
-                return await _screen_one(tools, s, q)
+                return await _screen_one(tools, s, sq)
 
         screened = await asyncio.gather(*[_screen_gated(s) for s in seats])
         live = []
@@ -425,7 +591,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
             s["role"] = r
 
         yield _sse("status", {"step": f"본심 — 좌석별 자기판정·답변({len(live)}명)", "tool": None})
-        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem, _docs)) for s in live]
+        tasks = [asyncio.ensure_future(_judge_one(llm, s, q, sem, _docs, _session, _topic)) for s in live]
         try:
             for fut in asyncio.as_completed(tasks):
                 r = await fut
@@ -452,7 +618,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
                     t.cancel()
 
     try:
-        first = await _summon(tools, q, CANDIDATES, seen_keys)
+        first = await _summon(tools, sq, CANDIDATES, seen_keys)
         if not first:
             msg = ("이 질문에 맞는 전문가를 풀에서 찾지 못했습니다. "
                    "질문을 도메인 용어로 좁혀 다시 물어보세요.")
@@ -496,7 +662,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
             async for ev in _run_hop(found, hop):
                 yield ev
 
-        text = _summary_text(q, answered, passed, screened_out, errored, capped, hops_done)
+        text = _summary_text(q, answered, passed, screened_out, errored, capped, hops_done, _session_note(_sess_st))
         yield _think("summary", answered=len(answered), passed=len(passed),
                      screened_out=len(screened_out), errored=len(errored),
                      capped=len(capped), hops=hops_done, no_answer=not answered)
@@ -508,7 +674,7 @@ async def run_thinking(app, question: str, groups: list, user: str = "", user_pa
     except Exception as exc:  # noqa: BLE001 — 부분 결과가 있으면 버리지 않는다
         print(f"[thinking] 실패: {exc!r}")
         if answered or passed:
-            text = _summary_text(q, answered, passed, screened_out, errored, capped, hops_done)
+            text = _summary_text(q, answered, passed, screened_out, errored, capped, hops_done, _session_note(_sess_st))
             text += "\n\n⚠ 처리 도중 오류가 나 여기까지만 모았습니다."
             yield _sse("token", {"delta": text})
             yield _sse("result", {"type": "text", "content": text})

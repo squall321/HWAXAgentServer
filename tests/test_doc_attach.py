@@ -408,9 +408,13 @@ def test_문서는_전문가_발굴_검색어에_안_섞인다():
 
     import thinking
 
-    src = inspect.getsource(thinking.run_thinking)
+    # 본체는 _run_thinking 이다(run_thinking 은 좌석 LLM 과 그 창을 먼저 정하는 껍데기 — HWAXPortal docs/chat-depth-context).
+    src = inspect.getsource(thinking._run_thinking)
     assert "_docs = _doc_block" in src
     assert "q += _docs" not in src and "q = q +" not in src
+    # 세션 맥락도 같다 — 검색어(sq)에는 대화 화두 한 문장만 더하고 맥락 · 문서는 섞지 않는다
+    assert 'sq = f"{_topic}\\n{q}"' in src
+    assert "sq += " not in src and "_session}" not in src.split("sq = ", 1)[1].split("\n", 1)[0]
 
 
 # ── 챗→심의 핸드오프가 대화를 얼마나 넘기나 ────────────────────────────────────────
