@@ -856,6 +856,9 @@ HIST_CTX_SHARE = float(os.environ.get("HIST_CTX_SHARE", "0.40"))       # 문서�
 HIST_CTX_SHARE_SOLO = float(os.environ.get("HIST_CTX_SHARE_SOLO", "0.85"))  # 문서가 없을 때
 # 예산을 넘긴 오래된 턴을 **버리지 않고** 압축해 넣는다. 이 몫이 그 압축본에 쓰인다.
 HIST_COMPACT_SHARE = float(os.environ.get("HIST_COMPACT_SHARE", "0.20"))
+# 앞 턴에서 도구가 조회한 결과(포털 ChatHistoryMessage.evidence)에 주는 이력 몫의 위쪽 — 근거가 없거나 적으면 글이 그 자리를 쓴다.
+# 종전엔 이력이 글만이라 다음 턴이 '아까 조회한 그 값' 을 모르고 다시 조회하거나 지어냈다(HWAXPortal docs/chat-depth-context CD-D5).
+HIST_EVIDENCE_SHARE = float(os.environ.get("HIST_EVIDENCE_SHARE", "0.5"))
 
 
 def _cap(text, limit=None):
@@ -2440,6 +2443,33 @@ def _compact_turns(dropped: list, budget: int) -> str:
             "지어내지 말고 사용자에게 그 대목을 다시 말해 달라고 하라]\n" + "\n".join(lines))
 
 
+# 앞 턴의 조회 근거를 그 턴의 물음 뒤에 붙일 때의 머리 — 사람 쪽 메시지에 '시스템 첨부' 로 단다. 답 쪽에 넣으면 모델이 이 꼴을 제
+# 답으로 흉내 낸다. 그때의 값이라는 것도 적는다 — 바뀌었을 만한 값을 옛 근거로 단정하지 않게.
+_HIST_EVID_HEAD = ("[시스템 첨부 — 어시스턴트가 이 물음에 답하려고 도구로 조회한 결과다(앞 턴). 같은 값을 다시 물으면 다시 조회하지 "
+                   "말고 이것을 인용하라. 그때의 값이라 그사이 바뀌었을 만한 것은 다시 조회하라]")
+_HIST_EVID_FLOOR = 1000     # 남은 근거 몫이 이보다 작으면 줄여 싣지 않고 도구 이름만 남긴다(토막은 근거가 못 된다)
+
+
+def _hist_evidence(entry: dict, item_cap: int) -> tuple[list[str], list[str]]:
+    """이력 항목의 evidence(포털 ChatHistoryMessage.evidence — 그 턴에 도구가 낸 [{tool, args, result}]) → (줄들, 도구 이름들).
+    모양이 틀린 것은 건너뛴다. 결과 하나는 좁은 창에서만 항목 상한(item_cap)으로 줄인다 — 넓은 창은 이 턴의 근거 몫이 지킨다."""
+    rows: list[str] = []
+    names: list[str] = []
+    ev = entry.get("evidence")
+    for e in (ev if isinstance(ev, list) else []):
+        if not isinstance(e, dict):
+            continue
+        tool = str(e.get("tool") or "").strip()[:200]
+        res = str(e.get("result") or "").strip()
+        if not tool or not res:
+            continue
+        args = " ".join(str(e.get("args") or "").split())[:2000]
+        rows.append(f"· {tool}{f'({args})' if args else ''} → {_cut_mark(res, item_cap)}")
+        if tool not in names:
+            names.append(tool)
+    return rows, names
+
+
 def _history_messages(history: list[dict], stats: dict | None = None,
                       has_docs: bool = False) -> list[tuple[str, str]]:
     """멀티턴 history 를 검증·절단해 LangChain 메시지 tuple 로 만든다.
@@ -2448,11 +2478,20 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     HIST_MAX_ITEMS. 전체는 최신 것 우선으로 예산 안에 담고, **밀려난 오래된 턴은 버리지 않고
     압축본 한 덩어리로** 맨 앞에 넣는다(_compact_turns).
 
+    어시스턴트 항목에 evidence(그 턴에 도구가 조회한 결과)가 있으면 그 턴의 물음 뒤에 '시스템 첨부' 로 붙인다 — 종전엔 글만 실어
+    다음 턴이 '아까 조회한 그 값' 을 모르고 다시 조회하거나 지어냈다(HWAXPortal docs/chat-depth-context CD-D5). 근거 몫은 이력
+    예산의 HIST_EVIDENCE_SHARE 까지다. 1차로 원문에 남는 턴을 정하고, 그 턴들의 근거만큼 원문 몫을 줄여 다시 채운다(2차) — 근거가
+    없는 이력은 1차 그대로라 종전과 같다. 근거는 최신 턴부터 싣고, 몫이 모자라면 오래된 턴의 근거부터 줄이고 그다음엔 도구 이름만
+    남긴다(결론 글보다 원자료를 먼저 버린다). 압축본에는 그 턴이 조회한 도구 이름을 남긴다.
+
     stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다. 가장 최근 항목 하나를
-    줄였으면 "cut"(그 항목의 원문 길이)과 "cut_role"(user·assistant — 경고 문구를 가른다)도 채운다.
+    줄였으면 "cut"(그 항목의 원문 길이)과 "cut_role"(user·assistant — 경고 문구를 가른다)도 채운다. 근거를 실었으면
+    "evidence"(온전히 실은 턴 수) · "evidence_cut"(앞부분만 실은 턴 수) · "evidence_names"(도구 이름만 남긴 턴 수)도 채운다.
     """
     items: list[tuple[str, str]] = []
     raws: list[str] = []                    # 항목 상한 전의 원문 — 최근 항목을 다시 줄일 때 원문 길이를 적는다
+    evs: list[list[str]] = []               # 항목마다 그 턴의 조회 근거 줄(어시스턴트 항목만)
+    names_of: list[list[str]] = []          # 항목마다 그 턴이 조회한 도구 이름
     # 항목 하나의 상한 — 좁은 창은 HIST_ITEM_MAX(종전 24,000자), 넓은 창은 그 턴의 이력 예산이 지킨다(항목 상한 없음).
     # 포털은 항목을 창 하나까지 받는데(HWAXPortal ee24499) 종전엔 1백만 토큰 창에서도 24,000자에서 '…' 로 끊어, 이력의
     # 결정문 뒤쪽이 빠졌다. 끊으면 원문 길이를 적는다.
@@ -2465,7 +2504,11 @@ def _history_messages(history: list[dict], stats: dict | None = None,
             continue
         items.append((role, _cut_mark(content, _item_cap)))
         raws.append(content)
+        rows, names = _hist_evidence(entry, _item_cap) if role == "assistant" else ([], [])
+        evs.append(rows)
+        names_of.append(names)
     items, raws = items[-HIST_MAX_ITEMS:], raws[-HIST_MAX_ITEMS:]
+    evs, names_of = evs[-HIST_MAX_ITEMS:], names_of[-HIST_MAX_ITEMS:]
 
     budget = _hist_budget_chars("".join(c for _, c in items[-6:]), has_docs)
     verbatim_budget = int(budget * (1.0 - HIST_COMPACT_SHARE))
@@ -2473,45 +2516,100 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     # 실렸다. 항목마다 글 전체로 잰 토큰(_est_tokens_all)으로도 지킨다(둘 중 먼저 차는 쪽에서 멈춘다).
     tok_budget = _hist_budget_tokens(has_docs)
     verbatim_tok = int(tok_budget * (1.0 - HIST_COMPACT_SHARE))
-    kept: list[tuple[str, str]] = []
-    used = used_tok = 0
-    cut = len(items)                        # 이 앞의 것들이 압축 대상
-    item_cut, item_role = 0, ""
-    for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
-        role, content = items[idx]
-        tok = _est_tokens_all(content)
-        if used + len(content) > verbatim_budget or used_tok + tok > verbatim_tok:
-            if kept:
-                break
-            # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
-            # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
-            # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
-            # 좁은 창은 항목 상한(HIST_ITEM_MAX)이 이미 묶으므로 그 항목이 창을 실제로 넘길 때만(_hist_item_room_tokens)
-            # 그 문턱까지 줄인다 — 원문 몫에 맞추면 예비분이 창보다 큰 dev 16K 에서 몫이 바닥(960토큰)이라, 보통 답 하나가
-            # 매 턴 약 1,000자로 잘렸다(m1 2차 AF1-dev-hist-cut).
-            room = verbatim_tok if _wide() else _hist_item_room_tokens(verbatim_tok)
-            if _wide() or tok > room:
-                raw = raws[idx]
-                chars = verbatim_budget if _wide() else _chars_for_tokens(raw, room)
-                content = _fit_tokens(lambda c: _cut_mark(raw, c), max(1, chars - _CUT_MARK_ROOM), room, 1)[0]
-                item_cut, item_role = len(raw), role
-                tok = _est_tokens_all(content)
-        kept.append((role, content))
-        used += len(content)
-        used_tok += tok
-        cut = idx
-    kept.reverse()
 
-    # 압축본도 토큰으로 지킨다 — 글자 몫이 영문 표본으로 부풀었으면 한국어 압축본이 창을 넘는다.
-    digest = (_fit_tokens(lambda c: _compact_turns(items[:cut], c), int(budget * HIST_COMPACT_SHARE),
+    def _fill(vb: int, vt: int):
+        """최신부터 원문 몫(vb 자 · vt 토큰)을 채운다 — ([(항목 번호, 역할, 글)] 시간순, 압축 경계, 줄인 원문 길이, 그 역할)."""
+        kept: list[tuple[int, str, str]] = []
+        used = used_tok = 0
+        cut = len(items)                        # 이 앞의 것들이 압축 대상
+        item_cut, item_role = 0, ""
+        for idx in range(len(items) - 1, -1, -1):   # 최신부터 예산을 채운다
+            role, content = items[idx]
+            tok = _est_tokens_all(content)
+            if used + len(content) > vb or used_tok + tok > vt:
+                if kept:
+                    break
+                # 가장 최근 항목 하나가 원문 몫을 넘는다 — 종전엔 예산과 상관없이 통째로 넣었다. 포털은 항목을 창 하나
+                # (4,194,304자)까지 받으므로 창을 넘는 붙여넣기 한 번이 그 턴을 400 으로 죽이고, 실패한 턴의 메시지가 다음
+                # 턴의 최신 이력이 되어 이후 턴과 자동 재시도가 전부 같은 400 이었다. 원문 길이를 적고 원문 몫까지 줄인다.
+                # 좁은 창은 항목 상한(HIST_ITEM_MAX)이 이미 묶으므로 그 항목이 창을 실제로 넘길 때만(_hist_item_room_tokens)
+                # 그 문턱까지 줄인다 — 원문 몫에 맞추면 예비분이 창보다 큰 dev 16K 에서 몫이 바닥(960토큰)이라, 보통 답 하나가
+                # 매 턴 약 1,000자로 잘렸다(m1 2차 AF1-dev-hist-cut).
+                room = vt if _wide() else _hist_item_room_tokens(vt)
+                if _wide() or tok > room:
+                    raw = raws[idx]
+                    chars = vb if _wide() else _chars_for_tokens(raw, room)
+                    content = _fit_tokens(lambda c: _cut_mark(raw, c), max(1, chars - _CUT_MARK_ROOM), room, 1)[0]
+                    item_cut, item_role = len(raw), role
+                    tok = _est_tokens_all(content)
+            kept.append((idx, role, content))
+            used += len(content)
+            used_tok += tok
+            cut = idx
+        kept.reverse()
+        return kept, cut, item_cut, item_role
+
+    def _block(idx: int) -> str:
+        return "\n".join([_HIST_EVID_HEAD, *evs[idx]]) if evs[idx] else ""
+
+    ev_cap_c, ev_cap_t = int(budget * HIST_EVIDENCE_SHARE), int(tok_budget * HIST_EVIDENCE_SHARE)
+
+    def _need(kept_) -> tuple[int, int]:
+        """원문에 남는 턴들의 근거가 쓸 몫(자 · 토큰) — 근거 몫(HIST_EVIDENCE_SHARE)까지."""
+        c = t = 0
+        for idx, _r, _c in kept_:
+            b = _block(idx)
+            if b:
+                c, t = c + len(b) + 2, t + _est_tokens_all(b)
+        return min(c, ev_cap_c), min(t, ev_cap_t)
+
+    kept, cut, item_cut, item_role = _fill(verbatim_budget, verbatim_tok)
+    need_c, need_t = _need(kept)
+    if need_c:
+        kept, cut, item_cut, item_role = _fill(max(1, verbatim_budget - need_c), max(1, verbatim_tok - need_t))
+        need_c, need_t = _need(kept)        # 2차로 남은 턴의 근거 — 1차보다 적거나 같다
+
+    out: list[tuple[str, str]] = [(r, c) for _i, r, c in kept]
+    n_full = n_cut = n_names = 0
+    left_c, left_t = need_c, need_t
+    for k in range(len(kept) - 1, -1, -1):  # 최신 턴의 근거부터 — 몫이 모자라면 오래된 턴의 것이 먼저 줄고 빠진다
+        idx = kept[k][0]
+        blk = _block(idx)
+        if not blk:
+            continue
+        t = _est_tokens_all(blk)
+        if len(blk) + 2 <= left_c and t <= left_t:
+            text = blk
+            n_full += 1
+        elif left_c - _CUT_MARK_ROOM - 2 >= _HIST_EVID_FLOOR and left_t > 0:
+            text = _fit_tokens(lambda c, b=blk: _cut_mark(b, c), left_c - _CUT_MARK_ROOM - 2, left_t, 200)[0]
+            n_cut += 1
+        else:
+            text = (f"[시스템 첨부 — 어시스턴트가 이 물음에 답하려고 {', '.join(names_of[idx])} 을(를) 조회했다. 결과는 이력 "
+                    "예산 밖이라 싣지 않았다 — 그 값이 필요하면 다시 조회하라]")
+            n_names += 1
+        left_c -= len(text) + 2
+        left_t -= _est_tokens_all(text)
+        # 그 턴의 물음(바로 앞의 사람 발화) 뒤에 붙인다 — 물음이 압축본으로 밀려났으면 그 답 바로 앞에 따로 넣는다.
+        if k > 0 and out[k - 1][0] == "user":
+            out[k - 1] = ("user", f"{out[k - 1][1]}\n\n{text}")
+        else:
+            out.insert(k, ("user", text))
+
+    # 압축본도 토큰으로 지킨다 — 글자 몫이 영문 표본으로 부풀었으면 한국어 압축본이 창을 넘는다. 근거가 있던 턴은 조회한 도구
+    # 이름을 앞에 남긴다(그 턴에 무엇을 봤는지는 남긴다 — 다시 조회할지 모델이 고른다).
+    dropped = [(r, (f"(조회: {', '.join(names_of[i])}) {c}" if names_of[i] else c)) for i, (r, c) in enumerate(items[:cut])]
+    digest = (_fit_tokens(lambda c: _compact_turns(dropped, c), int(budget * HIST_COMPACT_SHARE),
                           int(tok_budget * HIST_COMPACT_SHARE), 200)[0] if cut else "")
     if digest:
-        kept.insert(0, ("user", digest))
+        out.insert(0, ("user", digest))
     if stats is not None:
         stats.update(kept=len(items) - cut, compacted=cut, budget=budget)
         if item_cut:
             stats["cut"], stats["cut_role"] = item_cut, item_role
-    return kept
+        if n_full or n_cut or n_names:
+            stats.update(evidence=n_full, evidence_cut=n_cut, evidence_names=n_names)
+    return out
 
 
 def _hist_item_room_tokens(verbatim_tok: int) -> int:
@@ -3607,6 +3705,15 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
         if _hstat.get("compacted"):
             yield _sse("status", {"step": f"이전 대화 {_hstat['compacted']}턴은 길이 때문에 "
                                           f"발췌로 압축해 넣었습니다(최근 {_hstat['kept']}턴은 원문)",
+                                  "tool": None})
+        if _hstat.get("evidence") or _hstat.get("evidence_cut") or _hstat.get("evidence_names"):
+            # 앞 턴의 조회 근거를 얼마나 실었나 — 줄이거나 이름만 남긴 턴이 있으면 그 수를 같이 말한다(조용히 빼지 않는다).
+            _ev_parts = [f"{_hstat['evidence']}턴 원문"] if _hstat.get("evidence") else []
+            if _hstat.get("evidence_cut"):
+                _ev_parts.append(f"{_hstat['evidence_cut']}턴 앞부분만")
+            if _hstat.get("evidence_names"):
+                _ev_parts.append(f"{_hstat['evidence_names']}턴은 이력 예산 밖이라 도구 이름만")
+            yield _sse("status", {"step": "앞 턴에서 조회한 근거를 이력에 실었습니다 — " + " · ".join(_ev_parts),
                                   "tool": None})
         if _hstat.get("cut"):
             # 줄인 것이 모델의 답이면 '나눠서 다시 보내 주세요' 는 틀린 말이다 — 사용자가 보낸 글이 아니다.
