@@ -171,14 +171,23 @@ def _glm(monkeypatch, base):
     monkeypatch.setattr(a, "VLLM_MODEL", "fake-glm")
 
 
-def test_판정은_탐침으로_하고_모름은_굳히지_않는다(fake_server):
+def test_판정은_탐침으로_하고_모름은_굳히지_않는다(fake_server, capsys):
     yes, no = fake_server(model="q", vision=1), fake_server(model="g", vision=0)
+    other400 = fake_server(model="o", vision=1, script="http_400")
     assert v.supports("auto", f"{yes}/v1", "k", "q") is True
     assert v.supports("auto", f"{no}/v1", "k", "g") is False
+    assert v.supports("auto", f"{other400}/v1", "k", "o") is False and v.cached("auto", f"{other400}/v1", "o") is None, \
+        "그림 · 다중모달을 말하지 않는 400(모델 이름 · 상한 등)은 '못 받는다' 로 굳히지 않는다"
     closed = f"http://127.0.0.1:{_free_port()}/v1"
     assert v.supports("auto", closed, "k", "x") is False and v.cached("auto", closed, "x") is None, "닿지 않음은 모름 — 굳히지 않는다"
     assert v.supports("1", closed, "k", "x") is True and v.supports("0", f"{yes}/v1", "k", "q") is False, "설정은 묻지 않는다"
-    assert any(val is True for val in v.state().values()) and any(val is False for val in v.state().values())
+    st = v.state()
+    assert any(x["ok"] is True for x in st.values()) and any(x["ok"] is False for x in st.values())
+    assert any("is not a multimodal model" in x["why"] for x in st.values()), "판정 까닭이 /health 에 남는다"
+    log = capsys.readouterr().out
+    assert "그림을 받지 않는다: HTTP 400" in log and "받는지 모른다" in log, "'못 받는다' 와 '모른다' 를 까닭과 함께 로그에"
+    note = v.unknown_note()
+    assert "그림을 받는지 아직 모른다" in note and "다음 그림 턴에 다시 묻는다" in note, "화면 알림이 '못 읽는다' 와 갈린다"
 
 
 def test_올린_그림은_아티팩트로_남고_꼴이_틀리면_건너뛰고_센다(_iso):

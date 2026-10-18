@@ -32,7 +32,8 @@ HISTORY_IMAGES = int(os.environ.get("VISION_HISTORY_IMAGES", "6"))          # �
 TRANSCRIBE_MAX = int(os.environ.get("VISION_TRANSCRIBE_MAX", "8"))          # 한 번에 판독하는 그림 수(띵킹 · 심의)
 _TRANSCRIBE_CONC = 4      # 판독을 한꺼번에 몇 장 — 그림 여덟 장을 줄 세우면 띵킹 · 심의의 시작이 몇 분 늦고, 챗 서버를 혼자 차지하지도 않게
 _RETRY_S = 60.0
-PROBE_TIMEOUT_S = float(os.environ.get("VISION_PROBE_TIMEOUT_S", "15"))   # 탐침 한 번 — 길면 그림 턴의 시작이 그만큼 늦는다
+PROBE_TIMEOUT_S = float(os.environ.get("VISION_PROBE_TIMEOUT_S", "120"))  # 탐침 한 번 — 기동 직후 첫 그림 요청 · 바쁜 서버는 15초를 넘긴다
+#   (dev 실측 10-18 — 막 뜬 vLLM 의 첫 다중모달 요청이 15초를 넘겨 '모름' 이 됐고 그 턴은 그림 없이 갔다). 판정은 서버마다 한 번이라 첫 그림 턴만 기다린다
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 IMG_URL_RE = re.compile(
     r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\.(?:png|jpe?g|gif|webp)\b"
@@ -152,7 +153,9 @@ def red_png(n: int = 16) -> bytes:
 _probe_cache: dict = {}
 
 
-def _probe(base_url: str, api_key: str, model: str) -> bool | None:
+def _probe(base_url: str, api_key: str, model: str) -> tuple[bool | None, str]:
+    """(판정, 까닭). 200 이면 받는다. 400 · 422 중 그림 · 다중모달을 말하는 거절만 '못 받는다' — 다른 400(모델 이름 · 상한 등)과
+    닿지 않음 · 5xx · 401 은 모른다(굳히지 않는다). 까닭은 로그와 /health 에 남긴다 — 삼키면 '그림을 못 읽는다' 가 왜인지 아무도 모른다."""
     body = json.dumps({"model": model, "max_tokens": 1, "temperature": 0,
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [{"role": "user", "content": [
@@ -162,11 +165,18 @@ def _probe(base_url: str, api_key: str, model: str) -> bool | None:
                                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key or 'EMPTY'}"})
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=PROBE_TIMEOUT_S) as r:
-            return r.status == 200
+            return r.status == 200, f"HTTP {r.status}"
     except urllib.error.HTTPError as e:
-        return False if e.code in (400, 422) else None     # 400 · 422 — 그림을 거절했다. 401 · 5xx 는 모른다
-    except Exception:  # noqa: BLE001
-        return None
+        try:
+            msg = e.read(400).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        why = f"HTTP {e.code} {msg[:240]}".strip()
+        if e.code in (400, 422) and re.search(r"multimodal|multi-modal|image|vision", msg, re.I):
+            return False, why
+        return None, why
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
 def supports(setting: str, base_url: str, api_key: str, model: str) -> bool:
@@ -181,8 +191,12 @@ def supports(setting: str, base_url: str, api_key: str, model: str) -> bool:
     now = time.monotonic()
     if got and (got["v"] is not None or now < got["retry_at"]):
         return bool(got["v"])
-    v2 = _probe(base_url, api_key, model)
-    _probe_cache[key] = {"v": v2, "retry_at": now + _RETRY_S, "at": time.time()}
+    v2, why = _probe(base_url, api_key, model)
+    _probe_cache[key] = {"v": v2, "why": why, "retry_at": now + _RETRY_S, "at": time.time()}
+    if v2 is not True:
+        host = re.sub(r"^https?://", "", base_url).split("/", 1)[0]
+        print(f"[vision] {host} · {model} — 그림을 " + ("받지 않는다" if v2 is False else f"받는지 모른다({int(_RETRY_S)}초 뒤 다시 묻는다)")
+              + f": {why}", flush=True)
     return bool(v2)
 
 
@@ -197,12 +211,20 @@ def cached(setting: str, base_url: str, model: str) -> bool | None:
     return None if not got else got["v"]
 
 
+def unknown_note() -> str:
+    """판정이 '모름'(닿지 않음 · 시간 초과 · 5xx)인 서버가 있으면 그 까닭 한 줄 — 화면의 '그림을 싣지 못했다' 에 붙여 '못 받는다' 와 가른다."""
+    notes = [f"{k}: {v['why']}" for k, v in state().items() if v["ok"] is None]
+    if not notes:
+        return ""
+    return f" · 그림을 받는지 아직 모른다({'; '.join(notes)[:300]}) — 다음 그림 턴에 다시 묻는다"
+
+
 def state() -> dict:
-    """/health 용 — 서버(호스트:포트 · 모델)마다 판정 값(None 은 아직 모름)."""
+    """/health 용 — 서버(호스트:포트 · 모델)마다 {ok: 판정(None 은 모름), why: 까닭}."""
     out = {}
     for (url, model), v in _probe_cache.items():
         host = re.sub(r"^https?://", "", url).split("/", 1)[0]
-        out[f"{host} · {model}"] = v["v"]
+        out[f"{host} · {model}"] = {"ok": v["v"], "why": v.get("why", "")}
     return out
 
 

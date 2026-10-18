@@ -484,7 +484,7 @@ both clients read it. Only the chat ReAct agent and the chat-turn tool planners 
 | `CHAT_LLM_REASONING_EFFORT` | `xhigh` | sent as `reasoning_effort` while thinking is on; empty = not sent. `LLM_REASONING_EFFORT` is a `VLLM_*` setting and is not sent to the chat server |
 | `CHAT_LLM_MAX_TOKENS` | `0` while thinking (not sent) | the stcx server caps output with `--override-generation-config` (131,072). Thinking off → `LLM_MAX_TOKENS` |
 | `CHAT_LLM_OUTPUT_RESERVE` | `65536` while thinking | tokens kept free for the answer: the chat turn budgets with min(chat window, GLM window) minus this (at most half the window) — a prompt that fills the window leaves no room to think |
-| `CHAT_LLM_VISION` | `auto` | does the chat server take images — `auto` probes once (a red PNG) when an image is about to be sent; `1` / `0` skip the probe. `LLM_VISION` is the same for `VLLM_*` |
+| `CHAT_LLM_VISION` | `auto` | does the chat server take images — `auto` probes once (a red PNG, `VISION_PROBE_TIMEOUT_S` 120 — a freshly started or busy vLLM took longer than 15 s) when an image is about to be sent; `1` / `0` skip the probe. `LLM_VISION` is the same for `VLLM_*`. Only a 400/422 that talks about images or multimodal input counts as "no"; anything else (timeout, other 400, 5xx) is "unknown" and is asked again 60 s later |
 | `CHAT_LLM_DISABLE_STREAMING` | _(follows `LLM_DISABLE_STREAMING`)_ | a box that turned GLM streaming off (tool_calls lost) starts the chat server non-streaming too; set `0` once the chat server's streaming tool calls are verified |
 | `CHAT_LLM_MAX_RETRIES` | `1` | SDK retries on the chat server before falling back |
 | `CHAT_LLM_FALLBACK` | `1` | `0` = no fallback (the failure shows in chat) |
@@ -502,7 +502,8 @@ non-streaming GLM fallback loses nothing. **Context:** a chat turn budgets with 
 sized for GLM's 1M — and the fallback still fits. **`/health` `chat_llm`:** server (host:port), model, thinking,
 effort, max_tokens, output_reserve, streaming, fallback `{enabled, to, count, last_at}`, the chat server's last error,
 `ctx_tokens` / `ctx_source` / `model_served` once read (no key). Top level: `tool_cut` (the last chat turn's schema cut —
-count and apps; null = nothing cut) and `vision` (probe result per server — null = not asked yet). The chat server's
+count and apps; null = nothing cut) and `vision` (per server `{ok, why}` — `ok` null = unknown, `why` = the probe's
+answer, e.g. `HTTP 200` or the refusal text; empty map = not asked yet). The chat server's
 thinking text streams as `reasoning` events and each turn ends with a `meta` event (models called, thinking, effort,
 fallback). Tests: `tests/test_chat_llm.py` (real lifespan, fake servers — closed port, 5xx,
 400, a streaming chat server falling back to a non-streaming GLM through a real chat turn, the window override).
@@ -519,7 +520,9 @@ read). **Thinking:** seats get the images if the seat model takes them, otherwis
 context. **Deliberation** (`/심의`, `/시뮬심의`, `/시험계획`): transcripts are always added to `delib_opts.evidence`
 (citable as `[e:N]`); if `VLLM_*` takes images they are also attached to every seat and chair call (`DELIB_IMAGES`).
 Transcripts are cached by image hash in `ARTIFACT_DIR/.transcripts`, four at a time, at most `VISION_TRANSCRIBE_MAX` (8).
-Nothing is probed at startup. Tests: `tests/test_chat_vision.py`, `tests/test_vision_think_delib.py`.
+Nothing is probed at startup. Tests: `tests/test_chat_vision.py`, `tests/test_vision_think_delib.py`; checked once against a real
+vision model on vLLM 0.23 (Qwen2.5-VL-3B — upload, an earlier turn's image, a tool's image, deliberation transcripts; portal
+`docs/chat-depth-context` CD-D13).
 
 ## Status
 

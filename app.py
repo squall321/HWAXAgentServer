@@ -3640,11 +3640,11 @@ async def _turn_image_messages(app_, req, vision_ok: bool):
         user_msg = ("user", req.message + "\n\n[시스템 첨부 — 올린 그림을 이 챗 모델은 읽지 못해 그림을 읽는 모델이 판독문으로 옮겼다. "
                     "판독문에 없는 수치를 지어내지 마라]\n"
                     + "\n".join(f"· [그림 {i}] {t or '판독하지 못했다'}" for i, (_u, _w, t) in enumerate(got, start=1)))
-        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 판독문으로 실었다")
+        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 판독문으로 실었다" + _vision.unknown_note())
     elif up:
         user_msg = ("user", f"{req.message}\n\n[시스템 첨부 — 그림 {len(up)}장을 올렸지만 이 서버의 모델은 그림을 읽지 못하고, "
                             "판독할 모델도 없다]")
-        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 모델에 싣지 못했다(판독할 모델도 없다)")
+        say("이 챗 모델은 그림을 읽지 못한다 — 올린 그림을 모델에 싣지 못했다(판독할 모델도 없다)" + _vision.unknown_note())
     if pick and vision_ok:
         ps, labels = [], []
         for u, why in pick:     # 한 장씩 — 지워진 그림이 끼어도 설명 번호가 실린 그림 순서와 맞게
@@ -3666,10 +3666,10 @@ async def _turn_image_messages(app_, req, vision_ok: bool):
         if lines:
             recap = HumanMessage(content="[시스템 첨부 — 앞 대화에 나온 그림의 판독문이다(그림을 읽는 모델이 옮긴 글 — 그림 자체가 아니다). "
                                          "판독문에 없는 수치를 지어내지 마라]\n" + "\n".join(lines))
-        say(f"앞 대화의 그림 판독문 {len(lines)}장을 실었습니다(챗 모델이 그림을 읽지 못한다)"
+        say(f"앞 대화의 그림 판독문 {len(lines)}장을 실었습니다(챗 모델이 그림을 읽지 못한다)" + _vision.unknown_note()
             + (f" · {len(got) - len(lines)}장은 판독하지 못했다" if len(got) > len(lines) else ""))
     elif pick:
-        say(f"앞 대화의 그림 {len(hist)}장 — 챗 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다")
+        say(f"앞 대화의 그림 {len(hist)}장 — 챗 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다" + _vision.unknown_note())
     return user_msg, recap
 
 
@@ -5197,7 +5197,8 @@ async def _delib_image_evidence(req, q: str, imgs: list):
     """그림을 판독해 req.delib_opts.evidence 에 덧붙인다(그림 해시로 디스크에 남아 같은 그림은 다시 읽지 않는다). 상태 줄을 낸다."""
     tr = await asyncio.to_thread(_transcriber, app)
     if tr is None:
-        yield _sse("status", {"step": f"그림 {len(imgs)}장 — 판독할 모델이 없어(그림을 받는 모델 없음) 심의 근거에 싣지 못했다",
+        yield _sse("status", {"step": f"그림 {len(imgs)}장 — 판독할 모델이 없어(그림을 받는 모델 없음) 심의 근거에 싣지 못했다"
+                                      + _vision.unknown_note(),
                               "tool": None})
         return
     pick = imgs[-_vision.TRANSCRIBE_MAX:] if _vision.TRANSCRIBE_MAX > 0 else []

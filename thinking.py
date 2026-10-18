@@ -384,7 +384,8 @@ async def _session_images(app, llm, imgs: list, question: str, box: dict):
         return
     tr = await asyncio.to_thread(_transcriber, app)
     if tr is None:
-        yield _sse("status", {"step": f"앞 대화의 그림 {len(imgs)}장 — 좌석 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다",
+        yield _sse("status", {"step": f"앞 대화의 그림 {len(imgs)}장 — 좌석 모델도 판독할 모델도 그림을 읽지 못해 싣지 못했다"
+                                      + vision.unknown_note(),
                               "tool": None})
         return
     pick = imgs[-vision.TRANSCRIBE_MAX:] if vision.TRANSCRIBE_MAX > 0 else []
