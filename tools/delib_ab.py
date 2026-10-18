@@ -29,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.delib_metrics import metrics_layer_a, metrics_layer_b  # noqa: E402
 
-DEFAULT_URL = "http://127.0.0.1:8000/chat"
+# 에이전트 서버는 :9009 다(포털 docs/PORT-MAP.md). 종전 :8000 은 dev 의 vLLM 자리라, --url 없이 돌리면 심의가 아니라 LLM 서버를 불렀다(10-18).
+DEFAULT_URL = "http://127.0.0.1:9009/chat"
 
 # T-서열 순서(GLM-DELIB-TUNING-REVIEW §실행 순서). 이 순서대로 하나씩 A/B 한다.
 KNOB_ORDER = ("evidence_prepass", "rebut_quote", "prose_first",
@@ -54,43 +55,61 @@ async def run_one(url: str, question: str, opts: dict, timeout: float) -> dict:
                       ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
-    personas, rounds, decision = [], {}, ""
     t0 = time.time()
+    out: dict = {}
 
     def _pump():
-        nonlocal decision
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            for raw in r:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    ev = json.loads(line[5:].strip())
-                except json.JSONDecodeError:
-                    continue
-                kind = ev.get("kind") or ev.get("type")
-                if kind == "personas":
-                    for p in ev.get("personas", []):
-                        if p.get("key") and p["key"] not in personas:
-                            personas.append(p["key"])
-                elif kind == "turn":
-                    rnd = ev.get("round") or ev.get("r") or 1
-                    rounds.setdefault(rnd, []).append(ev.get("data") or ev)
-                elif ev.get("type") == "result":
-                    decision = ev.get("content", "") or decision
+        # 프록시를 타지 않는다 — cae00 셸에는 사내 프록시 환경값이 걸려 있어, NO_PROXY 가 빠지면 루프백 요청도 프록시로 간다.
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
+            out.update(fold_sse(r))
 
     await asyncio.get_running_loop().run_in_executor(None, _pump)
+    return {**out, "source": "chat-sse", "elapsed_s": round(time.time() - t0, 1)}
+
+
+def fold_sse(lines) -> dict:
+    """SSE 줄들 → {personas, rounds, decision, n_ops}. **이벤트 이름(event:)을 본다** — 결정문은 delib 의 kind=decision(본문 +
+    보고서 안내)이고, 없으면 `event: result` 의 content 다. result 의 data 는 `{"type":"text", …}` 라 data 만 보던 종전 판은 결정문을
+    한 번도 못 잡아 결정문 지표가 양쪽 조건 모두 0 이었다(10-18 확인)."""
+    personas, rounds, decision, result, event = [], {}, "", "", ""
+    for raw in lines:
+        line = (raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)).strip()
+        if line.startswith("event:"):
+            event = line[6:].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+        try:
+            ev = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if event == "result":
+            if isinstance(ev.get("content"), str) and ev["content"]:
+                result = ev["content"]
+            continue
+        kind = ev.get("kind")
+        if kind == "personas":
+            for p in ev.get("personas", []):
+                if isinstance(p, dict) and p.get("key") and p["key"] not in personas:
+                    personas.append(p["key"])
+        elif kind == "turn":
+            rnd = ev.get("round") or ev.get("r") or 1
+            rounds.setdefault(rnd, []).append(ev.get("data") or ev)
+        elif kind == "decision" and isinstance(ev.get("text"), str) and ev["text"]:
+            decision = ev["text"]
     return {"personas": personas, "rounds": [rounds[k] for k in sorted(rounds)],
-            "decision": decision, "n_ops": sum(len(v) for v in rounds.values()),
-            "source": "chat-sse", "elapsed_s": round(time.time() - t0, 1)}
+            "decision": decision or result, "n_ops": sum(len(v) for v in rounds.values())}
 
 
 # ── 조건 실행과 집계 ─────────────────────────────────────────────────────────
-async def run_condition(url, questions, knob, level, repeat, timeout, out_dir) -> list:
+async def run_condition(url, questions, knob, level, repeat, timeout, out_dir, save_report=False) -> list:
     docs = []
     for qi, q in enumerate(questions):
         for rep in range(repeat):
-            opts = {knob: level}
+            # 측정용 심의는 RA 보고서를 만들지 않는다 — 엔진 기본(save_report=1)이면 18회가 운영 RA 에 초안 18건을 남긴다(10-18 확인).
+            opts = {knob: level, **({} if save_report else {"save_report": 0})}
             tag = f"{knob}={level}_q{qi}_r{rep}"
             print(f"  … {tag}", flush=True)
             try:
@@ -159,9 +178,9 @@ async def main_async(a) -> int:
     print(f"■ {a.knob} A/B — 질문 {len(questions)}개 × 반복 {a.repeat} × 조건 2 "
           f"= 심의 {len(questions) * a.repeat * 2}회\n")
     print(f"[대조군 {a.knob}={lo}]")
-    off = await run_condition(a.url, questions, a.knob, lo, a.repeat, a.timeout, out_dir)
+    off = await run_condition(a.url, questions, a.knob, lo, a.repeat, a.timeout, out_dir, a.save_report)
     print(f"[실험군 {a.knob}={hi}]")
-    on = await run_condition(a.url, questions, a.knob, hi, a.repeat, a.timeout, out_dir)
+    on = await run_condition(a.url, questions, a.knob, hi, a.repeat, a.timeout, out_dir, a.save_report)
     print("\n" + compare(aggregate(off), aggregate(on), a.knob, hi))
     if out_dir:
         (out_dir / "summary.json").write_text(json.dumps(
@@ -181,6 +200,7 @@ def main(argv: list) -> int:
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--out", help="결과 저장 디렉토리")
     p.add_argument("--report", help="저장된 디렉토리에서 재집계만")
+    p.add_argument("--save-report", action="store_true", help="심의마다 RA 보고서 초안을 남긴다(기본은 남기지 않는다 — 측정용 심의)")
     a = p.parse_args(argv)
 
     if a.report:
