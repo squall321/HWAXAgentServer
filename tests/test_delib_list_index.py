@@ -81,10 +81,11 @@ def test_재기동_정리는_끝난_잡의_원장을_통째로_읽지_않는다(
 def _rows_from_ledger(viewer: str = "") -> list:
     """원장 파일 전부를 읽어 만든 목록 행 — 색인이 없던 때의 list_jobs 와 같은 행이다(비교 기준)."""
     jobs = [delib_jobs._load(f.stem) for f in delib_jobs.JOB_DIR.glob("*.json")]
-    jobs = [j for j in jobs if j and not delib_jobs._foreign(j, viewer)]
+    jobs = [j for j in jobs if j and delib_jobs.can_read(j, viewer)]   # 볼 수 있는 잡만(결정 6, 10-18 — 종전 _foreign)
     jobs.sort(key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     me = viewer.strip().lower()
-    return [{**delib_jobs.summary(j), "mine": bool(me and delib_jobs._owner(j) == me)} for j in jobs]
+    return [{**delib_jobs.summary(j), "mine": bool(me and delib_jobs._owner(j) == me), "owner": delib_jobs._owner(j)}
+            for j in jobs]
 
 
 def test_색인으로_만든_목록_행은_원장으로_만든_행과_같다(monkeypatch, tmp_path):

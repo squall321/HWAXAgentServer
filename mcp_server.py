@@ -111,6 +111,31 @@ def _caller(ctx: Context | None) -> tuple[str, list[str]]:
         return "", []
 
 
+# 관리자 표지 — 게이트웨이가 포털이 **지금** 관리자라고 답할 때만 그룹에 싣는다(HWAXMcpGateway ADMIN_GROUP).
+_ADMIN_GROUP = "portal-admin"
+
+
+def _caller_view(ctx: Context | None) -> tuple[str, str, bool]:
+    """심의를 **볼 때**의 호출자 — (신원, 소속, 관리자인가). 소속은 게이트웨이가 포털 원장의 지금 값으로 싣는다(x-hwax-affiliation,
+    없으면 빈 값 — 빈 소속은 누구와도 같은 소속이 아니다). HWAXPortal docs/followups-1017 결정 6."""
+    user, groups = _caller(ctx)
+    aff = ""
+    try:
+        hdr = getattr(getattr(ctx.request_context, "request", None), "headers", None) if ctx is not None else None
+        aff = unquote((hdr.get("x-hwax-affiliation") or "") if hdr is not None else "").strip()
+    except Exception:  # noqa: BLE001 — 못 읽으면 소속 없음(같은 소속으로 열리지 않는 쪽)
+        aff = ""
+    return user, aff, _ADMIN_GROUP in groups
+
+
+def _need_read(job: dict, ctx: Context | None) -> None:
+    """볼 수 없는 심의면 거절한다(주인 · 같은 소속 · 관리자 · 신원 없는 내부 호출만 — delib_jobs.can_read)."""
+    user, aff, admin = _caller_view(ctx)
+    if not delib_jobs.can_read(job, user, aff, admin):
+        raise ValueError(f"이 심의({job.get('id')})는 볼 수 없다 — 시작한 사람과 같은 소속, 관리자만 본다"
+                         "(소속이 정해지지 않았거나 다른 소속의 심의다).")
+
+
 def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None,
                 tools=None, apps=None, human_note: str = "", search_sources=None,
                 continue_summary: str = "", non_negotiables=None, options=None,
@@ -463,9 +488,10 @@ async def deliberate_start(
                        save_report=save_report, advanced=advanced)
     user, groups = _caller(ctx)
     # owner — 외부 응답자 심의(advanced.llm=external)의 과제 주인은 게이트웨이 헤더를 푼 이름이다(과제 도구 쪽과 같은 규칙). 잡 기록의
-    # 주인(user)은 종전 그대로 헤더 원문이다(접기·이어하기·목록이 같은 원문으로 견준다).
+    # 주인(user)은 종전 그대로 헤더 원문이다(견줄 때 양쪽을 delib_jobs._norm 으로 푼다). 소속은 같은 소속 열람(결정 6)이 견준다.
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
-                           groups=groups, user_email=user, owner=external_llm.header_owner(user))
+                           groups=groups, user_email=user, owner=external_llm.header_owner(user),
+                           owner_aff=_caller_view(ctx)[1])
     out = delib_jobs.summary(rec)
     out["caller"] = user or "(서비스 계정 — 게이트웨이가 신원 헤더를 안 보냈다)"
     out["note"] = (_queued_note(out["queue"]) if out.get("queue") else
@@ -560,6 +586,8 @@ async def deliberate_continue(
     prev = delib_jobs.get(previous_job_id)
     if not prev:
         raise ValueError(f"그런 심의 잡이 없다: {previous_job_id} — deliberate_list 로 확인하라")
+    # 이어하기는 이전 결정문을 내 잡으로 옮긴다 — 볼 수 없는 심의를 이어 가면 그것이 읽기 우회로가 된다(결정 6 조사).
+    _need_read(prev, ctx)
     summary_text = (prev.get("decision") or prev.get("result_text") or "").strip()
     if not summary_text:
         raise ValueError(f"이전 심의에 결정문이 없다(status={prev.get('status')}) — 끝난 뒤 이어하라")
@@ -607,7 +635,8 @@ async def deliberate_continue(
     )
     rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
-                           groups=groups, user_email=user, owner=external_llm.header_owner(user))
+                           groups=groups, user_email=user, owner=external_llm.header_owner(user),
+                           owner_aff=_caller_view(ctx)[1])
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
@@ -631,7 +660,7 @@ _JOB_TAIL = ("question",)
                       + _STATE_DESC + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
                       "칸이 다 실린다.")
 async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
+                            part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
     """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다.
 
     queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다.
@@ -639,6 +668,7 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
+    _need_read(job, ctx)
     out = delib_jobs.summary(job)
     # 좌석에 주지 않은 근거는 **도는 동안** 보여야 한다 — 결정문을 받을 때 알면 이미 수십 분을
     # 쓴 뒤다. 목록(deliberate_list)에는 싣지 않으려고 summary 가 아니라 여기서 붙인다.
@@ -658,11 +688,12 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                       "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
                       "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
 async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
+                            part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
+    _need_read(job, ctx)
     out = delib_jobs.summary(job, full=True)
     if job.get("status") == "running":
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
@@ -673,17 +704,17 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
 
 @mcp.tool(title="심의 목록",
           description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다. 내가 시작한 "
-                      "심의만 실린다(행의 mine 이 참이다 — 주인이 안 적힌 옛 잡은 mine 이 거짓인 채로 함께 "
-                      "실린다). running·queued 는 전체 수다 — 남의 심의는 수로만 보인다. " + _PAGE_DESC)
+                      "심의와 **같은 소속**의 심의가 실린다(행의 mine 이 내 것인지, owner 가 시작한 사람이다 — 주인이 안 적힌 "
+                      "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. " + _PAGE_DESC)
 async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
                           part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
     신원 있는 호출자에게는 제 잡(과 주인이 안 적힌 잡)만 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는
     길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
-    user, _groups = _caller(ctx)
+    user, aff, admin = _caller_view(ctx)
     lim = max(1, min(100, int(limit or 20)))
-    rows = delib_jobs.list_jobs(lim, viewer=user)
+    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin)
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
     out = {"jobs": rows, "running": delib_jobs.running_count(),
            "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
@@ -730,7 +761,7 @@ async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_
                                 offset: Annotated[int, Field(description=_A_TR_OFFSET)] = 0,
                                 limit: Annotated[int, Field(description=_A_TR_LIMIT)] = 40,
                                 full: Annotated[bool, Field(description=_A_TR_FULL)] = False,
-                                part: Annotated[int, Field(description=_A_PART)] = 1) -> dict:
+                                part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
     """좌석 발언 전사를 묶음으로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 주고, 묶음이 MCP 결과 상한보다 크면 쪽으로 나눈다.
 
     Args:
@@ -741,6 +772,9 @@ async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_
         full: True 면 화면용으로 줄이지 않은 발언을 준다(기본은 줄인 글 + say_clipped 표식).
         part: 묶음이 쪽으로 나뉘었을 때 받을 쪽(1부터). page.next 가 알려 준다.
     """
+    _job = delib_jobs.get(job_id)
+    if _job:
+        _need_read(_job, ctx)
     out = delib_jobs.transcript(job_id, rnd=(round or None), seat=seat,
                                 offset=offset, limit=limit, full=full)
     return mcp_pages.paged(out, part=part, ids=_TRANSCRIPT_IDS, tail=("note",),

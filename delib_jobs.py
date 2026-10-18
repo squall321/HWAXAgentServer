@@ -23,6 +23,7 @@ import logging
 import os
 import time
 import uuid
+from urllib.parse import unquote
 from pathlib import Path
 
 import call_trace
@@ -210,7 +211,7 @@ def _path(job_id: str) -> Path:
 _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step")
+              "last_step", "owner_aff")
 
 
 def _list_path(job_id: str) -> Path:
@@ -303,16 +304,40 @@ def running_human_count() -> int:
     return sum(1 for j in _JOBS.values() if j.get("status") == "running" and j.get("started_by") != "app")
 
 
+def _norm(who: str) -> str:
+    """신원 이메일을 견주는 꼴로 — 게이트웨이가 헤더에 퍼센트 인코딩해 싣고(+ 가 %2B) 원장은 그 원문을 적어 둔다. 양쪽을 같은
+    꼴로 풀어야 '+' 가 든 이메일에서 어긋나지 않는다(HWAXPortal docs/followups-1017 결정 6 조사)."""
+    return unquote(str(who or "")).strip().lower()
+
+
 def _owner(job: dict) -> str:
-    return str(job.get("user") or "").strip().lower()
+    return _norm(job.get("user"))
 
 
 def _foreign(job: dict, viewer: str) -> bool:
     """그 잡이 viewer 에게 **남의 것**인가. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)에게는 남의 것이
-    없고, 주인이 안 적힌 잡은 누구에게도 남의 것이 아니다(누구 것인지 알 수 없다). 접기·목록·이어 붙이기가
-    같은 규칙을 봐야 해서 한 곳에 둔다."""
-    me = (viewer or "").strip().lower()
+    없고, 주인이 안 적힌 잡은 누구에게도 남의 것이 아니다(누구 것인지 알 수 없다). 접기·이어 붙이기가
+    같은 규칙을 봐야 해서 한 곳에 둔다. **읽기(상태 · 결과 · 발언 · 이어하기 · 목록)는 can_read** 가 본다."""
+    me = _norm(viewer)
     return bool(me and _owner(job) and _owner(job) != me)
+
+
+def can_read(job: dict, viewer: str, viewer_aff: str = "", viewer_admin: bool = False) -> bool:
+    """viewer 가 그 심의를 볼 수 있나(사용자 결정 10-18 — HWAXPortal docs/followups-1017 결정 6 · FU-D17).
+    · 신원 없는 호출(서비스 계정 — 운영 · 워크플로가 쓰는 길) · 관리자 — 다 본다
+    · 주인 — 본다
+    · 같은 소속 — 잡을 열 때 적은 소속(owner_aff)과 지금 호출자의 소속이 같고 둘 다 비지 않았을 때(빈 소속끼리는 묶지 않는다)
+    · 주인이 안 적힌 옛 잡 — 신원 없는 호출과 관리자만(누구 것인지 알 수 없다)"""
+    me = _norm(viewer)
+    if not me or viewer_admin:
+        return True
+    owner = _owner(job)
+    if not owner:
+        return False
+    if owner == me:
+        return True
+    aff = str(job.get("owner_aff") or "").strip()
+    return bool(aff and str(viewer_aff or "").strip() == aff)
 
 
 def _glm_running_count() -> int:
@@ -573,7 +598,8 @@ async def _drive(job: dict, gen) -> None:
 
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
-          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "") -> dict:
+          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
+          owner_aff: str = "") -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
@@ -698,6 +724,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "error": None, "warnings": [], "evidence_omitted": [],
         "started_at": None, "updated_at": _now(), "finished_at": None,
         "user": user_email or "",
+        # 잡을 연 사람의 소속(게이트웨이가 실어 준 포털 원장의 그때 값) — 같은 소속 열람(can_read)이 이것과 견준다(결정 6, 10-18).
+        "owner_aff": str(owner_aff or "").strip(),
         # 누가 띄웠나(M3.md #26) — app 이면 카드 대조 관문의 절반 판정에 세지 않는다(running_human_count).
         "started_by": _started_by(opts.get("started_by")),
         # 외부 응답자 잡만 — 과제를 받는 주인. 그 잡의 자리(주인마다 EXTERNAL_PER_OWNER 건)를 이 이름으로 센다(_pump).
@@ -921,15 +949,19 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
 LIST_SCAN_MAX = 300
 
 
-def list_jobs(limit: int = 20, *, viewer: str = "") -> list[dict]:
-    """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게 **남의 잡은 싣지 않는다.**
+def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer_admin: bool = False) -> list[dict]:
+    """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게는 **볼 수 있는 잡만**(can_read — 제 잡 · 같은
+    소속의 잡, 관리자는 전부) 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)은 종전대로 전부 본다.
 
-    종전엔 전원의 잡을 id·화두째 내줬다. 거절·순번 문구에서 남의 job_id 를 뺀 것(start 의 주석)이 목록 한
-    번으로 무효였다 — 결과 회수·전사·이어하기는 id 만 받는다. 행마다 mine(내가 시작한 잡인가)을 싣는다 —
-    주인의 계정은 싣지 않는다(cancel 의 주석).
-    남의 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다."""
-    me = (viewer or "").strip().lower()
-    seen = {jid: j for jid, j in _JOBS.items() if not _foreign(j, viewer)}
+    행마다 mine(내가 시작한 잡인가)과 owner(시작한 사람 — 사용자 결정 10-18 '같은 소속 것도 목록에, 주인 표시')를 싣는다.
+    종전엔 남의 잡을 아예 싣지 않아 주인을 적을 일이 없었다(거절 · 순번 문구에서 남의 job_id 를 뺀 까닭과 같다 — 지금은
+    볼 수 있는 잡만 싣는다).
+    볼 수 없는 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다."""
+    me = _norm(viewer)
+
+    def ok(j: dict) -> bool:
+        return can_read(j, viewer, viewer_aff, viewer_admin)
+    seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
     try:
         kept = 0
         for f in sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
@@ -937,7 +969,7 @@ def list_jobs(limit: int = 20, *, viewer: str = "") -> list[dict]:
             if kept >= limit * 3:
                 break
             j = _list_load(f)        # 목록 색인 — 원장 파일(수 MB)을 통째로 읽지 않는다
-            if not j or _foreign(j, viewer):
+            if not j or not ok(j):
                 continue
             kept += 1
             if j["id"] not in seen:
@@ -945,4 +977,4 @@ def list_jobs(limit: int = 20, *, viewer: str = "") -> list[dict]:
     except OSError:
         pass
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
-    return [{**summary(j), "mine": bool(me and _owner(j) == me)} for j in rows[:limit]]
+    return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]

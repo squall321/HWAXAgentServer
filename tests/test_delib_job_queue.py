@@ -442,8 +442,11 @@ def test_신원_있는_호출의_목록에는_남의_잡이_없고_제_것에는
         _start("남의 화두 가", YOU), _start("내 화두 가", ME), _start("주인 없는 화두"), _start("남의 화두 나", THIRD)
         await _tick()
         mine = await m.deliberate_list(ctx=_ctx("Me@Example.com"))       # 대소문자가 달라도 같은 사람이다
-        assert sorted(_rows(mine)) == [("내 화두 가", True), ("주인 없는 화두", False)], _rows(mine)
-        assert not any(k in r for r in mine["jobs"] for k in ("user", "owner")), "행에 계정을 실었다"
+        # 주인 없는 잡은 신원 있는 사람에게 싣지 않는다 — 사용자 결정 10-18(HWAXPortal docs/followups-1017 결정 6: 옛 잡은 내부와 관리자만).
+        # 소속이 없는 호출자라 같은 소속 잡도 없다(그건 tests/test_delib_same_aff.py).
+        assert sorted(_rows(mine)) == [("내 화두 가", True)], _rows(mine)
+        # 행에 주인을 싣는다 — 사용자 결정 10-18('같은 소속 것도 목록에, 주인 표시'). 남의 계정은 볼 수 있는 잡에만 실린다.
+        assert [r["owner"] for r in mine["jobs"]] == [ME] and not any("user" in r for r in mine["jobs"])
         # 수는 전체다 — 제 것만 세면 상한이 얼마나 찼는지를 틀리게 읽는다.
         assert (mine["running"], mine["queued"], mine["running_max"]) == (2, 2, 2), mine
         everyone = await m.deliberate_list()                               # 신원 없는 호출(운영이 쓰는 길)
@@ -494,17 +497,18 @@ def _done(owner, jid="prev-1"):
 
 
 @pytest.mark.parametrize("owner,caller,appends", [
-    (YOU, ME, False),            # 남의 심의 — 이어는 가되 그 보고서에는 붙이지 않는다
+    (YOU, ME, False),            # 같은 소속의 남의 심의 — 이어는 가되 그 보고서에는 붙이지 않는다
     (ME, "Me@Example.com", True),   # 내 심의
-    ("", ME, True),              # 주인이 안 적힌 잡 — 누구 것인지 모르니 종전대로
     (YOU, "", True),             # 신원 없는 호출(운영이 쓰는 길) — 종전대로
 ])
 def test_남의_심의를_이어갈_때는_그_보고서에_이어_붙이지_않는다(eng, monkeypatch, owner, caller, appends):
     _caps(monkeypatch, 3)
 
     async def scenario():
-        _done(owner)
-        out = await m.deliberate_continue("prev-1", "두께를 다시 보라", ctx=_ctx(caller) if caller else None)
+        _done(owner)["owner_aff"] = "CAEG"            # 남의 심의는 같은 소속이어야 이어 간다(결정 6, 10-18)
+        _c = SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(
+            headers={"x-hwax-user": caller, "x-hwax-affiliation": "CAEG"})))
+        out = await m.deliberate_continue("prev-1", "두께를 다시 보라", ctx=_c if caller else None)
         await _tick()
         got = eng.seen["힌지 크랙 원인"].opts
         assert (got.get("append_to_report_id") == 7) is appends, got
@@ -519,6 +523,21 @@ def test_남의_심의를_이어갈_때는_그_보고서에_이어_붙이지_않
 # 시작 거절 문구는 '접을 수 있는 것은 제 것뿐' 이라고 말해 왔는데 막는 코드는 없었다 — job_id 만 알면 누구든
 # 접을 수 있었고, 목록(deliberate_list)은 전원의 id 를 보여 준다. 줄이 생긴 뒤로는 앞에 선 남의 잡을 접으면
 # 제 순번이 당겨지니 그럴 까닭까지 생겼다.
+def test_볼_수_없는_심의는_이어_가지_못한다(eng, monkeypatch):
+    """다른 소속 · 주인 없는 옛 잡은 이어하기로도 못 옮긴다 — 이어하기는 이전 결정문을 내 잡에 싣는 읽기다(결정 6, 10-18)."""
+    _caps(monkeypatch, 3)
+
+    async def scenario():
+        _done(YOU)["owner_aff"] = "OTHER"
+        _done("", jid="prev-2")
+        for jid in ("prev-1", "prev-2"):
+            with pytest.raises(ValueError, match="볼 수 없다"):
+                await m.deliberate_continue(jid, "다시", ctx=_ctx(ME))
+        assert "힌지 크랙 원인" not in eng.seen, "새 잡이 서지 않았다"
+
+    _play(scenario)
+
+
 def test_신원이_다른_사람은_남의_심의를_접지_못한다(eng, monkeypatch):
     _caps(monkeypatch, 1)
 
