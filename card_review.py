@@ -3839,8 +3839,10 @@ def merge_paged(prep: dict, results: list) -> dict:
         "soft_over": any(bool(m.get("soft_over")) for m in metas),
         "bg_dropped": len(pctx["card_order"]) - len(pctx["must_full"]) + sum(int(m.get("must_dropped") or 0) for m in metas),
         "must_dropped": sum(int(m.get("must_dropped") or 0) for m in metas),
+        # 전문으로 실린 카드만 — 한 번에 부른 호출의 meta.aliases.cards 와 같은 뜻이다(제목만 실린 카드는 넣지 않는다). 반드시 전문인
+        # 카드는 모두 어느 쪽에 통째로든 조각으로든 실렸다(_page_prep) — 조각은 원래 별칭으로 센다.
         "aliases": {**(metas[0].get("aliases") or {}),
-                    "cards": {a: pctx["cards"][a]["record_id"] for a in pctx["card_order"]}},
+                    "cards": {a: pctx["cards"][a]["record_id"] for a in pctx["must_full"]}},
         "paged": {"n": len(results), "pages": pg["pages"], "must_full": len(pctx["must_full"])},
     })
 

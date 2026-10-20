@@ -89,7 +89,8 @@ def test_창_한_번에_안_들면_쪽으로_나눠_부르고_한_결과로_합�
     assert [r["t"] for r in res["rows"]].count("more") == 1 and res["missing"] == []
     meta = res["meta"]
     assert meta["paged"] == {"n": len(pages), "pages": pages, "must_full": 5} and meta["bg_dropped"] == 1
-    assert set(meta["aliases"]["cards"]) == {c["alias"] for c in cards} and len(a.app.state.delib_llm.calls) == len(pages)
+    assert set(meta["aliases"]["cards"]) == set(must), "전문으로 실린 카드만(제목만 실린 K06 은 빠진다)"
+    assert len(a.app.state.delib_llm.calls) == len(pages)
 
 
 def test_쪽_자리보다_긴_카드는_조각으로_쪽에_싣고_근거를_원래_별칭으로_접는다(client):
@@ -104,6 +105,7 @@ def test_쪽_자리보다_긴_카드는_조각으로_쪽에_싣고_근거를_원
     assert ks <= {"K01", "K02"} and "K01" in ks, "조각 별칭(K01.n)이 결과에 남지 않는다"
     assert all(r["checks"]["quote"] == "ok" for r in res["rows"] if r["t"] == "q1" and r["k"] == "K01")
     assert res["meta"]["paged"]["pages"] == prep["paged"]["pages"]
+    assert set(res["meta"]["aliases"]["cards"]) == {"K01", "K02"}, "조각으로 실린 카드는 원래 별칭으로 센다"
 
 
 def test_카드_밖_쪽_합치기는_m_은_합_more_는_더_있다가_이기고_none_은_지적이_없을_때만(client, monkeypatch):
