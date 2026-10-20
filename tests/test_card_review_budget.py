@@ -363,8 +363,10 @@ def test_plan_의_불변식(ctx, env, seed):
     pairs = {(p["deck_id"], p["unit_id"]): p for p in out["pair_over"]}
     for u in units:
         n = u["body_chars"]
+        # 조각을 켠 창에서는 카드가 그 단위에 맞게 조각 난다 — 단위가 돌릴 바닥(RUN_FLOOR)만큼의 카드 자리도 못 남길 때만 oversize(W-D16)
+        need = cr.RUN_FLOOR if room > 0 else card_max
         assert (u["unit_id"] in uo) == (lim["offcard"]["fixed"] + n > lim["p_hard"]
-                                        or (bool(seen_v) and v["fixed"] + n + card_max > lim["p_hard"]))
+                                        or (bool(seen_v) and v["fixed"] + n + need > lim["p_hard"]))
         assert (u["unit_id"] in us) == (u["unit_id"] not in uo and n > lim["unit_body_max"])
         for d in out["verdict_decks"]:
             need = v["fixed"] + n + d["chars"]

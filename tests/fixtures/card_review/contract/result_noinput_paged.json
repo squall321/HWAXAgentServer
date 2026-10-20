@@ -243,6 +243,7 @@
   "soft_over": false,
   "basis": "noinput",
   "bg_dropped": 1,
+  "must_dropped": 0,
   "order_effective": true,
   "aliases": {
    "cards": {

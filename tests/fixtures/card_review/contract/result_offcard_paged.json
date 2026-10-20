@@ -105,6 +105,7 @@
   "soft_over": false,
   "basis": "cards",
   "bg_dropped": 1,
+  "must_dropped": 0,
   "order_effective": true,
   "aliases": {
    "cards": {

@@ -514,9 +514,13 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     chunked = {a for d in verdict_decks if d.get("chunked") for a in d["aliases"]}
     card_max = max((int(c.get("chars") or 0) for c in checkable if c["alias"] not in v_over and c["alias"] not in chunked),
                    default=0)
+    # 조각을 켠 창(chunk_room > 0)에서는 카드가 그 단위와 함께 들 만큼 조각 난다(run 의 _chunk_prep — 단위가 커서 넘는 카드도) — 단위가
+    # 돌릴 바닥(RUN_FLOOR)만큼의 카드 자리도 못 남길 때만 oversize 다(HWAXPortal docs/risk-200k W-D16). 카드 밖 호출은 종전대로 홀로만
+    # 들면 된다 — 반드시 전문인 카드를 실을 자리가 없으면 제목으로 내리고 meta.must_dropped 로 센다(build_prompt).
+    card_need = RUN_FLOOR if chunk_room > 0 else card_max
     for u in units:
         n = int(u.get("body_chars") or 0)
-        if o_fixed + n > p_hard or (verdict_decks and v["fixed"] + n + card_max > p_hard):
+        if o_fixed + n > p_hard or (verdict_decks and v["fixed"] + n + card_need > p_hard):
             u_over.append(u["unit_id"])
             continue
         if n > unit_max:
@@ -703,8 +707,9 @@ def render_card(card: dict, alias: str) -> str:
                    f" 인용한 절만 모았다 · 전체 목차 «{_unquote_marks(ck.get('toc'))}»")
     elif isinstance(ck, dict):
         # 조각(chunk_card) — 이 카드의 일부만 실렸다는 것과 카드 전체의 모양(절 목차)을 함께 싣는다. 목차는 원천 글이라 «» 안이다.
+        toc = _unquote_marks(ck.get("toc"))
         out.append(f"조각 {int(ck.get('index') or 0)}/{int(ck.get('of') or 0)} — 카드 {_frame_safe(ck.get('parent'))} 의 일부"
-                   f" · 실린 절 {_frame_safe(ck.get('span'))} · 전체 목차 «{_unquote_marks(ck.get('toc'))}»")
+                   f" · 실린 절 {_frame_safe(ck.get('span'))}" + (f" · 전체 목차 «{toc}»" if toc else ""))
     for s in card.get("sections") or []:
         if not isinstance(s, dict):
             continue
@@ -752,7 +757,6 @@ CHUNK_OVERLAP_MAX = 300         # 한 절을 나눌 때 앞 조각 끝 문장을
 CARD_ALIAS_RE = re.compile(r"K\d{2,}(?:\.\d{1,3})?")      # 팩 별칭 K01 … 과 조각 별칭 K01.1 …
 CHUNK_KINDS = ("verdict", "sweep")      # 조각으로 도는 호출 — 카드 밖 · 입력 결손은 W2(쪽 나누기)
 CHUNK_SHRINK_TRIES = 3          # 단위가 커서 조각과 함께 창을 넘으면 조각을 줄여 다시 나누는 횟수
-CHUNK_MIN = 2_000               # 조각을 이보다 줄여야 하면 나누지 않는다(종전처럼 over_budget)
 CHUNK_BUSY_WAIT_MAX_S = 900.0   # 조각 사이에 관문 자리를 다시 기다리는 합의 상한(초)
 RECONCILE_CONTEXT = 3_000        # 재판정에 싣는 인용 앞뒤 글(자) — 절 전체가 아니라 인용 둘레
 _SENT_END = r"(?<=[.!?。…])"
@@ -834,9 +838,16 @@ def chunk_card(card: dict, alias: str, limit: int) -> list:
     if not secs or len(render_card(card, alias)) <= limit:
         return []
     toc = _toc(card)
-    probe = {**card, "sections": [], "chunk": {"parent": alias, "index": 999, "of": 999,
-                                               "span": "§9999 (나눔 999/999)~§9999 (나눔 999/999)", "toc": toc}}
-    room = limit - len(render_card(probe, f"{alias}.999"))
+
+    def text_room(t: str) -> int:
+        probe = {**card, "sections": [], "chunk": {"parent": alias, "index": 999, "of": 999,
+                                                   "span": "§9999 (나눔 999/999)~§9999 (나눔 999/999)", "toc": t}}
+        return limit - len(render_card(probe, f"{alias}.999"))
+
+    room = text_room(toc)
+    if room < 200 and toc:
+        toc = ""                    # 자리가 좁다(단위가 크다) — 전체 목차를 빼고 조각 위치만 싣는다
+        room = text_room(toc)
     if room < 200:
         return []                   # 틀만으로 자리가 거의 없다 — 나누지 않는다(run 이 종전처럼 over_budget 으로 거절한다)
     units: list = []
@@ -1053,7 +1064,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
     return {
         "kind": kind, "variant": variant or None, "expert": expert, "unit_id": unit_id,
         "cards": cards, "card_order": order, "digest": digest, "judge": list(order) if kind == "verdict" else [],
-        "fold": fold, "must_full": [a for a in order if a in set(must_full)], "lines": lines, "units": units,
+        "fold": fold, "must_full": [a for a in order if a in set(must_full)], "must_dropped": 0, "lines": lines,
+        "units": units,
         "num_src": num_src,
         "mechs": codes(extra.get("mechanisms"), "code"), "domains": codes(extra.get("domains"), "key"),
         "findings_max": int(lim["offcard"]["findings_max"]), "items_max": int(lim["noinput"]["items_max"]),
@@ -2607,26 +2619,28 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
         # 결손 호출은 카드 전부(점검·배경, 훑기 k 에 걸린 것 먼저 — 앱이 순서를 정한다)를 같은 규칙으로 싣는다(M3.md 4.4.2).
         # 긴 문서 발췌(run_search 가 같은 자리에 맞춘 것)가 있으면 먼저 쓰고 남은 자리를 카드가 쓴다.
         # 반드시 전문인 카드(extra.must_full — 훑기에 걸린 카드)는 몫이 아니라 창 한도까지 싣는다(HWAXPortal docs/risk-200k W-D15 —
-        # 몫을 넘으면 soft_over). 그래도 안 들면 이 호출은 설 수 없다 — run 이 쪽으로 나눠 부르고(_page_prep), 여기서는 over_budget 이다.
-        # 남은 몫 안 자리는 종전처럼 다른 카드를 차례로 채운다. must_full 이 없으면 종전 그대로다.
+        # 몫을 넘으면 soft_over). 넘치는 것은 run 이 쪽으로 나눠 부른다(_page_prep). 단위가 커서 쪽으로도 실을 자리가 없을 때만 제목으로
+        # 내리고 must_dropped 로 센다(멈추지 않는다 — 앱이 그 카드를 전문 노출 없음으로 적는다). 남은 몫 안 자리는 종전처럼 다른 카드를
+        # 차례로 채운다. must_full 이 없으면 종전 그대로다.
         room = max(0, kl["body"] - unit_size(unit) - len(docs_text))
         hard = max(0, lim["p_hard"] - kl["fixed"] - unit_size(unit) - len(docs_text))
         must = set(ctx["must_full"])
         size = {a: len(render_card(ctx["cards"][a]["card"], a)) for a in order}
         keep, used = set(), 0
         for a in (x for x in order if x in must):
-            if used + size[a] > hard:
-                raise OverBudget(lim["p_hard"] - hard + used + size[a], lim["p_hard"], "cards")
-            keep.add(a)
-            used += size[a]
+            if used + size[a] <= hard:
+                keep.add(a)
+                used += size[a]
+            else:
+                ctx["must_dropped"] += 1
         for a in (x for x in order if x not in must):
             if used + size[a] <= room:
                 keep.add(a)
                 used += size[a]
-            else:
-                c = ctx["cards"].pop(a)
-                ctx["digest"][a] = {k: c[k] for k in ("record_id", "card_id", "type", "title")}
-                ctx["bg_dropped"] += 1
+        for a in (x for x in order if x not in keep):      # 제목으로 — bg_dropped 는 제목만 실린 카드 전부(반드시 전문 포함)다
+            c = ctx["cards"].pop(a)
+            ctx["digest"][a] = {k: c[k] for k in ("record_id", "card_id", "type", "title")}
+            ctx["bg_dropped"] += 1
         order = [a for a in order if a in keep]
         ctx["card_order"] = order
 
@@ -3257,38 +3271,44 @@ def prepare(req: dict, lim: dict) -> dict:
     paged = _page_prep(req, lim)
     if paged is not None:
         return paged
-    chunked = _chunk_prep(req, lim)
-    if chunked is not None:
+    try:
+        system, human, ctx = build_prompt(req, lim)
+    except OverBudget as exc:
+        # 카드 한 장이 그 단위(또는 목록 쪽)와 함께 창을 넘는다 — 그 카드를 조각 내 돈다(docs/risk-200k W-D11 · W-D16). 조각으로도 안
+        # 되면(조각 자리가 돌릴 바닥 RUN_FLOOR 밑) 종전처럼 over_budget 이다.
+        chunked = _chunk_prep(req, lim, exc)
+        if chunked is None:
+            raise
         return chunked
-    system, human, ctx = build_prompt(req, lim)
     return {"req": req, "lim": lim, "system": system, "human": human, "ctx": ctx}
 
 
-def _chunk_prep(req: dict, lim: dict) -> dict | None:
-    """한 장 자리를 넘는 카드 한 장의 verdict · sweep — 조각마다 보통 준비물을 만들어 묶는다(run 이 차례로 돌려 합친다,
-    docs/risk-200k W-D11). 해당하지 않으면 None(종전 길 — 넘으면 build_prompt 가 over_budget 이다). 조각은 다시 조각 내지 않는다
-    (별칭 K12.1 은 걸리지 않는다). 단위가 커서 조각과 함께 창을 넘으면 넘친 만큼 조각을 줄여 다시 나눈다 — 같은 카드 · 같은
-    단위면 같은 조각이다."""
+def _chunk_prep(req: dict, lim: dict, over: OverBudget) -> dict | None:
+    """카드 한 장의 verdict · sweep 이 창을 넘으면(over) — 조각마다 보통 준비물을 만들어 묶는다(run 이 차례로 돌려 합친다,
+    docs/risk-200k W-D11 · W-D16). 조각 크기는 한 장 자리(card_room)와 '이 단위와 함께 들 자리'(카드 − 넘친 만큼) 가운데 작은 것의
+    CHUNK_SHARE 다 — 카드가 한 장 자리를 넘든, 단위가 커서 넘든 같은 길이다. 해당하지 않으면 None(그 over_budget 그대로). 조각과 재판정
+    카드(chunk 칸이 있는 카드)는 다시 조각 내지 않는다. 조각이 실제 틀과 함께 또 넘치면 넘친 만큼 줄여 다시 나누고(CHUNK_SHRINK_TRIES),
+    조각 자리가 돌릴 바닥(RUN_FLOOR) 밑이면 나누지 않는다. 같은 카드 · 같은 단위면 같은 조각이다."""
     kind = req.get("kind")
     cards = [c for c in req.get("cards") or [] if isinstance(c, dict)]
-    if kind not in CHUNK_KINDS or len(cards) != 1:
+    if kind not in CHUNK_KINDS or len(cards) != 1 or isinstance(cards[0].get("chunk"), dict):
         return None
     card = cards[0]
     alias = _str(card.get("alias"))
-    room = card_room(lim)
-    if not re.fullmatch(r"K\d{2,}", alias) or len(render_card(card, alias)) <= room:
+    if not re.fullmatch(r"K\d{2,}", alias):
         return None
-    limit = int(room * CHUNK_SHARE)
+    # 넘친 만큼 줄이되 보충 시도의 지적 블록 몫(hint_max)도 남긴다 — 넘친 셈은 지적 블록 없는 첫 시도의 것이다.
+    room = min(card_room(lim), len(render_card(card, alias)) - (over.need - over.have) - lim[kind]["hint_max"])
     for _ in range(CHUNK_SHRINK_TRIES):
-        chunks = chunk_card(card, alias, limit)
+        if room < RUN_FLOOR:
+            return None
+        chunks = chunk_card(card, alias, int(room * CHUNK_SHARE))
         if not chunks:
             return None
         try:
             subs = [prepare({**req, "cards": [c]}, lim) for c in chunks]
         except OverBudget as exc:
-            limit -= (exc.need - exc.have) + 1_000
-            if limit < CHUNK_MIN:
-                return None
+            room -= (exc.need - exc.have) + 1_000
             continue
         return {"req": req, "lim": lim, "ctx": subs[0]["ctx"],
                 "chunked": {"parent": alias, "card": card, "subs": subs, "parent_ctx": build_ctx(req, lim)}}
@@ -3817,7 +3837,8 @@ def merge_paged(prep: dict, results: list) -> dict:
     return _combine(kind, pctx["variant"], rows, settled, results, {
         "input_sha": _canon_sha({"paged": pg["pages"], "subs": [m.get("input_sha") for m in metas]}),
         "soft_over": any(bool(m.get("soft_over")) for m in metas),
-        "bg_dropped": len(pctx["card_order"]) - len(pctx["must_full"]),
+        "bg_dropped": len(pctx["card_order"]) - len(pctx["must_full"]) + sum(int(m.get("must_dropped") or 0) for m in metas),
+        "must_dropped": sum(int(m.get("must_dropped") or 0) for m in metas),
         "aliases": {**(metas[0].get("aliases") or {}),
                     "cards": {a: pctx["cards"][a]["record_id"] for a in pctx["card_order"]}},
         "paged": {"n": len(results), "pages": pg["pages"], "must_full": len(pctx["must_full"])},
@@ -4064,6 +4085,7 @@ async def run(app, prep: dict):
                      "input_sha": ctx["input_sha"], "prompt_chars": ctx["prompt_chars"], "usage": _usage(per),
                      "finish_reason": finishes[-1] if finishes else None, "llm_ms": llm_ms,
                      "soft_over": ctx["soft_over"], "basis": ctx["basis"], "bg_dropped": ctx["bg_dropped"],
+                     **({"must_dropped": ctx["must_dropped"]} if ctx.get("must_full") else {}),
                      "order_effective": ctx["order_effective"], "aliases": ctx["aliases"],
                      # 몫에서 끊은 입력 — {이름: {orig_chars, kept_chars, …}}(끊은 것이 없으면 {}) — RB3-11
                      "clipped": ctx.get("clipped") or {}},

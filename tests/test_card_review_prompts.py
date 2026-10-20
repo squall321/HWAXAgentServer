@@ -190,6 +190,24 @@ def _plan_in(pack, units: dict) -> tuple:
     return cards, sizes
 
 
+def _runs(kind, cards, pack, unit, lim, variant="fwd") -> bool:
+    """run 이 받는가 — prepare 가 지나고(조각이면 조각마다), 역할 · 지적 블록을 몫 끝까지 채워도 창 안이다(W-D16 — 카드가 단위와
+    함께 넘치면 run 이 조각 낸다)."""
+    kl = lim[kind]
+    req = _req(kind, cards, _digest(pack, [c["alias"] for c in cards]), unit=unit, variant=variant,
+               role="역할 원문 " * (kl["role_max"] // 3))
+    try:
+        prep = cr.prepare(req, lim)
+    except cr.OverBudget:
+        return False
+    for sub in (prep.get("chunked") or {}).get("subs") or [prep]:
+        try:
+            cr.build_prompt(sub["req"], lim, hint="지적 " * kl["hint_max"])
+        except cr.OverBudget:
+            return False
+    return True
+
+
 def _fits(kind, cards, pack, unit, lim, variant="fwd") -> bool:
     """역할·지적 블록을 몫 끝까지 채운 조립이 창 안인가(OverBudget 이 아닌가)."""
     kl = lim[kind]
@@ -205,19 +223,25 @@ def _fits(kind, cards, pack, unit, lim, variant="fwd") -> bool:
 def test_plan_은_run_이_넘칠_쌍을_내주지_않는다_128K_보고서_사례():
     """RB-7 재현 — 128K 창에서 점검형 카드 한 장을 한 장 자리(card_room)−2,000 자로, 단위를 p_hard−fixed−card_budget−500 자로
     키웠다. 옛 plan 은 묶음 K01(soft_over)과 단위 u-01(soft_over)을 받아 줬고 run 은 422 over_budget{need 180,796, have 112,367}
-    이었다. 카드 한 장과도 넘는 단위이므로 oversize.units 다(앱은 ctx_too_small 로 멈춘다). 옛 재현은 카드를 v_room−2,000 자로
-    키웠다 — 그 카드는 이제 한 장 자리를 넘어 조각으로 돈다(다음 시험)."""
+    이었다. M3 는 그 단위를 oversize(앱은 ctx_too_small 로 멈춘다)로 돌렸다. 이제 run 이 그 카드를 그 단위에 맞게 조각 낸다(W-D16)
+    — 계획은 단위를 멈추지 않고 그 쌍을 pair_over 로 알린다(앱이 solo 로 돌린다). 계획이 낸 쌍을 run 이 over_budget 으로 거절하지
+    않는다는 RB-7 의 뜻은 그대로다 — solo 준비가 조각으로 서고 조각마다 창 안이다."""
     lim = cr.limits(131_072, "server", 0, env={})
     v = lim["verdict"]
     pack = cr.assign_aliases([_grow(_checkable_base()[0], cr.card_room(lim) - 2_000, "-big")])
     assert v["card_budget"] < pack[0]["chars"] <= cr.card_room(lim)
     unit = _unit(lim["p_hard"] - v["fixed"] - v["card_budget"] - 500)
     out = cr.plan(*_plan_in(pack, {"u-01": unit}), lim)
-    assert [d["aliases"] for d in out["verdict_decks"]] == [["K01"]] and out["verdict_decks"][0]["soft_over"]
-    assert not out["verdict_decks"][0].get("chunked")
-    assert out["oversize"]["units"] == ["u-01"] and out["soft_over"]["units"] == [] and out["pair_over"] == []
-    with pytest.raises(cr.OverBudget):                     # 받아 줬다면 run 이 이렇게 거절했다
-        cr.prepare(_req("verdict", pack, [], unit=unit, variant="fwd"), lim)
+    (deck,) = out["verdict_decks"]
+    assert deck["aliases"] == ["K01"] and deck["soft_over"] and not deck.get("chunked")
+    assert out["oversize"]["units"] == [] and out["soft_over"]["units"] == ["u-01"]
+    assert [(p["deck_id"], p["unit_id"]) for p in out["pair_over"]] == [(deck["deck_id"], "u-01")]
+    with pytest.raises(cr.OverBudget):                     # 통째로는 여전히 넘는다
+        cr.build_prompt(_req("verdict", pack, [], unit=unit, variant="solo"), lim)
+    prep = cr.prepare(_req("verdict", pack, [], unit=unit, variant="solo"), lim)
+    subs = prep["chunked"]["subs"]
+    assert len(subs) >= 2 and all(len(s["system"]) + len(s["human"]) <= lim["p_hard"] for s in subs)
+    assert _runs("verdict", pack, pack, unit, lim, variant="solo")
 
 
 def test_한_장_자리를_넘는_카드는_큰_단위와도_조각으로_돈다_128K():
@@ -267,8 +291,9 @@ def test_plan_은_묶음째로_넘는_쌍을_pair_over_로_알리고_solo_는_�
 @pytest.mark.parametrize("ctx_tokens", [16_384, 131_072])
 @pytest.mark.parametrize("seed", range(4))
 def test_plan_이_낸_쌍은_전부_run_이_받는다(ctx_tokens, seed):
-    """속성 — plan 이 낸 (verdict 묶음, 단위) 쌍은 묶음째로, pair_over 쌍은 카드 한 장씩(solo) 창 안이고, (sweep 묶음, 목록 쪽)
-    쌍도 창 안이다. 카드에는 혼자 넘는(soft) 것을, 단위에는 상한을 넘는 것과 창 근처의 것을 섞는다."""
+    """속성 — plan 이 낸 (verdict 묶음, 단위) 쌍은 묶음째로, pair_over 쌍은 카드 한 장씩(solo) run 이 받고(단위와 함께 넘는 카드는
+    조각으로 — W-D16), (sweep 묶음, 목록 쪽) 쌍도 창 안이다. 카드에는 혼자 넘는(soft) 것을, 단위에는 상한을 넘는 것과 창 근처의 것을
+    섞는다."""
     rng = random.Random(f"pair-{ctx_tokens}-{seed}")
     lim = cr.limits(ctx_tokens, "server", 0, env={})
     v, s = lim["verdict"], lim["sweep"]
@@ -289,9 +314,9 @@ def test_plan_이_낸_쌍은_전부_run_이_받는다(ctx_tokens, seed):
         for d in out["verdict_decks"]:
             cards = [by[a] for a in d["aliases"]]
             if (d["deck_id"], uid) in over:
-                assert all(_fits("verdict", [c], pack, unit, lim, variant="solo") for c in cards), (uid, d)
+                assert all(_runs("verdict", [c], pack, unit, lim, variant="solo") for c in cards), (uid, d)
             else:
-                assert _fits("verdict", cards, pack, unit, lim), (uid, d)
+                assert _runs("verdict", cards, pack, unit, lim), (uid, d)
     items = {f"m-{i}": {"unit_id": f"m-{i}", "kind": "bundle", "title": "단위", "text": "가" * n}
              for i, n in enumerate([rng.randint(50, s["manifest_item_max"]), rng.randint(s["manifest_page_max"],
                                                                                           lim["p_hard"] // 2)])}

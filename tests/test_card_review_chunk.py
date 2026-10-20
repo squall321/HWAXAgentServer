@@ -354,3 +354,74 @@ def test_판정_행_없이_끝난_조각이_있으면_그_카드는_빠진_카�
     assert result["meta"]["chunked"]["unjudged"] == ["K07.2"] and result["meta"]["chunked"]["reconcile"] is None
     assert (result["quality"]["expected"], result["quality"]["missing"]) == (1, 1)
     assert len(llm.calls) > n, "빠진 조각은 보통 run 이 보충까지 물었다"
+
+
+# ── W-D16 — 단위가 커서 카드 한 장과도 넘치면 그 카드를 단위에 맞게 조각 낸다 ─────────────────────────────────────────
+def test_단위가_커서_넘치는_보통_카드도_조각으로_돌고_계획은_단위를_멈추지_않는다():
+    """한 장 자리 안의 카드(3만 자)와 큰 단위 — 통째로는 창을 넘는다. 계획은 단위를 oversize 로 멈추지 않고(pair_over 로 solo), run 은
+    그 카드를 그 단위와 함께 들 만큼 조각 낸다. 조각마다 보충 지적 블록까지 실어도 창 안이다."""
+    lim = LIM_200K
+    card = _long_card("K03", secs=(15_000, 15_000), seed=31)
+    v = lim["verdict"]
+    unit = _unit(lim["p_hard"] - max(v["fixed"], lim["offcard"]["fixed"]) - 3_000)   # 카드 밖 호출에는 홀로 든다
+    plan = cr.plan([{"alias": "K03", "record_id": card["record_id"], "checkable": True, "chars": card["chars"]}],
+                   [{"unit_id": "u-01", "manifest_chars": 200, "body_chars": cr.unit_size(unit)}], lim)
+    assert plan["oversize"]["units"] == [] and [p["unit_id"] for p in plan["pair_over"]] == ["u-01"]
+    prep = cr.prepare(_req("verdict", [card], [], unit=unit, variant="solo"), lim)
+    subs = prep["chunked"]["subs"]
+    assert len(subs) >= 2
+    for sub in subs:
+        cr.build_prompt(sub["req"], lim, hint="지적 " * v["hint_max"])     # 넘치면 OverBudget
+
+
+def test_자리가_좁으면_조각_틀에서_목차를_빼고_카드_밖은_홀로_들면_멈추지_않는다():
+    """조각 자리가 좁으면 목차를 실을 수 없다 — 목차를 빼고 조각 위치만 싣는다(넓으면 싣는다). 단위가 카드 밖 호출에 홀로 겨우 들면
+    (그 호출의 고정 몫이 판정보다 커 단위의 한계를 정한다) 계획은 멈추지 않고 — 판정은 카드를 조각으로, 카드 밖 호출은 반드시 전문인
+    카드를 실을 자리가 없어 제목으로 내리고 must_dropped 로 센다(멈추지 않는다). 한 글자 더 크면 oversize 다."""
+    lim = LIM_200K
+    v, o = lim["verdict"], lim["offcard"]
+    card = _long_card("K04", secs=tuple([800] * 40), seed=41)          # 절 40개 — 긴 절 제목으로 목차가 1,500자 상한을 채운다
+    card["sections"] = [{**s, "title": f"냉각 경로와 고정 보스 둘레의 응력 집중을 함께 보는 절 {s['sid']}"} for s in card["sections"]]
+    card["chars"] = len(cr.render_card(card, "K04"))
+    assert len(cr._toc(card)) > 1_400
+    pieces = cr.chunk_card(card, "K04", 1_200)
+    assert pieces and all("전체 목차" not in cr.render_card(c, c["alias"]) for c in pieces), "좁으면 목차를 뺀다"
+    wide = cr.chunk_card(card, "K04", 8_000)
+    assert wide and all("전체 목차" in cr.render_card(c, c["alias"]) for c in wide), "넓으면 목차를 싣는다"
+    assert o["fixed"] > v["fixed"] + cr.RUN_FLOOR, "이 창에서는 카드 밖 호출의 고정 몫이 단위의 한계를 정한다"
+    tight = lim["p_hard"] - o["fixed"]
+    units = [{"unit_id": "u-ok", "manifest_chars": 200, "body_chars": tight},
+             {"unit_id": "u-over", "manifest_chars": 200, "body_chars": tight + 1}]
+    plan = cr.plan([{"alias": "K04", "record_id": card["record_id"], "checkable": True, "chars": card["chars"]}], units, lim)
+    assert "u-ok" not in plan["oversize"]["units"] and "u-over" in plan["oversize"]["units"]
+    unit = _unit(tight)
+    solo = cr.prepare(_req("verdict", [card], [], unit=unit, variant="solo"), lim)
+    assert len(solo["chunked"]["subs"]) >= 2, "판정은 카드를 단위에 맞게 조각 낸다"
+    bg = {**card, "checkable": False}
+    off = cr.prepare(_req("offcard", [bg], [], unit=unit, extra={"must_full": ["K04"]}), lim)
+    assert off.get("paged") is None and off["ctx"]["must_dropped"] == 1 and off["ctx"]["bg_dropped"] == 1
+    assert "K04" in off["ctx"]["digest"] and "[K04] 종류 " not in off["human"], "자리가 없으면 제목으로 — 멈추지 않는다"
+
+
+def test_단위에_맞춘_조각은_보충_지적_블록_몫을_남기고_돌릴_바닥_밑이면_나누지_않는다():
+    """넘친 셈은 지적 블록 없는 첫 시도의 것이다 — 역할 · 배경 제목 · 메커니즘 블록을 몫 끝까지 채운 요청에서 조각에 보충 지적 블록
+    (hint_max) 몫을 남기지 않으면 자리가 좁을 때 보충 시도가 창을 넘는다. 조각 자리가 돌릴 바닥(RUN_FLOOR) 밑이면 아주 작은 조각
+    수십 개로 부르지 않고 over_budget 그대로 둔다."""
+    lim = LIM_200K
+    v = lim["verdict"]
+    card = _long_card("K05", secs=(10_000, 10_000), seed=51)
+    unit = _unit(lim["p_hard"] - v["fixed"] - 2_500)
+    digest = [{"alias": f"K{i:02d}", "type": "design-rule", "title": "가" * 300, "record_id": f"D-{i}", "card_id": f"C-{i}"}
+              for i in range(10, 99)]
+    mechs = [{"code": f"thermal.code_{i}", "label": "나" * 200} for i in range(200)]
+    req = _req("verdict", [card], digest, unit=unit, variant="solo", extra={"mechanisms": mechs},
+               role="역할 원문 " * (v["role_max"] // 3))
+    subs = cr.prepare(req, lim)["chunked"]["subs"]
+    for sub in subs:
+        cr.build_prompt(sub["req"], lim, hint="지적 " * v["hint_max"])     # 넘치면 OverBudget — 보충 시도가 설 자리
+    n = card["chars"]
+    hint = v["hint_max"]
+    tight = cr.OverBudget(10_000 + n - hint - (cr.RUN_FLOOR - 1), 10_000, "cards")      # 남는 자리 = 바닥 − 1
+    assert cr._chunk_prep(req, lim, tight) is None
+    roomy = cr.OverBudget(10_000 + n - hint - cr.RUN_FLOOR * 4, 10_000, "cards")
+    assert cr._chunk_prep(req, lim, roomy)["chunked"]["subs"]
