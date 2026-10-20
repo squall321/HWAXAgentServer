@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import copy
 import hashlib
 import json
 import logging
@@ -431,11 +432,13 @@ def _sha8(*parts) -> str:
     return hashlib.sha256(json.dumps(parts, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
 
 
-def _pack_decks(kind: str, cards: list, budget: int, k: int | None, hard_room: int) -> tuple[list, list]:
+def _pack_decks(kind: str, cards: list, budget: int, k: int | None, hard_room: int,
+                chunk_room: int = 0) -> tuple[list, list]:
     """카드를 팩의 고정 순서로 묶는다 — 장수(k, None 이면 없음)와 글자 합(budget)을 함께 보고 닫는다.
 
-    한 장이 budget 보다 크면 혼자 한 묶음(soft_over)이고, 그 한 장이 hard_room(창 한도에서 틀·블록 몫·단위 상한을 뺀
-    자리)마저 넘으면 묶지 않고 oversize 로 돌려준다(조용히 자르지 않는다)."""
+    한 장이 budget 보다 크면 혼자 한 묶음(soft_over)이다. 한 장이 chunk_room(card_room — run 이 조각 내는 선과 같다)을 넘으면
+    혼자 한 묶음에 `chunked`(run 이 조각 내 여러 번 부른다, docs/risk-200k W-D11)와 조각 수 어림 `chunks` 를 단다. chunk_room 이
+    없는데 hard_room(창 한도에서 틀·블록 몫·단위 상한을 뺀 자리)을 넘으면 묶지 않고 oversize 로 돌려준다(조용히 자르지 않는다)."""
     decks, over, cur, cur_chars = [], [], [], 0
 
     def close():
@@ -448,6 +451,14 @@ def _pack_decks(kind: str, cards: list, budget: int, k: int | None, hard_room: i
 
     for c in cards:
         n = int(c.get("chars") or 0)
+        if chunk_room > 0 and n > chunk_room:
+            close()
+            # 조각 수는 하한에 가까운 어림이다 — run 은 이 자리의 CHUNK_SHARE 로 절 경계에서 끊어 하나둘 더 낼 수 있다(실제 수는
+            # 결과의 meta.chunked.n). CHUNK_SHARE 를 여기서 읽지 않는다 — 판(limits_rev)에 들면 1M 박스의 셀 지문까지 바뀐다.
+            decks.append({"deck_id": f"{kind[0]}-{_sha8(kind, [[c['alias'], c.get('record_id', '')]])}",
+                          "aliases": [c["alias"]], "chars": n, "soft_over": True, "chunked": True,
+                          "chunks": -(-n // chunk_room)})
+            continue
         if n > hard_room:
             over.append(c["alias"])
             continue
@@ -476,8 +487,12 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     v_room = p_hard - v["fixed"] - unit_max
     s_room = p_hard - s["fixed"] - s["manifest_page_max"]
     checkable = [c for c in cards if c.get("checkable")]
-    verdict_decks, v_over = _pack_decks("verdict", checkable, v["card_budget"], v["k"], v_room)
-    sweep_decks, s_over = _pack_decks("sweep", list(cards), s["card_budget"], None, s_room)
+    # 한 장 자리를 넘는 카드는 멈추지 않는다 — 혼자 한 묶음(chunked)이고 run 이 조각 내 여러 번 부른다(docs/risk-200k W-D11).
+    # 선은 두 종류 모두 card_room(판정 · 훑기 자리 중 작은 것)이다 — run 의 _chunk_prep 과 같은 선이라 계획과 실행이 갈리지 않는다.
+    # 1M 창에서는 한 장 자리가 80만 자를 넘어 이 길에 드는 카드가 없다(계획이 종전과 같다).
+    chunk_room = max(card_room(lim), 0)
+    verdict_decks, v_over = _pack_decks("verdict", checkable, v["card_budget"], v["k"], v_room, chunk_room)
+    sweep_decks, s_over = _pack_decks("sweep", list(cards), s["card_budget"], None, s_room, chunk_room)
     kinds_of: dict = {}
     for kind, aliases in (("verdict", v_over), ("sweep", s_over)):
         for a in aliases:
@@ -490,7 +505,10 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     # 그 단위는 oversize 다(다시 쪼개지 않는다 — 앱은 ctx_too_small 로 멈춘다).
     u_over, u_soft, pair_over = [], [], []
     o_fixed = lim["offcard"]["fixed"]
-    card_max = max((int(c.get("chars") or 0) for c in checkable if c["alias"] not in v_over), default=0)
+    # 조각으로 도는 카드는 셈에서 뺀다 — 조각은 그 단위와 함께 창 안에 들도록 run 이 크기를 줄인다(_chunk_prep).
+    chunked = {a for d in verdict_decks if d.get("chunked") for a in d["aliases"]}
+    card_max = max((int(c.get("chars") or 0) for c in checkable if c["alias"] not in v_over and c["alias"] not in chunked),
+                   default=0)
     for u in units:
         n = int(u.get("body_chars") or 0)
         if o_fixed + n > p_hard or (verdict_decks and v["fixed"] + n + card_max > p_hard):
@@ -499,6 +517,8 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         if n > unit_max:
             u_soft.append(u["unit_id"])
         for d in verdict_decks:
+            if d.get("chunked"):
+                continue
             need = v["fixed"] + n + d["chars"]
             if need > p_hard:
                 pair_over.append({"deck_id": d["deck_id"], "unit_id": u["unit_id"], "need": need, "have": p_hard})
@@ -507,7 +527,8 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     # 함께 창을 넘으면 oversize 다(쪽 몫 안의 쪽은 어느 묶음과도 든다 — 묶음 자리 s_room 이 쪽 몫을 비워 둔다).
     pages, m_over, m_soft, cur, cur_chars = [], [], [], [], 0
     page_max, per_page = s["manifest_page_max"], s["units_per_page_max"]
-    s_cards = max((d["chars"] for d in sweep_decks), default=len(_NO_CARDS))
+    # 조각으로 도는 묶음은 뺀다 — 조각은 목록 쪽과 함께 창 안에 들도록 run 이 크기를 줄인다(_chunk_prep).
+    s_cards = max((d["chars"] for d in sweep_decks if not d.get("chunked")), default=len(_NO_CARDS))
     for u in units:
         n = int(u.get("manifest_chars") or 0)
         if s["fixed"] + n + s_cards > p_hard:
@@ -670,14 +691,30 @@ def render_card(card: dict, alias: str) -> str:
     """프롬프트에 싣는 카드 한 장(끝 줄바꿈 포함 — 묶음 글자 수는 이 길이의 합이다). 원천 글(제목·절 제목·본문)은 전부
     «» 안이고, 틀 밖의 절 번호는 한 줄로 위생한다(RB-5)."""
     out = [card_header(card, alias), f"제목 «{_unquote_marks(card.get('title'))}»"]
+    ck = card.get("chunk")
+    if isinstance(ck, dict) and ck.get("mode") == "reconcile":
+        # 재판정(_reconcile_prep) — 조각들이 판정을 달리해 그 조각들이 인용한 절만 모아 다시 묻는다.
+        out.append(f"재판정 — 카드 {_frame_safe(ck.get('parent'))} 의 조각 {int(ck.get('of') or 0)}개가 판정을 달리해 그 조각들이"
+                   f" 인용한 절만 모았다 · 전체 목차 «{_unquote_marks(ck.get('toc'))}»")
+    elif isinstance(ck, dict):
+        # 조각(chunk_card) — 이 카드의 일부만 실렸다는 것과 카드 전체의 모양(절 목차)을 함께 싣는다. 목차는 원천 글이라 «» 안이다.
+        out.append(f"조각 {int(ck.get('index') or 0)}/{int(ck.get('of') or 0)} — 카드 {_frame_safe(ck.get('parent'))} 의 일부"
+                   f" · 실린 절 {_frame_safe(ck.get('span'))} · 전체 목차 «{_unquote_marks(ck.get('toc'))}»")
     for s in card.get("sections") or []:
         if not isinstance(s, dict):
             continue
-        head = f"§{_frame_safe(s.get('sid'))}"
-        title = _unquote_marks(s.get("title")).strip()
-        out.append(f"{head} «{title}»" if title else head)
+        out.append(_section_head(s))
         out.append(f"«{_unquote_marks(s.get('text'))}»")
     return "\n".join(out) + "\n"
+
+
+def _section_head(s: dict) -> str:
+    """절 머리 줄 — `§번호 «제목»`, 한 절을 나눠 실은 조각이면 뒤에 `(나눔 j/m)`(틀 밖 표지라 숫자만)."""
+    head = f"§{_frame_safe(s.get('sid'))}"
+    title = _unquote_marks(s.get("title")).strip()
+    part = s.get("part")
+    mark = f" (나눔 {int(part[0])}/{int(part[1])})" if isinstance(part, (list, tuple)) and len(part) == 2 else ""
+    return (f"{head} «{title}»" if title else head) + mark
 
 
 def alias_width(n: int) -> int:
@@ -696,6 +733,140 @@ def assign_aliases(cards: list) -> list:
     for i, c in enumerate(ranked, 1):
         alias = f"K{i:0{w}d}"
         out.append({"alias": alias, **c, "chars": len(render_card(c, alias))})
+    return out
+
+
+# ── 카드 조각 — 한 장이 창의 '한 장 자리' 를 넘는 카드(HWAXPortal docs/risk-200k W-D4 · W-D11) ─────────────────────
+# 계획(plan)은 그런 카드를 혼자 한 묶음(chunked)으로 낸다. 앱은 원래 카드를 그대로 보내고, run 이 이것으로 조각 내(별칭 K12.1 …) 조각마다
+# 부른 뒤 카드 한 장의 행으로 합친다(_run_chunked — 앱에는 한 카드 = 한 행 그대로라 원장 · 불변식이 바뀌지 않는다). 조각 크기는 한 장
+# 자리의 CHUNK_SHARE 다 — 틀 · 단위가 선언한 여유보다 커도 한 번에 들게 남기는 몫이다. 1M 창에서는 한 장 자리가 80만 자를 넘어 조각이
+# 생기지 않는다.
+CHUNK_SHARE = 0.9
+CHUNK_TOC_MAX = 1_500           # 조각마다 싣는 전체 절 목차의 상한(자) — 넘으면 '외 n절'
+CHUNK_OVERLAP_MAX = 300         # 한 절을 나눌 때 앞 조각 끝 문장을 다음 조각 머리에 겹쳐 싣는 상한(자)
+CARD_ALIAS_RE = re.compile(r"K\d{2,}(?:\.\d{1,3})?")      # 팩 별칭 K01 … 과 조각 별칭 K01.1 …
+CHUNK_KINDS = ("verdict", "sweep")      # 조각으로 도는 호출 — 카드 밖 · 입력 결손은 W2(쪽 나누기)
+CHUNK_SHRINK_TRIES = 3          # 단위가 커서 조각과 함께 창을 넘으면 조각을 줄여 다시 나누는 횟수
+CHUNK_MIN = 2_000               # 조각을 이보다 줄여야 하면 나누지 않는다(종전처럼 over_budget)
+CHUNK_BUSY_WAIT_MAX_S = 900.0   # 조각 사이에 관문 자리를 다시 기다리는 합의 상한(초)
+RECONCILE_CONTEXT = 3_000        # 재판정에 싣는 인용 앞뒤 글(자) — 절 전체가 아니라 인용 둘레
+_SENT_END = r"(?<=[.!?。…])"
+
+
+def card_room(lim: dict) -> int:
+    """카드 한 장이 혼자 들 수 있는 자리(자) — plan() 의 판정 · 훑기 '한 장 자리' 가운데 작은 것. 넘으면 계획이 조각 묶음(chunked)으로
+    내고 run 이 조각 낸다. 0 이하(카드 한 장도 못 싣는 창)면 조각도 없다 — 계획이 종전처럼 oversize 로 돌려준다."""
+    v, s = lim["verdict"], lim["sweep"]
+    return min(lim["p_hard"] - v["fixed"] - lim["unit_body_max"], lim["p_hard"] - s["fixed"] - s["manifest_page_max"])
+
+
+def _toc(card: dict) -> str:
+    """전체 절 목차 한 줄 — `§1 제목 / §2 제목 …`, CHUNK_TOC_MAX 를 넘으면 앞에서 끊고 `외 n절`."""
+    items = []
+    for s in card.get("sections") or []:
+        if isinstance(s, dict):
+            title = re.sub(r"\s+", " ", _unquote_marks(s.get("title")).strip())
+            items.append(f"§{_frame_safe(s.get('sid'))} {title}".rstrip())
+    out: list = []
+    used = 0
+    for i, it in enumerate(items):
+        if used + len(it) + 3 > CHUNK_TOC_MAX:
+            return " / ".join(out) + f" / 외 {len(items) - i}절"
+        out.append(it)
+        used += len(it) + 3
+    return " / ".join(out)
+
+
+def _sec_chars(s: dict) -> int:
+    """render_card 에서 절 하나가 차지하는 글자 수(머리 줄 + 본문 줄, 줄바꿈 둘 포함) — 조각 묶기의 셈."""
+    return len(_section_head(s)) + 1 + len(f"«{_unquote_marks(s.get('text'))}»") + 1
+
+
+def _overlap_tail(text: str) -> str:
+    """앞 조각 끝에서 다음 조각 머리로 겹쳐 실을 글 — 마지막 CHUNK_OVERLAP_MAX 자 안의 문장 시작부터. 문장 끝이 없으면 그 꼬리 전부."""
+    tail = text[-CHUNK_OVERLAP_MAX:]
+    m = re.search(_SENT_END + r"\s+", tail)
+    return tail[m.end():] if m and m.end() < len(tail) else tail
+
+
+def _split_text(text: str, room: int) -> list:
+    """한 절의 본문을 room 자 안의 조각들로 — 문단 → 문장 → 글자 차례(결정적). 둘째 조각부터는 앞 조각 끝 문장을 머리에 겹친다.
+    조각은 모두 원문의 이어진 부분 문자열이다 — 인용 대조가 원래 절에서 그대로 선다."""
+    room = max(room, 50)
+    atoms: list = []
+    for para in re.split(r"(?<=\n\n)", text):
+        if not para:
+            continue
+        if len(para) <= room:
+            atoms.append(para)
+            continue
+        for sent in re.split(_SENT_END + r"(?=\s)", para):
+            while len(sent) > room:
+                atoms.append(sent[:room])
+                sent = sent[room:]
+            if sent:
+                atoms.append(sent)
+    pieces: list = []
+    cur = ""
+    for a in atoms:
+        if cur and len(cur) + len(a) > room:
+            pieces.append(cur)
+            tail = _overlap_tail(cur)
+            cur = tail if len(tail) + len(a) <= room else ""
+        cur += a
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
+def chunk_card(card: dict, alias: str, limit: int) -> list:
+    """한 장 자리를 넘는 카드 → 조각 카드들(별칭 `<alias>.1` …). 넘지 않거나 절이 없으면 [] — 조각이 필요 없다(또는 나눌 수 없다).
+
+    절 경계에서 나누고, 한 절이 혼자 넘으면 그 절을 문단 → 문장 경계로 나눠 `part=(j, m)` 을 단다(절 번호는 원래 것 — 인용 대조가
+    원래 절에서 선다). 조각마다 카드 머리 · 제목 · `chunk{parent, index, of, span, toc}`(조각 줄)을 싣는다. 결정적이다 — 같은 카드 ·
+    같은 한도면 같은 조각이다(셀 지문 · 접두 캐시). 조각마다 `chars` 는 render_card 길이이고 limit 을 넘지 않는다."""
+    secs = [s for s in card.get("sections") or [] if isinstance(s, dict)]
+    if not secs or len(render_card(card, alias)) <= limit:
+        return []
+    toc = _toc(card)
+    probe = {**card, "sections": [], "chunk": {"parent": alias, "index": 999, "of": 999,
+                                               "span": "§9999 (나눔 999/999)~§9999 (나눔 999/999)", "toc": toc}}
+    room = limit - len(render_card(probe, f"{alias}.999"))
+    if room < 200:
+        return []                   # 틀만으로 자리가 거의 없다 — 나누지 않는다(run 이 종전처럼 over_budget 으로 거절한다)
+    units: list = []
+    for s in secs:
+        if _sec_chars(s) <= room:
+            units.append(dict(s))
+            continue
+        text_room = room - _sec_chars({**s, "text": "", "part": (999, 999)})
+        pieces = _split_text(str(s.get("text") or ""), text_room)
+        units += [{**s, "text": p, "part": (j, len(pieces))} for j, p in enumerate(pieces, 1)]
+    groups: list = []
+    cur: list = []
+    used = 0
+    for u in units:
+        n = _sec_chars(u)
+        if cur and used + n > room:
+            groups.append(cur)
+            cur, used = [], 0
+        cur.append(u)
+        used += n
+    if cur:
+        groups.append(cur)
+
+    def label(u: dict) -> str:
+        part = u.get("part")
+        return f"§{_frame_safe(u.get('sid'))}" + (f" (나눔 {part[0]}/{part[1]})" if part else "")
+
+    out: list = []
+    for i, g in enumerate(groups, 1):
+        span = label(g[0]) if len(g) == 1 else f"{label(g[0])}~{label(g[-1])}"
+        a = f"{alias}.{i}"
+        c = {**card, "alias": a, "sections": g, "text_sha": _text_sha(g),
+             "chunk": {"parent": alias, "index": i, "of": len(groups), "span": span, "toc": toc}}
+        c["chars"] = len(render_card(c, a))
+        out.append(c)
     return out
 
 
@@ -777,7 +948,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
     order: list = []
     for c in req.get("cards") or []:
         a = _str((c or {}).get("alias")) if isinstance(c, dict) else ""
-        if not re.fullmatch(r"K\d{2,}", a) or not isinstance(c.get("sections"), list):
+        if not CARD_ALIAS_RE.fullmatch(a) or not isinstance(c.get("sections"), list):
             raise RequestError("bad_request", "cards 의 항목은 팩 카드 그대로여야 한다(alias K01…·sections)")
         if a in cards:
             raise RequestError("bad_request", f"cards 에 같은 별칭 {_echo(a)} 가 둘이다")
@@ -790,7 +961,7 @@ def build_ctx(req: dict, lim: dict) -> dict:
     digest: dict = {}
     for d in req.get("digest") or []:
         a = _str((d or {}).get("alias")) if isinstance(d, dict) else ""
-        if not re.fullmatch(r"K\d{2,}", a):
+        if not CARD_ALIAS_RE.fullmatch(a):
             raise RequestError("bad_request", "digest 의 항목은 {alias, type, title} 이다")
         if a not in cards:
             digest[a] = {"record_id": _str(d.get("record_id")), "card_id": _str(d.get("card_id")),
@@ -858,10 +1029,16 @@ def build_ctx(req: dict, lim: dict) -> dict:
     def codes(items, key):          # 프롬프트에 렌더한 것과 같은 위생(_code_list) — 모델은 본 코드를 고른다
         return {_frame_safe(x.get(key)) for x in items or [] if isinstance(x, dict) and _frame_safe(x.get(key))}
 
+    # 조각 카드(K12.1 …) 한 장의 호출에서 모델이 틀 줄의 원래 별칭(K12)으로 답하면 그 조각의 답으로 읽는다 — 실린 카드가 그 조각
+    # 하나뿐이라 갈 데가 하나다(버리면 세 번 묻고 no_rows 로 조각째 실패한다). 원래 별칭이 따로 실렸으면 접지 않는다.
+    parents = [((cards[a]["card"].get("chunk") or {}).get("parent"), a) for a in order
+               if isinstance(cards[a]["card"].get("chunk"), dict)]
+    fold = {pa: a for pa, a in parents if isinstance(pa, str) and pa != a and pa not in cards
+            and sum(1 for x, _ in parents if x == pa) == 1}
     return {
         "kind": kind, "variant": variant or None, "expert": expert, "unit_id": unit_id,
         "cards": cards, "card_order": order, "digest": digest, "judge": list(order) if kind == "verdict" else [],
-        "lines": lines, "units": units, "num_src": num_src,
+        "fold": fold, "lines": lines, "units": units, "num_src": num_src,
         "mechs": codes(extra.get("mechanisms"), "code"), "domains": codes(extra.get("domains"), "key"),
         "findings_max": int(lim["offcard"]["findings_max"]), "items_max": int(lim["noinput"]["items_max"]),
         "bg_dropped": 0, "docs": {},
@@ -1686,9 +1863,14 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
         raise ValueError(f"({kind}, {variant!r}) 가 별칭 표({ctx['kind']}, {ctx.get('variant')!r})와 다르다")
     out, extra_inj = [], []
     stats = {"dropped_alias": 0, "dropped_over_cap": 0, "dup": 0, "cut": []}
+    fold = ctx.get("fold") or {}
     for raw in rows:
         r = dict(raw)
         t = r["t"]
+        if fold and t == "v" and isinstance(r.get("k"), str) and r["k"] in fold:
+            r["k"] = fold[r["k"]]                # 조각 호출에 원래 별칭으로 답했다 — build_ctx 의 fold
+        elif fold and t == "u" and isinstance(r.get("k"), list):
+            r["k"] = [fold.get(x, x) for x in r["k"]]
         if t == "inj":
             extra_inj.append({"at": r.get("at", ""), "text": r.get("text", "")})
             continue
@@ -1948,7 +2130,7 @@ _MISSING_SAY = {"m": "m 줄(따져 본 메커니즘)", "more": "more 줄(더 있
                 "q1": "q1 줄(질문 1 — 지금 변경으로 말할 수 있는 영향. 없으면 impact=no 한 줄)",
                 "q2": "q2 줄(질문 2 — 결측 입력이 오면 확인할 것. 없으면 item 이 빈 한 줄)",
                 "head": "head 줄(요지 — 정확히 한 줄)", "para": "para 줄(서술 문단 — 한 줄 이상)"}
-_HINT_ALIAS = re.compile(r"[KLUR]\d{2,}|[a-z]{1,8}|q[12]")  # 지적 블록에 그대로 쓰는 대상 — 별칭, 줄 종류(f·m·need·q1·head…)
+_HINT_ALIAS = re.compile(r"K\d{2,}(?:\.\d{1,3})?|[LUR]\d{2,}|[a-z]{1,8}|q[12]")  # 지적 블록에 그대로 쓰는 대상 — 별칭, 줄 종류(f·m·need·q1·head…)
 _HINT_SAY = {
     "missing": "줄이 없다",
     "enum": "열거 밖 값을 적었다",
@@ -3036,8 +3218,42 @@ def prepare(req: dict, lim: dict) -> dict:
                            **({"reason": reason} if reason else {}),
                            **({"need_max_tokens": small["need_max_tokens"]} if small.get("need_max_tokens")
                               and cell else {}))
+    chunked = _chunk_prep(req, lim)
+    if chunked is not None:
+        return chunked
     system, human, ctx = build_prompt(req, lim)
     return {"req": req, "lim": lim, "system": system, "human": human, "ctx": ctx}
+
+
+def _chunk_prep(req: dict, lim: dict) -> dict | None:
+    """한 장 자리를 넘는 카드 한 장의 verdict · sweep — 조각마다 보통 준비물을 만들어 묶는다(run 이 차례로 돌려 합친다,
+    docs/risk-200k W-D11). 해당하지 않으면 None(종전 길 — 넘으면 build_prompt 가 over_budget 이다). 조각은 다시 조각 내지 않는다
+    (별칭 K12.1 은 걸리지 않는다). 단위가 커서 조각과 함께 창을 넘으면 넘친 만큼 조각을 줄여 다시 나눈다 — 같은 카드 · 같은
+    단위면 같은 조각이다."""
+    kind = req.get("kind")
+    cards = [c for c in req.get("cards") or [] if isinstance(c, dict)]
+    if kind not in CHUNK_KINDS or len(cards) != 1:
+        return None
+    card = cards[0]
+    alias = _str(card.get("alias"))
+    room = card_room(lim)
+    if not re.fullmatch(r"K\d{2,}", alias) or len(render_card(card, alias)) <= room:
+        return None
+    limit = int(room * CHUNK_SHARE)
+    for _ in range(CHUNK_SHRINK_TRIES):
+        chunks = chunk_card(card, alias, limit)
+        if not chunks:
+            return None
+        try:
+            subs = [prepare({**req, "cards": [c]}, lim) for c in chunks]
+        except OverBudget as exc:
+            limit -= (exc.need - exc.have) + 1_000
+            if limit < CHUNK_MIN:
+                return None
+            continue
+        return {"req": req, "lim": lim, "ctx": subs[0]["ctx"],
+                "chunked": {"parent": alias, "card": card, "subs": subs, "parent_ctx": build_ctx(req, lim)}}
+    return None
 
 
 def _http_status(exc) -> int | None:
@@ -3163,6 +3379,276 @@ def _external_admit(gate, board, req: dict):
     return owner
 
 
+# ── 조각 실행 — 한 장 자리를 넘는 카드 한 장(docs/risk-200k W-D5 · W-D11) ─────────────────────────────────────────
+_APPLIES_RANK = {"yes": 2, "unknown": 1, "no": 0}
+_JUDGE_RANK = {"FAIL": 4, "WARNING": 3, "undetermined": 2, "OK": 1, "na": 0}
+_REL_RANK = {"yes": 2, "maybe": 1, "no": 0}
+
+
+async def _drive(app, sub: dict, mark: dict, out: dict):
+    """조각(또는 재판정) 하나의 보통 run — status 에 mark(조각은 {chunk, of}, 재판정은 {step: "reconcile", of})를 얹어, ping 은
+    그대로 흘리고 result · error 는 out 에 담는다.
+    자리가 없으면(review_busy — LLM 을 부르기 전이다) retry_after_s 뒤 다시 낸다(합 CHUNK_BUSY_WAIT_MAX_S 안). 앞 조각의
+    결과는 그대로라 조각 사이에 자리를 남에게 내줘도 처음부터 다시 돌지 않는다."""
+    from app import DELIB_HEARTBEAT_S, _sse  # noqa: PLC0415
+    import delib_jobs  # noqa: PLC0415 — SSE 한 덩이 읽기
+
+    waited = 0.0
+    while True:
+        out["result"], out["error"] = None, None
+        agen = run(app, sub)
+        try:
+            async for b in agen:
+                ev, data = delib_jobs._parse_sse(b)
+                if ev == "result":
+                    out["result"] = data
+                elif ev == "error":
+                    out["error"] = data
+                elif ev == "status":
+                    yield _sse("status", {**data, **mark})
+                elif ev != "done":
+                    yield b
+        finally:
+            await agen.aclose()
+        err = out["error"]
+        if not (isinstance(err, dict) and err.get("code") == "review_busy" and waited < CHUNK_BUSY_WAIT_MAX_S):
+            return
+        delay = max(1.0, float(err.get("retry_after_s") or 5))
+        waited += delay
+        hb = float(DELIB_HEARTBEAT_S)
+        end = time.monotonic() + delay
+        while (left := end - time.monotonic()) > 0:
+            await asyncio.sleep(min(left, hb) if hb > 0 else left)
+            if hb > 0 and end - time.monotonic() > 0:
+                yield _sse("ping", {"idle_s": int(waited), "ts": int(time.time() * 1000)})
+
+
+def _unjudged(prep: dict, results: list) -> list:
+    """제 판정 행을 내지 못한 조각의 별칭(verdict) — 보통 run 이 보충까지 물은 뒤에도 빠진 조각이다. 훑기는 단위 줄이라 빠진 단위를
+    합친 정산이 센다."""
+    if prep["chunked"]["parent_ctx"]["kind"] != "verdict":
+        return []
+    out = []
+    for sub, res in zip(prep["chunked"]["subs"], results):
+        alias = sub["req"]["cards"][0]["alias"]
+        if not any(r.get("t") == "v" and r.get("k") == alias for r in res.get("rows") or []):
+            out.append(alias)
+    return out
+
+
+def _yes_rows(prep: dict, results: list) -> list:
+    """해당(applies=yes)인 조각 판정 행 — [(조각 준비물, 행)]."""
+    return [(sub, r) for sub, res in zip(prep["chunked"]["subs"], results) for r in res.get("rows") or []
+            if r.get("t") == "v" and r.get("applies") == "yes"]
+
+
+def _chunks_split(prep: dict, results: list) -> bool:
+    """해당인 조각들이 걸림(FAIL · WARNING)과 그 밖(OK 등)으로 갈렸나."""
+    return {r.get("judgement") in ("FAIL", "WARNING") for _, r in _yes_rows(prep, results)} == {True, False}
+
+
+def _reconcile_prep(prep: dict, results: list) -> dict | None:
+    """해당(applies=yes)인 조각들이 걸림(FAIL · WARNING)과 OK 로 갈렸으면 — 그 조각들이 인용한 자리(인용 앞뒤
+    RECONCILE_CONTEXT 자)만 모아 그 카드 하나를 한 번 더 묻는 준비물(W-D5). 두 쪽 근거를 번갈아 세우고, 한도에 맞춰 덜어 낸 뒤에도
+    두 쪽이 다 남아야 묻는다. 갈리지 않았거나 한쪽 근거만 남으면 None — 해당 조각 가운데 가장 무거운 판정이 선다(갈렸는데 못 물었으면
+    _run_chunked 가 reconcile=skipped 로 적는다)."""
+    ck = prep["chunked"]
+    yes = _yes_rows(prep, results)
+    if not _chunks_split(prep, results):
+        return None
+    sides: dict = {True: [], False: []}
+    seen: set = set()
+    for sub, r in yes:
+        sid = str((r.get("checks") or {}).get("quote_sid") or "")
+        sec = next((x for x in sub["req"]["cards"][0]["sections"] if sid and str(x.get("sid")) == sid), None)
+        if sec is None:
+            continue
+        text, q = str(sec.get("text") or ""), str(r.get("cq") or "")
+        at = text.find(q) if q else -1
+        lo = max(0, at - RECONCILE_CONTEXT) if at >= 0 else 0
+        hi = min(len(text), (at + len(q) + RECONCILE_CONTEXT) if at >= 0 else 2 * RECONCILE_CONTEXT)
+        if (sid, lo, hi) in seen:
+            continue
+        seen.add((sid, lo, hi))
+        sides[r.get("judgement") in ("FAIL", "WARNING")].append({"sid": sid, "title": sec.get("title") or "",
+                                                                   "text": text[lo:hi]})
+    picked = [x for pair in zip(sides[True], sides[False]) for x in pair]
+    picked += sides[True][len(sides[False]):] + sides[False][len(sides[True]):]
+    card, parent, lim = ck["card"], ck["parent"], prep["lim"]
+    limit = int(card_room(lim) * CHUNK_SHARE)
+    mini = {**card, "sections": picked, "chunk": {"parent": parent, "mode": "reconcile", "of": len(results),
+                                                  "toc": _toc(card)}}
+    while len(mini["sections"]) > 2 and len(render_card(mini, parent)) > limit:
+        mini["sections"] = mini["sections"][:-1]
+    kept = {id(x) for x in mini["sections"]}
+    if not (any(id(x) in kept for x in sides[True]) and any(id(x) in kept for x in sides[False])):
+        return None
+    mini.update(text_sha=_text_sha(mini["sections"]), chars=len(render_card(mini, parent)))
+    try:
+        return prepare({**prep["req"], "cards": [mini]}, lim)
+    except RequestError:
+        return None
+
+
+def _union(items) -> list:
+    return list(dict.fromkeys(x for x in items if isinstance(x, (str, int))))
+
+
+def _merge_verdict(parent: str, pctx: dict, rows_all: list, rec_row: dict | None, rec_state: str | None) -> list:
+    """조각들의 판정 → 카드 한 장의 판정 행. 해당은 '어느 조각이든', 판정은 해당 조각 가운데 가장 무거운 것(재판정이 섰으면 그 답),
+    변경 줄 · 참조는 해당 조각의 것을 다 모은다. 인용은 카드 전체 본문에서 다시 대조한다(조각 본문은 원문의 부분 문자열이다).
+    checks.chunks 에 조각마다 해당 · 판정 · 인용 결과를 남긴다."""
+    vs = [(i, r) for i, r in rows_all if r.get("t") == "v"]
+    cs = list({json.dumps([r.get("cond"), r.get("met"), r.get("note")], ensure_ascii=False): r
+               for _, r in rows_all if r.get("t") == "c"}.values())
+    rest = [r for _, r in rows_all if r.get("t") not in ("v", "c")]
+    if not vs:
+        return cs + rest
+    _i, dec = max(vs, key=lambda x: (_APPLIES_RANK.get(x[1].get("applies"), 0),
+                                      _JUDGE_RANK.get(x[1].get("judgement"), 0) if x[1].get("applies") == "yes" else 0, -x[0]))
+    yes = [r for _, r in vs if r.get("applies") == "yes"] or [dec]
+    base = rec_row or dec
+    merged = copy.deepcopy(base)
+    merged["k"] = parent
+    merged["l"] = _union(x for r in [base, *yes] for x in r.get("l") or [])
+    merged["refs"] = _union(x for r in [base, *yes] for x in r.get("refs") or [])
+    q, qsid = quote_check(merged.get("cq", ""), pctx["cards"][parent])
+    checks = {**(base.get("checks") or {}), "quote": q, "quote_sid": qsid,
+              "chunks": [{"a": r.get("k"), "applies": r.get("applies"), "judgement": r.get("judgement"),
+                          "quote": (r.get("checks") or {}).get("quote")} for _, r in vs]}
+    if rec_state:
+        checks["reconcile"] = rec_state
+    merged["checks"] = checks
+    return [merged, *cs, *rest]
+
+
+def _merge_sweep(parent: str, rows_all: list) -> list:
+    """조각들의 훑기 → 카드 한 장의 훑기. 단위마다 관련은 가장 센 것, 어느 조각이든 걸렸으면 그 카드가 걸린다. 넘김 줄은 모은다."""
+    groups: dict = {}
+    for i, r in rows_all:
+        if r.get("t") == "u":
+            groups.setdefault(r.get("u"), []).append((i, r))
+    out = []
+    for group in groups.values():
+        _i, dec = max(group, key=lambda x: (_REL_RANK.get(x[1].get("rel"), 0), -x[0]))
+        m = copy.deepcopy(dec)
+        # 조각 줄의 rel=no 에는 k 가 없다(_check_u 가 no+k 를 maybe 로 올렸다) — 가장 센 줄이 no 면 걸린 조각도 없다.
+        m["k"] = [parent] if any(r.get("k") for _, r in group) else []
+        out.append(m)
+    hs = list({json.dumps([r.get("u"), r.get("to")], ensure_ascii=False): r
+               for _, r in rows_all if r.get("t") == "h"}.values())
+    return out + hs + [r for _, r in rows_all if r.get("t") not in ("u", "h")]
+
+
+def _sum_usage(usages: list) -> dict | None:
+    got = [u for u in usages if isinstance(u, dict)]
+    if not got:
+        return None
+
+    def total(k):
+        vals = [u.get(k) for u in got]
+        return None if any(v is None for v in vals) or len(got) < len(usages) else sum(vals)
+
+    return {"llm_calls": sum(int(u.get("llm_calls") or 0) for u in got), "tokens_in": total("tokens_in"),
+            "tokens_out": total("tokens_out"), "per_attempt": [p for u in got for p in u.get("per_attempt") or []]}
+
+
+def merge_chunked(prep: dict, results: list, rec: dict | None) -> dict:
+    """조각 결과들 → 카드 한 장의 result(앱이 보는 모양 그대로 — 한 카드는 한 행). 정산은 원래 카드의 맥락으로 다시 한다."""
+    ck = prep["chunked"]
+    parent, pctx, lim = ck["parent"], ck["parent_ctx"], prep["lim"]
+    kind, variant = pctx["kind"], pctx["variant"]
+    rows_all = [(i, r) for i, res in enumerate(results) for r in res.get("rows") or []]
+    unjudged = _unjudged(prep, results)
+    rec_res = (rec or {}).get("result")
+    rec_row = next((r for r in (rec_res or {}).get("rows") or [] if r.get("t") == "v" and r.get("k") == parent), None)
+    # 재판정 — None(갈리지 않았다) · ok · failed(물었는데 답이 서지 않았다) · skipped(갈렸는데 두 쪽 근거를 한 번에 못 실었다)
+    rec_state = None if rec is None else ("skipped" if rec.get("skipped") else ("ok" if rec_row else "failed"))
+    rows = (_merge_verdict(parent, pctx, rows_all, rec_row, rec_state) if kind == "verdict"
+            else _merge_sweep(parent, rows_all))
+    if unjudged:
+        # 판정 행을 끝내 못 낸 조각이 있다 — 나머지 조각만으로 카드의 판정을 세우지 않는다(그 조각에 걸림이 있을 수 있다). 판정 행을
+        # 빼면 정산이 그 카드를 빠진 카드(missing)로 세고 앱이 빠진 카드의 규칙으로 다시 낸다.
+        rows = [r for r in rows if r.get("t") != "v"]
+    settled = settle(kind, rows, pctx)
+    done = results + ([rec_res] if rec_res else [])
+    qs = [res.get("quality") or {} for res in done]
+    metas = [res.get("meta") or {} for res in done]
+    truncs = [q.get("truncated") for q in qs]
+    quality = {
+        "expected": settled["expected"], "ok": settled["ok"], "flagged": settled["flagged"],
+        "missing": len(settled["missing"]), "bad_lines": sum(int(q.get("bad_lines") or 0) for q in qs),
+        "truncated": True if any(t is True for t in truncs) else (False if all(t is False for t in truncs) else None),
+        "tail_broken": any(bool(q.get("tail_broken")) for q in qs), "attempts": sum(int(q.get("attempts") or 0) for q in qs),
+        "repaired": any(bool(q.get("repaired")) for q in qs), "stamp": settled["stamp"],
+        "dropped_over_cap": sum(int(q.get("dropped_over_cap") or 0) for q in qs), "maybe_more": settled["maybe_more"],
+        "dropped_alias": sum(int(q.get("dropped_alias") or 0) for q in qs), "dup": sum(int(q.get("dup") or 0) for q in qs),
+        "dup_conflict": sum(1 for r in rows if (r.get("checks") or {}).get("dup_conflict")),
+        "flipped": sum(1 for r in rows if r.get("flipped_from")),
+    }
+    rep = next((q["repair_error"] for q in qs if q.get("repair_error")), None)
+    if rep:
+        quality["repair_error"] = rep
+    extras: dict = {"inj": [x for res in done for x in (res.get("extras") or {}).get("inj") or []]}
+    if kind == "sweep":
+        extras["unmatched_cards"] = settled["unmatched_cards"]
+    meta = dict(metas[0])
+    meta.update({
+        "prompt_chars": sum(int(m.get("prompt_chars") or 0) for m in metas),
+        "usage": _sum_usage([m.get("usage") for m in metas]),
+        "llm_ms": [x for m in metas for x in m.get("llm_ms") or []],
+        "finish_reason": metas[-1].get("finish_reason"),
+        "input_sha": _canon_sha({"chunked": parent, "subs": [m.get("input_sha") for m in metas]}),
+        "soft_over": True, "bg_dropped": sum(int(m.get("bg_dropped") or 0) for m in metas),
+        "aliases": {**(meta.get("aliases") or {}), "cards": {parent: pctx["cards"][parent]["record_id"]}},
+        "clipped": {k: v for m in metas for k, v in (m.get("clipped") or {}).items()},
+        "chunked": {"parent": parent, "n": len(results),
+                    "aliases": [sub["req"]["cards"][0]["alias"] for sub in ck["subs"]], "reconcile": rec_state,
+                    "unjudged": unjudged},
+    })
+    return {"kind": kind, "variant": variant, "rows": rows, "missing": settled["missing"], "extras": extras,
+            "quality": quality, "meta": meta}
+
+
+async def _run_chunked(app, prep: dict):
+    """조각 준비물의 SSE — 조각마다 보통 run 을 차례로 돌리고(_drive — 빠진 카드 보충은 그 안에서 한다), 갈린 판정은 인용된 절만
+    모아 다시 묻은 뒤(_reconcile_prep) 카드 한 장의 result 로 합친다(merge_chunked). 조각 하나라도 끝내 실패하면 그 error 로
+    끝내고(앱이 그 호출을 종전 규칙으로 다시 낸다), 판정 행 없이 끝난 조각이 있으면 그 카드를 빠진 카드로 낸다 — 받은 조각을 반쯤
+    합쳐 '판정함' 으로 두지 않는다."""
+    from app import _sse  # noqa: PLC0415
+
+    ck = prep["chunked"]
+    subs, parent, pctx = ck["subs"], ck["parent"], ck["parent_ctx"]
+    t0 = time.monotonic()
+    tag = f"{pctx['kind']}/{pctx['variant'] or '-'} {pctx['expert'].get('key', '')} {pctx['unit_id'] or '-'} {parent}"
+    results: list = []
+    for i, sub in enumerate(subs, 1):
+        out: dict = {}
+        async for b in _drive(app, sub, {"chunk": i, "of": len(subs)}, out):
+            yield b
+        if out.get("error") is not None or out.get("result") is None:
+            err = out.get("error") or {"code": "internal_error", "message": "조각 결과가 없다", "infra": False,
+                                       "retryable": False}
+            print(f"[card_review] {tag} 조각 {i}/{len(subs)} → {err.get('code')}")
+            yield _sse("error", {**err, "chunk": i, "of": len(subs)})
+            yield _sse("done", {})
+            return
+        results.append(out["result"])
+    rec = None
+    if pctx["kind"] == "verdict" and not _unjudged(prep, results) and _chunks_split(prep, results):
+        rprep = _reconcile_prep(prep, results)
+        rec = {"skipped": True} if rprep is None else {}
+        if rprep is not None:
+            async for b in _drive(app, rprep, {"step": "reconcile", "of": len(subs)}, rec):
+                yield b
+    merged = merge_chunked(prep, results, rec)
+    state = merged["meta"]["chunked"]["reconcile"]
+    print(f"[card_review] {tag} 조각 {len(subs)}개{f' · 재판정 {state}' if state else ''} "
+          f"{time.monotonic() - t0:.1f}s → ok")
+    yield _sse("result", merged)
+    yield _sse("done", {})
+
+
 async def run(app, prep: dict):
     """`POST /card-review/run` 의 SSE 본체 — prepare() 를 지난 요청만 받는다.
 
@@ -3171,6 +3657,11 @@ async def run(app, prep: dict):
     error{review_busy} → done 이고 LLM 을 부르지 않는다. 첫 시도의 LLM 실패는 error 다. 보충(n ≥ 2) 중의 실패는 error 가
     아니라 result 로 끝내고 quality.repair_error 를 싣는다(받은 행을 버리지 않는다 — P-08). 단 그때까지 받은 행이 0 이면
     살릴 것이 없으므로 error 다. 구독이 닫히면(취소·aclose) LLM 태스크를 취소하고 자리를 돌려준다."""
+    if prep.get("chunked"):
+        # 한 장 자리를 넘는 카드 한 장 — 조각마다 이 함수를 다시 돌려 합친다(관문 자리는 조각마다 잡고 놓는다).
+        async for b in _run_chunked(app, prep):
+            yield b
+        return
     from app import DELIB_HEARTBEAT_S, _est_tokens_all, _sse  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
 
     req, lim, ctx = prep["req"], prep["lim"], prep["ctx"]
@@ -3592,6 +4083,7 @@ class PlanRequest(_Ident):
     units: list[PlanUnit] = []
     expect: Expect | None = None
     llm: Literal["glm", "external"] | None = None      # run 과 같다 — external 이면 외부 응답자의 창·출력 상한으로 짠다
+
 
 
 def check_shape(model, body) -> None:

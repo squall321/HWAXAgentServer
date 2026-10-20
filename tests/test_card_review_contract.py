@@ -30,7 +30,8 @@ import app as a  # noqa: E402
 import card_review as cr  # noqa: E402
 import delib_jobs  # noqa: E402
 import review_gate  # noqa: E402
-from fakes.llm import Act, FakeLLM  # noqa: E402
+from fakes.llm import Act, FakeLLM, default_oracle  # noqa: E402
+from test_card_review_chunk import _long_card, _split_oracle  # noqa: E402
 from test_card_review_pack import KEY, Hub, _tools  # noqa: E402
 from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: E402
 
@@ -41,6 +42,9 @@ MANAGED = ("index.json", "rejects.json", "limits_", "pack_", "plan_", "req_", "r
            "llm_transcript_", "drain_")
 MODEL = "fake-glm"
 W1M, W16K = 1_048_576, 16_384
+# 조각 장면(HWAXPortal docs/risk-200k W-D11)의 창 — 한 장 자리가 1만 자 남짓이라 카드 3만 자로 조각 넷이 난다(예제 파일이 작다).
+# 계획 예제는 실제 목표 창(20만)으로 뜬다 — 계획 요청에는 글자 수만 실려 파일이 작다.
+W32K, W200K = 32_768, 200_000
 
 PACK = _pack(random.Random(1), n=4, size=(300, 600))
 CHECK = [c for c in PACK if c["checkable"]]
@@ -114,6 +118,29 @@ def _near_window_req():
     return _verdict_req(n=1, unit=unit)
 
 
+def _chunk_card(*, mark=False) -> dict:
+    """한 장 자리(창 32,768 에서 약 1.1만 자)를 넘는 카드 — 절 셋, 가운데 절이 문단 · 문장으로 나뉜다. mark 면 마지막 절 머리에
+    위험표지 문장을 넣는다(갈림 대본 _split_oracle 이 그 조각만 FAIL 로 낸다)."""
+    card = _long_card("K05", secs=(3_000, 24_000, 2_000))
+    if mark:
+        last = card["sections"][-1]
+        last["text"] = "위험표지 이 절의 하중 조건에서는 압입 간극이 한계를 넘는다. " + last["text"]
+        card["text_sha"] = cr._text_sha(card["sections"])
+        card["chars"] = len(cr.render_card(card, "K05"))
+    return card
+
+
+def _verdict_chunked_req(mark=False):
+    """판정 — 점검형 카드 한 장(K05)이 한 장 자리를 넘는다. 앱은 원래 카드를 그대로 보내고 run 이 조각 낸다."""
+    return _req("verdict", [_chunk_card(mark=mark)], _digest(PACK), unit=_unit(0), variant="fwd")
+
+
+def _sweep_chunked_req():
+    manifest = [{"unit_id": f"u-{i:02d}", "kind": "bundle", "title": f"단위 {i}", "text": "후면 커버 둘레 접착 계면 변경"}
+                for i in range(3)]
+    return _req("sweep", [_chunk_card()], [], manifest=manifest, extra={"domains": DOMAINS})
+
+
 REQUESTS = {
     "verdict_fwd": _verdict_req("fwd"), "verdict_rev": _verdict_req("rev"), "verdict_solo": _verdict_req("solo"),
     "verdict_one": _verdict_req(n=1), "sweep": _sweep_req(), "offcard": _offcard_req(),
@@ -121,6 +148,9 @@ REQUESTS = {
     # M3 — 결측 훑기 · 판정 틀의 mech · 입력 결손 두 질문 · 긴 문서 검색 · 요약
     "sweep_gaps": _sweep_gaps_req(), "verdict_mech": _verdict_mech_req(), "noinput": _noinput_req(),
     "offcard_search": _offcard_search_req(), "summary_domain": _summary_req(),
+    # W1 카드 조각 — 한 장 자리를 넘는 카드 한 장의 판정 · 판정(조각들이 갈린다) · 훑기
+    "verdict_chunked": _verdict_chunked_req(), "verdict_chunked_split": _verdict_chunked_req(mark=True),
+    "sweep_chunked": _sweep_chunked_req(),
 }
 # 포털 중계가 덮어쓰는 신원 칸 넷 — 예제 요청 파일에는 싣지 않고 보낼 때만 더한다(긴 문서 검색은 사용자 PAT 로만 돈다).
 IDENT = {"groups": ["g"], "user_email": "u@x.com", "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
@@ -174,7 +204,13 @@ SCENES = {
     # 적대 검토 6라운드(RB3D · D-42) — 별칭 표의 낱말(checks.alias)과, 표 밖 낱말로 고친 판정이 OK 와 부딪쳐 남긴 다툼(raw).
     "verdict_alias": ("verdict_fwd", ["alias_words"], W1M),
     "verdict_coerced_clash": ("verdict_fwd", ["coerced_clash"], W1M),
+    # W1 카드 조각(docs/risk-200k W-D11) — 조각마다 부르고 카드 한 장의 행으로 합친다 · 갈리면 인용된 절만 모아 한 번 더 · 훑기.
+    "verdict_chunked": ("verdict_chunked", ["oracle"], W32K),
+    "verdict_chunked_split": ("verdict_chunked_split", ["oracle"], W32K),
+    "sweep_chunked": ("sweep_chunked", ["oracle"], W32K),
 }
+# 장면마다의 정답 — 없으면 프롬프트에서 만든 기본 정답(default_oracle).
+ORACLES = {"verdict_chunked_split": _split_oracle}
 # 장면마다 더 하는 준비 — 검색 도구의 답(사용자 PAT 로 붙는 가짜 게이트웨이)·검색 기한·비우기 깃발.
 SEARCH_SCENES = {"offcard_search_ok": ("answer", SEARCH_HITS), "offcard_search_empty_scope": ("answer", SEARCH_EMPTY),
                  "offcard_search_failed": ("hang", None)}
@@ -294,13 +330,24 @@ def produce(monkeypatch) -> dict:
     assert r.status_code == 200 and [p["unit_id"] for p in r.json()["pair_over"]] == ["u-big"], r.json()
     files["plan_pair_over_req.json"] = _dump(po_req)
     files["plan_pair_over.json"] = _dump(r.json())
+    # plan — 창 200,000 에서 한 장 자리를 넘는 카드(점검형 K02 · 배경 K03)는 멈추지 않고 혼자 한 묶음(chunked)이다(W-D11).
+    c = _setup(monkeypatch, W200K, FakeLLM(["oracle"]))
+    ch_req = {"cards": [{"alias": "K01", "record_id": "DOC-T-0001", "checkable": True, "chars": 3_000},
+                        {"alias": "K02", "record_id": "DOC-T-0002", "checkable": True, "chars": 300_000},
+                        {"alias": "K03", "record_id": "DOC-T-0003", "checkable": False, "chars": 160_000},
+                        {"alias": "K04", "record_id": "DOC-T-0004", "checkable": True, "chars": 4_000}],
+              "units": [{"unit_id": f"u-{i:02d}", "manifest_chars": 300 + i, "body_chars": 2_000 + i} for i in range(3)]}
+    r = c.post("/card-review/plan", json=ch_req)
+    assert r.status_code == 200 and r.json()["oversize"]["cards"] == [], r.json()
+    files["plan_chunked_req.json"] = _dump(ch_req)
+    files["plan_chunked.json"] = _dump(r.json())
 
     # run — 장면마다 요청·프레임 전부·마지막 프레임·대본 원문.
     for name, req in REQUESTS.items():
         files[f"req_{name}.json"] = _dump(req)
     index = {}
     for name, (req_name, script, window) in SCENES.items():
-        llm = FakeLLM(script)
+        llm = FakeLLM(script, oracle=ORACLES.get(name, default_oracle))
         c = _setup(monkeypatch, window, llm)
         held = []
         body = REQUESTS[req_name]
@@ -348,6 +395,8 @@ def produce(monkeypatch) -> dict:
                                **({"timeout_s": 0.05} if SEARCH_SCENES[name][0] == "hang" else {})}
         if name == "review_busy_draining":
             entry["drain"] = {"on": True, "scope": "all", "by": "update-all"}
+        if name in ORACLES:
+            entry["oracle"] = f"{ORACLES[name].__name__} (tests/test_card_review_chunk.py)"
         if llm.calls:
             files[f"llm_transcript_{name}.txt"] = _transcript(llm)
             entry["transcript"] = f"llm_transcript_{name}.txt"
@@ -504,7 +553,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 27
+    assert len(results) == 30
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -537,7 +586,8 @@ def test_limits_예제의_판이_팩_결과와_같다():
 
 @pytest.mark.parametrize("name", ["req_verdict_fwd.json", "req_sweep.json", "req_offcard.json", "req_verdict_solo.json",
                                   "req_sweep_gaps.json", "req_verdict_mech.json", "req_noinput.json",
-                                  "req_offcard_search.json", "req_summary_domain.json"])
+                                  "req_offcard_search.json", "req_summary_domain.json", "req_verdict_chunked.json",
+                                  "req_verdict_chunked_split.json", "req_sweep_chunked.json"])
 def test_요청_예제는_app_없는_검증기를_지난다(name):
     lim = _load("limits_1m.json")
     assert cr.validate_run_request(_load(name), lim) == []
@@ -668,3 +718,43 @@ def test_RB3D_별칭과_고친_판정의_다툼_예제():
         "OK", True, ["yes", "undetermined"], "보류중"), k01
     assert (cl["quality"]["dup_conflict"], cl["quality"]["attempts"]) == (1, 1)
 
+
+# ── W1 카드 조각 예제(HWAXPortal docs/risk-200k W-D11) ─────────────────────────────────
+def test_W1_조각_계획_예제():
+    """20만 창 — 한 장 자리를 넘는 카드는 oversize 가 아니라 혼자 한 묶음(chunked)이다. 점검형은 판정 · 훑기 둘 다, 배경 카드는
+    훑기에만. 조각 수 어림(chunks)은 하한에 가깝다(실제는 결과의 meta.chunked.n)."""
+    pl = _load("plan_chunked.json")
+    assert pl["oversize"] == {"cards": [], "kinds": {}, "units": [], "manifest": []} and pl["pair_over"] == []
+    ch_v = [d for d in pl["verdict_decks"] if d.get("chunked")]
+    ch_s = [d for d in pl["sweep_decks"] if d.get("chunked")]
+    assert [d["aliases"] for d in ch_v] == [["K02"]] and [d["aliases"] for d in ch_s] == [["K02"], ["K03"]]
+    assert all(d["soft_over"] and d["chunks"] >= 2 for d in ch_v + ch_s)
+    assert all(not d.get("chunked") for d in pl["verdict_decks"] + pl["sweep_decks"] if d not in ch_v + ch_s)
+
+
+def test_W1_조각_실행_예제():
+    """조각마다 status{chunk, of} 를 내며 부르고 카드 한 장의 행으로 합친다 — 앱에는 한 카드 = 한 행(k 는 원래 별칭)."""
+    index = _load("index.json")
+    ok = _load("result_verdict_chunked.json")
+    n = ok["meta"]["chunked"]["n"]
+    (row,) = [r for r in ok["rows"] if r["t"] == "v"]
+    assert row["k"] == "K05" and [c["a"] for c in row["checks"]["chunks"]] == ok["meta"]["chunked"]["aliases"]
+    assert ok["meta"]["chunked"]["aliases"] == [f"K05.{i}" for i in range(1, n + 1)] and n >= 3
+    assert ok["meta"]["aliases"]["cards"] == {"K05": _load("req_verdict_chunked.json")["cards"][0]["record_id"]}
+    assert (ok["quality"]["attempts"], ok["meta"]["chunked"]["reconcile"], index["verdict_chunked"]["llm_calls"]) == (
+        n, None, n)
+    frames = [delib_jobs._parse_sse(x.encode()) for x in (OUT / "run_verdict_chunked.sse").read_text(encoding="utf-8")
+              .split("\n\n") if x.strip()]
+    assert [(d["chunk"], d["of"]) for e, d in frames if e == "status"] == [(i, n) for i in range(1, n + 1)]
+    split = _load("result_verdict_chunked_split.json")
+    split_frames = [delib_jobs._parse_sse(x.encode()) for x in (OUT / "run_verdict_chunked_split.sse")
+                    .read_text(encoding="utf-8").split("\n\n") if x.strip()]
+    last = [d for e, d in split_frames if e == "status"][-1]
+    assert last == {"step": "reconcile", "n": 1, "of": split["meta"]["chunked"]["n"]}, "재판정은 조각 번호가 아니다"
+    (row,) = [r for r in split["rows"] if r["t"] == "v"]
+    assert {c["judgement"] for c in row["checks"]["chunks"]} >= {"FAIL", "OK"}, "조각들이 갈렸다"
+    assert (row["judgement"], row["checks"]["reconcile"], split["meta"]["chunked"]["reconcile"]) == ("WARNING", "ok", "ok")
+    assert index["verdict_chunked_split"]["llm_calls"] == split["meta"]["chunked"]["n"] + 1, "재판정 한 번 더"
+    sw = _load("result_sweep_chunked.json")
+    us = [r for r in sw["rows"] if r["t"] == "u"]
+    assert len(us) == 3 and all(u["k"] == ["K05"] for u in us) and sw["extras"]["unmatched_cards"] == []

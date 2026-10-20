@@ -1,0 +1,8 @@
+=== 시도 1 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.1", "applies": "yes", "judgement": "OK", "cq": "균열 실링 간극 압입 접합 압입 피로 응력 이 변하면 응력이 달라진다.", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""}
+=== 시도 2 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.2", "applies": "yes", "judgement": "OK", "cq": "열팽창 실링 누설 누설 열팽창 응력 응력 볼트 간극 도금 간극 이 변하면", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""}
+=== 시도 3 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.3", "applies": "yes", "judgement": "OK", "cq": "균열 실링 실링 간극 피로 압입 접합 볼트 압입 이 변하면 응력이 달라진", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""}
+=== 시도 4 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.4", "applies": "yes", "judgement": "OK", "cq": "간극 열팽창 도금 응력 간극 압입 도금 균열 균열 응력 이 변하면 응력이", "l": ["L01"], "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": ""}

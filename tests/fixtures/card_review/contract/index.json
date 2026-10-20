@@ -439,5 +439,39 @@
   "final": "result_verdict_coerced_clash.json",
   "llm_calls": 1,
   "transcript": "llm_transcript_verdict_coerced_clash.txt"
+ },
+ "verdict_chunked": {
+  "request": "req_verdict_chunked.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_verdict_chunked.sse",
+  "final": "result_verdict_chunked.json",
+  "llm_calls": 4,
+  "transcript": "llm_transcript_verdict_chunked.txt"
+ },
+ "verdict_chunked_split": {
+  "request": "req_verdict_chunked_split.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_verdict_chunked_split.sse",
+  "final": "result_verdict_chunked_split.json",
+  "llm_calls": 5,
+  "oracle": "_split_oracle (tests/test_card_review_chunk.py)",
+  "transcript": "llm_transcript_verdict_chunked_split.txt"
+ },
+ "sweep_chunked": {
+  "request": "req_sweep_chunked.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_sweep_chunked.sse",
+  "final": "result_sweep_chunked.json",
+  "llm_calls": 4,
+  "transcript": "llm_transcript_sweep_chunked.txt"
  }
 }

@@ -315,17 +315,31 @@ def test_plan_의_불변식(ctx, env, seed):
     over = out["oversize"]["kinds"]
     by_alias = {c["alias"]: c for c in cards}
 
+    # 한 장 자리(card_room)를 넘는 카드는 혼자 한 묶음(chunked)이고 run 이 조각 내 돈다(docs/risk-200k W-D11) — 자리가 있는 창에서는
+    # oversize 카드가 없다. 자리가 0 이하인 창(카드 한 장도 못 싣는다)만 종전처럼 oversize 다.
+    room = cr.card_room(lim)
+    if room > 0:
+        assert out["oversize"]["cards"] == [] and over == {}, "자리가 있는 창에서 카드를 멈췄다 — 조각으로 돌아야 한다"
     seen_v = [a for d in out["verdict_decks"] for a in d["aliases"]]
     want_v = [c["alias"] for c in cards if c["checkable"] and "verdict" not in over.get(c["alias"], [])]
     assert seen_v == want_v, "점검형 카드가 정확히 한 묶음이거나 oversize 여야 한다(팩 순서 그대로)"
+    for d in out["verdict_decks"] + out["sweep_decks"]:
+        big = len(d["aliases"]) == 1 and by_alias[d["aliases"][0]]["chars"] > room > 0
+        assert bool(d.get("chunked")) == big, "조각 묶음은 한 장 자리를 넘는 카드 한 장뿐이다"
+        if big:
+            assert d["soft_over"] and d["chunks"] == -(-d["chars"] // room) >= 2
     for d in out["verdict_decks"]:
         assert 1 <= len(d["aliases"]) <= v["k"]
         assert d["chars"] == sum(by_alias[a]["chars"] for a in d["aliases"])
+        if d.get("chunked"):
+            continue
         assert d["chars"] <= v["card_budget"] or (d["soft_over"] and len(d["aliases"]) == 1)
         assert v["fixed"] + lim["unit_body_max"] + d["chars"] <= lim["p_hard"], "상한 크기 단위와 함께 창을 넘는 묶음"
     seen_s = [a for d in out["sweep_decks"] for a in d["aliases"]]
     assert seen_s == [c["alias"] for c in cards if "sweep" not in over.get(c["alias"], [])]
     for d in out["sweep_decks"]:
+        if d.get("chunked"):
+            continue
         assert d["chars"] <= s["card_budget"] or (d["soft_over"] and len(d["aliases"]) == 1)
         assert s["fixed"] + s["manifest_page_max"] + d["chars"] <= lim["p_hard"]
     for a, ks in over.items():
@@ -343,7 +357,8 @@ def test_plan_의_불변식(ctx, env, seed):
     uo, us = set(out["oversize"]["units"]), set(out["soft_over"]["units"])
     # 단위는 이 계획이 실제로 낸 묶음과 견준다(RB-7) — 가장 큰 카드 한 장과도(또는 offcard 홀로) 넘으면 oversize, 묶음째로만
     # 넘으면 그 쌍이 pair_over 다.
-    card_max = max((by_alias[a]["chars"] for a in seen_v), default=0)
+    whole = [a for d in out["verdict_decks"] if not d.get("chunked") for a in d["aliases"]]
+    card_max = max((by_alias[a]["chars"] for a in whole), default=0)     # 조각 카드는 run 이 단위에 맞춰 줄인다
     pairs = {(p["deck_id"], p["unit_id"]): p for p in out["pair_over"]}
     for u in units:
         n = u["body_chars"]
@@ -352,9 +367,10 @@ def test_plan_의_불변식(ctx, env, seed):
         assert (u["unit_id"] in us) == (u["unit_id"] not in uo and n > lim["unit_body_max"])
         for d in out["verdict_decks"]:
             need = v["fixed"] + n + d["chars"]
-            assert ((d["deck_id"], u["unit_id"]) in pairs) == (u["unit_id"] not in uo and need > lim["p_hard"])
+            want = u["unit_id"] not in uo and need > lim["p_hard"] and not d.get("chunked")
+            assert ((d["deck_id"], u["unit_id"]) in pairs) == want
     assert all(p["have"] == lim["p_hard"] < p["need"] for p in out["pair_over"])
-    s_cards = max((d["chars"] for d in out["sweep_decks"]), default=len(cr._NO_CARDS))
+    s_cards = max((d["chars"] for d in out["sweep_decks"] if not d.get("chunked")), default=len(cr._NO_CARDS))
     mo = set(out["oversize"]["manifest"])
     for u in units:
         assert (u["unit_id"] in mo) == (s["fixed"] + u["manifest_chars"] + s_cards > lim["p_hard"])

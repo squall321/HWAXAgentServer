@@ -1,0 +1,45 @@
+{
+ "cards": [
+  {
+   "alias": "K01",
+   "record_id": "DOC-T-0001",
+   "checkable": true,
+   "chars": 3000
+  },
+  {
+   "alias": "K02",
+   "record_id": "DOC-T-0002",
+   "checkable": true,
+   "chars": 300000
+  },
+  {
+   "alias": "K03",
+   "record_id": "DOC-T-0003",
+   "checkable": false,
+   "chars": 160000
+  },
+  {
+   "alias": "K04",
+   "record_id": "DOC-T-0004",
+   "checkable": true,
+   "chars": 4000
+  }
+ ],
+ "units": [
+  {
+   "unit_id": "u-00",
+   "manifest_chars": 300,
+   "body_chars": 2000
+  },
+  {
+   "unit_id": "u-01",
+   "manifest_chars": 301,
+   "body_chars": 2001
+  },
+  {
+   "unit_id": "u-02",
+   "manifest_chars": 302,
+   "body_chars": 2002
+  }
+ ]
+}

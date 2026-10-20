@@ -59,7 +59,7 @@ def act(x) -> Act:
 
 
 # ── 프롬프트 읽기 ─────────────────────────────────────────────────────────────
-_CARD_HEAD = re.compile(r"^\[(K\d+)\] 종류 ", re.M)
+_CARD_HEAD = re.compile(r"^\[(K\d+(?:\.\d+)?)\] 종류 ", re.M)     # 조각 별칭 K12.1 도(docs/risk-200k W-D11)
 _DOC_HEAD = re.compile(r"^\[(D\d+)\] 출처 [^\n]*\n«([^«»]*)»", re.M)      # 긴 문서 발췌(cr-offcard-2)
 _LINE = re.compile(r"^(L\d+) \[[^\]]*\] «", re.M)
 _UNIT = re.compile(r"^(U\d+) \[[^\]]*\] «", re.M)
@@ -89,7 +89,7 @@ def read_prompt(human: str) -> dict:
         kind = "verdict"
     else:
         kind = "offcard"
-    named = set(re.findall(r"\b([KUR]\d{2,})\b", hint)) if hint else None
+    named = set(re.findall(r"\b(K\d{2,}(?:\.\d+)?|[UR]\d{2,})\b", hint)) if hint else None
     cover_at = re.search(r"\[꼭 다룰 행 \d+개[^\n]*\n([^\n]*)\n", body)
     mechs: list = []
     at = body.find("[메커니즘 목록]\n")

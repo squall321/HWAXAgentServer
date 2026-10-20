@@ -1,0 +1,10 @@
+=== 시도 1 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.1", "applies": "yes", "judgement": "OK", "cq": "균열 실링 간극 압입 접합 압입 피로 응력 이 변하면 응력이 달라진다.", "l": ["L01"], "why": "한계 안이다", "need": ""}
+=== 시도 2 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.2", "applies": "yes", "judgement": "OK", "cq": "열팽창 실링 누설 누설 열팽창 응력 응력 볼트 간극 도금 간극 이 변하면", "l": ["L01"], "why": "한계 안이다", "need": ""}
+=== 시도 3 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.3", "applies": "yes", "judgement": "OK", "cq": "균열 실링 실링 간극 피로 압입 접합 볼트 압입 이 변하면 응력이 달라진", "l": ["L01"], "why": "한계 안이다", "need": ""}
+=== 시도 4 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05.4", "applies": "yes", "judgement": "FAIL", "cq": "위험표지 이 절의 하중 조건에서는 압입 간극이 한계를 넘는다. 접합 열팽", "l": ["L01"], "why": "이 절의 한계를 넘는다", "need": ""}
+=== 시도 5 · oracle · finish_reason=stop ===
+{"t": "v", "k": "K05", "applies": "yes", "judgement": "WARNING", "cq": "위험표지 이 절의 하중 조건에서는 압입 간극이 한계를 넘는다. 접합 열팽", "l": ["L01"], "why": "두 조각의 근거를 맞대니 조건부로 걸린다", "need": "시험으로 확인"}

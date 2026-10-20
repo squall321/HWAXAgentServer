@@ -1,0 +1,18 @@
+event: status
+data: {"step": "attempt", "n": 1, "chunk": 1, "of": 4}
+
+event: status
+data: {"step": "attempt", "n": 1, "chunk": 2, "of": 4}
+
+event: status
+data: {"step": "attempt", "n": 1, "chunk": 3, "of": 4}
+
+event: status
+data: {"step": "attempt", "n": 1, "chunk": 4, "of": 4}
+
+event: result
+data: {"kind": "verdict", "variant": "fwd", "rows": [{"t": "v", "l": ["L01"], "k": "K05", "applies": "yes", "judgement": "OK", "cq": "균열 실링 간극 압입 접합 압입 피로 응력 이 변하면 응력이 달라진다.", "why": "카드의 조건과 변경 줄을 맞대어 보니 한계 안이다", "need": "", "sev": "", "path": "", "check_kind": "", "check": "", "mech": "", "mech_free": "", "refs": ["c:ab12cd34ef56"], "record_id": "DOC-CHUNK-0007", "card_id": "C-7", "from_attempt": 1, "checks": {"quote": "ok", "quote_sid": "1", "refs": "ok", "nums_unsourced": [], "need": "ok", "coerced": [], "mech": "no_list", "chunks": [{"a": "K05.1", "applies": "yes", "judgement": "OK", "quote": "ok"}, {"a": "K05.2", "applies": "yes", "judgement": "OK", "quote": "ok"}, {"a": "K05.3", "applies": "yes", "judgement": "OK", "quote": "ok"}, {"a": "K05.4", "applies": "yes", "judgement": "OK", "quote": "ok"}]}}], "missing": [], "extras": {"inj": []}, "quality": {"expected": 1, "ok": 1, "flagged": 0, "missing": 0, "bad_lines": 0, "truncated": false, "tail_broken": false, "attempts": 4, "repaired": false, "stamp": false, "dropped_over_cap": 0, "maybe_more": null, "dropped_alias": 0, "dup": 0, "dup_conflict": 0, "flipped": 0}, "meta": {"model": "fake-glm", "ctx_tokens": 32768, "ctx_source": "server", "prompt_rev": "cr-verdict-2", "norm_rev": "cr-n1", "limits_rev": "18b8efaa", "limits_rev_kind": "5ea471dc", "input_sha": "294479240f8ccb1f56e5a33de33dac62f8c76069c9910ea21f0ea86f997fb7aa", "prompt_chars": 42041, "usage": {"llm_calls": 4, "tokens_in": 21020, "tokens_out": 348, "per_attempt": [{"n": 1, "tokens_in": 3052, "tokens_out": 87}, {"n": 1, "tokens_in": 6261, "tokens_out": 87}, {"n": 1, "tokens_in": 6255, "tokens_out": 87}, {"n": 1, "tokens_in": 5452, "tokens_out": 87}]}, "finish_reason": "stop", "llm_ms": [0, 0, 0, 0], "soft_over": true, "basis": "cards", "bg_dropped": 0, "order_effective": true, "aliases": {"cards": {"K05": "DOC-CHUNK-0007"}, "lines": {"L01": "c:ab12cd34ef56", "L02": "c:ctx0", "L03": "c:ctx1", "L04": "tool:call-0", "L05": "tool:call-1"}, "units": {}}, "clipped": {}, "chunked": {"parent": "K05", "n": 4, "aliases": ["K05.1", "K05.2", "K05.3", "K05.4"], "reconcile": null, "unjudged": []}}}
+
+event: done
+data: {}
+

@@ -203,19 +203,42 @@ def _fits(kind, cards, pack, unit, lim, variant="fwd") -> bool:
 
 
 def test_plan_은_run_이_넘칠_쌍을_내주지_않는다_128K_보고서_사례():
-    """RB-7 재현 — 128K 창에서 점검형 카드 한 장을 v_room−2,000 자로, 단위를 p_hard−fixed−card_budget−500 자로 키웠다.
-    옛 plan 은 묶음 K01(soft_over)과 단위 u-01(soft_over)을 받아 줬고 run 은 422 over_budget{need 180,796, have 112,367}
-    이었다. 카드 한 장과도 넘는 단위이므로 oversize.units 다(앱은 ctx_too_small 로 멈춘다)."""
+    """RB-7 재현 — 128K 창에서 점검형 카드 한 장을 한 장 자리(card_room)−2,000 자로, 단위를 p_hard−fixed−card_budget−500 자로
+    키웠다. 옛 plan 은 묶음 K01(soft_over)과 단위 u-01(soft_over)을 받아 줬고 run 은 422 over_budget{need 180,796, have 112,367}
+    이었다. 카드 한 장과도 넘는 단위이므로 oversize.units 다(앱은 ctx_too_small 로 멈춘다). 옛 재현은 카드를 v_room−2,000 자로
+    키웠다 — 그 카드는 이제 한 장 자리를 넘어 조각으로 돈다(다음 시험)."""
+    lim = cr.limits(131_072, "server", 0, env={})
+    v = lim["verdict"]
+    pack = cr.assign_aliases([_grow(_checkable_base()[0], cr.card_room(lim) - 2_000, "-big")])
+    assert v["card_budget"] < pack[0]["chars"] <= cr.card_room(lim)
+    unit = _unit(lim["p_hard"] - v["fixed"] - v["card_budget"] - 500)
+    out = cr.plan(*_plan_in(pack, {"u-01": unit}), lim)
+    assert [d["aliases"] for d in out["verdict_decks"]] == [["K01"]] and out["verdict_decks"][0]["soft_over"]
+    assert not out["verdict_decks"][0].get("chunked")
+    assert out["oversize"]["units"] == ["u-01"] and out["soft_over"]["units"] == [] and out["pair_over"] == []
+    with pytest.raises(cr.OverBudget):                     # 받아 줬다면 run 이 이렇게 거절했다
+        cr.prepare(_req("verdict", pack, [], unit=unit, variant="fwd"), lim)
+
+
+def test_한_장_자리를_넘는_카드는_큰_단위와도_조각으로_돈다_128K():
+    """docs/risk-200k W-D11 — 위와 같은 단위에 한 장 자리를 넘는 카드(v_room−2,000 자 — 판정 자리 안, 훑기 자리 밖)를 대면 계획은
+    그 카드를 조각 묶음(chunked)으로 내고 단위를 멈추지 않는다(soft_over). run 은 조각을 그 단위에 맞게 줄여 모든 조각이 창 안에
+    든다 — 계획이 낸 쌍을 run 이 over_budget 으로 거절하지 않는다(RB-7 의 뜻 그대로)."""
     lim = cr.limits(131_072, "server", 0, env={})
     v = lim["verdict"]
     v_room = lim["p_hard"] - v["fixed"] - lim["unit_body_max"]
     pack = cr.assign_aliases([_grow(_checkable_base()[0], v_room - 2_000, "-big")])
+    assert pack[0]["chars"] > cr.card_room(lim)
     unit = _unit(lim["p_hard"] - v["fixed"] - v["card_budget"] - 500)
     out = cr.plan(*_plan_in(pack, {"u-01": unit}), lim)
-    assert [d["aliases"] for d in out["verdict_decks"]] == [["K01"]] and out["verdict_decks"][0]["soft_over"]
-    assert out["oversize"]["units"] == ["u-01"] and out["soft_over"]["units"] == [] and out["pair_over"] == []
-    with pytest.raises(cr.OverBudget):                     # 받아 줬다면 run 이 이렇게 거절했다
-        cr.prepare(_req("verdict", pack, [], unit=unit, variant="fwd"), lim)
+    (deck,) = out["verdict_decks"]
+    assert deck["aliases"] == ["K01"] and deck["chunked"] and deck["chunks"] >= 2
+    assert out["oversize"]["units"] == [] and out["soft_over"]["units"] == ["u-01"] and out["pair_over"] == []
+    prep = cr.prepare(_req("verdict", pack, [], unit=unit, variant="fwd"), lim)
+    subs = prep["chunked"]["subs"]
+    assert [s["req"]["cards"][0]["alias"] for s in subs] == [f"K01.{i}" for i in range(1, len(subs) + 1)]
+    assert len(subs) >= deck["chunks"], "조각 수 어림은 하한에 가깝다 — 실제가 어림보다 적을 수 없다"
+    assert all(len(s["system"]) + len(s["human"]) <= lim["p_hard"] for s in subs)
 
 
 def test_plan_은_묶음째로_넘는_쌍을_pair_over_로_알리고_solo_는_든다():
