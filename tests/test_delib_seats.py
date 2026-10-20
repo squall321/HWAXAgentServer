@@ -444,18 +444,20 @@ def test_읽기_도구는_앱_조건부이고_쓰기_도구가_없다():
         assert n not in write and not n.startswith("upload_"), n
 
 
-def test_유지_도구는_17종이고_계약표_rel_std_행과_변경_원장_도구를_담는다():
-    """계획 §6.5.2 keep 15종 — RA·laminate·열충격 8 + rel 필드 이력·std 문헌 7 — 에 변경 원장 2종(M1 E3).
-    rel·std 7종이 빠지면 계약표 rel·std 행이 시키는 조회가 앱 제한에서 사라진다. 변경 원장 2종은 러너의 apps 가
-    어댑터 앱으로 차서 이 목록이 좌석이 변경 전체에 닿는 유일한 통로다."""
+def test_유지_도구는_18종이고_계약표_rel_std_행과_변경_원장_카드_절_도구를_담는다():
+    """계획 §6.5.2 keep 15종 — RA·laminate·열충격 8 + rel 필드 이력·std 문헌 7 — 에 변경 원장 2종(M1 E3)과 카드 절 다시
+    읽기 1종(HWAXPortal docs/risk-200k E2). rel·std 7종이 빠지면 계약표 rel·std 행이 시키는 조회가 앱 제한에서 사라진다. 변경
+    원장 2종은 러너의 apps 가 어댑터 앱으로 차서 이 목록이 좌석이 변경 전체에 닿는 유일한 통로다. 카드 절 다시 읽기는 좁은 창에서
+    근거의 카드 절이 인용 둘레만 실리거나 빠질 때 좌석이 그 절 전문을 읽는 통로다(AIDataHub — apps 밖이다)."""
     assert set(d._RISK_KEEP_TOOLS) == {
         "search_objects", "get_object", "get_subgraph", "search_reports", "predict_sed",
         "check_design_rules", "pcb_warpage_surrogate", "get_reference_cases",
         "get_top_issues", "query_voc", "search_voc", "get_voc_summary",
         "get_kg_relations", "search_scholar", "search_web",
-        "risk_get_snapshot", "risk_get_diff",
+        "risk_get_snapshot", "risk_get_diff", "get_record_sections",
     }
-    assert len(d._RISK_KEEP_TOOLS) == len(set(d._RISK_KEEP_TOOLS)) == 17
+    assert len(d._RISK_KEEP_TOOLS) == len(set(d._RISK_KEEP_TOOLS)) == 18
+    assert d._free_tool_ok("get_record_sections"), "읽기 전용 접두사(get_)라 자유 조회 검문을 지난다"
     for n in ("get_top_issues", "query_voc"):
         assert n in d._RISK_SEAT_CONTRACT["rel"], n
     for n in ("search_scholar", "search_web"):

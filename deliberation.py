@@ -989,13 +989,18 @@ _RISK_KEEP_TOOLS = ("search_objects", "get_object", "get_subgraph", "search_repo
                     # 변경 원장 — 러너의 apps 세 칸은 어댑터 앱이 채우므로(앱키 heax-hwax_risk 가 없다) 러너 패널의
                     # 좌석에게는 이 목록이 변경 전체와 스냅샷에 닿는 통로다(apps 로 리스크 앱을 직접 고른 심의는
                     # _RISK_READ_TOOLS 로도 닿는다). 등록부 둘(_RISK_REGISTRY_TOOLS)은 어느 목록에도 넣지 않는다 — D-18.
-                    "risk_get_snapshot", "risk_get_diff")
+                    "risk_get_snapshot", "risk_get_diff",
+                    # 카드 절 다시 읽기(HWAXPortal docs/risk-200k W4 · E2 — 사용자 결정 W-D8) — 근거의 [card:<record_id>#<절>]
+                    # 이 인용 둘레만 실렸거나 칸에서 빠졌을 때 좌석이 그 절 전문을 읽는다(AIDataHub, 읽기 전용).
+                    "get_record_sections")
 
 # 리스크 앱이 패널 질문에 싣는 변경 비교 표식(HWAXRisk runner.panel_question — `diff_id=<id>`). 이 낱말이 질문에 있을 때만
 # 아래 고정과 안내가 붙는다. 스냅샷 타깃 · 그 도구를 못 쓰는 자격 · 옛 앱의 질문에는 없다. 글자를 바꾸려면 그 리포와 같이 바꾼다.
 _RISK_DIFF_MARK = "diff_id="
-# 좌석별 도구 추림에서 맨 앞에 서는 도구 — 예산을 더 쓰지 않고 순위만 올린다(_tools_for_seat 의 pin).
+# 좌석별 도구 추림에서 맨 앞에 서는 도구 — 예산을 더 쓰지 않고 순위만 올린다(_tools_for_seat 의 pin). 변경 원장은 질문에 변경
+# 비교 표식이 있을 때만, 카드 절 다시 읽기는 리스크 심사면 늘(좁은 창에서 근거의 카드 절이 줄어든다 — W4 · E2).
 _RISK_PIN_TOOLS = ("risk_get_diff",)
+_RISK_CARD_PIN_TOOLS = ("get_record_sections",)
 _RISK_LOOKUP_NOTE = ("심의 주제에 diff_id= 가 있으면 risk_get_diff(diff_id, part='lines') 로 변경 전체를 본다. "
                      "종류로 좁히려면 change_kind 를 주고 offset 은 0 부터다.")
 
@@ -5552,7 +5557,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
             _seat_agents, _seat_n = {}, {}
             # 변경 원장 도구 고정 — 리스크 심사이고 질문에 변경 비교 표식이 있을 때만. 얹지 않고 순위만 올린다.
-            _pin = _RISK_PIN_TOOLS if (opts.chair_template == "risk-review" and _RISK_DIFF_MARK in question) else ()
+            _pin = ((_RISK_PIN_TOOLS if _RISK_DIFF_MARK in question else ()) + _RISK_CARD_PIN_TOOLS
+                    if opts.chair_template == "risk-review" else ())
             for p in personas:
                 _st = _tools_for_seat(free_pool, p, question, _free_tool_tokens(), pin=_pin) if free_pool else {}
                 _seat_agents[p["key"]] = create_react_agent(llm, list(_st.values())) if _st else g_agent

@@ -530,10 +530,11 @@ def test_이어하기_설명이_무엇을_이어받는지와_봉인은_못_푼�
     assert "advanced" in tool.inputSchema["properties"], "설명은 advanced 로 바꾸라는데 인자가 없다"
 
 
-# ── 변경 원장 도구 고정 — 리스크 심사이고 화두에 변경 비교 표식(diff_id=)이 있을 때만 ──────────────────────
+# ── 도구 고정 — 변경 원장은 리스크 심사이고 화두에 변경 비교 표식(diff_id=)이 있을 때만, 카드 절 다시 읽기(get_record_sections —
+# HWAXPortal docs/risk-200k E2)는 리스크 심사면 늘 ──────────────────────────────────────────────────────
 @pytest.mark.parametrize("job,question,want", [
-    ("risk-review", "힌지 크랙 원인 — diff_id=3f2a 기준 변경 18건", ("risk_get_diff",)),
-    ("risk-review", "힌지 크랙 원인", ()),                                   # 스냅샷 타깃 · 옛 앱의 질문
+    ("risk-review", "힌지 크랙 원인 — diff_id=3f2a 기준 변경 18건", ("risk_get_diff", "get_record_sections")),
+    ("risk-review", "힌지 크랙 원인", ("get_record_sections",)),              # 스냅샷 타깃 · 옛 앱의 질문
     ("diagnosis", "힌지 크랙 원인 — diff_id=3f2a 기준 변경 18건", ()),         # 다른 Job
 ], ids=["risk-review·mark", "risk-review·no-mark", "diagnosis·mark"])
 def test_변경_원장_도구는_조건이_맞을_때만_고정한다(monkeypatch, tmp_path, job, question, want):
