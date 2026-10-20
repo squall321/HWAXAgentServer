@@ -473,5 +473,27 @@
   "final": "result_sweep_chunked.json",
   "llm_calls": 4,
   "transcript": "llm_transcript_sweep_chunked.txt"
+ },
+ "offcard_paged": {
+  "request": "req_offcard_paged.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_offcard_paged.sse",
+  "final": "result_offcard_paged.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_offcard_paged.txt"
+ },
+ "noinput_paged": {
+  "request": "req_noinput_paged.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_noinput_paged.sse",
+  "final": "result_noinput_paged.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_noinput_paged.txt"
  }
 }

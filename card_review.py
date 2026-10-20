@@ -54,6 +54,10 @@ from review_gate import Busy
 
 # ── 판 번호 ──────────────────────────────────────────────────────────────────
 API_REV = "cr-1"                  # M3 도 cr-1 그대로다 — 더하기만 하므로 앱은 kinds 에 그 종류가 있는지로 가른다(M3.md #58)
+# 더하기만 한 기능 — 앱은 limits.features 에 있을 때만 그 칸을 보낸다(옛 엔진은 모르는 칸을 422 unknown_fields 로 거절한다).
+#   chunk      한 장 자리를 넘는 카드를 계획이 조각 묶음으로 내고 run 이 조각 낸다(HWAXPortal docs/risk-200k W1)
+#   must_full  카드 밖 · 입력 결손의 extra.must_full — 그 카드는 몫이 아니라 창까지 전문, 넘치면 쪽으로 나눠 부른다(W-D15)
+FEATURES = ("chunk", "must_full")
 KINDS = ("sweep", "verdict", "offcard", "noinput", "summary")
 # 셀 일을 하는 종류 — ctx_too_small 은 이것들만 본다. summary 만 못 도는 박스는 runnable.summary=false 로만 알리고 셀 일을
 # 멈추지 않는다(앱이 그 박스에서 요약을 코드 조립본으로 낸다 — M3.md 4.3).
@@ -370,7 +374,8 @@ def limits(ctx_tokens: int, ctx_source: str, max_tokens: int | None, *, retrying
             "ctx": "EXTERNAL_LLM_CTX_TOKENS" if ext else "LLM_CONTEXT_TOKENS·VLLM_MODEL",
             "mt_or": "EXTERNAL_LLM_MAX_TOKENS" if ext else "CARD_REVIEW_MAX_TOKENS 또는 DELIB_MAX_TOKENS"}
     out = {
-        "api_rev": API_REV, "kinds": list(KINDS), "cell_kinds": list(CELL_KINDS), "model": model,
+        "api_rev": API_REV, "features": list(FEATURES), "kinds": list(KINDS), "cell_kinds": list(CELL_KINDS),
+        "model": model,
         "ctx_tokens": b["ctx"], "ctx_source": ctx_source, "ctx_retrying": bool(retrying),
         "llm_max_tokens": b["mt"] or None,
         "max_tokens_source": max_tokens_source or ("delib" if b["mt"] else "none"),
@@ -1025,20 +1030,31 @@ def build_ctx(req: dict, lim: dict) -> dict:
         qs = (search or {}).get("queries") or []
         if not 1 <= len(qs) <= SEARCH_QUERIES_MAX or not all(str(q).strip() for q in qs):
             raise RequestError("bad_request", f"extra.search.queries 는 빈 글이 아닌 검색어 1~{SEARCH_QUERIES_MAX}개다")
+    must_full = [_str(a) for a in extra.get("must_full") or []]
+    if must_full:
+        if kind not in ("offcard", "noinput"):
+            raise RequestError("bad_request", f"extra.must_full(반드시 전문인 카드)은 offcard · noinput 에만 싣는다 — {kind} 에는 없다")
+        stray = [a for a in must_full if a not in cards]
+        if stray:
+            raise RequestError("bad_request", f"extra.must_full 의 별칭은 cards 안이어야 한다 — 실리지 않은 "
+                               f"{', '.join(_echo(a) for a in stray[:5])}")
 
     def codes(items, key):          # 프롬프트에 렌더한 것과 같은 위생(_code_list) — 모델은 본 코드를 고른다
         return {_frame_safe(x.get(key)) for x in items or [] if isinstance(x, dict) and _frame_safe(x.get(key))}
 
-    # 조각 카드(K12.1 …) 한 장의 호출에서 모델이 틀 줄의 원래 별칭(K12)으로 답하면 그 조각의 답으로 읽는다 — 실린 카드가 그 조각
-    # 하나뿐이라 갈 데가 하나다(버리면 세 번 묻고 no_rows 로 조각째 실패한다). 원래 별칭이 따로 실렸으면 접지 않는다.
-    parents = [((cards[a]["card"].get("chunk") or {}).get("parent"), a) for a in order
-               if isinstance(cards[a]["card"].get("chunk"), dict)]
-    fold = {pa: a for pa, a in parents if isinstance(pa, str) and pa != a and pa not in cards
-            and sum(1 for x, _ in parents if x == pa) == 1}
+    # 조각 카드(K12.1 …)가 실린 호출에서 모델이 틀 줄의 원래 별칭(K12)으로 답하면 그 조각의 답으로 읽는다(버리면 세 번 묻고 no_rows 로
+    # 조각째 실패한다). 같은 카드의 조각이 둘 이상 실렸으면 인용이 든 조각으로, 인용이 없거나 어디에도 없으면 첫 조각으로 읽는다
+    # (check_rows). 원래 별칭이 따로 실렸으면 접지 않는다.
+    fold: dict = {}
+    for a in order:
+        pa = (cards[a]["card"].get("chunk") or {}).get("parent") if isinstance(cards[a]["card"].get("chunk"), dict) else None
+        if isinstance(pa, str) and pa != a and pa not in cards:
+            fold.setdefault(pa, []).append(a)
     return {
         "kind": kind, "variant": variant or None, "expert": expert, "unit_id": unit_id,
         "cards": cards, "card_order": order, "digest": digest, "judge": list(order) if kind == "verdict" else [],
-        "fold": fold, "lines": lines, "units": units, "num_src": num_src,
+        "fold": fold, "must_full": [a for a in order if a in set(must_full)], "lines": lines, "units": units,
+        "num_src": num_src,
         "mechs": codes(extra.get("mechanisms"), "code"), "domains": codes(extra.get("domains"), "key"),
         "findings_max": int(lim["offcard"]["findings_max"]), "items_max": int(lim["noinput"]["items_max"]),
         "bg_dropped": 0, "docs": {},
@@ -1864,13 +1880,23 @@ def check_rows(kind: str, variant, rows: list, ctx: dict, *, attempt: int = 1) -
     out, extra_inj = [], []
     stats = {"dropped_alias": 0, "dropped_over_cap": 0, "dup": 0, "cut": []}
     fold = ctx.get("fold") or {}
+
+    def unfold(alias: str, quote) -> str:
+        """원래 별칭 → 그 카드의 조각 별칭(build_ctx 의 fold) — 조각이 여럿이면 인용이 든 조각."""
+        cands = fold[alias]
+        if len(cands) > 1 and isinstance(quote, str) and quote.strip():
+            return next((c for c in cands if quote_check(quote, ctx["cards"][c])[0] == "ok"), cands[0])
+        return cands[0]
+
     for raw in rows:
         r = dict(raw)
         t = r["t"]
-        if fold and t == "v" and isinstance(r.get("k"), str) and r["k"] in fold:
-            r["k"] = fold[r["k"]]                # 조각 호출에 원래 별칭으로 답했다 — build_ctx 의 fold
+        if fold and t in ("v", "q1", "q2") and isinstance(r.get("k"), str) and r["k"] in fold:
+            r["k"] = unfold(r["k"], r.get("cq"))   # 조각 호출에 원래 별칭으로 답했다 — build_ctx 의 fold
+        elif fold and t == "f" and isinstance(r.get("src"), str) and r["src"] in fold:
+            r["src"] = unfold(r["src"], r.get("q"))
         elif fold and t == "u" and isinstance(r.get("k"), list):
-            r["k"] = [fold.get(x, x) for x in r["k"]]
+            r["k"] = [unfold(x, None) if x in fold else x for x in r["k"]]
         if t == "inj":
             extra_inj.append({"at": r.get("at", ""), "text": r.get("text", "")})
             continue
@@ -2580,19 +2606,29 @@ def build_prompt(req: dict, lim: dict, hint: str = "", docs: list | None = None)
         # 카드 전문은 본문 몫에서 단위가 쓰고 남은 만큼 — 넘치는 꼬리는 제목으로 내리고 그 수를 알린다(M2.md 5절 10). 입력
         # 결손 호출은 카드 전부(점검·배경, 훑기 k 에 걸린 것 먼저 — 앱이 순서를 정한다)를 같은 규칙으로 싣는다(M3.md 4.4.2).
         # 긴 문서 발췌(run_search 가 같은 자리에 맞춘 것)가 있으면 먼저 쓰고 남은 자리를 카드가 쓴다.
+        # 반드시 전문인 카드(extra.must_full — 훑기에 걸린 카드)는 몫이 아니라 창 한도까지 싣는다(HWAXPortal docs/risk-200k W-D15 —
+        # 몫을 넘으면 soft_over). 그래도 안 들면 이 호출은 설 수 없다 — run 이 쪽으로 나눠 부르고(_page_prep), 여기서는 over_budget 이다.
+        # 남은 몫 안 자리는 종전처럼 다른 카드를 차례로 채운다. must_full 이 없으면 종전 그대로다.
         room = max(0, kl["body"] - unit_size(unit) - len(docs_text))
-        keep, used = [], 0
-        for a in order:
-            n = len(render_card(ctx["cards"][a]["card"], a))
-            if used + n <= room:
-                keep.append(a)
-                used += n
+        hard = max(0, lim["p_hard"] - kl["fixed"] - unit_size(unit) - len(docs_text))
+        must = set(ctx["must_full"])
+        size = {a: len(render_card(ctx["cards"][a]["card"], a)) for a in order}
+        keep, used = set(), 0
+        for a in (x for x in order if x in must):
+            if used + size[a] > hard:
+                raise OverBudget(lim["p_hard"] - hard + used + size[a], lim["p_hard"], "cards")
+            keep.add(a)
+            used += size[a]
+        for a in (x for x in order if x not in must):
+            if used + size[a] <= room:
+                keep.add(a)
+                used += size[a]
             else:
                 c = ctx["cards"].pop(a)
                 ctx["digest"][a] = {k: c[k] for k in ("record_id", "card_id", "type", "title")}
                 ctx["bg_dropped"] += 1
-        order = keep
-        ctx["card_order"] = keep
+        order = [a for a in order if a in keep]
+        ctx["card_order"] = order
 
     if kind in ("verdict", "offcard", "noinput") and ctx["digest"]:
         head = ("[배경 카드 — 제목만. 판정 대상이 아니다]\n" if kind == "verdict"
@@ -3218,6 +3254,9 @@ def prepare(req: dict, lim: dict) -> dict:
                            **({"reason": reason} if reason else {}),
                            **({"need_max_tokens": small["need_max_tokens"]} if small.get("need_max_tokens")
                               and cell else {}))
+    paged = _page_prep(req, lim)
+    if paged is not None:
+        return paged
     chunked = _chunk_prep(req, lim)
     if chunked is not None:
         return chunked
@@ -3553,25 +3592,9 @@ def _sum_usage(usages: list) -> dict | None:
             "tokens_out": total("tokens_out"), "per_attempt": [p for u in got for p in u.get("per_attempt") or []]}
 
 
-def merge_chunked(prep: dict, results: list, rec: dict | None) -> dict:
-    """조각 결과들 → 카드 한 장의 result(앱이 보는 모양 그대로 — 한 카드는 한 행). 정산은 원래 카드의 맥락으로 다시 한다."""
-    ck = prep["chunked"]
-    parent, pctx, lim = ck["parent"], ck["parent_ctx"], prep["lim"]
-    kind, variant = pctx["kind"], pctx["variant"]
-    rows_all = [(i, r) for i, res in enumerate(results) for r in res.get("rows") or []]
-    unjudged = _unjudged(prep, results)
-    rec_res = (rec or {}).get("result")
-    rec_row = next((r for r in (rec_res or {}).get("rows") or [] if r.get("t") == "v" and r.get("k") == parent), None)
-    # 재판정 — None(갈리지 않았다) · ok · failed(물었는데 답이 서지 않았다) · skipped(갈렸는데 두 쪽 근거를 한 번에 못 실었다)
-    rec_state = None if rec is None else ("skipped" if rec.get("skipped") else ("ok" if rec_row else "failed"))
-    rows = (_merge_verdict(parent, pctx, rows_all, rec_row, rec_state) if kind == "verdict"
-            else _merge_sweep(parent, rows_all))
-    if unjudged:
-        # 판정 행을 끝내 못 낸 조각이 있다 — 나머지 조각만으로 카드의 판정을 세우지 않는다(그 조각에 걸림이 있을 수 있다). 판정 행을
-        # 빼면 정산이 그 카드를 빠진 카드(missing)로 세고 앱이 빠진 카드의 규칙으로 다시 낸다.
-        rows = [r for r in rows if r.get("t") != "v"]
-    settled = settle(kind, rows, pctx)
-    done = results + ([rec_res] if rec_res else [])
+def _combine(kind: str, variant, rows: list, settled: dict, done: list, meta_update: dict) -> dict:
+    """나눠 부른 결과들(done) → result 한 건 — 합친 행(rows)과 원래 요청 맥락의 정산(settled)에 시도 · 사용량 · 절단을 더해 모은다.
+    meta 는 첫 결과의 것에 합(글자 · 사용량 · 시간)과 meta_update 를 얹는다."""
     qs = [res.get("quality") or {} for res in done]
     metas = [res.get("meta") or {} for res in done]
     truncs = [q.get("truncated") for q in qs]
@@ -3598,16 +3621,40 @@ def merge_chunked(prep: dict, results: list, rec: dict | None) -> dict:
         "usage": _sum_usage([m.get("usage") for m in metas]),
         "llm_ms": [x for m in metas for x in m.get("llm_ms") or []],
         "finish_reason": metas[-1].get("finish_reason"),
+        "clipped": {k: v for m in metas for k, v in (m.get("clipped") or {}).items()},
+        **meta_update,
+    })
+    return {"kind": kind, "variant": variant, "rows": rows, "missing": settled["missing"], "extras": extras,
+            "quality": quality, "meta": meta}
+
+
+def merge_chunked(prep: dict, results: list, rec: dict | None) -> dict:
+    """조각 결과들 → 카드 한 장의 result(앱이 보는 모양 그대로 — 한 카드는 한 행). 정산은 원래 카드의 맥락으로 다시 한다."""
+    ck = prep["chunked"]
+    parent, pctx = ck["parent"], ck["parent_ctx"]
+    kind, variant = pctx["kind"], pctx["variant"]
+    rows_all = [(i, r) for i, res in enumerate(results) for r in res.get("rows") or []]
+    unjudged = _unjudged(prep, results)
+    rec_res = (rec or {}).get("result")
+    rec_row = next((r for r in (rec_res or {}).get("rows") or [] if r.get("t") == "v" and r.get("k") == parent), None)
+    # 재판정 — None(갈리지 않았다) · ok · failed(물었는데 답이 서지 않았다) · skipped(갈렸는데 두 쪽 근거를 한 번에 못 실었다)
+    rec_state = None if rec is None else ("skipped" if rec.get("skipped") else ("ok" if rec_row else "failed"))
+    rows = (_merge_verdict(parent, pctx, rows_all, rec_row, rec_state) if kind == "verdict"
+            else _merge_sweep(parent, rows_all))
+    if unjudged:
+        # 판정 행을 끝내 못 낸 조각이 있다 — 나머지 조각만으로 카드의 판정을 세우지 않는다(그 조각에 걸림이 있을 수 있다). 판정 행을
+        # 빼면 정산이 그 카드를 빠진 카드(missing)로 세고 앱이 빠진 카드의 규칙으로 다시 낸다.
+        rows = [r for r in rows if r.get("t") != "v"]
+    done = results + ([rec_res] if rec_res else [])
+    metas = [res.get("meta") or {} for res in done]
+    return _combine(kind, variant, rows, settle(kind, rows, pctx), done, {
         "input_sha": _canon_sha({"chunked": parent, "subs": [m.get("input_sha") for m in metas]}),
         "soft_over": True, "bg_dropped": sum(int(m.get("bg_dropped") or 0) for m in metas),
-        "aliases": {**(meta.get("aliases") or {}), "cards": {parent: pctx["cards"][parent]["record_id"]}},
-        "clipped": {k: v for m in metas for k, v in (m.get("clipped") or {}).items()},
+        "aliases": {**(metas[0].get("aliases") or {}), "cards": {parent: pctx["cards"][parent]["record_id"]}},
         "chunked": {"parent": parent, "n": len(results),
                     "aliases": [sub["req"]["cards"][0]["alias"] for sub in ck["subs"]], "reconcile": rec_state,
                     "unjudged": unjudged},
     })
-    return {"kind": kind, "variant": variant, "rows": rows, "missing": settled["missing"], "extras": extras,
-            "quality": quality, "meta": meta}
 
 
 async def _run_chunked(app, prep: dict):
@@ -3649,6 +3696,162 @@ async def _run_chunked(app, prep: dict):
     yield _sse("done", {})
 
 
+# ── 쪽 실행 — 카드 밖 · 입력 결손의 반드시 전문인 카드가 창 한 번에 안 들 때(HWAXPortal docs/risk-200k W-D15) ────────────────
+PAGE_KINDS = ("offcard", "noinput")
+
+
+def _page_room(req: dict, lim: dict) -> int:
+    """쪽 하나에 반드시 전문인 카드를 실을 자리(자) — build_prompt 의 hard 와 같은 셈(창 한도 − 선언한 틀 · 블록 몫 − 단위)."""
+    unit = req.get("unit") if isinstance(req.get("unit"), dict) else {}
+    return lim["p_hard"] - lim[req["kind"]]["fixed"] - unit_size(unit)
+
+
+def _page_req(req: dict, cards: dict, page: list) -> dict:
+    """쪽 하나의 요청 — 그 쪽의 카드(조각 포함)만 전문이고 반드시 전문이다. 다른 쪽의 카드는 제목(digest)으로 싣는다 — 이 쪽에 조각으로
+    실린 카드는 원래 별칭을 제목으로 싣지 않는다(조각 틀 줄이 이미 말한다)."""
+    on = {c["alias"] for c in page}
+    parents = {(c.get("chunk") or {}).get("parent") for c in page if isinstance(c.get("chunk"), dict)}
+    titles = [{"alias": a, "type": c.get("type"), "title": c.get("title"), "record_id": c.get("record_id"),
+               "card_id": c.get("card_id")} for a, c in cards.items() if a not in on and a not in parents]
+    extra = {**(req.get("extra") if isinstance(req.get("extra"), dict) else {}), "must_full": [c["alias"] for c in page]}
+    return {**req, "cards": page, "digest": list(req.get("digest") or []) + titles, "extra": extra}
+
+
+def _page_prep(req: dict, lim: dict) -> dict | None:
+    """offcard · noinput 의 반드시 전문인 카드(extra.must_full)가 창 한 번에 안 들면 — 쪽마다 보통 준비물을 만들어 묶는다(run 이 차례로
+    돌려 합친다). 쪽에는 그 카드들을 요청 차례대로 채우고, 한 장이 쪽 자리를 넘으면 W1 의 조각으로 나눠 싣는다. 해당하지 않으면 None
+    (한 번에 든다 — build_prompt 가 싣는다). 쪽 자리는 선언한 틀 몫(지적 블록 포함)과 실제 단위 크기로 셈하므로 쪽은 늘 창 안이다 —
+    W1 처럼 줄여 다시 나누지 않는다(넘치면 over_budget 으로 드러난다)."""
+    kind = req.get("kind")
+    extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
+    must = {_str(a) for a in extra.get("must_full") or []}
+    if kind not in PAGE_KINDS or not must:
+        return None
+    cards = {_str(c.get("alias")): c for c in req.get("cards") or [] if isinstance(c, dict)}
+    order = [a for a in cards if a in must]
+    size = {a: len(render_card(cards[a], a)) for a in order}
+    limit = _page_room(req, lim)
+    if sum(size.values()) <= limit or limit <= 0:
+        return None
+    items: list = []
+    for a in order:
+        if size[a] <= limit:
+            items.append(cards[a])
+            continue
+        pieces = chunk_card(cards[a], a, int(limit * CHUNK_SHARE))
+        if not pieces:
+            return None                 # 틀만으로 자리가 거의 없다 — build_prompt 가 over_budget 으로 거절한다
+        items += pieces
+    pages, cur, used = [], [], 0
+    for c in items:
+        n = len(render_card(c, c["alias"]))
+        if cur and used + n > limit:
+            pages.append(cur)
+            cur, used = [], 0
+        cur.append(c)
+        used += n
+    if cur:
+        pages.append(cur)
+    subs = [prepare(_page_req(req, cards, page), lim) for page in pages]
+    return {"req": req, "lim": lim, "ctx": subs[0]["ctx"],
+            "paged": {"subs": subs, "pages": [[c["alias"] for c in page] for page in pages],
+                      "parent_ctx": build_ctx(req, lim)}}
+
+
+def _merge_page_rows(kind: str, rows: list) -> list:
+    """쪽들의 줄 → 한 호출의 줄. 정체가 같은 줄(_identity)은 하나로, 한 줄짜리(m · more · none)는 하나로 모은다 — m 은 본 메커니즘의
+    합, more 는 어느 쪽이든 '더 있다' 면 더 있다(모두 '없다' 일 때만 없다), none 은 지적(f)이 하나도 없을 때만. 입력 결손의 '없음' 자리
+    줄(q1 impact=no · 항목이 빈 q2)은 다른 쪽에 실제 줄이 있으면 뺀다."""
+    out, seen, single = [], set(), {}
+    for r in rows:
+        if r.get("t") in ("m", "more", "none"):
+            single.setdefault(r["t"], []).append(r)
+            continue
+        key = _identity(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    if kind == "noinput":
+        if any(r["t"] == "q1" and r.get("impact") != "no" for r in out):
+            out = [r for r in out if not (r["t"] == "q1" and r.get("impact") == "no")]
+        if any(r["t"] == "q2" and r.get("item") for r in out):
+            out = [r for r in out if not (r["t"] == "q2" and not r.get("item"))]
+    if single.get("m"):
+        m = copy.deepcopy(single["m"][0])
+        m["seen"] = list(dict.fromkeys(c for r in single["m"] for c in r.get("seen") or []))
+        out.append(m)
+    if single.get("more"):
+        mores = single["more"]
+        out.append(next((r for r in mores if r.get("more") == "yes"), None)
+                   or next((r for r in mores if r.get("more") != "no"), mores[0]))
+    if single.get("none") and not any(r["t"] == "f" for r in out):
+        out.append(single["none"][0])
+    return out
+
+
+def merge_paged(prep: dict, results: list) -> dict:
+    """쪽 결과들 → 그 호출 하나의 result. 조각 별칭(K12.1)으로 댄 근거는 원래 별칭으로 접고 인용을 카드 전체 본문에서 다시
+    대조한다. 정산은 원래 요청의 맥락으로 다시 하고, '더 있다'(maybe_more)는 어느 쪽이든 상한에 닿았거나 더 있다고 했으면 참이다
+    (쪽들을 합친 줄 수로 다시 셈하지 않는다). 반드시 전문인 카드 밖의 카드는 모두 제목으로 실렸다(bg_dropped)."""
+    pg = prep["paged"]
+    pctx = pg["parent_ctx"]
+    kind = pctx["kind"]
+    parent_of = {c["alias"]: c["chunk"]["parent"] for sub in pg["subs"] for c in sub["req"]["cards"]
+                 if isinstance(c.get("chunk"), dict)}
+    rows = []
+    for res in results:
+        for r in res.get("rows") or []:
+            r = copy.deepcopy(r)
+            key, qkey = (("src", "q") if r.get("t") == "f" else ("k", "cq") if r.get("t") in ("q1", "q2") else (None, None))
+            if key and r.get(key) in parent_of:
+                r[key] = parent_of[r[key]]
+                if r.get(qkey):
+                    r["checks"] = dict(r.get("checks") or {})
+                    r["checks"]["quote"], r["checks"]["quote_sid"] = quote_check(r[qkey], pctx["cards"][r[key]])
+            rows.append(r)
+    rows = _merge_page_rows(kind, rows)
+    settled = settle(kind, rows, pctx)
+    mores = [(res.get("quality") or {}).get("maybe_more") for res in results]
+    settled["maybe_more"] = True if True in mores else (False if all(x is False for x in mores) else None)
+    metas = [res.get("meta") or {} for res in results]
+    return _combine(kind, pctx["variant"], rows, settled, results, {
+        "input_sha": _canon_sha({"paged": pg["pages"], "subs": [m.get("input_sha") for m in metas]}),
+        "soft_over": any(bool(m.get("soft_over")) for m in metas),
+        "bg_dropped": len(pctx["card_order"]) - len(pctx["must_full"]),
+        "aliases": {**(metas[0].get("aliases") or {}),
+                    "cards": {a: pctx["cards"][a]["record_id"] for a in pctx["card_order"]}},
+        "paged": {"n": len(results), "pages": pg["pages"], "must_full": len(pctx["must_full"])},
+    })
+
+
+async def _run_paged(app, prep: dict):
+    """쪽 준비물의 SSE — 쪽마다 보통 run 을 차례로 돌리고(_drive — status{page, of}) 한 result 로 합친다(merge_paged). 쪽 하나라도
+    끝내 실패하면 그 error 로 끝낸다(앱이 그 호출을 종전 규칙으로 다시 낸다 — 받은 쪽만 합쳐 다 본 것처럼 두지 않는다)."""
+    from app import _sse  # noqa: PLC0415
+
+    pg = prep["paged"]
+    subs, pctx = pg["subs"], pg["parent_ctx"]
+    t0 = time.monotonic()
+    tag = f"{pctx['kind']}/- {pctx['expert'].get('key', '')} {pctx['unit_id'] or '-'}"
+    results: list = []
+    for i, sub in enumerate(subs, 1):
+        out: dict = {}
+        async for b in _drive(app, sub, {"page": i, "of": len(subs)}, out):
+            yield b
+        if out.get("error") is not None or out.get("result") is None:
+            err = out.get("error") or {"code": "internal_error", "message": "쪽 결과가 없다", "infra": False,
+                                       "retryable": False}
+            print(f"[card_review] {tag} 쪽 {i}/{len(subs)} → {err.get('code')}")
+            yield _sse("error", {**err, "page": i, "of": len(subs)})
+            yield _sse("done", {})
+            return
+        results.append(out["result"])
+    merged = merge_paged(prep, results)
+    print(f"[card_review] {tag} 쪽 {len(subs)}개(반드시 전문 {len(pctx['must_full'])}장) {time.monotonic() - t0:.1f}s → ok")
+    yield _sse("result", merged)
+    yield _sse("done", {})
+
+
 async def run(app, prep: dict):
     """`POST /card-review/run` 의 SSE 본체 — prepare() 를 지난 요청만 받는다.
 
@@ -3657,9 +3860,10 @@ async def run(app, prep: dict):
     error{review_busy} → done 이고 LLM 을 부르지 않는다. 첫 시도의 LLM 실패는 error 다. 보충(n ≥ 2) 중의 실패는 error 가
     아니라 result 로 끝내고 quality.repair_error 를 싣는다(받은 행을 버리지 않는다 — P-08). 단 그때까지 받은 행이 0 이면
     살릴 것이 없으므로 error 다. 구독이 닫히면(취소·aclose) LLM 태스크를 취소하고 자리를 돌려준다."""
-    if prep.get("chunked"):
-        # 한 장 자리를 넘는 카드 한 장 — 조각마다 이 함수를 다시 돌려 합친다(관문 자리는 조각마다 잡고 놓는다).
-        async for b in _run_chunked(app, prep):
+    if prep.get("chunked") or prep.get("paged"):
+        # 한 장 자리를 넘는 카드 한 장(조각) · 창 한 번에 안 드는 반드시 전문인 카드(쪽) — 조각 · 쪽마다 이 함수를 다시 돌려 합친다
+        # (관문 자리는 조각 · 쪽마다 잡고 놓는다).
+        async for b in (_run_chunked(app, prep) if prep.get("chunked") else _run_paged(app, prep)):
             yield b
         return
     from app import DELIB_HEARTBEAT_S, _est_tokens_all, _sse  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
@@ -3999,6 +4203,9 @@ class RunExtra(_Strict):
     missing: list[MissingItem] = []
     # 긴 문서 검색(cr-offcard-2) — offcard 에만. 앱은 카드 0장 전문가에게만 보낸다(M3.md #38).
     search: SearchSpec | None = None
+    # 반드시 전문으로 실을 카드(W-D15) — offcard · noinput 에만, cards 안의 별칭. 앱이 그 단위의 훑기에 걸린 카드(훑기 결과가 없으면
+    # 그 호출의 카드 전부)를 적는다. 몫이 아니라 창 한도까지 싣고, 그래도 넘치면 run 이 쪽으로 나눠 부른다.
+    must_full: list[str] = []
 
 
 class Expect(_Strict):

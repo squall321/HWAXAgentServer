@@ -135,6 +135,25 @@ def _verdict_chunked_req(mark=False):
     return _req("verdict", [_chunk_card(mark=mark)], _digest(PACK), unit=_unit(0), variant="fwd")
 
 
+def _paged_cards() -> list:
+    """창 32,768 에서 반드시 전문인 카드 넷(6천 자 남짓)이 한 번에 안 든다(카드 밖 쪽 자리 1.3만 자) — 쪽 둘. 다섯째는 반드시 전문 밖이다."""
+    out = []
+    for i in range(1, 6):
+        c = _long_card(f"K0{i}", secs=(3_000, 3_000) if i < 5 else (800,), seed=60 + i)
+        c = {**c, "record_id": f"DOC-PAGE-{60 + i:04d}", "card_id": f"C-{60 + i}", "checkable": False}
+        c["chars"] = len(cr.render_card(c, c["alias"]))
+        out.append(c)
+    return out
+
+
+def _paged_req(kind: str) -> dict:
+    """카드 밖 · 입력 결손 — 앱이 훑기에 걸린 카드(K01~K04)를 반드시 전문으로 알린다(extra.must_full · W-D15)."""
+    extra = {"mechanisms": MECHS, "must_full": ["K01", "K02", "K03", "K04"]}
+    if kind == "offcard":
+        extra.update(domains=DOMAINS, known=[{"alias": "K01", "judgement": "OK", "why": "접착폭 하한을 지킨다"}])
+    return _req(kind, _paged_cards(), [], unit=_unit(0), extra=extra)
+
+
 def _sweep_chunked_req():
     manifest = [{"unit_id": f"u-{i:02d}", "kind": "bundle", "title": f"단위 {i}", "text": "후면 커버 둘레 접착 계면 변경"}
                 for i in range(3)]
@@ -151,6 +170,8 @@ REQUESTS = {
     # W1 카드 조각 — 한 장 자리를 넘는 카드 한 장의 판정 · 판정(조각들이 갈린다) · 훑기
     "verdict_chunked": _verdict_chunked_req(), "verdict_chunked_split": _verdict_chunked_req(mark=True),
     "sweep_chunked": _sweep_chunked_req(),
+    # W2-B 반드시 전문인 카드의 쪽 — 카드 밖 · 입력 결손
+    "offcard_paged": _paged_req("offcard"), "noinput_paged": _paged_req("noinput"),
 }
 # 포털 중계가 덮어쓰는 신원 칸 넷 — 예제 요청 파일에는 싣지 않고 보낼 때만 더한다(긴 문서 검색은 사용자 PAT 로만 돈다).
 IDENT = {"groups": ["g"], "user_email": "u@x.com", "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
@@ -208,6 +229,9 @@ SCENES = {
     "verdict_chunked": ("verdict_chunked", ["oracle"], W32K),
     "verdict_chunked_split": ("verdict_chunked_split", ["oracle"], W32K),
     "sweep_chunked": ("sweep_chunked", ["oracle"], W32K),
+    # W2-B(docs/risk-200k W-D15) — 반드시 전문인 카드가 창 한 번에 안 들어 쪽마다 부르고 한 결과로 합친다.
+    "offcard_paged": ("offcard_paged", ["oracle"], W32K),
+    "noinput_paged": ("noinput_paged", ["oracle"], W32K),
 }
 # 장면마다의 정답 — 없으면 프롬프트에서 만든 기본 정답(default_oracle).
 ORACLES = {"verdict_chunked_split": _split_oracle}
@@ -553,7 +577,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 30
+    assert len(results) == 32
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -587,7 +611,8 @@ def test_limits_예제의_판이_팩_결과와_같다():
 @pytest.mark.parametrize("name", ["req_verdict_fwd.json", "req_sweep.json", "req_offcard.json", "req_verdict_solo.json",
                                   "req_sweep_gaps.json", "req_verdict_mech.json", "req_noinput.json",
                                   "req_offcard_search.json", "req_summary_domain.json", "req_verdict_chunked.json",
-                                  "req_verdict_chunked_split.json", "req_sweep_chunked.json"])
+                                  "req_verdict_chunked_split.json", "req_sweep_chunked.json",
+                                  "req_offcard_paged.json", "req_noinput_paged.json"])
 def test_요청_예제는_app_없는_검증기를_지난다(name):
     lim = _load("limits_1m.json")
     assert cr.validate_run_request(_load(name), lim) == []
@@ -758,3 +783,23 @@ def test_W1_조각_실행_예제():
     sw = _load("result_sweep_chunked.json")
     us = [r for r in sw["rows"] if r["t"] == "u"]
     assert len(us) == 3 and all(u["k"] == ["K05"] for u in us) and sw["extras"]["unmatched_cards"] == []
+
+
+def test_W2_쪽_실행_예제():
+    """반드시 전문인 카드(K01~K04)가 창 한 번에 안 들어 쪽마다 status{page, of} 를 내며 부르고 한 result 로 합친다 — 반드시 전문 밖의
+    카드(K05)만 제목이다(bg_dropped 1). 합친 줄의 한 줄짜리(m · more)는 하나다."""
+    index = _load("index.json")
+    for kind in ("offcard", "noinput"):
+        res = _load(f"result_{kind}_paged.json")
+        pg = res["meta"]["paged"]
+        assert pg["n"] >= 2 and sorted(x for p in pg["pages"] for x in p) == ["K01", "K02", "K03", "K04"], pg
+        assert (pg["must_full"], res["meta"]["bg_dropped"], index[f"{kind}_paged"]["llm_calls"]) == (4, 1, pg["n"])
+        frames = [delib_jobs._parse_sse(x.encode()) for x in (OUT / f"run_{kind}_paged.sse").read_text(encoding="utf-8")
+                  .split("\n\n") if x.strip()]
+        assert [(d["page"], d["of"]) for e, d in frames if e == "status"] == [(i, pg["n"]) for i in range(1, pg["n"] + 1)]
+        ts = [r["t"] for r in res["rows"]]
+        assert ts.count("more") == 1 and res["missing"] == [], ts
+    off = _load("result_offcard_paged.json")
+    assert [r["t"] for r in off["rows"]].count("m") == 1 and off["quality"]["maybe_more"] is False
+    ni = _load("result_noinput_paged.json")
+    assert {r["k"] for r in ni["rows"] if r["t"] == "q1"} >= {p[0] for p in ni["meta"]["paged"]["pages"]}

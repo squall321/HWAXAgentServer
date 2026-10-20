@@ -316,18 +316,24 @@ def test_조각_호출에_원래_별칭으로_답해도_그_조각의_답이다(
     assert [u["k"] for u in us] == [["K07"]] and all("k:unknown_alias" not in u["checks"]["coerced"] for u in us)
 
 
-def test_원래_별칭이_따로_실렸으면_접지_않는다():
-    """조각과 원래 카드가 한 요청에 같이 있으면(앱이 그렇게 보내지 않지만) K07 은 원래 카드의 답이다 — 접지 않는다."""
+def test_원래_별칭이_따로_실렸으면_접지_않고_조각이_둘이면_인용이_든_조각으로_접는다():
+    """조각과 원래 카드가 한 요청에 같이 있으면(앱이 그렇게 보내지 않지만) K07 은 원래 카드의 답이다 — 접지 않는다. 같은 카드의 조각이
+    둘 실렸으면(쪽 실행) 인용이 든 조각으로, 인용이 어디에도 없으면 첫 조각으로 읽는다."""
     card = _long_card()
     chunks = cr.chunk_card(card, "K07", int(cr.card_room(LIM_200K) * cr.CHUNK_SHARE))
     small = {**_long_card("K08", secs=(800,)), "record_id": "DOC-8"}
     ctx = cr.build_ctx(_req("verdict", [chunks[0], small], [], unit=_unit(2_000), variant="fwd"), LIM_1M)
-    assert ctx["fold"] == {"K07": "K07.1"}
+    assert ctx["fold"] == {"K07": ["K07.1"]}
     ctx = cr.build_ctx(_req("verdict", [chunks[0], {**card, "alias": "K07"}], [], unit=_unit(2_000), variant="fwd"),
                        LIM_1M)
     assert ctx["fold"] == {}
     ctx = cr.build_ctx(_req("verdict", chunks[:2], [], unit=_unit(2_000), variant="fwd"), LIM_1M)
-    assert ctx["fold"] == {}, "조각이 둘이면 어느 조각인지 모른다"
+    assert ctx["fold"] == {"K07": ["K07.1", "K07.2"]}
+    second = chunks[1]["sections"][-1]["text"][:60]
+    row = {"t": "v", "k": "K07", "applies": "yes", "judgement": "OK", "cq": second, "l": ["L01"], "why": "한계 안이다",
+           "need": "", "sev": "", "path": "", "check_kind": "", "check": "", "mech": "", "mech_free": ""}
+    got = cr.check_rows("verdict", "fwd", [row, {**row, "cq": "어디에도 없는 인용 문장이다 정말로"}], ctx)["rows"]
+    assert [r["k"] for r in got] == ["K07.2", "K07.1"], "인용이 든 조각 · 없으면 첫 조각"
 
 
 def test_판정_행_없이_끝난_조각이_있으면_그_카드는_빠진_카드다(client200k, monkeypatch):

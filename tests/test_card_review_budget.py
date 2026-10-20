@@ -170,9 +170,10 @@ def _global_names(fn) -> set:
 
 def test_예산_식이_읽는_모듈_상수는_전부_판에_든다():
     """새 상수를 예산 식에 더하고 LIMITS_CONSTANTS 에 안 더하면 판이 그 상수를 모른다 — 식의 함수들이 읽는 모듈 상수를 모아
-    대조한다. 손잡이 기본값(K_DEFAULT·SHARE_DEFAULT)은 손잡이 값으로, 다른 판(PROMPT_REV·NORM_REV·API_REV)은 따로 싣는다."""
-    other = {"KINDS", "CELL_KINDS", "API_REV", "PROMPT_REV", "NORM_REV", "K_DEFAULT", "SHARE_DEFAULT", "_SHARE_ENV",
-             "LIMITS_CONSTANTS"}
+    대조한다. 손잡이 기본값(K_DEFAULT·SHARE_DEFAULT)은 손잡이 값으로, 다른 판(PROMPT_REV·NORM_REV·API_REV)은 따로 싣는다.
+    FEATURES 는 예산이 아니라 엔진이 아는 칸의 목록이다(앱이 보낼지 가른다)."""
+    other = {"KINDS", "CELL_KINDS", "API_REV", "FEATURES", "PROMPT_REV", "NORM_REV", "K_DEFAULT", "SHARE_DEFAULT",
+             "_SHARE_ENV", "LIMITS_CONSTANTS"}
     read = set()
     for fn in (cr._budget, cr._need_ctx, cr.limits, cr.plan, cr._pack_decks, cr.unit_size, cr._knob_k,
                cr._knob_shares, cr._limits_constants):

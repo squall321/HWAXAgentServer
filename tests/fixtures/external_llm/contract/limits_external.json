@@ -1,5 +1,9 @@
 {
  "api_rev": "cr-1",
+ "features": [
+  "chunk",
+  "must_full"
+ ],
  "kinds": [
   "sweep",
   "verdict",
