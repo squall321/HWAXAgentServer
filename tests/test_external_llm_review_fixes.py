@@ -559,10 +559,11 @@ def test_외부_심의의_의장_결정문_절단_경고는_EXTERNAL_LLM_MAX_TOK
     assert cut and cut[0]["knob"] == "EXTERNAL_LLM_MAX_TOKENS", [dd for e, dd in events if e == "warning"]
 
 
-# ── L5. 외부 잡의 닫힌 free_tools 는 호출자의 선택과 따로 ─────────────────────────────
-def test_외부_잡의_닫힌_free_tools_는_따로_적혀_GLM_이어하기가_물려받지_않는다(monkeypatch, tmp_path):
-    """탐침 p10 — 외부 잡의 기록에 닫힌 free_tools=0 이 호출자의 값처럼 적혀, llm 을 이어받지 않는 이어하기(GLM)가 그 0 을
-    물려받았다(호출자는 free_tools 를 보내지 않았거나 1 을 보냈다)."""
+# ── L5. 외부 잡의 free_tools 는 호출자의 선택 그대로 ─────────────────────────────────
+def test_외부_잡의_free_tools_는_호출자의_값_그대로_돌고_GLM_이어하기도_그_값을_물려받는다(monkeypatch, tmp_path):
+    """탐침 p10 — 종전엔 외부 잡이 free_tools 를 0 으로 닫아 그 0 이 호출자의 값처럼 적힐 수 있었다(그래서 닫힌 값을 따로 적었다).
+    좌석 자유 조회가 글 왕복이 된 뒤로 외부 길은 닫는 값이 없다 — 기록 · 엔진 · llm 을 이어받지 않는 이어하기(GLM)가 모두
+    호출자가 보낸 값 그대로이고, 보내지 않은 값은 지어내지 않는다."""
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
     monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
     monkeypatch.setattr(delib_jobs, "_JOBS", {})
@@ -587,15 +588,14 @@ def test_외부_잡의_닫힌_free_tools_는_따로_적혀_GLM_이어하기가_�
         return delib_jobs._JOBS[out["job_id"]], delib_jobs._JOBS[cont["job_id"]]
 
     prev, nxt = asyncio.run(go({**EXT, "free_tools": 1}))
-    assert (prev["opts"]["llm"], prev["opts"]["free_tools"], prev["opts"]["external_forced"]) == (
-        "external", 1, {"free_tools": 0})
+    assert (prev["opts"]["llm"], prev["opts"]["free_tools"]) == ("external", 1) and "external_forced" not in prev["opts"]
     (first_opts, first_kw), (cont_opts, cont_kw) = seen
-    assert first_kw == {"owner": "first+tag@x.com"} and d._resolve_opts(first_opts).free_tools == 0, "외부 잡은 닫혀 돈다"
+    assert first_kw == {"owner": "first+tag@x.com"} and d._resolve_opts(first_opts).free_tools == 1, "외부 잡이 조회를 닫았다"
     assert cont_kw == {} and "llm" not in cont_opts and cont_opts["free_tools"] == 1
     assert d._resolve_opts(cont_opts).free_tools == 1 and "external_forced" not in nxt["opts"]
     seen.clear()
     prev, _nxt = asyncio.run(go(dict(EXT)))                   # 호출자가 free_tools 를 보내지 않았다
-    assert "free_tools" not in prev["opts"] and prev["opts"]["external_forced"] == {"free_tools": 0}
+    assert "free_tools" not in prev["opts"] and "external_forced" not in prev["opts"]
     assert "free_tools" not in seen[1][0], "보내지 않은 값을 이어하기가 지어냈다"
 
 

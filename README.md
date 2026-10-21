@@ -361,18 +361,29 @@ the risk app copies byte for byte).
 
 **Deliberation.** `delib_opts.llm: "external"` with `consent_external: true` (portal `/chat` deliberation, `/시뮬심의`,
 `/시험계획`, and MCP `deliberate_start`'s `advanced`) runs every judgement call of that deliberation — seats, chair,
-summaries, tool-argument planning — as tasks of the caller. It forces **evidence_only**: the seats' free lookup is closed
-(`free_tools=0` — the only place the engine binds tools to the model; `ExternalChatModel.bind_tools` raises), and a
-`free_tools` the caller sent is named in a notice card (`delib` evidence `source: "외부 응답자 실행 — evidence_only"`,
-`notice: true`). Engine-run steps (pinned tools, knowledge cards, VOC recall, evidence prepass) are unchanged; their LLM
-parts go to the responder as text tasks. The whole deliberation budgets with `EXTERNAL_LLM_CTX_TOKENS` (a context
+summaries, tool-argument planning — as tasks of the caller. **Seat free lookups run as a text round trip**
+(`_TextReactAgent`, HWAXPortal `docs/claude-delib-parity`): tools cannot be bound to the responder
+(`ExternalChatModel.bind_tools` raises), so the seat's lookup task carries the seat's own tool list (name, description, args
+JSON schema — the same per-seat pick a GLM seat is bound with) and a rule block; the responder writes one
+`CALL {"tool": "<name>", "args": {…}}` per line (a line wrapped in single backticks is accepted), **the engine** runs those
+tools and sends their results back in the next task. At most `tool_budget` calls in total and `tool_budget + 1` tasks per
+seat and round; a tool not on the list, a line that is not a JSON object, non-object `args` or a line past the budget is not
+run and the next task says why; `CALL` lines in the last task are not run. The tools are the same objects a GLM seat gets
+(read-only allow list, per-deliberation cache, result cap, phantom-id gate), and the calls flow into the same places —
+status lines with the `call` pairing key, evidence cards, the shared lookup pool, the number-source corpus, the risk app's
+`used_tool`. `free_tools=0` (or no lookup tool available — `warning{code: free_tools_unavailable}`) is **evidence_only**:
+seats speak from `[근거]` and knowledge cards only. A notice card names the path (`delib` evidence `source: "외부 응답자 실행 —
+좌석 도구 글 왕복"` or `"외부 응답자 실행 — evidence_only"`, `notice: true`). Engine-run steps (pinned tools, knowledge
+cards, VOC recall, evidence prepass) are unchanged; their LLM parts go to the responder as text tasks. The whole deliberation budgets with `EXTERNAL_LLM_CTX_TOKENS` (a context
 variable set at its entry — other deliberations, card review and chat keep this server's window);
 `/health.external_llm.evid_budget` is the evidence share under that window, for the risk app's brief. Marks: the
-decision text starts with `■ 외부 응답자 실행 — …` (stamped by code, like the sealed mark), the `result` frame gains
-`llm: "external", tool_mode: "evidence_only"`, and the MCP job's summary and transcript carry the same two fields. The
-job's `applied_opts` show `llm`, `consent_external`, the caller's own `free_tools` if sent (read as on the GLM path) and,
-separately, `external_forced: {free_tools: 0}` — so a continuation, which runs on this server's LLM unless
-`advanced.llm` is sent again (with the flag), inherits the caller's choice, not the forced 0. Limit failures go through
+decision text starts with `■ 외부 응답자 실행 — …` (stamped by code, like the sealed mark — it names the lookup path), the
+`result` frame gains `llm: "external", tool_mode: "tools" | "evidence_only"` (the path that actually ran: `tools` when the
+seats had a lookup agent — the risk ledger's word), and the MCP job's summary and transcript carry the same two fields (the
+job records the requested path at start and takes the engine's on `result`; a job record without the field predates the
+text round trip and reads `evidence_only`). The job's `applied_opts` show `llm`, `consent_external` and the caller's own
+`free_tools` if sent (read as on the GLM path — nothing is forced); a continuation runs on this server's LLM unless
+`advanced.llm` is sent again (with the flag). Limit failures go through
 the existing paths with `cause`: `warning{code: seat_lost, cause}`, skip warnings (`summary_skipped`, …) and
 `error{code: chair_failed, cause}`; a cut chair decision's `warning{code: chair_output_cut}` names
 `EXTERNAL_LLM_MAX_TOKENS`; with an absent worker the first round waits once and the rest fail at once. Refusals:

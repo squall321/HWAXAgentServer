@@ -112,8 +112,8 @@ def test_bind_의_max_tokens_가_과제에_실리고_넘는_답은_그_자리에
     assert (full.content, full.response_metadata["finish_reason"]) == (long, "stop")
 
 
-def test_도구를_묶을_수_없다_evidence_only():
-    with pytest.raises(NotImplementedError, match="evidence_only"):
+def test_도구를_묶을_수_없다_좌석_조회는_글_왕복이다():
+    with pytest.raises(NotImplementedError, match="글 왕복"):
         x.ExternalChatModel(board=x.Board()).bind_tools([])
 
 

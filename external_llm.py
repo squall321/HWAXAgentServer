@@ -702,7 +702,8 @@ def _model_class():
     class ExternalChatModel(BaseChatModel):
         """엔진이 LLM 을 쓰는 자리에 그대로 들어가는 외부 응답자 — ainvoke([("system", …), ("human", …)]) 와 bind(max_tokens=…)를
         받는다. 부르면 과제를 줄 세우고 낸 글을 AIMessage(content, response_metadata.finish_reason)로 돌려준다. 토큰 사용량은 모른다
-        (싣지 않는다 — 0 으로 세지 않는다). 도구를 묶을 수 없다(bind_tools 는 NotImplementedError — 이 길은 evidence_only 다)."""
+        (싣지 않는다 — 0 으로 세지 않는다). 도구를 묶을 수 없다(bind_tools 는 NotImplementedError — 좌석 자유 조회는 글 왕복이다:
+        deliberation._TextReactAgent 가 도구 목록을 과제 글에 싣고 응답자가 적은 CALL 줄을 엔진이 실행한다)."""
 
         max_tokens: int | None = None
         owner: str = ""
@@ -740,7 +741,7 @@ def _model_class():
             return ChatResult(generations=[ChatGeneration(message=msg, generation_info={"finish_reason": finish})])
 
         def bind_tools(self, tools, **kwargs):
-            raise NotImplementedError("외부 응답자는 엔진의 도구를 실행할 수 없다 — 이 길은 좌석 도구 호출이 없는 evidence_only 다")
+            raise NotImplementedError("외부 응답자에는 도구를 묶을 수 없다 — 좌석 자유 조회는 글 왕복(deliberation._TextReactAgent)이다")
 
     return ExternalChatModel
 

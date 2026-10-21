@@ -211,7 +211,7 @@ def _path(job_id: str) -> Path:
 _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step", "owner_aff")
+              "last_step", "owner_aff", "tool_mode")
 
 
 def _list_path(job_id: str) -> Path:
@@ -233,6 +233,11 @@ def _list_rec(job: dict) -> dict:
 def _external(job: dict) -> bool:
     """외부 응답자(판단 LLM 이 잡 주인의 Claude Code 워크플로)로 돈 잡인가 — 잡 기록의 걸린 값으로 본다."""
     return (job.get("opts") or {}).get("llm") == "external"
+
+
+def _tool_mode(job: dict) -> str:
+    """외부 응답자 잡의 좌석 자유 조회 길 — tools(글 왕복) · evidence_only. 칸이 없는 잡은 글 왕복 전에 돈 것이라 evidence_only 다."""
+    return job.get("tool_mode") or "evidence_only"
 
 
 def _stamp(st: os.stat_result) -> list:
@@ -562,6 +567,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
         content = data.get("content")
         if content:
             job["result_text"] = content
+        if data.get("tool_mode") in ("tools", "evidence_only"):      # 외부 응답자 심의만 싣는다 — 실제로 돈 길
+            job["tool_mode"] = data["tool_mode"]
     elif event == "error":
         # 설정 이름(knob)은 여기서 붙인다(상태줄·카드·경고와 같다).
         job["error"] = (str(data.get("message") or "알 수 없는 오류")
@@ -685,22 +692,17 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 상한에서 줄인 것(rounds=99)이 걸린 값처럼 남는다 — 호출자가 손잡이를 끈 줄 아는 그 기록이 된다.
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
-    # 외부 응답자 길이 닫는 값(free_tools=0 — evidence_only)은 호출자의 선택이 아니다. 손잡이 칸에는 호출자가 보낸 값을 읽은 그대로
-    # 적고(외부 응답자 없이 읽은 값) 닫힌 값은 external_forced 에 따로 적는다 — 한 칸에 섞으면 이 잡을 GLM 으로 이어 갈 때
-    # (이어하기는 llm 을 이어받지 않는다) 닫힌 0 을 호출자가 고른 값처럼 물려받았다.
-    _mine = (_resolve_opts({k: v for k, v in applied.items() if k not in ("evidence", "llm")})
-             if _read.llm == "external" else _read)
     # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
     # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
-    applied = {**applied, **{k: getattr(_mine, k) for k in applied
+    applied = {**applied, **{k: getattr(_read, k) for k in applied
                              if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
     # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다.
-    # 받으면 잡 기록에 판단 LLM 과 그 길이 닫은 값(external_forced)을 적는다.
+    # 받으면 잡 기록에 판단 LLM 을 적는다.
     _refused = _external_refusal(app, applied, owner or user_email)
     if _refused:
         raise ValueError(f"{_refused['code']}: {_refused['message']}")
     if _read.llm == "external":
-        applied = {**applied, "llm": "external", "external_forced": {"free_tools": _read.free_tools}}
+        applied = {**applied, "llm": "external"}
     elif "llm" in applied:
         applied = {**applied, "llm": _read.llm}
 
@@ -728,8 +730,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         "owner_aff": str(owner_aff or "").strip(),
         # 누가 띄웠나(M3.md #26) — app 이면 카드 대조 관문의 절반 판정에 세지 않는다(running_human_count).
         "started_by": _started_by(opts.get("started_by")),
-        # 외부 응답자 잡만 — 과제를 받는 주인. 그 잡의 자리(주인마다 EXTERNAL_PER_OWNER 건)를 이 이름으로 센다(_pump).
-        **({"task_owner": x_owner} if _read.llm == "external" else {}),
+        # 외부 응답자 잡만 — 과제를 받는 주인. 그 잡의 자리(주인마다 EXTERNAL_PER_OWNER 건)를 이 이름으로 센다(_pump). tool_mode 는
+        # 좌석 자유 조회의 길(tools — 글 왕복 · evidence_only) — 여기서는 요청으로 적고, 엔진의 result 프레임이 실제로 돈 길로 고쳐 적는다.
+        **({"task_owner": x_owner, "tool_mode": "tools" if _read.free_tools else "evidence_only"}
+           if _read.llm == "external" else {}),
     }
     _JOBS[job_id] = job
     # 누구든 줄 끝에 세운 다음 줄을 한 번 돌린다 — 자리가 있으면 그 자리에서 곧바로 뜬다(종전과 같다).
@@ -855,8 +859,8 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "error": job.get("error"),
     }
     if _external(job):
-        # 판단 LLM 이 외부 응답자였다 — 좌석 도구 호출이 없는 evidence_only 등급이다(리스크 원장의 tool_mode 와 같은 말).
-        out["llm"], out["tool_mode"] = "external", "evidence_only"
+        # 판단 LLM 이 외부 응답자였다 — tool_mode 는 좌석 자유 조회의 길(리스크 원장의 tool_mode 와 같은 말).
+        out["llm"], out["tool_mode"] = "external", _tool_mode(job)
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
         # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —
@@ -930,7 +934,7 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
     lim = max(1, min(200, int(limit)))
     page = [_turn_view(t, full) for t in rows[off:off + lim]]
     clipped = sum(1 for t in page if t.get("say_clipped"))
-    return {"job_id": job_id, **({"llm": "external", "tool_mode": "evidence_only"} if _external(job) else {}),
+    return {"job_id": job_id, **({"llm": "external", "tool_mode": _tool_mode(job)} if _external(job) else {}),
             "total": total, "offset": off, "limit": lim,
             "next_offset": off + lim if off + lim < total else None,
             "remaining": max(0, total - off - lim),

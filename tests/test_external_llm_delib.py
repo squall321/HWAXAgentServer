@@ -1,4 +1,4 @@
-# 심의(쟁점 패널)를 외부 응답자로 — delib_opts.llm=external 이 evidence_only 를 강제하고 외부 창으로 셈하며 결과·잡 기록에 표지를 남기는지, 한도가 기존 오류 길(좌석 유실·의장 실패)로 cause 를 싣고 나가는지 본다
+# 심의(쟁점 패널)를 외부 응답자로 — delib_opts.llm=external 이 좌석 자유 조회를 글 왕복(응답자가 CALL 줄을 적고 엔진이 실행)으로 돌리고 외부 창으로 셈하며 결과·잡 기록에 표지를 남기는지, 한도가 기존 오류 길(좌석 유실·의장 실패)로 cause 를 싣고 나가는지 본다
 #
 # 쟁점 패널은 리스크 앱이 포털 /agent/chat 으로 띄우는 심의다(free_tools=1 · tools=[] · voc=off · risk-review · save_report=0 ·
 # started_by=app). 같은 모양으로 run_deliberation 을 **실제로** 돌리고 LLM 자리에는 아무것도 바꿔 끼우지 않는다 — 판단 호출은 전부
@@ -69,18 +69,21 @@ def on(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
 
 
-def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None, brain=None, question=Q):
+def _panel(monkeypatch, opts=None, *, user=OWNER, worker=True, board=None, entry=None, brain=None, question=Q,
+           search_answer='{"hits": []}', tools_loader=None):
     """쟁점 패널 하나를 끝까지 — (사건, 일꾼, create_react_agent 에 묶인 도구, 도구 사전, 줄). brain 을 주면 일꾼이 그것으로 답한다.
-    opts 의 값이 None 이면 PANEL 에서 그 칸을 뺀다(보내지 않은 것과 같다)."""
+    opts 의 값이 None 이면 PANEL 에서 그 칸을 뺀다(보내지 않은 것과 같다). search_answer 는 agent_search 가 돌려줄 글이고,
+    tools_loader 를 주면 도구 사전 대신 그것이 도구를 낸다."""
     import langgraph.prebuilt
 
-    tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
+    tools = {"agent_search": _Tool("agent_search", search_answer),
+             "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
 
     async def fake_tools(*_a, **_k):
         return tools
 
     bound = []
-    monkeypatch.setattr(d, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(d, "_tools_by_name", tools_loader or fake_tools)
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent",
                         lambda _llm, ts, **_k: bound.extend(t.name for t in ts) or object())
     board = board or x.Board(x.Settings())
@@ -111,20 +114,26 @@ def _cards(events):
     return [data for ev, data in events if ev == "delib" and data.get("kind") == "evidence"]
 
 
-# ── 끝까지 — evidence_only · 표지 · 판정 ───────────────────────────────────────────
-def test_외부_응답자로_쟁점_패널이_evidence_only_로_끝까지_돌고_결과에_표지가_남는다(monkeypatch, ctx_1m, on):
+# ── 끝까지 — 글 왕복 조회 · 표지 · 판정 ───────────────────────────────────────────
+def test_외부_응답자로_쟁점_패널이_끝까지_돌고_좌석_조회는_글_왕복이며_결과에_표지가_남는다(monkeypatch, ctx_1m, on):
     events, w, bound, tools, board = _panel(monkeypatch)
     assert not [data for ev, data in events if ev == "error"], events[-3:]
-    assert bound == [], "좌석에 도구를 묶었다 — evidence_only 가 아니다"
+    assert bound == [], "외부 응답자 좌석을 create_react_agent 에 묶었다 — 외부 응답자에는 도구를 묶을 수 없다(글 왕복이어야 한다)"
     steps = [data.get("step", "") for ev, data in events if ev == "status"]
-    assert any(s.startswith("외부 응답자 실행 — ") for s in steps)
-    notice = next(c for c in _cards(events) if c["source"] == "외부 응답자 실행 — evidence_only")
-    assert notice["notice"] is True and notice["included"] is False and "free_tools=1 는 닫혔다" in notice["text"]
+    assert any(s.startswith("외부 응답자 실행 — ") and "글 왕복" in s for s in steps)
+    assert any(s.startswith("전문가 자유 조회 활성 — ") and "CALL 줄" in s for s in steps)
+    notice = next(c for c in _cards(events) if c["source"] == "외부 응답자 실행 — 좌석 도구 글 왕복")
+    assert notice["notice"] is True and notice["included"] is False and "엔진이 그 도구를 실행" in notice["text"]
     assert "200,000 토큰" in notice["text"], "외부 응답자 창으로 셈했다고 밝혀야 한다"
     result = next(data for ev, data in events if ev == "result")
-    assert (result["llm"], result["tool_mode"]) == ("external", "evidence_only")
+    assert (result["llm"], result["tool_mode"]) == ("external", "tools")
     decision = next(data["text"] for ev, data in events if ev == "delib" and data.get("kind") == "decision")
     assert decision.startswith("■ 외부 응답자 실행 — ") and result["content"].startswith("■ 외부 응답자 실행 — ")
+    assert "글 왕복으로 돌았다" in decision.split("\n", 1)[0]
+    # 좌석마다 조회 과제(1 · 2 라운드 — 수렴은 조회하지 않는다)가 외부 응답자에게 갔다 — 도구 목록은 읽기 전용 후보만(쓰기 도구는 없다)
+    lookups = [s for s in w.seen if "[글로 도구 부르기" in s["system"]]
+    assert len(lookups) == 4 * 2, len(lookups)
+    assert all("- agent_search — " in s["system"] and "create_report_draft" not in s["system"] for s in lookups)
     spec = json.loads(re.findall(r"```json\s*(\{.*?\})\s*```", decision, re.S)[-1])
     assert (spec["schema"], spec["findings"][0]["judgement"], spec["scope"]["target_key"]) == ("risk_spec", "FAIL", TK)
     heads = [s["head"] for s in w.seen]
@@ -139,6 +148,80 @@ def test_외부_응답자로_쟁점_패널이_evidence_only_로_끝까지_돌고
     assert not any("cause" in data for ev, data in events if ev in ("warning", "error"))
     assert board.counts() == {"queued": 0, "claimed": 0} and not w.errors
     assert tools["create_report_draft"].calls == [], "save_report=0 인데 저장했다"
+
+
+HIT = '{"hits": [{"id": "card-77", "text": "보스 둘레 간극 0.21 mm — 낙하 1.5 m 에서 접촉"}]}'
+CALLS = ['CALL {"tool": "agent_search", "args": {"query": "보스 간극"}}',
+         'CALL {"tool": "create_report_draft", "args": {"title": "몰래 저장"}}',      # 목록에 없는 도구(쓰기 — 자유 조회 후보가 아니다)
+         'CALL {"tool": "agent_search", 깨진 줄}',                                    # JSON 이 아니다
+         'CALL {"tool": "agent_search", "args": "보스"}',                              # args 가 객체가 아니다
+         'CALL {"tool": "agent_search", "args": {"query": "낙하 응력"}}',
+         'CALL {"tool": "agent_search", "args": {"query": "접착 계면"}}',
+         'CALL {"tool": "agent_search", "args": {"query": "넷째 — 예산 밖"}}']        # tool_budget 3 을 넘는다
+
+
+def _lookup_brain(head, system, human):
+    """조회 과제면 첫 차례에 CALL 줄을 적고 다음 차례에 요약한다 — 그 밖은 심의 대본."""
+    if "[글로 도구 부르기" not in system:
+        return delib_respond(system, human)
+    if "[이 조회 단계에서 부른 것" not in human:
+        return "필요한 조회를 부른다.\n" + "\n".join(CALLS)
+    return "조회 요약: 보스 둘레 간극 0.21 mm(card-77) — 낙하 1.5 m 에서 접촉."
+
+
+def test_외부_응답자가_적은_CALL_줄을_엔진이_실행해_근거_공용_풀_발언_턴에_싣는다(monkeypatch, ctx_1m, on):
+    events, w, bound, tools, _board = _panel(monkeypatch, brain=_lookup_brain, search_answer=HIT)
+    assert not [data for ev, data in events if ev == "error"], events[-3:]
+    assert bound == []
+    # 엔진이 실행한 것은 목록에 있는 도구 · 예산 안의 줄뿐이다 — 좌석 넷 · 조회 라운드 둘 · 좌석마다 셋
+    assert tools["create_report_draft"].calls == [], "목록에 없는 쓰기 도구를 실행했다"
+    seat_calls = [c for c in tools["agent_search"].calls if "query" in c]     # 엔진이 스스로 부르는 지식 조회(q · agent_type)는 빼고
+    assert len(seat_calls) == 4 * 2 * 3
+    assert {c["query"] for c in seat_calls} == {"보스 간극", "낙하 응력", "접착 계면"}
+    # 두 번째 차례 과제 — 실행한 호출과 결과, 실행하지 않은 줄과 까닭, 예산을 다 썼다는 말
+    second = [s for s in w.seen if "[글로 도구 부르기" in s["system"] and "[이 조회 단계에서 부른 것" in s["human"]]
+    assert len(second) == 4 * 2
+    h = second[0]["human"]
+    assert 'CALL {"tool": "agent_search", "args": {"query": "보스 간극"}}\n결과:\n' + HIT in h
+    assert "목록에 없는 도구다(create_report_draft)" in h and "JSON 으로 읽지 못했다" in h
+    assert "args 가 JSON 객체가 아니다" in h and "호출 예산(3회)을 넘었다" in h and "넷째 — 예산 밖" in h
+    assert "호출 예산을 다 썼다" in h
+    # 조회가 GLM 길과 같은 자리로 흐른다 — 상태줄(짝 키) · 근거 카드 · 좌석 발언 턴
+    looked = [data for ev, data in events if ev == "status" and data.get("tool") == "agent_search" and " 조회: " in data["step"]]
+    assert len(looked) == 4 * 2 * 3 and all(data["ok"] and data["call"].startswith("text-") for data in looked)
+    cards = [c for c in _cards(events) if c["source"].endswith(" · agent_search")]
+    assert len(cards) == 4 * 2 * 3 and all(c["included"] and c["text"] == HIT for c in cards)
+    speech = [s for s in w.seen if "전문가입니다" in s["system"]]
+    assert speech and any("보스 둘레 간극 0.21 mm" in s["human"] for s in speech), "조회 결과가 좌석 발언 턴에 실리지 않았다"
+    assert any("(전문가 자체 요약) 조회 요약: 보스 둘레 간극 0.21 mm" in s["human"] for s in speech)
+    result = next(data for ev, data in events if ev == "result")
+    assert result["tool_mode"] == "tools"
+
+
+def test_free_tools_0_이면_외부_응답자_심의는_evidence_only_다(monkeypatch, ctx_1m, on):
+    events, w, bound, tools, _board = _panel(monkeypatch, {"free_tools": 0}, brain=_lookup_brain, search_answer=HIT)
+    assert not [data for ev, data in events if ev == "error"], events[-3:]
+    assert not [s for s in w.seen if "[글로 도구 부르기" in s["system"]]
+    assert not [c for c in tools["agent_search"].calls if "query" in c], "좌석 자유 조회가 돌았다"
+    notice = next(c for c in _cards(events) if c["source"] == "외부 응답자 실행 — evidence_only")
+    assert "free_tools=0" in notice["text"] and "글 왕복" not in notice["text"]
+    start = next(data["step"] for ev, data in events if ev == "status" and data.get("step", "").startswith("외부 응답자 실행 — "))
+    assert "evidence_only 로 돈다" in start and "글 왕복" not in start
+    result = next(data for ev, data in events if ev == "result")
+    assert (result["llm"], result["tool_mode"]) == ("external", "evidence_only")
+    assert "evidence_only 로 돌았다" in result["content"].split("\n", 1)[0]
+
+
+async def _write_only(*_a, **_k):
+    """쓰기 도구 하나뿐 — 엔진은 돌지만 좌석 자유 조회 후보(읽기 전용)는 하나도 없다."""
+    return {"create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
+
+
+def test_쓸_도구가_하나도_없으면_요청이_켜도_결과는_evidence_only_다(monkeypatch, ctx_1m, on):
+    events, w, *_ = _panel(monkeypatch, brain=_lookup_brain, tools_loader=_write_only)
+    assert any(ev == "warning" and data.get("code") == "free_tools_unavailable" for ev, data in events)
+    result = next(data for ev, data in events if ev == "result")
+    assert result["tool_mode"] == "evidence_only" and "evidence_only 로 돌았다" in result["content"].split("\n", 1)[0]
 
 
 def test_외부_창으로_셈해_1M_창이면_들어갈_큰_근거가_줄어_실리고_창은_그_심의_밖으로_새지_않는다(monkeypatch, ctx_1m, on):
@@ -196,7 +279,7 @@ def test_llm_을_안_주면_GLM_길_그대로다(monkeypatch, ctx_1m, on):
 
 
 # ── MCP 잡 길(deliberate_start) ─────────────────────────────────────────────────
-def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER)):
+def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER), tools_loader=None):
     import langgraph.prebuilt
 
     tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
@@ -204,7 +287,7 @@ def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER)):
     async def fake_tools(*_a, **_k):
         return tools
 
-    monkeypatch.setattr(d, "_tools_by_name", fake_tools)
+    monkeypatch.setattr(d, "_tools_by_name", tools_loader or fake_tools)
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda *_a, **_k: pytest.fail("도구를 묶었다"))
     monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
     monkeypatch.setattr(delib_jobs, "_JOBS", {})
@@ -232,15 +315,29 @@ def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER)):
 def test_MCP_심의_시작도_외부_응답자로_돌고_잡_기록에_llm_과_tool_mode_가_남는다(monkeypatch, tmp_path, ctx_1m, on):
     out, done, tr = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "voc": "off",
                                                           "free_tools": 1})
-    assert (out["llm"], out["tool_mode"]) == ("external", "evidence_only")
+    assert (out["llm"], out["tool_mode"]) == ("external", "tools")
     assert done["status"] == "done", done.get("error")
-    # 손잡이 칸은 호출자가 보낸 값(1)이고 외부 응답자 길이 닫은 값은 따로 적힌다(GLM 이어하기가 닫힌 0 을 물려받지 않게 — L5).
+    # 손잡이 칸은 호출자가 보낸 값 그대로 돈다 — 외부 응답자 길이 닫는 값이 없다(좌석 자유 조회는 글 왕복이다).
     ao = done["applied_opts"]
-    assert (done["llm"], ao["llm"], ao["free_tools"], ao["external_forced"]) == ("external", "external", 1, {"free_tools": 0})
+    assert (done["llm"], ao["llm"], ao["free_tools"]) == ("external", "external", 1) and "external_forced" not in ao
     assert ao["consent_external"] is True, "반출 동의 표지가 잡 기록에 남아야 한다"
-    assert done["decision"].startswith("■ 외부 응답자 실행 — ")
-    assert (tr["llm"], tr["tool_mode"]) == ("external", "evidence_only") and tr["total"] > 0
-    assert any(e["source"] == "외부 응답자 실행 — evidence_only" for e in done["evidence_omitted"])
+    assert done["decision"].startswith("■ 외부 응답자 실행 — ") and done["tool_mode"] == "tools"
+    job = delib_jobs._JOBS[out["job_id"]]
+    assert delib_jobs.summary(delib_jobs._list_rec(job))["tool_mode"] == "tools", "목록 색인이 tool_mode 를 잃었다"
+    assert (tr["llm"], tr["tool_mode"]) == ("external", "tools") and tr["total"] > 0
+    assert any(e["source"] == "외부 응답자 실행 — 좌석 도구 글 왕복" for e in done["evidence_omitted"])
+
+
+def test_MCP_외부_잡의_tool_mode_는_엔진이_실제로_돈_길로_고쳐_적힌다(monkeypatch, tmp_path, ctx_1m, on):
+    """시작 응답은 요청으로 적고(free_tools=1 → tools), 쓸 도구가 하나도 없어 evidence_only 로 돌았으면 result 프레임이 고쳐 적는다.
+    tool_mode 칸이 없는 옛 잡 기록은 글 왕복 전에 돈 것이라 evidence_only 로 읽는다."""
+    out, done, tr = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "voc": "off",
+                                                          "free_tools": 1}, tools_loader=_write_only)
+    assert out["tool_mode"] == "tools" and done["status"] == "done", done.get("error")
+    assert (done["tool_mode"], tr["tool_mode"]) == ("evidence_only", "evidence_only")
+    old = {**delib_jobs._JOBS[out["job_id"]]}
+    old.pop("tool_mode")
+    assert delib_jobs.summary(old)["tool_mode"] == "evidence_only"
 
 
 def test_MCP_심의_시작은_꺼진_서버와_신원_없는_호출을_잡을_만들기_전에_거절한다(monkeypatch, tmp_path, ctx_1m):
@@ -255,13 +352,14 @@ def test_MCP_심의_시작은_꺼진_서버와_신원_없는_호출을_잡을_�
 
 # ── 요청 값 읽기 · 안내 ─────────────────────────────────────────────────────────
 def test_심의_요청의_llm_읽기():
+    # 외부 응답자 길이 좌석 자유 조회를 닫지 않는다 — 호출자가 보낸 값 · 서버 기본값 그대로다(글 왕복)
     o = d._resolve_opts({"llm": "external", "free_tools": 1})
-    assert (o.llm, o.free_tools, o.external_closed) == ("external", 0, ["free_tools=1"])
-    o = d._resolve_opts({"llm": "external"})
-    assert (o.llm, o.free_tools, o.external_closed) == ("external", 0, []), "서버 기본값으로 켜진 것은 호출자가 청한 것이 아니다"
+    assert (o.llm, o.free_tools) == ("external", 1) and not hasattr(o, "external_closed")
+    assert d._resolve_opts({"llm": "external"}).free_tools == d._resolve_opts({}).free_tools
+    assert d._resolve_opts({"llm": "external", "free_tools": 0}).free_tools == 0
     o = d._resolve_opts({"llm": "gpt", "free_tools": 1})
     assert (o.llm, o.free_tools) == ("glm", 1) and "llm=gpt" in o.req_unread["llm"]
-    assert d._resolve_opts({}).llm == "glm" and d._resolve_opts(None).external_closed == []
+    assert d._resolve_opts({}).llm == "glm"
     assert json.dumps(vars(d._resolve_opts(None)), default=str)          # 직렬화가 깨지지 않는다
 
 

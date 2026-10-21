@@ -290,10 +290,23 @@ def _delib_frames(monkeypatch) -> dict:
     out["start_status"] = next(data for ev, data in events if ev == "status"
                                and data.get("step", "").startswith("외부 응답자 실행"))
     out["notice_card"] = next(data for ev, data in events if ev == "delib" and data.get("kind") == "evidence"
-                              and data.get("source") == "외부 응답자 실행 — evidence_only")
+                              and data.get("source") == "외부 응답자 실행 — 좌석 도구 글 왕복")
     res = next(data for ev, data in events if ev == "result")
     out["result"] = {**{k: v for k, v in res.items() if k != "content"},
                      "content": res["content"].split("\n", 1)[0] + "\n…(결정문 — 줄임)"}
+    # 좌석 자유 조회의 글 왕복 — 첫 차례 과제의 규약 · 도구 목록, 응답자가 적은 CALL 줄, 엔진이 실행해 다음 차례에 이어 붙인 결과
+    from test_external_llm_delib import HIT, _lookup_brain  # noqa: PLC0415
+
+    events, w, _b, tools, _bd = _panel(monkeypatch, brain=_lookup_brain, search_answer=HIT)
+    first = next(s for s in w.seen if "[글로 도구 부르기" in s["system"] and "[이 조회 단계에서 부른 것" not in s["human"])
+    second = next(s for s in w.seen if s["head"]["kind"] == "deliberation" and "[이 조회 단계에서 부른 것" in s["human"]
+                  and s["system"] == first["system"])
+    out["seat_lookup"] = {"system_rules": first["system"][first["system"].index("[글로 도구 부르기"):],
+                          "answer_first": first["answer"],
+                          "second_turn": second["human"][second["human"].index("[이 조회 단계에서 부른 것"):],
+                          "answer_second": second["answer"],
+                          "executed": [{"tool": "agent_search", "args": c} for c in tools["agent_search"].calls
+                                       if "query" in c][:3]}
     # 쟁점 패널 질문('[쟁점 …]' — 리스크심사 머리가 없다)의 외부 과제 머리 — delib_opts.target_key 가 대상 열쇠를 싣는다(X-D8 ⑦)
     events, w, *_ = _panel(monkeypatch, question=Q_ISSUE)
     out["issue_panel_task_head"] = {k: w.seen[0]["head"][k] for k in ("kind", "target_key", "label")}
@@ -313,6 +326,9 @@ def _delib_frames(monkeypatch) -> dict:
                    "issue_panel_task_head": {"question": Q_ISSUE, "delib_opts": "request.delib_opts 그대로(target_key 포함)",
                                              "shows": "review_task_next 머리의 kind · target_key · label"},
                    "path": "포털 /agent/chat 의 /심의(리스크 앱 쟁점 패널) — 여기서는 run_deliberation 을 바로 돌렸다",
+                   "seat_lookup": "좌석 자유 조회(글 왕복) — 첫 차례 과제 system 의 규약 · 도구 목록부터, 응답자의 CALL 줄 답, 엔진이 "
+                                  "실행한 결과를 이어 붙인 둘째 차례 human 의 뒷부분(가짜 일꾼 — 넷째 줄은 예산 밖 · 쓰기 도구 · 깨진 줄은 "
+                                  "실행하지 않는다)",
                    "absent": "일꾼 없음 · EXTERNAL_LLM_WAIT_S=300(시계를 빨리 돌렸다)",
                    "bad_request": "llm 에 모르는 값('claude') — 스위치가 꺼진 서버에서도 bad_request 다(받는 값은 glm·external)"}
     return out
@@ -375,7 +391,11 @@ def test_예제가_계약의_칸을_싣는다():
     assert [p["next_offset"] is None for p in ex["read_chain_long"]["pages"]].count(True) == 1
     assert {t["name"] for t in _load("mcp_tools.json")} == {"review_task_next", "review_task_read", "review_task_submit"}
     frames = _load("delib_frames.json")
-    assert (frames["result"]["llm"], frames["result"]["tool_mode"]) == ("external", "evidence_only")
+    assert (frames["result"]["llm"], frames["result"]["tool_mode"]) == ("external", "tools")
+    look = frames["seat_lookup"]
+    assert look["system_rules"].startswith("[글로 도구 부르기") and 'CALL {"tool": "<도구 이름>", "args": {<인자>}} 꼴로' in look["system_rules"]
+    assert look["second_turn"].startswith("[이 조회 단계에서 부른 것") and "\n결과:\n" in look["second_turn"]
+    assert look["executed"] and all(c["tool"] == "agent_search" for c in look["executed"])
     assert frames["seat_lost_absent"]["cause"] == frames["chair_failed_absent"]["cause"] == "external_worker_absent"
     assert (frames["refused_disabled"]["code"], frames["refused_owner_missing"]["code"],
             frames["refused_consent_required"]["code"], frames["refused_bad_request"]["code"]) == (
