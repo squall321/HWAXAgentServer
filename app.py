@@ -5173,7 +5173,12 @@ async def _with_delib_images(req, q: str, start):
     if imgs:
         async for chunk in _delib_image_evidence(req, q, imgs):
             yield chunk
-        if await asyncio.to_thread(_base_vision):
+        if _delib_engine._wants_external(req.delib_opts):
+            # 외부 응답자 심의 — 과제는 글뿐이라(external_llm 이 그림 조각을 싣지 못한다) 그림 조각은 싣지 않는다. 판독문은 위에서 근거로
+            # 실렸다(동의한 반출의 글이다). 종전엔 심의 LLM 의 판정대로 '그림 N장을 싣는다' 고 말하고 조각은 과제에서 말없이 빠졌다.
+            yield _sse("status", {"step": f"외부 응답자 심의다 — 과제가 글뿐이라 그림 {len(imgs)}장 자체는 싣지 않는다(판독문은 근거로 "
+                                          "간다)", "tool": None})
+        elif await asyncio.to_thread(_base_vision):
             pick = imgs[-_vision.HISTORY_IMAGES:] if _vision.HISTORY_IMAGES > 0 else []
             ps, miss = await asyncio.to_thread(_vision.parts, [u for u, _ in pick], ARTIFACT_DIR, AIDH_HTTP, len(pick))
             if ps:

@@ -119,11 +119,12 @@ def test_판독문은_그림_해시로_남아_다시_읽지_않는다(_iso):
     assert a1 == a2 and tr.calls == 1 and (_iso / ".transcripts").is_dir()
 
 
-def _delib(monkeypatch, *, base_vision: str, evidence=None):
+def _delib(monkeypatch, *, base_vision: str, evidence=None, extra=None):
     tr = _Transcriber()
     monkeypatch.setattr(app, "_transcriber", lambda _a: tr)
     monkeypatch.setenv("LLM_VISION", base_vision)
-    req = app.ChatRequest(message="/심의 최대 위치", groups=[], history=HIST, delib_opts={"evidence": evidence or []})
+    req = app.ChatRequest(message="/심의 최대 위치", groups=[], history=HIST,
+                          delib_opts={"evidence": evidence or [], **(extra or {})})
     seen = {}
 
     async def engine(opts):
@@ -160,6 +161,16 @@ def test_심의_LLM_이_그림을_받으면_좌석_의장_호출마다_그림도
     assert "그림 2장을 좌석 · 의장 호출마다 싣는다" in out
     assert any(e.get("tool") == "vision_transcribe" for e in seen["opts"]["evidence"]), "판독문도 근거로 — 짚을 번호가 있게"
     assert seen["after"] is None, "심의가 끝나면 문맥 변수를 되돌린다"
+
+
+def test_외부_응답자_심의는_그림_조각을_싣지_않고_판독문만_근거로_간다고_말한다(monkeypatch):
+    """외부 응답자(llm=external)의 과제는 글뿐이다 — 심의 LLM 이 그림을 받아도 그림 조각을 문맥에 세우지 않고, 상태 줄이 그렇다고
+    말한다(종전엔 '그림 N장을 싣는다' 고 말하고 조각은 과제에서 말없이 빠졌다). 판독문은 근거로 간다."""
+    out, seen, _tr = _delib(monkeypatch, base_vision="1", extra={"llm": "external", "consent_external": True})
+    assert seen["imgs"] is None and seen["seat"] is None
+    assert "외부 응답자 심의다 — 과제가 글뿐이라 그림 2장 자체는 싣지 않는다(판독문은 근거로 간다)" in out
+    assert "좌석 · 의장 호출마다 싣는다" not in out
+    assert any(e.get("tool") == "vision_transcribe" for e in seen["opts"]["evidence"])
 
 
 def test_그림이_있으면_사람_메시지를_그림_먼저_글_뒤로_보낸다():
