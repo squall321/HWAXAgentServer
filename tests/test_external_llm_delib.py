@@ -381,6 +381,24 @@ def test_꺼진_서버의_심의_옵션_안내에는_llm_이_없다():
     assert "llm(판단 LLM" not in m._ADV_DESC
 
 
+def test_심의_메뉴는_외부_응답자_창의_한도를_따로_싣는다(monkeypatch, ctx_1m):
+    """외부 응답자 심의는 근거 · 사람 의견 상한을 외부 창(EXTERNAL_LLM_CTX_TOKENS)에서 유도한다 — limits(이 서버의 1M 창)만 보고 근거를
+    꾸린 호출자는 외부 심의에서 뒤쪽이 빠진다. 길이 열린 서버의 deliberate_jobs 는 limits_external 을 싣고, 꺼진 서버는 종전 그대로다."""
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None, external_board=x.Board(x.Settings())))
+    monkeypatch.setattr(m, "_APP", stub)
+    off = asyncio.run(m.deliberate_jobs())
+    assert "limits_external" not in off
+    monkeypatch.setenv("EXTERNAL_LLM_ENABLED", "1")
+    on = asyncio.run(m.deliberate_jobs())
+    ext, glm = on["limits_external"], on["limits"]
+    assert ext["ctx_tokens"] == x.CTX_DEFAULT
+    assert 0 < ext["evidence_total_chars"] < glm["evidence_total_chars"], (ext, glm)
+    assert ext["evidence_items"] == glm["evidence_items"] and set(ext) == {"ctx_tokens", *glm} - {
+        "seats", "tools", "apps", "options", "timeout_s_max", "timeout_s_default"}
+    assert app._model_context_tokens() == 1_048_576 and x.ctx_override.get() is None, "외부 창이 메뉴 밖으로 샜다"
+    assert m._external_limits() == ext and x.ctx_override.get() is None, "같은 문맥에서 부른 뒤에도 외부 창을 되돌려야 한다"
+
+
 # ── 대상 열쇠(delib_opts.target_key — X-D8 ⑦) ───────────────────────────────────────
 def test_쟁점_패널_꼴의_외부_심의는_delib_opts_의_대상_열쇠를_과제_머리에_싣는다(monkeypatch, ctx_1m, on):
     """리스크 앱 쟁점 패널의 질문은 '[쟁점 …]' 로 시작해 리스크심사 머리가 없다 — 종전엔 그 심의의 과제 머리에 target_key 가 없어 제 대상의

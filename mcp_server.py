@@ -365,6 +365,20 @@ def _evid_limits() -> dict:
             "evidence_total_chars": total}
 
 
+def _external_limits() -> dict | None:
+    """외부 응답자 심의(advanced.llm=external)의 창에서 잰 한도 — 길이 열린 서버에서만(아니면 None). 외부 심의는 근거 · 사람 의견 상한을
+    외부 응답자 창(EXTERNAL_LLM_CTX_TOKENS)에서 유도하므로 limits(이 서버의 LLM 창)보다 작을 수 있다 — /health.external_llm.evid_budget
+    과 같은 셈이다(app._external_llm_health)."""
+    board = external_llm.board_of(_APP)
+    if board is None:
+        return None
+    token = external_llm.ctx_override.set(board.settings.ctx_tokens)
+    try:
+        return {"ctx_tokens": board.settings.ctx_tokens, **_evid_limits(), "human_note_chars": _engine._human_note_max()}
+    finally:
+        external_llm.ctx_override.reset(token)
+
+
 # 인자 설명(inputSchema 의 description) — 클라이언트 LLM 은 도구 설명과 함께 인자마다 이 글을 본다(게이트웨이 인자 설명 점수판,
 # 포털 docs/improvement-1015 6번). 상한 숫자는 엔진 상수에서 읽는다 — 손으로 적은 수는 낡는다. 긴 규칙은 도구 설명의 절을 가리킨다.
 _A_QUESTION = "심의할 화두(필수). 구체적일수록 좌석 발굴이 정확하다. 응답에는 길면 머리만 되돌린다(question_chars)."
@@ -822,6 +836,8 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
                    # LLM 호출 1회 한도(초) — 요청이 청할 수 있는 최대값과, 안 주면 걸리는 서버 기본값(0=무제한).
                    "timeout_s_max": _engine.DELIB_TIMEOUT_MAX_S,
                    "timeout_s_default": getattr(getattr(_APP, "state", None), "delib_timeout_s", None)},
+        # 외부 응답자 심의(advanced.llm=external)의 한도 — 외부 창으로 셈한다(길이 열린 서버에만 싣는다 — 꺼진 서버의 응답은 종전 그대로).
+        **({"limits_external": ext} if (ext := _external_limits()) else {}),
         "running_max": delib_jobs.MAX_RUNNING,
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
