@@ -5220,6 +5220,46 @@ async def _delib_image_evidence(req, q: str, imgs: list):
                           "tool": None})
 
 
+class _SeatImageReader:
+    """심의 도중 좌석이 자유 조회로 받은 그림의 판독기 — 엔진(deliberation._seat_image_transcripts)이 부른다(HWAXPortal
+    docs/chat-depth-context T5-b · CD-D14, 사용자 요청 10-21). 판독 모델은 위 심의 판독과 같다(_transcriber — 그림을 받는 챗 서버 → 그림을
+    받는 VLLM_*). 같은 그림은 해시로 디스크에서 꺼낸다(vision.transcribe). 판독 묶음은 서버 전체에서 한 번에 하나다(묶음 안은 넷씩) — 20석이
+    한꺼번에 판독하면 챗 서버를 혼자 차지한다. 잠금은 이벤트 루프마다 새로 짓는다(시험은 asyncio.run 을 여러 번 돈다)."""
+
+    def __init__(self, app_):
+        self._app = app_
+        self._gate: tuple | None = None        # (루프, asyncio.Lock)
+
+    @property
+    def limit(self) -> int:
+        """조회 한 번(좌석 하나의 한 라운드)에서 판독하는 그림 수 — 심의 판독과 같은 손잡이(VISION_TRANSCRIBE_MAX)."""
+        return _vision.TRANSCRIBE_MAX
+
+    @staticmethod
+    def image_urls(text) -> list:
+        return _vision.image_urls(text)
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._gate is None or self._gate[0] is not loop:
+            self._gate = (loop, asyncio.Lock())
+        return self._gate[1]
+
+    async def read(self, urls: list, hint: str = "") -> dict | None:
+        """그림 주소들 → {주소: 판독문}(받아 오지 못했거나 판독에 실패한 것은 빈 글). 판독할 모델이 없으면 None."""
+        tr = await asyncio.to_thread(_transcriber, self._app)
+        if tr is None:
+            return None
+        async with self._lock():
+            got = await _vision.transcribe_all(tr, [(u, "") for u in urls], ARTIFACT_DIR, AIDH_HTTP, hint=(hint or "")[:300])
+        return {u: t for u, _why, t in got}
+
+
+# 엔진에 기동 때 단다 — MCP 심의 잡(delib_jobs)도 같은 엔진 모듈을 부른다(_with_delib_images 를 지나지 않는다). 엔진은 모듈로 읽는다 —
+# 시험이 엔진을 다시 읽으면(reload) 이 값은 비고, 그때는 종전대로 그림 주소만 간다.
+_delib_engine.SEAT_IMAGE_READER = _SeatImageReader(app)
+
+
 async def _derive_topic(history: list, fallback: str = "") -> dict:
     """대화에서 심의 화두 한 문장을 뽑는다. 엔드포인트와 `/심의` 경로가 **같은 것**을 쓴다.
 

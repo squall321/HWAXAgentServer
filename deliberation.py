@@ -2265,6 +2265,14 @@ _OUT_CUT_MARK = "…[출력 상한(max_tokens) 절단 — 이 응답은 불완�
 # (HWAXPortal docs/chat-depth-context T5, 사용자 결정 10-18 '탐침 뒤 자동'). 좌석은 제 태스크(ensure_future)로 돌아 이 값을 물려받는다.
 DELIB_IMAGES: contextvars.ContextVar = contextvars.ContextVar("delib_images", default=None)
 
+# 심의 도중 좌석이 자유 조회로 받은 그림의 판독기 — 에이전트 서버가 기동 때 단다(app._SeatImageReader, HWAXPortal docs/chat-depth-context
+# T5-b · CD-D14, 사용자 요청 10-21). 요청 길이 아니라 여기 두는 까닭 — MCP 심의 잡(delib_jobs)은 그림 준비(app._with_delib_images)를 지나지
+# 않고 엔진을 부른다. 없으면(엔진만 도는 시험 · 포털 계약 시험) 좌석이 받은 그림은 종전대로 결과 글의 그림 주소로만 간다.
+SEAT_IMAGE_READER = None
+# 라운드 하나의 좌석 그림 판독 셈 {read · fail · no_model · over · err} — 좌석 태스크 **안에서** 건다(_gather_with_img_acc). 심의 생성기의
+# 문맥에 걸고 되돌리면 yield 사이에 문맥이 바뀌어 되돌리기가 깨진다.
+_SEAT_IMG: contextvars.ContextVar = contextvars.ContextVar("seat_img", default=None)
+
 
 def _img_arg() -> tuple:
     """_llm_text 에 덧붙일 그림 인자 — 그림이 없으면 빈 튜플이라 호출 모양이 종전과 같다(시험의 가짜 _llm_text 들이 인자 셋을 받는다)."""
@@ -3926,6 +3934,64 @@ class _TextReactAgent:
             yield {"messages": list(msgs)}
 
 
+async def _seat_image_transcripts(calls: list, question: str) -> list:
+    """좌석 자유 조회 [(도구, 인자, 결과, 짝 키)] — 결과에 나온 그림을 판독해 그 호출 **바로 뒤에** 근거 항목
+    ('vision_transcribe', {image · from}, 판독문, 짝 키#imgN)으로 붙인다(T5-b). 그 좌석의 발언 블록 · 다른 좌석의 공용 근거 · 근거 카드가
+    이 목록을 그대로 쓰므로 세 곳에 함께 실린다. 도구 결과에 섞지 않는다 — 근거 카드가 도구 출력과 모델이 옮긴 글을 한 덩이로 보이고, 결과
+    상한에서 판독문이 먼저 잘린다. 판독기가 없으면 그대로 돌려준다. 판독하지 못한 그림(판독할 모델 없음 · 조회 한 번의 상한 밖 · 실패)은
+    라운드 셈(_SEAT_IMG)에 남겨 라운드가 알린다 — 조용히 빼지 않는다."""
+    rd = SEAT_IMAGE_READER
+    if rd is None:
+        return calls
+    found: list = []          # [(호출 순번, 그림 주소)] — 처음 나온 순서, 중복 없이
+    seen: set = set()
+    for i, (n, _ap, b, _cid) in enumerate(calls):
+        if n == "vision_transcribe" or not _delib_tool_result_ok(b):
+            continue
+        for u in rd.image_urls(b):
+            if u not in seen:
+                seen.add(u)
+                found.append((i, u))
+    if not found:
+        return calls
+    acc = _SEAT_IMG.get()
+    cap = max(0, int(getattr(rd, "limit", 0) or 0))
+    pick = found[:cap]
+    got = await rd.read([u for _i, u in pick], question) if pick else {}
+    if got is None:
+        if acc is not None:
+            acc["no_model"] += len(found)
+        return calls
+    by_call: dict = {}
+    for i, u in pick:
+        by_call.setdefault(i, []).append(u)
+    out: list = []
+    n_read = n_fail = 0
+    for i, c in enumerate(calls):
+        out.append(c)
+        for j, u in enumerate(by_call.get(i, [])):
+            t = str(got.get(u) or "").strip()
+            if not t:
+                n_fail += 1
+                continue
+            n_read += 1
+            out.append(("vision_transcribe", json.dumps({"image": u, "from": c[0]}, ensure_ascii=False),
+                        f"[그림 판독 — {c[0]} 의 결과에 나온 그림을 그림 읽는 모델이 글로 옮겼다(도구 결과가 아니다)]\n{t}",
+                        f"{c[3]}#img{j}" if c[3] else ""))
+    if acc is not None:
+        acc["read"] += n_read
+        acc["fail"] += n_fail
+        acc["over"] += len(found) - len(pick)
+    return out
+
+
+async def _gather_with_img_acc(acc: dict, *args):
+    """좌석 자유 조회 하나 — 라운드의 그림 판독 셈(acc)을 **이 태스크의 문맥에만** 걸고 _free_gather_one 을 부른다(CD-D14 ③). 이름은 부를 때
+    찾는다 — 시험이 _free_gather_one 을 가짜로 바꿔 끼운다."""
+    _SEAT_IMG.set(acc)
+    return await _free_gather_one(*args)
+
+
 async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budget: int,
                            prior: str = ""):
     """전문가 1명의 자유 조회(ReAct 1턴) — (키, 호출목록, 발언 주입 블록, 실패사유) 반환.
@@ -4021,6 +4087,15 @@ async def _free_gather_one(g_agent, persona: dict, question: str, ctx: str, budg
         interrupted = f"(조회 도중 중단: 해석 실패 {type(exc).__name__})"
         summary = interrupted
     calls = calls[:budget]
+    # 조회 결과에 나온 그림 — 판독해 그 호출 뒤에 근거 항목으로 붙인다(T5-b). 예산 자르기 **뒤라** 좌석의 조회 예산을 먹지 않는다. 판독이 무엇으로
+    # 터져도 조회를 막지 않는다 — 셈에 남겨 라운드가 알린다.
+    try:
+        calls = await _seat_image_transcripts(calls, question)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[deliberation] 좌석 그림 판독 실패({persona.get('key')}): {exc!r}")
+        _acc = _SEAT_IMG.get()
+        if _acc is not None:
+            _acc["err"] += 1
     # ⚠ `calls` 는 **4-튜플**이다(짝 키를 싣느라 늘렸다). 3개로 풀면 `ValueError` 가 나는데, 이 줄은 위 try 밖이라
     # 호출부의 blanket except 가 받아 `continue` 로 넘어간다. 그러면 **도구를 부른 좌석만** 근거 0건이 되고,
     # 아무것도 안 부른 좌석은 멀쩡해서 화면상 "조회할 게 없었나 보다" 로 보인다(_gather_good 이 푼다).
@@ -5729,9 +5804,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _prior += f"\n(… 그 앞 {len(_sigs) - len(_keep)}건 생략 — 오래된 순)"
             _gcut: list = []      # [(좌석, 건수, 원문 합, 건당 몫)] — 발언 턴 몫에 맞춰 줄인 좌석
             _nv_round: list = []  # ['좌석·도구'] — 리스크 심사 좌석이 리스크 앱 읽기 도구에서 not_visible 을 받은 것
+            # 좌석이 조회로 받은 그림의 판독 셈 — 좌석 태스크마다 같은 사전을 건다(_gather_with_img_acc, T5-b)
+            _img_acc = {"read": 0, "fail": 0, "no_model": 0, "over": 0, "err": 0}
             _gt = [asyncio.ensure_future(
-                _free_gather_one(_seat_agents.get(p["key"]) or g_agent, p, question,
-                                 _gctx, opts.tool_budget, _prior)) for p in personas]
+                _gather_with_img_acc(_img_acc, _seat_agents.get(p["key"]) or g_agent, p, question,
+                                     _gctx, opts.tool_budget, _prior)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
             # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
             # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,
@@ -5790,6 +5867,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 for _t in _gt:
                     if not _t.done():
                         _t.cancel()
+            # 좌석이 조회로 받은 그림(T5-b) — 판독해 실은 수, 그리고 못 한 것은 까닭과 함께 알린다(못 한 그림은 결과 글의 주소로만 갔다).
+            if _img_acc["read"]:
+                yield _sse("status", {"step": f"좌석 조회 그림 {_img_acc['read']}장을 판독해 근거로 실었다(vision_transcribe)",
+                                      "tool": None})
+            _img_miss = [txt for n, txt in ((_img_acc["no_model"], f"판독할 모델이 없어(그림을 받는 모델 없음) {_img_acc['no_model']}장"),
+                                            (_img_acc["over"], f"조회 한 번의 판독 상한(VISION_TRANSCRIBE_MAX) 밖 {_img_acc['over']}장"),
+                                            (_img_acc["fail"], f"판독 실패(그림을 못 받아 왔거나 모델이 답하지 않음) {_img_acc['fail']}장"),
+                                            (_img_acc["err"], f"판독 중 오류 {_img_acc['err']}회")) if n]
+            if _img_miss:
+                _img_txt = " · ".join(_img_miss)
+                yield _sse("status", {"step": f"좌석 조회 그림 중 판독하지 못한 것 — {_img_txt}(그 그림은 결과 글의 주소로만 갔다)",
+                                      "tool": None})
+                yield _delib("evidence", source="좌석 조회 그림 판독 못 함", included=False,
+                             text=f"{_dr(rnd)}라운드 좌석이 조회로 받은 그림 가운데 {_img_txt} — 판독하지 못해 좌석에게는 결과 글의 그림 "
+                                  "주소로만 갔다(모델은 그 그림을 보지 않았다).")
             # 리스크 앱이 좌석의 읽기를 not_visible 로 막았으면 알린다(risk-entry SEC-3). 그 응답은 isError 가 아닌 정상 JSON
             # 이라 게이트웨이 감사에는 성공으로 남고, 엔진은 좌석마다 ok:false 상태줄 한 줄뿐이라 질문의 diff_id 로 앞세운
             # 변경 전체 보기가 버려진 채 패널이 done 으로 끝났다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
