@@ -139,6 +139,7 @@ def test_외부_응답자로_쟁점_패널이_끝까지_돌고_좌석_조회는_
     heads = [s["head"] for s in w.seen]
     assert heads and {h["kind"] for h in heads} == {"deliberation"}
     assert {h["target_key"] for h in heads} == {TK} and {h["label"] for h in heads} == {"risk-review"}
+    assert not any("job_id" in h for h in heads), "포털 /chat 심의(MCP 잡이 아니다)에 잡 id 가 실렸다"
     assert len({h["run_id"] for h in heads}) == 1 and heads[0]["run_id"].startswith("delib-")
     seated = {re.search(r"'([^']+)' 전문가입니다", s["system"]).group(1) for s in w.seen if "전문가입니다" in s["system"]}
     assert seated == {"mech-a", "rel-b", "pcb-c", "delib-baseline-defender"}
@@ -279,7 +280,8 @@ def test_llm_을_안_주면_GLM_길_그대로다(monkeypatch, ctx_1m, on):
 
 
 # ── MCP 잡 길(deliberate_start) ─────────────────────────────────────────────────
-def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER), tools_loader=None):
+def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER), tools_loader=None, question=Q, job="risk-review",
+         with_worker=False):
     import langgraph.prebuilt
 
     tools = {"agent_search": _Tool("agent_search"), "create_report_draft": _Tool("create_report_draft", '{"id": 7}')}
@@ -295,11 +297,12 @@ def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER), tools_loader=Non
     stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None, external_board=x.Board(x.Settings())))
     monkeypatch.setattr(m, "_APP", stub)
 
+    w = FakeWorker(OWNER, poll_s=0.05)
+
     async def go():
-        w = FakeWorker(OWNER, poll_s=0.05)
         serve = asyncio.ensure_future(w.serve())
         try:
-            out = await m.deliberate_start(Q, job="risk-review", rounds=2, personas=SEATS, save_report=False,
+            out = await m.deliberate_start(question, job=job, rounds=2, personas=SEATS, save_report=False,
                                            advanced=advanced, ctx=ctx)
             await delib_jobs._TASKS[out["job_id"]]
             done = await m.deliberate_result(out["job_id"])
@@ -309,12 +312,15 @@ def _mcp(monkeypatch, tmp_path, *, advanced, ctx=ctx_of(OWNER), tools_loader=Non
             w.stop()
             await serve
 
-    return asyncio.run(go())
+    got = asyncio.run(go())
+    return (*got, w) if with_worker else got
 
 
 def test_MCP_심의_시작도_외부_응답자로_돌고_잡_기록에_llm_과_tool_mode_가_남는다(monkeypatch, tmp_path, ctx_1m, on):
-    out, done, tr = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "voc": "off",
-                                                          "free_tools": 1})
+    out, done, tr, w = _mcp(monkeypatch, tmp_path, advanced={"llm": "external", "consent_external": True, "voc": "off",
+                                                             "free_tools": 1}, with_worker=True)
+    # 과제마다 머리에 이 잡의 id 가 실린다(워크플로가 맡은 잡의 과제만 답한다 — 리스크 대상이 없는 일반 심의의 표지)
+    assert w.seen and {s["head"].get("job_id") for s in w.seen} == {out["job_id"]}
     assert (out["llm"], out["tool_mode"]) == ("external", "tools")
     assert done["status"] == "done", done.get("error")
     # 손잡이 칸은 호출자가 보낸 값 그대로 돈다 — 외부 응답자 길이 닫는 값이 없다(좌석 자유 조회는 글 왕복이다).
@@ -326,6 +332,14 @@ def test_MCP_심의_시작도_외부_응답자로_돌고_잡_기록에_llm_과_t
     assert delib_jobs.summary(delib_jobs._list_rec(job))["tool_mode"] == "tools", "목록 색인이 tool_mode 를 잃었다"
     assert (tr["llm"], tr["tool_mode"]) == ("external", "tools") and tr["total"] > 0
     assert any(e["source"] == "외부 응답자 실행 — 좌석 도구 글 왕복" for e in done["evidence_omitted"])
+
+
+def test_대상_열쇠가_없는_일반_MCP_외부_심의도_과제_머리의_잡_id_로_가려진다(monkeypatch, tmp_path, ctx_1m, on):
+    out, done, _tr, w = _mcp(monkeypatch, tmp_path, question="보스 둘레 간극을 줄일 것인가", job="default",
+                             advanced={"llm": "external", "consent_external": True, "voc": "off"}, with_worker=True)
+    assert done["status"] == "done", done.get("error")
+    heads = [s["head"] for s in w.seen]
+    assert heads and {h.get("job_id") for h in heads} == {out["job_id"]} and not any(h.get("target_key") for h in heads)
 
 
 def test_MCP_외부_잡의_tool_mode_는_엔진이_실제로_돈_길로_고쳐_적힌다(monkeypatch, tmp_path, ctx_1m, on):

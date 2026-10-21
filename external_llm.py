@@ -93,6 +93,9 @@ ctx_override: contextvars.ContextVar[int | None] = contextvars.ContextVar("exter
 # 외부 응답자 심의의 과제 주인 — 심의 입구(deliberation._external_entry)가 세운다. MCP 로 연 심의는 게이트웨이 헤더를 푼 이름
 # (header_owner), 포털 /chat 심의는 원문 신원이다. 잡 기록·도구 호출 신원(user)은 종전 그대로 두고 과제의 주인만 이것으로 맞춘다.
 task_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("external_llm_owner", default=None)
+# 외부 응답자 심의의 MCP 잡 id — 심의 입구가 세운다(delib_jobs 가 준다). 과제 머리의 job_id 로 실려, 리스크 대상 열쇠가 없는 일반 심의도
+# 워크플로가 '맡은 잡의 과제만' 답하게 한다. 포털 /chat 심의에는 없다.
+task_job: contextvars.ContextVar[str | None] = contextvars.ContextVar("external_llm_job", default=None)
 
 _ON_WORDS = ("1", "true", "yes", "on")
 _OFF_WORDS = ("", "0", "false", "no", "off")
@@ -275,7 +278,7 @@ class _Task:
     """과제 하나 — 기다림(waiting) 또는 집힘(claimed). 끝나면(답·실패·취소) 줄에서 빠진다. lease 는 지금 집기의 임대다(집힐 때마다
     새로, 되돌리면 지운다)."""
 
-    __slots__ = ("id", "owner", "kind", "seq", "parts", "text", "max_tokens", "run_id", "target_key", "label",
+    __slots__ = ("id", "owner", "kind", "seq", "parts", "text", "max_tokens", "run_id", "target_key", "label", "job_id",
                  "created", "created_wall", "state", "unclaimed_since", "claimed_at", "deadline", "claims", "lease", "buf",
                  "received", "fut", "loop")
 
@@ -327,7 +330,7 @@ class Board:
 
     # ── 엔진 쪽 ──
     def open(self, *, owner: str, kind: str, parts: list, max_tokens: int | None, run_id: str = "",
-             target_key: str = "", label: str = "") -> _Task:
+             target_key: str = "", label: str = "", job_id: str = "") -> _Task:
         """과제를 줄 세운다(부르는 쪽은 이벤트 루프 안이다). 주인이 '없다' 로 판정된 뒤 WAIT_S 안이면 줄 세우지 않고 바로
         external_worker_absent."""
         owner = _norm_owner(owner)
@@ -347,6 +350,7 @@ class Board:
             text = "".join(t for _r, t in parts)
             task = _Task(id=self._new_id(), owner=owner, kind=kind, seq=self._seq, parts=list(parts), text=text,
                          max_tokens=max_tokens, run_id=run_id or "", target_key=target_key or "", label=label or "",
+                         job_id=job_id or "",
                          created=now, created_wall=self._wall(), state="waiting", unclaimed_since=now, claimed_at=None,
                          deadline=None, claims=0, lease=None, buf=[], received=0, fut=loop.create_future(), loop=loop)
             self._tasks[task.id] = task
@@ -576,7 +580,7 @@ class Board:
                 "max_chars": max_chars(t.max_tokens), "chars": len(t.text), "parts": parts,
                 "answer_deadline": int(self._wall() + left), "answer_s": int(left), "claim": t.claims,
                 "created_at": int(t.created_wall)}
-        for k in ("run_id", "target_key", "label"):
+        for k in ("run_id", "target_key", "label", "job_id"):
             if getattr(t, k):
                 head[k] = getattr(t, k)
         return head
@@ -648,14 +652,15 @@ def board_of(app) -> Board | None:
 
 
 def model_for(app, *, owner: str, kind: str, run_id: str = "", target_key: str = "",
-              label: str = "") -> "ExternalChatModel | None":
-    """이 호출 하나의 외부 모델 — 주인·종류를 실은 채 줄에 붙는다. 꺼져 있으면 None."""
+              label: str = "", job_id: str = "") -> "ExternalChatModel | None":
+    """이 호출 하나의 외부 모델 — 주인·종류를 실은 채 줄에 붙는다. 꺼져 있으면 None. job_id 는 MCP 심의 잡의 id(과제 머리에 실린다)."""
     b = board_of(app)
     if b is None:
         return None
     # 호출 추적(CALL_TRACE_URL)이 켜져 있으면 과제 하나의 기다림을 'external' 서버의 호출로 남긴다(꺼져 있으면 그대로).
     return call_trace.instrument_llm(_model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
-                                                    run_id=run_id, target_key=target_key, label=label), "external")
+                                                    run_id=run_id, target_key=target_key, label=label, job_id=job_id),
+                                 "external")
 
 
 def health_fields(board: Board) -> dict:
@@ -711,6 +716,7 @@ def _model_class():
         run_id: str = ""
         target_key: str = ""
         label: str = ""
+        job_id: str = ""
         _board: Any = PrivateAttr(default=None)
 
         def __init__(self, board: Board | None = None, **kw):
@@ -732,7 +738,7 @@ def _model_class():
             mt = mt if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0 else self.max_tokens
             parts = [(m.type, _content_text(m.content)) for m in messages]
             task = board.open(owner=self.owner, kind=self.kind, parts=parts, max_tokens=mt, run_id=self.run_id,
-                              target_key=self.target_key, label=self.label)
+                              target_key=self.target_key, label=self.label, job_id=self.job_id)
             try:
                 text, finish = await board.wait(task)
             finally:

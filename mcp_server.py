@@ -860,7 +860,8 @@ _TASK_EGRESS = (
 _TASK_NEXT_DESC = (
     "리스크 심사 Claude 길(외부 응답자) — 엔진이 LLM 대신 맡긴 판단 과제 하나를 집는다. 내가(호출자 신원) 주인인 과제만 보인다. "
     "과제가 있으면 머리 {task_id, lease, kind, max_tokens, max_chars, chars, parts[{role, start, chars}], answer_deadline(유닉스 초), "
-    "answer_s, claim, created_at, run_id?, target_key?, label?} 를 돌려주고 그 과제는 내 것으로 집힌다. lease 는 이 집기의 임대다 — "
+    "answer_s, claim, created_at, run_id?, target_key?, label?, job_id?} 를 돌려주고 그 과제는 내 것으로 집힌다(target_key 는 리스크 "
+    "심사 대상, job_id 는 MCP 심의 잡 deliberate_start 의 id — 맡은 대상 · 잡의 과제인지 이것으로 가린다). lease 는 이 집기의 임대다 — "
     "review_task_read·review_task_submit 에 그대로 싣는다. 없으면 {empty: true, claimed(내가 집고 아직 안 낸 수), waited_s}. "
     "wait_s(초, 최대 25)만큼 과제가 생기기를 기다렸다 답한다(긴 폴링). 고리 — 집기(review_task_next) → 프롬프트 읽기"
     "(review_task_read 를 offset 0 부터 next_offset 이 null 이 될 때까지 불러 text 를 이어 붙이면 chars 자다. parts[i].start·chars 로 "

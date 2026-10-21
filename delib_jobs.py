@@ -742,8 +742,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   잡은 앞 심의의 뒷정리 안에서 뜬다 — 그대로 만들면 앞 심의가 세운 요청 단위 표식(자격 강등
     #   _pat_degraded · 유령 ID 출처 _turn_ids)을 달고 돈다. 곧바로 뜨는 잡은 종전과 같은 컨텍스트다.
     groups, ctx = list(groups or []), contextvars.copy_context()
-    # 외부 응답자 잡만 과제 주인을 따로 넘긴다(GLM 잡의 진입 호출은 종전 그대로다).
-    ext_kw = {"owner": owner or user_email} if _read.llm == "external" else {}
+    # 외부 응답자 잡만 과제 주인과 잡 id(과제 머리의 job_id — 워크플로가 맡은 잡의 과제만 답한다)를 따로 넘긴다(GLM 잡의 진입 호출은
+    # 종전 그대로다).
+    ext_kw = {"owner": owner or user_email, "job_id": job_id} if _read.llm == "external" else {}
 
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)

@@ -590,7 +590,8 @@ def test_외부_잡의_free_tools_는_호출자의_값_그대로_돌고_GLM_이�
     prev, nxt = asyncio.run(go({**EXT, "free_tools": 1}))
     assert (prev["opts"]["llm"], prev["opts"]["free_tools"]) == ("external", 1) and "external_forced" not in prev["opts"]
     (first_opts, first_kw), (cont_opts, cont_kw) = seen
-    assert first_kw == {"owner": "first+tag@x.com"} and d._resolve_opts(first_opts).free_tools == 1, "외부 잡이 조회를 닫았다"
+    assert first_kw == {"owner": "first+tag@x.com", "job_id": prev["id"]}, "외부 잡은 과제 주인과 잡 id 를 넘긴다"
+    assert d._resolve_opts(first_opts).free_tools == 1, "외부 잡이 조회를 닫았다"
     assert cont_kw == {} and "llm" not in cont_opts and cont_opts["free_tools"] == 1
     assert d._resolve_opts(cont_opts).free_tools == 1 and "external_forced" not in nxt["opts"]
     seen.clear()

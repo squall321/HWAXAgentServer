@@ -1301,17 +1301,19 @@ def _external_refusal(app, req_opts, user: str) -> dict | None:
     return None
 
 
-def _external_entry(app, req_opts, user: str, owner: str = "") -> dict | None:
+def _external_entry(app, req_opts, user: str, owner: str = "", job_id: str = "") -> dict | None:
     """심의 입구(run_deliberation·run_sim_deliberation·run_test_plan) — 거절이면 그 오류 칸을 돌려주고, 받으면 이 심의를 도는
     태스크(문맥)의 창을 외부 응답자 창으로, 과제 주인을 owner(비면 user)로 세운다. 요청 값 읽기(_resolve_opts 의 근거·요약·역할
     몫)부터 라운드·의장 프롬프트의 예산까지 전부 창에서 유도되는데, GLM 창(1백만 토큰)으로 짠 프롬프트는 외부 모델이 받지 못한다.
     문맥 변수라 다른 심의·카드 대조·챗에는 닿지 않는다(이 태스크가 띄우는 좌석 태스크는 물려받는다). owner — MCP 로 연 심의는
-    게이트웨이 헤더를 푼 이름(delib_jobs 가 준다), 포털 /chat 심의는 원문 신원(user)이다."""
+    게이트웨이 헤더를 푼 이름(delib_jobs 가 준다), 포털 /chat 심의는 원문 신원(user)이다. job_id — MCP 심의 잡의 id(delib_jobs 가
+    준다)라 과제 머리에 실린다(워크플로가 맡은 잡의 과제만 답한다 — 리스크 대상 열쇠가 없는 일반 심의의 표지). 포털 /chat 심의는 없다."""
     who = owner or user
     refused = _external_refusal(app, req_opts, who)
     if refused is None and _wants_external(req_opts):
         external_llm.ctx_override.set(external_llm.board_of(app).settings.ctx_tokens)
         external_llm.task_owner.set(who)
+        external_llm.task_job.set(job_id or None)
     return refused
 
 
@@ -4479,7 +4481,7 @@ def _carry_cut_cards(what: str, text: str, cap: int, to: str, nn: list | None = 
 
 
 async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                               user_pat: str = "", history: list | None = None, *, owner: str = ""):
+                               user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
     """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
 
     라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
@@ -4489,7 +4491,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
     call_trace.tag(kind="sim-delib")
-    _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
+    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
@@ -4620,12 +4622,12 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
 
 
 async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                           user_pat: str = "", history: list | None = None, *, owner: str = ""):
+                           user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     call_trace.tag(kind="delib")      # 호출 추적의 자리 — 이 제너레이터를 돌리는 태스크(웹 _detach_stream · MCP 잡)에 붙는다
-    _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {})
@@ -4641,7 +4643,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
 
 
 async def run_test_plan(app, question: str, groups: list, req_opts=None, user: str = "",
-                        user_pat: str = "", history: list | None = None, *, owner: str = ""):
+                        user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
     """시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정해 시험 계획서를 낸다.
 
     해석은 물성이 없으면 시작할 수 없고, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는
@@ -4653,7 +4655,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
     call_trace.tag(kind="test-plan")
-    _refused = _external_entry(app, req_opts, user, owner)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
@@ -4725,7 +4727,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 대상 열쇠 — 앱이 준 delib_opts.target_key 가 먼저(X-D8 ⑦ — 쟁점 패널 질문은 '[쟁점 …]' 로 시작해 머리가 없다), 없으면 질문
         # 머리('[리스크심사 <과제코드> <target_key>]'). 과제 머리 · 과제 기록에만 쓰고 다른 데(앞 패널 보고서 거름 따위)에는 쓰지 않는다.
         llm = external_llm.model_for(app, owner=external_llm.task_owner.get() or user, kind="deliberation",
-                                     run_id=f"delib-{uuid.uuid4().hex[:12]}",
+                                     run_id=f"delib-{uuid.uuid4().hex[:12]}", job_id=external_llm.task_job.get() or "",
                                      target_key=getattr(opts, "target_key", "") or (_qm.group(2) if _qm else ""),
                                      label=str(opts.chair_template or ""))
         if llm is None:

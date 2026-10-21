@@ -399,6 +399,10 @@ belongs to; the risk app's issue-panel questions start with `[쟁점 …]`, so t
 present the field wins. Another shape is refused before anything runs with `bad_request` (switch on or off). It is used
 for nothing else (not the prior-report filter), and a GLM deliberation does not read it at all — sent or not, valid or
 not, the GLM path is unchanged.
+**Job id**: every task of an external MCP job (`deliberate_start`/`deliberate_continue`) also carries `job_id` — that job's
+id (`review_task_next`'s `job_id` and the task record) — so a general deliberation, which has no risk target key, can be
+answered by a workflow told to take that job (HWAXPortal `hwax-risk-claude.js` `jobId`). A portal `/chat` deliberation
+(the risk app's panels) has none.
 External MCP jobs (`deliberate_start`/`deliberate_continue`) take **no slot of `DELIB_JOB_MAX_RUNNING`** (nor of
 `DELIB_JOB_MAX_RUNNING_PER_USER` — both count GLM jobs only): a human-paced worker must not hold the GLM deliberation
 slots for hours. Instead one external deliberation runs per owner (the task owner); the owner's next ones wait in the
