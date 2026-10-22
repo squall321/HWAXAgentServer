@@ -3087,13 +3087,20 @@ def _model_context_tokens() -> int:
 def _context_health() -> dict:
     """/health 의 context — 창을 정한 근거(HWAXPortal docs/delib-ops R5). tokens 는 context_tokens 와 같은 값이다. server 는 마지막으로 물은
     답(받은 창들 중 가장 작은 것) · samples 는 그 답들 · env_cap 은 사람이 적은 상한 · wider 는 서버가 더 큰 창을 답했지만 넓히지 않은 값
-    (재기동 때 넓힌다) · asked_s_ago 는 마지막으로 물은 뒤 지난 초."""
+    (재기동 때 넓힌다) · asked_s_ago 는 마지막으로 물은 뒤 지난 초. 아직 못 물었으면(LLM 서버가 안 닿는다) 가정한 창과 그 출처(env · fallback)를
+    싣고 retrying 참 · retry_in_s(다음 물음까지) — 비워 두면 /health 를 보는 사람이 '창을 모른다' 로 읽는다(실제로는 가정한 값으로 돈다)."""
     c = _ctx_cache
     at = c.get("at")
-    return {"tokens": c.get("n"), "source": c.get("src"), "server": c.get("server"), "samples": list(c.get("samples") or []),
-            "env_cap": _CTX_FALLBACK if _CTX_ENV_SET else None, "wider": c.get("wider"),
-            "reask_s": _CTX_TTL_S, "samples_per_ask": _CTX_SAMPLES,
-            "asked_s_ago": round(time.monotonic() - at, 1) if at is not None else None}
+    known = "n" in c
+    out = {"tokens": c.get("n") if known else _CTX_FALLBACK,
+           "source": c.get("src", "server") if known else ("env" if _CTX_ENV_SET else "fallback"),
+           "retrying": not known, "server": c.get("server"), "samples": list(c.get("samples") or []),
+           "env_cap": _CTX_FALLBACK if _CTX_ENV_SET else None, "wider": c.get("wider"),
+           "reask_s": _CTX_TTL_S, "samples_per_ask": _CTX_SAMPLES,
+           "asked_s_ago": round(time.monotonic() - at, 1) if at is not None else None}
+    if not known and c.get("retry_at"):
+        out["retry_in_s"] = round(max(0.0, c["retry_at"] - time.monotonic()), 1)
+    return out
 
 
 _chat_ctx_cache: dict = {}

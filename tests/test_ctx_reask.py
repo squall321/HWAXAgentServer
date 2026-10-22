@@ -219,3 +219,19 @@ def test_health_가_창의_근거를_싣는다(ask, monkeypatch):
     c = h["context"]
     assert (c["tokens"], c["source"], c["server"], c["env_cap"], c["reask_s"], c["samples_per_ask"]) == (K300, "env", M, K300, 600.0, 3)
     assert c["asked_s_ago"] == 0.0 and c["samples"] == [M, M, M]
+
+
+@pytest.mark.parametrize("env_set,source", [(False, "fallback"), (True, "env")])
+def test_못_물었으면_가정한_창과_다시_묻는_중을_보인다(ask, monkeypatch, env_set, source):
+    """LLM 서버가 안 닿으면 엔진은 가정한 창으로 돈다 — /health.context 를 비워 두면 '창을 모른다' 로 읽힌다(dev 실측 10-22)."""
+    monkeypatch.setattr(app, "_CTX_ENV_SET", env_set)
+    ask["answers"] = [httpx.ConnectError("refused")]
+    assert app._model_context_tokens() == 128_000
+    h = app._context_health()
+    assert (h["tokens"], h["source"], h["retrying"]) == (128_000, source, True) and h["retry_in_s"] == app._CTX_RETRY_S
+    ask["answers"] = [_models(K300)]
+    ask["now"] += app._CTX_RETRY_S + 1
+    app._model_context_tokens()
+    h = app._context_health()
+    want = 128_000 if env_set else K300           # 사람이 적은 값은 서버 답의 상한이다(R5)
+    assert (h["tokens"], h["retrying"]) == (want, False) and "retry_in_s" not in h
