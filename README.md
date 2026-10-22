@@ -57,7 +57,10 @@ ChatDock (portal frontend)
 - **Resume an interrupted job** (R3) — `deliberate_continue(previous_job_id=<interrupted job>)`, no human note needed.
   The status carries `resume{rounds_done, total_rounds, rounds_left, args, resumed_by}`: rounds done are counted from
   the stage (entering round N means N−1 are done; `decide` · `explain` · `report` mean all). The new job carries each
-  seat's last position of the finished rounds as its summary ("결정문은 아직 없다"), runs only the remaining rounds (at
+  seat's last position of the finished rounds as its summary ("결정문은 아직 없다") — fitted **per seat** inside the length the
+  engine takes for a summary (8,000 characters up to a 300K window, 29,077 on 1M), so a 20-seat panel loses no seat (long
+  positions are cut to an equal share with their full length marked; a chained earlier decision summary gets at most a
+  third) — runs only the remaining rounds (at
   least 2 — the engine's floor), keeps the seats and the round numbering, and reuses the original arguments from the
   args file (a given human note is appended to the original one). Same question and kind only; a job resumes once
   (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A

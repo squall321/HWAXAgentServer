@@ -457,3 +457,53 @@ def test_정상_종료로_접힌_도는_잡은_cancelled_가_아니라_interrupt
     rec = _on_disk(a)
     assert rec["status"] == "interrupted" and "deliberate_continue" in rec["error"], rec
     assert delib_jobs._args_path(a["id"]).exists(), "이어 돌 재료(시작 인자 파일)를 지웠다"
+
+
+def _many_seats(n: int, chars: int, job_id: str, **opts) -> dict:
+    """좌석 n 석이 1~2라운드를 마치고 3라운드에서 끊긴 잡 — 입장마다 chars 자(좌석마다 끝에 표지)."""
+    seats = [f"좌석{i:02d}" for i in range(n)]
+    turns = [{"round": r, "display_round": r, "persona": p, "say": p[:20],
+              "say_full": (f"{p} {r}R 입장 " + "가" * chars)[:chars - 6] + f"<{p}끝>"} for r in (1, 2) for p in seats]
+    job = {"id": job_id, "job": "default", "kind": "default", "label": "자유 심의", "question": "대형 패널 쟁점", "chair_template": None,
+           "opts": {"rounds": 4}, "status": "interrupted", "stage": "r3", "round": 3, "total_rounds": 4,
+           "seats": [{"key": f"k{i}", "role": "역할"} for i in range(n)], "seat_roles": {}, "turns": turns, "decision": None,
+           "result_text": None, "report_id": None, "checkpoint": None, "error": delib_jobs.INTERRUPTED_MSG, "warnings": [],
+           "evidence_omitted": [], "started_at": 1000.0, "updated_at": 2000.0, "finished_at": 2000.0, "user": ME, "owner_aff": "CAEG",
+           "started_by": "human"}
+    delib_jobs._persist(job)
+    assert delib_jobs._write_args(job_id, {"job_kind": "default", "question": job["question"], "groups": [], "opts": dict(opts),
+                                           "user_email": ME, "owner": "", "owner_aff": "CAEG"})
+    return job
+
+
+def test_좌석이_많아도_이어하기_요약에_모든_좌석이_실리고_엔진_상한_안이다(eng, monkeypatch):
+    """심의와 리스크 심사 패널은 좌석 수가 다르다 — 입장 전문을 이어 붙이면 엔진이 앞 8,000자만 받아(20만 · 30만 창) 뒤쪽 좌석이 빠졌다."""
+    _caps(monkeypatch, 2)
+    cap = d._summary_max()
+    assert cap == 8_000, "시험 전제 — 고정된 창(128K)에서 이어하기 요약 상한은 8,000자다"
+    job = _many_seats(20, 2_000, "default-20261022-020000-big001")
+    _resume(eng, job["id"])
+    cs = eng.seen["대형 패널 쟁점"].opts["continue_summary"]
+    assert len(cs) <= cap, f"요약 {len(cs):,}자가 엔진 상한 {cap:,}자를 넘었다 — 엔진이 뒤쪽 좌석부터 자른다"
+    missing = [i for i in range(20) if f"• 좌석{i:02d} (2R): 좌석{i:02d} 2R 입장" not in cs]
+    assert not missing, f"입장이 빠진 좌석 {missing}"
+    assert cs.count("자 중 앞 ") == 20, "줄인 입장에 원래 길이 표식이 없다"
+
+
+def test_짧은_입장은_그대로_두고_긴_입장만_줄인다(eng, monkeypatch):
+    _caps(monkeypatch, 2)
+    job = _many_seats(4, 600, "default-20261022-020000-big002")         # 4석 × 600자 — 상한 안
+    _resume(eng, job["id"])
+    cs = eng.seen["대형 패널 쟁점"].opts["continue_summary"]
+    assert "자 중 앞 " not in cs and all(f"<좌석{i:02d}끝>" in cs for i in range(4)), "상한 안인데 입장을 줄였다"
+
+
+def test_긴_앞_회차_요약과_함께여도_좌석_입장이_상한_안에_다_실린다(eng, monkeypatch):
+    _caps(monkeypatch, 2)
+    cap = d._summary_max()
+    job = _many_seats(12, 1_500, "default-20261022-020000-big003", continue_summary="앞 회차 결정: " + "나" * 20_000)
+    _resume(eng, job["id"])
+    cs = eng.seen["대형 패널 쟁점"].opts["continue_summary"]
+    assert len(cs) <= cap and cs.startswith("앞 회차 결정: ") and "[앞 회차 결정 요약 " in cs, cs[:200]
+    assert cs.index("[서버 재기동으로 끊긴") > 0 and all(f"• 좌석{i:02d} (2R)" in cs for i in range(12)), "새 입장이 앞 요약에 밀려 빠졌다"
+    assert cs.index("[서버 재기동으로 끊긴") <= cap // 3 + 80, "앞 회차 요약이 셋 중 하나를 넘게 차지했다"

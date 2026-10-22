@@ -539,17 +539,25 @@ def _carry_seats(prev: dict) -> list:
     return [{**s, "role": full.get(s.get("key")) or s.get("role") or ""} for s in (prev.get("seats") or [])]
 
 
-def _resume_summary(prev: dict, done: int) -> str:
+def _resume_summary(prev: dict, done: int, cap: int) -> str:
     """끊긴 잡의 끝난 라운드(1~done)에서 좌석별 마지막 입장 — 이어 돌 라운드의 요약(continue_summary)이다. 결정문은 아직 없다고 적는다
-    (요약을 결정으로 읽지 않게). 줄이지 않은 발언(say_full)이 있으면 그것을 싣는다 — 길이는 엔진이 창에서 죄고 줄였다고 알린다."""
+    (요약을 결정으로 읽지 않게).
+
+    **cap 안에서 좌석마다 몫을 나눈다.** 엔진은 이 글을 창에서 정한 길이(_summary_max — 20만 · 30만 창 8,000자, 1백만 창 29,077자)에서
+    앞부분만 받는다. 입장 전문을 이어 붙인 채로 넘기면 좌석이 많을수록 뒤쪽 좌석의 입장이 통째로 빠진다(20석 · 입장 2,000자면 앞 서너 석만
+    닿는다 — 심의와 리스크 심사 패널은 좌석 수가 다르다). 짧은 입장이 안 쓴 몫은 긴 입장에 돌리고(엔진 _fit_rows 와 같은 식) 바닥값은 두지
+    않는다 — 바닥값이 합을 cap 위로 밀면 엔진이 다시 뒤를 자른다. 줄인 입장에는 원래 길이를 표식으로 단다."""
     last: dict = {}
     for t in prev.get("turns") or []:
         if isinstance(t, dict) and t.get("persona") and int(t.get("round") or 0) <= done:
             last[t["persona"]] = t
-    rows = [f"• {p} ({t.get('display_round') or t.get('round')}R): {str(t.get('say_full') or t.get('say') or '').strip()}"
-            for p, t in last.items()]
-    return (f"[서버 재기동으로 끊긴 심의를 이어 돈다 — 끝난 {done}라운드까지 좌석별 마지막 입장이다. 결정문은 아직 없다]\n"
-            + "\n".join(rows))
+    head = f"[서버 재기동으로 끊긴 심의를 이어 돈다 — 끝난 {done}라운드까지 좌석 {len(last)}석의 마지막 입장이다. 결정문은 아직 없다]"
+    pre = {p: f"• {p} ({t.get('display_round') or t.get('round')}R): " for p, t in last.items()}
+    rows = [(p, str(t.get("say_full") or t.get("say") or "").strip()) for p, t in last.items()]
+    # 머리 · 좌석 머리 · 줄바꿈 · 줄임 표식(" …[N자 중 앞 M자]")의 몫을 먼저 뗀다
+    room = cap - len(head) - sum(len(x) + 1 for x in pre.values()) - 32 * len(rows)
+    fitted, _share = _engine._fit_rows(rows, max(len(rows), room), floor=1)
+    return head + "".join(f"\n{pre[p]}{t}" for p, t in fitted)
 
 
 def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int, non_negotiables, advanced, evidence,
@@ -577,9 +585,18 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         if isinstance(prev_opts.get("human_note"), str) and prev_opts["human_note"]:
             o["human_note"] = prev_opts["human_note"]
     if done:
-        # 끊긴 잡이 그 자체로 이어하기였으면(앞 회차의 결정문이 요약으로 실렸다) 그 요약 뒤에 끝난 라운드의 입장을 덧붙인다.
+        # 끊긴 잡이 그 자체로 이어하기였으면(앞 회차의 결정문이 요약으로 실렸다) 그 요약 뒤에 끝난 라운드의 입장을 덧붙인다. 둘의 합이 엔진이 받는
+        # 길이(_summary_max)를 넘지 않게 나눈다 — 넘으면 엔진이 뒤(새 입장)부터 자른다. 앞 회차 요약은 셋 중 하나까지 — 끊긴 회차의 좌석 입장이
+        # 그 결정을 이미 딛고 선 더 새로운 사정이다.
+        cap = _engine._summary_max()
         base_sum = str(o.get("continue_summary") or "").strip()
-        o["continue_summary"] = (f"{base_sum}\n\n" if base_sum else "") + _resume_summary(prev, done)
+        if base_sum:
+            keep = cap // 3
+            if len(base_sum) > keep:
+                base_sum = base_sum[:keep].rstrip() + f" …[앞 회차 결정 요약 {len(base_sum):,}자 중 앞 {keep:,}자]"
+            o["continue_summary"] = f"{base_sum}\n\n" + _resume_summary(prev, done, cap - len(base_sum) - 2)
+        else:
+            o["continue_summary"] = _resume_summary(prev, done, cap)
         o["rounds"] = int(rounds) if rounds else int(info.get("rounds_left") or 2)
         o["rounds_so_far"] = int(prev_opts.get("rounds_so_far") or 0) + done
         seats = _carry_seats(prev)

@@ -97,9 +97,14 @@ def _portal_busy(body: str) -> tuple[int, str]:
     return r.returncode, r.stdout.strip()
 
 
-@pytest.mark.parametrize("load,review,drain", [((0, 0), 0, False), ((2, 1), 3, True), ((0, 4), 0, True)])
-def test_셸과_포털이_실제_health_글에서_종전과_같은_수를_읽는다(client, monkeypatch, load, review, drain):
+# durable — 줄 선 잡이 전부 시작 인자 파일을 가졌나(/health.delib_queue_durable — HWAXPortal docs/delib-ops R2'). 가짜 부하의 '대기 N건' 과 줄의
+# 사정을 함께 준다 — 줄이 빈 채로 대기 4건만 지어내면 그 줄은 넘기는 줄(빈 줄은 참)로 읽혀 셸이 막지 않는다.
+@pytest.mark.parametrize("load,review,drain,durable", [((0, 0), 0, False, True), ((2, 1), 3, True, False), ((0, 4), 0, True, False),
+                                                       ((0, 4), 0, False, True), ((2, 1), 0, False, True)])
+def test_셸과_포털이_실제_health_글에서_종전과_같은_수를_읽는다(client, monkeypatch, load, review, drain, durable):
+    import delib_jobs  # noqa: PLC0415
     monkeypatch.setattr(a, "_delib_load", lambda: load)
+    monkeypatch.setattr(delib_jobs, "queue_durability", lambda: {"durable": durable, "requeued": 0})
     gate = cr.gate_of(a.app)
     held = [gate.try_acquire("x") for _ in range(review)]
     if drain:
@@ -116,7 +121,9 @@ def test_셸과_포털이_실제_health_글에서_종전과_같은_수를_읽는
     if not PORTAL_LIB.parent.parent.parent.parent.is_dir():
         pytest.skip("형제 리포 HWAXPortal 이 곁에 없다")
     rc, out = _portal_busy(body)
-    assert (rc, out) == ((1, "") if sum(load) == 0 else (0, f"{load[0]} {load[1]}"))
+    # 줄을 넘기는 엔진이면 줄만 선 것은 막지 않는다 — 도는 것이 있을 때만 막고, 찍는 수는 둘 다다
+    blocking = load[0] + (0 if durable else load[1])
+    assert (rc, out) == ((1, "") if blocking == 0 else (0, f"{load[0]} {load[1]}")), (durable, body[:200])
 
 
 # ── /drain 라우트 ─────────────────────────────────────────────────────────────
