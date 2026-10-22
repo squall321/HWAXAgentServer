@@ -50,6 +50,9 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 |---|---|---|
 | `VLLM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible inference base |
 | `VLLM_MODEL` | `qwen2.5-7b-dev` | served model name |
+| `LLM_CONTEXT_TOKENS` | _(unset — 128000)_ | The window, normally read from the server's `/v1/models` (`max_model_len`). Set by a person, it is also a **cap** on the server's answer (`min(server, this)`, `source` `env` — portal `docs/delib-ops` R5): a pool of servers with different windows sets the smallest one here. Unset, it is only the value used while the server cannot be read |
+| `LLM_CONTEXT_TTL_S` | `600` | Re-ask the window this often, in the background (callers get the current value and never wait). A re-asked answer is taken **only when smaller** — widening needs a restart: a pool's busy small server can be missed by `least_conn`, and a window that moves changes the card-review `limits_rev`, which holds the risk app's runs. A larger answer shows in `/health.context.wider`. A failed re-ask keeps the value and tries again after 60 s. `0` = keep the first answer for the process's life (the old behavior) |
+| `LLM_CONTEXT_SAMPLES` | `3` | `/v1/models` asks per lookup; the smallest answer wins (a pool answers from a different server each time). `/health.context` shows `tokens`, `source`, the last `server` answer and its `samples`, `env_cap`, `wider`, `reask_s` and `asked_s_ago` |
 | `MCP_CONFIG` | _(unset)_ | path to a gitignored JSON file holding the gateway entry + token (takes precedence) |
 | `MCP_SERVERS` | _(empty)_ | fallback `name=url` pairs when `MCP_CONFIG` is unset (no auth headers) |
 

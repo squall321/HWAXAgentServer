@@ -414,6 +414,9 @@ def lookup(monkeypatch):
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(app.time, "monotonic", lambda: st["now"])
     monkeypatch.setattr(app, "_CTX_FALLBACK", 128_000)
+    # 한 번 물을 때 한 번 · 다시 묻지 않음(종전) — 여러 번 묻기 · 주기로 다시 묻기(R5)는 tests/test_ctx_reask.py 가 본다.
+    monkeypatch.setattr(app, "_CTX_SAMPLES", 1)
+    monkeypatch.setattr(app, "_CTX_TTL_S", 0.0)
     yield st, monkeypatch
     app._ctx_cache.clear()
     app._ctx_cache.update(saved)

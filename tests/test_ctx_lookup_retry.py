@@ -47,6 +47,9 @@ def lookup(monkeypatch):
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(app.time, "monotonic", lambda: st["now"])
     monkeypatch.setattr(app, "_CTX_FALLBACK", 128000)
+    # 이 파일은 '한 번 묻기' 의 실패 · 재시도를 본다 — 한 번에 여러 번 묻기 · 주기로 다시 묻기(R5)는 tests/test_ctx_reask.py 가 본다.
+    monkeypatch.setattr(app, "_CTX_SAMPLES", 1)
+    monkeypatch.setattr(app, "_CTX_TTL_S", 0.0)
     monkeypatch.setattr(d, "_DECISION_CTX", None)      # 의장 상한을 창에서 유도하는 박스
     yield st
     for c in (app._ctx_cache, d._evid_cache, d._free_tok_cache):

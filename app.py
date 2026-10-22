@@ -35,6 +35,7 @@ import json
 import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 없었다 — 심의가 터지면 오류 처리 자체가 NameError 로 죽었다
 import os
 import re
+import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator
@@ -2886,6 +2887,14 @@ _CTX_FALLBACK = int(os.environ.get("LLM_CONTEXT_TOKENS", "128000"))  # 물어보
 # 둘 다 같은 int 라 _model_context_tokens 만 보면 가를 수 없다(카드 대조의 ctx_source 가 이걸로 셋을 가른다).
 _CTX_ENV_SET = bool((os.environ.get("LLM_CONTEXT_TOKENS") or "").strip())
 _CTX_RETRY_S = 60.0     # 조회가 실패한 뒤 다시 묻기까지(초) — 그동안은 기본값으로 간다
+# 받은 창을 다시 묻기까지(초) — 0 이면 처음 답을 굳힌다(종전). 다시 묻는 동안 호출자는 기다리지 않는다(뒤에서 묻고 지금 값을 준다).
+# 다시 물은 답은 **줄일 때만** 받는다 — 넓히는 것은 재기동 때다(_refresh_context_bg). HWAXPortal docs/delib-ops R5.
+_CTX_TTL_S = max(0.0, float(os.environ.get("LLM_CONTEXT_TTL_S", "600") or 0))
+# 한 번 물을 때 /models 를 몇 번 묻나 — LLM 서버 여럿을 한 주소로 묶은 풀(nginx least_conn)은 묻는 때마다 다른 서버가 답한다. 가장 작은
+# 창을 쓴다 — 큰 창으로 짠 예산이 작은 서버로 가면 400(maximum context length)이다(10-20 free-gather 2건). 바쁜 서버는 least_conn 이 비켜
+# 가 몇 번을 물어도 작은 서버를 못 만날 수 있다 — 섞인 풀은 작은 서버의 창을 LLM_CONTEXT_TOKENS 에 적는다(상한으로도 쓴다 — _decide_context).
+_CTX_SAMPLES = max(1, int(os.environ.get("LLM_CONTEXT_SAMPLES", "3") or 1))
+_CTX_LOCK = threading.Lock()        # 뒤에서 다시 묻기는 한 번에 하나
 _ctx_cache: dict = {}
 
 # 토큰 환산 — 한글은 토큰당 1자 남짓, 라틴 문자는 3~4자다. 한 값으로 뭉뚱그리면 한국어 문서에서
@@ -2941,12 +2950,84 @@ def _chars_for_tokens(text: str, tokens: int) -> int:
     return max(500, int(tokens / max(1e-6, _tokens_per_char(text))))
 
 
+def _ask_context() -> tuple[int | None, list]:
+    """LLM 서버의 /models 를 _CTX_SAMPLES 번 물어 (가장 작은 창, 받은 창들). 답은 왔는데 창 칸이 없으면 (None, []). 첫 물음이 실패하면
+    예외를 그대로 올린다(못 물었다). 뒤 물음이 실패하면 받은 것만 쓴다."""
+    import httpx
+
+    got: list = []
+    for i in range(_CTX_SAMPLES):
+        try:
+            r = httpx.get(f"{VLLM_BASE_URL.rstrip('/')}/models",
+                          headers={"Authorization": f"Bearer {VLLM_API_KEY}"}, timeout=5.0)
+            data = [m for m in ((r.json() or {}).get("data") or []) if isinstance(m, dict)]
+        except Exception:
+            if i == 0:
+                raise
+            break
+        # 이름이 맞는 것 우선, 서빙 모델이 하나뿐이면 그것. 여러 개인데 이름이 안 맞으면
+        # 아무거나 집지 않는다 — 틀린 컨텍스트로 예산을 잡느니 보수적 기본값이 낫다.
+        pick = next((m for m in data if m.get("id") == VLLM_MODEL), data[0] if len(data) == 1 else None)
+        v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            got.append(v)
+    return (min(got) if got else None), got
+
+
+def _decide_context(server_n: int | None) -> tuple[int, str]:
+    """(창, 출처) — 서버 답과 LLM_CONTEXT_TOKENS(사람이 적었으면 **상한**)의 작은 쪽. 출처는 server · env(상한이 걸렸거나 서버가 창 칸
+    없이 답했는데 사람이 적었다) · fallback(코드 기본값)."""
+    if server_n is None:
+        return _CTX_FALLBACK, ("env" if _CTX_ENV_SET else "fallback")
+    if _CTX_ENV_SET and _CTX_FALLBACK < server_n:
+        # 섞인 풀(창 300K · 1M)이면 서버 답이 큰 쪽일 수 있다 — 사람이 적은 값이 이긴다(HWAXPortal docs/delib-ops R5). 종전엔 이 값이 '물어보기
+        # 실패 때' 값일 뿐이라 서버 답을 누를 수 없었고, 리스크 20만 A/B 절차(1M 서버에 200000)도 1M 으로 돌았을 것이다.
+        return _CTX_FALLBACK, "env"
+    return server_n, "server"
+
+
+def _refresh_context_bg() -> None:
+    """뒤에서 창을 다시 묻는다(_CTX_TTL_S — 부른 쪽이 _CTX_LOCK 을 쥐고 넘긴다). **줄일 때만** 받는다 — 넓히는 것은 재기동 때다.
+
+    섞인 풀에서 바쁜 작은 서버를 least_conn 이 비켜 가면 다시 물은 답이 큰 쪽뿐일 수 있다 — 그 답으로 넓히면 작은 서버로 간 큰 호출이
+    400 이다. 그리고 창이 오르내리면 카드 대조의 판(limits_rev)이 그때마다 바뀌어 리스크 앱의 며칠짜리 실행이 보류된다(P-06). 서버가 더 큰
+    창을 답하면 넓히지 않고 /health 의 context.wider 에 적는다. 못 물으면 지금 값을 그대로 두고 _CTX_RETRY_S 뒤에 다시 묻는다."""
+    try:
+        old = _ctx_cache.get("n")
+        try:
+            server_n, got = _ask_context()
+        except Exception as e:  # noqa: BLE001 — 지금 값으로 계속 간다
+            print(f"[agent] 모델 컨텍스트 다시 묻기 실패({type(e).__name__}) — {old:,} 토큰 그대로({_CTX_RETRY_S:.0f}초 뒤 다시 묻는다)")
+            _ctx_cache["at"] = time.monotonic() - max(0.0, _CTX_TTL_S - _CTX_RETRY_S)
+            return
+        _ctx_cache.update(server=server_n, samples=list(got), at=time.monotonic())
+        if server_n is None:
+            return          # 창 칸 없이 답했다 — 지금 값을 둔다
+        n, src = _decide_context(server_n)
+        if n < old:
+            _ctx_cache.update(n=n, src=src)
+            _ctx_cache.pop("wider", None)
+            print(f"[agent] 문서 예산 기준 컨텍스트를 줄였다 — {old:,} → {n:,} 토큰(서버 답 {got} · 출처 {src})")
+        elif n > old:
+            if _ctx_cache.get("wider") != n:
+                print(f"[agent] LLM 서버가 지금 창({old:,})보다 큰 창 {n:,} 을 답했다 — 넓히는 것은 재기동 때다(풀에 작은 서버가 섞였으면 "
+                      "그 창을 LLM_CONTEXT_TOKENS 에 적는다)")
+            _ctx_cache["wider"] = n
+        else:
+            _ctx_cache["src"] = src
+            _ctx_cache.pop("wider", None)
+    finally:
+        _CTX_LOCK.release()
+
+
 def _model_context_tokens() -> int:
-    """이 모델이 받는 최대 토큰. OpenAI 호환 /v1/models 의 max_model_len 을 한 번만 읽는다.
+    """이 모델이 받는 최대 토큰. OpenAI 호환 /v1/models 의 max_model_len 을 읽는다.
 
     박스마다 모델이 다르다(dev 16K · 운영 GLM). env 로 박아 두면 한쪽에서 반드시 틀리고,
     틀린 결과는 400 이라 사용자에게 '응답 생성 실패' 로만 보인다.
-    한 번만 읽는 것은 **답을 받았을 때**다. 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다.
+    처음 물을 때는 답을 기다린다. 받은 뒤로는 _CTX_TTL_S 마다 **뒤에서** 다시 묻고 그동안 지금 값을 준다 — 다시 물은 답은 줄일 때만
+    받는다(_refresh_context_bg). 못 물어봤으면 굳히지 않고 _CTX_RETRY_S 뒤에 다시 묻는다. LLM_CONTEXT_TOKENS 를 사람이 적었으면 그 값이
+    서버 답의 **상한**이다(_decide_context). HWAXPortal docs/delib-ops R5.
 
     외부 응답자 심의를 도는 태스크(문맥) 안에서는 그 응답자의 창(EXTERNAL_LLM_CTX_TOKENS)이다 — 심의 입구가 세운다
     (deliberation._external_entry). 그 밖(챗·카드 대조·다른 심의·/health)은 종전 그대로 이 서버 모델의 창이다."""
@@ -2954,37 +3035,46 @@ def _model_context_tokens() -> int:
     if _ov:
         return _ov
     if "n" in _ctx_cache:
-        return _ctx_cache["n"]
+        n = _ctx_cache["n"]         # 다시 묻기를 띄운 호출도 지금 값을 준다
+        # 물은 때(at)가 있는 값만 다시 묻는다 — 없으면 시험이 창을 박아 둔 것이다(그 값이 이 박스의 창이다).
+        if (_CTX_TTL_S > 0 and "at" in _ctx_cache and time.monotonic() - _ctx_cache["at"] >= _CTX_TTL_S
+                and _CTX_LOCK.acquire(blocking=False)):
+            try:
+                threading.Thread(target=_refresh_context_bg, name="ctx-refresh", daemon=True).start()
+            except Exception:  # noqa: BLE001 — 스레드를 못 띄우면(자원 고갈) 다음 호출이 다시 해 본다
+                _CTX_LOCK.release()
+        return n
     n = _CTX_FALLBACK
     if time.monotonic() < _ctx_cache.get("retry_at", 0.0):
         return n        # 방금 못 물어봤다 — 죽은 엔드포인트를 호출마다 5초씩 기다리지 않는다
     try:
-        import httpx
-
-        r = httpx.get(f"{VLLM_BASE_URL.rstrip('/')}/models",
-                      headers={"Authorization": f"Bearer {VLLM_API_KEY}"}, timeout=5.0)
-        data = [m for m in ((r.json() or {}).get("data") or []) if isinstance(m, dict)]
-        # 이름이 맞는 것 우선, 서빙 모델이 하나뿐이면 그것. 여러 개인데 이름이 안 맞으면
-        # 아무거나 집지 않는다 — 틀린 컨텍스트로 예산을 잡느니 보수적 기본값이 낫다.
-        pick = next((m for m in data if m.get("id") == VLLM_MODEL), data[0] if len(data) == 1 else None)
-        v = (pick or {}).get("max_model_len") or (pick or {}).get("context_length")
-        if isinstance(v, int) and v > 0:
-            n = v
-            _ctx_cache["src"] = "server"
-        else:
-            _ctx_cache["src"] = "env" if _CTX_ENV_SET else "fallback"
+        server_n, got = _ask_context()
     except Exception as e:      # 못 물어보면 기본값으로 간다 — 기능을 막지는 않는다
         # ⚠ 이 값은 굳히지 않는다. 첫 호출자는 /health 이고 재기동 직후에는 LLM 이 아직 안 떠 있다 —
         #   그 한 번의 실패로 기본값이 프로세스 수명 내내 남아, 창이 더 작은 박스에서 예산이 전부 실제
         #   창 밖으로 잡혔다(dev 16K 를 128K 로 — 의장 프롬프트가 넘쳐 다 돈 심의의 결정문이 400 으로 죽는다).
-        #   답은 왔는데 창 크기가 없는 것은 실패가 아니다(다시 물어도 같다) — 그건 아래에서 굳힌다.
+        #   답은 왔는데 창 크기가 없는 것은 실패가 아니다(다시 물어도 같다) — 그건 굳힌다.
         print(f"[agent] 모델 컨텍스트 조회 실패({e}) — {n:,} 토큰으로 가정한다"
               f"({_CTX_RETRY_S:.0f}초 뒤 다시 묻는다)")
         _ctx_cache["retry_at"] = time.monotonic() + _CTX_RETRY_S
         return n
-    _ctx_cache["n"] = n
-    print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰")
+    n, src = _decide_context(server_n)
+    _ctx_cache.update(n=n, src=src, server=server_n, samples=list(got), at=time.monotonic())
+    print(f"[agent] 문서 예산 기준 컨텍스트 = {n:,} 토큰(서버 답 {got or '없음'} · 출처 {src}"
+          + (f" · {_CTX_TTL_S:.0f}초마다 다시 묻고 줄일 때만 받는다" if _CTX_TTL_S > 0 else "") + ")")
     return n
+
+
+def _context_health() -> dict:
+    """/health 의 context — 창을 정한 근거(HWAXPortal docs/delib-ops R5). tokens 는 context_tokens 와 같은 값이다. server 는 마지막으로 물은
+    답(받은 창들 중 가장 작은 것) · samples 는 그 답들 · env_cap 은 사람이 적은 상한 · wider 는 서버가 더 큰 창을 답했지만 넓히지 않은 값
+    (재기동 때 넓힌다) · asked_s_ago 는 마지막으로 물은 뒤 지난 초."""
+    c = _ctx_cache
+    at = c.get("at")
+    return {"tokens": c.get("n"), "source": c.get("src"), "server": c.get("server"), "samples": list(c.get("samples") or []),
+            "env_cap": _CTX_FALLBACK if _CTX_ENV_SET else None, "wider": c.get("wider"),
+            "reask_s": _CTX_TTL_S, "samples_per_ask": _CTX_SAMPLES,
+            "asked_s_ago": round(time.monotonic() - at, 1) if at is not None else None}
 
 
 _chat_ctx_cache: dict = {}
@@ -3034,7 +3124,7 @@ def _model_context_state() -> dict:
     """창 크기와 **그 값이 어디서 왔나** — {"tokens", "source", "retrying"}. 값은 _model_context_tokens 그대로다.
 
     source 는 셋이다 — server(LLM 서버가 창을 알려 줬다) · env(서버가 창 칸 없이 답했거나 닿지 않았는데
-    LLM_CONTEXT_TOKENS 를 사람이 적었다) · fallback(코드 기본값). retrying 은 방금 묻지 못해 _CTX_RETRY_S 뒤에
+    LLM_CONTEXT_TOKENS 를 사람이 적었다 · 서버 답이 그 값보다 커서 상한이 걸렸다 — R5) · fallback(코드 기본값). retrying 은 방금 묻지 못해 _CTX_RETRY_S 뒤에
     다시 묻는 중일 때 참이다. 창으로 예산을 짜는 쪽(카드 대조)이 '가정한 창' 위에서 몇 시간짜리 계획을 굳히지
     않게 가른다 — int 하나만으로는 '서버가 128,000 이라 했다' 와 '못 물어서 128,000 으로 친다' 가 같다."""
     n = _model_context_tokens()
@@ -5969,6 +6059,8 @@ def health() -> dict:
         "tool_max": TOOL_MAX,   # 0=무제한. >0 이고 게이트웨이 도구수보다 작으면 챗에 일부 도구 미바인딩
         # 예산은 이제 모델 컨텍스트에서 유도한다 — 원격 진단에서 실제 값이 보여야 한다.
         "context_tokens": _model_context_tokens(),
+        # 그 창을 정한 근거 — 서버 답 · 사람이 적은 상한 · 넓히지 않은 큰 답(HWAXPortal docs/delib-ops R5). context_tokens 뒤에 둔다(첫 조회가 먼저다).
+        "context": _context_health(),
         # 좌석 프롬프트에 실을 수 있는 원천 근거의 글자 수(창에서 유도한다 — 요청 때 잰다). 리스크 앱이 이 값으로
         # 브리프 예산을 잡는다 — 이름을 바꾸면 그쪽이 옛 한도로 떨어진다(tests/test_risk_app_contract_anchors).
         "evid_budget": _evid_budget(),
