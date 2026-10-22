@@ -25,7 +25,8 @@ def test_덮개가_없으면_env_값이고_출처는_env(eng, monkeypatch):
     _caps(monkeypatch, 3, per_user=2, queue=7)
     lim = delib_jobs.limits()
     assert (lim["max_running"], lim["max_running_per_user"], lim["queue_max"]) == (3, 2, 7)
-    assert lim["source"] == {"max_running": "env", "max_running_per_user": "env", "queue_max": "env"} and "error" not in lim
+    assert lim["source"] == {"max_running": "env", "max_running_per_user": "env", "queue_max": "env", "max_seats_running": "env"}
+    assert lim["max_seats_running"] == 0 and "error" not in lim, "좌석 합 상한은 기본 꺼짐이다(종전 — 잡 수만 센다)"
 
 
 def test_덮개는_준_칸만_덮고_사용자별은_전역을_따르던_박스면_덮인_전역을_따른다(eng, monkeypatch):

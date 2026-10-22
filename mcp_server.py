@@ -285,7 +285,8 @@ _STATE_DESC = (
     "재기동을 넘겨 같은 차례로 다시 선다. 운영이 새 심의를 잠시 멈춘 서버는 시작 · 이어하기를 '점검 중 — 약 N분 뒤 다시"
     "(retry_after_s)' 오류로 거절한다(도는 잡 · 줄 선 잡은 그대로다 — 그때 다시 부른다). "
     + (f"줄은 {delib_jobs.queue_max()}건까지 선다(DELIB_JOB_QUEUE_MAX — 운영이 재기동 없이 바꿀 수 있어 지금 값은 deliberate_jobs 의 "
-       "queue) — 줄까지 차면 시작이 오류로 거절되고, 그 문구에는 내 잡만 실린다." if delib_jobs.queue_max() > 0
+       "queue) — 줄까지 차면 시작이 오류로 거절되고, 그 문구에는 내 잡만 실린다. 운영이 좌석 합 상한(deliberate_jobs 의 "
+       "running_seats_max)을 걸었으면 좌석이 많은 심의는 건수 한도 안이어도 자리가 나기를 기다린다(먼저 선 심의부터)." if delib_jobs.queue_max() > 0
        else "이 서버는 줄을 세우지 않는다(DELIB_JOB_QUEUE_MAX=0) — 상한이 차 있으면 시작이 오류로 거절되고 "
             "queued 는 나오지 않는다.")
 )
@@ -960,6 +961,9 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
         "running_max": delib_jobs.max_running(),
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
         "running_max_per_user": delib_jobs.max_running_per_user(),
+        # 도는 GLM 잡의 좌석 합과 그 상한(0 = 끔) — 좌석이 많은 심의는 잡 수 한도 안이어도 좌석이 나기를 기다린다(앉기 전은 어림).
+        "running_seats": delib_jobs.seats_running(),
+        "running_seats_max": delib_jobs.limits()["max_seats_running"],
         # 줄 — 길이와 **호출자 자신의** 순번만. 남의 잡은 길이에 수로만 들어간다(id·화두를 싣지 않는다).
         "queue": delib_jobs.queue_state(user),
         "states": _STATE_DESC,

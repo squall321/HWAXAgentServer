@@ -76,14 +76,19 @@ MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 기본값에서는 건너뛸 일이 없어 한 사람의 잡 여럿이 줄을 통째로 차지할 수 있다 — 그게 싫으면 사용자별
 # 상한을 전역보다 낮춘다.
 QUEUE_MAX = max(0, _env_int("DELIB_JOB_QUEUE_MAX", 20))
+# 도는 GLM 잡의 좌석 합 상한(HWAXPortal docs/delib-ops R4' · DO-D16) — 0 이면 끔(종전 — 잡 수만 센다). 위 셋은 **잡 수**를 세서 3석 심의도 20석
+# 심의도 1건이다. 한 심의는 단계마다 좌석 수만큼 LLM 호출을 한꺼번에 내니(한도 6 에 20석 여섯이면 120개), LLM 서버가 받는 수를 묶으려면 좌석을
+# 센다. 좌석이 앉기 전(자동 발굴 · 줄 선 잡)은 어림이다(_seats_est). 혼자면 상한보다 커도 돈다 — 아니면 그 잡은 영영 못 뜬다.
+MAX_SEATS_RUNNING = max(0, _env_int("DELIB_JOB_MAX_SEATS_RUNNING", 0))
 
 # 동시 한도 덮개(HWAXPortal docs/delib-ops R4) — 박스 파일(<잡 원장>/state/limits.json)이 위 셋(env 값) 위에 덮인다. **판정 때마다** 읽어(수십
 # 바이트다) 재기동 없이 바뀐다. 쓰는 길은 루프백 POST /limits(app — /drain 과 같은 신뢰)이고 사람이 파일을 고쳐도 된다.
 # 종전엔 셋이 import 때 한 번 읽는 상수라 한도 하나를 바꾸는 데 재기동이 들었고, 재기동은 도는 잡과 줄 선 잡을 닫았다(10-22 새벽 반나절).
 # 내리면 도는 잡은 그대로 두고 새 시작만 줄인다. 깨진 파일은 읽지 않고(env 값으로 돈다) 사유를 limits() 에 싣는다(/health). 위 셋은 env 층으로
 # 그대로 둔다 — 시험이 그 이름을 바꿔 끼운다.
-_LIMIT_KEYS = ("max_running", "max_running_per_user", "queue_max")
-_LIMIT_LO = {"max_running": 1, "max_running_per_user": 0, "queue_max": 0}      # max_running_per_user 0 = 전역을 따른다
+_LIMIT_KEYS = ("max_running", "max_running_per_user", "queue_max", "max_seats_running")
+# max_running_per_user 0 = 전역을 따른다 · max_seats_running 0 = 좌석 합 상한 없음
+_LIMIT_LO = {"max_running": 1, "max_running_per_user": 0, "queue_max": 0, "max_seats_running": 0}
 _LIMIT_HI = 1000          # 손잡이 하나의 위쪽 — 오타(60000)가 LLM 을 통째로 묶지 않게
 _lim_cache: dict = {}
 
@@ -374,6 +379,7 @@ def limits() -> dict:
     else:
         pu = MAX_RUNNING_PER_USER
     return {"max_running": mr, "max_running_per_user": pu, "queue_max": over.get("queue_max", QUEUE_MAX),
+            "max_seats_running": over.get("max_seats_running", MAX_SEATS_RUNNING),
             "source": {k: ("file" if k in over else "env") for k in _LIMIT_KEYS}, **meta,
             **({"error": err} if err else {})}
 
@@ -420,8 +426,8 @@ def set_limits(values: dict, *, by: str, reason: str = "", reset: bool = False) 
         tmp.replace(limits_path())
     _lim_cache.clear()
     out = limits()
-    log.info("동시 한도 %s — 전역 %d · 사용자별 %d · 줄 %d (by %s)", "덮개를 지웠다" if reset else "바꿨다",
-             out["max_running"], out["max_running_per_user"], out["queue_max"], by)
+    log.info("동시 한도 %s — 전역 %d · 사용자별 %d · 줄 %d · 좌석 합 %s (by %s)", "덮개를 지웠다" if reset else "바꿨다",
+             out["max_running"], out["max_running_per_user"], out["queue_max"], out["max_seats_running"] or "끔", by)
     _pump()
     return out
 
@@ -578,6 +584,25 @@ def _glm_running_count() -> int:
     return sum(1 for j in _JOBS.values() if j.get("status") == "running" and not _external(j))
 
 
+def _seats_of(job: dict) -> int:
+    """그 잡이 쥐는(쥘) 좌석 수 — 앉은 좌석(엔진의 personas 사건 — 다단 심의는 지금 단의 좌석)이 있으면 그 수, 아직이면 시작 때 어림."""
+    n = len(job.get("seats") or [])
+    return n if n else max(1, int(job.get("seats_est") or 1))
+
+
+def seats_running() -> int:
+    """도는 GLM 잡의 좌석 합 — 좌석 합 상한(max_seats_running)이 이것을 본다. 외부 응답자 잡은 GLM 을 물지 않아 세지 않는다."""
+    return sum(_seats_of(j) for j in _JOBS.values() if j.get("status") == "running" and not _external(j))
+
+
+def _seats_est(opts: dict) -> int:
+    """좌석이 앉기 전의 어림 — 지정 좌석이 있으면 그 수(상한 DELIB_MAX_SEATS) + 1(종류마다 엔진이 더하는 반대석 · 고정석 몫), 없으면 자동 발굴
+    기본(DELIB_PERSONAS + DELIB_COUNTER_SEATS) + 1. 넉넉한 쪽으로 어림한다 — 적게 어림하면 앉는 순간 상한을 넘는다. 앉으면 실제 수로 고친다."""
+    from deliberation import _COUNTER_SEATS, MAX_REQ_SEATS, N_PERSONAS  # noqa: PLC0415 — 늦은 import(순환 방지)
+    req = [p for p in (opts.get("personas") or []) if isinstance(p, dict)]
+    return (min(len(req), MAX_REQ_SEATS) if req else N_PERSONAS + max(0, _COUNTER_SEATS)) + 1
+
+
 def _running_of(owner: str) -> list[str]:
     """그 사람이 돌리고 있는 GLM 잡 id — 사용자별 상한(GLM 몫)이 본다. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석).
     외부 응답자 잡은 따로 센다(_external_running_of)."""
@@ -613,6 +638,9 @@ def _pump() -> None:
     if _CLOSING or _paused():
         return              # 멈춤(R1)이면 줄 선 잡을 띄우지 않는다 — 잡아 두고 재기동한다(풀리면 주기 펌프 · /drain 끄기가 띄운다)
     lim = limits()          # 한도는 판정 때마다 읽는다(R4) — 한 번 읽어 이 걸음 안에서 같은 값을 쓴다
+    seat_cap = lim["max_seats_running"]
+    seats = seats_running() if seat_cap > 0 else 0
+    seat_hold = False       # 먼저 선 GLM 잡이 좌석을 기다리는 중 — 뒤의 GLM 잡이 그 좌석을 가로채지 않는다(큰 심의가 굶지 않게)
     for jid, (job, spawn) in list(_PENDING.items()):
         if _external(job):
             if len(_external_running_of(job.get("task_owner") or "")) >= EXTERNAL_PER_OWNER:
@@ -622,6 +650,13 @@ def _pump() -> None:
                 continue
             if len(_running_of(_owner(job))) >= lim["max_running_per_user"]:
                 continue
+            if seat_cap > 0:
+                w = _seats_of(job)
+                # 혼자면(도는 GLM 잡이 없으면) 상한보다 커도 띄운다 — 아니면 그 잡은 영영 못 뜬다
+                if seat_hold or (_glm_running_count() > 0 and seats + w > seat_cap):
+                    seat_hold = True
+                    continue
+                seats += w
         del _PENDING[jid]
         _launch(job, spawn)
 
@@ -661,9 +696,15 @@ def queue_info(job: dict) -> dict | None:
     else:
         lim = limits()
         mine = len(_running_of(_owner(job)))
-        why = (f"사용자별 상한 {lim['max_running_per_user']}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
-               "선 다른 사람이 먼저 갈 수 있다)" if mine >= lim["max_running_per_user"]
-               else f"전역 상한 {lim['max_running']}건 — 진행 중인 심의가 끝나야 차례가 온다")
+        if mine >= lim["max_running_per_user"]:
+            why = (f"사용자별 상한 {lim['max_running_per_user']}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
+                   "선 다른 사람이 먼저 갈 수 있다)")
+        elif _glm_running_count() < lim["max_running"] and lim["max_seats_running"] > 0:
+            w = _seats_of(job)
+            why = (f"좌석 합 상한 {lim['max_seats_running']}석 — 도는 심의가 좌석 {seats_running()}석을 쓰고 이 심의는 {w}석"
+                   f"{'' if job.get('seats') else '(어림)'}이라, 자리가 나면 먼저 선 심의부터 차례로 든다")
+        else:
+            why = f"전역 상한 {lim['max_running']}건 — 진행 중인 심의가 끝나야 차례가 온다"
     return {"position": pos, "ahead": pos - 1, "length": len(_PENDING), "max": queue_max(), "why": why,
             "waited_s": round(_now() - (job.get("queued_at") or _now()), 1)}
 
@@ -818,8 +859,11 @@ async def _drive(job: dict, gen) -> None:
     """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다."""
     try:
         async for chunk in gen:
-            _apply(job, *_parse_sse(chunk))
+            ev, data = _parse_sse(chunk)
+            _apply(job, ev, data)
             job["updated_at"] = _now()
+            if ev == "delib" and data.get("kind") == "personas" and _PENDING:
+                _pump()     # 좌석이 앉았다 — 어림보다 적으면 줄 선 잡이 들 자리가 났다(좌석 합 상한)
     except asyncio.CancelledError:
         if _CLOSING:
             # 서버가 내려가며 접혔다(정상 종료 — 루프가 남은 태스크를 취소한다). 사람이 접은 것이 아니다 — interrupted 로 남기고 시작 인자
@@ -900,7 +944,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 거절 문구가 말하는 손잡이 — 값이 덮개에서 왔으면 덮개다(env 이름을 대면 그 값을 고쳐도 안 바뀐다).
     _knob = {k: ("박스 덮개 POST /limits" if lim["source"][k] == "file" else env)
              for k, env in (("max_running", "DELIB_JOB_MAX_RUNNING"), ("max_running_per_user", "DELIB_JOB_MAX_RUNNING_PER_USER"),
-                            ("queue_max", "DELIB_JOB_QUEUE_MAX"))}
+                            ("queue_max", "DELIB_JOB_QUEUE_MAX"), ("max_seats_running", "DELIB_JOB_MAX_SEATS_RUNNING"))}
     me = (user_email or "").strip().lower()
     mine = _external_running_of(x_owner) if external else _running_of(me)
     who = x_owner if external else me
@@ -914,6 +958,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             hit.append(f"전역 {_mr}건 — {_knob['max_running']}")
         if me and len(mine) >= _pu:
             hit.append(f"사용자별 {_pu}건 — {_knob['max_running_per_user']}")
+        _sc = lim["max_seats_running"]
+        if _sc > 0 and total > 0:
+            _w, _sr = _seats_est(dict(delib_opts or {})), seats_running()
+            if _sr + _w > _sc:
+                hit.append(f"좌석 합 {_sc}석(도는 {_sr}석 + 이 심의 {_w}석 어림) — {_knob['max_seats_running']}")
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
     # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.
@@ -971,6 +1020,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
 
     job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     job = {
+        # 좌석이 앉기 전의 어림 — 좌석 합 상한(max_seats_running)이 앉을 때까지 이 수로 센다(앉으면 seats 의 수).
+        "seats_est": _seats_est(opts),
         "id": job_id, "job": j, "kind": j, "label": spec["label"], "question": q,
         "chair_template": opts.get("chair_template"), "opts": _opts_echo(applied),
         "status": "queued", "stage": "queued", "step": "", "steps": [],

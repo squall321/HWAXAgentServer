@@ -6042,17 +6042,18 @@ def _delib_ops_health() -> dict:
         pause = _delib_pause_view()
         d = delib_jobs.queue_durability()
         return {"delib_paused": bool(pause.get("on")), "delib_pause": pause, "delib_queue_durable": d["durable"],
-                "delib_requeued": d["requeued"]}
+                "delib_requeued": d["requeued"], "delib_seats_running": delib_jobs.seats_running()}
     except Exception as exc:  # noqa: BLE001
         return {"delib_paused": False, "delib_pause": {"on": False, "error": f"{type(exc).__name__}: {exc}"[:200]},
-                "delib_queue_durable": False, "delib_requeued": 0}
+                "delib_queue_durable": False, "delib_requeued": 0, "delib_seats_running": None}
 
 
 # ── 동시 심의 한도(HWAXPortal docs/delib-ops R4) ─────────────────────────────────
-# GET /limits · POST /limits {max_running?, max_running_per_user?, queue_max?(정수 · null 은 그 칸의 덮개를 지운다), by, reason?, reset?} —
+# GET /limits · POST /limits {max_running?, max_running_per_user?, queue_max?, max_seats_running?(정수 · null 은 그 칸의 덮개를 지운다), by, reason?,
+# reset?} — max_seats_running 은 도는 GLM 잡의 좌석 합 상한(0 = 끔 — R4' · DO-D16).
 # 박스 덮개(<잡 원장>/state/limits.json)가 env 위에 덮이고 판정 때마다 읽혀 재기동이 없다. 올리면 그 자리에서 줄 선 잡을 띄운다. 내리면 도는
 # 잡은 그대로 두고 새 시작만 줄인다. 인증은 없다 — /drain 과 같다(서버는 루프백에만 묶인다). 포털은 이 주소를 중계하지 않는다.
-_LIMITS_FIELDS = ("max_running", "max_running_per_user", "queue_max", "by", "reason", "reset")
+_LIMITS_FIELDS = ("max_running", "max_running_per_user", "queue_max", "max_seats_running", "by", "reason", "reset")
 
 
 @app.get("/limits")
@@ -6078,10 +6079,10 @@ async def post_limits(request: Request):
                              "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
     if not isinstance(body.get("reset", False), bool):
         return JSONResponse({"code": "bad_request", "message": "reset 은 true|false 다"}, status_code=422)
-    vals = {k: body[k] for k in ("max_running", "max_running_per_user", "queue_max") if k in body}
+    vals = {k: body[k] for k in ("max_running", "max_running_per_user", "queue_max", "max_seats_running") if k in body}
     if not vals and not body.get("reset"):
-        return JSONResponse({"code": "bad_request", "message": "바꿀 칸(max_running · max_running_per_user · queue_max)이나 "
-                             "reset 이 없다"}, status_code=422)
+        return JSONResponse({"code": "bad_request", "message": "바꿀 칸(max_running · max_running_per_user · queue_max · "
+                             "max_seats_running)이나 reset 이 없다"}, status_code=422)
     try:
         out = delib_jobs.set_limits(vals, by=str(body.get("by") or ""), reason=str(body.get("reason") or ""),
                                     reset=bool(body.get("reset")))
@@ -6090,8 +6091,8 @@ async def post_limits(request: Request):
     except OSError as exc:                  # 덮개 파일을 못 쓰거나 못 지운다(권한·디스크) — 거짓 200 이 아니라 사유를 싣는다
         return JSONResponse({"code": "limits_unavailable", "message": f"동시 한도 덮개 파일을 쓰거나 지우지 못했다 — "
                              f"{type(exc).__name__}(DELIB_JOB_DIR 의 권한·디스크를 본다)"}, status_code=503)
-    print(f"[limits] 전역 {out['max_running']} · 사용자별 {out['max_running_per_user']} · 줄 {out['queue_max']} "
-          f"(by {str(body.get('by'))[:80]}{' · 덮개 지움' if body.get('reset') else ''})")
+    print(f"[limits] 전역 {out['max_running']} · 사용자별 {out['max_running_per_user']} · 줄 {out['queue_max']} · 좌석 합 "
+          f"{out['max_seats_running'] or '끔'} (by {str(body.get('by'))[:80]}{' · 덮개 지움' if body.get('reset') else ''})")
     return out
 
 
@@ -6123,7 +6124,8 @@ def health() -> dict:
         # 동시 심의 한도 셋과 출처 — 박스 덮개(POST /limits)가 env 위에 덮인다(HWAXPortal docs/delib-ops R4).
         "limits": _limits_health(),
         # 새 심의 멈춤(delib_paused · delib_pause — R1) · 줄이 재기동을 넘기나(delib_queue_durable — 참이면 재기동 판정이 줄 선 수를 막는 수로
-        # 세지 않는다, start.sh · 포털 lib/delib-busy.sh) · 이번 기동에 다시 세운 줄(delib_requeued — R2, update-all 이 재기동 뒤 찍는다).
+        # 세지 않는다, start.sh · 포털 lib/delib-busy.sh) · 이번 기동에 다시 세운 줄(delib_requeued — R2, update-all 이 재기동 뒤 찍는다) ·
+        # 도는 GLM 잡의 좌석 합(delib_seats_running — 좌석 합 상한 limits.max_seats_running 이 본다, 앉기 전은 어림).
         **_delib_ops_health(),
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
         **_review,

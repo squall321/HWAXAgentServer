@@ -23,15 +23,23 @@ ChatDock (portal frontend)
   `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
   `start.sh` reads them before it replaces a running instance, and any unattended restart
   (the portal's update-all) should do the same.
-- `GET /limits` · `POST /limits` — the three deliberation job limits without a restart (portal `docs/delib-ops` R4).
+- `GET /limits` · `POST /limits` — the deliberation job limits without a restart (portal `docs/delib-ops` R4).
   A box file `<DELIB_JOB_DIR>/state/limits.json` overlays `DELIB_JOB_MAX_RUNNING` · `DELIB_JOB_MAX_RUNNING_PER_USER` ·
   `DELIB_JOB_QUEUE_MAX` and is read at every start and queue decision (a person may edit it by hand too).
-  `POST {max_running?, max_running_per_user?, queue_max?, by, reason?, reset?}` — integers (1–1000 · 0–1000 · 0–1000,
-  per-user `0` = follow the global); `null` removes that key's overlay, `reset: true` deletes the file; an unknown field
+  `POST {max_running?, max_running_per_user?, queue_max?, max_seats_running?, by, reason?, reset?}` — integers (1–1000 ·
+  0–1000 · 0–1000 · 0–1000, per-user `0` = follow the global, seats `0` = off); `null` removes that key's overlay, `reset: true` deletes the file; an unknown field
   is 422 `unknown_fields`, a file that cannot be written 503 `limits_unavailable`. Raising starts queued jobs at once;
   lowering never stops a running job — new starts queue. A per-user limit that env left following the global follows the
   overlaid global. A broken file is ignored (env values apply) and the answer's `error` says why. Loopback only, like
   `/drain`; the portal does not relay it. `/health.limits` carries the same values with `source` per key (`file` · `env`).
+  A fourth key, `max_seats_running` (`DELIB_JOB_MAX_SEATS_RUNNING`, default `0` = off), caps the **seats** of running GLM
+  jobs: the three above count jobs, so a 3-seat and a 20-seat deliberation weigh the same, while one deliberation sends
+  as many LLM calls at a time as it has seats. A job holds its seated count (`personas` event — the current stage of a
+  multi-stage job) or, before seating, an estimate (requested seats + 1, or `DELIB_PERSONAS` + `DELIB_COUNTER_SEATS` + 1).
+  A job that would pass the cap queues; one alone runs even if larger; the first seat-blocked job holds the line so a
+  large deliberation is not starved by small ones behind it; seating re-checks the queue at once. External-responder jobs
+  and web deliberations (portal screen · risk panels, bounded by the risk app's `HWAXRISK_CONCURRENCY`) are not in the
+  sum. `/health.delib_seats_running` and `deliberate_jobs` (`running_seats` · `running_seats_max`) show it.
 - `POST /drain {scope: "delib", on, ttl_s | hold, by, reason?, force?}` — **pause new deliberations** (portal
   `docs/delib-ops` R1). Same rules as the card-review drain flag (6 h TTL cap, owner `by` — 409 `drain_owned` /
   `drain_held`, `hold` lives until a person lifts it, atomic writes, 503 `drain_unavailable`), but its own file
