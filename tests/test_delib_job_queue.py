@@ -572,9 +572,9 @@ def test_신원_없는_호출과_주인_없는_잡은_종전대로다(eng, monke
 
 
 # ── 재기동 ───────────────────────────────────────────────────────────────────
-def test_줄_선_잡은_재기동을_못_넘기고_다시_시작하라고_남는다(eng, monkeypatch):
-    """띄울 때 쓸 인자(호출자 토큰·근거 본문)는 메모리에만 있다 — 재기동 뒤에는 띄울 수가 없다.
-    queued 로 남겨 두면 호출자는 영영 차례를 기다린다."""
+def test_시작_인자_파일이_없는_줄_선_잡은_재기동을_못_넘기고_다시_시작하라고_남는다(eng, monkeypatch):
+    """시작 인자 파일(HWAXPortal docs/delib-ops R2)이 없는 잡 — 이 판 이전에 줄을 섰거나 파일을 못 쓴 잡 — 은 재기동 뒤에 띄울 수가 없다.
+    queued 로 남겨 두면 호출자는 영영 차례를 기다린다. (파일이 있는 잡이 다시 서는 것은 tests/test_delib_ops.py 가 본다.)"""
     _caps(monkeypatch, 1)
 
     async def scenario():
@@ -586,6 +586,7 @@ def test_줄_선_잡은_재기동을_못_넘기고_다시_시작하라고_남는
     for job, status in ((a, "running"), (b, "queued")):
         job["status"] = status
         delib_jobs._persist(job)
+        delib_jobs._drop_args(job["id"])          # 시작 인자 파일이 없는 잡(이 판 이전) — _play 의 뒷정리도 이미 지웠다
     for store in (delib_jobs._JOBS, delib_jobs._TASKS, delib_jobs._PENDING):
         store.clear()
     m.bind(object())                              # 기동 때 도는 정리
@@ -630,7 +631,9 @@ def test_서버가_내려가는_동안에는_줄_선_심의를_띄우지_않는�
     try:
         asyncio.run(serve())
         assert eng.started == ["가"], f"내려가는 중에 줄 선 심의를 띄웠다 — {eng.started}"
-        assert [_on_disk(j)["status"] for j in jobs.values()] == ["cancelled", "queued", "queued"]
+        # 내려가며 접힌 도는 잡은 사람이 접은 것(cancelled)이 아니라 끊긴 것(interrupted)이다 — 시작 인자 파일이 남아 이어 돌 수 있다(R3).
+        assert [_on_disk(j)["status"] for j in jobs.values()] == ["interrupted", "queued", "queued"]
+        assert all(delib_jobs._args_path(j["id"]).exists() for j in jobs.values()), "끊긴 잡 · 줄 선 잡의 시작 인자 파일이 지워졌다"
     finally:
         # ⚠ 이 시험이 깨질 때(내려가는 중에 잡이 떠 버렸을 때) 그 태스크는 루프가 닫힌 뒤에도 남는다. 그대로
         #   두면 시험이 끝나 원장 경로가 **실 경로로 되돌아간 뒤에** 뒷정리가 돌아 실 원장에 기록을 쓴다
@@ -642,17 +645,22 @@ def test_서버가_내려가는_동안에는_줄_선_심의를_띄우지_않는�
                 pass
     for store in (delib_jobs._JOBS, delib_jobs._TASKS, delib_jobs._PENDING):
         store.clear()
-    m.bind(object())                              # 다음 기동
-    for q in ("나", "다"):
-        rec = asyncio.run(m.deliberate_status(jobs[q]["id"]))
-        assert rec["status"] == "interrupted" and "시작하지 못했다" in rec["error"], rec
-    assert _play(_starts_now) == "running", "다시 뜬 서버가 새 심의를 띄우지 않는다"
+    m.bind(object())                              # 다음 기동 — 줄 선 둘은 같은 차례로 다시 선다(R2), 도는 것은 interrupted 그대로
+    assert list(delib_jobs._PENDING) == [jobs["나"]["id"], jobs["다"]["id"]], "다시 선 줄의 차례가 다르다"
+    rec = asyncio.run(m.deliberate_status(jobs["가"]["id"]))
+    assert rec["status"] == "interrupted" and rec["resume"]["args"] is True, rec
+    assert _play(_starts_now) == (["가", "나"], "queued"), "다시 뜬 서버가 다시 선 줄을 먼저 띄우지 않는다"
 
 
 async def _starts_now():
+    delib_jobs._pump()                            # 기동 뒤 첫 줄 다시 보기(주기 펌프 · 다음 시작이 한다)
     job = _start("새 화두")
     await _tick()
-    return _st(job)
+    return eng_started(), _st(job)
+
+
+def eng_started():
+    return list(d.run_deliberation.__self__.started)
 
 
 def test_시험_세션의_기본_원장_경로는_실_원장이_아니다():

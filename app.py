@@ -904,6 +904,25 @@ def _denied_feature(req: "ChatRequest") -> str | None:
     return None
 
 
+def _delib_pause_info() -> dict | None:
+    """새 심의 멈춤(R1)이 켜져 있으면 그 상태(retry_after_s 포함), 아니면 None. 잡 모듈을 못 붙이면 None 이다(멈춤은 운영 손잡이다 — 못 읽어
+    막지 않는다. 깃발 판정 규칙은 review_gate.DrainState)."""
+    try:
+        import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+        return delib_jobs.pause_info()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[agent] 새 심의 멈춤을 읽지 못했다({type(exc).__name__}) — 꺼짐으로 읽는다")
+        return None
+
+
+async def _paused_stream(info: dict) -> AsyncIterator[bytes]:
+    """새 심의 멈춤의 답 — 엔진의 다른 거절과 같은 꼴(error 다음 done). 포털 화면은 error 의 글을 그대로 보인다."""
+    import delib_jobs  # noqa: PLC0415
+    yield _sse("error", {"code": "delib_paused", "message": delib_jobs.pause_message(info),
+                         "retry_after_s": info["retry_after_s"], "infra": True, "retryable": True})
+    yield _sse("done", {})
+
+
 async def _deny_stream(key: str) -> AsyncIterator[bytes]:
     """권한이 없을 때의 답 — 오류 배너가 아니라 대화에 남는 한 줄로 알린다(무엇이 없고 어디서 청하나)."""
     msg = (f"'{_FEATURE_LABEL.get(key, key)}' 을(를) 쓸 권한이 없습니다. "
@@ -4681,6 +4700,12 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     _call_trace.tag(kind="chat", turn=_call_trace.new_id())
     # 누가 띄운 심의인가 — 리스크 앱 러너의 패널은 app(카드 대조 관문의 절반 판정에 세지 않는다 — M3.md #26).
     started_by = _started_by(req.delib_opts.get("started_by") if isinstance(req.delib_opts, dict) else None)
+    # 새 심의 멈춤(HWAXPortal docs/delib-ops R1) — 웹 세 트리거도 MCP 두 도구와 같이 막는다. 앱이 띄운 리스크 패널은 막지 않는다 — 엔진이
+    # 거절하면 패널이 오류로 닫힌다. 앱은 비우기 깃발(/health.drain)로 스스로 새 패널을 멈춘다(update-all 은 둘 다 세운다).
+    if started_by != "app" and (is_sim_deliberation(req.message) or is_test_plan(req.message) or is_deliberation(req.message)):
+        _paused = _delib_pause_info()
+        if _paused:
+            return StreamingResponse(_paused_stream(_paused), media_type="text/event-stream", headers=SSE_HEADERS)
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
@@ -5885,6 +5910,10 @@ def _external_llm_health() -> dict:
 # POST /drain {on, scope: all|panels, ttl_s | until_idle{grace_s, max_s}, hold?, by, reason, force?} · GET /drain. 깃발은
 # review_gate.DrainState(파일 하나 — 재기동을 넘긴다)이고 규칙도 거기 있다. 인증은 없다 — 서버는 루프백에만 묶이고 /chat 도
 # 같은 신뢰 수준이다. 포털은 /drain 을 중계하지 않는다(포털 시험이 라우터에서 뽑아 본다).
+# scope: "delib" 는 **새 심의 멈춤**(HWAXPortal docs/delib-ops R1)이다 — 같은 규칙의 다른 파일(delib_jobs.pause_state)이라 카드 대조 깃발과
+# 서로 건드리지 않는다. 끄기도 scope: "delib" 를 적어야 그 깃발이다(종전 끄기 요청은 scope 를 안 적었다 — 그대로 카드 대조 깃발이다).
+# GET /drain 은 카드 대조 깃발 그대로다(리스크 앱 · 포털과 나눠 쓰는 계약 예제) — 멈춤은 /health 의 delib_pause 와 scope delib 응답이 보인다.
+# until_idle 은 받지 않는다(멈춤은 '심의가 비면 풀린다' 가 아니라 잡아 두고 재기동하는 것이다). 끄면 그 자리에서 줄을 띄운다.
 _DRAIN_FIELDS = ("on", "scope", "ttl_s", "until_idle", "hold", "by", "reason", "force")
 _ECHO_MAX = 80                          # 거절이 되비추는 호출자 값 하나의 글자 상한
 
@@ -5899,6 +5928,15 @@ def _drain_view(gate) -> dict:
     a, q = _delib_load()
     return {**gate.drain.snapshot(), "review_active": gate.active + _external_review_active(), "delib_active": a,
             "delib_queued": q}
+
+
+def _delib_pause_view() -> dict:
+    """새 심의 멈춤 깃발(R1) — DrainState.snapshot 꼴(꺼져 있으면 on=false). 켜져 있으면 retry_after_s 도. 못 읽으면 꺼짐 꼴에 error."""
+    try:
+        import delib_jobs  # noqa: PLC0415
+        return delib_jobs.pause_info() or delib_jobs.pause_state().snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return {"on": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def _external_review_active() -> int:
@@ -5918,14 +5956,17 @@ def get_drain():
 
 @app.post("/drain")
 async def post_drain(request: Request):
-    if _card_review is None:
-        return JSONResponse({"code": "drain_unavailable", "message": f"카드 대조 모듈이 없다 — {_CARD_REVIEW_ERR}"},
-                            status_code=503)
     from review_gate import DrainError  # noqa: PLC0415
 
     try:
         body = json.loads(await request.body() or b"{}")
     except ValueError:
+        body = None
+    # 새 심의 멈춤(scope delib)은 카드 대조 모듈 없이도 받는다. 그 밖은 종전 그대로 — 모듈이 없으면 무엇을 보내든 503 이다.
+    if _card_review is None and not (isinstance(body, dict) and body.get("scope") == "delib"):
+        return JSONResponse({"code": "drain_unavailable", "message": f"카드 대조 모듈이 없다 — {_CARD_REVIEW_ERR}"},
+                            status_code=503)
+    if body is None:
         return JSONResponse({"code": "bad_request", "message": "본문이 JSON 이 아니다"}, status_code=422)
     if not isinstance(body, dict):
         return JSONResponse({"code": "bad_request", "message": "본문은 JSON 객체여야 한다"}, status_code=422)
@@ -5942,6 +5983,8 @@ async def post_drain(request: Request):
             return JSONResponse({"code": "bad_request", "message": f"{k} 는 true|false 다"}, status_code=422)
     if body.get("until_idle") is not None and not isinstance(body["until_idle"], dict):
         return JSONResponse({"code": "bad_request", "message": "until_idle 은 {grace_s, max_s} 다"}, status_code=422)
+    if body.get("scope") == "delib":
+        return _post_delib_pause(body)
     gate = _card_review.gate_of(app)
     try:
         if body["on"]:
@@ -5960,6 +6003,49 @@ async def post_drain(request: Request):
         return JSONResponse({"code": "drain_unavailable", "message": f"비우기 깃발 파일을 쓰거나 지우지 못했다 — "
                              f"{type(exc).__name__}(DRAIN_STATE_PATH 의 권한·디스크를 본다)"}, status_code=503)
     return _drain_view(gate)
+
+
+def _post_delib_pause(body: dict):
+    """POST /drain {scope: "delib", ...} — 새 심의 멈춤을 세우거나 내린다. 규칙(수명 · 주인 · 고정 · 409 · 503)은 비우기 깃발과 같다."""
+    import delib_jobs  # noqa: PLC0415
+    from review_gate import DrainError  # noqa: PLC0415
+
+    if body.get("until_idle") is not None:
+        return JSONResponse({"code": "bad_request", "message": "새 심의 멈춤은 until_idle 을 받지 않는다 — ttl_s 나 hold 다(멈춤은 "
+                             "심의가 비어도 풀리지 않는다 — 잡아 두고 재기동한다)"}, status_code=422)
+    pause = delib_jobs.pause_state()
+    try:
+        if body["on"]:
+            snap = pause.set_on(scope="delib", by=body.get("by"), reason=body.get("reason") or "", ttl_s=body.get("ttl_s"),
+                                hold=bool(body.get("hold")))
+            print(f"[drain] 새 심의 멈춤 on by={snap['by']} hold={snap['hold']} until={snap['until']}")
+        else:
+            pause.set_off(by=body.get("by") or "", force=bool(body.get("force")))
+            print(f"[drain] 새 심의 멈춤 off by={str(body.get('by'))[:80]}")
+            delib_jobs._pump()                      # 풀렸다 — 붙잡아 둔 줄을 그 자리에서 띄운다
+    except DrainError as exc:
+        print(f"[drain] 새 심의 멈춤 거절 {exc.status} {exc.code} — {exc.message}"[:300])
+        return JSONResponse(exc.body(), status_code=exc.status)
+    except OSError as exc:
+        print(f"[drain] 새 심의 멈춤 파일을 쓰거나 지우지 못했다 — {type(exc).__name__}: {exc}"[:300])
+        return JSONResponse({"code": "drain_unavailable", "message": f"새 심의 멈춤 파일을 쓰거나 지우지 못했다 — "
+                             f"{type(exc).__name__}(DELIB_JOB_DIR 의 권한·디스크를 본다)"}, status_code=503)
+    a, q = _delib_load()
+    return {**_delib_pause_view(), "delib_active": a, "delib_queued": q}
+
+
+def _delib_ops_health() -> dict:
+    """/health 의 새 심의 멈춤 · 줄 넘기기(HWAXPortal docs/delib-ops R1 · R2). 모듈을 못 붙이면 멈춤 꺼짐 · 줄 넘기지 않음으로 낸다(재기동 판정이
+    줄 선 수를 막는 수로 센다 — 종전 쪽)."""
+    try:
+        import delib_jobs  # noqa: PLC0415
+        pause = _delib_pause_view()
+        d = delib_jobs.queue_durability()
+        return {"delib_paused": bool(pause.get("on")), "delib_pause": pause, "delib_queue_durable": d["durable"],
+                "delib_requeued": d["requeued"]}
+    except Exception as exc:  # noqa: BLE001
+        return {"delib_paused": False, "delib_pause": {"on": False, "error": f"{type(exc).__name__}: {exc}"[:200]},
+                "delib_queue_durable": False, "delib_requeued": 0}
 
 
 # ── 동시 심의 한도(HWAXPortal docs/delib-ops R4) ─────────────────────────────────
@@ -6036,6 +6122,9 @@ def health() -> dict:
         "delib_queued": _queued,
         # 동시 심의 한도 셋과 출처 — 박스 덮개(POST /limits)가 env 위에 덮인다(HWAXPortal docs/delib-ops R4).
         "limits": _limits_health(),
+        # 새 심의 멈춤(delib_paused · delib_pause — R1) · 줄이 재기동을 넘기나(delib_queue_durable — 참이면 재기동 판정이 줄 선 수를 막는 수로
+        # 세지 않는다, start.sh · 포털 lib/delib-busy.sh) · 이번 기동에 다시 세운 줄(delib_requeued — R2, update-all 이 재기동 뒤 찍는다).
+        **_delib_ops_health(),
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
         **_review,
         # 외부 응답자(켜진 박스만) — 과제 줄의 수. 재기동하면 줄을 잃는다(도는 호출은 앱이 인프라로 다시 낸다).

@@ -190,7 +190,9 @@ def test_인자_설명을_더해도_필수_인자와_기본값은_그대로다()
     """설명은 스키마의 글만 바꾼다 — 필수 · 기본값이 움직이면 기존 호출이 깨진다."""
     s = _schemas()
     assert s["deliberate_start"]["required"] == ["question"]
-    assert s["deliberate_continue"]["required"] == ["previous_job_id", "human_note"]
+    # 사람 의견은 선택이다 — 재기동으로 끊긴 심의는 의견 없이 이어 돈다(HWAXPortal docs/delib-ops R3). 필수면 호출자가 아무 글이나 지어
+    # 넣고 그 글이 매 라운드 좌석에 실린다.
+    assert s["deliberate_continue"]["required"] == ["previous_job_id"]
     assert s["deliberate_list"].get("required", []) == []
     assert s["deliberate_start"]["properties"]["job"]["default"] == "default"
     assert s["deliberate_start"]["properties"]["save_report"]["default"] is True

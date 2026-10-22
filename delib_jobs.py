@@ -20,6 +20,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -27,6 +28,7 @@ from urllib.parse import unquote
 from pathlib import Path
 
 import call_trace
+import review_gate
 
 log = logging.getLogger("agent.delib_jobs")
 
@@ -84,6 +86,25 @@ _LIMIT_KEYS = ("max_running", "max_running_per_user", "queue_max")
 _LIMIT_LO = {"max_running": 1, "max_running_per_user": 0, "queue_max": 0}      # max_running_per_user 0 = 전역을 따른다
 _LIMIT_HI = 1000          # 손잡이 하나의 위쪽 — 오타(60000)가 LLM 을 통째로 묶지 않게
 _lim_cache: dict = {}
+
+# 새 심의 멈춤(HWAXPortal docs/delib-ops R1) — 카드 대조 비우기 깃발(review_gate.DrainState)과 같은 규칙(수명 상한 6시간 · 주인 by · 사람의
+# 고정 hold · 원자적 쓰기)의 **따로 된 파일**(<잡 원장>/state/delib-pause.json · scope delib). 켜져 있으면 새 잡(시작 · 이어하기)을 받지 않고
+# 줄 선 잡도 띄우지 않는다(잡아 두고 재기동 — 줄은 시작 인자 파일로 재기동을 넘긴다, R2). 도는 잡은 끝까지 간다. 쓰는 길은 루프백
+# POST /drain {scope: "delib"}(app). 종전엔 이 스위치가 없어 운영이 '아무도 안 거는 때' 를 기다렸고, 그 사이 줄 선 잡이 빈자리에 들어갔다(10-22).
+PAUSE_HOLD_RETRY_S = 600      # 사람이 고정한 멈춤(끝 시각 없음)의 '약 N분 뒤' — 풀 때를 모르니 10분 뒤 다시 보라고 한다
+_PAUSE: dict = {}
+# 줄을 다시 보는 간격(초) — 멈춤이 수명으로 풀리거나 사람이 한도 덮개를 손으로 고친 것을 이만큼 안에 따라간다. 종전엔 줄은 잡이 끝날 때만
+# 움직였다(그때뿐이라 바깥 사정이 바뀌어도 다음 잡이 끝날 때까지 그대로였다).
+PUMP_TICK_S = 15.0
+_TICKER = None
+# 시작 인자 파일(R2 · R3) — 잡마다 시작 인자 전부(근거 본문 · 좌석 · 사람 의견 · 손잡이 · 신원 — **토큰 없음**)를 <잡 원장>/args/<id>.json(0600)에
+# 적는다. 재기동 정리가 줄 선 잡을 같은 차례로 다시 세우고(reap_orphans), 재기동으로 끊긴 잡의 이어하기가 처음 인자를 그대로 쓴다. 끝나면
+# 지운다(끊긴 잡만 남긴다 — 이어 돌리면 지운다). 끊긴 잡의 것도 ARGS_KEEP_S 가 지나면 재기동 정리가 지운다(근거 본문이 남지 않게).
+_ARGS_DIR = "args"
+ARGS_KEEP_S = 7 * 86400
+_REQUEUED = 0                 # 이번 기동에서 다시 세운 줄 선 잡 수(/health.delib_requeued — update-all 이 재기동 뒤 찍는다, O2)
+INTERRUPTED_MSG = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 끝난 라운드 뒤부터 남은 라운드만 이어 돈다"
+                   "(사람 의견은 비워도 된다 · 처음 인자를 그대로 쓴다). 처음부터 다시 시작하려면 deliberate_start")
 # 외부 응답자 심의(delib_opts.llm=external)의 자리 — 판단 호출이 전부 잡 주인의 Claude Code 워크플로로 가서 이 서버의 LLM 을 물지
 # 않는다. 사람 속도의 워커를 기다리는 그 잡이 전역 자리(MAX_RUNNING)를 쥐면 남의 GLM 심의가 그 몇 시간 동안 줄에 묶였다(X-D6).
 # 그래서 전역 상한·사용자별 상한(GLM 몫)에 세지 않고 주인(과제를 받는 사람)마다 이만큼만 돌린다 — 나머지는 줄에서 그 주인의 것이
@@ -188,13 +209,14 @@ _JOBS: dict[str, dict] = {}
 _TASKS: dict[str, asyncio.Task] = {}
 # 줄 선 잡 — job_id → (잡 기록, 그 잡의 태스크를 만드는 함수). **넣은 순서가 순번이다.** 상태가 queued 인
 # 잡과 이 사전의 키는 늘 같다.
-# ⚠ 메모리에만 둔다 — 띄울 때 쓸 인자에 호출자 토큰과 근거 본문이 들어 있어 파일에 적지 않는다. 그래서
-#   줄 선 잡은 재기동을 넘기지 못한다(reap_orphans 가 '다시 시작하라' 로 닫는다).
+# 띄울 함수는 메모리에만 있다. 재기동을 넘기는 것은 시작 인자 파일(<잡 원장>/args — 근거 본문 · 좌석 · 신원, **토큰 없음**)이다 —
+# 재기동 정리(reap_orphans)가 그 파일로 같은 차례에 다시 세운다(HWAXPortal docs/delib-ops R2). 파일을 못 쓴 잡은 종전처럼 '다시 시작하라' 로 닫힌다.
 _PENDING: dict[str, tuple] = {}
 # 서버가 내려가는 중이면 참 — 자리가 나도 줄 선 잡을 띄우지 않는다(_pump). 내려갈 때는 도는 심의가 전부
 # 취소되면서 자리가 한꺼번에 나는데, 그 자리에 줄 선 잡을 띄우면 뜨자마자 죽는다. 헛도는 조회를 쏘고, 죽은
 # 모양에 따라 **결정문 없는 done** 으로 남는다(재기동 정리는 done 을 건드리지 않는다). 줄에 그대로 두면
-# 다음 기동이 '다시 시작하라' 로 닫는다(reap_orphans).
+# 다음 기동이 같은 차례로 다시 세운다(reap_orphans — 시작 인자 파일이 없으면 '다시 시작하라' 로 닫는다). 내려가며 접힌 도는 잡은
+# interrupted 로 남는다(_drive — 사람이 접은 것과 가른다, 이어하기 R3).
 _CLOSING = False
 
 
@@ -215,6 +237,98 @@ def _state_dir() -> Path:
 
 def limits_path() -> Path:
     return _state_dir() / "limits.json"
+
+
+def pause_path() -> Path:
+    return _state_dir() / "delib-pause.json"
+
+
+def pause_state() -> review_gate.DrainState:
+    """새 심의 멈춤 깃발(R1) — 잡 원장 자리마다 하나(시험이 JOB_DIR 을 바꿔 끼운다). 규칙은 review_gate.DrainState 그대로다."""
+    p = str(pause_path())
+    st = _PAUSE.get(p)
+    if st is None:
+        st = _PAUSE[p] = review_gate.DrainState(p, scopes=("delib",))
+    return st
+
+
+def pause_info() -> dict | None:
+    """멈춤이 켜져 있으면 그 상태(DrainState.snapshot 꼴 + retry_after_s — 다시 해 볼 때까지 초), 아니면 None. 깃발 파일을 못 읽거나 깨졌으면
+    꺼짐이다(DrainState 규칙 — 멈춤은 운영 손잡이라 못 읽어 막지 않는다)."""
+    st = pause_state()
+    snap = st.snapshot()
+    if not snap.get("on"):
+        return None
+    until = snap.get("until")
+    left = math.ceil(float(until) - st.clock()) if until is not None else PAUSE_HOLD_RETRY_S
+    return {**snap, "retry_after_s": max(60, int(left))}
+
+
+def pause_message(info: dict) -> str:
+    mins = max(1, round(info["retry_after_s"] / 60))
+    why = f" — {str(info['reason'])[:200]}" if info.get("reason") else ""
+    return (f"새 심의를 잠시 멈췄다(점검 중{why}) — 약 {mins}분 뒤 다시 하라(retry_after_s={info['retry_after_s']}). "
+            "도는 심의는 끝까지 가고, 줄 선 심의는 그대로 기다린다.")
+
+
+class DelibPaused(RuntimeError):
+    """새 심의 멈춤으로 거절한다 — MCP 두 도구는 이 글을 도구 오류로, 웹 트리거는 SSE error(code delib_paused)로 낸다."""
+
+    def __init__(self, info: dict):
+        self.info = info
+        self.retry_after_s = int(info["retry_after_s"])
+        super().__init__(pause_message(info))
+
+
+def _paused() -> bool:
+    try:
+        return pause_info() is not None
+    except Exception:  # noqa: BLE001 — 깃발을 판정하지 못하면 꺼짐으로 읽는다(DrainState 와 같은 쪽)
+        log.exception("새 심의 멈춤을 읽지 못했다 — 꺼짐으로 읽는다")
+        return False
+
+
+def _args_path(job_id: str) -> Path:
+    return JOB_DIR / _ARGS_DIR / f"{job_id}.json"
+
+
+def _write_args(job_id: str, args: dict) -> bool:
+    """시작 인자 파일을 쓴다(0600 · 원자적). 못 쓰면(디스크 · 권한 · JSON 이 아닌 값) 거짓 — 그 잡은 종전처럼 재기동을 넘기지 못한다."""
+    d = JOB_DIR / _ARGS_DIR
+    tmp = d / f".{job_id}.{os.getpid()}.tmp"
+    try:
+        data = json.dumps({"v": 1, **args}, ensure_ascii=False)
+        d.mkdir(parents=True, exist_ok=True)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, _args_path(job_id))
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        log.warning("[delib-job %s] 시작 인자 파일을 못 썼다 — 이 잡은 재기동을 넘기지 못한다: %r", job_id, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def _read_args(job_id: str) -> dict | None:
+    try:
+        a = json.loads(_args_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return a if isinstance(a, dict) and a.get("v") == 1 and isinstance(a.get("question"), str) else None
+
+
+def _drop_args(job_id: str) -> None:
+    try:
+        _args_path(job_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("[delib-job %s] 시작 인자 파일을 못 지웠다: %r", job_id, exc)
 
 
 def _limit_value(k: str, v) -> int:
@@ -325,7 +439,7 @@ def _path(job_id: str) -> Path:
 _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step", "owner_aff", "tool_mode")
+              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from")
 
 
 def _list_path(job_id: str) -> Path:
@@ -496,8 +610,8 @@ def _pump() -> None:
     하나에 둘이 뜨지 않고, 부른 뒤에는 '자리가 비었는데 뜰 수 있는 잡이 줄에 있다' 가 남지 않는다.
     제 사용자별 상한에 걸린 잡은 **건너뛴다** — 거기서 멈추면 한 사람이 줄 전체를 세운다. 외부 응답자 잡은 전역 자리를 보지 않고
     주인마다 EXTERNAL_PER_OWNER 건으로 뜬다 — 그래서 전역 자리가 차도 멈추지 않고 끝까지 본다(GLM 잡은 어차피 다 건너뛴다)."""
-    if _CLOSING:
-        return
+    if _CLOSING or _paused():
+        return              # 멈춤(R1)이면 줄 선 잡을 띄우지 않는다 — 잡아 두고 재기동한다(풀리면 주기 펌프 · /drain 끄기가 띄운다)
     lim = limits()          # 한도는 판정 때마다 읽는다(R4) — 한 번 읽어 이 걸음 안에서 같은 값을 쓴다
     for jid, (job, spawn) in list(_PENDING.items()):
         if _external(job):
@@ -520,7 +634,11 @@ def _settle(job: dict, task: asyncio.Task) -> None:
     손에 있어, 띄운 바로 그 틈에 deliberate_cancel 이 들어올 수 있다."""
     if job["status"] != "running":
         return      # _drive 가 제 손으로 끝냈다 — 자리도 거기서 넘겼다
-    job["status"], job["error"] = "cancelled", "취소됨"
+    if _CLOSING:    # 서버가 내려가며 접혔다 — 사람이 접은 것이 아니다(_drive 와 같다)
+        job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+    else:
+        job["status"], job["error"] = "cancelled", "취소됨"
+        _drop_args(job["id"])
     job["finished_at"] = job["updated_at"] = _now()
     _persist(job)
     if _TASKS.get(job["id"]) is task:
@@ -703,8 +821,13 @@ async def _drive(job: dict, gen) -> None:
             _apply(job, *_parse_sse(chunk))
             job["updated_at"] = _now()
     except asyncio.CancelledError:
-        job["status"] = "cancelled"
-        job["error"] = "취소됨"
+        if _CLOSING:
+            # 서버가 내려가며 접혔다(정상 종료 — 루프가 남은 태스크를 취소한다). 사람이 접은 것이 아니다 — interrupted 로 남기고 시작 인자
+            # 파일을 둔다(이어하기 — R3). 종전엔 '취소됨' 으로 남아, 재기동 한 번이 사람이 접은 것과 같아 보였다.
+            job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+        else:
+            job["status"] = "cancelled"
+            job["error"] = "취소됨"
         raise
     except Exception as exc:  # noqa: BLE001 — 태스크 안 예외는 아무도 await 안 하면 무음이다
         log.exception("[delib-job %s] 심의 태스크 오류", job["id"])
@@ -715,9 +838,26 @@ async def _drive(job: dict, gen) -> None:
         if job["status"] == "running":
             job["status"] = "error" if job.get("error") else "done"
         _persist(job)
+        if job["status"] != "interrupted":
+            _drop_args(job["id"])
         _TASKS.pop(job["id"], None)
         _prune()
         _pump()      # 자리가 났다 — 끝났든 접혔든 터졌든. 상태를 바꾼 **같은 걸음에서** 넘겨준다
+
+
+def _entry(spec: dict):
+    """잡 종류의 진입 함수 — 늦게 import 한다(deliberation 이 app 을 다시 부르는 순환을 피한다)."""
+    from deliberation import run_deliberation, run_sim_deliberation, run_test_plan  # noqa: PLC0415
+    return {"general": run_deliberation, "sim": run_sim_deliberation, "test-plan": run_test_plan}[spec["engine"]]
+
+
+def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_email: str, user_pat: str, ext_kw: dict, ctx):
+    """잡을 띄울 때 부를 것 — 시작(start)과 재기동 뒤 다시 세우기(_requeue)가 같은 것을 만든다."""
+    def spawn() -> asyncio.Task:
+        gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
+        ctx.run(call_trace.tag, job=job["id"])   # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
+        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job['id']}")
+    return spawn
 
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
@@ -741,6 +881,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     q = (question or "").strip()
     if not q:
         raise ValueError("question 이 비어 있다 — 심의할 화두가 필요하다")
+    paused = pause_info()       # 새 심의 멈춤(R1) — 시작 · 이어하기 모두 여기를 지난다
+    if paused:
+        raise DelibPaused(paused)
     # ⚠ 거절 문구에 **남의 job_id 를 싣지 않는다.** 종전엔 진행 중인 잡 id 를 전부 찍었는데,
     #   deliberate_cancel·deliberate_result 는 id 만 받으므로 거절당한 사람이 남의 심의를 들여다보고
     #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
@@ -795,10 +938,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
                else "줄이 빠진 뒤 다시 하라."))
 
     from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _external_refusal,  # noqa: PLC0415
-                              _resolve_opts, _role_req_max, _seal, _seat_key, _started_by, run_deliberation,
-                              run_sim_deliberation, run_test_plan)
-    entry = {"general": run_deliberation, "sim": run_sim_deliberation,
-             "test-plan": run_test_plan}[spec["engine"]]
+                              _resolve_opts, _role_req_max, _seal, _seat_key, _started_by)
+    entry = _entry(spec)
 
     opts = dict(delib_opts or {})
     if spec.get("chair"):
@@ -858,6 +999,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
            if _read.llm == "external" else {}),
     }
     _JOBS[job_id] = job
+    # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
+    job["durable"] = (not user_pat) and _write_args(job_id, {
+        "job_kind": j, "question": q, "groups": list(groups or []), "opts": opts,
+        "user_email": user_email or "", "owner": owner or "", "owner_aff": owner_aff or ""})
     # 누구든 줄 끝에 세운 다음 줄을 한 번 돌린다 — 자리가 있으면 그 자리에서 곧바로 뜬다(종전과 같다).
     # 띄우는 곳을 _pump 하나로 두어야 '먼저 선 잡보다 방금 온 잡이 먼저 뜬다' 가 생기지 않는다.
     # ⚠ 태스크는 **이 요청의 컨텍스트에서** 만든다. 태스크는 만든 자리의 컨텍스트 변수를 물려받는데, 줄 선
@@ -867,12 +1012,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 외부 응답자 잡만 과제 주인과 잡 id(과제 머리의 job_id — 워크플로가 맡은 잡의 과제만 답한다)를 따로 넘긴다(GLM 잡의 진입 호출은
     # 종전 그대로다).
     ext_kw = {"owner": owner or user_email, "job_id": job_id} if _read.llm == "external" else {}
-
-    def spawn() -> asyncio.Task:
-        gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
-        ctx.run(call_trace.tag, job=job_id)      # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
-        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job_id}")
-
+    spawn = _make_spawn(app, job, entry, q, groups, opts, user_email, user_pat, ext_kw, ctx)
     _PENDING[job_id] = (job, spawn)
     _pump()
     if job["status"] == "queued":
@@ -921,6 +1061,7 @@ def cancel(job_id: str, *, by: str = "") -> dict:
         job["status"], job["error"] = "cancelled", "취소됨 — 줄을 선 채로 접었다(시작하지 않았다)"
         job["finished_at"] = job["updated_at"] = _now()
         _persist(job)
+        _drop_args(job_id)
         return {"job_id": job_id, "status": "cancelled",
                 "note": "대기열에서 뺐다 — 시작하지 않은 심의라 남은 것이 없다."}
     t = _TASKS.get(job_id)
@@ -931,14 +1072,16 @@ def cancel(job_id: str, *, by: str = "") -> dict:
             "note": "취소를 요청했다. 잠시 뒤 deliberate_status 로 확인하라(저장은 중단된다)."}
 
 
-def reap_orphans() -> int:
-    """재기동 뒤 파일에 running·queued 로 남은 잡을 interrupted 로 정리한다.
+def reap_orphans(app=None) -> int:
+    """재기동 뒤 파일에 running·queued 로 남은 잡을 정리한다 — 닫은(interrupted) 수를 돌려준다.
 
-    프로세스가 죽으면 태스크도 죽는데 파일은 running 인 채로 남는다 — 그대로 두면
-    영원히 '진행 중'으로 보이고 동시 상한 계산도 어긋난다.
-    줄 선 잡(queued)도 같이 닫는다. 띄울 때 쓸 인자(호출자 토큰·근거 본문·좌석)는 메모리에만 있었으니
-    다시 줄을 세울 수가 없다 — queued 로 두면 호출자는 오지 않을 차례를 영영 기다린다."""
-    n = 0
+    프로세스가 죽으면 태스크도 죽는데 파일은 running 인 채로 남는다 — 그대로 두면 영원히 '진행 중'으로 보이고 동시 상한 계산도
+    어긋난다. 도는 잡은 interrupted 로 닫고 시작 인자 파일을 둔다 — deliberate_continue 한 번으로 남은 라운드만 이어 돈다(R3).
+    줄 선 잡(queued)은 app 을 받았고 시작 인자 파일이 있으면 **처음 줄 선 차례대로 다시 세운다**(R2 — 띄우기는 주기 펌프 · 다음
+    시작이 한다. 멈춤이 켜져 있으면 그대로 붙잡힌다). 파일이 없거나 깨졌으면(이 판 이전의 잡 · 쓰기 실패) 종전처럼 '시작하지 못했다' 로
+    닫는다 — queued 로 두면 호출자는 오지 않을 차례를 영영 기다린다."""
+    global _REQUEUED  # noqa: PLW0603 — 이번 기동의 수(/health)
+    n, back = 0, []
     try:
         for f in JOB_DIR.glob("*.json"):
             # 상태는 목록 색인에서 본다 — 끝난 잡의 원장(수 MB)까지 통째로 읽지 않는다. 고칠 잡만 원장 전부를 읽는다.
@@ -946,19 +1089,139 @@ def reap_orphans() -> int:
             if not (rec and rec.get("status") in ("running", "queued") and rec["id"] not in _JOBS):
                 continue
             j = _load(f.stem)
-            if j and j.get("status") in ("running", "queued") and j["id"] not in _JOBS:
-                j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다. "
-                              "deliberate_start 로 다시 시작해야 한다" if j["status"] == "queued"
-                              else "서버 재기동으로 중단됨 — 다시 시작해야 한다")
-                j["status"] = "interrupted"
-                j["finished_at"] = j.get("updated_at") or _now()
-                _persist(j)
-                n += 1
+            if not (j and j.get("status") in ("running", "queued") and j["id"] not in _JOBS):
+                continue
+            args = _read_args(j["id"]) if j["status"] == "queued" and app is not None else None
+            if args is not None:
+                back.append((j, args))
+                continue
+            _close_orphan(j)
+            n += 1
     except OSError:
         pass
+    requeued = 0
+    for j, args in sorted(back, key=lambda x: x[0].get("queued_at") or x[0].get("updated_at") or 0):
+        try:
+            _requeue(app, j, args)
+            requeued += 1
+        except Exception as exc:  # noqa: BLE001 — 한 잡이 깨져도 나머지는 다시 세운다
+            log.warning("[delib-job %s] 줄에 다시 세우지 못했다 — 닫는다: %r", j.get("id"), exc)
+            _close_orphan(j, why=f"{type(exc).__name__}")
+            n += 1
+    _REQUEUED = requeued
+    _sweep_args()
     if n:
         log.info("재기동 정리: running·queued 로 남은 잡 %d건을 interrupted 로", n)
+    if requeued:
+        log.info("재기동 정리: 줄 선 잡 %d건을 처음 차례대로 다시 세웠다", requeued)
     return n
+
+
+def _close_orphan(j: dict, *, why: str = "") -> None:
+    if j["status"] == "queued":
+        j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다"
+                      + (f"(시작 인자를 다시 읽지 못했다 — {why})" if why else "") + ". deliberate_start 로 다시 시작해야 한다")
+        _drop_args(j["id"])
+    else:
+        j["error"] = INTERRUPTED_MSG
+    j["status"] = "interrupted"
+    j["finished_at"] = j.get("updated_at") or _now()
+    _persist(j)
+
+
+def _requeue(app, job: dict, args: dict) -> None:
+    """재기동 전 줄 선 잡을 시작 인자 파일로 다시 세운다 — 띄우는 것은 start() 와 같은 _make_spawn 이다. 그룹은 줄에 설 때의 값이다(메모리
+    줄도 같은 값으로 돈다 — HWAXPortal docs/delib-ops DO-D2 ③)."""
+    spec = JOBS[resolve_job(str(args.get("job_kind") or job.get("job") or "default"))]
+    ext_kw = ({"owner": args.get("owner") or args.get("user_email"), "job_id": job["id"]} if _external(job) else {})
+    spawn = _make_spawn(app, job, _entry(spec), args["question"], list(args.get("groups") or []), dict(args.get("opts") or {}),
+                        str(args.get("user_email") or ""), "", ext_kw, contextvars.copy_context())
+    job.update(status="queued", stage="queued", durable=True, requeued=int(job.get("requeued") or 0) + 1, requeued_at=_now())
+    _JOBS[job["id"]] = job
+    _PENDING[job["id"]] = (job, spawn)
+    _persist(job)
+
+
+def _sweep_args() -> None:
+    """남은 시작 인자 파일을 치운다 — 원장이 없거나 끝난 잡(끝남과 지우기 사이에 죽었다)의 것, 끊긴 잡이라도 이어 돌렸거나 ARGS_KEEP_S 가
+    지난 것. 근거 본문이 원장 옆에 오래 남지 않게 한다."""
+    d = JOB_DIR / _ARGS_DIR
+    try:
+        files = list(d.glob("*.json"))
+    except OSError:
+        return
+    now = _now()
+    for f in files:
+        jid = f.stem
+        if jid in _JOBS:
+            continue
+        rec = _list_load(JOB_DIR / f"{jid}.json")
+        status = (rec or {}).get("status")
+        if status in ("running", "queued"):
+            continue
+        if status == "interrupted" and not rec.get("resumed_by") and now - float(rec.get("finished_at") or now) < ARGS_KEEP_S:
+            continue
+        _drop_args(jid)
+
+
+def resume_info(job: dict) -> dict | None:
+    """재기동으로 끊긴(interrupted) 잡을 이어 돌릴 재료 — {rounds_done, total_rounds, rounds_left, args, resumed_by}. 아니면 None.
+
+    끝난 라운드는 단계로 센다 — 라운드 N 에 들어서면(stage rN) 앞의 N-1 이 끝난 것이고, 의장 결정 이후 단계(decide · explain · report)면 전부다.
+    단계 rN 에서 끊긴 라운드는 일부 좌석만 말했을 수 있어 세지 않는다. 다단 심의(sim · test-plan)는 단 사이 승계가 엔진 안에 있어 끝난
+    라운드로 잇지 않는다(rounds_done 0 — 같은 인자로 처음부터). rounds_left 는 이어 돌 라운드 수다 — 엔진의 하한이 2 라, 마지막 라운드나
+    결정문에서 끊긴 잡도 2라운드(앞 입장을 이어받은 입장 · 수렴)를 돈다."""
+    if job.get("status") != "interrupted":
+        return None
+    try:
+        general = JOBS[resolve_job(str(job.get("job") or job.get("kind") or "default"))]["engine"] == "general"
+    except (KeyError, ValueError):
+        general = False
+    total = int(job.get("total_rounds") or 0)       # 엔진이 좌석을 앉힐 때 적는다 — 그 전에 끊겼으면 끝난 라운드가 없다(목록 색인에도 이 칸뿐이다)
+    stage = str(job.get("stage") or "")
+    done = 0
+    if general and total:
+        if stage.startswith("r") and stage[1:].isdigit():
+            done = max(0, min(total, int(stage[1:]) - 1))
+        elif stage in ("decide", "explain", "report"):
+            done = total
+    return {"rounds_done": done, "total_rounds": total or None,
+            "rounds_left": (max(2, min(8, total - done)) if done else None),
+            "args": _args_path(job["id"]).exists(), "resumed_by": job.get("resumed_by")}
+
+
+def queue_durability() -> dict:
+    """/health 의 delib_queue_durable · delib_requeued — 줄 선 잡이 전부 시작 인자 파일을 가졌으면 참(재기동이 줄을 잃지 않는다 — 재기동
+    판정이 줄 선 수를 막는 수로 세지 않는다, R2'). 줄이 비었으면 참이다. 하나라도 파일을 못 썼으면 거짓(그 잡은 재기동에 사라진다)."""
+    return {"durable": all(job.get("durable") for job, _spawn in _PENDING.values()), "requeued": _REQUEUED}
+
+
+async def _tick() -> None:
+    while True:
+        await asyncio.sleep(PUMP_TICK_S)
+        try:
+            if _PENDING:
+                _pump()
+        except Exception:  # noqa: BLE001 — 한 번 실패로 줄 다시 보기를 멈추지 않는다
+            log.exception("줄 다시 보기 실패 — 다음 간격에 다시 본다")
+
+
+def start_ticker() -> None:
+    """줄을 PUMP_TICK_S 마다 다시 본다 — 기동 때(mcp_server.bind, 도는 이벤트 루프 안). 루프 밖에서 부르면 아무것도 안 한다(시험)."""
+    global _TICKER  # noqa: PLW0603
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _TICKER is None or _TICKER.done():
+        _TICKER = loop.create_task(_tick(), name="delib-pump-tick")
+
+
+def stop_ticker() -> None:
+    global _TICKER  # noqa: PLW0603
+    if _TICKER is not None:
+        _TICKER.cancel()
+        _TICKER = None
 
 
 def summary(job: dict, *, full: bool = False) -> dict:
@@ -984,6 +1247,11 @@ def summary(job: dict, *, full: bool = False) -> dict:
     if _external(job):
         # 판단 LLM 이 외부 응답자였다 — tool_mode 는 좌석 자유 조회의 길(리스크 원장의 tool_mode 와 같은 말).
         out["llm"], out["tool_mode"] = "external", _tool_mode(job)
+    if job["status"] == "interrupted":
+        # 재기동으로 끊겼다 — 끝난 라운드 수와 이어 돌 라운드 수(deliberate_continue 한 번으로 잇는다 — R3).
+        out["resume"] = resume_info(job)
+    if job.get("resumed_from"):
+        out["resumed_from"] = job["resumed_from"]
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
         # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —

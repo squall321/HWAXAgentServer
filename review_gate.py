@@ -232,9 +232,9 @@ def _num(v, *, pos: bool = False) -> bool:
             and (not pos or v > 0))
 
 
-def _check_file(st) -> None:
+def _check_file(st, scopes: tuple = DRAIN_SCOPES) -> None:
     """깃발 파일의 칸을 하나씩 본다 — 맞지 않으면 ValueError(읽는 쪽이 꺼짐으로 읽고 지운다)."""
-    if not isinstance(st, dict) or st.get("scope") not in DRAIN_SCOPES:
+    if not isinstance(st, dict) or st.get("scope") not in scopes:
         raise ValueError("모양이 다르다")
     for k in ("until", "set_at", "set_idle_at", "ttl_since"):
         if st.get(k) is not None and not _num(st[k]):
@@ -279,12 +279,14 @@ class DrainState:
     - 판정은 읽을 때 한다. 칸 하나라도 깨진 파일은 '꺼짐' 으로 읽고 지우며 한 줄 남긴다(같은 사유는 _LOG_EVERY_S 마다 한
       번). 읽는 길에서 idle_since 를 못 쓰면(디스크·권한) 깃발은 그대로 산다. 쓰기는 원자적이다(같은 디렉터리의 고유한 임시
       파일 → os.replace)이고 읽고-고치고-쓰기는 경로마다 잠금 하나다. 끄기에서 파일을 못 지우면 OSError 가 그대로 오른다(503).
-    clock 은 epoch 초(time.time), delib_load() 는 (도는, 줄 선) 심의 수다(시험이 둘 다 주입한다)."""
+    clock 은 epoch 초(time.time), delib_load() 는 (도는, 줄 선) 심의 수다(시험이 둘 다 주입한다). scopes 는 이 깃발이 받는 scope 들이다 —
+    카드 대조 비우기는 DRAIN_SCOPES, 새 심의 멈춤(delib_jobs — HWAXPortal docs/delib-ops R1)은 ("delib",) 로 같은 규칙의 다른 파일이다."""
 
-    def __init__(self, path: str, *, clock=time.time, delib_load=None):
+    def __init__(self, path: str, *, clock=time.time, delib_load=None, scopes: tuple = DRAIN_SCOPES):
         self.path = path
         self.clock = clock
         self.delib_load = delib_load
+        self.scopes = tuple(scopes)
         self._lock = _lock_for(path)
         self._said: dict = {}
         self._idle: tuple | None = None   # (until_idle 를 세운 때, idle_since) — 파일에 못 쓴 grace 시계를 기억한다(RB3C-9)
@@ -309,7 +311,7 @@ class DrainState:
             return None
         try:
             st = json.loads(raw)
-            _check_file(st)
+            _check_file(st, self.scopes)
             return st
         except ValueError as exc:
             self._say(f"bad:{exc}", f"[drain] 깃발 파일이 깨졌다({exc}) — 꺼짐으로 읽고 지운다: {self.path}")
@@ -448,8 +450,8 @@ class DrainState:
         """깃발을 세우거나 늘린다 — 지금 깃발(snapshot 꼴)을 돌려준다. 계약에 안 맞으면 DrainError(422), 사람이 고정한 깃발에
         hold 아닌 요청이면 DrainError(409 drain_held), 다른 주체가 세운 살아 있는 깃발에 hold 아닌 요청이면 DrainError(409
         drain_owned — 본문의 drain 이 주인·scope·until 을 싣는다)."""
-        if scope not in DRAIN_SCOPES:
-            raise DrainError("bad_request", f"scope 는 {'·'.join(DRAIN_SCOPES)} 가운데 하나다", 422)
+        if scope not in self.scopes:
+            raise DrainError("bad_request", f"scope 는 {'·'.join(self.scopes)} 가운데 하나다", 422)
         by = str(by or "").strip()[:DRAIN_BY_MAX]
         if not by:
             raise DrainError("bad_request", "by(세운 주체)가 비었다 — 끄는 쪽이 같은 이름으로 끈다", 422)

@@ -32,6 +32,36 @@ ChatDock (portal frontend)
   lowering never stops a running job — new starts queue. A per-user limit that env left following the global follows the
   overlaid global. A broken file is ignored (env values apply) and the answer's `error` says why. Loopback only, like
   `/drain`; the portal does not relay it. `/health.limits` carries the same values with `source` per key (`file` · `env`).
+- `POST /drain {scope: "delib", on, ttl_s | hold, by, reason?, force?}` — **pause new deliberations** (portal
+  `docs/delib-ops` R1). Same rules as the card-review drain flag (6 h TTL cap, owner `by` — 409 `drain_owned` /
+  `drain_held`, `hold` lives until a person lifts it, atomic writes, 503 `drain_unavailable`), but its own file
+  `<DELIB_JOB_DIR>/state/delib-pause.json`, so the two never touch each other; `until_idle` is refused (422 — a pause is
+  for holding the queue across a restart, not "until idle"). Turning it off needs `scope: "delib"` too (an off request
+  without a scope is the card-review flag, as before) and starts held queued jobs at once. While on: MCP
+  `deliberate_start` · `deliberate_continue` fail with "점검 중 — 약 N분 뒤 다시 (retry_after_s=…)" (`retry_after_s` = time
+  left, or 600 for a `hold`); the web triggers `/심의` · `/시뮬심의` · `/시험계획` answer an SSE `error`
+  `{code: "delib_paused", message, retry_after_s, infra, retryable}` then `done` — except panels the risk app starts
+  (`delib_opts.started_by = "app"`: the app holds its own panels on the card-review flag, and a refused panel would close
+  with an error); queued jobs are not started; running jobs run to the end. Works without the card-review module.
+  `GET /drain` is unchanged (the card-review flag only — a contract shared with the risk app and the portal);
+  `/health.delib_paused` · `delib_pause` show the pause. A pause that ends by its TTL is noticed by the queue tick
+  (every 15 s).
+- **The queue survives a restart** (R2). Every MCP job writes all its start arguments — question, evidence bodies,
+  seats, human note, knobs, identity (email, groups as received, affiliation), **never a token** — to
+  `<DELIB_JOB_DIR>/args/<id>.json` (0600). At startup queued jobs are put back in their original order (`queued_at`) and
+  started by the queue tick (held while paused); a job without that file (older build, write failure, a caller token)
+  is closed as before ("시작하지 못했다"). The file is removed when the job ends; an interrupted job keeps it for 7 days
+  (or until it is resumed). `/health.delib_queue_durable` is true when every queued job has its file (so a restart loses
+  none — `start.sh` and the portal's `lib/delib-busy.sh` then stop counting queued jobs as blocking), and
+  `/health.delib_requeued` counts the jobs put back at this startup.
+- **Resume an interrupted job** (R3) — `deliberate_continue(previous_job_id=<interrupted job>)`, no human note needed.
+  The status carries `resume{rounds_done, total_rounds, rounds_left, args, resumed_by}`: rounds done are counted from
+  the stage (entering round N means N−1 are done; `decide` · `explain` · `report` mean all). The new job carries each
+  seat's last position of the finished rounds as its summary ("결정문은 아직 없다"), runs only the remaining rounds (at
+  least 2 — the engine's floor), keeps the seats and the round numbering, and reuses the original arguments from the
+  args file (a given human note is appended to the original one). Same question and kind only; a job resumes once
+  (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A
+  graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
 
 ## Run (dev)
 
