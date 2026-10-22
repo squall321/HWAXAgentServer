@@ -23,6 +23,15 @@ ChatDock (portal frontend)
   `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
   `start.sh` reads them before it replaces a running instance, and any unattended restart
   (the portal's update-all) should do the same.
+- `GET /limits` · `POST /limits` — the three deliberation job limits without a restart (portal `docs/delib-ops` R4).
+  A box file `<DELIB_JOB_DIR>/state/limits.json` overlays `DELIB_JOB_MAX_RUNNING` · `DELIB_JOB_MAX_RUNNING_PER_USER` ·
+  `DELIB_JOB_QUEUE_MAX` and is read at every start and queue decision (a person may edit it by hand too).
+  `POST {max_running?, max_running_per_user?, queue_max?, by, reason?, reset?}` — integers (1–1000 · 0–1000 · 0–1000,
+  per-user `0` = follow the global); `null` removes that key's overlay, `reset: true` deletes the file; an unknown field
+  is 422 `unknown_fields`, a file that cannot be written 503 `limits_unavailable`. Raising starts queued jobs at once;
+  lowering never stops a running job — new starts queue. A per-user limit that env left following the global follows the
+  overlaid global. A broken file is ignored (env values apply) and the answer's `error` says why. Loopback only, like
+  `/drain`; the portal does not relay it. `/health.limits` carries the same values with `source` per key (`file` · `env`).
 
 ## Run (dev)
 

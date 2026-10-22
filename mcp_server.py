@@ -276,8 +276,8 @@ _STATE_DESC = (
     "시작하지 마라 — 그만두려면 deliberate_cancel) · done(끝났다 — deliberate_result 로 결정문을 받는다). "
     "error·cancelled·interrupted 는 결정문 "
     "없이 끝난 것이고 까닭은 error 에 있다(interrupted 는 서버 재기동 — 다시 시작해야 한다). "
-    + (f"줄은 {delib_jobs.QUEUE_MAX}건까지 선다(DELIB_JOB_QUEUE_MAX) — 줄까지 차면 시작이 오류로 거절되고, "
-       "그 문구에는 내 잡만 실린다." if delib_jobs.QUEUE_MAX > 0
+    + (f"줄은 {delib_jobs.queue_max()}건까지 선다(DELIB_JOB_QUEUE_MAX — 운영이 재기동 없이 바꿀 수 있어 지금 값은 deliberate_jobs 의 "
+       "queue) — 줄까지 차면 시작이 오류로 거절되고, 그 문구에는 내 잡만 실린다." if delib_jobs.queue_max() > 0
        else "이 서버는 줄을 세우지 않는다(DELIB_JOB_QUEUE_MAX=0) — 상한이 차 있으면 시작이 오류로 거절되고 "
             "queued 는 나오지 않는다.")
 )
@@ -731,11 +731,12 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     lim = max(1, min(100, int(limit or 20)))
     rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin)
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
+    caps = delib_jobs.limits()       # 판정 때와 같은 값(박스 덮개가 env 위에 덮인다 — HWAXPortal docs/delib-ops R4)
     out = {"jobs": rows, "running": delib_jobs.running_count(),
            "queued": delib_jobs.queue_state()["length"],     # 목록에 다 안 실려도 줄 전체를 센다
-           "running_max": delib_jobs.MAX_RUNNING,
-           "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
-           "queue_max": delib_jobs.QUEUE_MAX}
+           "running_max": caps["max_running"],
+           "running_max_per_user": caps["max_running_per_user"],
+           "queue_max": caps["queue_max"]}
     # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
     return mcp_pages.paged(out, part=part, again={"limit": lim},
                            ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
@@ -838,9 +839,9 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
                    "timeout_s_default": getattr(getattr(_APP, "state", None), "delib_timeout_s", None)},
         # 외부 응답자 심의(advanced.llm=external)의 한도 — 외부 창으로 셈한다(길이 열린 서버에만 싣는다 — 꺼진 서버의 응답은 종전 그대로).
         **({"limits_external": ext} if (ext := _external_limits()) else {}),
-        "running_max": delib_jobs.MAX_RUNNING,
+        "running_max": delib_jobs.max_running(),
         # 전역만 적으면 사용자별 상한이 더 낮을 때 그만큼 돌릴 수 있다고 읽힌다.
-        "running_max_per_user": delib_jobs.MAX_RUNNING_PER_USER,
+        "running_max_per_user": delib_jobs.max_running_per_user(),
         # 줄 — 길이와 **호출자 자신의** 순번만. 남의 잡은 길이에 수로만 들어간다(id·화두를 싣지 않는다).
         "queue": delib_jobs.queue_state(user),
         "states": _STATE_DESC,

@@ -5872,6 +5872,62 @@ async def post_drain(request: Request):
     return _drain_view(gate)
 
 
+# ── 동시 심의 한도(HWAXPortal docs/delib-ops R4) ─────────────────────────────────
+# GET /limits · POST /limits {max_running?, max_running_per_user?, queue_max?(정수 · null 은 그 칸의 덮개를 지운다), by, reason?, reset?} —
+# 박스 덮개(<잡 원장>/state/limits.json)가 env 위에 덮이고 판정 때마다 읽혀 재기동이 없다. 올리면 그 자리에서 줄 선 잡을 띄운다. 내리면 도는
+# 잡은 그대로 두고 새 시작만 줄인다. 인증은 없다 — /drain 과 같다(서버는 루프백에만 묶인다). 포털은 이 주소를 중계하지 않는다.
+_LIMITS_FIELDS = ("max_running", "max_running_per_user", "queue_max", "by", "reason", "reset")
+
+
+@app.get("/limits")
+def get_limits():
+    import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+    return delib_jobs.limits()
+
+
+@app.post("/limits")
+async def post_limits(request: Request):
+    import delib_jobs  # noqa: PLC0415
+
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"code": "bad_request", "message": "본문이 JSON 이 아니다"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"code": "bad_request", "message": "본문은 JSON 객체여야 한다"}, status_code=422)
+    extra = sorted(set(body) - set(_LIMITS_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 "
+                             "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
+    if not isinstance(body.get("reset", False), bool):
+        return JSONResponse({"code": "bad_request", "message": "reset 은 true|false 다"}, status_code=422)
+    vals = {k: body[k] for k in ("max_running", "max_running_per_user", "queue_max") if k in body}
+    if not vals and not body.get("reset"):
+        return JSONResponse({"code": "bad_request", "message": "바꿀 칸(max_running · max_running_per_user · queue_max)이나 "
+                             "reset 이 없다"}, status_code=422)
+    try:
+        out = delib_jobs.set_limits(vals, by=str(body.get("by") or ""), reason=str(body.get("reason") or ""),
+                                    reset=bool(body.get("reset")))
+    except ValueError as exc:
+        return JSONResponse({"code": "bad_request", "message": str(exc)[:300]}, status_code=422)
+    except OSError as exc:                  # 덮개 파일을 못 쓰거나 못 지운다(권한·디스크) — 거짓 200 이 아니라 사유를 싣는다
+        return JSONResponse({"code": "limits_unavailable", "message": f"동시 한도 덮개 파일을 쓰거나 지우지 못했다 — "
+                             f"{type(exc).__name__}(DELIB_JOB_DIR 의 권한·디스크를 본다)"}, status_code=503)
+    print(f"[limits] 전역 {out['max_running']} · 사용자별 {out['max_running_per_user']} · 줄 {out['queue_max']} "
+          f"(by {str(body.get('by'))[:80]}{' · 덮개 지움' if body.get('reset') else ''})")
+    return out
+
+
+def _limits_health() -> dict:
+    """/health 의 limits — 지금 걸린 동시 한도 셋과 출처(file · env). 모듈을 못 붙였으면 빈 사전(/health 는 늘 답한다)."""
+    try:
+        import delib_jobs  # noqa: PLC0415
+        return delib_jobs.limits()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 @app.get("/health")
 def health() -> dict:
     _active, _queued = _delib_load()
@@ -5888,6 +5944,8 @@ def health() -> dict:
         # 재기동을 건너뛴다(강행은 AGENT_RESTART_FORCE=1). 이름을 바꾸면 그쪽이 '모름' 으로 읽고 그대로 내린다.
         "delib_active": _active,
         "delib_queued": _queued,
+        # 동시 심의 한도 셋과 출처 — 박스 덮개(POST /limits)가 env 위에 덮인다(HWAXPortal docs/delib-ops R4).
+        "limits": _limits_health(),
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
         **_review,
         # 외부 응답자(켜진 박스만) — 과제 줄의 수. 재기동하면 줄을 잃는다(도는 호출은 앱이 인프라로 다시 낸다).

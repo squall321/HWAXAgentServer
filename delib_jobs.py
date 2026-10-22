@@ -74,6 +74,16 @@ MAX_RUNNING_PER_USER = _PER_USER if _PER_USER > 0 else MAX_RUNNING
 # 기본값에서는 건너뛸 일이 없어 한 사람의 잡 여럿이 줄을 통째로 차지할 수 있다 — 그게 싫으면 사용자별
 # 상한을 전역보다 낮춘다.
 QUEUE_MAX = max(0, _env_int("DELIB_JOB_QUEUE_MAX", 20))
+
+# 동시 한도 덮개(HWAXPortal docs/delib-ops R4) — 박스 파일(<잡 원장>/state/limits.json)이 위 셋(env 값) 위에 덮인다. **판정 때마다** 읽어(수십
+# 바이트다) 재기동 없이 바뀐다. 쓰는 길은 루프백 POST /limits(app — /drain 과 같은 신뢰)이고 사람이 파일을 고쳐도 된다.
+# 종전엔 셋이 import 때 한 번 읽는 상수라 한도 하나를 바꾸는 데 재기동이 들었고, 재기동은 도는 잡과 줄 선 잡을 닫았다(10-22 새벽 반나절).
+# 내리면 도는 잡은 그대로 두고 새 시작만 줄인다. 깨진 파일은 읽지 않고(env 값으로 돈다) 사유를 limits() 에 싣는다(/health). 위 셋은 env 층으로
+# 그대로 둔다 — 시험이 그 이름을 바꿔 끼운다.
+_LIMIT_KEYS = ("max_running", "max_running_per_user", "queue_max")
+_LIMIT_LO = {"max_running": 1, "max_running_per_user": 0, "queue_max": 0}      # max_running_per_user 0 = 전역을 따른다
+_LIMIT_HI = 1000          # 손잡이 하나의 위쪽 — 오타(60000)가 LLM 을 통째로 묶지 않게
+_lim_cache: dict = {}
 # 외부 응답자 심의(delib_opts.llm=external)의 자리 — 판단 호출이 전부 잡 주인의 Claude Code 워크플로로 가서 이 서버의 LLM 을 물지
 # 않는다. 사람 속도의 워커를 기다리는 그 잡이 전역 자리(MAX_RUNNING)를 쥐면 남의 GLM 심의가 그 몇 시간 동안 줄에 묶였다(X-D6).
 # 그래서 전역 상한·사용자별 상한(GLM 몫)에 세지 않고 주인(과제를 받는 사람)마다 이만큼만 돌린다 — 나머지는 줄에서 그 주인의 것이
@@ -196,6 +206,110 @@ def closing(on: bool = True) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+def _state_dir() -> Path:
+    """원장 옆의 상태 파일 자리 — 한도 덮개 · 심의 멈춤 깃발. 원장의 glob("*.json") 에 걸리지 않게 하위 폴더다."""
+    return JOB_DIR / "state"
+
+
+def limits_path() -> Path:
+    return _state_dir() / "limits.json"
+
+
+def _limit_value(k: str, v) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not (_LIMIT_LO[k] <= v <= _LIMIT_HI):
+        raise ValueError(f"{k} 는 {_LIMIT_LO[k]}~{_LIMIT_HI} 의 정수다(받은 값 {str(v)[:40]})")
+    return v
+
+
+def _limits_file() -> tuple[dict, dict, str]:
+    """(덮개 값, 메타 {by · reason · set_at}, 사유) — 파일이 없으면 ({}, {}, ""). 깨졌거나 못 읽으면 ({}, {}, 사유).
+    판정 때마다 읽는다 — 수십 바이트라 싸다. 바뀐 때 · 크기로 캐시하면 같은 크기의 값을 같은 틱에 고쳐 쓴 것을 놓친다(사람이 손으로
+    6 을 8 로 고치는 것이 그 꼴이다). 경고는 사유가 바뀔 때만 남긴다."""
+    p = limits_path()
+    vals, meta, err = {}, {}, ""
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("JSON 객체가 아니다")
+        for k in _LIMIT_KEYS:
+            if raw.get(k) is not None:
+                vals[k] = _limit_value(k, raw[k])
+        meta = {m: raw[m] for m in ("by", "reason", "set_at") if raw.get(m) is not None}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        vals, meta = {}, {}
+        err = (f"읽지 못했다({type(exc).__name__})" if isinstance(exc, OSError) else f"깨졌다({str(exc)[:160]})") + " — env 값으로 돈다"
+    if err and _lim_cache.get("err") != err:
+        log.warning("동시 한도 덮개 %s %s", p, err)
+    _lim_cache["err"] = err
+    return vals, meta, err
+
+
+def limits() -> dict:
+    """지금 걸린 동시 한도 셋과 출처 — {max_running, max_running_per_user, queue_max, source{키: file|env}, by, reason, set_at, error}.
+    사용자별 상한은 덮개에 없으면 env 를 따르되, env 도 따로 적지 않았으면(전역을 따르던 값) 덮인 전역을 따른다."""
+    over, meta, err = _limits_file()
+    mr = over.get("max_running", MAX_RUNNING)
+    if over.get("max_running_per_user"):
+        pu = over["max_running_per_user"]
+    elif "max_running_per_user" in over or (_PER_USER <= 0 and MAX_RUNNING_PER_USER == MAX_RUNNING):
+        pu = mr                     # 0(전역을 따른다) · env 도 전역을 따르던 박스
+    else:
+        pu = MAX_RUNNING_PER_USER
+    return {"max_running": mr, "max_running_per_user": pu, "queue_max": over.get("queue_max", QUEUE_MAX),
+            "source": {k: ("file" if k in over else "env") for k in _LIMIT_KEYS}, **meta,
+            **({"error": err} if err else {})}
+
+
+def max_running() -> int:
+    return limits()["max_running"]
+
+
+def max_running_per_user() -> int:
+    return limits()["max_running_per_user"]
+
+
+def queue_max() -> int:
+    return limits()["queue_max"]
+
+
+def set_limits(values: dict, *, by: str, reason: str = "", reset: bool = False) -> dict:
+    """덮개를 고친다 — 준 칸만 바꾸고(None 이면 그 칸의 덮개를 지운다) reset 이면 파일째 지운다. 원자적으로 쓰고, 올렸으면 그 자리에서 줄을
+    띄운다(_pump). 틀린 값은 ValueError. 돌려주는 것은 limits()."""
+    by = str(by or "").strip()[:120]
+    if not by:
+        raise ValueError("by(바꾼 주체)가 비었다")
+    if reset:
+        try:
+            limits_path().unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        bad = sorted(set(values) - set(_LIMIT_KEYS))
+        if bad:
+            raise ValueError(f"모르는 칸 {bad[:5]} — 받는 칸은 {'·'.join(_LIMIT_KEYS)}")
+        cur, _meta, _err = _limits_file()
+        new = dict(cur)
+        for k, v in values.items():
+            if v is None:
+                new.pop(k, None)
+            else:
+                new[k] = _limit_value(k, v)
+        d = _state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".limits.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({**new, "by": by, "reason": str(reason or "")[:300], "set_at": _now()},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(limits_path())
+    _lim_cache.clear()
+    out = limits()
+    log.info("동시 한도 %s — 전역 %d · 사용자별 %d · 줄 %d (by %s)", "덮개를 지웠다" if reset else "바꿨다",
+             out["max_running"], out["max_running_per_user"], out["queue_max"], by)
+    _pump()
+    return out
 
 
 def _path(job_id: str) -> Path:
@@ -384,14 +498,15 @@ def _pump() -> None:
     주인마다 EXTERNAL_PER_OWNER 건으로 뜬다 — 그래서 전역 자리가 차도 멈추지 않고 끝까지 본다(GLM 잡은 어차피 다 건너뛴다)."""
     if _CLOSING:
         return
+    lim = limits()          # 한도는 판정 때마다 읽는다(R4) — 한 번 읽어 이 걸음 안에서 같은 값을 쓴다
     for jid, (job, spawn) in list(_PENDING.items()):
         if _external(job):
             if len(_external_running_of(job.get("task_owner") or "")) >= EXTERNAL_PER_OWNER:
                 continue
         else:
-            if _glm_running_count() >= MAX_RUNNING:
+            if _glm_running_count() >= lim["max_running"]:
                 continue
-            if len(_running_of(_owner(job))) >= MAX_RUNNING_PER_USER:
+            if len(_running_of(_owner(job))) >= lim["max_running_per_user"]:
                 continue
         del _PENDING[jid]
         _launch(job, spawn)
@@ -426,18 +541,19 @@ def queue_info(job: dict) -> dict | None:
         why = (f"외부 응답자 심의는 주인마다 {EXTERNAL_PER_OWNER}건씩 돈다 — 내 외부 응답자 심의 {mine}건이 끝나야 차례가 "
                "온다(GLM 심의 자리와는 따로다)")
     else:
+        lim = limits()
         mine = len(_running_of(_owner(job)))
-        why = (f"사용자별 상한 {MAX_RUNNING_PER_USER}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
-               "선 다른 사람이 먼저 갈 수 있다)" if mine >= MAX_RUNNING_PER_USER
-               else f"전역 상한 {MAX_RUNNING}건 — 진행 중인 심의가 끝나야 차례가 온다")
-    return {"position": pos, "ahead": pos - 1, "length": len(_PENDING), "max": QUEUE_MAX, "why": why,
+        why = (f"사용자별 상한 {lim['max_running_per_user']}건 — 내 진행 중 {mine}건이 끝나야 차례가 온다(그동안 뒤에 "
+               "선 다른 사람이 먼저 갈 수 있다)" if mine >= lim["max_running_per_user"]
+               else f"전역 상한 {lim['max_running']}건 — 진행 중인 심의가 끝나야 차례가 온다")
+    return {"position": pos, "ahead": pos - 1, "length": len(_PENDING), "max": queue_max(), "why": why,
             "waited_s": round(_now() - (job.get("queued_at") or _now()), 1)}
 
 
 def queue_state(user_email: str = "") -> dict:
     """대기열 현황 — 길이와 **그 사람의** 순번만. 남의 잡은 길이에 수로만 들어간다."""
     me = (user_email or "").strip().lower()
-    return {"length": len(_PENDING), "max": QUEUE_MAX,
+    return {"length": len(_PENDING), "max": queue_max(),
             "mine": [{"job_id": jid, "position": i + 1, "ahead": i}
                      for i, (jid, (job, _spawn)) in enumerate(_PENDING.items()) if me and _owner(job) == me]}
 
@@ -636,6 +752,12 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     external = _wants_external(delib_opts)
     x_owner = str(owner or user_email or "").strip().lower() if external else ""
     total = _glm_running_count()
+    lim = limits()          # 판정 때마다 읽는다(R4) — 박스 파일이 env 위에 덮인다
+    _mr, _pu, _qm = lim["max_running"], lim["max_running_per_user"], lim["queue_max"]
+    # 거절 문구가 말하는 손잡이 — 값이 덮개에서 왔으면 덮개다(env 이름을 대면 그 값을 고쳐도 안 바뀐다).
+    _knob = {k: ("박스 덮개 POST /limits" if lim["source"][k] == "file" else env)
+             for k, env in (("max_running", "DELIB_JOB_MAX_RUNNING"), ("max_running_per_user", "DELIB_JOB_MAX_RUNNING_PER_USER"),
+                            ("queue_max", "DELIB_JOB_QUEUE_MAX"))}
     me = (user_email or "").strip().lower()
     mine = _external_running_of(x_owner) if external else _running_of(me)
     who = x_owner if external else me
@@ -645,30 +767,30 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         if x_owner and len(mine) >= EXTERNAL_PER_OWNER:
             hit.append(f"외부 응답자 심의 주인마다 {EXTERNAL_PER_OWNER}건 — GLM 심의 자리와는 따로다")
     else:
-        if total >= MAX_RUNNING:
-            hit.append(f"전역 {MAX_RUNNING}건 — DELIB_JOB_MAX_RUNNING")
-        if me and len(mine) >= MAX_RUNNING_PER_USER:
-            hit.append(f"사용자별 {MAX_RUNNING_PER_USER}건 — DELIB_JOB_MAX_RUNNING_PER_USER")
+        if total >= _mr:
+            hit.append(f"전역 {_mr}건 — {_knob['max_running']}")
+        if me and len(mine) >= _pu:
+            hit.append(f"사용자별 {_pu}건 — {_knob['max_running_per_user']}")
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
     # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.
-    if hit and QUEUE_MAX <= 0:
+    if hit and _qm <= 0:
         raise RuntimeError(
             f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if who
                else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
-            + ("" if external else f" · 전체 {total}/{MAX_RUNNING}") + ". "
+            + ("" if external else f" · 전체 {total}/{_mr}") + ". "
             + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
                else "진행 중인 심의가 끝난 뒤 다시 하라."))
-    if hit and len(_PENDING) >= QUEUE_MAX:
+    if hit and len(_PENDING) >= _qm:
         waiting = [x["job_id"] for x in queue_state(me)["mine"]]
         raise RuntimeError(
             f"동시 실행 상한에 걸렸고({' · '.join(hit)}) 대기열도 찼다"
-            f"({len(_PENDING)}/{QUEUE_MAX}건 — DELIB_JOB_QUEUE_MAX) — "
+            f"({len(_PENDING)}/{_qm}건 — {_knob['queue_max']}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}"
                f" · 내 대기 {len(waiting)}건{' ' + ', '.join(waiting) if waiting else ''}" if who
                else "신원 없는 호출이라 내 심의를 가려 보여 줄 수 없다")
-            + ("" if external else f" · 전체 진행 {total}/{MAX_RUNNING}") + ". "
+            + ("" if external else f" · 전체 진행 {total}/{_mr}") + ". "
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
