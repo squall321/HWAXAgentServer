@@ -103,7 +103,7 @@ def test_좌석_모델이_그림을_못_받으면_판독문을_세션에_싣는�
     p = prompts[0]
     text = p[1] if isinstance(p, tuple) else p.content
     assert isinstance(text, str), "그림 조각은 보내지 않는다"
-    assert "[g:1] (1번째 발화에 사람이 올린 그림) 판독: 최대 432 MPa" in text and "[g:2]" in text
+    assert "[g:1] (1번째 발화에 사람이 올린 그림(1턴 전)) 판독: 최대 432 MPa" in text and "[g:2]" in text
     assert "판독문 2장을 좌석마다 실었다" in out and tr.calls == 2
 
 
@@ -219,3 +219,24 @@ def test_좌석_발언은_문맥의_그림을_싣고_없으면_종전_모양이�
     import inspect
     src = inspect.getsource(deliberation)
     assert src.count("_llm_text(llm, chair_sys, chair_human, *_img_arg())") == 2, "의장 호출(한 번 · best-of 후보)도 그림을 싣는다"
+
+
+def test_앞_대화_그림_출처에_몇_턴_전인지_적는다():
+    # '방금 올린 것' 을 물을 때 오래전 그림이 방금 것처럼 읽히지 않게(HWAXPortal docs/chat-ppt PP-D5)
+    h = [{"role": "user", "content": "첫 그림", "images": ["/agent/artifacts/aa11.png"]},
+         {"role": "assistant", "content": "봤다 /agent/artifacts/cc33.png"},
+         {"role": "user", "content": "다음"},
+         {"role": "assistant", "content": "답", "evidence": [{"tool": "plot_stress", "result": "/agent/artifacts/bb22.png"}]}]
+    got = dict(v.history_images(h))
+    assert got["/agent/artifacts/aa11.png"] == "1번째 발화에 사람이 올린 그림(2턴 전)"
+    assert got["/agent/artifacts/cc33.png"] == "2번째 답에 실린 그림(2턴 전)", "답의 그림은 그 턴의 물음까지 센다"
+    assert got["/agent/artifacts/bb22.png"] == "4번째 답 앞에 도구 plot_stress 가 낸 그림(1턴 전)"
+
+
+def test_띵킹_세션_맥락은_업로드_근거를_사람이_올린_것으로_적는다():
+    h = [{"role": "assistant", "content": "PPT 를 변환했습니다",
+          "evidence": [{"tool": "convert_file", "args": '{"file": "a.pptx"}', "result": "초안", "kind": "upload"},
+                       {"tool": "lookup", "result": "값"}]}]
+    text, _st = t._session_block(h, 20000)
+    assert '[e:1] [사람이 올려 보낸 파일 · convert_file({"file": "a.pptx"})] 초안' in text
+    assert "[e:2] [lookup] 값" in text

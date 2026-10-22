@@ -249,6 +249,7 @@ def test_챗_모델이_못_읽어도_그림을_읽는_모델이_있으면_판독
         sent = "\n".join(c.get(f"{chat}/_stats").json()["humans"])
     assert "올린 그림을 이 챗 모델은 읽지 못해 그림을 읽는 모델이 판독문으로 옮겼다" in sent, "올린 그림의 판독문이 챗 요청에 실렸다"
     assert "앞 대화에 나온 그림의 판독문이다" in sent, "앞 그림의 판독문이 챗 요청에 실렸다"
+    assert a._RECAP_NOT_UPLOAD in sent, "판독문 머리에도 업로드 단서(PP-D5)"
 
 
 def test_넘겨받는_GLM_이_그림을_못_받으면_그림을_빼고_보낸다(monkeypatch, fake_server):
@@ -275,6 +276,10 @@ def test_앞_대화의_그림을_최근부터_다시_싣는다(monkeypatch, fake
     evs = _turn(monkeypatch, st, message="아까 그림에서 최대 위치는?", history=hist)
     assert any(e == "status" and "앞 대화의 그림 1장" in d.get("step", "") for e, d in evs), evs[:6]
     assert max(_images_seen(chat)) >= 1
+    with httpx.Client(timeout=5, trust_env=False) as c:
+        sent = "\n".join(c.get(f"{chat}/_stats").json()["humans"])
+    # 다시 싣기 머리에 상대 시점과 업로드 단서 — '방금 변환한 것' 을 이 그림으로 읽지 않게(HWAXPortal docs/chat-ppt PP-D5)
+    assert "1번째 발화에 사람이 올린 그림(1턴 전)" in sent and a._RECAP_NOT_UPLOAD in sent, sent[-600:]
 
 
 def test_도구_그림은_결과_묶음_뒤에_끼우고_결과_사이에는_끼우지_않는다(_iso):

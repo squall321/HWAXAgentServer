@@ -161,6 +161,10 @@ SYSTEM_PROMPT = (
     "Report Archive(보고서) 도구는 종류가 많고 저작 워크플로용입니다 — 익숙하지 않은 작업은 "
     "get_guide 로 사용법을 먼저 확인하고, 보고서 찾기·요약은 search_reports 또는 "
     "get_reports_digest 부터 시작하세요(list_reports 의 수십 개 인자를 추측으로 채우지 마세요). "
+    # 10-22 cae00 — PPT 를 AI 데이터 허브로 보낸 뒤 '방금 변환한 것 검토해 줘' 에 앞서 올린 그림을 검토했다. 보내기 결과는 이제 이력에
+    # 업로드 근거로 남는다(HWAXPortal docs/chat-ppt PP-D3 · PP-D5).
+    "사용자가 '방금 올린 것 · 변환한 것 · 보낸 것' 을 말하면 이력의 업로드 근거('사람이 챗 화면에서 파일을 올려 보낸 결과')를 먼저 "
+    "보세요 — 없으면 앞 대화의 그림으로 대신 답하지 말고 어느 파일인지(이름) 물으세요. "
     # 도구는 질의 관련도로 일부만 바인딩된다(TOOL_MAX) — 랭킹이 빗나가면 모델이 '기능이
     # 없다'고 단정하는 게 최악의 실패다. 안내대(search_tools)가 그 폴백이다.
     "필요한 기능의 도구가 목록에 안 보이면 '없다'고 단정하기 전에 search_tools 로 찾아보세요 "
@@ -2675,13 +2679,22 @@ def _compact_turns(dropped: list, budget: int) -> str:
 _HIST_EVID_HEAD = ("[시스템 첨부 — 어시스턴트가 이 물음에 답하려고 도구로 조회한 결과다(앞 턴). 같은 값을 다시 물으면 다시 조회하지 "
                    "말고 이것을 인용하라. 그때의 값이라 그사이 바뀌었을 만한 것은 다시 조회하라]")
 _HIST_EVID_FLOOR = 1000     # 남은 근거 몫이 이보다 작으면 줄여 싣지 않고 도구 이름만 남긴다(토막은 근거가 못 된다)
+# 업로드 근거(kind=upload — 사람이 챗 화면에서 파일을 올려 보낸 결과, 포털이 사람 대신 도구를 불렀다)의 머리. 위 머리('이 물음에 답하려고
+# 조회한')를 달면 앞 물음과 상관없는 일이 그 답의 근거로 읽힌다 — 10-22 '방금 변환한 것' 이 대화에 없어 앞 그림을 검토했다(HWAXPortal
+# docs/chat-ppt PP-D3). 알림은 대개 앞 답 뒤에 오므로 그 알림 바로 앞에 사람 쪽 메시지로 따로 선다(바로 앞이 사람 메시지면 거기 잇되 이 머리로 갈린다).
+_HIST_UPLOAD_HEAD = ("[시스템 첨부 — 사람이 챗 화면에서 파일을 올려 보낸 결과다(포털이 사람 대신 도구를 불렀다 — 어시스턴트가 조회한 것이 "
+                     "아니다). 사람이 '방금 올린 것 · 변환한 것 · 보낸 것' 이라고 하면 이것을 가리킨다. 같은 결과를 다시 조회하지 말고 "
+                     "이것을 쓰라]")
 
 
-def _hist_evidence(entry: dict, item_cap: int) -> tuple[list[str], list[str]]:
-    """이력 항목의 evidence(포털 ChatHistoryMessage.evidence — 그 턴에 도구가 낸 [{tool, args, result}]) → (줄들, 도구 이름들).
+def _hist_evidence(entry: dict, item_cap: int) -> tuple[list[str], list[str], list[str], list[str]]:
+    """이력 항목의 evidence(포털 ChatHistoryMessage.evidence — 그 턴에 도구가 낸 [{tool, args, result, kind?}]) →
+    (조회 줄들, 조회 도구 이름들, 업로드 줄들, 업로드 도구 이름들). kind=upload 는 사람이 올려 보낸 결과라 따로 모은다(PP-D3).
     모양이 틀린 것은 건너뛴다. 결과 하나는 좁은 창에서만 항목 상한(item_cap)으로 줄인다 — 넓은 창은 이 턴의 근거 몫이 지킨다."""
     rows: list[str] = []
     names: list[str] = []
+    up_rows: list[str] = []
+    up_names: list[str] = []
     ev = entry.get("evidence")
     for e in (ev if isinstance(ev, list) else []):
         if not isinstance(e, dict):
@@ -2691,10 +2704,12 @@ def _hist_evidence(entry: dict, item_cap: int) -> tuple[list[str], list[str]]:
         if not tool or not res:
             continue
         args = " ".join(str(e.get("args") or "").split())[:2000]
-        rows.append(f"· {tool}{f'({args})' if args else ''} → {_cut_mark(res, item_cap)}")
-        if tool not in names:
-            names.append(tool)
-    return rows, names
+        line = f"· {tool}{f'({args})' if args else ''} → {_cut_mark(res, item_cap)}"
+        rs, ns = (up_rows, up_names) if e.get("kind") == "upload" else (rows, names)
+        rs.append(line)
+        if tool not in ns:
+            ns.append(tool)
+    return rows, names, up_rows, up_names
 
 
 def _history_messages(history: list[dict], stats: dict | None = None,
@@ -2709,7 +2724,8 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     다음 턴이 '아까 조회한 그 값' 을 모르고 다시 조회하거나 지어냈다(HWAXPortal docs/chat-depth-context CD-D5). 근거 몫은 이력
     예산의 HIST_EVIDENCE_SHARE 까지다. 1차로 원문에 남는 턴을 정하고, 그 턴들의 근거만큼 원문 몫을 줄여 다시 채운다(2차) — 근거가
     없는 이력은 1차 그대로라 종전과 같다. 근거는 최신 턴부터 싣고, 몫이 모자라면 오래된 턴의 근거부터 줄이고 그다음엔 도구 이름만
-    남긴다(결론 글보다 원자료를 먼저 버린다). 압축본에는 그 턴이 조회한 도구 이름을 남긴다.
+    남긴다(결론 글보다 원자료를 먼저 버린다). 압축본에는 그 턴이 조회한 도구 이름을 남긴다. 근거 중 kind=upload(사람이 챗 화면에서
+    파일을 올려 보낸 결과 — 포털이 대화에 남긴 알림의 근거)는 따로 된 머리로 싣는다 — 앞 물음의 근거가 아니다(HWAXPortal docs/chat-ppt PP-D3).
 
     stats 를 주면 {"kept", "compacted", "budget"} 을 채워 준다 — 호출부가 사용자에게 알린다. 가장 최근 항목 하나를
     줄였으면 "cut"(그 항목의 원문 길이)과 "cut_role"(user·assistant — 경고 문구를 가른다)도 채운다. 근거를 실었으면
@@ -2719,6 +2735,8 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     raws: list[str] = []                    # 항목 상한 전의 원문 — 최근 항목을 다시 줄일 때 원문 길이를 적는다
     evs: list[list[str]] = []               # 항목마다 그 턴의 조회 근거 줄(어시스턴트 항목만)
     names_of: list[list[str]] = []          # 항목마다 그 턴이 조회한 도구 이름
+    ups: list[list[str]] = []               # 항목마다 업로드 근거 줄(kind=upload — 사람이 올려 보낸 결과, PP-D3)
+    up_names_of: list[list[str]] = []       # 항목마다 업로드 근거의 도구 이름
     # 항목 하나의 상한 — 좁은 창은 HIST_ITEM_MAX(종전 24,000자), 넓은 창은 그 턴의 이력 예산이 지킨다(항목 상한 없음).
     # 포털은 항목을 창 하나까지 받는데(HWAXPortal ee24499) 종전엔 1백만 토큰 창에서도 24,000자에서 '…' 로 끊어, 이력의
     # 결정문 뒤쪽이 빠졌다. 끊으면 원문 길이를 적는다.
@@ -2731,11 +2749,14 @@ def _history_messages(history: list[dict], stats: dict | None = None,
             continue
         items.append((role, _cut_mark(content, _item_cap)))
         raws.append(content)
-        rows, names = _hist_evidence(entry, _item_cap) if role == "assistant" else ([], [])
+        rows, names, up_rows, up_names = _hist_evidence(entry, _item_cap) if role == "assistant" else ([], [], [], [])
         evs.append(rows)
         names_of.append(names)
+        ups.append(up_rows)
+        up_names_of.append(up_names)
     items, raws = items[-HIST_MAX_ITEMS:], raws[-HIST_MAX_ITEMS:]
     evs, names_of = evs[-HIST_MAX_ITEMS:], names_of[-HIST_MAX_ITEMS:]
+    ups, up_names_of = ups[-HIST_MAX_ITEMS:], up_names_of[-HIST_MAX_ITEMS:]
 
     budget = _hist_budget_chars("".join(c for _, c in items[-6:]), has_docs)
     verbatim_budget = int(budget * (1.0 - HIST_COMPACT_SHARE))
@@ -2776,8 +2797,14 @@ def _history_messages(history: list[dict], stats: dict | None = None,
         kept.reverse()
         return kept, cut, item_cut, item_role
 
-    def _block(idx: int) -> str:
-        return "\n".join([_HIST_EVID_HEAD, *evs[idx]]) if evs[idx] else ""
+    def _blocks(idx: int) -> list[tuple[str, str]]:
+        """그 항목의 근거 덩이 [(종류, 글)] — 업로드(사람이 올려 보낸 결과, PP-D3)가 앞, 그 턴의 조회가 뒤."""
+        out_: list[tuple[str, str]] = []
+        if ups[idx]:
+            out_.append(("upload", "\n".join([_HIST_UPLOAD_HEAD, *ups[idx]])))
+        if evs[idx]:
+            out_.append(("tool", "\n".join([_HIST_EVID_HEAD, *evs[idx]])))
+        return out_
 
     ev_cap_c, ev_cap_t = int(budget * HIST_EVIDENCE_SHARE), int(tok_budget * HIST_EVIDENCE_SHARE)
 
@@ -2785,8 +2812,7 @@ def _history_messages(history: list[dict], stats: dict | None = None,
         """원문에 남는 턴들의 근거가 쓸 몫(자 · 토큰) — 근거 몫(HIST_EVIDENCE_SHARE)까지."""
         c = t = 0
         for idx, _r, _c in kept_:
-            b = _block(idx)
-            if b:
+            for _kind, b in _blocks(idx):
                 c, t = c + len(b) + 2, t + _est_tokens_all(b)
         return min(c, ev_cap_c), min(t, ev_cap_t)
 
@@ -2801,31 +2827,40 @@ def _history_messages(history: list[dict], stats: dict | None = None,
     left_c, left_t = need_c, need_t
     for k in range(len(kept) - 1, -1, -1):  # 최신 턴의 근거부터 — 몫이 모자라면 오래된 턴의 것이 먼저 줄고 빠진다
         idx = kept[k][0]
-        blk = _block(idx)
-        if not blk:
-            continue
-        t = _est_tokens_all(blk)
-        if len(blk) + 2 <= left_c and t <= left_t:
-            text = blk
-            n_full += 1
-        elif left_c - _CUT_MARK_ROOM - 2 >= _HIST_EVID_FLOOR and left_t > 0:
-            text = _fit_tokens(lambda c, b=blk: _cut_mark(b, c), left_c - _CUT_MARK_ROOM - 2, left_t, 200)[0]
-            n_cut += 1
-        else:
-            text = (f"[시스템 첨부 — 어시스턴트가 이 물음에 답하려고 {', '.join(names_of[idx])} 을(를) 조회했다. 결과는 이력 "
-                    "예산 밖이라 싣지 않았다 — 그 값이 필요하면 다시 조회하라]")
-            n_names += 1
-        left_c -= len(text) + 2
-        left_t -= _est_tokens_all(text)
-        # 그 턴의 물음(바로 앞의 사람 발화) 뒤에 붙인다 — 물음이 압축본으로 밀려났으면 그 답 바로 앞에 따로 넣는다.
-        if k > 0 and out[k - 1][0] == "user":
-            out[k - 1] = ("user", f"{out[k - 1][1]}\n\n{text}")
-        else:
-            out.insert(k, ("user", text))
+        a_pos = k                           # 이 답의 자리 — 앞에 따로 넣으면 한 칸 밀린다
+        for kind, blk in _blocks(idx):
+            t = _est_tokens_all(blk)
+            if len(blk) + 2 <= left_c and t <= left_t:
+                text = blk
+                n_full += 1
+            elif left_c - _CUT_MARK_ROOM - 2 >= _HIST_EVID_FLOOR and left_t > 0:
+                text = _fit_tokens(lambda c, b=blk: _cut_mark(b, c), left_c - _CUT_MARK_ROOM - 2, left_t, 200)[0]
+                n_cut += 1
+            elif kind == "upload":
+                text = (f"[시스템 첨부 — 사람이 챗 화면에서 파일을 올려 보냈다({', '.join(up_names_of[idx])}). 결과는 이력 예산 밖이라 "
+                        "싣지 않았다 — 알림에 적힌 파일 이름 · 보고서 번호로 다시 조회하라]")
+                n_names += 1
+            else:
+                text = (f"[시스템 첨부 — 어시스턴트가 이 물음에 답하려고 {', '.join(names_of[idx])} 을(를) 조회했다. 결과는 이력 "
+                        "예산 밖이라 싣지 않았다 — 그 값이 필요하면 다시 조회하라]")
+                n_names += 1
+            left_c -= len(text) + 2
+            left_t -= _est_tokens_all(text)
+            # 그 턴의 물음(바로 앞의 사람 발화) 뒤에 붙인다 — 물음이 압축본으로 밀려났거나 바로 앞이 답이면(업로드 알림은 대개 앞
+            # 답 뒤에 온다) 그 답 바로 앞에 사람 쪽 메시지로 따로 넣는다. 같은 역할이 둘 잇달아 가지 않게 하는 것은 둘 다 같다 —
+            # 업로드는 머리가 따로라('사람이 올려 보낸 결과') 앞 물음의 근거로 읽히지 않는다.
+            if a_pos > 0 and out[a_pos - 1][0] == "user":
+                out[a_pos - 1] = ("user", f"{out[a_pos - 1][1]}\n\n{text}")
+            else:
+                out.insert(a_pos, ("user", text))
+                a_pos += 1
 
     # 압축본도 토큰으로 지킨다 — 글자 몫이 영문 표본으로 부풀었으면 한국어 압축본이 창을 넘는다. 근거가 있던 턴은 조회한 도구
     # 이름을 앞에 남긴다(그 턴에 무엇을 봤는지는 남긴다 — 다시 조회할지 모델이 고른다).
-    dropped = [(r, (f"(조회: {', '.join(names_of[i])}) {c}" if names_of[i] else c)) for i, (r, c) in enumerate(items[:cut])]
+    def _tag(i: int) -> str:
+        return " · ".join([*([f"올림: {', '.join(up_names_of[i])}"] if up_names_of[i] else []),
+                           *([f"조회: {', '.join(names_of[i])}"] if names_of[i] else [])])
+    dropped = [(r, (f"({_tag(i)}) {c}" if _tag(i) else c)) for i, (r, c) in enumerate(items[:cut])]
     digest = (_fit_tokens(lambda c: _compact_turns(dropped, c), int(budget * HIST_COMPACT_SHARE),
                           int(tok_budget * HIST_COMPACT_SHARE), 200)[0] if cut else "")
     if digest:
@@ -3724,6 +3759,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
                 pass
 
 
+# 앞 대화 그림 다시 싣기 머리의 단서(PP-D5) — 다시 실린 그림은 질문 바로 앞에 놓여, 사람이 '방금 변환한 것' 이라고 하면 모델이 그 그림을
+# 가리키는 말로 읽었다(10-22 cae00 대화 — PPT 를 AI 데이터 허브로 보낸 뒤 앞서 올린 그림을 검토했다). 다시 싣기는 그대로 둔다(그림과 새
+# 문서를 견주는 질문 · 이력 압축) — 단서만 단다.
+_RECAP_NOT_UPLOAD = ("이번 질문이 이 그림이 아니라 올리거나 변환한 파일 · 보고서를 가리키면 그림으로 대신 답하지 말고, 이력의 업로드 근거"
+                     "('사람이 챗 화면에서 파일을 올려 보낸 결과')를 보거나 없으면 어느 파일인지 물어라")
+
+
 async def _turn_image_messages(app_, req, vision_ok: bool):
     """(이 발화의 사람 메시지, 앞 대화의 그림 메시지 또는 None). 화면 사건은 _TURN_IMAGE_EVENTS 에 쌓는다(호출부가 흘린다).
     챗 모델이 그림을 받으면 그림 조각, 못 받으면 그림을 받는 다른 모델이 옮긴 판독문, 그것도 없으면 싣지 못했다고 적는다 — 어느 갈래든
@@ -3773,7 +3815,7 @@ async def _turn_image_messages(app_, req, vision_ok: bool):
             recap = HumanMessage(content=[{"type": "text", "text": (
                 f"[시스템 첨부 — 앞 대화에 나온 그림 {len(ps)}장(전체 {len(hist)}장 중 최근부터): " + "; ".join(labels)
                 + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "")
-                + ". 질문에 이 그림이 걸리면 직접 보고 판단하라]")}, *ps])
+                + ". 질문에 이 그림이 걸리면 직접 보고 판단하라. " + _RECAP_NOT_UPLOAD + "]")}, *ps])
         say(f"앞 대화의 그림 {len(ps)}장을 다시 실었습니다" + (f" · {miss}장은 서버에서 지워졌거나 커서 못 실었다" if miss else "")
             + (f" · 오래된 {len(hist) - len(pick)}장은 상한(VISION_HISTORY_IMAGES) 밖" if len(hist) > len(pick) else ""))
     elif pick and tr is not None:
@@ -3781,7 +3823,7 @@ async def _turn_image_messages(app_, req, vision_ok: bool):
         lines = [f"· {k}) ({why}) {t}" for k, (_u, why, t) in enumerate(got, start=1) if t]
         if lines:
             recap = HumanMessage(content="[시스템 첨부 — 앞 대화에 나온 그림의 판독문이다(그림을 읽는 모델이 옮긴 글 — 그림 자체가 아니다). "
-                                         "판독문에 없는 수치를 지어내지 마라]\n" + "\n".join(lines))
+                                         "판독문에 없는 수치를 지어내지 마라. " + _RECAP_NOT_UPLOAD + "]\n" + "\n".join(lines))
         say(f"앞 대화의 그림 판독문 {len(lines)}장을 실었습니다(챗 모델이 그림을 읽지 못한다)" + _vision.unknown_note()
             + (f" · {len(got) - len(lines)}장은 판독하지 못했다" if len(got) > len(lines) else ""))
     elif pick:

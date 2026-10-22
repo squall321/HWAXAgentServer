@@ -51,28 +51,37 @@ def image_urls(*texts) -> list[str]:
 
 
 def history_images(history) -> list[tuple[str, str]]:
-    """앞 대화의 그림 — [(주소, 출처 설명)] 시간순. 사람이 올린 그림(images) · 그 턴의 조회 근거와 답에 나온 그림 주소."""
+    """앞 대화의 그림 — [(주소, 출처 설명)] 시간순. 사람이 올린 그림(images) · 그 턴의 조회 근거와 답에 나온 그림 주소.
+    설명에 '(N턴 전)' 을 단다 — 그 항목 뒤의 사람 발화 수다(사람 항목은 자신까지, 답 · 근거는 그 턴의 물음까지 센다). 몇 번째 항목인지만
+    적으면 '방금 올린 것' 을 물을 때 오래전 그림이 방금 것처럼 읽혔다(HWAXPortal docs/chat-ppt PP-D5)."""
     out: list[tuple[str, str]] = []
     seen: set = set()
+    msgs = list(history or [])
+    users_from = [0] * (len(msgs) + 1)              # users_from[i] = i 번째 항목부터 끝까지의 사람 발화 수
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        users_from[i] = users_from[i + 1] + (1 if isinstance(m, dict) and m.get("role") == "user" else 0)
 
     def add(u: str, why: str) -> None:
         if u not in seen:
             seen.add(u)
             out.append((u, why))
-    for i, m in enumerate(history or []):
+    for i, m in enumerate(msgs):
         if not isinstance(m, dict):
             continue
         if m.get("role") == "user":
+            ago = f"({users_from[i]}턴 전)"
             for u in (m.get("images") if isinstance(m.get("images"), list) else []):
                 if isinstance(u, str) and IMG_URL_RE.fullmatch(u):
-                    add(u, f"{i + 1}번째 발화에 사람이 올린 그림")
+                    add(u, f"{i + 1}번째 발화에 사람이 올린 그림{ago}")
         elif m.get("role") == "assistant":
+            ago = f"({users_from[i] + 1}턴 전)"
             for e in (m.get("evidence") if isinstance(m.get("evidence"), list) else []):
                 if isinstance(e, dict):
                     for u in image_urls(e.get("result")):
-                        add(u, f"{i + 1}번째 답 앞에 도구 {str(e.get('tool') or '')[:80]} 가 낸 그림")
+                        add(u, f"{i + 1}번째 답 앞에 도구 {str(e.get('tool') or '')[:80]} 가 낸 그림{ago}")
             for u in image_urls(m.get("content")):
-                add(u, f"{i + 1}번째 답에 실린 그림")
+                add(u, f"{i + 1}번째 답에 실린 그림{ago}")
     return out
 
 

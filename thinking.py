@@ -343,7 +343,9 @@ def _session_block(history: list | None, cap: int) -> tuple[str, dict]:
                 if not tool or not res:
                     continue
                 args = " ".join(str(e.get("args") or "").split())[:2000]
-                evid.append(f"[e:{len(evid) + 1}] [{tool}{f'({args})' if args else ''}] {res}")
+                # 업로드 근거(kind=upload)는 챗이 조회한 것이 아니라 사람이 챗 화면에서 올려 보낸 결과다(HWAXPortal docs/chat-ppt PP-D3).
+                who = "사람이 올려 보낸 파일 · " if e.get("kind") == "upload" else ""
+                evid.append(f"[e:{len(evid) + 1}] [{who}{tool}{f'({args})' if args else ''}] {res}")
     if not conv and not evid:
         return "", {}
     room = max(0, cap - len(_SESSION_HEAD) - 40)          # 머리 · 소제목 몫을 먼저 뗀다
