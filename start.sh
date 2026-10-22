@@ -114,6 +114,13 @@ delib_load() {   # delib_load <health 본문>
   que="$(printf '%s' "$body" | grep -oE '"delib_queued": *[0-9]+' | grep -oE '[0-9]+$' || true)"
   if [ -n "$act" ] && [ -n "$que" ]; then echo "$act $que"; fi
 }
+# 줄이 재기동을 넘기나(HWAXPortal docs/delib-ops R2 — /health.delib_queue_durable). 참일 때만 "1" 을 찍는다 — 그때만 줄 선 수를 막는
+# 수로 세지 않는다(재기동 뒤 같은 차례로 다시 선다). 모르면(옛 판 · 무응답 · 거짓) 아무것도 안 찍는다 — 종전대로 센다.
+queue_durable() {   # queue_durable <health 본문>
+  local body="${1:-}" d
+  d="$(printf '%s' "$body" | grep -oE '"delib_queue_durable": *true' || true)"
+  if [ -n "$d" ]; then echo 1; fi
+}
 # 카드 대조·비우기 안내 — 판정은 바꾸지 않는다(재기동을 막는 것은 심의뿐이다 — 카드 대조는 끊기면 리스크 앱이 차감 없이 다시
 # 낸다). 끊길 카드 대조 수와 서 있는 비우기 깃발을 한 줄씩 찍는다. 모르면(무응답·옛 판) 아무것도 찍지 않는다. grep -q 를 파이프에
 # 걸지 않는다 — pipefail 아래서 일찍 끝난 grep 이 printf 를 SIGPIPE 로 죽여 '찾았다' 를 '없다' 로 읽는다.
@@ -133,7 +140,8 @@ OLD_PIDS="$(port_pids || true)"
 if [ -n "$OLD_PIDS" ]; then
   HEALTH_BODY="$(health_body)"
   review_notes "$HEALTH_BODY" || true
-  # 재기동은 도는 심의와 줄 선 심의를 **전부 끊는다**(도는 것은 interrupted 로 남고, 줄 선 것은 사라진다).
+  # 재기동은 도는 심의와 줄 선 심의를 **전부 끊는다**(도는 것은 interrupted 로 남고, 줄 선 것은 사라진다 — 줄을 파일로 넘기는 판
+  # (delib_queue_durable)이면 줄 선 것은 같은 차례로 다시 서고, 도는 것은 deliberate_continue 한 번으로 남은 라운드만 잇는다).
   # 좌석 20석 넘는 패널은 수 시간 돈다 — 종전엔 코드를 고치고 이 스크립트를 부르는 순간(update-forges 도
   # 직접 부른다) 그 심의가 말없이 사라졌다. 유예를 늘리는 것은 답이 아니다(수 시간을 기다릴 수는 없다).
   # 도는 심의가 있으면 **내리지 않고 나간다**(exit 3 — 건너뜀). 강행은 AGENT_RESTART_FORCE=1.
@@ -141,14 +149,27 @@ if [ -n "$OLD_PIDS" ]; then
   LOAD="$(delib_load "$HEALTH_BODY" || true)"
   if [ -n "$LOAD" ]; then
     D_ACT="${LOAD%% *}"; D_QUE="${LOAD##* }"
-    if [ $((D_ACT + D_QUE)) -gt 0 ]; then
-      echo "==> ⚠⚠ 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기 — 재기동하면 전부 끊긴다"
+    DURABLE="$(queue_durable "$HEALTH_BODY" || true)"
+    D_BLOCK=$((D_ACT + D_QUE))
+    if [ -n "$DURABLE" ]; then D_BLOCK="$D_ACT"; fi
+    if [ "$D_BLOCK" -gt 0 ]; then
+      if [ -n "$DURABLE" ]; then
+        echo "==> ⚠⚠ 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기 — 재기동하면 진행 중인 것은 끊긴다(대기는 다시 선다)"
+      else
+        echo "==> ⚠⚠ 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기 — 재기동하면 전부 끊긴다"
+      fi
       if [ "${AGENT_RESTART_FORCE:-0}" != "1" ]; then
         echo "○ agent-server 재기동 건너뜀 — 심의 ${D_ACT}건 진행 중, ${D_QUE}건 대기. 끝난 뒤 ./start.sh -d, 지금 강행하려면 AGENT_RESTART_FORCE=1"
         echo "    (떠 있는 인스턴스는 그대로 둔다. 진행 상황: curl -s http://127.0.0.1:${PORT}/health)"
         exit 3
       fi
-      echo "==> AGENT_RESTART_FORCE=1 — 강행한다. 진행 중 ${D_ACT}건은 interrupted 로 끊기고 대기 ${D_QUE}건은 사라진다"
+      if [ -n "$DURABLE" ]; then
+        echo "==> AGENT_RESTART_FORCE=1 — 강행한다. 진행 중 ${D_ACT}건은 interrupted 로 끊기고(deliberate_continue 로 남은 라운드만 잇는다) 대기 ${D_QUE}건은 같은 차례로 다시 선다"
+      else
+        echo "==> AGENT_RESTART_FORCE=1 — 강행한다. 진행 중 ${D_ACT}건은 interrupted 로 끊기고 대기 ${D_QUE}건은 사라진다"
+      fi
+    elif [ -n "$DURABLE" ] && [ "$D_QUE" -gt 0 ]; then
+      echo "==> 대기 ${D_QUE}건은 재기동을 넘겨 같은 차례로 다시 선다(줄을 파일로 넘기는 판) — 그대로 재기동한다"
     fi
   else
     echo "==> 진행 중 심의 수를 확인하지 못했다(/health 무응답 또는 그 수를 안 주는 옛 빌드) — 그대로 재기동한다"

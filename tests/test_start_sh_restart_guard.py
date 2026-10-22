@@ -353,3 +353,30 @@ def test_근거_예산을_실어도_start_sh_가_심의_수를_같은_식으로_
         got = subprocess.run(["bash", "-c", f"grep -oE '{pat.group(1)}' | grep -oE '[0-9]+$'"],
                              input=body, capture_output=True, text=True, timeout=10).stdout.strip()
         assert got == want, (name, got, body[:200])
+
+
+# ── 줄이 재기동을 넘기는 판(HWAXPortal docs/delib-ops R2') ───────────────────────
+def test_줄을_파일로_넘기는_판이면_줄_선_수만으로는_막지_않는다(box):
+    box.health('{"status":"ok","delib_active":0,"delib_queued":3,"delib_queue_durable":true}')
+    rc, out = box.run()
+    assert rc == 0 and not box.old_alive() and box.started(), (rc, out)
+    assert "대기 3건은 재기동을 넘겨 같은 차례로 다시 선다" in out and "건너뜀" not in out, out
+
+
+def test_줄을_넘겨도_도는_심의가_있으면_막고_대기는_다시_선다고_말한다(box):
+    box.health('{"status":"ok","delib_active":1,"delib_queued":2,"delib_queue_durable":true}')
+    rc, out = box.run()
+    assert rc == 3 and box.old_alive() and not box.started(), (rc, out)
+    assert "진행 중인 것은 끊긴다(대기는 다시 선다)" in out and "심의 1건 진행 중, 2건 대기" in out, out
+    rc, out = box.run(AGENT_RESTART_FORCE="1")
+    assert rc == 0 and "같은 차례로 다시 선다" in out and "deliberate_continue" in out, out
+
+
+@pytest.mark.parametrize("flag", ['"delib_queue_durable":false', '"delib_queue_durable":"true"', ""])
+def test_줄을_넘기는지_모르거나_거짓이면_종전대로_줄_선_수도_막는다(box, flag):
+    """하나라도 시작 인자 파일을 못 쓴 줄은 durable 이 거짓이다 — 그 잡은 재기동에 사라진다. 모르는 것도 '넘긴다' 로 읽지 않는다."""
+    body = '{"status":"ok","delib_active":0,"delib_queued":2' + (f",{flag}" if flag else "") + "}"
+    box.health(body)
+    rc, out = box.run()
+    assert rc == 3 and box.old_alive(), (rc, out)
+    assert "재기동하면 전부 끊긴다" in out, out
