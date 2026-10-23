@@ -3729,6 +3729,314 @@ async def _timed_events(events):
             await aclose()
 
 
+# ── 챗 자기검증(HWAXPortal docs/chat-self-check) ─────────────────────────────────────────────────────────────
+# 초안을 근거와 대조해 한 번 고친 뒤 본문으로 낸다. 사용자 결정(10-23, SC-D1) — 검증한 답만 본문에(초안은 '생각 중' 칸) · 같은 챗 모델 ·
+# 항상(근거도 수치도 없는 짧은 답만 건너뜀). 끄면(CHAT_SELF_CHECK=0) 종전 그대로다.
+_SELF_CHECK_SHORT = 400          # 이보다 짧고 근거(조회 · 붙인 문서 · 그림)도 수치도 없는 답은 건너뛴다(인사 · 되묻기)
+_SELF_CHECK_MIN_RATIO = 0.4      # 고친 답이 초안의 이 비율보다 짧으면 의심한다 — 검토자가 답을 잘라 먹었다
+_SELF_CHECK_NUMS = 30            # 검토자에게 넘기는 '출처 없는 수치' 의 위쪽
+_DRAFT_HEAD = "\n\n— 초안(검증 전) —\n"
+_CHECK_HEAD = "\n\n— 검증 —\n"
+_SELF_CHECK_SYS = ("당신은 답변 검토자입니다. 어시스턴트가 쓴 답 초안을 근거와 대조해 틀린 곳만 고칩니다. 근거는 아래 [사용자 질문] · "
+                   "[이번 턴 조회 결과] · [붙인 문서] · [앞 대화] 뿐입니다 — 근거에 없는 사실을 새로 지어 넣지 않습니다. 한국어로 씁니다.")
+_SELF_CHECK_ASK = (
+    "다음을 검토하라.\n"
+    "① 질문의 모든 부분에 답했나 — 빠진 부분을 근거로 답할 수 있으면 채우고, 없으면 '근거가 없어 답하지 못했다' 고 밝혀라.\n"
+    "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라.\n"
+    "③ 근거와 어긋나는 말 — 근거대로 고쳐라.\n"
+    "④ 계산 · 단위 — 다시 계산해 틀리면 고쳐라.\n"
+    "⑤ 조회해 놓고 빠뜨린 중요한 결과 — 답에 더하라.\n"
+    "고칠 곳만 고치고 나머지는 글자 그대로 둔다. 말투 · 형식(표 · 목록 · 그림 링크 ![…](…) · 출처 표기)을 바꾸지 마라. 근거가 잘려 있으면"
+    "(…[N자 중 앞 M자]) 그 뒤에 있을 수 있는 내용은 지우지 말고 그대로 둔다.\n\n"
+    "아래 꼴로만 답하라.\n"
+    "[판정] 고칠 것 없음  또는  [판정] 고침\n"
+    "[고친 점]\n- 한 줄에 하나(무엇을 왜 — 근거). 고칠 것이 없으면 '- 없음'\n"
+    "[답]\n고친 답 전체(고칠 것이 없으면 비워 둔다)")
+_SC_VERDICT = re.compile(r"\[판정\]\s*([^\n]*)")
+_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[답\]|\Z)", re.S)
+_SC_IMG = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
+
+
+def _self_check_on() -> bool:
+    return os.environ.get("CHAT_SELF_CHECK", "1") != "0"
+
+
+def _sse_parse(frame) -> tuple[str, dict]:
+    """우리가 만든 SSE 프레임 하나(_sse) → (사건, 자료). 꼴이 다르면 ('', {}) — 감싸개는 그런 프레임을 그대로 흘린다."""
+    try:
+        txt = frame.decode("utf-8") if isinstance(frame, (bytes, bytearray)) else str(frame)
+        head, _, rest = txt.partition("\n")
+        if not head.startswith("event: ") or not rest.startswith("data: ") or not txt.endswith("\n\n") or txt.count("\nevent: "):
+            return "", {}
+        data = json.loads(rest[6:].strip())
+        return (head[7:].strip(), data) if isinstance(data, dict) else ("", {})
+    except (UnicodeDecodeError, ValueError):
+        return "", {}
+
+
+def _self_check_skip(req: ChatRequest, draft: str, calls: list) -> bool:
+    """검증을 건너뛰나 — 이번 턴에 근거(조회 · 붙인 문서 · 올린 그림)도 수치도 없는 짧은 답(인사 · 되묻기)만."""
+    if calls or req.documents or req.images:
+        return False
+    return len(draft.strip()) < _SELF_CHECK_SHORT and not _sig_numbers(draft)
+
+
+def _sc_fit(text: str, tokens: int) -> str:
+    """tokens 안에 들게 앞부분만(잘랐으면 _cut_mark 표지 — 검토자가 잘린 근거를 '없다' 로 읽지 않게 지시에 적었다)."""
+    if not text or _est_tokens_all(text) <= tokens:
+        return text
+    return _fit_tokens(lambda c: _cut_mark(text, c), _chars_for_tokens(text, tokens), max(1, tokens), 200)[0]
+
+
+def _sc_recent(hist: list, tokens: int) -> str:
+    """앞 대화를 최근 것부터 tokens 안에 — 넘치는 항목은 앞부분만(표지), 그보다 오래된 것은 싣지 않는다."""
+    lines: list[str] = []
+    for r, c in reversed(hist):
+        line = f"{'사람' if r == 'user' else '어시스턴트'}: {c}"
+        t = _est_tokens_all(line)
+        if t > tokens:
+            if tokens > 200:
+                lines.append(_sc_fit(line, tokens))
+            break
+        lines.append(line)
+        tokens -= t
+    return "\n".join(reversed(lines))
+
+
+_SC_SHARES = {"res": 0.55, "doc": 0.25, "hist": 0.20}     # 넘칠 때 조회 결과 · 붙인 문서 · 앞 대화의 몫
+
+
+def _sc_shares(need: dict, room: int) -> dict:
+    """몫 나누기 — 제 몫 안에 드는 쪽은 다 주고, 남는 몫을 넘치는 쪽에 비율대로 다시 나눈다(드는 쪽이 없어질 때까지). 문서 · 앞 대화가
+    없는 턴에 조회 결과가 55% 에서 잘리지 않는다."""
+    got: dict = {}
+    while True:
+        left = room - sum(got.values())
+        over = [k for k in need if k not in got]
+        tot = sum(_SC_SHARES[k] for k in over)
+        fit = [k for k in over if need[k] <= left * _SC_SHARES[k] / tot] if tot else []
+        if not fit:
+            part = {k: max(0, int(left * _SC_SHARES[k] / tot)) for k in over}
+            if part:
+                part[over[0]] += max(0, left - sum(part.values()))      # 나눗셈 끝수는 첫 쪽에(합이 남는 몫과 같게)
+            got.update(part)
+            return got
+        got.update({k: need[k] for k in fit})
+
+
+def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: list) -> list:
+    """검토자 입력 — 이 턴의 창(_model_context_tokens — 챗 턴은 두 서버 중 작은 창) 안에서. 고친 답을 쓸 출력 몫을 먼저 떼고, 남는 몫에
+    다 들면 그대로, 넘치면 조회 결과 55% · 붙인 문서 25% · 앞 대화 20% 로 나눈다(쓰지 않는 몫은 넘치는 쪽으로 — _sc_shares)."""
+    win = _model_context_tokens()
+    out_room = max(2048, int(_est_tokens_all(draft) * 1.3) + 1024)
+    room = max(3000, win - out_room - _est_tokens_all(_SELF_CHECK_SYS + _SELF_CHECK_ASK) - _est_tokens_all(draft) - 2000)
+    q = _sc_fit(req.message or "", max(500, room // 10))
+    room -= _est_tokens_all(q)
+    res = "\n\n".join(f"─ 결과 {i} ─\n{o}" for i, o in enumerate(outputs, start=1)) if calls else ""
+    docs = [d for d in (req.documents or []) if isinstance(d, dict) and str(d.get("text") or "").strip()]
+    dtext = "\n\n".join(f"── {str(d.get('name') or '문서')[:200]} ──\n{d.get('text')}" for d in docs)
+    hist = _history_messages(req.history)[-8:]
+    cap = _sc_shares({"res": _est_tokens_all(res), "doc": _est_tokens_all(dtext),
+                      "hist": sum(_est_tokens_all(f"어시스턴트: {c}") for _r, c in hist)}, room)
+    blocks = [f"[사용자 질문]\n{q}"]
+    if calls:
+        lines = [f"{i}. {n}{f'({a})' if a else ''}" for i, (n, a) in enumerate(calls, start=1)]
+        blocks.append("[이번 턴 조회 결과]\n" + "\n".join(lines) + ("\n\n" + _sc_fit(res, cap["res"]) if res else ""))
+    else:
+        blocks.append("[이번 턴 조회 결과]\n(이번 턴에는 도구를 부르지 않았다 — 근거 대조는 붙인 문서 · 앞 대화로만 한다. 일반 지식으로 쓴 설명은 "
+                      "지우지 말고, ① 빠진 물음 ③ 앞뒤가 어긋나는 말 ④ 계산 · 단위만 본다)")
+    if docs:
+        blocks.append("[붙인 문서]\n" + _sc_fit(dtext, cap["doc"]))
+    htext = _sc_recent(hist, cap["hist"])
+    if htext:
+        blocks.append("[앞 대화 — 최근]\n" + htext)
+    if req.images or _vision.history_images(req.history):
+        blocks.append("[그림]\n이 턴에는 그림이 실렸다 — 검토자는 그림을 보지 못한다. 그림에서 읽은 내용(수치 포함)은 지우지 말고 그대로 둔다.")
+    bad = _unsourced_numbers(draft, "\n".join(outputs) + "\n" + (req.message or ""), limit=0)
+    if calls and bad:
+        blocks.append("[코드 대조 — 답의 수치 중 조회 결과 · 사용자 발화에서 찾지 못한 것]\n"
+                      + ", ".join(f"`{v}`" for v in bad[:_SELF_CHECK_NUMS]) + (f" 외 {len(bad) - _SELF_CHECK_NUMS}건" if len(bad) > _SELF_CHECK_NUMS else ""))
+    blocks.append(f"[답 초안]\n{draft}")
+    blocks.append(_SELF_CHECK_ASK)
+    from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
+    return [SystemMessage(content=_SELF_CHECK_SYS), HumanMessage(content="\n\n".join(blocks))]
+
+
+def _self_check_parse(out: str) -> tuple[str | None, list, str]:
+    """검토자 답 → (판정 'ok' · 'fixed' · 못 읽으면 None, 고친 점들, 고친 답)."""
+    m = _SC_VERDICT.search(out or "")
+    if not m:
+        return None, [], ""
+    v = re.sub(r"[*_`\s]", "", m.group(1))
+    verdict = "fixed" if v.startswith("고침") and "없" not in v else "ok"
+    fx = _SC_FIXES.search(out)
+    fixes = []
+    for line in (fx.group(1).splitlines() if fx else []):
+        t = line.strip()
+        if t.startswith("-"):
+            t = t[1:].strip()
+            if t and t not in ("없음", "없음."):
+                fixes.append(t[:400])
+    ans = out.split("[답]", 1)[1].strip() if "[답]" in out else ""
+    return verdict, fixes[:20], ans
+
+
+def _self_check_judge(draft: str, verdict: str | None, fixes: list, ans: str, cut: bool) -> tuple[str, dict]:
+    """검토자 판정 → (낼 답, meta.self_check). 고친 답이 수상하면 초안을 그대로 내고 까닭을 적는다(고칠 점은 보인다)."""
+    if verdict is None:
+        return draft, {"status": "unreadable", "reason": "검토자 답을 읽지 못했다 — 초안을 그대로 냈다"}
+    if verdict == "ok":
+        return draft, {"status": "ok"}
+    why = ""
+    if cut:
+        why = "검토자 답이 출력 상한에서 끊겼다"
+    elif not ans:
+        why = "고친 답이 비었다"
+    elif len(ans) < len(draft) * _SELF_CHECK_MIN_RATIO:
+        why = f"고친 답이 초안보다 지나치게 짧다({len(draft):,}자 → {len(ans):,}자)"
+    else:
+        lost = [u for u in dict.fromkeys(_SC_IMG.findall(draft)) if u not in ans]
+        if lost:
+            why = f"고친 답이 초안의 그림 {len(lost)}개를 잃었다"
+    if why:
+        return draft, {"status": "suspect", "reason": why + " — 초안을 그대로 냈다", "fixes": fixes}
+    if ans.strip() == draft.strip():
+        return draft, {"status": "ok"}         # 고쳤다고 했지만 바뀐 글자가 없다
+    return ans, {"status": "fixed", "fixes": fixes}
+
+
+async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: list, outputs: list, res: dict):
+    """검토자를 부른다 — 글은 '생각 중' 칸으로 흘리고, 끝나면 res 에 final · check 를 둔다. 실패해도 초안이 나간다."""
+    llm = _chat_llm_of(app)
+    acc, shown, answering = "", 0, False      # 검토자 글 · '생각' 칸에 흘린 데까지 · [답] 표지를 지났나
+    cut = False
+    model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
+    kw = {} if os.environ.get("CHAT_SELF_CHECK_THINK", "0") == "1" else {
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    try:
+        msgs = await asyncio.to_thread(_self_check_messages, req, draft, calls, outputs)
+        yield _sse("reasoning", {"delta": _CHECK_HEAD})
+        async for ch in llm.astream(msgs, **kw):
+            rc = (getattr(ch, "additional_kwargs", None) or {}).get("reasoning_content")
+            if rc:
+                yield _sse("reasoning", {"delta": rc})
+            c = getattr(ch, "content", "") or ""
+            if isinstance(c, list):
+                c = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
+            if c and not answering:
+                # 판정 · 고친 점은 '생각' 칸에 흘리고, [답] 뒤(고친 답 전체)는 흘리지 않는다 — 끝나면 본문으로 나간다(같은 글이 두 번 보이지 않게).
+                # 표지가 조각 경계에 걸칠 수 있어 끝 두 자는 다음 조각까지 쥔다.
+                acc += c
+                k = acc.find("[답]", max(0, shown - 2))
+                if k >= 0:
+                    answering = True
+                    if acc[shown:k]:
+                        yield _sse("reasoning", {"delta": acc[shown:k]})
+                    yield _sse("reasoning", {"delta": "[답] — 고친 답은 본문에 냅니다"})
+                    yield _sse("status", {"step": "고친 답을 쓰는 중 — 다 쓰면 본문에 냅니다", "tool": None})
+                elif len(acc) - 2 > shown:
+                    yield _sse("reasoning", {"delta": acc[shown:len(acc) - 2]})
+                    shown = len(acc) - 2
+            elif c:
+                acc += c
+            md = getattr(ch, "response_metadata", None) or {}
+            if md.get("finish_reason") == "length":
+                cut = True
+            if md.get("model_name"):
+                model = md["model_name"]
+    except Exception as exc:  # noqa: BLE001 — 검증 실패가 답을 못 죽인다
+        print(f"[self-check] 검토자 호출 실패 — {type(exc).__name__}: {exc}"[:300])
+        res.update(final=draft, check={"status": "failed", "reason": f"검토자 호출 실패({type(exc).__name__}) — 초안을 그대로 냈다"},
+                   model=None)
+        return
+    if not answering and acc[shown:]:
+        yield _sse("reasoning", {"delta": acc[shown:]})
+    verdict, fixes, ans = _self_check_parse(acc)
+    final, check = _self_check_judge(draft, verdict, fixes, ans, cut)
+    res.update(final=final, check=check, model=str(model) if model else None)
+
+
+async def _self_checked_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
+    """자기검증 감싸개(SC-D2) — 안쪽 턴의 초안 글(token)은 '생각 중' 칸(reasoning)으로 돌리고 결과 · 끝 · meta 는 붙잡는다. 초안이
+    끝나면 검증해 고친 답을 본문(token)으로 내고, 근거 블록은 고친 답으로 다시 센다. 오류 · 조기 종료 · 다른 결과 꼴은 초안을 본문으로
+    그대로 흘린다(종전과 같은 끝)."""
+    box: dict = {}
+    inner = _agent_stream_turn(app, req, box)
+    draft_parts: list[str] = []
+    held: dict = {}
+    in_draft = failed = False
+    try:
+        async for frame in inner:
+            ev, data = _sse_parse(frame)
+            if ev == "token" and not failed:
+                d = str(data.get("delta") or "")
+                if d:
+                    draft_parts.append(d)
+                    if not in_draft:        # 첫 초안 글 · 도구를 부르고 다시 쓰기 시작한 글 — 생각 글과 갈라 보이게 머리를 단다
+                        in_draft = True
+                        yield _sse("reasoning", {"delta": _DRAFT_HEAD})
+                    yield _sse("reasoning", {"delta": d})
+                continue
+            if ev == "reasoning" and in_draft:
+                in_draft = False
+                yield _sse("reasoning", {"delta": "\n\n"})
+            if ev in ("result", "meta", "done"):
+                held[ev] = data
+                continue
+            if ev == "error" and not failed:
+                failed = True       # 오류 길 — 초안을 본문으로 먼저 흘리고 오류를 낸다(종전과 같은 화면)
+                if draft_parts:
+                    yield _sse("token", {"delta": "".join(draft_parts)})
+            yield frame
+    finally:
+        await inner.aclose()
+    res = held.get("result")
+    draft = box.get("draft")
+    if failed or draft is None or not isinstance(res, dict) or res.get("type") != "text":
+        if not failed and draft_parts:
+            yield _sse("token", {"delta": "".join(draft_parts)})
+        for ev in ("meta", "result", "done"):
+            if ev in held:
+                yield _sse(ev, held[ev])
+        return
+    calls, outputs = box.get("calls") or [], box.get("outputs") or []
+    t0 = time.monotonic()
+    if _self_check_skip(req, draft, calls):
+        final, check, vmodel = draft, {"status": "skipped", "reason": "근거(조회 · 붙인 문서 · 그림)도 수치도 없는 짧은 답"}, None
+    else:
+        yield _sse("status", {"step": "답을 검증하는 중 — 질문 · 근거 · 수치를 대조합니다", "tool": None})
+        out: dict = {}
+        sc = _self_check_stream(app, req, draft, calls, outputs, out)
+        try:
+            async for fr in sc:
+                yield fr
+        finally:
+            await sc.aclose()       # 연결이 끊기면 검토자 호출도 지금 닫는다
+        final, check, vmodel = out.get("final", draft), out.get("check") or {"status": "failed"}, out.get("model")
+    check["ms"] = int((time.monotonic() - t0) * 1000)
+    for i in range(0, len(final), 400):
+        yield _sse("token", {"delta": final[i:i + 400]})
+    text = final
+    if calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0":
+        try:
+            _bad = _unsourced_numbers(final, "\n".join(outputs) + "\n" + (req.message or ""), limit=0)
+            _ev = _evidence_block(calls, _bad)
+            if _ev:
+                text += _ev
+                yield _sse("token", {"delta": _ev})
+        except Exception as exc:  # noqa: BLE001 — 근거 표기 실패가 답변을 못 죽인다
+            print(f"[agent] evidence block failed: {exc!r}")
+    meta = dict(held.get("meta") or {})
+    meta["models"] = dict(meta.get("models") or {})
+    if vmodel:
+        meta["models"][vmodel] = meta["models"].get(vmodel, 0) + 1    # 검토자 호출도 이 턴의 모델 호출이다(C3)
+    meta["self_check"] = check
+    yield _sse("meta", meta)
+    yield _sse("result", {"type": "text", "content": text})
+    if "done" in held:
+        yield _sse("done", held["done"])
+
+
 async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     """챗 한 턴. 챗 전용 LLM(CHAT_LLM_*)이 켜져 있으면 이 턴의 문맥 예산을 그 서버 창과 VLLM_* 창 중 **작은 값**으로 잡는다 —
     챗 경로의 예산(이력 · 문서 · 도구 결과 · 도구 설명)은 _model_context_tokens() 하나를 보는데 그 값은 VLLM_*(GLM 1M) 창이라,
@@ -3746,7 +4054,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         win = min(chat_ctx, base_ctx)
         out = max(0, int(chat_cfg.get("output_reserve") or chat_cfg.get("max_tokens") or 0))
         tok = _external_llm.ctx_override.set(win - min(out, win // 2))
-    turn = _agent_stream_turn(app, req)
+    # 자기검증(HWAXPortal docs/chat-self-check) — 켜져 있으면 초안을 근거와 대조해 한 번 고친 뒤 본문으로 낸다
+    turn = _self_checked_turn(app, req) if _self_check_on() else _agent_stream_turn(app, req)
     try:
         async for chunk in turn:
             yield chunk
@@ -3840,7 +4149,9 @@ async def _drain_image_events(events: list):
 _TURN_IMAGE_EVENTS: contextvars.ContextVar = contextvars.ContextVar("turn_image_events", default=None)
 
 
-async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
+async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = None) -> AsyncIterator[bytes]:
+    """챗 한 턴. box 를 주면(자기검증 감싸개 — HWAXPortal docs/chat-self-check SC-D2) 끝에서 초안(text) · 이번 턴 조회 기록을 거기
+    넘기고 근거 블록은 붙이지 않는다 — 감싸개가 고친 답으로 다시 센다."""
     full: list[str] = []
     _turn_models: dict = {}     # 이 턴의 모델 호출 수(모델 이름 → 횟수) — 턴 끝 'meta' 사건(C3)
     turn_imgs: list = []
@@ -4715,10 +5026,12 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
             text = (text + _fallback) if text.strip() else _fallback
             yield _sse("token", {"delta": _fallback})
             print("[agent] empty-final retry 실패 — 원문 발췌로 대체")
+    if box is not None:
+        box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out))
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
     # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.
-    if turn_calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0":
+    if turn_calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0" and box is None:
         try:
             _src = "\n".join(turn_out) + "\n" + (req.message or "")
             _bad = _unsourced_numbers(text, _src, limit=0)   # 전부 센다 — 블록이 6건만 보이고 총 건수를 적는다
