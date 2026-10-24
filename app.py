@@ -861,6 +861,9 @@ class ChatRequest(BaseModel):
     # — 헤더로 누구인지 알리는 것만으로는 포털에 되묻는 도구(대화 검색·저장)가 401 이 된다.
     # 없으면 종전대로 서비스 계정(GW_TOKEN)으로 돈다.
     user_pat: str = ""
+    # 호출자 소속 id — 포털이 원장에서 채운다(권한표에 없는 id 는 빈 값). 위키에 남기는 심의(delib_opts.wiki)의 범위(aff:<소속>)다 —
+    # 비면 후보로 보낸다(HWAXPortal docs/mxwp-wiki P8). 요청 손잡이가 아니라 신원이라 delib_opts 에 두지 않는다.
+    affiliation: str = ""
     # 멀티턴: 이전 대화 [{"role":"user"|"assistant","content":str}, …]. 검증/절단은 _history_messages 가 담당.
     history: list[dict] = []
     # 심의 손잡이 요청 오버라이드(웹 토글) — deliberation._resolve_opts 가 화이트리스트 키만 읽고
@@ -5073,13 +5076,13 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         _q = strip_sim_trigger(req.message)
         stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_sim_deliberation(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history)), "sim", started_by)
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "sim", started_by)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
         _q = strip_test_plan_trigger(req.message)
         stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_test_plan(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history)), "test-plan", started_by)
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "test-plan", started_by)
     elif is_deliberation(req.message):
         # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
         # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
@@ -5602,6 +5605,12 @@ class TopicRequest(BaseModel):
 DELIB_TOPIC_MIN = int(os.environ.get("DELIB_TOPIC_MIN", "12"))
 
 
+def _wiki_kw(req) -> dict:
+    """위키에 남기는 심의(delib_opts.wiki)만 소속을 입구에 넘긴다(범위 aff:<소속> — HWAXPortal docs/mxwp-wiki P8). 아니면 입구
+    호출은 종전 그대로다."""
+    return {"affiliation": req.affiliation} if (req.delib_opts or {}).get("wiki") else {}
+
+
 async def _delib_with_topic(req):
     """`/심의` 경로 — 화두가 비었거나 너무 짧으면 대화에서 뽑아 쓴다."""
     q = strip_trigger(req.message)
@@ -5622,7 +5631,7 @@ async def _delib_with_topic(req):
             yield _sse("done", {})
             return
     async for chunk in _with_delib_images(req, q, lambda o: run_deliberation(
-            app, q, req.groups, o, req.user_email, req.user_pat, req.history)):
+            app, q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))):
         yield chunk
 
 

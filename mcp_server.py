@@ -146,7 +146,7 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
                 continue_summary: str = "", non_negotiables=None, options=None,
                 stop_after_round: int = 0, rounds_so_far: int = 0,
                 save_report: bool = True, append_to_report_id: int = 0,
-                advanced=None) -> dict:
+                wiki: bool = False, advanced=None) -> dict:
     """도구 인자 → deliberation._resolve_opts 화이트리스트 dict.
 
     값 검증·클램프는 엔진이 한다(신뢰 안 되는 입력을 전제로 짜여 있다). 여기서는 모양만 맞춘다."""
@@ -183,6 +183,8 @@ def _build_opts(*, rounds: int = 0, modifiers=None, evidence=None, personas=None
         o["save_report"] = 0
     if append_to_report_id:
         o["append_to_report_id"] = int(append_to_report_id)
+    if wiki:
+        o["wiki"] = 1
     if isinstance(advanced, dict):
         o.update({k: v for k, v in advanced.items() if v is not None})
     return o
@@ -413,6 +415,10 @@ _A_OPTIONS = (f"후보안(안 선택용, 최대 {_engine._OPTIONS_MAX}개). 2개
               "없으면 표결을 강제하지 않는다.")
 _A_STOP = "1 이면 초기 라운드까지만 돌고 사람 검토를 기다린다(체크포인트). 기본 0 — 끝까지 돈다."
 _A_SAVE = "거짓이면 Report Archive 에 보고서를 남기지 않는다(탐색용 심의). 기본 참."
+_A_WIKI = ("참이면 결정문을 MX 백서 LLM 위키에도 원천으로 남긴다(기본 거짓). 사람 명의로만 들어가고(신원 없는 호출은 남기지 않는다) "
+           "범위는 시작한 사람의 소속(aff:<소속>)이다 — 소속이 정해지지 않았으면 후보로 보내 주인만 보고, MX 백서 '내 후보' 에서 범위를 "
+           "골라 승인해야 들어간다. 다단 심의(sim-plan · build-plan)는 단마다 결정문 하나씩이다. 이어하기는 이 값을 이어받는다. "
+           "결과는 결정문 끝의 안내 한 줄이다(원천 번호 또는 남기지 못한 까닭).")
 _A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 이름과 뜻(timeout_s 는 LLM 호출 1회 한도 초 · 엔진의 최소~최대 범위로 죈다)은 도구 "
                "설명의 advanced 절이다.")
 _A_JOB_ID = "심의 잡 id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
@@ -456,6 +462,7 @@ async def deliberate_start(
     options: Annotated[list[str] | None, Field(description=_A_OPTIONS)] = None,
     stop_after_round: Annotated[int, Field(description=_A_STOP)] = 0,
     save_report: Annotated[bool, Field(description=_A_SAVE)] = True,
+    wiki: Annotated[bool, Field(description=_A_WIKI)] = False,
     advanced: Annotated[dict | None, Field(description=_A_ADVANCED)] = None,
     ctx: Context | None = None,
 ) -> dict:
@@ -491,6 +498,7 @@ async def deliberate_start(
         stop_after_round: 1 이면 초기 라운드까지만 돌고 사람 검토를 기다린다(체크포인트).
         save_report: False 면 Report Archive 저장을 건너뛴다. 탐색적 심의로 아카이브를 어지럽히지
                      않으려 할 때. 기본 True.
+        wiki: True 면 결정문을 MX 백서 LLM 위키에도 남긴다(기본 False — 뜻은 _A_WIKI).
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
                   parse_retries · timeout_s · voc · persona_knowledge · chair_template · sealed.
@@ -510,7 +518,7 @@ async def deliberate_start(
     opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
                        tools=tools, apps=apps, human_note=human_note, options=options,
                        search_sources=search_sources, stop_after_round=stop_after_round,
-                       save_report=save_report, advanced=advanced)
+                       save_report=save_report, wiki=wiki, advanced=advanced)
     user, groups = _caller(ctx)
     # owner — 외부 응답자 심의(advanced.llm=external)의 과제 주인은 게이트웨이 헤더를 푼 이름이다(과제 도구 쪽과 같은 규칙). 잡 기록의
     # 주인(user)은 종전 그대로 헤더 원문이다(견줄 때 양쪽을 delib_jobs._norm 으로 푼다). 소속은 같은 소속 열람(결정 6)이 견준다.
@@ -651,8 +659,9 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
 # tools(지정 도구 사전 호출)는 넣지 않는다 — 이어받으면 같은 도구를 또 불러 유입이 는다.
 # timeout_s(LLM 호출 1회 한도)도 이어받는다 — 큰 패널이라 한도를 올려 돈 심의를 이어가면 서버 기본값으로
 # 돌아가, 첫 회차에 멀쩡하던 좌석이 이어하기에서 시간 초과로 빠졌다. 원장에는 상한에서 죈 값이 적혀 있다.
+# wiki(MX 백서 위키에 결정문 남기기)는 save_report 와 같은 까닭으로 이어받는다 — 위키에 남기던 심의의 다음 결정문도 남는다.
 _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_prepass", "search_sources",
-               "apps", "save_report", "timeout_s")
+               "apps", "save_report", "timeout_s", "wiki")
 _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 advanced 와 같다). 비우면 이전 회차의 손잡이(" + "·".join(_CONT_CARRY)
                     + ")를 이어받고 여기 적은 것이 그 위에 덮인다. sealed 는 풀 수 없다.")
 

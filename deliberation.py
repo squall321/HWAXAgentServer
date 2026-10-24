@@ -10,8 +10,9 @@ import re
 import asyncio
 import contextvars
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from urllib.parse import quote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다
+from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다(풀기는 위키 원천의 주인 이메일)
 
 import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
@@ -1225,14 +1226,14 @@ _INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "an
              "chair_bestof", "chair_cite", "parse_retries", "rounds",
              "free_tools", "tool_budget", "stop_after_round", "build_plan",
              "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
-             "persona_knowledge", "sealed")
+             "persona_knowledge", "sealed", "wiki")
 # 그 가운데 켜고 끄는 것(0|1)은 낱말로도 받는다. voc 는 off 로 끄고 persona_knowledge 는 0 으로 끈다 —
 # 안내에 나란히 적혀 있어, 소급 검증을 손으로 꾸리는 호출자는 둘 다 "off" 로 보낸다. int("off") 는 예외라
 # 기본값(켜짐)이 말없이 남았고 오늘의 지식카드가 실렸다. 개수(rounds·tool_budget 등)는 낱말을 안 받는다.
 # sealed 는 여기 없다 — 못 읽는 값을 닫힌 쪽으로 읽어야 해서 _seal 이 먼저 0/1 로 맞춘다.
 _ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
                          "chair_cite", "free_tools", "stop_after_round", "build_plan", "save_report",
-                         "rescreen", "persona_knowledge"))
+                         "rescreen", "persona_knowledge", "wiki"))
 _ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
 
 
@@ -1373,6 +1374,8 @@ def _resolve_opts(req_opts):
         # 0 이면 저장을 건너뛴다(탐색적 심의가 RA 를 어지럽히지 않게). append_to_report_id 를 주면
         # 새 보고서를 만들지 않고 그 보고서에 페이지로 이어붙인다 — 이어하기 회차를 한 건으로 묶는다.
         save_report=1, append_to_report_id=0,
+        # MX 백서 LLM 위키에도 결정문을 남긴다(1) — 기본 꺼짐, 시작한 사람이 켠 심의만(_wiki_submit · HWAXPortal docs/mxwp-wiki P8).
+        wiki=0,
         # 안 선택(option-select) 후보안 목록. 2개 이상일 때만 최종 라운드가 표결을 요구한다.
         # 없으면 표결 강제를 끈다 — 후보 없이 vote 를 요구하면 좌석이 자기가 방금 함께 만든
         # 결론에 찬성표를 던져 정보량 0 인 표결이 된다(hwax-deliberate.js HAS_CHOICES 와 같은 규율).
@@ -3270,6 +3273,103 @@ def _ra_report_id(made) -> int | None:
         return None
 
 
+# ── MX 백서 LLM 위키에 결정문 남기기(HWAXPortal docs/mxwp-wiki P8) ──────────────────────────────────────────
+# 시작한 사람이 켠 심의(delib_opts.wiki=1)만 남긴다 — 기본 꺼짐. RA 저장과 같은 자리에서 단마다 하나다(다단 심의는 메커니즘 · 해석 설계 ·
+# 구축 계획이 저마다 결정이다). 이 심의의 도구(그 사람 자격)로 게이트웨이 wiki_submit_source 를 부른다 — 사람 명의 위임(소속 · 플랫폼
+# 증명)은 게이트웨이가 하고 엔진은 위임 비밀을 쥐지 않는다. 범위는 시작한 사람의 소속(aff:<소속>)이고, 소속이 없으면 포털 '해결됨' 과
+# 같이 후보(주인만 본다 · 'MX 백서 쓰는 사람 모두' 를 제안)로 보낸다 — 주인이 MX 백서 '내 후보' 에서 범위를 골라 승인한다.
+# 결정문 · 소수 의견은 자르지 않는다(버리지 않을 수 있으면 버리지 않는다). 근거 발췌만 MX 백서 인용 상한에 맞춘다 — 전문은 보고서 ·
+# 잡 전사에 있다. 봉투 칸은 MX 백서 계약(MXWhitePaper docs/llm-wiki/CONTRACTS.md §3)의 것만이다 — 모르는 칸은 거부된다.
+# (소속, 원천 열쇠) — 입구(run_*)가 _wiki_bind 로 세운다. 열쇠는 MCP 잡이면 잡 id, 웹 심의면 입구가 짓는 id 다(단마다 같다).
+_WIKI_WHO: contextvars.ContextVar = contextvars.ContextVar("wiki_who", default=None)
+_WIKI_TOOL = "wiki_submit_source"
+_WIKI_PLAT = "plat:mxwhitepaper"
+_WIKI_EXCERPT_MAX = 300      # 근거 발췌 상한 — MX 백서 인용 상한(V10) · 포털 챗 '위키에 남기기'(wiki_send.EXCERPT_MAX)와 같은 값
+_WIKI_TITLE_MAX = 120
+
+
+def _wiki_bind(affiliation: str, job_id: str) -> None:
+    """입구에서 — 이 심의의 소속과 원천 열쇠를 세운다. 소속은 신원이라 요청 손잡이로 받지 않는다(포털 · 게이트웨이가 원장 값으로 준다)."""
+    _WIKI_WHO.set((str(affiliation or "").strip(), str(job_id or "").strip() or f"web-{uuid.uuid4().hex[:12]}"))
+
+
+def _wiki_envelope(*, question: str, decision: str, stage: str, personas: list, last_list: list, rid,
+                   evidence: list, pool: list, owner: str, affiliation: str, ref: str, now) -> dict:
+    """원천 봉투(mxwp-source/1 · deliberation). 표는 착석 전원이다 — 마지막 라운드에 답하지 못한 좌석도 미표명으로 싣는다(집계와 같다).
+    소수 의견은 동의가 아닌 좌석의 마지막 입장 전문이다. 근거는 보고서 · 호출자가 준 근거 · 좌석 조회(같은 것은 한 번)."""
+    by_seat = {o.get("persona"): o for o in last_list}
+    votes, minority = [], []
+    for p in personas:
+        o = by_seat.get(p["key"])
+        stance = _norm_stance(o.get("stance")) if o else "미표명"
+        votes.append({"seat": p["key"], "stance": stance if o else "미표명(응답 없음)"})
+        if stance != "동의":
+            minority.append(f"[{p['key']}] {stance} — "
+                            + (_say_of(3, o, full=True) if o else "마지막 라운드에 응답하지 못했다"))
+    ev: list = []
+    seen: set = set()
+
+    def add(kind: str, src: str, text) -> None:
+        x = " ".join(str(text or "").split())
+        if not x:
+            return
+        x = x if len(x) <= _WIKI_EXCERPT_MAX else x[:_WIKI_EXCERPT_MAX - 1] + "…"
+        if (kind, src, x) not in seen:
+            seen.add((kind, src, x))
+            ev.append({"kind": kind, "ref": src[:200], "excerpt": x})
+
+    if rid:
+        add("doc", f"report-archive:{rid}", f"이 심의의 Report Archive 보고서 #{rid} — 결정문 · 회의록 전문")
+    for e in evidence:
+        add("tool" if e.get("tool") else "doc", str(e.get("tool") or e.get("source") or "근거"), e.get("result"))
+    for _r, _seat, tool, _args, out in pool:
+        add("tool", str(tool), out)
+    aud, mode = ([f"aff:{affiliation}"], "button") if affiliation else ([_WIKI_PLAT], "candidate")
+    return {
+        "schema": "mxwp-source/1", "kind": "deliberation",
+        "origin": {"system": "hwax-portal", "ref": f"delib:{ref}:{stage}"},
+        "title": "심의 — " + (" ".join(question.split())[:_WIKI_TITLE_MAX] or "결정"),
+        "captured_at": now.isoformat(), "owner": {"email": owner}, "audience": aud, "sensitivity": "internal",
+        "consent": {"by": owner, "at": now.isoformat(), "mode": mode},
+        "body": {"question": question, "decision": decision, "votes": votes, "evidence": ev,
+                 **({"minority": "\n\n".join(minority)} if minority else {}), "job_id": ref},
+    }
+
+
+def _wiki_note(raw, env: dict) -> str:
+    """wiki_submit_source 의 응답 → 결정문 끝에 붙일 안내. 실패는 도구가 준 사유를 그대로 싣는다(다시 해도 같은지 사람이 가른다)."""
+    if raw is None:
+        return (f"\n\n⚠ MX 백서 위키에 남기지 못했다 — 이 심의의 도구에 {_WIKI_TOOL} 가 없다(MX 백서 권한 {_WIKI_PLAT} 이나 "
+                "게이트웨이의 MX 백서 연결을 확인하라).")
+    fail = _ra_save_failure(raw)
+    got = {} if fail else (_parse_json(raw) or {})
+    if isinstance(got, dict) and isinstance(got.get("result"), dict):      # 구조화 응답 꼴 {"result": …} 도 받는다
+        got = got["result"]
+    if not isinstance(got, dict) or not got.get("id"):
+        return f"\n\n⚠ MX 백서 위키에 남기지 못했다 — {fail or 'MX 백서가 원천 번호를 돌려주지 않았다(들어갔는지 위키에서 확인하라)'}"
+    src, where = got.get("short") or got["id"], ", ".join(env["audience"])
+    if env["consent"]["mode"] == "candidate":
+        return (f"\n\n📚 MX 백서 위키 후보 {src} 로 보냈다 — 소속이 정해지지 않아 주인만 본다. MX 백서 '내 후보' 에서 범위(제안 {where})를 "
+                "골라 승인하면 위키에 들어간다(승인하지 않으면 7일 뒤 버려진다).")
+    if got.get("dedup"):
+        return f"\n\n📚 이 결정문은 이미 MX 백서 위키에 있다 — 원천 {src}(범위 {where})."
+    return f"\n\n📚 MX 백서 위키 원천 {src} 로 남겼다(범위 {where} · 들이기 {got.get('ingest_state') or '?'})."
+
+
+async def _wiki_submit(tools: dict, *, user: str, chair_failed, **env_kw) -> str:
+    """켠 심의의 결정문을 위키로 — 결정문 끝에 붙일 안내를 돌려준다. 의장이 결정문을 못 냈거나 신원이 없으면 보내지 않고 그렇다고 적는다."""
+    if chair_failed:
+        return "\n\n⚠ 의장이 결정문을 내지 못해 MX 백서 위키에 남기지 않았다 — 이어하기로 결정문을 받으면 그때 남는다."
+    owner = unquote(str(user or "")).strip()
+    if "@" not in owner:
+        return "\n\n⚠ 신원 없는 호출이라 MX 백서 위키에 남기지 않았다 — 위키 원천은 사람 명의로만 들어간다."
+    aff, ref = _WIKI_WHO.get() or ("", f"web-{uuid.uuid4().hex[:12]}")
+    env = _wiki_envelope(owner=owner, affiliation=aff, ref=ref, now=datetime.now(timezone.utc), **env_kw)
+    note = _wiki_note(await _call(tools, _WIKI_TOOL, {"envelope": env, "ingest": True}), env)
+    print(f"[deliberation] MX 백서 위키 {env['origin']['ref']}: {note.strip()[:300]}")
+    return note
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -4556,7 +4656,8 @@ def _carry_cut_cards(what: str, text: str, cap: int, to: str, nn: list | None = 
 
 
 async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                               user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
+                               user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = "",
+                               affiliation: str = ""):
     """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
 
     라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
@@ -4570,6 +4671,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
+    _wiki_bind(affiliation, job_id)    # 단 셋이 같은 열쇠 — 원천은 단마다(origin ref 의 끝이 단의 틀이다)
     opts = _resolve_opts(req_opts)
     if opts.sealed:   # 닫지 못한 채 '봉인' 이라고 적힌 결정문을 내느니 서지 않는다(_SEALED_UNSUPPORTED)
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
@@ -4697,7 +4799,8 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
 
 
 async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
-                           user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
+                           user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = "",
+                           affiliation: str = ""):
     """심의 SSE 진입점 — 내부 스트림이 어떤 예외로 죽어도 반드시 error+done 을 방출한다.
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
@@ -4707,6 +4810,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
         yield _sse("error", _refused)
         yield _sse("done", {})
         return
+    _wiki_bind(affiliation, job_id)
     opts = _resolve_opts(req_opts)
     try:
         async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat, history):
@@ -4718,7 +4822,8 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
 
 
 async def run_test_plan(app, question: str, groups: list, req_opts=None, user: str = "",
-                        user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = ""):
+                        user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = "",
+                        affiliation: str = ""):
     """시험 계획 심의 — "무엇을 먼저 측정할 것인가" 를 정해 시험 계획서를 낸다.
 
     해석은 물성이 없으면 시작할 수 없고, 요구 물성 대비 실측 비중이 낮은 항목이 어디인지는
@@ -4734,6 +4839,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
+    _wiki_bind(affiliation, job_id)
     opts = _resolve_opts(req_opts)
     if opts.sealed:   # 아래 물성 근거 현황 조회가 바깥 유입이다 — 봉인이 서지 않는다(_SEALED_UNSUPPORTED)
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
@@ -6472,13 +6578,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
+    # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
+    # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
+    wiki_note = ""
+    if getattr(opts, "wiki", 0):
+        yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
+        wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
+                                       stage=opts.chair_template, personas=personas, last_list=last_list, rid=rid,
+                                       evidence=opts.evidence, pool=gather_pool)
+        yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
     # 다음 단(시뮬 2·3단)에는 **진짜 결정문만** 넘긴다 — 의장이 못 낸 글을 넘기면 그 위에서 다음 단이 돈다.
     # 못 냈으면 사유를 넘긴다(다단 래퍼가 제 오류에 싣는다).
     if out is not None and not _chair_failed:
         out["decision"] = decision
     elif out is not None:
         out["chair_failed"] = (_chair_failed, _chair_knob)
-    yield _delib("decision", text=decision + report_note, **({"chair_failed": True} if _chair_failed else {}))
+    yield _delib("decision", text=decision + report_note + wiki_note, **({"chair_failed": True} if _chair_failed else {}))
     yield _delib("outcome", report_id=rid, title=_ra_report_title(question),
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
@@ -6489,9 +6604,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
-    yield _sse("token", {"delta": decision + report_note})
+    yield _sse("token", {"delta": decision + report_note + wiki_note})
     # 외부 응답자로 돈 심의는 결과 칸에 그 사실과 좌석 자유 조회의 길(tool_mode)을 싣는다(앱이 패널에 적는다) — GLM 길의 프레임은 종전 그대로다.
-    yield _sse("result", {"type": "text", "content": stream_head + decision + report_note,
+    yield _sse("result", {"type": "text", "content": stream_head + decision + report_note + wiki_note,
                           **({"llm": "external", "tool_mode": _ext_mode(g_agent)} if _ext else {})})
     if _chair_failed:
         # 결정문 없이 끝났다 — error 로 끝낸다(잡은 error 로 남고, 리스크 앱은 종전처럼 실패로 받는다). 위에서
