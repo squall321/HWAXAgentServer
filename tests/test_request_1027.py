@@ -247,3 +247,16 @@ def test_HA02_캡_경로도_코어를_예약한다(monkeypatch):
     noise = [_fake_tool(f"alpha_{i}", "alpha") for i in range(30)]
     core = [_fake_tool("compare_task_revisions", "zzz")]
     assert "compare_task_revisions" in {t.name for t in a._select_tools(noise + core, "alpha 결과")}
+
+
+# ── HA-03 — 코어 데이터 규칙 일곱 줄 ───────────────────────────────────────────────────────────────────
+def test_HA03_시스템_프롬프트에_코어_규칙_일곱이_있고_시험_앱_문구는_없다():
+    sp = a.SYSTEM_PROMPT
+    assert "[코어 데이터 규칙]" in sp
+    for i, must in enumerate(("object_resolve", "과제명", "objects_summary", "graph_neighbors", "다시 resolve",
+                              "조회하지 못했다", "ComponentCore"), 1):
+        mark = "①②③④⑤⑥⑦"[i - 1]
+        line = sp[sp.index(mark):]
+        assert must in line[:line.find("⑧") if "⑧" in line else 260], (mark, must)
+    assert "(시험)" not in sp, "D-1 — 라벨을 바로잡는다(시험 앱 문구는 넣지 않는다)"
+    assert sp.index("[코어 데이터 규칙]") > sp.index("search_tools 로 찾아보세요"), "search_tools 안내 뒤에 둔다"
