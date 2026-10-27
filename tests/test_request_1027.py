@@ -260,3 +260,47 @@ def test_HA03_시스템_프롬프트에_코어_규칙_일곱이_있고_시험_�
         assert must in line[:line.find("⑧") if "⑧" in line else 260], (mark, must)
     assert "(시험)" not in sp, "D-1 — 라벨을 바로잡는다(시험 앱 문구는 넣지 않는다)"
     assert sp.index("[코어 데이터 규칙]") > sp.index("search_tools 로 찾아보세요"), "search_tools 안내 뒤에 둔다"
+
+
+# ── HA-04 — 허브의 큰 응답을 접는다(group_options · ref_labels · properties_schema 걷기 · related 는 관계별 수 + 앞 몇 개) ─────────
+import json as _json  # noqa: E402
+
+
+def test_HA04_세_꼴을_접고_무엇을_접었는지_한_줄을_남긴다():
+    summ = _json.dumps({"total": 412, "groups": [{"k": "A", "n": 3}], "group_options": [{"v": i} for i in range(300)]})
+    out = a._fold_hub_result("rootdesigndatahub_objects_summary", summ)
+    head, body = out.split("\n", 1)
+    assert head.startswith("[포털 챗이 허브 응답을 접었다") and "group_options 1곳" in head and f"{len(summ):,}자" in head
+    assert _json.loads(body) == {"total": 412, "groups": [{"k": "A", "n": 3}]}
+    lst = _json.dumps({"total": 2, "ref_labels": {"x": "y" * 900}, "properties_schema": {"p": 1},
+                       "items": [{"id": 1, "ref_labels": {"a": 1}}, {"id": 2}]})
+    body = _json.loads(a._fold_hub_result("failuretrace_objects_list", lst).split("\n", 1)[1])
+    assert body == {"total": 2, "items": [{"id": 1}, {"id": 2}]}
+    get = _json.dumps({"id": "P-1", "related": {"uses": [{"id": f"m{i}"} for i in range(12)], "owner": [{"id": "o1"}],
+                                                "note": "기타"}})
+    out = a._fold_hub_result("object_get", get)
+    body = _json.loads(out.split("\n", 1)[1])
+    assert body["related"]["uses"] == {"count": 12, "head": [{"id": f"m{i}"} for i in range(a._HUB_RELATED_HEAD)]}
+    assert body["related"]["owner"] == {"count": 1, "head": [{"id": "o1"}]} and body["related"]["note"] == "기타"
+    assert "관계 항목 7건" in out.split("\n", 1)[0]
+    rel_list = _json.dumps({"id": "P-2", "related": [{"relation": "uses", "id": f"m{i}"} for i in range(8)] + [{"id": "x"}]})
+    body = _json.loads(a._fold_hub_result("rootdesigndatahub_object_get", rel_list).split("\n", 1)[1])
+    assert body["related"]["uses"]["count"] == 8 and len(body["related"]["uses"]["head"]) == a._HUB_RELATED_HEAD
+    assert body["related"]["관계 미상"]["count"] == 1
+
+
+def test_HA04_접을_것이_없거나_다른_도구면_글자_하나_바꾸지_않는다():
+    small = _json.dumps({"id": "P-1", "related": {"uses": [{"id": "m1"}]}})
+    assert a._fold_hub_result("object_get", small) == small, "앞 몇 개 안이면 그대로다"
+    for name, text in (("objects_summary", "표 형태의 글 — JSON 이 아니다"), ("objects_summary", '{"total": 3}'),
+                       ("list_materials", _json.dumps({"group_options": [1, 2]})), ("objects_list", "{깨진")):
+        assert a._fold_hub_result(name, text) == text, (name, text)
+
+
+def test_HA04_도구_래퍼를_지나면_접힌다():
+    async def call_tool(**_kw):
+        return _json.dumps({"total": 1, "group_options": ["x" * 5000]})
+    t = a._prep_tool(StructuredTool(name="rootdesigndatahub_objects_summary", description="요약", coroutine=call_tool,
+                                    args_schema={"type": "object", "properties": {}}))
+    out = asyncio.run(t.ainvoke({}))
+    assert "group_options" not in out.split("\n", 1)[1] and "x" * 100 not in out

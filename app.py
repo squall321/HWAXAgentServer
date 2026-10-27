@@ -1443,6 +1443,67 @@ def _arg_defaults_for(name, table) -> tuple[dict, str] | None:
     return None
 
 
+# 허브(자주검증 Datahub · FailureTrace) 응답 접기 — 한 응답이 13만 자를 넘겨 챗 창(262,144 토큰)을 넘기고, GLM 으로 넘겨도 30만 토큰을
+# 넘겨 턴이 오류로 끝났다(/health chat_llm.last_error ChatCtxOverflow — HWAXPortal docs/request-1027 HA-04). 원천이 줄이기 전까지
+# (Datahub-platform DP-01) 여기서 접는다 — 고르는 데 쓰지 않는 메타(objects_summary 의 group_options · objects_list 의 ref_labels ·
+# properties_schema)는 걷고, object_get 의 관계(related)는 관계별 수와 앞 _HUB_RELATED_HEAD 개로. 칸 모양은 요청서의 설명으로 잡았다(실물
+# 응답은 이 박스에서 못 봤다) — JSON 이 아니거나 그 칸이 없으면 글자 하나 바꾸지 않는다. 접었으면 맨 앞에 무엇을 얼마나 접었는지 한 줄.
+_HUB_RELATED_HEAD = 5
+_HUB_FOLD = (("objects_summary", ("group_options",), False), ("objects_list", ("ref_labels", "properties_schema"), False),
+             ("object_get", (), True))
+
+
+def _fold_hub_result(name, text):
+    n = str(name or "").strip().lower()
+    rule = next((r for r in _HUB_FOLD if n == r[0] or n.endswith("_" + r[0])), None)
+    if rule is None or not isinstance(text, str) or not text.lstrip().startswith(("{", "[")):
+        return text
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text
+    _, drop, fold_related = rule
+    cut: Counter = Counter()
+
+    def walk(v):
+        if isinstance(v, dict):
+            out = {}
+            for k, x in v.items():
+                if k in drop:
+                    cut[k] += 1
+                elif fold_related and k == "related":
+                    out[k] = fold(x)
+                else:
+                    out[k] = walk(x)
+            return out
+        return [walk(x) for x in v] if isinstance(v, list) else v
+
+    def group(items: list) -> dict:
+        res = {}
+        for r, its in items:
+            res[r] = {"count": len(its), "head": [walk(i) for i in its[:_HUB_RELATED_HEAD]]}
+            cut["related"] += max(0, len(its) - _HUB_RELATED_HEAD)
+        return res
+
+    def fold(rel):
+        if isinstance(rel, dict) and any(isinstance(x, list) and len(x) > _HUB_RELATED_HEAD for x in rel.values()):
+            return {**{r: walk(x) for r, x in rel.items() if not isinstance(x, list)},
+                    **group([(r, x) for r, x in rel.items() if isinstance(x, list)])}
+        if isinstance(rel, list) and len(rel) > _HUB_RELATED_HEAD:
+            by: dict = {}
+            for it in rel:
+                k = it.get("relation") or it.get("predicate") or it.get("type") if isinstance(it, dict) else None
+                by.setdefault(str(k or "관계 미상"), []).append(it)
+            return group(list(by.items()))
+        return walk(rel)
+
+    folded = walk(data)
+    if not cut:
+        return text
+    what = " · ".join(f"관계 항목 {v:,}건" if k == "related" else f"{k} {v:,}곳" for k, v in cut.items())
+    return f"[포털 챗이 허브 응답을 접었다 — {what} 뺐다 · 원문 {len(text):,}자]\n" + json.dumps(folded, ensure_ascii=False)
+
+
 def _cap_tool(tool, result_max=None, arg_defaults=None):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
     프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384).
@@ -1613,10 +1674,10 @@ def _cap_tool(tool, result_max=None, arg_defaults=None):
             # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
             return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            body = _maybe_repair_hint(_cap(_norm(out[0]), result_max))
+            body = _maybe_repair_hint(_cap(_fold_hub_result(getattr(tool, "name", ""), _norm(out[0])), result_max))
             _learn_ids(body)
             return (body, out[1])
-        body = _maybe_repair_hint(_cap(_norm(out), result_max))
+        body = _maybe_repair_hint(_cap(_fold_hub_result(getattr(tool, "name", ""), _norm(out)), result_max))
         _learn_ids(body)
         return body
 
