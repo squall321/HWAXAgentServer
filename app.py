@@ -1463,9 +1463,15 @@ def _cap_tool(tool, result_max=None):
             for _args in (kw, *(x for x in a if isinstance(x, dict))):
                 _inner = _args.get("name") if isinstance(_args, dict) else None
                 if isinstance(_inner, str) and _agent_denied(_inner):
-                    print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
-                    msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
-                           "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
+                    if _chat_panel_tool(_inner):
+                        print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 패널 전용 도구(이 대화는 패널을 그리지 못한다)")
+                        msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 패널을 그리는 클라이언트 전용 도구라 이 대화에서는 "
+                               "쓰지 않는다(패널이 그려지지 않는다). 같은 일을 하는 일반 도구(예: 실행 준비 prepare_run · 업로드 도구)로 한다. "
+                               "인자 문제가 아니다 — 다시 부르지 마라")
+                    else:
+                        print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
+                        msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
+                               "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
                     return ((msg, None)
                             if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
         # 외부 응답자 심의는 사람의 클라이언트에서만 연다(X-D6) — 심의 시작·이어하기에 외부 선택(advanced.llm=external)이나 반출 동의
@@ -2282,12 +2288,25 @@ async def run_tool_search(app: FastAPI, query: str, groups: list[str]):
 # /mcp 를 사용자 신원으로 중계하므로, 묶으면 주입된 지시를 받은 GLM 턴이 그 사람의 기다리는 과제를 집거나 답을 낼 수 있다.
 # 도구 목록을 받는 곳(_get_tools_retry — 챗·심의·카탈로그가 다 지난다)에서 빼고, 상시 묶이는 invoke_tool 로 부르는 것도 막는다(_cap_tool).
 _AGENT_DENY_TOOLS = frozenset(_external_llm.TASK_TOOLS)
+# 패널(MCP Apps)을 그리는 클라이언트 전용 도구 — 포털 챗 · 심의는 패널을 그리지 못해, 부르면 사용자는 패널 없이 글 몇 줄만 본다
+# (10-14 실측 — open_resin_panel 설명은 '묻지 않아도 먼저 호출' 이다). 같은 거부 길(목록에서 빼고 invoke_tool 로도 막는다)을 쓰되 집합은 따로
+# 둔다(_AGENT_DENY_TOOLS 는 외부 응답자 과제 도구와 같아야 한다). **정확한 이름만** — `*panel*` 무늬는 risk_list_panels 같은 조회 도구까지
+# 막는다. 포털이 패널을 그리게 되면(MCP 업로드 M-2) 이 집합을 푼다(HWAXPortal docs/request-1027 HA-05). ARP 의 arp_upload_open 은 무엇을
+# 돌려주는지 실측이 없어 넣지 않았다(같은 꼴로 확인되면 더한다).
+_CHAT_PANEL_TOOLS = frozenset({"open_workflow_panel", "open_resin_panel", "open_camfpcb_panel", "open_frc_panel", "open_gi_panel",
+                               "open_magnet_panel", "panel_upload_begin", "panel_upload_append", "panel_upload_commit"})
+
+
+def _chat_panel_tool(name: str) -> bool:
+    """패널 전용 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
+    n = str(name or "").strip().lower()
+    return any(n == t or n.endswith("_" + t) for t in _CHAT_PANEL_TOOLS)
 
 
 def _agent_denied(name: str) -> bool:
     """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
     n = str(name or "").strip().lower()
-    return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS)
+    return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or _chat_panel_tool(n)
 
 
 # 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
