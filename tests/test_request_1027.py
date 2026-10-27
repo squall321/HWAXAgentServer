@@ -413,3 +413,33 @@ def test_HA16_색인은_상한까지만_쥔다(monkeypatch):
     for k in range(a._TOOL_VEC_KEEP + 3):
         a._ensure_tool_vecs([_fake_tool(f"set{k}_{i}", "x") for i in range(2)])
     assert len(a._TOOL_VEC_LRU) == a._TOOL_VEC_KEEP
+
+
+# ── HA-18 — 긴 카드의 쪽은 펜스 · $$ 밖의 마지막 빈 줄에서 끊는다(이어 붙이면 원문과 같다) ─────────────────────────────
+def _pages(text: str, cap: int) -> list:
+    rec = {"id": "DOC-1", "title": "긴 카드", "data_type": "DOC",
+           "content": {"sections": [{"section_id": "1", "level": 1, "title": "본문", "content_text": text}]}}
+    out, at = [], {"section": 0, "char": 0}
+    while at and len(out) < 50:
+        v = a._record_view(rec, at["section"], at["char"])
+        out.append("".join(s["text"] for s in v["sections"]))
+        at = v.get("next")
+    return out
+
+
+def test_HA18_펜스와_수식_한가운데서_끊지_않고_이어_붙이면_원문이다(monkeypatch):
+    monkeypatch.setattr(a, "RECORD_TEXT_MAX", 120)
+    text = ("앞 문단 " * 18 + "\n\n" + "```python\nx = 1\n\ny = 2\n" + "z = 3\n" * 6 + "```\n\n" + "$$\na^2\n\nb^2\n$$\n\n"
+            + "| a | b |\n|---|---|\n" + "| 1 | 2 |\n" * 8 + "\n끝 문단")
+    pages = _pages(text, 120)
+    assert "".join(pages) == text, "이어 붙이면 원문과 글자까지 같아야 한다"
+    for p in pages[:-1]:
+        assert p.count("```") % 2 == 0 and p.count("$$") % 2 == 0, f"펜스 · 수식 한가운데서 끊겼다: {p!r}"
+    assert pages[1].startswith("```python"), pages[:2]
+
+
+def test_HA18_빈_줄이_없으면_종전대로_상한에서_끊는다(monkeypatch):
+    monkeypatch.setattr(a, "RECORD_TEXT_MAX", 100)
+    text = "가" * 250
+    assert [len(p) for p in _pages(text, 100)] == [100, 100, 50]
+    assert a._safe_cut("짧다", 100) == 2

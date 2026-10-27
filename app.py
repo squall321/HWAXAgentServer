@@ -6332,6 +6332,22 @@ def _flat_sections(secs, refs: dict):
         yield from _flat_sections(s.get("subsections") or s.get("children"), refs)
 
 
+def _safe_cut(text: str, limit: int) -> int:
+    """text 를 limit 자 안에서 끊을 자리 — 마지막 빈 줄(코드 펜스 ``` · $$ 수식 밖) 바로 뒤. 글자 위치 그대로 자르면 표 · 펜스 · 수식
+    한가운데서 끊겨 다음 쪽이 깨진 마크다운으로 시작했다(HWAXPortal docs/request-1027 HA-18). 표는 줄 사이에 빈 줄이 없어 빈 줄에서
+    끊으면 갈리지 않는다. 그런 자리가 쪽의 1/4 보다 앞이면(아주 긴 펜스 · 문단) 종전대로 limit 에서 끊는다 — 쪽이 작아지지 않게."""
+    if len(text) <= limit:
+        return len(text)
+    head = text[:limit]
+    pos = head.rfind("\n\n")
+    while pos >= limit // 4 and pos > 0:
+        before = head[:pos]
+        if before.count("```") % 2 == 0 and before.count("$$") % 2 == 0:
+            return pos + 2
+        pos = head.rfind("\n\n", 0, pos)
+    return limit
+
+
 def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> dict:
     """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
     그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다).
@@ -6355,7 +6371,8 @@ def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> di
             out["truncated"], out["next"] = True, {"section": i, "char": 0}
             break
         start = char_offset if i == section_offset else 0
-        s, text = secs[i], texts[i][start:start + budget]
+        s, rest = secs[i], texts[i][start:]
+        text = rest[:_safe_cut(rest, budget)]
         budget -= len(text)
         out["sections"].append({"id": str(s.get("section_id") or "")[:40], "title": str(s.get("title") or "")[:200],
                                 "level": s.get("level") if isinstance(s.get("level"), int) else 1, "text": text})
