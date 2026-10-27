@@ -5917,6 +5917,17 @@ async def _delib_image_evidence(req, q: str, imgs: list):
                           "tool": None})
 
 
+def _seat_vision_max() -> int:
+    """좌석 조회 그림 판독의 상한 — DELIB_SEAT_VISION_MAX(조회 한 번에 판독하는 그림 수, 0 = 좌석 판독만 끈다). 없으면 VISION_TRANSCRIBE_MAX 와
+    같은 값이다(종전 그대로). 종전엔 그 손잡이 하나라 좌석 판독만 끄려면 챗 · 띵킹 판독까지 꺼졌다(HWAXPortal docs/request-1027 HA-17).
+    부를 때 읽는다 — /health 가 지금 값을 보인다. 모양이 틀린 값은 종전 값이다."""
+    v = os.environ.get("DELIB_SEAT_VISION_MAX", "").strip()
+    try:
+        return max(0, int(v)) if v else _vision.TRANSCRIBE_MAX
+    except ValueError:
+        return _vision.TRANSCRIBE_MAX
+
+
 class _SeatImageReader:
     """심의 도중 좌석이 자유 조회로 받은 그림의 판독기 — 엔진(deliberation._seat_image_transcripts)이 부른다(HWAXPortal
     docs/chat-depth-context T5-b · CD-D14, 사용자 요청 10-21). 판독 모델은 위 심의 판독과 같다(_transcriber — 그림을 받는 챗 서버 → 그림을
@@ -5929,8 +5940,8 @@ class _SeatImageReader:
 
     @property
     def limit(self) -> int:
-        """조회 한 번(좌석 하나의 한 라운드)에서 판독하는 그림 수 — 심의 판독과 같은 손잡이(VISION_TRANSCRIBE_MAX)."""
-        return _vision.TRANSCRIBE_MAX
+        """조회 한 번(좌석 하나의 한 라운드)에서 판독하는 그림 수 — 좌석 전용 손잡이(_seat_vision_max)."""
+        return _seat_vision_max()
 
     @staticmethod
     def image_urls(text) -> list:
@@ -6728,6 +6739,10 @@ def health() -> dict:
         "tool_cut": dict(_TOOL_CUT) or None,
         # 그림을 받는가 — 서버(호스트 · 모델)마다 탐침 결과(None 은 아직 모름 — 첫 그림 턴에 묻는다). docs/chat-depth-context T5.
         "vision": _vision.state(),
+        # 심의 좌석이 조회로 받은 그림의 판독 — 지금 상한 · 그 값을 준 손잡이 · 판독기가 엔진에 달렸나(HA-17)
+        "seat_vision": {"max": _seat_vision_max(), "on": _seat_vision_max() > 0,
+                        "knob": "DELIB_SEAT_VISION_MAX" if os.environ.get("DELIB_SEAT_VISION_MAX", "").strip() else "VISION_TRANSCRIBE_MAX",
+                        "reader": getattr(_delib_engine, "SEAT_IMAGE_READER", None) is not None},
         "mcp": list(getattr(app.state, "connections", {})),
         "tool_scoping": "gateway (X-HWAX-Groups)",
         "tool_desc_max": TOOL_DESC_MAX,

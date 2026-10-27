@@ -365,3 +365,18 @@ def test_HA10_읽기는_폴더를_만들지_않는다(monkeypatch, tmp_path):
     monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
     monkeypatch.setattr(delib_jobs, "_PAUSE", {})
     assert delib_jobs.pause_info() is None and list(tmp_path.iterdir()) == [], "멈춤을 읽기만 했는데 폴더가 생겼다"
+
+
+# ── HA-17 — 좌석 조회 그림 판독만 끄는 손잡이(DELIB_SEAT_VISION_MAX)와 /health ───────────────────────────────────
+def test_HA17_좌석_판독만_따로_끄고_health_에_보인다(monkeypatch):
+    import vision as v
+    monkeypatch.delenv("DELIB_SEAT_VISION_MAX", raising=False)
+    assert a._SeatImageReader(a.app).limit == v.TRANSCRIBE_MAX, "없으면 종전 값이다"
+    h = a.health()["seat_vision"]
+    assert h["knob"] == "VISION_TRANSCRIBE_MAX" and h["max"] == v.TRANSCRIBE_MAX
+    monkeypatch.setenv("DELIB_SEAT_VISION_MAX", "0")
+    assert a._SeatImageReader(a.app).limit == 0 and v.TRANSCRIBE_MAX > 0, "챗 · 띵킹 판독은 그대로다"
+    h = a.health()["seat_vision"]
+    assert h == {"max": 0, "on": False, "knob": "DELIB_SEAT_VISION_MAX", "reader": h["reader"]}
+    monkeypatch.setenv("DELIB_SEAT_VISION_MAX", "셋")
+    assert a._SeatImageReader(a.app).limit == v.TRANSCRIBE_MAX, "모양이 틀린 값은 종전 값이다"

@@ -6002,7 +6002,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"좌석 조회 그림 {_img_acc['read']}장을 판독해 근거로 실었다(vision_transcribe)",
                                       "tool": None})
             _img_miss = [txt for n, txt in ((_img_acc["no_model"], f"판독할 모델이 없어(그림을 받는 모델 없음) {_img_acc['no_model']}장"),
-                                            (_img_acc["over"], f"조회 한 번의 판독 상한(VISION_TRANSCRIBE_MAX) 밖 {_img_acc['over']}장"),
+                                            (_img_acc["over"], f"조회 한 번의 판독 상한(DELIB_SEAT_VISION_MAX) 밖 {_img_acc['over']}장"),
                                             (_img_acc["fail"], f"판독 실패(그림을 못 받아 왔거나 모델이 답하지 않음) {_img_acc['fail']}장"),
                                             (_img_acc["err"], f"판독 중 오류 {_img_acc['err']}회")) if n]
             if _img_miss:
