@@ -489,3 +489,24 @@ def test_HA13_걸린_시간은_최근_것만_쥔다(monkeypatch):
     h = a._sc_health()
     assert h["ms"]["n"] == a._SC_MS_KEEP and h["counts"] == {"ok": a._SC_MS_KEEP + 50} and h["last_error"] is None
     assert h["ms"]["p50"] >= 50, "오래된 값이 남았다"
+
+
+# ── HA-12 — 조회 결과도 붙인 문서도 없는 턴은 일반 지식 수치에 '(근거 없음 — 추정)' 을 달라고 하지 않는다 ──────────────────────
+def _review_text(**req_kw) -> str:
+    req = a.ChatRequest(message="알루미늄 6061 의 밀도는?", groups=["portal-admin"], history=[], **req_kw)
+    return a._self_check_messages(req, "알루미늄 6061 의 밀도는 약 2.70 g/cm³ 입니다.", [], [])[1].content
+
+
+def test_HA12_도구도_문서도_없는_턴은_일반_지식_수치를_표시하지_않게_한다():
+    txt = _review_text()
+    assert "'(근거 없음 — 추정)' 으로 표시하라" not in txt, "도구 없는 턴 머리(① ③ ④ 만)와 어긋나는 ② 가 실렸다"
+    assert "일반 지식으로 쓴 수치 · 사실에 표시를 달지 말고" in txt and "도구를 부르지 않았다" in txt
+
+
+def test_HA12_조회_결과나_붙인_문서가_있으면_종전대로_대조한다():
+    req = a.ChatRequest(message="응력은?", groups=["portal-admin"], history=[])
+    with_tools = a._self_check_messages(req, "최대 응력은 321.5 MPa 입니다.", [("query_stress", "part=A")], ["max 312.5 MPa"])[1].content
+    assert "'(근거 없음 — 추정)' 으로 표시하라" in with_tools
+    docs = a.ChatRequest(message="응력은?", groups=["portal-admin"], history=[],
+                         documents=[{"name": "시험 성적서", "text": "최대 응력 312.5 MPa"}])
+    assert "'(근거 없음 — 추정)' 으로 표시하라" in a._self_check_messages(docs, "321.5 MPa", [], [])[1].content

@@ -3931,6 +3931,13 @@ _SELF_CHECK_ASK = (
     "[판정] 고칠 것 없음  또는  [판정] 고침\n"
     "[고친 점]\n- 한 줄에 하나(무엇을 왜 — 근거). 고칠 것이 없으면 '- 없음'\n"
     "[답]\n고친 답 전체(고칠 것이 없으면 비워 둔다)")
+# 조회 결과도 붙인 문서도 없는 턴 — ② 를 '일반 지식 수치는 표시하지 않는다' 로 바꾼다. 위 ② 를 그대로 주면 '도구 없는 턴' 머리(① ③ ④ 만
+# 본다)와 어긋나, 검토자가 일반 지식 수치마다 '(근거 없음 — 추정)' 을 달고 '고침' 으로 판정했다(HWAXPortal docs/request-1027 HA-12).
+_SC_ASK_EVIDENCE_LINE = "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라.\n"
+_SELF_CHECK_ASK_NO_EVIDENCE = _SELF_CHECK_ASK.replace(
+    _SC_ASK_EVIDENCE_LINE,
+    "② 이번 턴에는 대조할 조회 결과 · 붙인 문서가 없다 — 일반 지식으로 쓴 수치 · 사실에 표시를 달지 말고 지우지도 마라"
+    "(앞 대화와 어긋나는 것만 ③ 으로 고친다).\n")
 _SC_VERDICT = re.compile(r"\[판정\]\s*([^\n]*)")
 _SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[답\]|\Z)", re.S)
 _SC_IMG = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
@@ -4063,7 +4070,7 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
         blocks.append("[코드 대조 — 답의 수치 중 조회 결과 · 사용자 발화에서 찾지 못한 것]\n"
                       + ", ".join(f"`{v}`" for v in bad[:_SELF_CHECK_NUMS]) + (f" 외 {len(bad) - _SELF_CHECK_NUMS}건" if len(bad) > _SELF_CHECK_NUMS else ""))
     blocks.append(f"[답 초안]\n{draft}")
-    blocks.append(_SELF_CHECK_ASK)
+    blocks.append(_SELF_CHECK_ASK if (calls or docs) else _SELF_CHECK_ASK_NO_EVIDENCE)
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
     return [SystemMessage(content=_SELF_CHECK_SYS), HumanMessage(content="\n\n".join(blocks))]
 
