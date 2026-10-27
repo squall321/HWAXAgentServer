@@ -224,3 +224,26 @@ def test_HA21_캐시는_수명이_지나면_게이트웨이에서_다시_받는�
     monkeypatch.setattr(a, "AGENT_CACHE_TTL_S", 0)
     again._hwax_at -= 10 ** 6
     assert run(query="alpha") is again, "0 은 기한 없음이다"
+
+
+# ── HA-02 — 온톨로지 코어(허브 · PLM 과제 도구)는 예산 절단에서 빠지지 않는다 ─────────────────────────────────────
+def test_HA02_무캡_절단에서도_보이는_코어는_남고_운영자는_넣지_않는다(monkeypatch):
+    monkeypatch.setattr(a, "_semantic_order", lambda _q, _t: [])
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 8000)
+    noise = [_fake_tool(f"alpha_{i}", "alpha") for i in range(40)]
+    core = [_fake_tool(n, "zzz") for n in ("rootdesigndatahub_object_resolve", "failuretrace_graph_neighbors", "find_plm_task")]
+    kept = {t.name for t in a._select_tools(noise + core, "alpha 결과")}
+    assert {"rootdesigndatahub_object_resolve", "failuretrace_graph_neighbors", "find_plm_task"} <= kept, kept
+    assert len(kept) < len(noise) + len(core), "이 시험의 전제 — 절단이 일어나야 한다"
+    op = {t.name for t in a._select_tools(noise + core, "alpha 결과", core_names=a._GUIDE_TOOLS)}
+    assert "rootdesigndatahub_object_resolve" not in op, "HE팀 운영자에게까지 허브를 끼웠다"
+
+
+def test_HA02_캡_경로도_코어를_예약한다(monkeypatch):
+    monkeypatch.setattr(a, "_semantic_order", lambda _q, _t: [])
+    monkeypatch.setattr(a, "TOOL_MAX", 10)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 0)
+    noise = [_fake_tool(f"alpha_{i}", "alpha") for i in range(30)]
+    core = [_fake_tool("compare_task_revisions", "zzz")]
+    assert "compare_task_revisions" in {t.name for t in a._select_tools(noise + core, "alpha 결과")}

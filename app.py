@@ -1858,6 +1858,18 @@ def _tool_schema_cost(t) -> int:
 # 셋으로 닿는다(search_tools 가 찾고 invoke_tool 이 바인딩에 없는 것을 그 턴에 부른다). 종전엔 무캡 경로가 게이트웨이 순서 뒤에서부터
 # 잘라 이 셋이 맨 먼저 빠졌다 — 게이트웨이 자체 도구가 목록 맨 끝이다(HWAXPortal docs/chat-depth-context F1).
 _GUIDE_FRONT = _TOOL_PRIORITY[:3]
+# 온톨로지 코어 — 정본 허브(자주검증 Datahub · FailureTrace)의 해석 · 개수 · 관계 · 읽기 도구와 PLM 과제 도구. 무캡 경로가 예산 때문에
+# 자를 때 관련도와 상관없이 남기고(_fit_schema keep), 캡 경로는 상시 핵심과 함께 예약한다. 종전엔 절단 25회 모두에서 허브가 빠져(평균 103개
+# 중 89개 — 10-27 /health tool_cut 1,613 → 183) 웹 챗 도구 호출 722건 중 허브 호출이 1건이었다(HWAXPortal docs/request-1027 HA-02).
+# 사용자에게 보이는 것만 남는다(게이트웨이가 그 사람의 도구만 준다) — 약 15개 · 4~6천 토큰. 이름은 두 허브가 함께 붙은 박스의 노출 이름이다
+# (겹치는 이름은 둘 다 접두가 붙는다). HE팀 운영자(core_names 를 준다)는 제 앱 도구가 앞자리라 넣지 않는다.
+_ONTO_CORE = (
+    "rootdesigndatahub_object_resolve", "rootdesigndatahub_objects_resolve_many", "rootdesigndatahub_objects_list",
+    "rootdesigndatahub_objects_summary", "rootdesigndatahub_object_get", "rootdesigndatahub_object_fields",
+    "rootdesigndatahub_graph_neighbors", "rootdesigndatahub_search",
+    "failuretrace_object_resolve", "failuretrace_objects_list", "failuretrace_objects_summary", "failuretrace_graph_neighbors",
+    "list_tasks", "task_revisions", "compare_task_revisions", "find_plm_task",
+)
 # 마지막 절단 — /health 가 싣는다(앞뒤 개수 · 상한 · 추정 토큰 · 뺀 앱별 수). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다.
 _TOOL_CUT: dict = {}
 
@@ -1940,7 +1952,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     운영자의 입구 도구(get_guide·list_projects 등)가 캡 밖으로 밀려났다.
 
     core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
-    core_list = _TOOL_PRIORITY if core_names is None else core_names
+    core_list = (_TOOL_PRIORITY + _ONTO_CORE) if core_names is None else core_names
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
         # 캡이 없거나 안 걸리면 **아무것도 떨어뜨리지 않는다** — 스키마 총량이 예산 안이면. 다만 순서는 바꾼다 —
         # 전문가 도구를 465종 한가운데 묻어 두면 모델이 못 찾고, 상태줄이 "우선" 이라고
@@ -1959,9 +1971,10 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
         elif prefer:
             _r = {n: i for i, n in enumerate(prefer)}
             tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
-        front = [t for t in tools if getattr(t, "name", "") in _GUIDE_FRONT]
-        tools = front + [t for t in tools if getattr(t, "name", "") not in _GUIDE_FRONT]
-        return _fit_schema(tools, budget, keep=_GUIDE_FRONT)
+        keep = _GUIDE_FRONT + (_ONTO_CORE if core_names is None else ())
+        front = [t for t in tools if getattr(t, "name", "") in keep]
+        tools = front + [t for t in tools if getattr(t, "name", "") not in keep]
+        return _fit_schema(tools, budget, keep=keep)
     pin = set(pinned or []) | set(first or [])
     ordered = _relevance_order(tools, query, pinned, first, core_list, prefer)
     kept = [t for t, _ in ordered[:TOOL_MAX]]
