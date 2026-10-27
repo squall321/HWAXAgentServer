@@ -463,3 +463,29 @@ def test_끄면_종전_경로_LLM_한_번(monkeypatch, fake_llm):
     evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
     assert _stats(fake_llm)["calls"] == 1 and _text(evs, "token") == draft
     assert not any("self_check" in d for e, d in evs if e == "meta")
+
+
+# ── HA-13 — /health 의 self_check(켜짐 · 상태별 수 · 걸린 ms · 마지막 실패) — HWAXPortal docs/request-1027 ──────────────────
+def test_HA13_health_에_자기검증_런타임이_실린다(monkeypatch):
+    monkeypatch.setattr(a, "_SC_STAT", {"counts": a.Counter(), "ms": [], "last_error": None})
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    draft = "토크는 12.5 N·m 입니다."
+    _run(monkeypatch, _inner(draft), _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"))
+    _run(monkeypatch, _inner("안녕하세요! 무엇을 도와드릴까요?"), _Reviewer("x"))
+    _run(monkeypatch, _inner(draft), _Reviewer(boom=RuntimeError("down")))
+    h = a._sc_health()
+    assert h["on"] is True and h["counts"] == {"ok": 1, "skipped": 1, "failed": 1}, h
+    assert h["ms"]["n"] == 2 and isinstance(h["ms"]["p50"], int) and h["ms"]["p95"] >= h["ms"]["p50"], "건너뛴 것은 걸린 시간에 세지 않는다"
+    assert h["last_error"]["status"] == "failed" and "RuntimeError" in h["last_error"]["reason"]
+    assert a.health()["self_check"] == a._sc_health(), "/health 에 그대로 실린다"
+    monkeypatch.setenv("CHAT_SELF_CHECK", "0")
+    assert a._sc_health()["on"] is False
+
+
+def test_HA13_걸린_시간은_최근_것만_쥔다(monkeypatch):
+    monkeypatch.setattr(a, "_SC_STAT", {"counts": a.Counter(), "ms": [], "last_error": None})
+    for i in range(a._SC_MS_KEEP + 50):
+        a._sc_record({"status": "ok", "ms": i})
+    h = a._sc_health()
+    assert h["ms"]["n"] == a._SC_MS_KEEP and h["counts"] == {"ok": a._SC_MS_KEEP + 50} and h["last_error"] is None
+    assert h["ms"]["p50"] >= 50, "오래된 값이 남았다"

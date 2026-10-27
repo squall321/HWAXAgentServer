@@ -3823,6 +3823,33 @@ def _self_check_on() -> bool:
     return os.environ.get("CHAT_SELF_CHECK", "1") != "0"
 
 
+# 자기검증 런타임 — /health 의 self_check(HWAXPortal docs/request-1027 HA-13). 운영자가 검토자의 실패 · 지연을 알 길이 없었다.
+# 상태별 수(ok · fixed · suspect · unreadable · failed · skipped) · 검토에 걸린 ms(건너뛴 것 빼고 최근 200건의 p50 · p95) · 마지막 실패.
+# /health 는 스레드 풀에서, 기록은 이벤트 루프에서 돈다 — 자물쇠로 묶는다. 사유는 고정 문구다(사용자 글을 싣지 않는다).
+_SC_LOCK = threading.Lock()
+_SC_STAT: dict = {"counts": Counter(), "ms": [], "last_error": None}
+_SC_MS_KEEP = 200
+
+
+def _sc_record(check: dict) -> None:
+    st = str(check.get("status") or "?")
+    with _SC_LOCK:
+        _SC_STAT["counts"][st] += 1
+        if st != "skipped" and isinstance(check.get("ms"), int):
+            _SC_STAT["ms"] = (_SC_STAT["ms"] + [check["ms"]])[-_SC_MS_KEEP:]
+        if st in ("failed", "unreadable", "suspect"):
+            _SC_STAT["last_error"] = {"status": st, "reason": str(check.get("reason") or "")[:200], "at": int(time.time())}
+
+
+def _sc_health() -> dict:
+    with _SC_LOCK:
+        counts, ms, last = dict(_SC_STAT["counts"]), sorted(_SC_STAT["ms"]), _SC_STAT["last_error"]
+
+    def pct(q: float):
+        return ms[min(len(ms) - 1, int(round(q * (len(ms) - 1))))] if ms else None
+    return {"on": _self_check_on(), "counts": counts, "ms": {"n": len(ms), "p50": pct(0.5), "p95": pct(0.95)}, "last_error": last}
+
+
 def _sse_parse(frame) -> tuple[str, dict]:
     """우리가 만든 SSE 프레임 하나(_sse) → (사건, 자료). 꼴이 다르면 ('', {}) — 감싸개는 그런 프레임을 그대로 흘린다."""
     try:
@@ -4076,6 +4103,7 @@ async def _self_checked_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
             await sc.aclose()       # 연결이 끊기면 검토자 호출도 지금 닫는다
         final, check, vmodel = out.get("final", draft), out.get("check") or {"status": "failed"}, out.get("model")
     check["ms"] = int((time.monotonic() - t0) * 1000)
+    _sc_record(check)
     for i in range(0, len(final), 400):
         yield _sse("token", {"delta": final[i:i + 400]})
     text = final
@@ -6569,6 +6597,8 @@ def health() -> dict:
         "sampling": getattr(app.state, "delib_sampling", None),
         # 챗 전용 LLM(CHAT_LLM_*) — 꺼져 있으면 {"enabled": false}(챗도 위 model · vllm). 켜져 있으면 넘김 횟수까지(docs/chat-llm-stcx).
         "chat_llm": _chat_llm_health(),
+        # 챗 자기검증 — 켜짐 · 상태별 수 · 걸린 ms · 마지막 실패(HA-13 — 포털 update-all §7 스모크가 읽는다)
+        "self_check": _sc_health(),
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
