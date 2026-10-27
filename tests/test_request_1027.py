@@ -148,3 +148,79 @@ def test_HA24_invoke_tool_로_불러도_같다():
 def test_HA24_챗_도구_로드가_기본값을_싣는다():
     src = (ROOT / "app.py").read_text(encoding="utf-8")
     assert "_raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS) for t in _got]" in src
+
+
+# ── HA-01 — 무캡 경로가 예산 때문에 잘랐으면 턴마다 원본에서 다시 고른다(캐시 키에 질의 · 핀이 없다) ─────────────────────
+import types  # noqa: E402
+
+
+def _fake_tool(name: str, word: str):
+    async def call_tool(**_kw):
+        return "ok"
+    return StructuredTool(name=name, description=f"{word} " * 120, coroutine=call_tool,
+                          args_schema={"type": "object", "properties": {"q": {"type": "string"}}})
+
+
+def _agent_env(monkeypatch, tools):
+    loads = []
+
+    class _Client:
+        def __init__(self, _connections):
+            pass
+
+        async def get_tools(self):
+            loads.append(1)
+            return list(tools)
+
+    built = []
+
+    def _fake_react(_llm, tools_, prompt=None):
+        built.append(tuple(getattr(t, "name", "") for t in tools_))
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(a, "MultiServerMCPClient", _Client)
+    monkeypatch.setattr(a, "create_react_agent", _fake_react)
+    monkeypatch.setattr(a, "_semantic_order", lambda _q, _t: [])      # 어휘 순위만 — 임베더를 부르지 않는다
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 8000)    # 예산 max(4000, 3600) — 아래 도구 40개를 다 못 싣는다
+    state = types.SimpleNamespace(llm="LLM", chat_llm=None, connections={"gateway": {"url": "http://gw/mcp", "headers": {}}},
+                                  agent_cache={}, tool_degraded={}, tool_load_error={}, tool_snapshot={})
+    app_ = types.SimpleNamespace(state=state)
+
+    def run(**kw):
+        return asyncio.run(a._agent_for(app_, ["CAEG"], user="u1@corp.example", user_pat="pat-1", **kw))
+    return run, loads, built
+
+
+def test_HA01_잘린_묶음은_다음_질문에_다시_고르고_게이트웨이는_다시_안_부른다(monkeypatch):
+    tools = [_fake_tool(f"alpha_{i}", "alpha") for i in range(20)] + [_fake_tool(f"beta_{i}", "beta") for i in range(20)]
+    run, loads, built = _agent_env(monkeypatch, tools)
+    first = run(query="alpha 결과")
+    assert any(n.startswith("alpha_") for n in first._hwax_tools) and not any(n.startswith("beta_") for n in first._hwax_tools)
+    second = run(query="beta 결과")
+    assert any(n.startswith("beta_") for n in second._hwax_tools), "앞 질문의 묶음을 그대로 썼다"
+    assert loads == [1], "다시 고르는 데 게이트웨이를 다시 불렀다"
+    same = run(query="beta 결과")
+    assert same is second and len(built) == 2, "묶음이 같으면 새로 짓지 않는다"
+    pinned = run(query="beta 결과", pinned=["alpha_7"])
+    assert "alpha_7" in pinned._hwax_tools, "창 중간에 켠 핀이 묶음에 들지 않았다"
+
+
+def test_HA01_안_잘렸으면_종전대로_재사용한다(monkeypatch):
+    run, loads, built = _agent_env(monkeypatch, [_fake_tool(f"alpha_{i}", "alpha")
+                                                 for i in range(3)])
+    first = run(query="alpha")
+    assert run(query="전혀 다른 질문") is first and loads == [1] and len(built) == 1
+
+
+def test_HA21_캐시는_수명이_지나면_게이트웨이에서_다시_받는다(monkeypatch):
+    """서비스 계정 키(PAT 없음)는 기한 없이 옛 카탈로그를 썼다 — 수명(AGENT_CACHE_TTL_S, 기본 30분)이 지나면 다시 받는다."""
+    run, loads, _built = _agent_env(monkeypatch, [_fake_tool(f"alpha_{i}", "alpha") for i in range(3)])
+    first = run(query="alpha")
+    assert run(query="alpha") is first and loads == [1]
+    first._hwax_at -= a.AGENT_CACHE_TTL_S + 1
+    again = run(query="alpha")
+    assert again is not first and loads == [1, 1], "수명이 지난 에이전트를 그대로 썼다"
+    monkeypatch.setattr(a, "AGENT_CACHE_TTL_S", 0)
+    again._hwax_at -= 10 ** 6
+    assert run(query="alpha") is again, "0 은 기한 없음이다"

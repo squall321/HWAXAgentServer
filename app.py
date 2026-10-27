@@ -114,6 +114,10 @@ VLLM_API_KEY = os.environ.get("VLLM_API_KEY") or "EMPTY"
 MCP_SERVERS = os.environ.get("MCP_SERVERS", "")
 # 에이전트 캐시 상한. 사용자 × 30분 창 × 질의선택 조합이라 상한이 없으면 계속 는다.
 AGENT_CACHE_MAX = int(os.environ.get("AGENT_CACHE_MAX", "64"))
+# 에이전트 캐시의 수명(초, 0 = 기한 없음). 묶은 도구 목록은 지은 때의 게이트웨이 카탈로그다 — 사용자 PAT 키는 포털이 30분 창마다
+# 새 토큰을 줘 저절로 갈리지만, 서비스 계정 키(PAT 없음 · 강등 자리)는 기한 없이 옛 목록을 썼다. 새 도구는 그동안도 search_tools ·
+# invoke_tool 로 닿는다 — 수명은 그 창과 같은 30분이다(HWAXPortal docs/request-1027 HA-21).
+AGENT_CACHE_TTL_S = int(os.environ.get("AGENT_CACHE_TTL_S", "1800"))
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "")
 # 도구 호출 1건을 엔진이 기다리는 기한(초), 0=없음. 종전엔 없었다 — 게이트웨이가 ping 만 보내며 멈추면
 # (전송 한도 30초/300초는 바이트 사이 침묵만 재므로 ping 이 되감는다) 좌석 자유 조회·RA 저장·VOC·역할 복원이
@@ -2445,6 +2449,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned·first·core_names·prefer 는 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만
     캐시 키에 포함한다(무제한 환경은 바인딩 동일 → 키 분화 없이 시스템 프롬프트 지시로만 반영).
+    무제한 환경이라도 스키마 예산 때문에 잘라 만든 에이전트는 턴마다 원본 목록에서 다시 고른다(HA-01 — 아래 hit).
     ⚠ prefer 를 키에서 빼면 전문가를 바꿔도 앞 전문가로 만든 에이전트가 재사용돼 **조용히**
     무시된다 — 소스 토글에서 이미 같은 사고가 났다(아래 주석)."""
     # ⚠ prefer 는 TOOL_MAX 와 **무관하게** 키에 들어가야 한다. 캡이 없어도 바인딩 **순서**를
@@ -2469,8 +2474,28 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
            (user or "").strip().lower(),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
     cache = app.state.agent_cache
+    hit = cache.get(key)
+    if hit is not None and AGENT_CACHE_TTL_S > 0 and time.time() - getattr(hit, "_hwax_at", time.time()) > AGENT_CACHE_TTL_S:
+        cache.pop(key, None)         # 카탈로그가 바뀌었을 수 있다 — 게이트웨이에서 다시 받는다(HA-21)
+        hit = None
+    if hit is not None and TOOL_MAX <= 0 and len(getattr(hit, "_hwax_raw", ()) or ()) > len(getattr(hit, "_hwax_tools", ()) or ()):
+        # 무캡 경로가 스키마 예산 때문에 잘라 만든 에이전트다 — 그 묶음은 첫 질의 · 핀으로 고른 것이라, 키(질의 · 핀이 없다)로 재사용하면
+        # 30분 창의 다음 질문에도 앞 묶음을 썼고 창 중간에 켠 앱 핀은 안내만 바뀌었다(HWAXPortal docs/request-1027 HA-01 — 10-25 ~ 10-27
+        # 절단 25회 중 17회가 앞 묶음). 원본 목록(같은 자격 — 같은 키)에서 이번 턴으로 다시 고르고, 묶음이 바뀌었을 때만 새로 짓는다.
+        # 게이트웨이에서 다시 받지 않는다 — 도구 벡터는 이미 캐시라 질의 임베딩 한 번만 든다.
+        import asyncio as _aio
+        tools = await _aio.to_thread(_select_tools, list(hit._hwax_raw), query, pinned, first, core_names, prefer)
+        names = tuple(getattr(t, "name", "") for t in tools)
+        if names != hit._hwax_tools:
+            agent = create_react_agent(_chat_llm_of(app), tools, prompt=_loop_fit_prompt)
+            agent._hwax_tools, agent._hwax_raw = names, hit._hwax_raw
+            agent._hwax_at = getattr(hit, "_hwax_at", time.time())     # 원본 목록을 받은 때 — 수명은 그때부터 센다
+            cache.pop(key)
+            cache[key] = agent
+            return agent
     if key not in cache:
         tools = []
+        raw_pool = None     # 무캡 경로에서 다시 고를 원본 목록(소스 게이트 뒤) — 잘린 에이전트만 쓴다
         load_failed = False
         degraded = ""   # 사용자 PAT 로 못 붙어 서비스 계정으로 내려앉았다면 그 이유
         connections = app.state.connections
@@ -2509,6 +2534,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     app.state.tool_snapshot[(frozenset(groups), (user or "").strip().lower())] = (
                         _raw, time.time())
                 _raw = gate_sources(_raw, sources)
+                raw_pool = tuple(_raw)
                 # 임베딩 호출은 동기 HTTP — 이벤트 루프를 막지 않게 스레드로 뺀다(동시 챗 보호).
                 tools = await _aio.to_thread(_select_tools, _raw, query, pinned, first, core_names, prefer)
             except Exception as exc:  # gateway down → degrade to a no-tool agent, don't crash
@@ -2546,6 +2572,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     _snap_raw, _snap_ts = snap
                     _age = int(time.time() - _snap_ts)
                     _sr = gate_sources(list(_snap_raw), sources)
+                    raw_pool = tuple(_sr)
                     tools = await _aio.to_thread(_select_tools, _sr, query, pinned, first, core_names, prefer)
                     load_failed = False   # 도구가 살아 있으니 실패 아님 — 단 신선하지 않다
                     degraded = f"stale-snapshot({_age}s): {detail}"
@@ -2562,6 +2589,8 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
         # 캐시 값 모양을 바꾸지 않으려고 객체에 붙인다 — 캐시를 타도 함께 따라온다.
         agent._hwax_tools = tuple(getattr(t, "name", "") for t in tools)
+        agent._hwax_raw = raw_pool if TOOL_MAX <= 0 else None     # 캡 경로는 질의 · 핀이 이미 키에 있다
+        agent._hwax_at = time.time()
         if load_failed:
             # 실패 결과는 캐시하지 않는다 — 캐시하면 게이트웨이가 복구돼도 이 그룹은
             # 재시작 전까지 영구 no-tool 이 된다(조용한 최악의 실패 모드). 이번 요청만
