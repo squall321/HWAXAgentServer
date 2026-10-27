@@ -1844,32 +1844,52 @@ def _embed(texts: list, kind: str = "passage") -> list:
     return out
 
 
-def _ensure_tool_vecs(tools: list) -> None:
-    """도구 벡터 캐시 — 도구 구성이 바뀔 때만 재계산(수백 개도 수 초)."""
+# 서명(도구 이름 전부)별로 쥐는 색인 수 — 색인이 하나뿐이라 작은 목록(HE팀 운영자 · 카탈로그 10개)이 큰 목록(일반 챗 1,613개)을 밀어내고,
+# 다음 챗 턴이 1,613개를 다시 임베딩했다(로그 1613 → 10 → 1613 → 10 — HWAXPortal docs/request-1027 HA-16). 공간(임베더)도 열쇠에 든다.
+_TOOL_VEC_KEEP = 4
+_TOOL_VEC_LRU: "OrderedDict[tuple, dict]" = OrderedDict()
+
+
+def _ensure_tool_vecs(tools: list) -> dict | None:
+    """도구 벡터 캐시 — 그 도구 구성의 색인 {sig, names, vecs, space}(못 지으면 None). 구성이 바뀔 때만 재계산(수백 개도 수 초).
+    _TOOL_VEC 은 마지막으로 쓴 색인이다(보기용) — 부르는 쪽은 돌려받은 것을 쓴다(스레드 사이에 다른 구성으로 바뀌어도 이름 · 벡터가 짝을 잃지 않게)."""
     import hashlib
     names = sorted(getattr(t, "name", "") for t in tools)
     # 개수+첫/끝만 보면 중간 교체를 놓친다 — 전체 이름 해시로 정확히 무효화.
     sig = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
-    if _TOOL_VEC["sig"] == sig and _TOOL_VEC["vecs"] and _TOOL_VEC["space"] == _EMBED_SPACE["space"]:
-        return
+    cur = dict(_TOOL_VEC)
+    if cur["sig"] == sig and cur["vecs"] and cur["space"] == _EMBED_SPACE["space"]:
+        return cur
+    hit = _TOOL_VEC_LRU.get((sig, _EMBED_SPACE["space"]))
+    if hit is not None:
+        _TOOL_VEC_LRU.move_to_end((sig, _EMBED_SPACE["space"]))
+        _TOOL_VEC.update(hit)
+        return hit
     by = {getattr(t, "name", ""): t for t in tools}
     texts = [f"{n}: {(getattr(by[n], 'description', '') or '')[:400]}" for n in names]
     try:
         vecs = _embed(texts, "passage")
     except Exception as exc:  # noqa: BLE001 — 임베딩 미가용이면 어휘 매칭만으로 동작(회귀 0)
         print(f"[tools] embed failed: {exc!r}")
-        return
-    if len(vecs) == len(names):
-        _TOOL_VEC.update({"sig": sig, "names": names, "vecs": vecs, "space": _EMBED_SPACE["space"]})
-        print(f"[tools] semantic index: {len(names)}개")
+        return None
+    if len(vecs) != len(names):
+        return None
+    ent = {"sig": sig, "names": names, "vecs": vecs, "space": _EMBED_SPACE["space"]}
+    _TOOL_VEC.update(ent)
+    _TOOL_VEC_LRU[(sig, ent["space"])] = ent
+    _TOOL_VEC_LRU.move_to_end((sig, ent["space"]))
+    while len(_TOOL_VEC_LRU) > _TOOL_VEC_KEEP:
+        _TOOL_VEC_LRU.popitem(last=False)
+    print(f"[tools] semantic index: {len(names)}개")
+    return ent
 
 
 def _semantic_order(query: str, tools: list) -> list:
     """질의 임베딩 코사인 내림차순 도구 이름 목록(미가용이면 빈 목록)."""
     if not query.strip():
         return []
-    _ensure_tool_vecs(tools)
-    if not _TOOL_VEC["vecs"]:
+    ent = _ensure_tool_vecs(tools)
+    if not ent or not ent["vecs"]:
         return []
     try:
         qv = _embed([query], "query")
@@ -1877,17 +1897,17 @@ def _semantic_order(query: str, tools: list) -> list:
         return []
     if not qv:
         return []
-    if _TOOL_VEC["space"] != _EMBED_SPACE["space"]:
+    if ent["space"] != _EMBED_SPACE["space"]:
         # 질의가 다른 공간에서 왔다(AIDataHub 임베더가 바뀌었다) — 옛 도구 벡터와 견주면 zip 이 차원을 말없이 잘라 엉뚱한 순서가
         # 된다. 다시 짓고, 그래도 공간이 다르면 의미 순서를 내지 않는다(어휘 순서만 쓴다).
-        _ensure_tool_vecs(tools)
-        if _TOOL_VEC["space"] != _EMBED_SPACE["space"] or not _TOOL_VEC["vecs"]:
+        ent = _ensure_tool_vecs(tools)
+        if not ent or ent["space"] != _EMBED_SPACE["space"] or not ent["vecs"]:
             return []
     import math
     q = qv[0]
     qn = math.sqrt(sum(x * x for x in q)) or 1.0
     scored = []
-    for n, v in zip(_TOOL_VEC["names"], _TOOL_VEC["vecs"]):
+    for n, v in zip(ent["names"], ent["vecs"]):
         vn = math.sqrt(sum(x * x for x in v)) or 1.0
         scored.append((sum(a * b for a, b in zip(q, v)) / (qn * vn), n))
     scored.sort(reverse=True)

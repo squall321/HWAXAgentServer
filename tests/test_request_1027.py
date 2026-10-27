@@ -380,3 +380,36 @@ def test_HA17_좌석_판독만_따로_끄고_health_에_보인다(monkeypatch):
     assert h == {"max": 0, "on": False, "knob": "DELIB_SEAT_VISION_MAX", "reader": h["reader"]}
     monkeypatch.setenv("DELIB_SEAT_VISION_MAX", "셋")
     assert a._SeatImageReader(a.app).limit == v.TRANSCRIBE_MAX, "모양이 틀린 값은 종전 값이다"
+
+
+# ── HA-16 — 도구 의미 색인을 서명별 작은 LRU 로(작은 목록이 큰 색인을 밀어내지 않는다) ─────────────────────────────
+def test_HA16_다른_구성이_번갈아도_다시_임베딩하지_않는다(monkeypatch):
+    calls = []
+
+    def fake_embed(texts, kind="passage"):
+        calls.append((kind, len(texts)))
+        a._EMBED_SPACE["space"] = ("fake", 2)
+        return [[1.0, float(i)] for i in range(len(texts))] if kind == "passage" else [[1.0, 0.0]]
+
+    monkeypatch.setattr(a, "_embed", fake_embed)
+    monkeypatch.setattr(a, "_TOOL_VEC", {"sig": "", "names": [], "vecs": [], "space": None})
+    monkeypatch.setattr(a, "_TOOL_VEC_LRU", a.OrderedDict())
+    monkeypatch.setitem(a._EMBED_SPACE, "space", a._EMBED_SPACE["space"])     # 시험이 끝나면 되돌린다
+    big = [_fake_tool(f"big_{i}", "alpha") for i in range(30)]
+    small = [_fake_tool(f"op_{i}", "beta") for i in range(3)]
+    for tools in (big, small, big, small, big):
+        a._semantic_order("질문", tools)
+    passages = [n for k, n in calls if k == "passage"]
+    assert passages == [30, 3], f"번갈아 쓴 구성을 다시 임베딩했다: {passages}"
+    order = a._semantic_order("질문", small)
+    assert set(order) == {t.name for t in small}, "다른 구성의 이름을 섞었다"
+
+
+def test_HA16_색인은_상한까지만_쥔다(monkeypatch):
+    monkeypatch.setattr(a, "_embed", lambda texts, kind="passage": [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(a, "_TOOL_VEC", {"sig": "", "names": [], "vecs": [], "space": None})
+    monkeypatch.setattr(a, "_TOOL_VEC_LRU", a.OrderedDict())
+    monkeypatch.setitem(a._EMBED_SPACE, "space", a._EMBED_SPACE["space"])
+    for k in range(a._TOOL_VEC_KEEP + 3):
+        a._ensure_tool_vecs([_fake_tool(f"set{k}_{i}", "x") for i in range(2)])
+    assert len(a._TOOL_VEC_LRU) == a._TOOL_VEC_KEEP
