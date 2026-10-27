@@ -2002,15 +2002,12 @@ def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, p
     top = set(first or [])
     pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
     core = {n: i for i, n in enumerate(core_list)}
-    # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 동일 원리, 여기선 전 도구 대상 점수만).
+    # 관련도 — 이름+설명 어휘 겹침(_rank_tools 와 같은 _lex_scores — IDF 무게 · 앱 라벨은 지목할 때만, HA-07).
     qtok = _tok_query(query)
+    _lex = _lex_scores(tools, qtok)
 
     def rel(t) -> float:
-        if not qtok:
-            return 0.0
-        prof = f"{getattr(t,'name','')} {getattr(t,'description','') or ''}".lower().replace("_", " ")
-        hit = sum(1 for k in qtok if k in prof)
-        return hit / len(qtok)
+        return _lex.get(getattr(t, "name", ""), 0.0)
     # ⚠ 어휘 무매치(rel=0) 도구는 lex_order 에 넣지 않는다. 넣으면 '알파벳 순 전체 순열'이
     # 정상 랭킹인 척 RRF 에 들어가, 이름이 앞선 무관 도구가 진짜 관련 도구를 캡 밖으로 밀어낸다
     # (감사 실측: query_voc/search_voc 가 탈락해 모델이 product_code 를 지어내고 다른 제품
@@ -2107,12 +2104,16 @@ _TOOL_STOP = {
     "리스트", "보여", "보여줘", "가능", "사용", "쓸", "뭐", "뭐가", "무엇", "무슨", "어떤",
     "있어", "있냐", "있나", "관련", "대해", "대한", "해줘", "좀", "the", "a", "for", "what",
     "which", "list", "show", "available", "use",
+    # 채움말 — 긴 설명의 도구에 우연히 적중했다(HWAXPortal docs/request-1027 HA-07)
+    "있으면", "같이", "뭐야", "그리고", "그럼", "혹시", "그냥", "어떻게", "얼마나", "정도", "주세요", "싶어",
 }
 _JOSA_T = ("으로", "에서", "에게", "까지", "부터", "이나", "을", "를", "이", "가", "은", "는",
            "의", "에", "과", "와", "도", "로", "만")
 
 
 def _tok_query(text: str) -> set[str]:
+    """질의 → 낱말 집합. 한 글자 낱말과 띄어 쓴 조사 단독은 버린다 — 도구 설명의 아무 낱말 안에나 들어가 우연 적중했다(15/16 질문에서 허브
+    핵심 도구의 적중이 잡음뿐이었다 — HA-07). 종전엔 한 글자 한글(휨 등)을 남겼다 — 그런 질의는 의미 순위(임베딩)가 잡는다."""
     out = set()
     for t in re.split(r"[\s,./·|()\[\]{}:;\"'?!]+", (text or "").lower()):
         if not t:
@@ -2121,11 +2122,40 @@ def _tok_query(text: str) -> set[str]:
             if t.endswith(j) and len(t) - len(j) >= 2:
                 t = t[: -len(j)]
                 break
-        if t in _TOOL_STOP:
+        if t in _TOOL_STOP or t in _JOSA_T:
             continue
-        if len(t) >= 2 or any("가" <= ch <= "힣" for ch in t):
+        if len(t) >= 2:
             out.add(t)
     return out
+
+
+# 어휘 관련도 — 낱말마다 IDF 무게(여러 도구에 흔한 낱말은 덜 센다)로 '적중한 낱말의 무게 / 전체 무게'(0~1). 종전엔 적중 낱말 수 / 질의 낱말
+# 수라 흔한 낱말 하나가 드문 낱말 하나와 같은 무게였다. 앱 라벨([라벨] — _tag_tool_app 이 설명 앞에 붙인다)은 질의가 그 앱을 지목할 때만 센다 —
+# 라벨의 '(시험)' 때문에 '시험' 이 든 질문마다 230개가 적중했다(C-4). 지목 판정은 괄호 꼬리를 뺀 라벨 이름으로 한다(HA-07).
+_LABEL_HEAD = re.compile(r"^\[([^\]]*)\]\s*")
+
+
+def _lex_profile(t, qtok: set) -> str:
+    name, desc = getattr(t, "name", ""), getattr(t, "description", "") or ""
+    m = _LABEL_HEAD.match(desc)
+    if m:
+        desc = desc[m.end():]
+        core = re.sub(r"\([^)]*\)", " ", m.group(1)).lower()
+        if any(k in core for k in qtok):
+            desc = f"{m.group(1)} {desc}"
+    return f"{name} {desc}".lower().replace("_", " ")
+
+
+def _lex_scores(tools, qtok: set) -> dict:
+    """도구 이름 → 어휘 관련도(위 규칙). 질의 낱말이 없으면 빈 사전."""
+    import math
+    if not qtok:
+        return {}
+    profs = [(getattr(t, "name", ""), _lex_profile(t, qtok)) for t in tools]
+    n = len(profs)
+    w = {k: math.log((n + 1) / (sum(1 for _, pr in profs if k in pr) + 1)) + 1.0 for k in qtok}
+    tot = sum(w.values())
+    return {name: sum(w[k] for k in qtok if k in pr) / tot for name, pr in profs}
 
 
 # 도구 → 소유 MCP 앱(백엔드) 매핑 — 166개가 평평하게 쏟아지면 고르기 어려워, 게이트웨이의
@@ -2236,11 +2266,11 @@ def _rank_tools(tools: dict, query: str, top_k: int = 12) -> list[dict]:
     if not qtok:
         return []
     scored = []
+    lex = _lex_scores(list(tools.values()), qtok)
     for name, t in tools.items():
-        profile = f"{name} {getattr(t, 'description', '') or ''}".lower().replace("_", " ")
-        hits = sum(1 for tk in qtok if tk in profile)
-        if hits:
-            scored.append((hits / len(qtok), name, (getattr(t, "description", "") or "")[:160]))
+        sc = lex.get(getattr(t, "name", name), 0.0)
+        if sc > 0:
+            scored.append((sc, name, (getattr(t, "description", "") or "")[:160]))
     scored.sort(key=lambda x: (-x[0], x[1]))
     # 시맨틱 순위와 융합 — 어휘로 못 잡는 표현 차이(김서림↔fogging)를 임베딩이 보완.
     sem = _semantic_order(query, list(tools.values()))

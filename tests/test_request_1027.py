@@ -443,3 +443,31 @@ def test_HA18_빈_줄이_없으면_종전대로_상한에서_끊는다(monkeypat
     text = "가" * 250
     assert [len(p) for p in _pages(text, 100)] == [100, 100, 50]
     assert a._safe_cut("짧다", 100) == 2
+
+
+# ── HA-07 — 낱말 잡음(한 글자 · 띄어 쓴 조사 · 채움말)을 버리고, IDF 무게 · 앱 라벨은 지목할 때만 ────────────────────────
+def _desc_tool(name: str, desc: str):
+    async def call_tool(**_kw):
+        return "ok"
+    return StructuredTool(name=name, description=desc, coroutine=call_tool, args_schema={"type": "object", "properties": {}})
+
+
+def test_HA07_한_글자_띄어_쓴_조사_채움말을_버린다():
+    assert a._tok_query("보드 휨 이 있으면 같이 정리 해 줘 의 에서") == {"보드", "정리"}
+    assert a._tok_query("자주검증에서 과제를 찾아줘") == {"자주검증", "과제"}, "붙은 조사는 종전대로 뗀다"
+
+
+def test_HA07_흔한_낱말보다_드문_낱말이_무겁다():
+    common = [_desc_tool(f"t{i}", "데이터 조회") for i in range(20)]
+    rare = _desc_tool("hub_resolve", "자주검증 객체 해석")
+    both = a._lex_scores(common + [rare], a._tok_query("자주검증 데이터"))
+    assert both["hub_resolve"] > both["t0"] > 0, both
+    assert sum(1 for v in both.values() if v > 0) == 21
+
+
+def test_HA07_앱_라벨은_질의가_그_앱을_지목할_때만_센다():
+    tools = [_desc_tool("dynaforgeprod_mesh", "[DynaForge prod(시험)] 메시 생성"), _desc_tool("drop_result", "낙하 시험 결과 조회")]
+    sc = a._lex_scores(tools, a._tok_query("낙하 시험 결과"))
+    assert sc["dynaforgeprod_mesh"] == 0.0 and sc["drop_result"] > 0, "라벨의 (시험) 이 적중했다"
+    sc = a._lex_scores(tools, a._tok_query("dynaforge 메시"))
+    assert sc["dynaforgeprod_mesh"] > sc["drop_result"], "앱을 지목하면 라벨을 센다"
