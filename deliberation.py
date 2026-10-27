@@ -3286,11 +3286,20 @@ _WIKI_TOOL = "wiki_submit_source"
 _WIKI_PLAT = "plat:mxwhitepaper"
 _WIKI_EXCERPT_MAX = 300      # 근거 발췌 상한 — MX 백서 인용 상한(V10) · 포털 챗 '위키에 남기기'(wiki_send.EXCERPT_MAX)와 같은 값
 _WIKI_TITLE_MAX = 120
+# 위키가 꺼진 박스 — MX 백서는 위키가 꺼지면 wiki_* 를 싣지 않고(MXWhitePaper MW-01 — mxwp-mcp 가 뜰 때 /api/v1/wiki/health 의 404
+# wiki_disabled 를 본다), 그때 API 가 늦게 떠 도구가 실렸으면 부른 결과가 wiki_disabled 다. 포털 화면(HP-16)이 읽는 신호와 같은 근원이다.
+# 결정문 끝마다 내부 오류 문구를 붙이지 않고 한 줄만 남긴다 — 다단 심의는 단마다 부르므로 꺼짐을 한 번 알렸으면 다음 단은 조용히
+# 건너뛴다(HWAXPortal docs/request-1027 HA-08). 상태는 심의 하나의 것이다(입구가 _wiki_bind 로 새로 세운다).
+_WIKI_STATE: contextvars.ContextVar = contextvars.ContextVar("wiki_state", default=None)
+_WIKI_OFF_HINTS = ("wiki_disabled", "위키는 아직 열리지 않았다")
+_WIKI_OFF_NOTE = ("\n\nℹ MX 백서 위키에 남기지 않았다 — 이 박스의 MX 백서 위키가 꺼져 있거나(위키 도구가 없다) "
+                  f"MX 백서 권한({_WIKI_PLAT})이 없다.")
 
 
 def _wiki_bind(affiliation: str, job_id: str) -> None:
     """입구에서 — 이 심의의 소속과 원천 열쇠를 세운다. 소속은 신원이라 요청 손잡이로 받지 않는다(포털 · 게이트웨이가 원장 값으로 준다)."""
     _WIKI_WHO.set((str(affiliation or "").strip(), str(job_id or "").strip() or f"web-{uuid.uuid4().hex[:12]}"))
+    _WIKI_STATE.set({"off": False})
 
 
 def _wiki_envelope(*, question: str, decision: str, stage: str, personas: list, last_list: list, rid,
@@ -3357,7 +3366,16 @@ def _wiki_note(raw, env: dict) -> str:
 
 
 async def _wiki_submit(tools: dict, *, user: str, chair_failed, **env_kw) -> str:
-    """켠 심의의 결정문을 위키로 — 결정문 끝에 붙일 안내를 돌려준다. 의장이 결정문을 못 냈거나 신원이 없으면 보내지 않고 그렇다고 적는다."""
+    """켠 심의의 결정문을 위키로 — 결정문 끝에 붙일 안내를 돌려준다. 의장이 결정문을 못 냈거나 신원이 없으면 보내지 않고 그렇다고 적는다.
+    위키가 꺼져 있으면 부르지 않고 한 줄만 — 이 심의의 앞 단에서 이미 알렸으면 빈 글이다(HA-08)."""
+    st = _WIKI_STATE.get()
+    if st is not None and st.get("off"):
+        return ""
+    if tools.get(_WIKI_TOOL) is None:
+        if st is not None:
+            st["off"] = True
+        print("[deliberation] MX 백서 위키 도구가 없다 — 이 박스에서 꺼져 있거나 권한이 없다. 남기지 않는다")
+        return _WIKI_OFF_NOTE
     if chair_failed:
         return "\n\n⚠ 의장이 결정문을 내지 못해 MX 백서 위키에 남기지 않았다 — 이어하기로 결정문을 받으면 그때 남는다."
     owner = unquote(str(user or "")).strip()
@@ -3365,7 +3383,13 @@ async def _wiki_submit(tools: dict, *, user: str, chair_failed, **env_kw) -> str
         return "\n\n⚠ 신원 없는 호출이라 MX 백서 위키에 남기지 않았다 — 위키 원천은 사람 명의로만 들어간다."
     aff, ref = _WIKI_WHO.get() or ("", f"web-{uuid.uuid4().hex[:12]}")
     env = _wiki_envelope(owner=owner, affiliation=aff, ref=ref, now=datetime.now(timezone.utc), **env_kw)
-    note = _wiki_note(await _call(tools, _WIKI_TOOL, {"envelope": env, "ingest": True}), env)
+    raw = await _call(tools, _WIKI_TOOL, {"envelope": env, "ingest": True})
+    if isinstance(raw, str) and any(h in raw for h in _WIKI_OFF_HINTS):
+        if st is not None:
+            st["off"] = True
+        print(f"[deliberation] MX 백서 위키 {env['origin']['ref']}: 꺼져 있다(wiki_disabled) — 한 줄만 남긴다")
+        return _WIKI_OFF_NOTE
+    note = _wiki_note(raw, env)
     print(f"[deliberation] MX 백서 위키 {env['origin']['ref']}: {note.strip()[:300]}")
     return note
 
