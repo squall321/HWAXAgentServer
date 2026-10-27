@@ -304,3 +304,10 @@ def test_HA04_도구_래퍼를_지나면_접힌다():
                                     args_schema={"type": "object", "properties": {}}))
     out = asyncio.run(t.ainvoke({}))
     assert "group_options" not in out.split("\n", 1)[1] and "x" * 100 not in out
+
+
+# ── HA-15 — 질문의 언어로 답한다(기본 한국어 · 중국어로 새지 않는다) ─────────────────────────────────────────
+def test_HA15_질문의_언어로_답하고_중국어로_새지_않는다():
+    head = a.SYSTEM_PROMPT[:200]
+    assert "사용자 질문의 언어로 답하세요" in head and "기본은 한국어" in head and "중국어로 절대 전환하지 마세요" in head
+    assert "한국어로만" not in a.SYSTEM_PROMPT, "영어 질문에도 한국어로만 답하라는 줄이 남았다"
