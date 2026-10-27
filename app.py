@@ -1407,13 +1407,37 @@ def _extract_artifacts_text(s):
     return s
 
 
-def _cap_tool(tool, result_max=None):
+# 챗 경로에서만 거는 도구 인자 기본값 — 모델이 그 인자를 주지 않았을 때만 채운다(준 값은 그대로). 이름은 노출 이름 끝으로 고른다
+# (게이트웨이 별칭 · 충돌 접두 <앱키>_<도구>, invoke_tool 의 안쪽 이름도). 값 옆의 글은 그 도구 설명 끝에 붙여 모델이 언제 바꿀지 안다.
+#   plm_defect_search.enrich=0 — 기본 5 는 PLM 원본을 다시 불러 PLM 한도(하베스터 · 챗 · 웹이 같이 쓴다)를 먹는다(10-20 이후 웹 챗
+#   72건). 사용자가 실시간 상태를 요구할 때만 올린다(사용자 결정 10-27 D-3 — HWAXPortal docs/request-1027 HA-24). 심의 · 게이트웨이의
+#   노출 기본값은 그대로다(PLM 보류).
+_CHAT_ARG_DEFAULTS = {
+    "plm_defect_search": ({"enrich": 0}, "이 대화에서는 enrich 를 주지 않으면 0 이다(PLM 원본을 다시 부르지 않는다) — "
+                                         "사용자가 PLM 의 실시간 상태를 요구할 때만 enrich 를 준다"),
+}
+
+
+def _arg_defaults_for(name, table) -> tuple[dict, str] | None:
+    """그 도구 이름의 (기본값, 설명 끝에 붙일 글) — 이름 그대로이거나 별칭 · 충돌 접두를 단 꼴. 없으면 None."""
+    n = str(name or "").strip().lower()
+    for t, entry in (table or {}).items():
+        if n == t or n.endswith("_" + t):
+            return entry
+    return None
+
+
+def _cap_tool(tool, result_max=None, arg_defaults=None):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
     프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384).
-    result_max 를 주면 그 값으로 절단한다(결정적 JSON 조회는 CATALOG_RESULT_MAX 를 넘긴다)."""
+    result_max 를 주면 그 값으로 절단한다(결정적 JSON 조회는 CATALOG_RESULT_MAX 를 넘긴다).
+    arg_defaults 를 주면(챗 경로 — _CHAT_ARG_DEFAULTS) 모델이 주지 않은 인자를 그 값으로 채운다."""
     orig = tool.coroutine
     if orig is None:
         return tool
+    _own = _arg_defaults_for(getattr(tool, "name", ""), arg_defaults)
+    if _own:
+        tool.description = f"{tool.description or ''} [{_own[1]}]"
 
     def _norm(v):
         # MCP content-item 리스트 처리. str(list) 파이썬 repr 로 문자열화되면 URL 재작성·
@@ -1508,6 +1532,22 @@ def _cap_tool(tool, result_max=None):
                            f"필터를 빼고 더 짧은 조각으로 다시 찾아라.")
                     return ((msg, None)
                             if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
+        if _own:
+            for _k, _v in _own[0].items():
+                kw.setdefault(_k, _v)
+        elif arg_defaults and getattr(tool, "name", "") == "invoke_tool":
+            _inner = _arg_defaults_for(kw.get("name"), arg_defaults) if isinstance(kw.get("name"), str) else None
+            _inner_def = _inner[0] if _inner else None
+            _ia = kw.get("arguments")
+            if _inner_def and isinstance(_ia, str):
+                try:
+                    _parsed = json.loads(_ia or "{}")
+                except ValueError:
+                    _parsed = None
+                if isinstance(_parsed, dict):
+                    kw["arguments"] = json.dumps({**_inner_def, **_parsed}, ensure_ascii=False)
+            elif _inner_def and (_ia is None or isinstance(_ia, dict)):
+                kw["arguments"] = {**_inner_def, **(_ia or {})}
         try:
             out = await orig(*a, **kw)
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
@@ -1634,10 +1674,10 @@ def _attach_validation_hint(tool):
     return tool
 
 
-def _prep_tool(tool, result_max=None, desc_max=None):
+def _prep_tool(tool, result_max=None, desc_max=None, arg_defaults=None):
     """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
-    result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max)
+    result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값. arg_defaults 는 챗 경로만 준다(_CHAT_ARG_DEFAULTS)."""
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max, arg_defaults)
 
 
 # ── 컨텍스트 예산 (운영 타깃 = GLM on B300, 128K 창 기준) ────────────────────────────
@@ -2462,7 +2502,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     print(f"[agent] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({degraded})")
                     scoped = _with_groups(connections, sorted(groups), user, "")
                     _got = await _get_tools_retry(scoped)
-                _raw = [_prep_tool(t) for t in _got]
+                _raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS) for t in _got]
                 # 성공분을 스냅샷에 보관(source 게이트·select 전 순수 목록) — 다음 불통 때
                 # 폴백 재료다. 사용자 신원 키라 남에게 재사용되지 않는다.
                 if _raw:

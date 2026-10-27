@@ -92,3 +92,59 @@ def test_HA08_켜진_위키의_다른_실패와_성공은_단마다_그대로다
     ok = _WikiTool('{"id": "4f1e", "short": "src_4f1e", "dedup": false, "ingest_state": "queued"}')
     first, second = _two_stages({d._WIKI_TOOL: ok})
     assert "src_4f1e" in first and "src_4f1e" in second and len(ok.calls) == 2, "원천은 단마다 남긴다(P8)"
+
+
+# ── HA-24 — 챗 경로의 plm_defect_search 는 enrich 를 주지 않으면 0(사용자 결정 D-3 — 챗 쪽만 먼저) ──────────────────────
+def _plm_tool(name="plm_defect_search"):
+    """진짜 MCP 어댑터 도구와 같은 꼴 — args_schema 가 JSON 스키마 dict 이고 coroutine 이 받은 인자만 넘긴다(langchain_mcp_adapters).
+    pydantic 스키마로 지으면 LangChain 이 기본값(5)을 먼저 채워 이 시험이 아무것도 못 본다(가짜는 진짜 꼴로)."""
+    seen = []
+
+    async def call_tool(**arguments):
+        seen.append(arguments.get("enrich", "서버 기본(5)"))
+        return "ok"
+    schema = {"type": "object", "properties": {"query": {"type": "string"}, "enrich": {"type": "integer", "default": 5}},
+              "required": ["query"]}
+    return StructuredTool(name=name, description="PLM 불량 검색", args_schema=schema, coroutine=call_tool), seen
+
+
+def test_HA24_챗_경로는_enrich_를_주지_않으면_0_이고_준_값은_그대로다():
+    t, seen = _plm_tool()
+    t = a._prep_tool(t, arg_defaults=a._CHAT_ARG_DEFAULTS)
+    asyncio.run(t.ainvoke({"query": "힌지"}))
+    asyncio.run(t.ainvoke({"query": "힌지", "enrich": 3}))
+    assert seen == [0, 3], seen
+    assert "실시간 상태를 요구할 때만" in t.description, "모델이 언제 올릴지 설명에서 읽는다"
+    alias, seen2 = _plm_tool("plmdefect_plm_defect_search")       # 게이트웨이 충돌 접두
+    asyncio.run(a._prep_tool(alias, arg_defaults=a._CHAT_ARG_DEFAULTS).ainvoke({"query": "x"}))
+    assert seen2 == [0]
+
+
+def test_HA24_심의_경로는_그대로다():
+    t, seen = _plm_tool()
+    t = a._prep_tool(t, 4000, 2400)                                 # 심의가 부르는 꼴(deliberation._prep_tool(t, result_max, desc_max))
+    asyncio.run(t.ainvoke({"query": "힌지"}))
+    assert seen == ["서버 기본(5)"] and "실시간 상태" not in t.description
+
+
+def test_HA24_invoke_tool_로_불러도_같다():
+    got = []
+
+    async def call_tool(**kw):
+        got.append((kw.get("name"), kw.get("arguments")))
+        return "ok"
+    invoke = StructuredTool(name="invoke_tool", description="게이트웨이 invoke_tool 대역", coroutine=call_tool,
+                            args_schema={"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+                                         "required": ["name"]})
+    t = a._prep_tool(invoke, arg_defaults=a._CHAT_ARG_DEFAULTS)
+    asyncio.run(t.ainvoke({"name": "plm_defect_search", "arguments": {"query": "x"}}))
+    asyncio.run(t.ainvoke({"name": "plm_defect_search", "arguments": '{"query": "y", "enrich": 2}'}))
+    asyncio.run(t.ainvoke({"name": "list_materials", "arguments": {}}))
+    assert got[0] == ("plm_defect_search", {"enrich": 0, "query": "x"})
+    assert got[1][0] == "plm_defect_search" and __import__("json").loads(got[1][1]) == {"enrich": 2, "query": "y"}
+    assert got[2] == ("list_materials", {}), "다른 도구의 인자는 건드리지 않는다"
+
+
+def test_HA24_챗_도구_로드가_기본값을_싣는다():
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "_raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS) for t in _got]" in src
