@@ -471,3 +471,71 @@ def test_HA07_앱_라벨은_질의가_그_앱을_지목할_때만_센다():
     assert sc["dynaforgeprod_mesh"] == 0.0 and sc["drop_result"] > 0, "라벨의 (시험) 이 적중했다"
     sc = a._lex_scores(tools, a._tok_query("dynaforge 메시"))
     assert sc["dynaforgeprod_mesh"] > sc["drop_result"], "앱을 지목하면 라벨을 센다"
+
+
+# ── HA-09 — 다단 심의(해석 설계 · 구축 계획)는 끝난 단을 체크포인트로 남기고, 이어 돌 때 그 단을 건너뛴다 ─────────────────
+from types import SimpleNamespace  # noqa: E402
+
+
+def _sim_run(monkeypatch, req: dict):
+    """run_sim_deliberation 을 가짜 단(엔진 스트림)으로 끝까지 — 단마다 받은 opts 와 낸 이벤트."""
+    got = []
+
+    async def _core(_app, q, _groups, opts, *_a, out=None, **_k):
+        got.append((q, opts))
+        if out is not None:
+            out.update(decision=f"{len(got)}단 결정문", personas=[{"key": "mech-a", "role": "기구"}], non_negotiables=["조항"])
+        yield d._sse("status", {"step": "단 끝"})
+
+    async def _none(*_a, **_k):
+        return {}
+
+    async def _text(*_a, **_k):
+        return ""
+
+    async def _empty(*_a, **_k):
+        return []
+
+    for name, fn in (("_deliberation_stream", _core), ("_tools_by_name", _none), ("_restore_role", _text),
+                     ("_discover", _empty), ("_asset_snapshot", _text), ("_material_evidence_snapshot", _text)):
+        monkeypatch.setattr(d, name, fn)
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
+
+    async def go():
+        return [delib_jobs._parse_sse(c) async for c in d.run_sim_deliberation(stub, "화두", [], req)]
+    events = asyncio.run(go())
+    assert not [x for ev, x in events if ev == "error"], events
+    return got, [x for ev, x in events if ev == "delib" and x.get("kind") == "checkpoint"]
+
+
+def test_HA09_다단_심의는_끝난_단마다_체크포인트를_낸다(monkeypatch):
+    got, cps = _sim_run(monkeypatch, {"build_plan": 1})
+    assert [o.chair_template for _q, o in got] == ["mechanism", "sim-plan", "build-plan"]
+    assert [c["stage"] for c in cps] == ["sim-1", "sim-2"]
+    assert cps[0]["decision_a"] == "1단 결정문" and cps[0]["personas_a"][0]["key"] == "mech-a" and cps[0]["nn_a"] == ["조항"]
+    assert cps[1]["decision_b"] == "2단 결정문" and cps[1]["sim_seats"], cps[1]
+    _got, cps2 = _sim_run(monkeypatch, {})
+    assert [c["stage"] for c in cps2] == ["sim-1"], "2단으로 끝나는 해석 설계는 2단 체크포인트가 필요 없다"
+
+
+def test_HA09_1단_체크포인트로_이으면_2단부터_돈다(monkeypatch):
+    ck = {"stage": "sim-1", "decision_a": "앞 회차 1단 결정문", "personas_a": [{"key": "phys-a", "role": "물리"}], "nn_a": ["앞 조항"]}
+    got, _cps = _sim_run(monkeypatch, {"build_plan": 1, "resume_checkpoint": ck})
+    assert [o.chair_template for _q, o in got] == ["sim-plan", "build-plan"], "끝난 1단을 다시 돌렸다"
+    assert got[0][1].continue_summary == "앞 회차 1단 결정문" and got[0][1].continue_non_negotiables == ["앞 조항"]
+    assert "phys-a" in [p["key"] for p in got[0][1].continue_personas], "1단 좌석이 물리 유임으로 이어지지 않았다"
+
+
+def test_HA09_2단_체크포인트로_이으면_3단부터_돈다(monkeypatch):
+    ck = {"stage": "sim-2", "decision_a": "1단", "decision_b": "앞 회차 2단 결정문",
+          "sim_seats": [{"key": "cae-a", "role": "CAE", "origin": "new"}, {"key": "phys-a", "role": "물리", "origin": "carry"}]}
+    got, cps = _sim_run(monkeypatch, {"build_plan": 1, "resume_checkpoint": ck})
+    assert [o.chair_template for _q, o in got] == ["build-plan"] and cps == []
+    assert got[0][1].continue_summary == "앞 회차 2단 결정문"
+    assert [p["key"] for p in got[0][1].continue_personas] == ["cae-a", "phys-a"]
+
+
+def test_HA09_모양이_틀린_체크포인트는_쓰지_않고_처음부터(monkeypatch):
+    for bad in ({"stage": "sim-1"}, {"stage": "sim-2", "decision_a": "1단"}, {"stage": "r3", "decision_a": "x"}, "sim-1"):
+        got, _ = _sim_run(monkeypatch, {"build_plan": 1, "resume_checkpoint": bad})
+        assert len(got) == 3, bad

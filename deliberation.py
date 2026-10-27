@@ -4707,18 +4707,35 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     # 파싱하는 방식 자체를 없앤다 — 같은 실패가 조용히 재발할 자리를 남기지 않는다.
     out_a: dict = {}   # 1단 산출 — 결정문·좌석·양보 불가 조항(2단 입력)
     out_b: dict = {}   # 2단 산출 — 해석 계획 결정문(3단 build_plan 입력)
+    # 단 경계 체크포인트(HWAXPortal docs/request-1027 HA-09) — 끝난 단의 산출(결정문 · 좌석 · 양보 불가 조항)을 잡 원장의 checkpoint 칸에
+    # 남긴다(delib 이벤트 kind=checkpoint — delib_jobs._apply). 재기동으로 끊긴 잡을 이으면(mcp_server._resume) 그 칸이 resume_checkpoint 로
+    # 돌아와 끝난 단을 건너뛴다 — 종전엔 2단 · 3단에서 끊겨도 1단부터 다시 돌아 몇십 분이 사라졌다. 단 안의 라운드는 종전대로 처음부터다.
+    req_opts = dict(req_opts or {})
+    ckpt = req_opts.pop("resume_checkpoint", None)
+    ckpt = ckpt if (isinstance(ckpt, dict) and ckpt.get("stage") in ("sim-1", "sim-2") and str(ckpt.get("decision_a") or "").strip()
+                    and (ckpt["stage"] == "sim-1" or (str(ckpt.get("decision_b") or "").strip() and ckpt.get("sim_seats")))) else None
 
     try:
-        # ── 1단 — 메커니즘 심의 ──────────────────────────────────────────────
-        yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
-        opts_a = _resolve_opts(req_opts)
-        opts_a.chair_template = "mechanism"
-        async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
-                                                history, out=out_a):
-            yield chunk
-        decision_a = out_a.get("decision") or ""
-        personas_a = out_a.get("personas") or []
-        nn_a = out_a.get("non_negotiables") or []
+        if ckpt:
+            # ── 1단 — 끊기기 전에 끝났다(체크포인트) ─────────────────────────────
+            decision_a = str(ckpt["decision_a"])
+            personas_a = [x for x in (ckpt.get("personas_a") or []) if isinstance(x, dict) and x.get("key")]
+            nn_a = [str(x) for x in (ckpt.get("nn_a") or [])]
+            yield _sse("status", {"step": "1단(메커니즘)은 끊기기 전에 끝났다 — 그 결정문을 이어받아 건너뛴다(체크포인트)", "tool": None})
+        else:
+            # ── 1단 — 메커니즘 심의 ──────────────────────────────────────────────
+            yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
+            opts_a = _resolve_opts(req_opts)
+            opts_a.chair_template = "mechanism"
+            async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
+                                                    history, out=out_a):
+                yield chunk
+            decision_a = out_a.get("decision") or ""
+            personas_a = out_a.get("personas") or []
+            nn_a = out_a.get("non_negotiables") or []
+            if decision_a:
+                yield _delib("checkpoint", stage="sim-1", decision_a=decision_a, nn_a=list(nn_a),
+                             personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)])
         if not decision_a:
             # 의장이 결정문을 못 내 1단이 error 로 끝났으면 그 사유와 설정 이름을 이 오류에도 싣는다 — 잡 원장은
             # 마지막 오류만 남기므로, 안 실으면 '왜' 가 이 줄에 덮인다.
@@ -4729,6 +4746,14 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                                  **({"knob": _knob_a} if _knob_a else {})})
             yield _sse("done", {}); return
 
+        if ckpt and ckpt["stage"] == "sim-2":
+            # ── 2단 — 끊기기 전에 끝났다(체크포인트) — 3단(구축 계획)부터 ──────────────
+            sim_seats = [x for x in ckpt["sim_seats"] if isinstance(x, dict) and x.get("key")]
+            decision_b = str(ckpt["decision_b"])
+            yield _sse("status", {"step": "2단(해석 설계)도 끊기기 전에 끝났다 — 그 결정문을 이어받아 3단부터(체크포인트)", "tool": None})
+            async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, decision_b, sim_seats):
+                yield chunk
+            return
         # ── 좌석 전환 ────────────────────────────────────────────────────────
         yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
@@ -4789,37 +4814,46 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                                                 history, out=out_b):
             yield chunk
         decision_b = out_b.get("decision") or ""
-
-        # ── 3단 — 구축 계획 심의 (opt-in: build_plan) ─────────────────────────────
-        # 2단 해석 계획을 그 문제에 특화된 반복 파라메트릭 모듈로 "구축"하는 계획까지. 2단 결정문
-        # (sim_spec 포함)을 승계로 넘기고 CAE 좌석을 유임한다(carry — 3단 입력이라 가리지 않는다).
-        # build-plan 템플릿이 12항목 산출을 강제한다. build_plan 이 꺼져 있으면 종전 2단 동작 그대로.
         if opts.build_plan and decision_b:
-            yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
-            opts_c = _resolve_opts(req_opts)
-            opts_c.req_cut = {}
-            opts_c.req_unread = {}
-            opts_c.seats_no_key = None
-            opts_c.timeout_clamped = None
-            opts_c.chair_template = "build-plan"
-            # 2단 결정문(sim_spec 포함) — 종전 20,000자가 바닥이고 넓은 창은 이어하기 요약 몫까지(_summary_max).
-            _smax_c = max(20000, _summary_max())
-            opts_c.continue_summary = decision_b[:_smax_c]
-            for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
-                yield _c
-            opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
-                                        for s in sim_seats]
-            opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
-                                 "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
-            build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
-                       f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
-            async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
-                yield chunk
+            yield _delib("checkpoint", stage="sim-2", decision_a=decision_a, nn_a=list(nn_a), decision_b=decision_b,
+                         personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
+                         sim_seats=[{"key": x.get("key"), "role": x.get("role", ""), "origin": x.get("origin")} for x in sim_seats])
+        async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, decision_b, sim_seats):
+            yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[sim-deliberation] fatal: {exc!r}")
         yield _sse("error", {"code": "sim_deliberation_error",
                              "message": f"시뮬레이션 심의 처리 중 오류: {str(exc)[:200]}"})
         yield _sse("done", {})
+
+
+async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: str, user_pat: str, history, decision_b: str,
+                      sim_seats: list):
+    """3단 — 구축 계획 심의 (opt-in: build_plan). 2단 해석 계획을 그 문제에 특화된 반복 파라메트릭 모듈로 "구축"하는 계획까지. 2단 결정문
+    (sim_spec 포함)을 승계로 넘기고 CAE 좌석을 유임한다(carry — 3단 입력이라 가리지 않는다). build-plan 템플릿이 12항목 산출을 강제한다.
+    build_plan 이 꺼져 있으면 종전 2단 동작 그대로(아무것도 내지 않는다). 2단 체크포인트로 이어 돌 때도 이 길이다(HA-09)."""
+    if not (opts.build_plan and decision_b):
+        return
+    yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
+    opts_c = _resolve_opts(req_opts)
+    opts_c.req_cut = {}
+    opts_c.req_unread = {}
+    opts_c.seats_no_key = None
+    opts_c.timeout_clamped = None
+    opts_c.chair_template = "build-plan"
+    # 2단 결정문(sim_spec 포함) — 종전 20,000자가 바닥이고 넓은 창은 이어하기 요약 몫까지(_summary_max).
+    _smax_c = max(20000, _summary_max())
+    opts_c.continue_summary = decision_b[:_smax_c]
+    for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
+        yield _c
+    opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
+                                for s in sim_seats]
+    opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
+                         "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
+    build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
+               f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
+    async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
+        yield chunk
 
 
 async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",

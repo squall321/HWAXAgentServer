@@ -1120,7 +1120,8 @@ def _opts_echo(opts: dict) -> dict:
 
 def _opts_view(echo: dict) -> dict:
     """원장의 요청 값을 응답(applied_opts)에 싣는 모양 — 긴 글은 앞부분과 전체 길이만(전문은 원장 파일에 있다)."""
-    return {k: (v[:117] + f"… (전체 {len(v):,}자)" if isinstance(v, str) and len(v) > 120 else v)
+    return {k: ({"stage": v.get("stage")} if k == "resume_checkpoint" and isinstance(v, dict)     # 결정문 전문은 원장에 있다(HA-09)
+                else v[:117] + f"… (전체 {len(v):,}자)" if isinstance(v, str) and len(v) > 120 else v)
             for k, v in (echo or {}).items()}
 
 
@@ -1286,9 +1287,12 @@ def resume_info(job: dict) -> dict | None:
             done = max(0, min(total, int(stage[1:]) - 1))
         elif stage in ("decide", "explain", "report"):
             done = total
+    ck = job.get("checkpoint")
     return {"rounds_done": done, "total_rounds": total or None,
             "rounds_left": (max(2, min(8, total - done)) if done else None),
-            "args": _args_path(job["id"]).exists(), "resumed_by": job.get("resumed_by")}
+            "args": _args_path(job["id"]).exists(), "resumed_by": job.get("resumed_by"),
+            # 다단 심의의 끝난 단(HA-09) — 이으면 그 단까지 건너뛴다(sim-1 = 1단 · sim-2 = 2단까지 끝났다)
+            "checkpoint": ck.get("stage") if isinstance(ck, dict) else None}
 
 
 def queue_durability() -> dict:

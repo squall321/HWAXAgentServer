@@ -349,7 +349,8 @@ def _resume(eng, job_id, **kw):
 def test_끊긴_잡은_끝난_라운드_수를_싣는다(eng, monkeypatch):
     job = _interrupted(args_opts=_ORIG)
     st = asyncio.run(m.deliberate_status(job["id"]))
-    assert st["resume"] == {"rounds_done": 2, "total_rounds": 4, "rounds_left": 2, "args": True, "resumed_by": None}
+    assert st["resume"] == {"rounds_done": 2, "total_rounds": 4, "rounds_left": 2, "args": True, "resumed_by": None,
+                            "checkpoint": None}
     assert "deliberate_continue" in st["error"]
 
 
@@ -364,7 +365,8 @@ def test_이어하기는_사람_의견_없이_남은_라운드만_처음_인자�
     assert "3R" not in cs.replace("2R", ""), "끝나지 않은 3라운드 발언을 요약에 실었다"
     assert o["human_note"] == "현장 의견" and o["evidence"] == _ORIG["evidence"] and o["timeout_s"] == 3600, "처음 인자를 잇지 못했다"
     assert [p["key"] for p in o["personas"]] == ["mech-hinge", "thermal"] and o["personas"][0]["role"] == "기구 역할 전문"
-    assert out["resumed"] == {"rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3, "foreign": False}
+    assert out["resumed"] == {"rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3, "foreign": False,
+                              "checkpoint": None}
     assert out["continued_from"] == job["id"]
     prev = _on_disk(job)
     assert prev["resumed_by"] == out["job_id"] and not delib_jobs._args_path(job["id"]).exists()
@@ -460,6 +462,32 @@ def test_남이_이으면_시작_인자를_쓰지_않고_주인의_이어하기�
     assert o["human_note"] == "현장 의견" and o["evidence"] == _ORIG["evidence"] and o["timeout_s"] == 3600
     assert mine["resumed"]["foreign"] is False and _on_disk(job)["resumed_by"] == mine["job_id"]
     assert not delib_jobs._args_path(job["id"]).exists()
+
+
+def test_다단_심의는_체크포인트를_이어하기에_넘기고_그_단부터라고_말한다(eng, monkeypatch):
+    """HWAXPortal docs/request-1027 HA-09 — 끊긴 구축 계획(3단)을 이으면 원장의 checkpoint(끝난 단의 결정문 · 좌석)를 엔진에 넘겨 끝난
+    단을 건너뛴다(엔진 쪽은 tests/test_request_1027.py 의 HA-09). 종전엔 다단 심의를 늘 1단부터 다시 돌았다."""
+    _caps(monkeypatch, 2)
+    monkeypatch.setattr(d, "run_sim_deliberation", eng.entry)
+    job = _interrupted(stage="r2", args_opts={**_ORIG, "build_plan": 1}, job_id="build-plan-20261022-010000-cut009")
+    rec = _on_disk(job)
+    rec.update(job="build-plan", kind="build-plan",
+               checkpoint={"stage": "sim-1", "decision_a": "1단 결정문", "personas_a": [{"key": "phys-a", "role": "물리"}], "nn_a": []})
+    delib_jobs._persist(rec)
+    st = asyncio.run(m.deliberate_status(job["id"]))
+    assert st["resume"]["checkpoint"] == "sim-1" and st["resume"]["rounds_done"] == 0
+    out = _resume(eng, job["id"])
+    o = eng.seen["힌지 크랙 원인"].opts
+    assert o["resume_checkpoint"]["stage"] == "sim-1" and o["resume_checkpoint"]["decision_a"] == "1단 결정문"
+    assert out["resumed"]["checkpoint"] == "sim-1" and "2단부터" in out["note"], out["note"]
+    assert delib_jobs._opts_view(o)["resume_checkpoint"] == {"stage": "sim-1"}, "응답에 결정문 전문을 싣지 않는다"
+
+
+def test_체크포인트가_없는_잡은_시작_인자에_남은_옛_체크포인트를_쓰지_않는다(eng, monkeypatch):
+    _caps(monkeypatch, 2)
+    job = _interrupted(args_opts={**_ORIG, "resume_checkpoint": {"stage": "sim-1", "decision_a": "옛 것"}})
+    _resume(eng, job["id"])
+    assert "resume_checkpoint" not in eng.seen["힌지 크랙 원인"].opts
 
 
 async def go2(job):

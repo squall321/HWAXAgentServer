@@ -634,6 +634,12 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         o.update({k: v for k, v in advanced.items() if v is not None})
     if prev_opts.get("sealed"):
         o["sealed"] = 1             # 봉인은 풀 수 없다(이어하기와 같은 규칙)
+    ck = info.get("checkpoint")
+    if ck:
+        # 다단 심의가 끝낸 단의 산출 — 엔진(run_sim_deliberation)이 그 단까지 건너뛴다(HA-09). 원장의 칸이라 남의 이어하기에도 넘긴다(읽을 수 있는 값이다).
+        o["resume_checkpoint"] = prev["checkpoint"]
+    else:
+        o.pop("resume_checkpoint", None)      # 앞 회차의 체크포인트가 시작 인자에 남아 있어도 이번 원장에 없으면 쓰지 않는다
     if foreign:
         o.pop("append_to_report_id", None)          # 남의 심의를 이으면 그 사람의 보고서에 붙이지 않는다(이어하기와 같다)
     elif prev.get("report_id"):
@@ -654,10 +660,13 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     out = delib_jobs.summary(rec)
     out["continued_from"] = pid
     out["resumed"] = {"rounds_done": done, "rounds": o.get("rounds"), "args": args is not None,
-                      "rounds_start_at": (int(o.get("rounds_so_far") or 0) + 1) if done else None, "foreign": foreign}
+                      "rounds_start_at": (int(o.get("rounds_so_far") or 0) + 1) if done else None, "foreign": foreign,
+                      "checkpoint": ck}
+    _ck_say = {"sim-1": "끝난 1단(메커니즘)은 건너뛰고 그 결정문을 이어받아 2단부터 돈다.",
+               "sim-2": "끝난 1 · 2단은 건너뛰고 2단 결정문을 이어받아 3단(구축 계획)부터 돈다."}
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + (
         [f"끊긴 심의를 이어 돈다 — 끝난 {done}라운드 뒤부터 {o.get('rounds')}라운드." if done else
-         "끊긴 심의에 끝난 라운드가 없어 같은 인자로 처음부터 돈다."]) + (
+         _ck_say.get(ck) or "끊긴 심의에 끝난 라운드가 없어 같은 인자로 처음부터 돈다."]) + (
         ["남의 심의를 이어 돈다 — 원 주인의 시작 인자(근거 본문 · 지정 좌석 역할 전문 · 사람 의견)는 싣지 않고 남은 손잡이와 좌석만 넘겼다. "
          "원 주인의 이어하기는 그대로 남는다 — 다시 봐야 할 근거는 evidence 로 싣는다."] if foreign else
         [] if args is not None else ["시작 인자 파일이 없는 잡이라(이 판 이전) 처음 근거 본문 · 지정 좌석 역할 전문은 잇지 못했다 — "
