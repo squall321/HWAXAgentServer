@@ -364,7 +364,8 @@ def test_이어하기는_사람_의견_없이_남은_라운드만_처음_인자�
     assert "3R" not in cs.replace("2R", ""), "끝나지 않은 3라운드 발언을 요약에 실었다"
     assert o["human_note"] == "현장 의견" and o["evidence"] == _ORIG["evidence"] and o["timeout_s"] == 3600, "처음 인자를 잇지 못했다"
     assert [p["key"] for p in o["personas"]] == ["mech-hinge", "thermal"] and o["personas"][0]["role"] == "기구 역할 전문"
-    assert out["resumed"] == {"rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3} and out["continued_from"] == job["id"]
+    assert out["resumed"] == {"rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3, "foreign": False}
+    assert out["continued_from"] == job["id"]
     prev = _on_disk(job)
     assert prev["resumed_by"] == out["job_id"] and not delib_jobs._args_path(job["id"]).exists()
     assert _on_disk({"id": out["job_id"]})["resumed_from"] == job["id"]
@@ -432,6 +433,33 @@ def test_남의_끊긴_잡을_이으면_그_사람_보고서에_붙이지_않고
     mine = _interrupted(args_opts=_ORIG, report_id=77, job_id="default-20261022-010000-cut002")
     _play(lambda: go2(mine))
     assert eng.seen["힌지 크랙 원인"].opts["append_to_report_id"] == 77, "보고서 단계에서 끊긴 내 잡의 보고서에 잇지 않았다"
+
+
+def test_남이_이으면_시작_인자를_쓰지_않고_주인의_이어하기를_남긴다(eng, monkeypatch):
+    """HWAXPortal docs/request-1027 HA-06 — 같은 소속 · 관리자가 이으면 원 주인의 시작 인자 파일(근거 본문 · 지정 좌석 역할 전문 · 사람
+    의견)이 그 사람의 새 잡에 실렸고(원장에는 수만 남았던 근거다), 원 주인의 한 번뿐인 이어하기도 소진됐다. 남에게는 원장의 남은 손잡이와
+    좌석만 넘기고 원 주인의 이어하기는 그대로 둔다."""
+    _caps(monkeypatch, 2)
+    job = _interrupted(args_opts=_ORIG)
+
+    async def go(ctx):
+        out = await m.deliberate_continue(previous_job_id=job["id"], ctx=ctx)
+        await _tick()
+        return out
+    out = _play(lambda: go(_ctx(YOU, "CAEG")))
+    o = eng.seen["힌지 크랙 원인"].opts
+    assert "human_note" not in o and "evidence" not in o and "timeout_s" not in o, f"원 주인의 시작 인자를 실었다: {sorted(o)}"
+    assert [p["key"] for p in o["personas"]] == ["mech-hinge", "thermal"], "원장의 좌석은 넘긴다"
+    assert out["resumed"]["foreign"] is True and out["resumed"]["args"] is False and "남의 심의를 이어 돈다" in out["note"], out
+    prev = _on_disk(job)
+    assert not prev.get("resumed_by") and prev["resumed_by_others"] == [out["job_id"]], "원 주인의 이어하기를 소진했다"
+    assert delib_jobs._args_path(job["id"]).exists(), "원 주인의 시작 인자 파일을 지웠다"
+    eng.seen.clear()
+    mine = _play(lambda: go(_ctx(ME, "CAEG")))                     # 원 주인은 처음 인자 그대로 잇는다
+    o = eng.seen["힌지 크랙 원인"].opts
+    assert o["human_note"] == "현장 의견" and o["evidence"] == _ORIG["evidence"] and o["timeout_s"] == 3600
+    assert mine["resumed"]["foreign"] is False and _on_disk(job)["resumed_by"] == mine["job_id"]
+    assert not delib_jobs._args_path(job["id"]).exists()
 
 
 async def go2(job):

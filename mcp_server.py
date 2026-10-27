@@ -576,7 +576,11 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     처음 인자는 시작 인자 파일(R2)에서 그대로 쓴다 — 근거 본문 · 지정 좌석 · 사람 의견 · 손잡이. 없으면(이 판 이전의 잡) 원장의 손잡이만
     잇고 근거 본문은 없다고 알린다. 끝난 라운드가 있으면 그 좌석별 마지막 입장을 요약으로 싣고, 엔진이 앉힌 좌석을 그대로 앉히고, 라운드
     번호를 이어 센다. 끝난 라운드가 없으면(첫 라운드 도중 · 다단 심의) 같은 인자로 처음부터다. 한 잡은 한 번만 잇는다(두 번이면 같은
-    심의가 둘 돈다 — 이은 잡을 알려 준다)."""
+    심의가 둘 돈다 — 이은 잡을 알려 준다).
+
+    **남(같은 소속 · 관리자)이 이으면** 시작 인자 파일을 쓰지 않는다 — 원장에는 수만 남은 근거 본문 · 지정 좌석 역할 전문 · 사람 의견이
+    그 사람의 새 잡에 실렸고, 원 주인의 한 번뿐인 이어하기도 소진됐다(HWAXPortal docs/request-1027 HA-06). 남에게는 원장의 남은
+    손잡이와 좌석만 넘기고, 원 주인의 이어하기(잇기 표지 · 시작 인자 파일)는 그대로 둔다."""
     pid = prev["id"]
     if prev.get("resumed_by"):
         raise ValueError(f"{pid} 는 이미 이어 돌렸다 → {prev['resumed_by']} — 그 잡을 deliberate_status 로 본다")
@@ -584,15 +588,21 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         raise ValueError(f"끊긴 심의({pid})의 이어하기는 같은 화두 · 같은 종류로만 잇는다 — 바꾸려면 deliberate_start 로 새로 연다")
     info = delib_jobs.resume_info(prev) or {}
     done = int(info.get("rounds_done") or 0)
-    args = delib_jobs._read_args(pid)
+    user, groups = _caller(ctx)
+    foreign = delib_jobs._foreign(prev, user)
+    args = None if foreign else delib_jobs._read_args(pid)
     prev_opts = prev.get("opts") or {}
     if args is not None:
         o = dict(args.get("opts") or {})
     else:
-        # 시작 인자 파일이 없는 잡 — 이어하기의 손잡이만 잇는다(근거 본문 · 지정 좌석 역할 전문은 원장에 없다).
+        # 시작 인자 파일이 없는 잡 · 남의 이어하기 — 이어하기의 손잡이만 잇는다(근거 본문 · 지정 좌석 역할 전문은 원장에 없다).
         o = {k: prev_opts[k] for k in _CONT_CARRY if prev_opts.get(k) is not None}
-        if isinstance(prev_opts.get("human_note"), str) and prev_opts["human_note"]:
+        if not foreign and isinstance(prev_opts.get("human_note"), str) and prev_opts["human_note"]:
             o["human_note"] = prev_opts["human_note"]
+        if foreign and not done:
+            seats = _carry_seats(prev)       # 끝난 라운드가 있으면 아래에서 같은 좌석을 앉힌다
+            if seats:
+                o["personas"] = seats
     if done:
         # 끊긴 잡이 그 자체로 이어하기였으면(앞 회차의 결정문이 요약으로 실렸다) 그 요약 뒤에 끝난 라운드의 입장을 덧붙인다. 둘의 합이 엔진이 받는
         # 길이(_summary_max)를 넘지 않게 나눈다 — 넘으면 엔진이 뒤(새 입장)부터 자른다. 앞 회차 요약은 셋 중 하나까지 — 끊긴 회차의 좌석 입장이
@@ -624,8 +634,6 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         o.update({k: v for k, v in advanced.items() if v is not None})
     if prev_opts.get("sealed"):
         o["sealed"] = 1             # 봉인은 풀 수 없다(이어하기와 같은 규칙)
-    user, groups = _caller(ctx)
-    foreign = delib_jobs._foreign(prev, user)
     if foreign:
         o.pop("append_to_report_id", None)          # 남의 심의를 이으면 그 사람의 보고서에 붙이지 않는다(이어하기와 같다)
     elif prev.get("report_id"):
@@ -635,16 +643,23 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
                            owner_aff=_caller_view(ctx)[1])
     rec["resumed_from"] = pid
     delib_jobs._persist(rec)
-    prev["resumed_by"] = rec["id"]
-    delib_jobs._persist(prev)
-    delib_jobs._drop_args(pid)
+    if foreign:
+        # 원 주인의 이어하기를 소진하지 않는다 — 잇기 표지 · 시작 인자 파일을 그대로 두고 남이 이은 잡만 따로 적는다
+        prev["resumed_by_others"] = [*(prev.get("resumed_by_others") or []), rec["id"]]
+        delib_jobs._persist(prev)
+    else:
+        prev["resumed_by"] = rec["id"]
+        delib_jobs._persist(prev)
+        delib_jobs._drop_args(pid)
     out = delib_jobs.summary(rec)
     out["continued_from"] = pid
     out["resumed"] = {"rounds_done": done, "rounds": o.get("rounds"), "args": args is not None,
-                      "rounds_start_at": (int(o.get("rounds_so_far") or 0) + 1) if done else None}
+                      "rounds_start_at": (int(o.get("rounds_so_far") or 0) + 1) if done else None, "foreign": foreign}
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + (
         [f"끊긴 심의를 이어 돈다 — 끝난 {done}라운드 뒤부터 {o.get('rounds')}라운드." if done else
          "끊긴 심의에 끝난 라운드가 없어 같은 인자로 처음부터 돈다."]) + (
+        ["남의 심의를 이어 돈다 — 원 주인의 시작 인자(근거 본문 · 지정 좌석 역할 전문 · 사람 의견)는 싣지 않고 남은 손잡이와 좌석만 넘겼다. "
+         "원 주인의 이어하기는 그대로 남는다 — 다시 봐야 할 근거는 evidence 로 싣는다."] if foreign else
         [] if args is not None else ["시작 인자 파일이 없는 잡이라(이 판 이전) 처음 근거 본문 · 지정 좌석 역할 전문은 잇지 못했다 — "
                                      "다시 봐야 하면 evidence 로 싣는다."])
     out["note"] = " ".join(notes)
