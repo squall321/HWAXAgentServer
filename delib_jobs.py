@@ -240,6 +240,30 @@ def _state_dir() -> Path:
     return JOB_DIR / "state"
 
 
+# 권한 — 잡 폴더 안의 하위 폴더(args · state · list)는 0700, 원장 · 색인 파일은 0640, 상태 파일은 0600. 하위 폴더가 상위(공유 그룹 2775)를
+# 따라 만들어지고 원장이 664 였다 — 근거 본문 · 사람 의견 · 화두가 든 파일이다(HWAXPortal docs/request-1027 HA-10). JOB_DIR 자체는
+# 건드리지 않는다(운영이 정한 자리 · 같은 그룹의 백업이 읽는다). 고칠 수 없으면(남의 파일 · 읽기 전용) 조용히 둔다 — 기록이 먼저다.
+_LEDGER_MODE = 0o640
+_STATE_MODE = 0o600
+
+
+def _private_dir(d: Path) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        if d.stat().st_mode & 0o7777 != 0o700:
+            os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _chmod_quiet(f: Path, mode: int) -> None:
+    try:
+        os.chmod(f, mode)
+    except OSError:
+        pass
+
+
 def limits_path() -> Path:
     return _state_dir() / "limits.json"
 
@@ -253,7 +277,8 @@ def pause_state() -> review_gate.DrainState:
     p = str(pause_path())
     st = _PAUSE.get(p)
     if st is None:
-        st = _PAUSE[p] = review_gate.DrainState(p, scopes=("delib",))
+        # 깃발은 DrainState 가 쓴다(파일 0600) — 쓸 때 폴더를 0700 으로(읽기는 아무것도 만들지 않는다 — 거절된 시작은 흔적이 없다)
+        st = _PAUSE[p] = review_gate.DrainState(p, scopes=("delib",), dir_mode=0o700)
     return st
 
 
@@ -303,7 +328,7 @@ def _write_args(job_id: str, args: dict) -> bool:
     tmp = d / f".{job_id}.{os.getpid()}.tmp"
     try:
         data = json.dumps({"v": 1, **args}, ensure_ascii=False)
-        d.mkdir(parents=True, exist_ok=True)
+        _private_dir(d)
         tmp.unlink(missing_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -418,11 +443,11 @@ def set_limits(values: dict, *, by: str, reason: str = "", reset: bool = False) 
                 new.pop(k, None)
             else:
                 new[k] = _limit_value(k, v)
-        d = _state_dir()
-        d.mkdir(parents=True, exist_ok=True)
+        d = _private_dir(_state_dir())
         tmp = d / f".limits.{os.getpid()}.tmp"
         tmp.write_text(json.dumps({**new, "by": by, "reason": str(reason or "")[:300], "set_at": _now()},
                                   ensure_ascii=False), encoding="utf-8")
+        _chmod_quiet(tmp, _STATE_MODE)
         tmp.replace(limits_path())
     _lim_cache.clear()
     out = limits()
@@ -480,9 +505,10 @@ def _stamp(st: os.stat_result) -> list:
 
 
 def _write_list(job: dict, st: os.stat_result) -> None:
-    (JOB_DIR / _LIST_DIR).mkdir(parents=True, exist_ok=True)
+    _private_dir(JOB_DIR / _LIST_DIR)
     tmp = _list_path(job["id"]).with_suffix(".json.tmp")
     tmp.write_text(json.dumps({**_list_rec(job), "src": _stamp(st)}, ensure_ascii=False), encoding="utf-8")
+    _chmod_quiet(tmp, _LEDGER_MODE)
     tmp.replace(_list_path(job["id"]))
 
 
@@ -494,6 +520,7 @@ def _persist(job: dict) -> None:
         JOB_DIR.mkdir(parents=True, exist_ok=True)
         tmp = _path(job["id"]).with_suffix(".json.tmp")
         tmp.write_text(json.dumps(job, ensure_ascii=False, indent=1), encoding="utf-8")
+        _chmod_quiet(tmp, _LEDGER_MODE)
         tmp.replace(_path(job["id"]))
         _write_list(job, _path(job["id"]).stat())
     except OSError as exc:
@@ -1125,6 +1152,24 @@ def cancel(job_id: str, *, by: str = "") -> dict:
             "note": "취소를 요청했다. 잠시 뒤 deliberate_status 로 확인하라(저장은 중단된다)."}
 
 
+def _tighten_existing() -> None:
+    """기동 때 한 번 — 이 판 전에 넓게 만들어진 하위 폴더 · 원장 · 색인을 좁힌다(HA-10). 이미 좁으면 건드리지 않는다."""
+    for sub in (_ARGS_DIR, _LIST_DIR, "state"):
+        if (JOB_DIR / sub).is_dir():
+            _private_dir(JOB_DIR / sub)
+    for pat, mode in ((JOB_DIR.glob("*.json"), _LEDGER_MODE), ((JOB_DIR / _LIST_DIR).glob("*.json"), _LEDGER_MODE),
+                      ((JOB_DIR / "state").glob("*.json"), _STATE_MODE)):
+        try:
+            for f in pat:
+                try:
+                    if f.stat().st_mode & 0o7777 & ~mode:
+                        _chmod_quiet(f, mode)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
 def reap_orphans(app=None) -> int:
     """재기동 뒤 파일에 running·queued 로 남은 잡을 정리한다 — 닫은(interrupted) 수를 돌려준다.
 
@@ -1135,6 +1180,7 @@ def reap_orphans(app=None) -> int:
     닫는다 — queued 로 두면 호출자는 오지 않을 차례를 영영 기다린다."""
     global _REQUEUED  # noqa: PLW0603 — 이번 기동의 수(/health)
     n, back = 0, []
+    _tighten_existing()
     try:
         for f in JOB_DIR.glob("*.json"):
             # 상태는 목록 색인에서 본다 — 끝난 잡의 원장(수 MB)까지 통째로 읽지 않는다. 고칠 잡만 원장 전부를 읽는다.

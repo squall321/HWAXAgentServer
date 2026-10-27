@@ -282,11 +282,14 @@ class DrainState:
     clock 은 epoch 초(time.time), delib_load() 는 (도는, 줄 선) 심의 수다(시험이 둘 다 주입한다). scopes 는 이 깃발이 받는 scope 들이다 —
     카드 대조 비우기는 DRAIN_SCOPES, 새 심의 멈춤(delib_jobs — HWAXPortal docs/delib-ops R1)은 ("delib",) 로 같은 규칙의 다른 파일이다."""
 
-    def __init__(self, path: str, *, clock=time.time, delib_load=None, scopes: tuple = DRAIN_SCOPES):
+    def __init__(self, path: str, *, clock=time.time, delib_load=None, scopes: tuple = DRAIN_SCOPES, dir_mode: int | None = None):
         self.path = path
         self.clock = clock
         self.delib_load = delib_load
         self.scopes = tuple(scopes)
+        # 깃발 폴더의 권한 — 쓸 때만 세운다(읽기는 아무것도 만들지 않는다). 심의 멈춤은 잡 폴더 안의 하위 폴더라 0700(HWAXPortal
+        # docs/request-1027 HA-10). 카드 대조 깃발은 공유 산출물 폴더에 바로 놓여 손대지 않는다(None).
+        self.dir_mode = dir_mode
         self._lock = _lock_for(path)
         self._said: dict = {}
         self._idle: tuple | None = None   # (until_idle 를 세운 때, idle_since) — 파일에 못 쓴 grace 시계를 기억한다(RB3C-9)
@@ -321,6 +324,11 @@ class DrainState:
     def _write(self, st: dict) -> None:
         d = os.path.dirname(self.path) or "."
         os.makedirs(d, exist_ok=True)
+        if self.dir_mode is not None:
+            try:
+                os.chmod(d, self.dir_mode)
+            except OSError:
+                pass
         fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{os.path.basename(self.path)}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:

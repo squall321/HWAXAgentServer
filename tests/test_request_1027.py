@@ -311,3 +311,57 @@ def test_HA15_질문의_언어로_답하고_중국어로_새지_않는다():
     head = a.SYSTEM_PROMPT[:200]
     assert "사용자 질문의 언어로 답하세요" in head and "기본은 한국어" in head and "중국어로 절대 전환하지 마세요" in head
     assert "한국어로만" not in a.SYSTEM_PROMPT, "영어 질문에도 한국어로만 답하라는 줄이 남았다"
+
+
+# ── HA-10 — 잡 폴더 0700 · 원장 · 색인 0640 · 상태 0600(공유 그룹 상위를 따라 넓게 만들어지던 것) ──────────────────────
+import os  # noqa: E402
+import stat  # noqa: E402
+
+import delib_jobs  # noqa: E402
+
+
+def _mode(p: Path) -> int:
+    return stat.S_IMODE(p.stat().st_mode)
+
+
+def test_HA10_새로_쓰는_폴더와_파일은_좁다(monkeypatch, tmp_path):
+    shared = tmp_path / "shared"; shared.mkdir(); os.chmod(shared, 0o2775)
+    jobs = shared / "delib-jobs"; jobs.mkdir(); os.chmod(jobs, 0o2775)
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", jobs)
+    monkeypatch.setattr(delib_jobs, "_PAUSE", {})
+    old = os.umask(0o002)
+    try:
+        delib_jobs._persist({"id": "j-1", "status": "done", "question": "화두"})
+        assert delib_jobs._write_args("j-1", {"question": "화두", "opts": {"human_note": "사람 의견"}})
+        delib_jobs.set_limits({"max_running": 2}, by="시험")
+        assert delib_jobs.pause_info() is None
+        delib_jobs.pause_state().set_on(scope="delib", by="시험", reason="권한", ttl_s=60)
+    finally:
+        os.umask(old)
+    assert _mode(jobs / "j-1.json") == 0o640 and _mode(jobs / "list" / "j-1.json") == 0o640
+    for sub in ("args", "list", "state"):
+        assert _mode(jobs / sub) == 0o700, sub
+    assert _mode(delib_jobs._args_path("j-1")) == 0o600 and _mode(delib_jobs.limits_path()) == 0o600
+    assert _mode(delib_jobs.pause_path()) == 0o600
+    assert _mode(jobs) == 0o2775, "운영이 정한 잡 폴더 자체는 건드리지 않는다"
+
+
+def test_HA10_기동_때_이_판_전의_넓은_것을_좁힌다(monkeypatch, tmp_path):
+    jobs = tmp_path / "delib-jobs"
+    for sub in ("args", "list", "state"):
+        (jobs / sub).mkdir(parents=True); os.chmod(jobs / sub, 0o2775)
+    for f, m in ((jobs / "j-old.json", 0o664), (jobs / "list" / "j-old.json", 0o664), (jobs / "state" / "limits.json", 0o664),
+                 (jobs / "j-tight.json", 0o600)):
+        f.write_text("{}"); os.chmod(f, m)
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", jobs)
+    delib_jobs._tighten_existing()
+    assert all(_mode(jobs / s) == 0o700 for s in ("args", "list", "state"))
+    assert _mode(jobs / "j-old.json") == 0o640 and _mode(jobs / "list" / "j-old.json") == 0o640
+    assert _mode(jobs / "state" / "limits.json") == 0o600
+    assert _mode(jobs / "j-tight.json") == 0o600, "이미 좁은 것을 넓히지 않는다"
+
+
+def test_HA10_읽기는_폴더를_만들지_않는다(monkeypatch, tmp_path):
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_PAUSE", {})
+    assert delib_jobs.pause_info() is None and list(tmp_path.iterdir()) == [], "멈춤을 읽기만 했는데 폴더가 생겼다"
