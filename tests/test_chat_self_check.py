@@ -106,7 +106,7 @@ def test_검토자_입력은_창_안에_들고_자른_근거에는_표지가_붙
     body = msgs[1].content
     assert a._est_tokens_all(msgs[0].content + body) <= 16_000 - 2048, "고친 답을 쓸 몫을 남긴다"
     long_draft = "최대 응력은 321.5 MPa 입니다. " * 250
-    out_room = int(a._est_tokens_all(long_draft) * 1.3) + 1024
+    out_room = a._sc_out_cap(long_draft)          # 검토자 호출에 보내는 출력 상한 그대로(W-9)
     lone = a._self_check_messages(a.ChatRequest(message="최대 응력은?", groups=[], history=[]), long_draft,
                                   [("query_stress", "part=A")], [big])
     used = a._est_tokens_all(lone[0].content + lone[1].content)
@@ -222,7 +222,8 @@ def test_고친_답만_본문으로_나가고_초안은_생각_칸에_남는다(
     assert evs[-2][1] == {"type": "text", "content": body}
     msgs, kw = rv.calls[0]
     assert "max 312.5 MPa" in msgs[1].content and draft in msgs[1].content
-    assert kw == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}, "검토자는 생각을 끈다(CHAT_SELF_CHECK_THINK=0)"
+    assert kw == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}, "max_tokens": a._sc_out_cap(draft)}, \
+        "검토자는 생각을 끄고(CHAT_SELF_CHECK_THINK=0) 출력 상한을 보낸다(W-9)"
 
 
 def test_고칠_것_없으면_초안이_본문이다(monkeypatch):

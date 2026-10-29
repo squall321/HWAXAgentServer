@@ -4037,6 +4037,7 @@ async def _timed_events(events):
 _SELF_CHECK_SHORT = 400          # 이보다 짧고 근거(조회 · 붙인 문서 · 그림)도 수치도 없는 답은 건너뛴다(인사 · 되묻기)
 _SELF_CHECK_MIN_RATIO = 0.4      # 고친 답이 초안의 이 비율보다 짧으면 의심한다 — 검토자가 답을 잘라 먹었다
 _SELF_CHECK_NUMS = 30            # 검토자에게 넘기는 '출처 없는 수치' 의 위쪽
+_SC_OUT_MIN, _SC_OUT_MAX = 2048, 16384      # 검토자 출력 상한의 아래 · 위(W-9)
 _DRAFT_HEAD = "\n\n— 초안(검증 전) —\n"
 _CHECK_HEAD = "\n\n— 검증 —\n"
 _SELF_CHECK_SYS = ("당신은 답변 검토자입니다. 어시스턴트가 쓴 답 초안을 근거와 대조해 틀린 곳만 고칩니다. 근거는 아래 [사용자 질문] · "
@@ -4117,6 +4118,13 @@ def _self_check_skip(req: ChatRequest, draft: str, calls: list) -> bool:
     return len(draft.strip()) < _SELF_CHECK_SHORT and not _sig_numbers(draft)
 
 
+def _sc_out_cap(draft: str) -> int:
+    """검토자 출력 상한(HWAXPortal docs/request-1029 W-9) — 검토자는 고친 답 전체를 쓰므로 초안에 비례한다(초안 토큰 × 2 + 1,024,
+    2,048 ~ 16,384). 상한이 없던 때는 검토 글이 서버 상한(131,072 토큰)까지 늘었다(EX-03 — 한 호출 399초 · 생각 칸 240,960자). 걸리면
+    초안을 낸다(_self_check_judge 의 cut). 고칠 줄만 받는 꼴(W-4)이 들어오면 4,096 으로 줄인다. 본답에는 상한을 두지 않는다(결정 D-6)."""
+    return max(_SC_OUT_MIN, min(_SC_OUT_MAX, 2 * _est_tokens_all(draft) + 1024))
+
+
 def _sc_fit(text: str, tokens: int) -> str:
     """tokens 안에 들게 앞부분만(잘랐으면 _cut_mark 표지 — 검토자가 잘린 근거를 '없다' 로 읽지 않게 지시에 적었다)."""
     if not text or _est_tokens_all(text) <= tokens:
@@ -4164,7 +4172,7 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
     """검토자 입력 — 이 턴의 창(_model_context_tokens — 챗 턴은 두 서버 중 작은 창) 안에서. 고친 답을 쓸 출력 몫을 먼저 떼고, 남는 몫에
     다 들면 그대로, 넘치면 조회 결과 55% · 붙인 문서 25% · 앞 대화 20% 로 나눈다(쓰지 않는 몫은 넘치는 쪽으로 — _sc_shares)."""
     win = _model_context_tokens()
-    out_room = max(2048, int(_est_tokens_all(draft) * 1.3) + 1024)
+    out_room = _sc_out_cap(draft)            # 검토자 호출에 보내는 출력 상한 그대로 — 입력 + 상한이 창에 들어야 한다
     room = max(3000, win - out_room - _est_tokens_all(_SELF_CHECK_SYS + _SELF_CHECK_ASK) - _est_tokens_all(draft) - 2000)
     q = _sc_fit(req.message or "", max(500, room // 10))
     room -= _est_tokens_all(q)
@@ -4247,8 +4255,9 @@ async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: 
     acc, shown, answering = "", 0, False      # 검토자 글 · '생각' 칸에 흘린 데까지 · [답] 표지를 지났나
     cut = False
     model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
-    kw = {} if os.environ.get("CHAT_SELF_CHECK_THINK", "0") == "1" else {
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    kw = {"max_tokens": _sc_out_cap(draft)}
+    if os.environ.get("CHAT_SELF_CHECK_THINK", "0") != "1":
+        kw["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     try:
         msgs = await asyncio.to_thread(_self_check_messages, req, draft, calls, outputs)
         yield _sse("reasoning", {"delta": _CHECK_HEAD})

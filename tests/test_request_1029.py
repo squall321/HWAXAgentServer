@@ -1,10 +1,16 @@
-# HWAXPortal docs/request-1029 의 에이전트 서버 몫 — 코어 어휘표로 만드는 챗 코어 규칙(R-1 · R-2 · R-7 · R-8)
+# HWAXPortal docs/request-1029 의 에이전트 서버 몫 — 코어 어휘표로 만드는 챗 코어 규칙(R-1 · R-2 · R-7 · R-8)과 자기검증 출력 상한(W-9)
 """10-29 cae00 웹 챗 QA — 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성 질문 다섯이 코어를 건너뛰었다(OT-06 ~ 10). 발동 낱말이
-'부품 · 모델 · 과제 · 불량' 뿐이었고(R-1), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다(R-2). 낱말은 포털 리포의 코어 어휘표(정본)에서 읽는다."""
+'부품 · 모델 · 과제 · 불량' 뿐이었고(R-1), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다(R-2). 낱말은 포털 리포의 코어 어휘표(정본)에서 읽는다.
+자기검증 검토자는 출력 상한이 없어 한 호출이 399초 · 240,960자까지 늘었다(EX-03 — W-9)."""
 import json
 import os
+import sys
+from pathlib import Path
 
 import app as a
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_chat_self_check import _Reviewer, _inner, _run, _script, _stats, _text, _turn, fake_llm  # noqa: E402,F401
 
 _REAL = a.CORE_VOCAB_PATH          # 형제 포털 리포의 정본 — conftest 가 시험마다 '없음' 으로 돌리기 전의 기본 경로
 
@@ -72,3 +78,34 @@ def test_어휘표는_바뀐_시각에_다시_읽고_깨지면_기본_글로_돈
     assert a._system_prompt() == a.SYSTEM_PROMPT and a._core_vocab_health()["error"] == "없음"
     out = capsys.readouterr().out
     assert out.count("코어 어휘표") == 2, "깨짐 · 없어짐을 한 번씩 알린다"
+
+
+def test_W9_검토자_출력_상한은_초안에_비례하고_아래_위가_있다():
+    assert a._sc_out_cap("짧은 답") == 2048
+    mid = "최대 응력은 321.5 MPa 입니다. " * 300
+    assert a._sc_out_cap(mid) == 2 * a._est_tokens_all(mid) + 1024 and 2048 < a._sc_out_cap(mid) < 16384
+    assert a._sc_out_cap("가" * 200_000) == 16384
+
+
+def test_W9_검토자_호출에_출력_상한을_보내고_생각을_켜도_보낸다(monkeypatch):
+    draft = "토크는 12.5 N·m 입니다. " * 5
+    rv = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n")
+    _run(monkeypatch, _inner(draft), rv)
+    kw = rv.calls[0][1]
+    assert kw["max_tokens"] == a._sc_out_cap(draft) and kw["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    monkeypatch.setenv("CHAT_SELF_CHECK_THINK", "1")
+    rv2 = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n")
+    _run(monkeypatch, _inner(draft), rv2)
+    assert rv2.calls[0][1] == {"max_tokens": a._sc_out_cap(draft)}, "생각 몫도 상한 안이다 — 끊기면 초안을 낸다"
+
+
+def test_실제_경로_챗은_상한_없이_검토자는_상한으로_가고_시스템_글에_어휘표_규칙이_실린다(monkeypatch, fake_llm):
+    monkeypatch.setattr(a, "CORE_VOCAB_PATH", _REAL)
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
+    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"])
+    evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
+    st = _stats(fake_llm)
+    assert st["calls"] == 2 and _text(evs, "token") == draft
+    assert st["max_tokens"] == [None, a._sc_out_cap(draft)], "본답에는 상한을 두지 않는다(결정 D-6) · 검토자는 W-9 상한"
+    assert "FMEA(사내 규격 · 사례)" in st["systems"][0] and "첫 걸음은 정본의 object_resolve 하나" in st["systems"][0]

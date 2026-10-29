@@ -586,6 +586,10 @@ it. The file is re-read when its mtime changes. Missing or malformed → the bui
 byte). `/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
 Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test).
 
+**Self-check output cap (W-9).** The reviewer call sends `max_tokens` = draft tokens × 2 + 1,024, clamped to
+2,048 ~ 16,384 (langchain-openai sends it as `max_completion_tokens`); the input budget reserves the same amount. A cut
+reply keeps the draft (`self_check.status` `suspect`). The main chat answer has no cap (portal decision D-6).
+
 ### Images (portal docs/chat-depth-context T5)
 
 Images reach the models as `image_url` parts (`vision.py`). **Chat:** images uploaded with a message
