@@ -2,6 +2,7 @@
 """10-29 cae00 웹 챗 QA — 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성 질문 다섯이 코어를 건너뛰었다(OT-06 ~ 10). 발동 낱말이
 '부품 · 모델 · 과제 · 불량' 뿐이었고(R-1), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다(R-2). 낱말은 포털 리포의 코어 어휘표(정본)에서 읽는다.
 자기검증 검토자는 출력 상한이 없어 한 호출이 399초 · 240,960자까지 늘었다(EX-03 — W-9)."""
+import asyncio
 import json
 import os
 import sys
@@ -109,3 +110,75 @@ def test_실제_경로_챗은_상한_없이_검토자는_상한으로_가고_시
     assert st["calls"] == 2 and _text(evs, "token") == draft
     assert st["max_tokens"] == [None, a._sc_out_cap(draft)], "본답에는 상한을 두지 않는다(결정 D-6) · 검토자는 W-9 상한"
     assert "FMEA(사내 규격 · 사례)" in st["systems"][0] and "첫 걸음은 정본의 object_resolve 하나" in st["systems"][0]
+
+
+# ── R-10 · W-5 — 챗 도구 결과의 앱 머리 · 되풀이 꼬리 · 허브의 나머지 큰 응답 접기 ──────────────────────────────────────────
+import json as _json  # noqa: E402
+from collections import Counter as _Counter  # noqa: E402
+
+from langchain_core.tools import StructuredTool as _ST  # noqa: E402
+
+
+def _tool_of(name, text, *, chat=True):
+    async def call(**_kw):
+        return text
+    return a._prep_tool(_ST(name=name, description="d", coroutine=call, args_schema={"type": "object", "properties": {}}),
+                        arg_defaults=a._CHAT_ARG_DEFAULTS if chat else None, chat=chat)
+
+
+def _cache(monkeypatch, mapping, labels):
+    """도구 → 앱 캐시를 앉힌다 — 묻는 함수도 막는다(낡은 캐시면 도구를 묶을 때 떠 있는 게이트웨이에 실제로 물었다)."""
+    apps = {k: {"app": k, "label": v} for k, v in labels.items()}
+    monkeypatch.setitem(a._TOOLS_MAP_CACHE, "map", mapping)
+    monkeypatch.setitem(a._APPS_CACHE, "apps", apps)
+    monkeypatch.setattr(a, "_tools_map", lambda: mapping)
+    monkeypatch.setattr(a, "_gw_apps", lambda: apps)
+
+
+def test_R10_챗_도구_결과_머리에_앱_이름이_붙고_코드가_읽는_길에는_붙지_않는다(monkeypatch):
+    _cache(monkeypatch, {"list_tasks": "heax-kooremapper_mcp", "invoke_tool": "_gateway"},
+           {"heax-kooremapper_mcp": "DynaForge"})
+    out = asyncio.run(_tool_of("list_tasks", '{"items": []}').ainvoke({}))
+    assert out.startswith("[이 결과는 DynaForge 앱의 list_tasks 이다]\n") and out.endswith('{"items": []}')
+    raw = asyncio.run(_tool_of("list_tasks", '{"items": []}', chat=False).ainvoke({}))
+    assert raw == '{"items": []}', "카탈로그 · 심의 길은 결과를 코드가 JSON 으로 읽는다 — 머리를 달면 깨진다"
+    via = asyncio.run(_tool_of("invoke_tool", "결과").ainvoke({"name": "list_tasks", "arguments": {}}))
+    assert via.startswith("[이 결과는 DynaForge 앱의 list_tasks 이다]"), "경유면 안쪽 도구의 앱이다"
+    assert a._evidence_block([("list_tasks", "code=A")], []).count("`list_tasks`(DynaForge) · code=A") == 1
+
+
+def test_W5_같은_도구를_네_번째부터_부르면_앞_결과를_쓰라고_붙인다(monkeypatch):
+    _cache(monkeypatch, {}, {})
+    tok = a._turn_tool_calls.set(_Counter())
+    try:
+        tool = _tool_of("failuretrace_objects_summary", '{"total": 3}')
+        outs = [asyncio.run(tool.ainvoke({})) for _ in range(5)]
+    finally:
+        a._turn_tool_calls.reset(tok)
+    assert all("번째 불렀다" not in o for o in outs[:3])
+    assert "4번째 불렀다" in outs[3] and "5번째 불렀다" in outs[4] and "object_fields" in outs[3]
+    other = _tool_of("search_voc", "voc")
+    tok = a._turn_tool_calls.set(_Counter({"search_voc": 3}))
+    try:
+        o = asyncio.run(other.ainvoke({}))
+    finally:
+        a._turn_tool_calls.reset(tok)
+    assert "4번째 불렀다" in o and "object_fields" not in o, "조건 주소 안내는 허브의 개수 · 목록 도구에만"
+    assert "번째 불렀다" not in asyncio.run(tool.ainvoke({})), "턴 밖(카운터 없음)에서는 붙이지 않는다"
+
+
+def test_W5_허브의_나머지_큰_응답은_긴_목록을_앞부분과_전체_수로_접는다(monkeypatch):
+    big = _json.dumps({"type": "failure_mode", "fields": [{"path": f"in.f{i}", "label": "x" * 400} for i in range(300)]})
+    assert len(big) > a._HUB_BIG_CHARS
+    for name in ("object_fields", "rootdesigndatahub_graph_neighbors", "failuretrace_object_references"):
+        out = a._fold_hub_result(name, big)
+        head, body = out.split("\n", 1)
+        assert head.startswith("[포털 챗이 허브 응답을 접었다 — 긴 목록 1곳에서 항목 250건 뺐다"), head
+        data = _json.loads(body)
+        assert len(data["fields"]) == a._HUB_LIST_HEAD + 1 and "전체 300개 중" in data["fields"][-1]
+        assert data["type"] == "failure_mode"
+    small = _json.dumps({"fields": [{"path": f"in.f{i}"} for i in range(300)]})
+    assert a._fold_hub_result("object_fields", small) == small, "작은 응답은 글자 하나 바꾸지 않는다"
+    assert a._fold_hub_result("object_fields", "표 글 " * 20000) == "표 글 " * 20000, "JSON 이 아니면 그대로"
+    via = asyncio.run(_tool_of("invoke_tool", big).ainvoke({"name": "rootdesigndatahub_object_fields", "arguments": {}}))
+    assert "[포털 챗이 허브 응답을 접었다" in via, "invoke_tool 의 안쪽 이름으로도 접는다"

@@ -20,7 +20,8 @@ def _load() -> dict:
 
     app 전체를 import 하면 LLM·MCP 연결이 필요해 테스트가 환경에 묶인다."""
     src = APP.read_text(encoding="utf-8")
-    ns: dict = {"re": re}
+    # 근거 블록의 앱 라벨(_app_label_cached — 게이트웨이 도구 지도 캐시)은 여기서는 비운다 — 라벨은 tests/test_request_1029.py 가 본다
+    ns: dict = {"re": re, "_app_label_cached": lambda _name: ""}
     blocks = [
         r"_ID_ARG_RE = .*?_TURN_IDS_MAX = \d+",
         r"def _int_tokens.*?\n    return \{int\(m\) for m in _INT_TOK_RE\.findall\(s\)\}",

@@ -147,7 +147,7 @@ def test_HA24_invoke_tool_로_불러도_같다():
 
 def test_HA24_챗_도구_로드가_기본값을_싣는다():
     src = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert "_raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS) for t in _got]" in src
+    assert "_raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS, chat=True) for t in _got]" in src   # chat — 앱 머리 · 되풀이 꼬리(request-1029 R-10 · W-5)
 
 
 # ── HA-01 — 무캡 경로가 예산 때문에 잘랐으면 턴마다 원본에서 다시 고른다(캐시 키에 질의 · 핀이 없다) ─────────────────────

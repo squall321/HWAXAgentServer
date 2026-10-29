@@ -1273,6 +1273,10 @@ _turn_images: contextvars.ContextVar = contextvars.ContextVar("turn_images", def
 # 데이터를 받아오는 것)는 코드로 결정적으로 막는다 — 실측: test_id=1 → SUS201_annealed 카드를
 # 받아 'Al6061-T6' 라벨로 재출력. 빈 결과보다 나쁜 '확신에 찬 오답'이다.
 _turn_ids: contextvars.ContextVar = contextvars.ContextVar("turn_ids", default=None)
+# 이번 턴에 도구마다 부른 수(노출 이름 → 횟수) — 같은 도구를 네 번째 부르면 결과에 '앞 결과를 써라' 를 붙인다(HWAXPortal docs/request-1029 W-5).
+# 10-29 QA 에서 objects_summary 를 한 턴에 7번(셋은 조건 주소 오류) · failuretrace_objects_summary 를 10번(각 약 10만 자) 불렀다.
+_turn_tool_calls: contextvars.ContextVar = contextvars.ContextVar("turn_tool_calls", default=None)
+_TOOL_REPEAT_NOTE_AT = 4
 # 식별자 인자 이름 — id, test_id, material_id, job_id …
 _ID_ARG_RE = re.compile(r"^(id|.*_id)$")
 # 독립된 정수 토큰만 — \d+ 로 잡으면 "Al6061-T6" 의 부분수열 1 이 test_id=1 을 통과시킨다.
@@ -1449,7 +1453,8 @@ def _evidence_block(calls: list, unsourced: list) -> str:
         return ""
     lines = ["\n\n---", _EVIDENCE_MARK]
     for name, args in calls[:8]:
-        lines.append(f"- `{name}`" + (f" · {args}" if args else ""))
+        _lab = _app_label_cached(name)          # 어느 앱의 결과인지(R-10 — 접두 없는 이름을 다른 앱 것으로 읽었다)
+        lines.append(f"- `{name}`" + (f"({_lab})" if _lab else "") + (f" · {args}" if args else ""))
     if len(calls) > 8:
         lines.append(f"- … 외 {len(calls) - 8}건")
     if unsourced:
@@ -1571,10 +1576,47 @@ def _arg_defaults_for(name, table) -> tuple[dict, str] | None:
 _HUB_RELATED_HEAD = 5
 _HUB_FOLD = (("objects_summary", ("group_options",), False), ("objects_list", ("ref_labels", "properties_schema"), False),
              ("object_get", (), True))
+# 허브의 나머지 큰 응답(graph_neighbors · object_fields · object_references — HWAXPortal docs/request-1029 W-5, OT-11 object_fields 217,122자)은
+# 칸 모양을 본 적이 없다(견본 O-12 전). 그래서 칸 이름이 아니라 일반 규칙이다 — 응답이 _HUB_BIG_CHARS 를 넘을 때만, 길이가 _HUB_LIST_HEAD 를
+# 넘는 배열을 앞 _HUB_LIST_HEAD 개와 '전체 N개 중' 한 줄로 줄인다. 배열은 배열로 둔다(개수는 남는다).
+_HUB_FOLD_LISTS = ("graph_neighbors", "object_fields", "object_references")
+_HUB_BIG_CHARS = 60_000
+_HUB_LIST_HEAD = 50
+
+
+def _fold_hub_lists(text: str) -> str:
+    if len(text) <= _HUB_BIG_CHARS:
+        return text
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text
+    cut = {"lists": 0, "items": 0}
+
+    def walk(v):
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            if len(v) > _HUB_LIST_HEAD:
+                cut["lists"] += 1
+                cut["items"] += len(v) - _HUB_LIST_HEAD
+                return [walk(x) for x in v[:_HUB_LIST_HEAD]] + [
+                    f"…[전체 {len(v):,}개 중 앞 {_HUB_LIST_HEAD}개만 실었다 — 나머지는 조건을 좁혀 다시 조회]"]
+            return [walk(x) for x in v]
+        return v
+
+    folded = walk(data)
+    if not cut["lists"]:
+        return text
+    return (f"[포털 챗이 허브 응답을 접었다 — 긴 목록 {cut['lists']:,}곳에서 항목 {cut['items']:,}건 뺐다 · 원문 {len(text):,}자]\n"
+            + json.dumps(folded, ensure_ascii=False))
 
 
 def _fold_hub_result(name, text):
     n = str(name or "").strip().lower()
+    if (isinstance(text, str) and text.lstrip().startswith(("{", "["))
+            and any(n == t or n.endswith("_" + t) for t in _HUB_FOLD_LISTS)):
+        return _fold_hub_lists(text)
     rule = next((r for r in _HUB_FOLD if n == r[0] or n.endswith("_" + r[0])), None)
     if rule is None or not isinstance(text, str) or not text.lstrip().startswith(("{", "[")):
         return text
@@ -1624,11 +1666,40 @@ def _fold_hub_result(name, text):
     return f"[포털 챗이 허브 응답을 접었다 — {what} 뺐다 · 원문 {len(text):,}자]\n" + json.dumps(folded, ensure_ascii=False)
 
 
-def _cap_tool(tool, result_max=None, arg_defaults=None):
+def _app_label_cached(name: str) -> str:
+    """도구 노출 이름 → 앱 라벨 — 캐시만 본다(도구 결과마다 부르므로 게이트웨이에 묻지 않는다. 캐시는 이 턴의 도구를 묶을 때 채웠다)."""
+    key = (_TOOLS_MAP_CACHE.get("map") or {}).get(name, "")
+    if not key:
+        return ""
+    a = (_APPS_CACHE.get("apps") or {}).get(key) or {}
+    return (a.get("label") or "").strip() or _GROUP_LABEL.get(key) or _pretty_group(key)
+
+
+def _chat_result_note(name: str) -> tuple[str, str]:
+    """챗 도구 결과의 (머리, 꼬리). 머리는 '이 결과는 ○○ 앱' 이다(HWAXPortal docs/request-1029 R-10) — 도구 설명 앞 라벨만으로는 접두 없는
+    이름(DynaForge 의 list_tasks · ontology_sync_state …)을 다른 앱 것으로 읽었다(EX-05). 꼬리는 같은 도구를 이 턴에 네 번째부터 부를 때
+    '앞 결과를 써라' 다(W-5). 허브의 개수 · 목록 도구에는 조건 주소를 object_fields 로 보라고 덧붙인다(OT-11 APP-OBJECTS-0073 셋)."""
+    label = _app_label_cached(name)
+    head = f"[이 결과는 {label} 앱의 {name} 이다]\n" if label else ""
+    cnt = _turn_tool_calls.get()
+    if cnt is None:
+        return head, ""
+    cnt[name] += 1
+    if cnt[name] < _TOOL_REPEAT_NOTE_AT:
+        return head, ""
+    tail = (f"\n[이 턴에 {name} 를 {cnt[name]}번째 불렀다 — 앞 결과로 답할 수 있는지 먼저 보라. 같은 조건으로 다시 부르면 결과가 같다")
+    n = name.lower()
+    if any(n == t or n.endswith("_" + t) for t in ("objects_summary", "objects_list")):
+        tail += " · 조건 주소(in.applies_to_part 꼴)를 모르면 object_fields 로 확인하고 부른다"
+    return head, tail + "]"
+
+
+def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
     프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384).
     result_max 를 주면 그 값으로 절단한다(결정적 JSON 조회는 CATALOG_RESULT_MAX 를 넘긴다).
-    arg_defaults 를 주면(챗 경로 — _CHAT_ARG_DEFAULTS) 모델이 주지 않은 인자를 그 값으로 채운다."""
+    arg_defaults 를 주면(챗 경로 — _CHAT_ARG_DEFAULTS) 모델이 주지 않은 인자를 그 값으로 채운다.
+    chat 이면(챗에 묶는 도구만 — 결과를 코드가 JSON 으로 읽는 길에는 주지 않는다) 결과에 앱 머리 · 되풀이 꼬리를 단다(_chat_result_note)."""
     orig = tool.coroutine
     if orig is None:
         return tool
@@ -1793,13 +1864,18 @@ def _cap_tool(tool, result_max=None, arg_defaults=None):
                         "사용자에게 해당 백엔드가 일시적으로 불가하다고 알려라.")
             # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
             return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
+        # 접기 · 앱 머리 · 되풀이 꼬리는 경유(invoke_tool)면 안쪽 도구 이름으로 본다
+        _eff = getattr(tool, "name", "")
+        if _eff == "invoke_tool" and isinstance(kw.get("name"), str):
+            _eff = kw["name"]
+        _head, _tail = _chat_result_note(_eff) if chat else ("", "")
         if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            body = _maybe_repair_hint(_cap(_fold_hub_result(getattr(tool, "name", ""), _norm(out[0])), result_max))
+            body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, _norm(out[0])), result_max))
             _learn_ids(body)
-            return (body, out[1])
-        body = _maybe_repair_hint(_cap(_fold_hub_result(getattr(tool, "name", ""), _norm(out)), result_max))
+            return (_head + body + _tail, out[1])
+        body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, _norm(out)), result_max))
         _learn_ids(body)
-        return body
+        return _head + body + _tail
 
     tool.coroutine = capped
     return tool
@@ -1871,10 +1947,10 @@ def _attach_validation_hint(tool):
     return tool
 
 
-def _prep_tool(tool, result_max=None, desc_max=None, arg_defaults=None):
+def _prep_tool(tool, result_max=None, desc_max=None, arg_defaults=None, chat=False):
     """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
-    result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값. arg_defaults 는 챗 경로만 준다(_CHAT_ARG_DEFAULTS)."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max, arg_defaults)
+    result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값. arg_defaults · chat 은 챗 경로만 준다(_CHAT_ARG_DEFAULTS)."""
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max, arg_defaults, chat)
 
 
 # ── 컨텍스트 예산 (운영 타깃 = GLM on B300, 128K 창 기준) ────────────────────────────
@@ -2783,7 +2859,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     print(f"[agent] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({degraded})")
                     scoped = _with_groups(connections, sorted(groups), user, "")
                     _got = await _get_tools_retry(scoped)
-                _raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS) for t in _got]
+                _raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS, chat=True) for t in _got]
                 # 성공분을 스냅샷에 보관(source 게이트·select 전 순수 목록) — 다음 불통 때
                 # 폴백 재료다. 사용자 신원 키라 남에게 재사용되지 않는다.
                 if _raw:
@@ -4575,6 +4651,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             continue
         _seed_ids |= _int_tokens(_hc)
     _turn_ids.set(_seed_ids)
+    _turn_tool_calls.set(Counter())
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
     # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
