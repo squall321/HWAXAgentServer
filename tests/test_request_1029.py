@@ -81,34 +81,28 @@ def test_어휘표는_바뀐_시각에_다시_읽고_깨지면_기본_글로_돈
     assert out.count("코어 어휘표") == 2, "깨짐 · 없어짐을 한 번씩 알린다"
 
 
-def test_W9_검토자_출력_상한은_초안에_비례하고_아래_위가_있다():
-    assert a._sc_out_cap("짧은 답") == 2048
-    mid = "최대 응력은 321.5 MPa 입니다. " * 300
-    assert a._sc_out_cap(mid) == 2 * a._est_tokens_all(mid) + 1024 and 2048 < a._sc_out_cap(mid) < 16384
-    assert a._sc_out_cap("가" * 200_000) == 16384
-
-
-def test_W9_검토자_호출에_출력_상한을_보내고_생각을_켜도_보낸다(monkeypatch):
-    draft = "토크는 12.5 N·m 입니다. " * 5
-    rv = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n")
-    _run(monkeypatch, _inner(draft), rv)
-    kw = rv.calls[0][1]
-    assert kw["max_tokens"] == a._sc_out_cap(draft) and kw["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+def test_W9_W4_검토자_호출에_출력_상한_4096_을_보내고_생각을_켜도_보낸다(monkeypatch):
+    """W-4 로 검토자가 바꿀 곳만 쓰게 된 뒤 초안 비례 상한(2,048 ~ 16,384)을 4,096 으로 줄였다(요청서 W-9 의 권장값)."""
+    for draft in ("토크는 12.5 N·m 입니다. " * 5, "최대 응력은 321.5 MPa 입니다. " * 300):
+        rv = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n")
+        _run(monkeypatch, _inner(draft), rv)
+        kw = rv.calls[0][1]
+        assert kw["max_tokens"] == 4096 and kw["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}, "초안 길이와 상관없다"
     monkeypatch.setenv("CHAT_SELF_CHECK_THINK", "1")
-    rv2 = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n")
-    _run(monkeypatch, _inner(draft), rv2)
-    assert rv2.calls[0][1] == {"max_tokens": a._sc_out_cap(draft)}, "생각 몫도 상한 안이다 — 끊기면 초안을 낸다"
+    rv2 = _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n")
+    _run(monkeypatch, _inner("토크는 12.5 N·m 입니다."), rv2)
+    assert rv2.calls[0][1] == {"max_tokens": 4096}, "생각 몫도 상한 안이다 — 끊기면 초안을 낸다"
 
 
 def test_실제_경로_챗은_상한_없이_검토자는_상한으로_가고_시스템_글에_어휘표_규칙이_실린다(monkeypatch, fake_llm):
     monkeypatch.setattr(a, "CORE_VOCAB_PATH", _REAL)
     monkeypatch.setenv("CHAT_SELF_CHECK", "1")
     draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
-    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"])
+    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n"])
     evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
     st = _stats(fake_llm)
     assert st["calls"] == 2 and _text(evs, "token") == draft
-    assert st["max_tokens"] == [None, a._sc_out_cap(draft)], "본답에는 상한을 두지 않는다(결정 D-6) · 검토자는 W-9 상한"
+    assert st["max_tokens"] == [None, 4096], "본답에는 상한을 두지 않는다(결정 D-6) · 검토자는 W-9 · W-4 상한"
     assert "FMEA(사내 규격 · 사례)" in st["systems"][0] and "첫 걸음은 정본의 object_resolve 하나" in st["systems"][0]
 
 
@@ -215,7 +209,7 @@ def test_W1_실제_경로_한_턴의_챗_호출과_검토자_호출이_같은_�
     import hashlib
     monkeypatch.setenv("CHAT_SELF_CHECK", "1")
     draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
-    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"])
+    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n"])
     orig = a._agent_stream
 
     def with_conv(app_, req):                          # 포털이 서버 대화 id 를 실은 요청
@@ -286,3 +280,42 @@ def test_W2_예산_손잡이를_주면_그_값이고_비면_창의_45퍼센트�
     monkeypatch.setattr(a, "CHAT_TOOL_SCHEMA_BUDGET", 30_000)
     a._select_tools(tools, "질문")
     assert seen["budget"] == 30_000
+
+
+# ── W-4 — 자기검증 고침은 바꿀 곳만 받아 초안에 넣는다(못 넣으면 초안) ─────────────────────────────────────────────────────────
+def test_W4_바꿀_곳은_초안의_좌표로_한꺼번에_넣고_띄어쓰기만_다르면_찾는다():
+    draft = "| 부품 | 응력 |\n|---|---|\n| A | 321.5 MPa |\n\nA 의 안전율은 1.8 입니다. 결론은 A 가 위험하다는 것입니다."
+    got, why = a._sc_apply(draft, [("결론은 A 가 위험하다는 것입니다.", "결론은 A 가 안전하다는 것입니다."),
+                                   ("|  A  |  321.5 MPa |", "| A | 312.5 MPa |"),
+                                   ("안전율은 1.8 입니다.", "안전율은 1.8 입니다(조회 결과 1). 여유는 0.8 입니다.")])
+    assert why == "" and got == ("| 부품 | 응력 |\n|---|---|\n| A | 312.5 MPa |\n\nA 의 안전율은 1.8 입니다(조회 결과 1). 여유는 0.8 입니다. "
+                                 "결론은 A 가 안전하다는 것입니다."), "적은 차례와 상관없이 · 띄어쓰기만 다르게 옮긴 원문도 · 더하기는 원문 뒤에 이어"
+    assert a._sc_apply(draft, [("안전율은 1.8", "안전율은 2.0"), ("1.8 입니다", "x")]) == ("", "바꿀 곳끼리 겹친다")
+    assert a._sc_apply(draft, [("A", "B")])[1] == "바꿀 곳이 초안에 3번 나온다", "여러 곳이면 넣지 않는다 — 어느 것인지 모른다"
+
+
+def _review_prompt(fake_llm) -> str:
+    return _stats(fake_llm)["humans"][1]
+
+
+def test_W4_실제_경로_검토자는_바꿀_곳만_쓰고_본문은_초안에_넣은_고친_답이다(monkeypatch, fake_llm):
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다. 와셔는 쓰지 않습니다."
+    _script(fake_llm, [draft, "[판정] 고침\n[고친 점]\n- 12.5 는 근거가 없어 추정으로 표시\n[바꿀 곳]\n[원문]\n12.5 N·m 입니다.\n"
+                              "[새 글]\n12.5 N·m (근거 없음 — 추정) 입니다."])
+    evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
+    assert _text(evs, "token") == "M3 나사의 권장 체결 토크는 12.5 N·m (근거 없음 — 추정) 입니다. 와셔는 쓰지 않습니다."
+    sc = [d for e, d in evs if e == "meta"][-1]["self_check"]
+    assert sc["status"] == "fixed" and sc["fixes"] == ["12.5 는 근거가 없어 추정으로 표시"]
+    ask = _review_prompt(fake_llm)
+    assert "고친 답 전체를 다시 쓰지 마라" in ask and "[원문]" in ask and "[새 글]" in ask and "[답]\n" not in ask
+
+
+def test_W4_실제_경로_바꿀_곳을_초안에서_못_찾으면_초안을_내고_까닭을_적는다(monkeypatch, fake_llm):
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
+    _script(fake_llm, [draft, "[판정] 고침\n[고친 점]\n- x\n[바꿀 곳]\n[원문]\nM4 나사의 토크는 12.5\n[새 글]\nM4 나사의 토크는 15.2"])
+    evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
+    assert _text(evs, "token") == draft
+    sc = [d for e, d in evs if e == "meta"][-1]["self_check"]
+    assert sc["status"] == "suspect" and "찾지 못했다" in sc["reason"] and sc["fixes"] == ["x"], sc

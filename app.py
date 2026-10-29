@@ -4206,7 +4206,9 @@ async def _timed_events(events):
 _SELF_CHECK_SHORT = 400          # 이보다 짧고 근거(조회 · 붙인 문서 · 그림)도 수치도 없는 답은 건너뛴다(인사 · 되묻기)
 _SELF_CHECK_MIN_RATIO = 0.4      # 고친 답이 초안의 이 비율보다 짧으면 의심한다 — 검토자가 답을 잘라 먹었다
 _SELF_CHECK_NUMS = 30            # 검토자에게 넘기는 '출처 없는 수치' 의 위쪽
-_SC_OUT_MIN, _SC_OUT_MAX = 2048, 16384      # 검토자 출력 상한의 아래 · 위(W-9)
+# 검토자 출력 상한(토큰, HWAXPortal docs/request-1029 W-9 · W-4). 검토자는 고친 답 전체가 아니라 바꿀 곳만 쓴다(W-4) — 상한이 없던 때는 검토 글이
+# 서버 상한(131,072 토큰)까지 늘었다(EX-03 — 한 호출 399초). 걸리면 초안을 낸다(_self_check_judge 의 cut). 본답에는 상한을 두지 않는다(결정 D-6).
+_SC_OUT_CAP = 4096
 _DRAFT_HEAD = "\n\n— 초안(검증 전) —\n"
 _CHECK_HEAD = "\n\n— 검증 —\n"
 _SELF_CHECK_SYS = ("당신은 답변 검토자입니다. 어시스턴트가 쓴 답 초안을 근거와 대조해 틀린 곳만 고칩니다. 근거는 아래 [사용자 질문] · "
@@ -4220,10 +4222,12 @@ _SELF_CHECK_ASK = (
     "⑤ 조회해 놓고 빠뜨린 중요한 결과 — 답에 더하라.\n"
     "고칠 곳만 고치고 나머지는 글자 그대로 둔다. 말투 · 형식(표 · 목록 · 그림 링크 ![…](…) · 출처 표기)을 바꾸지 마라. 근거가 잘려 있으면"
     "(…[N자 중 앞 M자]) 그 뒤에 있을 수 있는 내용은 지우지 말고 그대로 둔다.\n\n"
-    "아래 꼴로만 답하라.\n"
+    "아래 꼴로만 답하라. 고친 답 전체를 다시 쓰지 마라 — 바꿀 곳만 적으면 초안에 넣어 준다.\n"
     "[판정] 고칠 것 없음  또는  [판정] 고침\n"
     "[고친 점]\n- 한 줄에 하나(무엇을 왜 — 근거). 고칠 것이 없으면 '- 없음'\n"
-    "[답]\n고친 답 전체(고칠 것이 없으면 비워 둔다)")
+    "[바꿀 곳](고칠 것이 없으면 이 칸을 쓰지 않는다. 바꿀 곳마다 [원문] · [새 글] 한 쌍을 쓴다)\n"
+    "[원문]\n초안의 글을 글자 그대로(초안에 한 번만 나오도록 앞뒤 낱말을 조금 넣는다)\n"
+    "[새 글]\n그 글을 고친 것(지우려면 비워 둔다. 더하려면 원문을 그대로 쓰고 그 뒤에 이어 쓴다)")
 # 조회 결과도 붙인 문서도 없는 턴 — ② 를 '일반 지식 수치는 표시하지 않는다' 로 바꾼다. 위 ② 를 그대로 주면 '도구 없는 턴' 머리(① ③ ④ 만
 # 본다)와 어긋나, 검토자가 일반 지식 수치마다 '(근거 없음 — 추정)' 을 달고 '고침' 으로 판정했다(HWAXPortal docs/request-1027 HA-12).
 _SC_ASK_EVIDENCE_LINE = "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라.\n"
@@ -4232,7 +4236,7 @@ _SELF_CHECK_ASK_NO_EVIDENCE = _SELF_CHECK_ASK.replace(
     "② 이번 턴에는 대조할 조회 결과 · 붙인 문서가 없다 — 일반 지식으로 쓴 수치 · 사실에 표시를 달지 말고 지우지도 마라"
     "(앞 대화와 어긋나는 것만 ③ 으로 고친다).\n")
 _SC_VERDICT = re.compile(r"\[판정\]\s*([^\n]*)")
-_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[답\]|\Z)", re.S)
+_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[바꿀 곳\]|\Z)", re.S)
 _SC_IMG = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
@@ -4304,13 +4308,6 @@ def _self_check_skip(req: ChatRequest, draft: str, calls: list) -> bool:
     return len(draft.strip()) < _SELF_CHECK_SHORT and not _sig_numbers(draft)
 
 
-def _sc_out_cap(draft: str) -> int:
-    """검토자 출력 상한(HWAXPortal docs/request-1029 W-9) — 검토자는 고친 답 전체를 쓰므로 초안에 비례한다(초안 토큰 × 2 + 1,024,
-    2,048 ~ 16,384). 상한이 없던 때는 검토 글이 서버 상한(131,072 토큰)까지 늘었다(EX-03 — 한 호출 399초 · 생각 칸 240,960자). 걸리면
-    초안을 낸다(_self_check_judge 의 cut). 고칠 줄만 받는 꼴(W-4)이 들어오면 4,096 으로 줄인다. 본답에는 상한을 두지 않는다(결정 D-6)."""
-    return max(_SC_OUT_MIN, min(_SC_OUT_MAX, 2 * _est_tokens_all(draft) + 1024))
-
-
 def _sc_fit(text: str, tokens: int) -> str:
     """tokens 안에 들게 앞부분만(잘랐으면 _cut_mark 표지 — 검토자가 잘린 근거를 '없다' 로 읽지 않게 지시에 적었다)."""
     if not text or _est_tokens_all(text) <= tokens:
@@ -4358,7 +4355,7 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
     """검토자 입력 — 이 턴의 창(_model_context_tokens — 챗 턴은 두 서버 중 작은 창) 안에서. 고친 답을 쓸 출력 몫을 먼저 떼고, 남는 몫에
     다 들면 그대로, 넘치면 조회 결과 55% · 붙인 문서 25% · 앞 대화 20% 로 나눈다(쓰지 않는 몫은 넘치는 쪽으로 — _sc_shares)."""
     win = _model_context_tokens()
-    out_room = _sc_out_cap(draft)            # 검토자 호출에 보내는 출력 상한 그대로 — 입력 + 상한이 창에 들어야 한다
+    out_room = _SC_OUT_CAP                   # 검토자 호출에 보내는 출력 상한 그대로 — 입력 + 상한이 창에 들어야 한다
     room = max(3000, win - out_room - _est_tokens_all(_SELF_CHECK_SYS + _SELF_CHECK_ASK) - _est_tokens_all(draft) - 2000)
     q = _sc_fit(req.message or "", max(500, room // 10))
     room -= _est_tokens_all(q)
@@ -4397,8 +4394,8 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
     return [SystemMessage(content=_SELF_CHECK_SYS), HumanMessage(content="\n\n".join(blocks))]
 
 
-def _self_check_parse(out: str) -> tuple[str | None, list, str]:
-    """검토자 답 → (판정 'ok' · 'fixed' · 못 읽으면 None, 고친 점들, 고친 답)."""
+def _self_check_parse(out: str) -> tuple[str | None, list, list | None]:
+    """검토자 답 → (판정 'ok' · 'fixed' · 못 읽으면 None, 고친 점들, 바꿀 곳 [(원문, 새 글)] — 쌍의 꼴이 깨졌으면 None)."""
     m = _SC_VERDICT.search(out or "")
     if not m:
         return None, [], ""
@@ -4412,24 +4409,56 @@ def _self_check_parse(out: str) -> tuple[str | None, list, str]:
             t = t[1:].strip()
             if t and t not in ("없음", "없음."):
                 fixes.append(t[:400])
-    ans = out.split("[답]", 1)[1].strip() if "[답]" in out else ""
-    return verdict, fixes[:20], ans
+    patches: list | None = []
+    for part in (out.split("[바꿀 곳]", 1)[1].split("[원문]")[1:] if "[바꿀 곳]" in out else []):
+        if "[새 글]" not in part:
+            patches = None
+            break
+        old, new = part.split("[새 글]", 1)
+        patches.append((old.strip(), new.strip()))
+    return verdict, fixes[:20], patches
 
 
-def _self_check_judge(draft: str, verdict: str | None, fixes: list, ans: str, cut: bool) -> tuple[str, dict]:
-    """검토자 판정 → (낼 답, meta.self_check). 고친 답이 수상하면 초안을 그대로 내고 까닭을 적는다(고칠 점은 보인다)."""
+def _sc_apply(draft: str, patches: list) -> tuple[str, str]:
+    """바꿀 곳을 초안에 넣는다 → (고친 답, '') 또는 ('', 까닭). 원문은 초안에서 한 곳만 찾아야 한다 — 띄어쓰기 · 줄바꿈만 다르게 옮겼으면
+    그것까지는 찾는다. 하나라도 못 넣으면(없음 · 여러 곳 · 겹침) 아무것도 넣지 않는다 — 일부만 고친 답은 앞뒤가 어긋난다(W-4)."""
+    spans = []
+    for old, new in patches:
+        if not old:
+            return "", "바꿀 곳의 원문이 비었다"
+        hits = [m.span() for m in re.finditer(re.escape(old), draft)]
+        if not hits:
+            hits = [m.span() for m in re.finditer(r"\s+".join(map(re.escape, old.split())), draft)]
+        if len(hits) != 1:
+            return "", "바꿀 곳을 초안에서 찾지 못했다" if not hits else f"바꿀 곳이 초안에 {len(hits)}번 나온다"
+        spans.append((*hits[0], new))
+    spans.sort(key=lambda x: x[0])
+    if any(b[0] < a[1] for a, b in zip(spans, spans[1:])):
+        return "", "바꿀 곳끼리 겹친다"
+    out = draft
+    for start, end, new in reversed(spans):
+        out = out[:start] + new + out[end:]
+    return out, ""
+
+
+def _self_check_judge(draft: str, verdict: str | None, fixes: list, patches: list | None, cut: bool) -> tuple[str, dict]:
+    """검토자 판정 → (낼 답, meta.self_check). 바꿀 곳을 못 넣거나 고친 답이 수상하면 초안을 그대로 내고 까닭을 적는다(고칠 점은 보인다)."""
     if verdict is None:
         return draft, {"status": "unreadable", "reason": "검토자 답을 읽지 못했다 — 초안을 그대로 냈다"}
     if verdict == "ok":
         return draft, {"status": "ok"}
-    why = ""
+    why, ans = "", ""
     if cut:
         why = "검토자 답이 출력 상한에서 끊겼다"
-    elif not ans:
-        why = "고친 답이 비었다"
-    elif len(ans) < len(draft) * _SELF_CHECK_MIN_RATIO:
-        why = f"고친 답이 초안보다 지나치게 짧다({len(draft):,}자 → {len(ans):,}자)"
+    elif patches is None:
+        why = "바꿀 곳의 꼴을 읽지 못했다([원문] 뒤에 [새 글] 이 없다)"
+    elif not patches:
+        why = "고친다고 했지만 바꿀 곳이 없다"
     else:
+        ans, why = _sc_apply(draft, patches)
+    if not why and len(ans) < len(draft) * _SELF_CHECK_MIN_RATIO:
+        why = f"고친 답이 초안보다 지나치게 짧다({len(draft):,}자 → {len(ans):,}자)"
+    if not why:
         lost = [u for u in dict.fromkeys(_SC_IMG.findall(draft)) if u not in ans]
         if lost:
             why = f"고친 답이 초안의 그림 {len(lost)}개를 잃었다"
@@ -4443,10 +4472,9 @@ def _self_check_judge(draft: str, verdict: str | None, fixes: list, ans: str, cu
 async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: list, outputs: list, res: dict):
     """검토자를 부른다 — 글은 '생각 중' 칸으로 흘리고, 끝나면 res 에 final · check 를 둔다. 실패해도 초안이 나간다."""
     llm = _chat_llm_of(app)
-    acc, shown, answering = "", 0, False      # 검토자 글 · '생각' 칸에 흘린 데까지 · [답] 표지를 지났나
-    cut = False
+    acc, cut = "", False
     model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
-    kw = {"max_tokens": _sc_out_cap(draft)}
+    kw = {"max_tokens": _SC_OUT_CAP}
     if os.environ.get("CHAT_SELF_CHECK_THINK", "0") != "1":
         kw["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     try:
@@ -4459,22 +4487,10 @@ async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: 
             c = getattr(ch, "content", "") or ""
             if isinstance(c, list):
                 c = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
-            if c and not answering:
-                # 판정 · 고친 점은 '생각' 칸에 흘리고, [답] 뒤(고친 답 전체)는 흘리지 않는다 — 끝나면 본문으로 나간다(같은 글이 두 번 보이지 않게).
-                # 표지가 조각 경계에 걸칠 수 있어 끝 두 자는 다음 조각까지 쥔다.
+            if c:
+                # 판정 · 고친 점 · 바꿀 곳을 그대로 '생각' 칸에 흘린다 — 바꿀 곳은 짧고(W-4), 무엇을 고쳤는지 그 칸에서 보인다.
                 acc += c
-                k = acc.find("[답]", max(0, shown - 2))
-                if k >= 0:
-                    answering = True
-                    if acc[shown:k]:
-                        yield _sse("reasoning", {"delta": acc[shown:k]})
-                    yield _sse("reasoning", {"delta": "[답] — 고친 답은 본문에 냅니다"})
-                    yield _sse("status", {"step": "고친 답을 쓰는 중 — 다 쓰면 본문에 냅니다", "tool": None})
-                elif len(acc) - 2 > shown:
-                    yield _sse("reasoning", {"delta": acc[shown:len(acc) - 2]})
-                    shown = len(acc) - 2
-            elif c:
-                acc += c
+                yield _sse("reasoning", {"delta": c})
             md = getattr(ch, "response_metadata", None) or {}
             if md.get("finish_reason") == "length":
                 cut = True
@@ -4485,10 +4501,8 @@ async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: 
         res.update(final=draft, check={"status": "failed", "reason": f"검토자 호출 실패({type(exc).__name__}) — 초안을 그대로 냈다"},
                    model=None)
         return
-    if not answering and acc[shown:]:
-        yield _sse("reasoning", {"delta": acc[shown:]})
-    verdict, fixes, ans = _self_check_parse(acc)
-    final, check = _self_check_judge(draft, verdict, fixes, ans, cut)
+    verdict, fixes, patches = _self_check_parse(acc)
+    final, check = _self_check_judge(draft, verdict, fixes, patches, cut)
     res.update(final=final, check=check, model=str(model) if model else None)
 
 

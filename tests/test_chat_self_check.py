@@ -62,25 +62,33 @@ def test_기본은_켬이고_0_만_끈다(monkeypatch):
 
 
 def test_판정_읽기():
-    assert a._self_check_parse("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n") == ("ok", [], "")
-    v, fx, ans = a._self_check_parse("[판정] **고침**\n[고친 점]\n- 12.5 를 근거대로 15.2 로\n- 빠진 ② 를 채움\n[답]\n고친 답 전체")
-    assert (v, fx, ans) == ("fixed", ["12.5 를 근거대로 15.2 로", "빠진 ② 를 채움"], "고친 답 전체")
-    assert a._self_check_parse("[판정] 고침 없음\n[답]\n")[0] == "ok"
+    assert a._self_check_parse("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n") == ("ok", [], [])
+    v, fx, pt = a._self_check_parse("[판정] **고침**\n[고친 점]\n- 12.5 를 근거대로 15.2 로\n- 지울 문장을 지움\n"
+                                    "[바꿀 곳](바꿀 곳마다 한 쌍)\n[원문]\n토크는 12.5 N·m\n[새 글]\n토크는 15.2 N·m\n- 와셔를 쓴다\n\n[원문]\n지울 문장.\n[새 글]\n")
+    assert (v, fx) == ("fixed", ["12.5 를 근거대로 15.2 로", "지울 문장을 지움"]), "고친 점은 [바꿀 곳] 앞에서 끝난다(새 글의 목록 줄은 고친 점이 아니다)"
+    assert pt == [("토크는 12.5 N·m", "토크는 15.2 N·m\n- 와셔를 쓴다"), ("지울 문장.", "")]
+    assert a._self_check_parse("[판정] 고침\n[바꿀 곳]\n[원문]\n새 글 표지가 없다")[2] is None, "쌍의 꼴이 깨졌다"
+    assert a._self_check_parse("[판정] 고침 없음\n")[0] == "ok"
     assert a._self_check_parse("판정을 못 하겠습니다")[0] is None
 
 
-def test_가드는_수상한_고친_답_대신_초안을_내고_까닭을_적는다():
-    draft = "결론은 이렇다. " * 30 + "\n![응력](/artifacts/a.png)"
-    ans_ok = draft.replace("이렇다", "저렇다")
-    assert a._self_check_judge(draft, None, [], "", False) == (draft, {"status": "unreadable",
+def test_가드는_바꿀_곳을_못_넣거나_고친_답이_수상하면_초안을_내고_까닭을_적는다():
+    draft = "결론은 이렇다. " * 30 + "끝 문장은 A 다.\n![응력](/artifacts/a.png)"
+    good = [("끝 문장은 A 다.", "끝 문장은 B 다.")]
+    assert a._self_check_judge(draft, None, [], [], False) == (draft, {"status": "unreadable",
                                                                       "reason": "검토자 답을 읽지 못했다 — 초안을 그대로 냈다"})
-    assert a._self_check_judge(draft, "ok", [], "", False) == (draft, {"status": "ok"})
-    assert a._self_check_judge(draft, "fixed", ["x"], ans_ok, False) == (ans_ok, {"status": "fixed", "fixes": ["x"]})
-    for ans, cut, why in ((ans_ok, True, "끊겼다"), ("", False, "비었다"), ("짧다", False, "지나치게 짧다"),
-                          (ans_ok.replace("![응력](/artifacts/a.png)", ""), False, "그림 1개를 잃었다")):
-        final, check = a._self_check_judge(draft, "fixed", ["x"], ans, cut)
+    assert a._self_check_judge(draft, "ok", [], good, False) == (draft, {"status": "ok"})
+    assert a._self_check_judge(draft, "fixed", ["x"], good, False) == (draft.replace("A 다.", "B 다."), {"status": "fixed", "fixes": ["x"]})
+    for patches, cut, why in ((good, True, "끊겼다"), (None, False, "꼴을 읽지 못했다"), ([], False, "바꿀 곳이 없다"),
+                              ([("없는 글", "x")], False, "찾지 못했다"), ([("결론은 이렇다.", "x")], False, "30번 나온다"),
+                              ([("", "x")], False, "원문이 비었다"), ([("끝 문장은 A", "x"), ("A 다.", "y")], False, "겹친다"),
+                              (good + [("없는 글", "x")], False, "찾지 못했다"),
+                              ([("결론은 이렇다. " * 30, "")], False, "지나치게 짧다"),
+                              ([("![응력](/artifacts/a.png)", "")], False, "그림 1개를 잃었다")):
+        final, check = a._self_check_judge(draft, "fixed", ["x"], patches, cut)
         assert final == draft and check["status"] == "suspect" and why in check["reason"] and check["fixes"] == ["x"], (why, check)
-    assert a._self_check_judge(draft, "fixed", ["x"], draft + "\n", False) == (draft, {"status": "ok"}), "바뀐 글자가 없으면 고친 것이 아니다"
+    assert a._self_check_judge(draft, "fixed", ["x"], [("끝 문장은 A 다.", "끝 문장은 A 다.")], False) == (draft, {"status": "ok"}), \
+        "바뀐 글자가 없으면 고친 것이 아니다"
 
 
 def test_건너뛰기는_이번_턴_근거도_수치도_없는_짧은_답만():
@@ -104,9 +112,9 @@ def test_검토자_입력은_창_안에_들고_자른_근거에는_표지가_붙
     draft = "최대 응력은 321.5 MPa 입니다."
     msgs = a._self_check_messages(req, draft, [("query_stress", "part=A")], [big])
     body = msgs[1].content
-    assert a._est_tokens_all(msgs[0].content + body) <= 16_000 - 2048, "고친 답을 쓸 몫을 남긴다"
+    assert a._est_tokens_all(msgs[0].content + body) <= 16_000 - a._SC_OUT_CAP, "검토자가 쓸 몫을 남긴다"
     long_draft = "최대 응력은 321.5 MPa 입니다. " * 250
-    out_room = a._sc_out_cap(long_draft)          # 검토자 호출에 보내는 출력 상한 그대로(W-9)
+    out_room = a._SC_OUT_CAP                      # 검토자 호출에 보내는 출력 상한 그대로(W-9 · W-4)
     lone = a._self_check_messages(a.ChatRequest(message="최대 응력은?", groups=[], history=[]), long_draft,
                                   [("query_stress", "part=A")], [big])
     used = a._est_tokens_all(lone[0].content + lone[1].content)
@@ -195,9 +203,9 @@ def _run(monkeypatch, inner, reviewer, message="질문", **req_kw):
 
 
 def test_고친_답만_본문으로_나가고_초안은_생각_칸에_남는다(monkeypatch):
-    draft = "A 부품의 최대 응력은 321.5 MPa 이고 안전율은 1.8 입니다. " * 3
+    draft = "A 부품의 최대 응력은 321.5 MPa 이고 안전율은 1.8 입니다. B 부품은 여유가 큽니다. C 부품도 같습니다."
     fixed = draft.replace("321.5", "312.5")
-    rv = _Reviewer(f"[판정] 고침\n[고친 점]\n- 321.5 → 312.5(조회 결과 1)\n[답]\n{fixed}")
+    rv = _Reviewer("[판정] 고침\n[고친 점]\n- 321.5 → 312.5(조회 결과 1)\n[바꿀 곳]\n[원문]\n최대 응력은 321.5 MPa\n[새 글]\n최대 응력은 312.5 MPa")
     evs = _run(monkeypatch, _inner(draft, calls=[("query_stress", "part=A")], outputs=["max 312.5 MPa, SF 1.8"]), rv)
     kinds = [e for e, _ in evs]
     first_tok = kinds.index("token")
@@ -212,8 +220,7 @@ def test_고친_답만_본문으로_나가고_초안은_생각_칸에_남는다(
     assert think.count(a._DRAFT_HEAD.strip()) == 2, "도구 뒤 다시 쓰기 시작한 초안에도 머리를 단다"
     assert draft[:20] in think and "[판정] 고침" in think and "[고친 점]\n- 321.5 → 312.5" in think
     assert fixed.strip() not in think, "고친 답 전체는 '생각' 칸에 다시 흘리지 않는다(본문으로 나간다)"
-    assert think.endswith("[답] — 고친 답은 본문에 냅니다")
-    assert any(e == "status" and d.get("step", "").startswith("고친 답을 쓰는 중") for e, d in evs)
+    assert think.endswith(rv.text), "검토자 글(판정 · 고친 점 · 바꿀 곳)은 그대로 '생각' 칸에"
     assert kinds[-3:] == ["meta", "result", "done"]
     meta = evs[-3][1]
     assert meta["self_check"]["status"] == "fixed" and meta["self_check"]["fixes"] == ["321.5 → 312.5(조회 결과 1)"]
@@ -222,23 +229,24 @@ def test_고친_답만_본문으로_나가고_초안은_생각_칸에_남는다(
     assert evs[-2][1] == {"type": "text", "content": body}
     msgs, kw = rv.calls[0]
     assert "max 312.5 MPa" in msgs[1].content and draft in msgs[1].content
-    assert kw == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}, "max_tokens": a._sc_out_cap(draft)}, \
-        "검토자는 생각을 끄고(CHAT_SELF_CHECK_THINK=0) 출력 상한을 보낸다(W-9)"
+    assert kw == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}, "max_tokens": a._SC_OUT_CAP}, \
+        "검토자는 생각을 끄고(CHAT_SELF_CHECK_THINK=0) 출력 상한을 보낸다(W-9 · W-4)"
 
 
 def test_고칠_것_없으면_초안이_본문이다(monkeypatch):
     for draft in ("결론: 체결 토크 12.5 N·m 이면 충분합니다.", "".join(f"{i}번 항목은 12.5 N·m 입니다.\n" for i in range(120))):
-        evs = _run(monkeypatch, _inner(draft), _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"))
+        evs = _run(monkeypatch, _inner(draft), _Reviewer("[판정] 고칠 것 없음\n[고친 점]\n- 없음\n"))
         assert _text(evs, "token") == draft and evs[-3][1]["self_check"]["status"] == "ok", len(draft)
 
 
-def test_답_표지가_조각_경계에_걸쳐도_찾는다(monkeypatch):
-    draft = "토크는 12.5 N·m 입니다. " * 5
+def test_조각_크기와_상관없이_검토자_글은_생각_칸에_그대로이고_본문은_고친_답이다(monkeypatch):
+    draft = "토크는 12.5 N·m 입니다. 볼트는 M3 입니다."
     fixed = draft.replace("12.5", "15.2")
+    text = "[판정] 고침\n[고친 점]\n- 12.5 → 15.2\n[바꿀 곳]\n[원문]\n토크는 12.5 N·m\n[새 글]\n토크는 15.2 N·m"
     for step in (1, 2, 3, 5):
-        rv = _Reviewer(f"[판정] 고침\n[고친 점]\n- 12.5 → 15.2\n[답]\n{fixed}")
+        rv = _Reviewer(text)
 
-        async def chop(msgs, _s=step, _rv=rv, **kw):     # 조각 크기를 바꿔 [답] 이 두 조각에 갈리게
+        async def chop(msgs, _s=step, _rv=rv, **kw):     # 조각 크기를 바꿔 표지([바꿀 곳] · [원문] · [새 글])가 두 조각에 갈리게
             _rv.calls.append((msgs, kw))
             for i in range(0, len(_rv.text), _s):
                 yield AIMessageChunk(content=_rv.text[i:i + _s], response_metadata={"model_name": "qwen-x"})
@@ -246,7 +254,7 @@ def test_답_표지가_조각_경계에_걸쳐도_찾는다(monkeypatch):
         rv.astream = chop
         evs = _run(monkeypatch, _inner(draft), rv)
         think = _text(evs, "reasoning").split(a._CHECK_HEAD.strip(), 1)[1]
-        assert think.strip() == "[판정] 고침\n[고친 점]\n- 12.5 → 15.2\n[답] — 고친 답은 본문에 냅니다", (step, think)
+        assert think.strip() == text, (step, think)
         assert _text(evs, "token") == fixed.strip(), step
 
 
@@ -263,13 +271,15 @@ def test_꼴_밖의_검토자_답은_초안을_내고_끝_글자까지_생각_�
     draft = "토크는 12.5 N·m 입니다."
     evs = _run(monkeypatch, _inner(draft), _Reviewer("검토했지만 형식을 모르겠습니다 — 끝"))
     assert _text(evs, "token") == draft and evs[-3][1]["self_check"]["status"] == "unreadable"
-    assert _text(evs, "reasoning").endswith(a._CHECK_HEAD + "검토했지만 형식을 모르겠습니다 — 끝"), "쥐고 있던 끝 두 자도 흘린다"
+    assert _text(evs, "reasoning").endswith(a._CHECK_HEAD + "검토했지만 형식을 모르겠습니다 — 끝"), "검토자 글은 끝 글자까지 생각 칸에"
 
 
 def test_끊긴_검토자_답은_초안을_낸다(monkeypatch):
-    draft = "토크는 12.5 N·m 입니다. " * 5
-    evs = _run(monkeypatch, _inner(draft), _Reviewer("[판정] 고침\n[고친 점]\n- x\n[답]\n" + draft[:-3], finish="length"))
-    assert _text(evs, "token") == draft and evs[-3][1]["self_check"]["status"] == "suspect"
+    draft = "토크는 12.5 N·m 입니다. 볼트는 M3 입니다."
+    evs = _run(monkeypatch, _inner(draft), _Reviewer("[판정] 고침\n[고친 점]\n- x\n[바꿀 곳]\n[원문]\n토크는 12.5 N·m\n[새 글]\n토크는 15",
+                                                    finish="length"))
+    sc = evs[-3][1]["self_check"]
+    assert _text(evs, "token") == draft and sc["status"] == "suspect" and "끊겼다" in sc["reason"], sc
 
 
 def test_짧은_잡담은_검토자를_부르지_않는다(monkeypatch):
@@ -324,7 +334,7 @@ def test_도구를_부른_실제_턴_근거_블록은_고친_답에만_한_번(m
     monkeypatch.setenv("CHAT_SELF_CHECK", "1")
     monkeypatch.setenv("CHAT_AUTO_RETRY", "0")
     monkeypatch.setattr(a, "_agent_for", built)
-    rv = _Reviewer("[판정] 고침\n[고친 점]\n- 321.5 → 312.5(조회 결과 1)\n[답]\nA 부품의 최대 응력은 312.5 MPa 입니다.")
+    rv = _Reviewer("[판정] 고침\n[고친 점]\n- 321.5 → 312.5(조회 결과 1)\n[바꿀 곳]\n[원문]\n321.5 MPa\n[새 글]\n312.5 MPa")
     monkeypatch.setattr(a.app.state, "chat_llm", rv, raising=False)
 
     async def go():
@@ -442,7 +452,8 @@ def test_실제_경로_챗_턴_한_번에_LLM_두_번_고친_답이_본문(monke
     monkeypatch.setenv("CHAT_SELF_CHECK", "1")
     draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
     fixed = "M3 나사의 권장 체결 토크는 12.5 N·m (근거 없음 — 추정) 입니다."
-    _script(fake_llm, [draft, f"[판정] 고침\n[고친 점]\n- 12.5 는 근거가 없어 추정으로 표시\n[답]\n{fixed}"])
+    _script(fake_llm, [draft, "[판정] 고침\n[고친 점]\n- 12.5 는 근거가 없어 추정으로 표시\n[바꿀 곳]\n[원문]\n12.5 N·m 입니다.\n"
+                              "[새 글]\n12.5 N·m (근거 없음 — 추정) 입니다."])
     evs = _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
     st = _stats(fake_llm)
     assert st["calls"] == 2, st

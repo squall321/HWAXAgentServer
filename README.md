@@ -594,9 +594,14 @@ knowledge-card excerpt, attached documents, "no tools this turn") goes into a se
 message. `CHAT_STABLE_PREFIX=0` puts it back into the first system message (the old layout) — the position changed, so
 instruction-following is measured on the box (portal docs/request-1029 C-7).
 
-**Self-check output cap (W-9).** The reviewer call sends `max_tokens` = draft tokens × 2 + 1,024, clamped to
-2,048 ~ 16,384 (langchain-openai sends it as `max_completion_tokens`); the input budget reserves the same amount. A cut
-reply keeps the draft (`self_check.status` `suspect`). The main chat answer has no cap (portal decision D-6).
+**Self-check patches and output cap (W-4 · W-9).** The reviewer no longer rewrites the whole answer. After `[판정]` and
+`[고친 점]` it writes `[바꿀 곳]` with one `[원문]` (draft text copied as is) / `[새 글]` (its replacement; empty deletes)
+pair per change, and the server puts the pairs into the draft. Each `[원문]` must be found exactly once in the draft
+(differences in spaces or line breaks only are tolerated); if any pair is not found, found more than once, overlaps
+another or is malformed, nothing is applied and the draft goes out (`self_check.status` `suspect` with the reason). The
+reviewer call sends `max_tokens` 4,096 (langchain-openai sends it as `max_completion_tokens`; with
+`CHAT_SELF_CHECK_THINK=1` the thinking counts against it too); the input budget reserves the same amount. A cut reply
+keeps the draft. The main chat answer has no cap (portal decision D-6).
 
 **Tool description budget (W-2).** With no tool cap (`TOOL_MAX=0`, cae00), the bound tool schemas are limited to 45% of
 the chat window (about 88,000 tokens on a 262,144 window). `CHAT_TOOL_SCHEMA_BUDGET` (estimated tokens) sets it to a fixed
