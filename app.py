@@ -2782,10 +2782,18 @@ def _chat_panel_tool(name: str) -> bool:
     return any(n == t or n.endswith("_" + t) for t in _CHAT_PANEL_TOOLS)
 
 
+# 분석 루틴 도구(게이트웨이 로컬 — HWAXPortal docs/analysis-routines R2) — 일반 챗 ReAct 는 묶지 않는다. 루틴은 사람이 골라 켜는 것이고(챗의
+# 루틴 모드는 코드가 단계를 돈다 — R3), 자유 턴의 모델이 실행을 시작하거나 원장에 쓰면 사람이 고르지 않은 연쇄가 돈다. 같은 거부 길(목록에서
+# 빼고 invoke_tool 로도 막는다)을 쓰되 집합은 따로 둔다(_AGENT_DENY_TOOLS 는 외부 응답자 과제 도구와 같아야 한다).
+_ROUTINE_TOOLS = frozenset({"routine_list", "routine_get", "routine_run_start", "routine_call", "routine_step_done",
+                            "routine_report_submit"})
+
+
 def _agent_denied(name: str) -> bool:
     """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
     n = str(name or "").strip().lower()
-    return any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or _chat_panel_tool(n)
+    return (any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or _chat_panel_tool(n)
+            or n in _ROUTINE_TOOLS)
 
 
 # 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
