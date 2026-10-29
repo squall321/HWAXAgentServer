@@ -1108,6 +1108,51 @@ def _detach_stream(gen, label: str, started_by: str = "human"):
     return _subscribe()
 
 
+def _pinged_stream(gen):
+    """챗 · 띵킹 · 도우미 스트림에도 DELIB_HEARTBEAT_S 마다 ping(HWAXPortal docs/request-1029 P-1 ④) — 생각 · 비스트리밍 LLM 호출 · 긴 도구가
+    조용한 동안 바깥 침묵 한도(포털 챗 중계 AGENT_CHAT_IDLE_TIMEOUT_S, 900초)에 살아 있는 답이 끊기지 않게. 프레임 꼴은 심의 ping 과 같다.
+    턴은 한 태스크가 끝까지 돌린다 — 걸음마다 다른 태스크로 돌리면 턴 안에서 건 ContextVar(_external_llm.ctx_override 등)가 다음 걸음에
+    사라진다. 심의(_detach_stream)와 달리 구독이 끊기면 그 태스크도 취소하고 정리를 기다린다 — 챗 중지는 중지다(C-5). 심의 수(/health
+    delib_active)에 세지 않는다. 턴의 예외는 끝에서 그대로 올린다(종전처럼 스트림이 끊긴다)."""
+    if DELIB_HEARTBEAT_S <= 0:
+        return gen
+
+    async def _sub():
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def _drive():
+            try:
+                async for chunk in gen:
+                    q.put_nowait(chunk)
+            finally:
+                q.put_nowait(None)
+
+        task = asyncio.create_task(_drive(), name="chat-turn")
+        get, last = None, time.monotonic()
+        try:
+            while True:
+                if get is None:
+                    get = asyncio.ensure_future(q.get())
+                done, _pending = await asyncio.wait({get}, timeout=DELIB_HEARTBEAT_S)
+                if not done:
+                    yield _sse("ping", {"idle_s": int(time.monotonic() - last), "ts": int(time.time() * 1000)})
+                    continue
+                chunk, get = await get, None
+                if chunk is None:
+                    break
+                last = time.monotonic()
+                yield chunk
+            await task
+        finally:
+            if get is not None and not get.done():
+                get.cancel()
+            if not task.done():
+                task.cancel()            # 구독이 끊겼다(중지 · 탭 닫기) — 턴도 멈춘다
+            await asyncio.gather(task, return_exceptions=True)
+
+    return _sub()
+
+
 # 도구 결과 절단(문자) — 컨텍스트 보호용 안전밸브. 무제한이면 대량 조회(VOC 수천 건)가
 # 프롬프트를 넘겨 'maximum context length' 로 챗 전체가 죽는다(dev 16K 실측).
 # 다만 6000 은 dev(16K) 기준값이라 대형 컨텍스트 모델(prod GLM)에 그대로 쓰면 목록이
@@ -5451,6 +5496,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                               req.user_email, req.user_pat, req.history, req.documents)
     else:
         stream = _agent_stream(app, req)
+    if not (is_sim_deliberation(req.message) or is_test_plan(req.message) or is_deliberation(req.message)):
+        stream = _pinged_stream(stream)      # 심의(_detach_stream)는 이미 ping 을 낸다
     return StreamingResponse(stream, media_type="text/event-stream", headers=SSE_HEADERS)
 
 
