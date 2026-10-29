@@ -182,3 +182,21 @@ def test_W5_허브의_나머지_큰_응답은_긴_목록을_앞부분과_전체_
     assert a._fold_hub_result("object_fields", "표 글 " * 20000) == "표 글 " * 20000, "JSON 이 아니면 그대로"
     via = asyncio.run(_tool_of("invoke_tool", big).ainvoke({"name": "rootdesigndatahub_object_fields", "arguments": {}}))
     assert "[포털 챗이 허브 응답을 접었다" in via, "invoke_tool 의 안쪽 이름으로도 접는다"
+
+
+# ── R-9 — 답에 섞인 다른 문자(한자 · 가나) 낱말을 자기검증에 짚어 넘긴다 ─────────────────────────────────────────────────
+def test_R9_질문_근거에_없는_한자_가나_낱말만_짚는다():
+    assert a._foreign_words("기준값은 380 MPa 이며 这个 기준은 엄격하다. 確認 필요", "관리 기준은?") == ["这个", "確認"]
+    assert a._foreign_words("这个 기준", "这个 기준이 뭐야?") == [], "그 문자로 물었으면 짚지 않는다"
+    assert a._foreign_words("VOC 원문은 '质量差' 이다", "VOC 요약", '{"text": "质量差"}') == [], "근거에 그대로 있는 인용은 짚지 않는다"
+    assert a._foreign_words("한국어만 쓴 답", "질문") == []
+
+
+def test_R9_다른_문자가_섞이면_짧은_답도_검증하고_검토자에게_목록을_준다():
+    req = a.ChatRequest(message="안녕", groups=[], history=[])
+    assert a._self_check_skip(req, "안녕하세요", []) is True
+    assert a._self_check_skip(req, "안녕하세요 这个", []) is False, "짧은 인사여도 다른 문자가 섞이면 돈다"
+    body = a._self_check_messages(req, "안녕하세요 这个", [], [])[1].content
+    assert "[코드 대조 — 답에 섞인 다른 문자(한자 · 가나) 낱말" in body and "`这个`" in body
+    assert body.index("[코드 대조 — 답에 섞인") < body.index("[답 초안]")
+    assert "[코드 대조 — 답에 섞인" not in a._self_check_messages(req, "안녕하세요", [], [])[1].content

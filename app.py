@@ -4232,9 +4232,26 @@ def _sse_parse(frame) -> tuple[str, dict]:
         return "", {}
 
 
+# 답에 섞인 다른 문자(한자 · 가나) — Qwen · GLM 이 한국어 답에 중국어 · 일본어 낱말을 하나씩 흘렸다(OT-10 · EX-01 · EX-03 — HWAXPortal
+# docs/request-1029 R-9). 기계로 갈아 끼우지 않는다(뜻이 틀어질 수 있다) — 자기검증에 짚어 넘기고 검토자가 고친다.
+_FOREIGN_SCRIPT = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]+")
+_FOREIGN_MAX = 20
+
+
+def _foreign_words(draft: str, question: str, *sources: str) -> list[str]:
+    """답의 한자 · 가나 낱말 가운데 질문 · 근거에 없는 것. 질문이 그 문자로 쓰였으면 짚지 않는다(그 언어로 물었다)."""
+    if not draft or _FOREIGN_SCRIPT.search(question or ""):
+        return []
+    hay = "\n".join(x for x in sources if x)
+    return [w for w in dict.fromkeys(_FOREIGN_SCRIPT.findall(draft)) if w not in hay][:_FOREIGN_MAX]
+
+
 def _self_check_skip(req: ChatRequest, draft: str, calls: list) -> bool:
-    """검증을 건너뛰나 — 이번 턴에 근거(조회 · 붙인 문서 · 올린 그림)도 수치도 없는 짧은 답(인사 · 되묻기)만."""
+    """검증을 건너뛰나 — 이번 턴에 근거(조회 · 붙인 문서 · 올린 그림)도 수치도 없는 짧은 답(인사 · 되묻기)만. 다른 문자 낱말이 섞였으면
+    짧아도 돈다(R-9)."""
     if calls or req.documents or req.images:
+        return False
+    if _foreign_words(draft, req.message or ""):
         return False
     return len(draft.strip()) < _SELF_CHECK_SHORT and not _sig_numbers(draft)
 
@@ -4321,6 +4338,11 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
     if calls and bad:
         blocks.append("[코드 대조 — 답의 수치 중 조회 결과 · 사용자 발화에서 찾지 못한 것]\n"
                       + ", ".join(f"`{v}`" for v in bad[:_SELF_CHECK_NUMS]) + (f" 외 {len(bad) - _SELF_CHECK_NUMS}건" if len(bad) > _SELF_CHECK_NUMS else ""))
+    alien = _foreign_words(draft, req.message or "", "\n".join(outputs), dtext)
+    if alien:
+        blocks.append("[코드 대조 — 답에 섞인 다른 문자(한자 · 가나) 낱말, 질문 · 근거에 없는 것]\n"
+                      + ", ".join(f"`{w}`" for w in alien)
+                      + "\n— 질문의 언어로 바꿔라(뜻을 그대로). 고칠 것이 이것뿐이어도 [판정] 고침 이다.")
     blocks.append(f"[답 초안]\n{draft}")
     blocks.append(_SELF_CHECK_ASK if (calls or docs) else _SELF_CHECK_ASK_NO_EVIDENCE)
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
