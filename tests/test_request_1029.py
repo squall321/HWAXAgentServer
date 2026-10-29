@@ -200,3 +200,27 @@ def test_R9_다른_문자가_섞이면_짧은_답도_검증하고_검토자에�
     assert "[코드 대조 — 답에 섞인 다른 문자(한자 · 가나) 낱말" in body and "`这个`" in body
     assert body.index("[코드 대조 — 답에 섞인") < body.index("[답 초안]")
     assert "[코드 대조 — 답에 섞인" not in a._self_check_messages(req, "안녕하세요", [], [])[1].content
+
+
+# ── W-1 — 챗 LLM 호출의 대화 머리(같은 대화 → 같은 GPU 복제본) ────────────────────────────────────────────────────────────
+def test_W1_대화_머리는_서버_대화_id_가_있으면_그_해시고_없으면_턴마다_다르다():
+    import hashlib
+    r = a.ChatRequest(message="x", groups=[], conversation_id="conv-1", user_email="u@x")
+    assert a._affinity_key(r) == hashlib.sha256(b"conv-1").hexdigest()[:16] == a._affinity_key(r)
+    n = a.ChatRequest(message="x", groups=[], user_email="u@x")
+    assert a._affinity_key(n) != a._affinity_key(n), "대화 id 가 없으면 '사람 + 턴의 시작' — 턴마다 새 값"
+
+
+def test_W1_실제_경로_한_턴의_챗_호출과_검토자_호출이_같은_대화_머리를_싣는다(monkeypatch, fake_llm):
+    import hashlib
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    draft = "M3 나사의 권장 체결 토크는 12.5 N·m 입니다."
+    _script(fake_llm, [draft, "[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[답]\n"])
+    orig = a._agent_stream
+
+    def with_conv(app_, req):                          # 포털이 서버 대화 id 를 실은 요청
+        return orig(app_, req.model_copy(update={"conversation_id": "conv-7"}))
+    monkeypatch.setattr(a, "_agent_stream", with_conv)
+    _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
+    st = _stats(fake_llm)
+    assert st["calls"] == 2 and st["affinity"] == [hashlib.sha256(b"conv-7").hexdigest()[:16]] * 2, st["affinity"]

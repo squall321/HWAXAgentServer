@@ -675,6 +675,26 @@ class _ChatLLMWatch(BaseCallbackHandler):
                   f"지금까지 {fb['count']}회")
 
 
+# 챗 LLM 호출의 대화 머리(HWAXPortal docs/request-1029 W-1) — 박스 부하분산기(~/stcx-llm/nginx.conf, O-2)가 이 값으로 같은 대화의 호출을
+# 같은 GPU 복제본에 보내 접두 캐시를 다시 쓰게 한다(10-29 — 이어진 두 호출이 같은 복제본으로 간 것은 117쌍 중 1쌍 · 접두 캐시 적중 11.9%).
+# 값은 서버 대화 id 의 해시, 없으면 '사람 + 이 턴의 시작' 의 해시다(한 질문의 3 ~ 16회 호출이 한 복제본). 자기검증 호출도 같은 값이다.
+# 머리를 보지 않는 부하분산기 · 서버에는 아무 일도 없다.
+_AFFINITY_HEADER = "X-Session-Affinity"
+_chat_affinity: contextvars.ContextVar = contextvars.ContextVar("chat_affinity", default="")
+
+
+async def _affinity_hook(request) -> None:
+    v = _chat_affinity.get()
+    if v:
+        request.headers[_AFFINITY_HEADER] = v
+
+
+def _affinity_key(req) -> str:
+    base = ((getattr(req, "conversation_id", "") or "").strip()
+            or f"{(getattr(req, 'user_email', '') or '').strip().lower()}|{time.time_ns()}")
+    return hashlib.sha256(base.encode()).hexdigest()[:16]
+
+
 def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeout_s: float, base_effort: str,
                     base_retries: int, base_nostream: bool):
     """(챗이 쓸 LLM, /health 에 실을 상태, 내부 설정). 꺼져 있으면 (base_llm, {"enabled": False}, None). mk 는 lifespan 의 _mk_llm."""
@@ -704,7 +724,7 @@ def _build_chat_llm(base_llm, mk, *, temperature: float, max_tokens: int, timeou
     primary = mk(temperature, chat_mt, effort, timeout_s, _env_int("CHAT_LLM_MAX_RETRIES", 1), base_url=url, model=model,
                  api_key=key, nostream=nostream, cls=_ChatServerLLM,
                  chat_template_kwargs={"enable_thinking": thinking},
-                 callbacks=[_ChatLLMWatch(info, "primary")])
+                 callbacks=[_ChatLLMWatch(info, "primary")], affinity=True)
     chat = primary
     if fallback_on:
         fb = mk(temperature, max_tokens, base_effort, timeout_s, base_retries, callbacks=[_ChatLLMWatch(info, "fallback")],
@@ -775,7 +795,7 @@ async def lifespan(app: FastAPI):
     def _mk_llm(temperature: float, max_tokens: int, effort: str, timeout_s: float = 0.0,
                 retries: int = 2, *, base_url: str = "", model: str = "", api_key: str = "",
                 nostream: bool | None = None, chat_template_kwargs: dict | None = None,
-                callbacks: list | None = None, cls: type = ChatOpenAI) -> ChatOpenAI:
+                callbacks: list | None = None, cls: type = ChatOpenAI, affinity: bool = False) -> ChatOpenAI:
         # 주소 · 모델 · 키를 주지 않으면 VLLM_* 다(챗 · 심의 클라이언트). 챗 전용 LLM(_build_chat_llm)만 다른 서버와 cls(_ChatServerLLM)를 준다.
         url = base_url or VLLM_BASE_URL
         kw: dict = dict(base_url=url, api_key=api_key or VLLM_API_KEY, model=model or VLLM_MODEL,
@@ -791,6 +811,10 @@ async def lifespan(app: FastAPI):
             kw["extra_body"] = {"chat_template_kwargs": tmpl}
         if callbacks:
             kw["callbacks"] = list(callbacks)
+        if affinity:
+            # 챗 전용 LLM 만 — 요청마다 대화 머리를 싣는다(_affinity_hook · W-1). SDK 의 기본 클라이언트 설정(제한 · 따라가기)은 그대로다.
+            import openai  # noqa: PLC0415
+            kw["http_async_client"] = openai.DefaultAsyncHttpxClient(event_hooks={"request": [_affinity_hook]})
         # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py).
         return _call_trace.instrument_llm(cls(**kw), _call_trace.server_label(url))
 
@@ -923,6 +947,8 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 class ChatRequest(BaseModel):
     message: str
+    # 서버 대화 id(포털이 싣는다 — 없으면 빈 값). 챗 LLM 호출의 대화 머리(W-1)에만 쓴다.
+    conversation_id: str = ""
     system_id: str | None = None  # sub-page context → tool scope (portal Phase 2; accepted, not yet used)
     groups: list[str] = []
     # 사용자 지정 우선 도구 — AI 의 도구 선택을 100% 신뢰할 수 없어, 사용자가 도구 카탈로그에서
@@ -4545,11 +4571,13 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         tok = _external_llm.ctx_override.set(win - min(out, win // 2))
     # 자기검증(HWAXPortal docs/chat-self-check) — 켜져 있으면 초안을 근거와 대조해 한 번 고친 뒤 본문으로 낸다
     turn = _self_checked_turn(app, req) if _self_check_on() else _agent_stream_turn(app, req)
+    atok = _chat_affinity.set(_affinity_key(req))      # 이 턴의 챗 LLM 호출 대화 머리(W-1) — 턴의 태스크에만
     try:
         async for chunk in turn:
             yield chunk
     finally:
         await turn.aclose()      # 연결이 끊겨 이 생성기가 닫혀도 턴의 finally 가 지금 돈다(종전과 같은 때)
+        _chat_affinity.reset(atok)
         if tok is not None:
             try:
                 _external_llm.ctx_override.reset(tok)
