@@ -598,6 +598,11 @@ instruction-following is measured on the box (portal docs/request-1029 C-7).
 2,048 ~ 16,384 (langchain-openai sends it as `max_completion_tokens`); the input budget reserves the same amount. A cut
 reply keeps the draft (`self_check.status` `suspect`). The main chat answer has no cap (portal decision D-6).
 
+**Tool description budget (W-2).** With no tool cap (`TOOL_MAX=0`, cae00), the bound tool schemas are limited to 45% of
+the chat window (about 88,000 tokens on a 262,144 window). `CHAT_TOOL_SCHEMA_BUDGET` (estimated tokens) sets it to a fixed
+value instead; empty or 0 keeps the 45%. The default is unchanged on purpose (portal decision D-3) — compare 30,000 and
+40,000 on the box with the same 16 questions first. A smaller bundle means more `search_tools` → `invoke_tool` round trips.
+
 ### Images (portal docs/chat-depth-context T5)
 
 Images reach the models as `image_url` parts (`vision.py`). **Chat:** images uploaded with a message

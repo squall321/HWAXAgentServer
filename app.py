@@ -2015,6 +2015,10 @@ AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "80"))
 TOOL_REPEAT_WARN = int(os.environ.get("TOOL_REPEAT_WARN", "3"))
 # 바인딩 도구 스키마의 추정 토큰 상한(0=무제한). 개수 캡만으로는 컨텍스트 초과를 못 막는다.
 TOOL_SCHEMA_BUDGET = int(os.environ.get("TOOL_SCHEMA_BUDGET", "40000"))
+# 캡 없는 길(TOOL_MAX=0 — 운영 cae00)의 도구 설명 예산(추정 토큰). 비거나 0 이면 종전대로 창의 45% 다(HWAXPortal docs/request-1029 W-2 ·
+# 결정 D-3 — 손잡이만 짓고 기본값은 그대로, 박스에서 30,000 · 40,000 을 같은 16문항으로 견준 뒤 정한다). 10-29 에는 호출마다 약 8.8만 토큰이
+# 실렸다(262,144 − 출력 몫 65,536 의 45%). 줄이면 search_tools → invoke_tool 왕복이 늘 수 있다.
+CHAT_TOOL_SCHEMA_BUDGET = int(os.environ.get("CHAT_TOOL_SCHEMA_BUDGET", "0") or 0)
 _TOOL_PRIORITY = (
     # 안내대 — 관련도 랭킹이 빗나갔을 때의 폴백 입구. 반드시 상시 바인딩한다(2026-09-03,
     # 도구 진입 구조). search_tools 가 이름·인자를 찾아 주고, invoke_tool 이 바인딩에 없는
@@ -2289,7 +2293,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
         # TOOL_MAX=0(운영 cae00)에서 465종이 무제한으로 붙었다 — 1M 창이라 지금은 넉넉하지만
         # 창 작은 모델로 바꾸면 조용히 400 이 된다. 상한은 env(TOOL_SCHEMA_BUDGET)가 아니라
         # **컨텍스트에서** 유도한다 — env 40,000 을 쓰면 cae00 의 의도된 전량 바인딩이 깨진다.
-        budget = max(4000, int(_model_context_tokens() * 0.45))
+        budget = CHAT_TOOL_SCHEMA_BUDGET if CHAT_TOOL_SCHEMA_BUDGET > 0 else max(4000, int(_model_context_tokens() * 0.45))
         if sum(_tool_schema_cost(t) for t in tools) > budget:
             # 다 못 싣는다 — 캡 경로와 같은 순서로 세워 관련도 낮은 것부터 뺀다. 종전엔 게이트웨이 순서 그대로 뒤에서부터 잘라, 챗이
             # stcx(창 262,144 — 상한 117,964)로 바뀐 뒤 대화마다 678개 중 226개가 관련도와 상관없이 빠졌다(MaterialTwin 34종 전부 ·

@@ -267,3 +267,22 @@ def test_W3_실제_경로_턴을_가로질러_첫_시스템_메시지가_바이�
     st = _stats(fake_llm)
     assert st["calls"] == 2 and st["first_system"][0] == st["first_system"][1], "바뀌는 안내가 첫 시스템 메시지에 섞였다"
     assert "붙인 문서의 본문 글" in st["systems"][1] and "붙인 문서의 본문 글" not in st["first_system"][1]
+
+
+# ── W-2 — 캡 없는 길의 도구 설명 예산 손잡이(기본값은 그대로) ───────────────────────────────────────────────────────────────
+def test_W2_예산_손잡이를_주면_그_값이고_비면_창의_45퍼센트다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 200_000)
+    seen = {}
+
+    def fit(tools, budget, keep=()):
+        seen["budget"] = budget
+        return tools
+    monkeypatch.setattr(a, "_fit_schema", fit)
+    tools = [_ST(name=f"t{i}", description="d", coroutine=lambda **_k: None, args_schema={"type": "object", "properties": {}})
+             for i in range(3)]
+    a._select_tools(tools, "질문")
+    assert seen["budget"] == 90_000, "비면 종전대로 창의 45%(결정 D-3)"
+    monkeypatch.setattr(a, "CHAT_TOOL_SCHEMA_BUDGET", 30_000)
+    a._select_tools(tools, "질문")
+    assert seen["budget"] == 30_000
