@@ -576,6 +576,16 @@ thinking text streams as `reasoning` events and each turn ends with a `meta` eve
 fallback). Tests: `tests/test_chat_llm.py` (real lifespan, fake servers — closed port, 5xx,
 400, a streaming chat server falling back to a non-streaming GLM through a real chat turn, the window override).
 
+### Core vocabulary (portal docs/request-1029)
+
+The chat's core-data rules (`[코어 데이터 규칙]` in the system prompt) are built from the portal's canonical vocabulary,
+`../HWAXPortal/backend/config/core_vocab.json` — the sibling repo on the same box (dev `~/claude`, cae00 `~/Projects`).
+The trigger words (`rule_words`), the first step (one `object_resolve` on the canonical hub before other apps), the
+relation map (`relations`, rule ④) and the apps that hold no core objects (`apps` with role `noncore`, rule ⑦) come from
+it. The file is re-read when its mtime changes. Missing or malformed → the built-in text (`SYSTEM_PROMPT`, byte for
+byte). `/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
+Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test).
+
 ### Images (portal docs/chat-depth-context T5)
 
 Images reach the models as `image_url` parts (`vision.py`). **Chat:** images uploaded with a message

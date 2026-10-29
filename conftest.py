@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*)과 호출 추적 스위치(CALL_TRACE_URL)를 지우며, 챗 자기검증(CHAT_SELF_CHECK)을 끈다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*)과 호출 추적 스위치(CALL_TRACE_URL)를 지우며, 챗 자기검증(CHAT_SELF_CHECK)을 끈다, 형제 포털 리포의 코어 어휘표는 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -10,7 +10,10 @@
 import atexit
 import os
 import shutil
+import sys
 import tempfile
+
+import pytest
 
 _JOB_DIR = tempfile.mkdtemp(prefix="hwax-delib-jobs-test-")
 os.environ["DELIB_JOB_DIR"] = _JOB_DIR      # delib_jobs 가 import 될 때 읽는다 — 시험 모듈보다 먼저 돈다
@@ -35,3 +38,14 @@ os.environ.pop("CALL_TRACE_URL", None)
 # 챗 자기검증(CHAT_SELF_CHECK — 기본 켬)은 시험에서 끈다 — 챗 턴 시험들이 LLM 호출 수 · 흘린 글을 그대로 센다. 검증을 보는 시험은 제 손으로
 # 켠다(tests/test_chat_self_check.py · HWAXPortal docs/chat-self-check).
 os.environ["CHAT_SELF_CHECK"] = "0"
+
+
+@pytest.fixture(autouse=True)
+def _no_core_vocab(monkeypatch, tmp_path):
+    """코어 어휘표 격리 — 기본은 '없음'(코어 규칙 기본 글)이다. 형제 리포의 실제 표를 읽는 시험은 본문에서 app.CORE_VOCAB_PATH 를 다시 건다
+    (tests/test_request_1029.py). 안 걸면 포털 리포의 표가 챗 시스템 프롬프트를 바꾸고, 모듈 상태라 앞 시험의 것이 뒤 시험에 남는다
+    (HWAXPortal docs/request-1029 C-11). app 을 import 하지 않는 시험은 건드리지 않는다."""
+    app_mod = sys.modules.get("app")
+    if app_mod is not None and hasattr(app_mod, "CORE_VOCAB_PATH"):
+        monkeypatch.setattr(app_mod, "CORE_VOCAB_PATH", tmp_path / "no-core-vocab.json")
+        monkeypatch.setattr(app_mod, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음"})

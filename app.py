@@ -41,6 +41,7 @@ from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -130,7 +131,7 @@ from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
 USER_HEADER = "X-HWAX-User"      # 호출자 이메일 — 게이트웨이가 사용자별 백엔드 자격증명으로 갈아탄다
-SYSTEM_PROMPT = (
+_SP_HEAD = (
     # 질문의 언어로 답한다 — 영어 질문에도 한국어로만 답했다(온톨로지 시험 OT-07 — HWAXPortal docs/request-1027 HA-15). 중국어로 새는 것
     # (Qwen · GLM 의 버릇)은 계속 막는다.
     "당신은 HWAX 포털의 어시스턴트입니다. 사용자 질문의 언어로 답하세요 — 기본은 한국어이고, "
@@ -177,6 +178,9 @@ SYSTEM_PROMPT = (
     "— 이 대화에 실리지 않은 도구까지 전부 검색됩니다. 찾은 도구가 목록에 없으면 "
     "invoke_tool(name, arguments) 로 그 자리에서 바로 호출하세요 — search_tools 결과의 "
     "args(required 포함)를 그대로 채우고, 인자를 모르면 추측하지 말고 다시 검색하세요. "
+)
+# 코어 데이터 규칙의 기본 글 — 코어 어휘표(아래 _core_vocab)가 없을 때 그대로 쓴다. 있으면 _core_rules_text 가 만든 글로 바꾼다.
+_CORE_RULES_DEFAULT = (
     # 코어 데이터(부품 · 모델 · 과제 · 불량) — 이 서버는 MCP 서버 instructions 를 읽지 않아 게이트웨이 안내문 · 허브 platform_profile 이 웹 챗에
     # 닿지 않았고, 코어 질문이 코어 타입이 없는 앱으로 갔다(온톨로지 시험 OT-02 · 03 · 04 · 12 · 13 — HWAXPortal docs/request-1027 HA-03).
     # 한 줄 한 실패 꼴이다. ⑥ 의 '(시험) 앱' 문구는 넣지 않는다(사용자 결정 D-1 — 라벨을 바로잡는다).
@@ -189,6 +193,8 @@ SYSTEM_PROMPT = (
     "⑤ 다른 허브(FailureTrace 등)로 건널 때는 앞 허브의 id 를 그대로 쓰지 말고 key 로 그 허브에서 다시 resolve 하세요. "
     "⑥ not_configured · 404 · 빈 출력은 '없다' 가 아니라 '조회하지 못했다' 로 말하세요. "
     "⑦ Report Archive · MatNexus · ComponentCore 는 코어 객체를 갖지 않습니다 — 코어 질문을 그쪽으로 보내지 마세요. "
+)
+_SP_TAIL = (
     # 종전엔 '차트를 요청받으면 HTML 로 출력하라'가 조건→문법→보상(챗이 렌더링합니다)까지 갖춘
     # 구체적 절차였고, 도구 우선은 추상적 원칙이었다. LLM 은 구체적 지시를 따르므로 자작이 이겼다
     # (실측: 도구 0회로 물성표 + Plotly CDN 차트 생성 — 그 문장 자신의 '외부 리소스 없이'까지 위반).
@@ -235,6 +241,73 @@ SYSTEM_PROMPT = (
     "당신이 아는 값이 아니라 조회한 값만 넣으세요. "
     "표·그래프를 요청받아도 첫 동작은 도구 호출입니다 — 도구를 부르기 전에 물성표나 코드블록을 먼저 출력하지 마세요."
 )
+SYSTEM_PROMPT = _SP_HEAD + _CORE_RULES_DEFAULT + _SP_TAIL
+
+# ── 코어 어휘표(HWAXPortal docs/request-1029 B-1 · C-11) ──────────────────────────────────────────────────────
+# 정본은 포털 리포의 backend/config/core_vocab.json 이다. 에이전트 서버 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects)
+# 그 파일을 직접 읽는다. 바뀐 시각이 다르면 다시 읽고 코어 규칙 글을 새로 만든다. 없거나 꼴이 틀리면 위 기본 글(SYSTEM_PROMPT 그대로)로
+# 돌고, 그 사실을 /health 의 core_vocab 에 싣는다.
+CORE_VOCAB_PATH = Path(__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "config" / "core_vocab.json"
+_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음"}
+
+
+def _core_rules_text(d: dict) -> str:
+    """코어 규칙 글 — 발동 낱말(R-1) · 첫 걸음은 정본 resolve 하나(R-7) · 관계 대응(R-8) · 코어가 아닌 앱(R-2)을 어휘표에서 만든다. 나머지
+    줄은 기본 글과 같다. 10-29 QA 에서 발동 낱말이 '부품 · 모델 · 과제 · 불량' 뿐이라 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성
+    질문 다섯이 코어를 건너뛰었고(OT-06 ~ 10), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다. 시스템 프롬프트는 호출마다 실리므로 짧게 둔다."""
+    apps = list((d.get("apps") or {}).values())
+    sib = " · ".join(a["label"] for a in apps if a.get("role") == "sibling") or "FailureTrace 등"
+    non = " · ".join(f"{a['label']}({a['note']})" if a.get("note") else a["label"] for a in apps if a.get("role") == "noncore")
+    rel = " · ".join(f"{r['phrase']} = {r['relation']}" for r in d.get("relations") or [])
+    return (
+        f"[코어 데이터 규칙] {' · '.join(d['rule_words'])} 같은 코어 객체를 물으면 이렇게 하세요. "
+        "이 낱말이 나오면 첫 걸음은 정본의 object_resolve 하나입니다 — 여러 앱을 한꺼번에 훑지 말고, 사례 · 실측 · 규격 원문은 그 뒤에 "
+        "다른 앱에서 덧붙이세요. "
+        f"① 정본은 {d['canonical']['label']}입니다 — 이름 · 코드는 먼저 object_resolve 로 풀고, 결과가 candidates(여럿)면 "
+        "고르지 말고 사용자에게 어느 것인지 물으세요. "
+        "② PLM 과제(plm_task)의 식별자는 과제명입니다 — 과제코드는 별칭 · task_code 로 대조하세요. "
+        "③ 개수는 목록을 세지 말고 응답의 total 이나 objects_summary 로 답하세요. "
+        "④ 무엇이 무엇과 이어져 있는지는 graph_neighbors 로 보세요" + (f" — 자주 묻는 관계는 {rel} 입니다. " if rel else ". ")
+        + f"⑤ 다른 허브({sib})로 건널 때는 앞 허브의 id 를 그대로 쓰지 말고 key 로 그 허브에서 다시 resolve 하세요. "
+        "⑥ not_configured · 404 · 빈 출력은 '없다' 가 아니라 '조회하지 못했다' 로 말하세요. "
+        + (f"⑦ {non} 는 코어 객체를 갖지 않습니다 — 표준 키 · 개수 · 관계는 코어에서 답하고, 코어 질문을 그쪽으로 보내지 마세요. "
+           if non else "⑦ Report Archive · MatNexus · ComponentCore 는 코어 객체를 갖지 않습니다 — 코어 질문을 그쪽으로 보내지 마세요. "))
+
+
+def _core_vocab() -> dict | None:
+    """코어 어휘표 — 바뀐 시각이 다르면 다시 읽고 코어 규칙 글을 만든다. 없거나 못 읽으면 None 이고 까닭은 _CORE_VOCAB['error'] 다."""
+    try:
+        mt = CORE_VOCAB_PATH.stat().st_mtime_ns
+    except OSError:
+        if _CORE_VOCAB["error"] != "없음":
+            print(f"[agent] ⚠ 코어 어휘표가 없다({CORE_VOCAB_PATH}) — 코어 규칙은 기본 글로 돈다")
+        _CORE_VOCAB.update(mtime=None, data=None, error="없음")
+        return None
+    if mt != _CORE_VOCAB["mtime"]:
+        try:
+            d = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
+            data = {"version": d.get("version"), "rule_words": len(d["rule_words"]), "canonical": d["canonical"]["app"],
+                    "rules": _core_rules_text(d)}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            print(f"[agent] ⚠ 코어 어휘표를 못 읽었다({CORE_VOCAB_PATH}) — 코어 규칙은 기본 글로 돈다: {exc!r}"[:400])
+            _CORE_VOCAB.update(mtime=mt, data=None, error=f"못 읽음({type(exc).__name__})")
+        else:
+            _CORE_VOCAB.update(mtime=mt, data=data, error=None)
+    return _CORE_VOCAB["data"]
+
+
+def _system_prompt() -> str:
+    """챗 시스템 프롬프트 — 코어 규칙만 어휘표에서 만든 글로 바꾼다. 어휘표가 없으면 SYSTEM_PROMPT 와 글자 하나 다르지 않다."""
+    d = _core_vocab()
+    return SYSTEM_PROMPT if d is None else _SP_HEAD + d["rules"] + _SP_TAIL
+
+
+def _core_vocab_health() -> dict:
+    """/health 의 core_vocab — 읽었나 · 버전 · 발동 낱말 수 · 정본 앱. 경로는 싣지 않는다(박스 배치가 드러난다)."""
+    d = _core_vocab()
+    if d is None:
+        return {"loaded": False, "error": _CORE_VOCAB["error"]}
+    return {"loaded": True, "version": d["version"], "rule_words": d["rule_words"], "canonical": d["canonical"]}
 
 
 def _parse_servers(spec: str) -> dict:
@@ -4572,7 +4645,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 도구 호출을 막지 않고, 사용자에게만 그 사실을 알린다(사용자별 칸이라 남에게 안 번진다).
         _tool_deg = (getattr(app.state, "tool_degraded", None) or {}).get(
             (frozenset(req.groups), (req.user_email or "").strip().lower()))
-        sys_prompt = SYSTEM_PROMPT
+        sys_prompt = _system_prompt()
         if _tool_deg and not _tool_err:
             yield _sse("status", {"step": "내 자격증명으로 도구에 붙지 못해 공용 권한으로 답합니다 "
                                           "— 내 대화 검색·저장은 이번 턴에 안 됩니다",
@@ -6801,6 +6874,8 @@ def health() -> dict:
         "chat_llm": _chat_llm_health(),
         # 챗 자기검증 — 켜짐 · 상태별 수 · 걸린 ms · 마지막 실패(HA-13 — 포털 update-all §7 스모크가 읽는다)
         "self_check": _sc_health(),
+        # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
+        "core_vocab": _core_vocab_health(),
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
