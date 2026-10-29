@@ -586,6 +586,14 @@ it. The file is re-read when its mtime changes. Missing or malformed → the bui
 byte). `/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
 Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test).
 
+**Stable prompt prefix (W-3).** The first system message is the same on every turn (`SYSTEM_PROMPT`, or the vocabulary
+version of it), and the fixed tool share (guide tools, then core tools) sits at the front of the bound tools in a fixed
+order. Qwen's chat template appends the tools to the first system message, so system + fixed tools can be reused from the
+server's prefix cache across turns and users. What changes per turn (apps or tools the user pinned, operator/persona role,
+knowledge-card excerpt, attached documents, "no tools this turn") goes into a second system message right before the user's
+message. `CHAT_STABLE_PREFIX=0` puts it back into the first system message (the old layout) — the position changed, so
+instruction-following is measured on the box (portal docs/request-1029 C-7).
+
 **Self-check output cap (W-9).** The reviewer call sends `max_tokens` = draft tokens × 2 + 1,024, clamped to
 2,048 ~ 16,384 (langchain-openai sends it as `max_completion_tokens`); the input budget reserves the same amount. A cut
 reply keeps the draft (`self_check.status` `suspect`). The main chat answer has no cap (portal decision D-6).

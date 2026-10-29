@@ -13,7 +13,7 @@ VLLM_BASE_URL 을 여기로 돌리면, 리스크 앱 → 포털 중계 → 엔�
 끝점 — GET /health · GET /v1/models · POST /v1/chat/completions(stream:true 면 OpenAI 꼴의 SSE 조각으로 — 챗 경로가 쓴다.
 카드 대조·심의는 비스트리밍이다) · POST /_script {"script": [...]}(대본을 갈고 호출 수를 0 으로) ·
 POST /_hold?s=<초>(--capacity 자리 하나를 그만큼 쥔다) · GET /_stats {calls, active, peak, behaviors, capacity, waiting,
-waited_peak, images, humans, systems, max_tokens, affinity — 뒤 다섯은 요청마다(최근 20건)}.
+waited_peak, images, humans, systems, max_tokens, affinity, first_system — 뒤 여섯은 요청마다(최근 20건)}.
 오류 거동 — http_NNN 은 그 상태 코드로 답하고, timeout 은 답하지 않고 기다린다(호출자의 시간 한도가 먼저 걸린다).
 unreachable 은 서버가 흉내 낼 수 없다 — 닫힌 포트를 가리켜라(여기서는 503 으로 답한다).
 9009(떠 있는 에이전트 서버)에는 뜨지 않는다.
@@ -103,7 +103,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
     def stats():
         return {**{k: state[k] for k in ("calls", "active", "peak", "behaviors", "capacity", "waiting", "waited_peak")},
                 "images": state.get("images", []), "humans": state.get("humans", []), "systems": state.get("systems", []),
-                "max_tokens": state.get("max_tokens", []), "affinity": state.get("affinity", [])}
+                "max_tokens": state.get("max_tokens", []), "affinity": state.get("affinity", []),
+                "first_system": state.get("first_system", [])}
 
     def chunk(i: int, delta: dict, finish=None) -> bytes:
         c = {"id": f"fake-{i}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
@@ -152,6 +153,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
         del state["max_tokens"][:-20]
         state.setdefault("affinity", []).append(request.headers.get("x-session-affinity"))   # 대화 머리(W-1) — 없으면 None
         del state["affinity"][:-20]
+        state.setdefault("first_system", []).append(_text(msgs[0].get("content")) if msgs and msgs[0].get("role") == "system" else None)
+        del state["first_system"][:-20]                              # 첫 시스템 메시지만(W-3 — 턴을 가로질러 같아야 한다)
         if n_img and not vision:
             return JSONResponse({"error": {"message": f"{model} is not a multimodal model", "type": "BadRequestError",
                                            "param": None, "code": 400}}, status_code=400)

@@ -224,3 +224,46 @@ def test_W1_실제_경로_한_턴의_챗_호출과_검토자_호출이_같은_�
     _turn(monkeypatch, fake_llm, "M3 나사 체결 토크는?")
     st = _stats(fake_llm)
     assert st["calls"] == 2 and st["affinity"] == [hashlib.sha256(b"conv-7").hexdigest()[:16]] * 2, st["affinity"]
+
+
+# ── W-3 — 프롬프트 앞부분 고정(첫 시스템 메시지 · 도구의 고정 몫이 턴을 가로질러 같다) ─────────────────────────────────────────
+def test_W3_바뀌는_안내는_사람_발화_바로_앞의_시스템_칸에_두고_끄면_종전_꼴이다(monkeypatch):
+    hist, user = [("user", "앞 질문"), ("assistant", "앞 답")], ("user", "이번 질문")
+    m = a._turn_msgs("고정 시스템", "\n\n[사용자 지정 우선 도구]\nx", hist, None, user)
+    assert m[0] == ("system", "고정 시스템") and m[-1] == user and m[1:3] == hist
+    assert m[-2] == ("system", "[이번 턴의 안내]\n[사용자 지정 우선 도구]\nx")
+    assert a._turn_msgs("고정 시스템", "", hist, None, user) == [("system", "고정 시스템"), *hist, user], "안내가 없으면 한 칸"
+    monkeypatch.setattr(a, "_STABLE_PREFIX", False)
+    assert a._turn_msgs("고정 시스템", "\n\nX", hist, ("user", "그림"), user) == \
+        [("system", "고정 시스템\n\nX"), *hist, ("user", "그림"), user], "CHAT_STABLE_PREFIX=0 — 종전처럼 한 시스템 메시지"
+
+
+def test_W3_도구의_고정_몫은_정해진_차례로_맨_앞이다(monkeypatch):
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_model_context_tokens", lambda: 1_000_000)
+    names = ["zz_other", "list_tasks", "search_tools", "rootdesigndatahub_objects_list", "aa_other", "invoke_tool",
+             "rootdesigndatahub_object_resolve"]
+    tools = [_ST(name=n, description="d", coroutine=lambda **_k: None, args_schema={"type": "object", "properties": {}}) for n in names]
+    keep = a._GUIDE_FRONT + a._ONTO_CORE
+    want = [n for n in keep if n in names]
+    got = [t.name for t in a._select_tools(tools, "질문")]
+    assert got[:len(want)] == want, got
+    assert [t.name for t in a._select_tools(list(reversed(tools)), "다른 질문")][:len(want)] == want, "들어온 차례와 무관하다"
+
+
+def test_W3_실제_경로_턴을_가로질러_첫_시스템_메시지가_바이트까지_같다(monkeypatch, fake_llm):
+    monkeypatch.setenv("CHAT_SELF_CHECK", "0")
+    _script(fake_llm, ["첫 답", "둘째 답"])
+    orig = a._agent_stream
+    docs = {"on": False}
+
+    def with_doc(app_, req):                           # 둘째 턴에는 문서를 붙인다 — 이 턴의 안내가 달라진다
+        return orig(app_, req.model_copy(update={"documents": [{"name": "a.txt", "text": "붙인 문서의 본문 글"}]})
+                    if docs["on"] else req)
+    monkeypatch.setattr(a, "_agent_stream", with_doc)
+    _turn(monkeypatch, fake_llm, "첫 질문")
+    docs["on"] = True
+    _turn(monkeypatch, fake_llm, "둘째 질문")
+    st = _stats(fake_llm)
+    assert st["calls"] == 2 and st["first_system"][0] == st["first_system"][1], "바뀌는 안내가 첫 시스템 메시지에 섞였다"
+    assert "붙인 문서의 본문 글" in st["systems"][1] and "붙인 문서의 본문 글" not in st["first_system"][1]

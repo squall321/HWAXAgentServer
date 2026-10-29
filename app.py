@@ -302,6 +302,21 @@ def _system_prompt() -> str:
     return SYSTEM_PROMPT if d is None else _SP_HEAD + d["rules"] + _SP_TAIL
 
 
+# 프롬프트 앞부분 고정(HWAXPortal docs/request-1029 W-3) — Qwen 의 채팅 틀은 도구 설명을 **첫 시스템 메시지 끝**에 붙인다. 턴마다 바뀌는
+# 안내(쓸 수 있는 앱 · 핀 · 페르소나 · 지식카드 발췌 · 붙인 문서)가 첫 시스템 메시지에 붙어 있으면 그것이 바뀔 때마다 '시스템 + 도구' 앞부분이
+# 캐시에서 깨진다. 그래서 바뀌는 안내는 이번 사람 발화 바로 앞의 시스템 칸에 둔다. 안내의 자리가 바뀌어 지시를 따르는 정도가 달라질 수 있어
+# (C-7) 끄는 손잡이를 둔다 — CHAT_STABLE_PREFIX=0 이면 종전처럼 한 시스템 메시지에 잇는다.
+_STABLE_PREFIX = os.environ.get("CHAT_STABLE_PREFIX", "1").strip() != "0"
+
+
+def _turn_msgs(sys_prompt: str, turn_notes: str, hist: list, recap, user_msg) -> list:
+    """챗 한 턴의 메시지 — [첫 시스템(고정) · 이력 · (그림 다시 싣기) · 이 턴의 안내(시스템) · 이번 발화]. 안내가 없거나 손잡이를 끄면 종전 꼴."""
+    if not turn_notes or not _STABLE_PREFIX:
+        return [("system", sys_prompt + turn_notes), *hist, *([recap] if recap else []), user_msg]
+    return [("system", sys_prompt), *hist, *([recap] if recap else []),
+            ("system", "[이번 턴의 안내]\n" + turn_notes.lstrip("\n")), user_msg]
+
+
 def _core_vocab_health() -> dict:
     """/health 의 core_vocab — 읽었나 · 버전 · 발동 낱말 수 · 정본 앱. 경로는 싣지 않는다(박스 배치가 드러난다)."""
     d = _core_vocab()
@@ -2284,7 +2299,10 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
             _r = {n: i for i, n in enumerate(prefer)}
             tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
         keep = _GUIDE_FRONT + (_ONTO_CORE if core_names is None else ())
-        front = [t for t in tools if getattr(t, "name", "") in keep]
+        # 고정 몫(안내대 · 코어)은 정해진 차례(keep — 안내대 먼저)로 맨 앞에 — 관련도 순서로 다시 놓이면 턴마다 도구 몫의 앞부분이 바뀌어
+        # 접두 캐시가 깨진다(HWAXPortal docs/request-1029 W-3). 요청서는 이름순을 권했지만 정해진 차례도 턴마다 같고 안내대가 앞에 남는다.
+        _ki = {n: i for i, n in enumerate(keep)}
+        front = sorted((t for t in tools if getattr(t, "name", "") in _ki), key=lambda t: _ki[getattr(t, "name", "")])
         tools = front + [t for t in tools if getattr(t, "name", "") not in keep]
         return _fit_schema(tools, budget, keep=keep)
     pin = set(pinned or []) | set(first or [])
@@ -4827,6 +4845,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         _tool_deg = (getattr(app.state, "tool_degraded", None) or {}).get(
             (frozenset(req.groups), (req.user_email or "").strip().lower()))
         sys_prompt = _system_prompt()
+        turn_notes = ""      # 이 턴만의 안내 — 시스템 메시지 밖에 둔다(_turn_msgs · W-3)
         if _tool_deg and not _tool_err:
             yield _sse("status", {"step": "내 자격증명으로 도구에 붙지 못해 공용 권한으로 답합니다 "
                                           "— 내 대화 검색·저장은 이번 턴에 안 됩니다",
@@ -4834,7 +4853,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         if _tool_err:
             yield _sse("status", {"step": f"도구 목록을 불러오지 못했습니다({_tool_err}) — 도구 없이 답변합니다",
                                   "tool": None})
-            sys_prompt += ("\n\n[중요] 이번 턴에는 사용 가능한 도구가 하나도 없다(게이트웨이 연결 실패). "
+            turn_notes += ("\n\n[중요] 이번 턴에는 사용 가능한 도구가 하나도 없다(게이트웨이 연결 실패). "
                            "도구를 호출하겠다고 말하지 말고, 도구 없이 답할 수 있는 범위만 답한 뒤 "
                            "도구가 필요하다면 '도구 연결이 복구되면 다시 시도해 달라'고 알려라.")
         # 앱 지정이면 도구 이름 20~30개를 나열하지 않는다 — 프롬프트가 이름 목록으로 뒤덮이면
@@ -4845,16 +4864,16 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             _hdr, _why = (("[운영 앱 — 선택한 HE팀 운영자]", "이 운영자가 모는 앱이다")
                           if set(apps) <= set(op_apps) else
                           ("[사용자 지정 우선 앱]", "사용자가 이 앱(들)의 기능을 쓰라고 직접 골랐다"))
-            sys_prompt += (f"\n\n{_hdr}\n{_labels}\n"
+            turn_notes += (f"\n\n{_hdr}\n{_labels}\n"
                            f"{_why}. 이 질문 처리에 적합한 도구가 "
                            f"그 앱 안에 있으면 반드시 우선 호출하고 결과를 답변에 인용하라"
                            f"(다른 도구 사용 금지는 아니다). 어떤 도구를 쓸지는 네가 고른다.")
             if req.pinned_tools:
                 _direct = [n for n in pinned if n in set(req.pinned_tools or [])]
                 if _direct:
-                    sys_prompt += ("\n그중 사용자가 콕 집은 도구: " + ", ".join(_direct[:12]) + " — 가장 우선.")
+                    turn_notes += ("\n그중 사용자가 콕 집은 도구: " + ", ".join(_direct[:12]) + " — 가장 우선.")
         elif pinned:
-            sys_prompt += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
+            turn_notes += ("\n\n[사용자 지정 우선 도구]\n" + ", ".join(pinned)
                            + "\n사용자가 직접 선택한 도구다. 이 질문 처리에 적합하면 반드시 이 도구들을 "
                              "우선 호출하고, 결과를 답변에 인용하라(다른 도구 사용 금지는 아님).")
         # 붙어 있는 앱만 말한다 — 일부만 빠졌는데 '그 앱 도구 없이' 라고 하면 붙은 앱 도구까지 쓰지 말라는 뜻으로 읽힌다.
@@ -4865,7 +4884,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             yield _sse("warning", {"code": "operator_app_missing",
                                    "message": f"{agent_key} 가 모는 앱({_ml})이 이 게이트웨이에 연결돼 있지 않습니다 — "
                                               + (f"{_okl} 도구로 답합니다." if _okl else "그 앱 도구 없이 답합니다.")})
-            sys_prompt += (f"\n\n[중요] 이 운영자가 모는 앱({_ml})의 도구가 지금 연결돼 있지 않다. 그 도구를 "
+            turn_notes += (f"\n\n[중요] 이 운영자가 모는 앱({_ml})의 도구가 지금 연결돼 있지 않다. 그 도구를 "
                            "호출하겠다고 말하지 말고, 연결되지 않았다는 사실을 먼저 밝힌 뒤 "
                            + (f"연결된 {_okl} 의 도구로 할 수 있는 범위에서 답하라." if _okl
                               else "도구 없이 답할 수 있는 범위만 답하라."))
@@ -4876,18 +4895,18 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             # 밝히게 하면, 도구로 답할 질문에 엉뚱한 단서가 붙는다.
             # 위 [중요] 와 반대로 말하지 않는다 — 모는 앱이 하나도 안 붙었으면 '직접 호출해 답하라' 를 싣지 않는다.
             if op_apps and not _op_ok:
-                sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 모는 앱이 이 서버에 "
+                turn_notes += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 모는 앱이 이 서버에 "
                                f"연결돼 있지 않으니 아래 사전 지식으로 답할 수 있는 범위만 답하라.\n{persona.get('role') or ''}")
                 yield _sse("status", {"step": f"{agent_key} — 모는 앱이 연결돼 있지 않아 도구 없이 답합니다", "tool": None})
             else:
                 _opl = ", ".join(_app_label(a) for a in _op_ok) or "지정 앱"
-                sys_prompt += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 아래 사전 지식과 "
+                turn_notes += (f"\n\n[HE팀 MCP 운영자 — 사용자가 선택]\n너는 '{agent_key}' 운영자다. 아래 사전 지식과 "
                                f"작업 순서를 따라 {_opl} 의 도구를 직접 호출해 답하라.\n{persona.get('role') or ''}")
                 yield _sse("status", {"step": f"{agent_key} — {_opl} 도구로 답합니다", "tool": None})
         elif agent_key:
             role = persona.get("role") or ""
             if role:
-                sys_prompt += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
+                turn_notes += (f"\n\n[전문가 페르소나 — 사용자가 선택]\n너는 '{agent_key}' 전문가다. "
                                f"아래 역할과 범위를 지켜 그 전문가로서 답하라.\n{role}\n"
                                f"이 전문가 도메인의 데이터 조회는 agent_search(\"{agent_key}\", 질문) 를 우선 사용하라.")
             else:
@@ -4896,7 +4915,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # '없다' 와 '못 물어봤다' 를 갈라 말하는데 정작 역할은 안 그러고 있었다.
                 _pnote = persona.get("note") or ""
                 if _pnote:
-                    sys_prompt += (f"\n\n[전문가 페르소나]\n'{agent_key}' 의 역할 문서를 불러오지 "
+                    turn_notes += (f"\n\n[전문가 페르소나]\n'{agent_key}' 의 역할 문서를 불러오지 "
                                    f"못했다. 일반 지식으로 답하되 '이 전문가의 역할 문서를 "
                                    f"불러오지 못했다'고 먼저 밝혀라.")
                     yield _sse("warning", {"code": "persona_load_failed",
@@ -4915,7 +4934,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             yield _sse("status", {"step": f"{agent_key} 지식카드 검색", "tool": "agent_search"})
             know = await _persona_knowledge(app, req.groups, agent_key, _sel_q)
             if know:
-                sys_prompt += (f"\n\n[{agent_key} 지식카드 — 이번 질문 연관 발췌]\n{know}\n"
+                turn_notes += (f"\n\n[{agent_key} 지식카드 — 이번 질문 연관 발췌]\n{know}\n"
                                f"이 발췌는 그 전문가가 실제로 보유한 사내 지식이다. 답변에 해당하는 내용이 "
                                f"있으면 반드시 근거로 인용하되, 발췌에 없는 것을 있는 것처럼 말하지 마라. "
                                f"더 필요하면 agent_search(\"{agent_key}\", 구체적 질의) 로 추가 조회하라.")
@@ -4925,7 +4944,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # '보유 지식 없음' 으로 말하면, 그 전문가가 아는 게 없다는 거짓이 사용자에게 간다.
                 _note = getattr(_persona_knowledge, "last_note", "")
                 if _note:
-                    sys_prompt += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
+                    turn_notes += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
                                    f"이번 답변에는 사내 발췌가 없다. 일반 지식으로 답하되 "
                                    f"'사내 지식카드를 조회하지 못했다(없다는 뜻이 아니다)'고 먼저 밝혀라.")
                     yield _sse("warning", {"code": "knowledge_degraded",
@@ -4934,7 +4953,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                     yield _sse("status", {"step": f"지식카드 조회 실패 — {_note}", "tool": None})
                 else:
                     # 0히트를 침묵하면 모델이 일반 지식으로 메우고 사용자는 그것을 사내 지식으로 읽는다.
-                    sys_prompt += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
+                    turn_notes += (f"\n\n[{agent_key} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다. "
                                    f"일반 지식으로 답하되 '사내 지식카드에는 관련 내용이 없다'고 먼저 밝혀라.")
                     yield _sse("status", {"step": "연관 지식카드 없음 — 일반 지식으로 답변", "tool": None})
         # 보조 전문가 — 목소리는 주 전문가 하나다. 보조는 판단 기준(역할)과 도구를 빌려줄 뿐이고,
@@ -4956,7 +4975,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                   " — 입구 도구만 묶여 있다. 더 필요하면 search_tools 로 찾아 "
                                   "invoke_tool 로 호출하라)")
                 _blocks.append(f"- {_k} · {_tag}{_apps_note}\n{_r}" if _r else f"- {_k} · {_tag}{_apps_note}")
-            sys_prompt += (
+            turn_notes += (
                 "\n\n[함께 선택된 보조 전문가 — 렌즈와 도구만 빌려준다]\n"
                 + "\n".join(_blocks)
                 + f"\n\n답은 '{agent_key}' 한 사람의 목소리로 쓴다. 보조 전문가의 이름으로 따로 말하지 말고, "
@@ -4966,8 +4985,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                   "판단이 갈려 결론을 못 내면 '/심의 <질문>' 으로 정식 심의를 권하라.")
             yield _sse("status", {"step": f"주 전문가 {agent_key} + 보조 {len(helpers)}명으로 답합니다",
                                   "tool": None})
-        # 붙인 문서는 **sys_prompt 에** 싣는다 — 아래 세 갈래(첫 호출·오류 재시도·강제 도구호출)가
-        # 모두 sys_prompt 를 공유하므로, user 메시지에 붙이면 재시도 경로에서 조용히 빠진다.
+        # 붙인 문서는 **turn_notes 에** 싣는다 — 아래 세 갈래(첫 호출·오류 재시도·강제 도구호출)가
+        # 모두 _turn_msgs 로 메시지를 지으므로, user 메시지에 붙이면 재시도 경로에서 조용히 빠진다.
         # ⚠ 순서가 중요하다. 문서 예산은 '컨텍스트 − 예비분 − 이력' 인데, 여기서 빼야 할 이력은
         # 원본이 아니라 **압축 뒤 실제로 실리는 것**이다. 원본을 빼면 긴 대화에서 문서가 자리를
         # 통째로 잃는다(실측 128K 창에서 문서 몫이 1,502자까지 떨어졌다).
@@ -5000,7 +5019,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         _hist_tokens = _est_tokens_all("".join(c for _, c in _hist_msgs))
         _docs = _doc_block(req.documents, _hist_tokens)
         if _docs:
-            sys_prompt += _docs
+            turn_notes += _docs
             yield _sse("status", {"step": _doc_status(_docs, min(len(req.documents), DOC_MAX_FILES),
                                                       _hist_tokens), "tool": None})
         # 그림 — 올린 그림은 아티팩트로 저장해 주소를 화면에 돌려준다(이력에 다시 실린다). 챗 모델이 그림을 받으면 이 발화의 그림 조각으로,
@@ -5011,7 +5030,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         _user_msg, _recap = await _turn_image_messages(app, req, _turn_vision)
         async for _ev in _drain_image_events(_turn_image_events):
             yield _ev
-        messages = [("system", sys_prompt), *_hist_msgs, *([_recap] if _recap else []), _user_msg]
+        messages = _turn_msgs(sys_prompt, turn_notes, _hist_msgs, _recap, _user_msg)
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
@@ -5226,10 +5245,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 if _attempt > 1:
                     await asyncio.sleep(min(4.0, 1.5 * (_attempt - 1)))
                 try:
-                    _msgs = [("system", sys_prompt),
-                             *_history_messages(req.history, has_docs=bool(req.documents)),
-                             *([locals()["_recap"]] if locals().get("_recap") else []),
-                             locals().get("_user_msg") or ("user", req.message)]
+                    _msgs = _turn_msgs(sys_prompt, locals().get("turn_notes") or "",
+                                       _history_messages(req.history, has_docs=bool(req.documents)),
+                                       locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
                     # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
                     _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
                     _r4 = await agent.ainvoke({"messages": _msgs}, config=_cfg4)
@@ -5301,13 +5319,12 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         print(f"[agent] 도구 미호출({_why}) — 강제 지시로 1회 재시도")
         yield _sse("status", {"step": "도구를 실제로 호출하도록 다시 시도합니다", "tool": None})
         try:
-            _forced = [("system", sys_prompt + "\n\n[중요] 도구를 쓰겠다고 예고하지 마라. "
-                        "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
-                        "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라. "
-                        "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라."),
-                       *_history_messages(req.history, has_docs=bool(req.documents)),
-                       *([locals()["_recap"]] if locals().get("_recap") else []),
-                       locals().get("_user_msg") or ("user", req.message)]
+            _forced = _turn_msgs(sys_prompt, (locals().get("turn_notes") or "") + "\n\n[중요] 도구를 쓰겠다고 예고하지 마라. "
+                                 "설명이나 인자 예시를 출력하지 말고, 필요한 도구를 **지금 즉시 호출**하라. "
+                                 "인자를 모르면 기본값이나 빈 인자로 호출한 뒤 결과를 보고 판단하라. "
+                                 "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라.",
+                                 _history_messages(req.history, has_docs=bool(req.documents)),
+                                 locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
             _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
             for m in reversed((_r2 or {}).get("messages") or []):
                 if getattr(m, "type", "") != "ai":

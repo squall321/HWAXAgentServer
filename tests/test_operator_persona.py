@@ -26,6 +26,12 @@ PLAIN_SESSION = {"agent_type": "rel-drop-impact", "name": "낙하 전문가", "d
                  "system_prompt": "낙하 전문가 역할", "response_config": {}}
 
 
+
+def _sys(sink) -> str:
+    """모델이 받은 시스템 안내 전부 — 이 턴의 안내는 첫 시스템 메시지가 아니라 이번 발화 바로 앞의 시스템 칸에 있다(HWAXPortal
+    docs/request-1029 W-3 · 프롬프트 앞부분 고정)."""
+    return "\n".join(c for r, c in sink["messages"] if r == "system")
+
 def _prime_tools_map(monkeypatch, mapping, areas=None):
     monkeypatch.setitem(a._TOOLS_MAP_CACHE, "at", time.time())
     monkeypatch.setitem(a._TOOLS_MAP_CACHE, "map", mapping)
@@ -197,7 +203,7 @@ def test_운영자를_고르면_앱_도구가_묶이고_지식카드_선조회�
     assert set(sink["pinned"]) >= {"predict_sed", "get_dataset_summary", "train_model"}
     assert "query_voc" not in sink["pinned"], "다른 앱 도구까지 핀하지 않는다"
     assert sink["first"][:2] == ["predict_sed", "get_dataset_summary"], "입구 도구는 먼저 산다"
-    sys_prompt = sink["messages"][0][1]
+    sys_prompt = _sys(sink)
     assert "[HE팀 MCP 운영자" in sys_prompt and "역할 본문" in sys_prompt
     assert "[운영 앱 — 선택한 HE팀 운영자]" in sys_prompt
     assert "agent_search" not in sys_prompt.split("[HE팀 MCP 운영자")[1], "운영자에게 지식카드 우선을 지시하지 않는다"
@@ -211,7 +217,7 @@ def test_운영자의_앱이_게이트웨이에_없으면_경고한다(monkeypat
                                              "key_tools": []})
     sink, out, _ = _run_stream(monkeypatch, sess, TS_MAP)
     assert "operator_app_missing" in out
-    assert "연결돼 있지 않다" in sink["messages"][0][1]
+    assert "연결돼 있지 않다" in _sys(sink)
 
 
 def _events(out: str) -> list:
@@ -233,7 +239,7 @@ def _op_turn(monkeypatch, apps, mapping):
     sink, out, _ = _run_stream(monkeypatch, sess, mapping)
     evs = _events(out)
     return ([d_["step"] for e, d_ in evs if e == "status"], [d_ for e, d_ in evs if e == "warning"],
-            sink["messages"][0][1])
+            _sys(sink))
 
 
 def test_앱이_다_빠진_운영자는_도구로_답한다고_말하지_않는다(monkeypatch):
@@ -272,7 +278,7 @@ def test_도구_매핑을_못_받으면_앱이_없다고_단정하지_않는다(
 def test_일반_전문가는_종전대로_지식카드를_조회한다(monkeypatch):
     sink, _out, kcalls = _run_stream(monkeypatch, PLAIN_SESSION, TS_MAP)
     assert len(kcalls) == 1
-    assert "agent_search" in sink["messages"][0][1]
+    assert "agent_search" in _sys(sink)
     assert sink["pinned"] == [] and sink["first"] == []
     assert sink["core"] is None, "일반 전문가는 종전 핵심 예약 그대로"
     # 낙하 전문가 + 해석(sim) 영역 도구 → 분야 도구가 붙는다.
@@ -461,7 +467,7 @@ def test_역할을_못_불러오면_사용자에게_말한다(monkeypatch):
                       "operator": False, "apps": [], "key_tools": []})
     assert "persona_load_failed" in out
     assert "gateway down" in out
-    assert "불러오지 못했다" in sink["messages"][0][1], "모델에게도 알려야 전문가인 척하지 않는다"
+    assert "불러오지 못했다" in _sys(sink), "모델에게도 알려야 전문가인 척하지 않는다"
 
 
 def test_역할이_비어_있으면_다르게_말한다(monkeypatch):
@@ -476,7 +482,7 @@ def test_역할이_있으면_경고하지_않는다(monkeypatch):
         monkeypatch, {"role": "휨 해석 전문가다", "note": "", "operator": False,
                       "apps": [], "key_tools": []})
     assert "persona_load_failed" not in out and "persona_role_empty" not in out
-    assert "휨 해석 전문가다" in sink["messages"][0][1]
+    assert "휨 해석 전문가다" in _sys(sink)
 
 
 # ── 캡이 없어도 전문가 도구가 앞에 선다(운영 cae00 은 TOOL_MAX=0) ──────────────
