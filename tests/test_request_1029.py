@@ -5,6 +5,8 @@
 import asyncio
 import json
 import os
+
+import pytest
 import sys
 from pathlib import Path
 
@@ -49,8 +51,10 @@ def test_R1_R2_R7_R8_코어_규칙을_어휘표에서_만든다(monkeypatch):
         assert x in seven, x
     assert "FailureTrace · CAE 그룹 Datahub" in rules[rules.index("⑤"):rules.index("⑥")]
     assert "(시험)" not in sp and "시험 사본" not in sp, "시험 사본은 규칙에 싣지 않는다(10-27 D-1 · R-6 은 2차)"
-    assert a._core_vocab_health() == {"loaded": True, "version": vocab["version"], "rule_words": len(vocab["rule_words"]),
-                                      "canonical": "rootdesigndatahub"}
+    h = a._core_vocab_health()
+    assert {k: h[k] for k in ("loaded", "version", "rule_words", "canonical")} == {
+        "loaded": True, "version": vocab["version"], "rule_words": len(vocab["rule_words"]), "canonical": "rootdesigndatahub"}
+    assert h["fingerprint"] == h["base"] and len(h["fingerprint"]) == 12 and h["overlay"] == {"present": False}, "덧씌우기 없음 — E-7 ③"
 
 
 def test_어휘표는_바뀐_시각에_다시_읽고_깨지면_기본_글로_돈다(monkeypatch, tmp_path, capsys):
@@ -319,3 +323,45 @@ def test_W4_실제_경로_바꿀_곳을_초안에서_못_찾으면_초안을_내
     assert _text(evs, "token") == draft
     sc = [d for e, d in evs if e == "meta"][-1]["self_check"]
     assert sc["status"] == "suspect" and "찾지 못했다" in sc["reason"] and sc["fixes"] == ["x"], sc
+
+
+# ── E-7 ② ③ — 코어 어휘표 박스 덧씌우기 · 지문(게이트웨이와 같은 셈) ──────────────────────────────────────────────────────
+def test_E7_어휘표_덧씌우기는_merge_patch_로_얹고_깨지면_버린다(monkeypatch, tmp_path):
+    import hashlib
+    monkeypatch.setattr(a, "CORE_VOCAB_PATH", _REAL)
+    loc = tmp_path / "core_vocab.local.json"
+    monkeypatch.setattr(a, "CORE_VOCAB_LOCAL_PATH", loc)
+    base = a._core_vocab()
+    assert base["fingerprint"] == base["base_fingerprint"] and a._core_vocab_health()["overlay"] == {"present": False}
+    loc.write_text(json.dumps({"rule_words": ["덧씌운낱말"], "apps": {"fmea": None}}, ensure_ascii=False), encoding="utf-8")
+    d = a._core_vocab()
+    assert "덧씌운낱말" in d["rules"] and "FMEA" not in d["rules"].split("⑦", 1)[1], "목록은 바꾸고 null 은 지운다"
+    raw = json.loads(_REAL.read_text(encoding="utf-8"))
+    merged = {**raw, "rule_words": ["덧씌운낱말"], "apps": {k: v for k, v in raw["apps"].items() if k != "fmea"}}
+    want = hashlib.sha256(json.dumps({k: v for k, v in merged.items() if k != "_doc"}, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()[:12]
+    h = a._core_vocab_health()
+    assert h["fingerprint"] == want and h["base"] == base["base_fingerprint"], "지문 — 덧씌운 표의 키 차례 JSON(_doc 뺌) sha256 앞 12자"
+    assert set(h["overlay"]["changed"]) == {"rule_words", "apps.fmea"}
+    loc.write_text("[]", encoding="utf-8")
+    st = loc.stat()
+    os.utime(loc, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert a._core_vocab()["fingerprint"] == base["fingerprint"] and "덧씌우기를 버렸다" in a._core_vocab_health()["overlay"]["error"]
+
+
+def test_E7_합치기와_지문은_게이트웨이와_글자까지_같다():
+    """두 서비스가 같은 파일에서 같은 지문을 내야 update-all §6 이 '한 표를 본다' 를 견줄 수 있다 — 한쪽만 고치면 여기서 깨진다."""
+    import inspect
+    gw = Path(a.__file__).resolve().parent.parent / "HWAXMcpGateway" / "gateway.py"
+    if not gw.exists():
+        pytest.skip("형제 게이트웨이 리포가 없다")
+    src = gw.read_text(encoding="utf-8")
+    for fn in (a._merge_patch, a._json_fp):
+        body = inspect.getsource(fn)
+        code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith(('"""', "#")) and "게이트웨이" not in ln)
+        name = fn.__name__
+        i = src.index(f"def {name}(")
+        theirs = src[i:src.index("\n\n\n", i)]
+        mine_lines = [ln for ln in code.splitlines() if ln.strip() and not ln.strip().startswith(("JSON", "값의"))]
+        their_lines = [ln for ln in theirs.splitlines() if ln.strip() and not ln.strip().startswith(('"""', "JSON", "값의", "#"))]
+        assert [ln for ln in mine_lines if '"""' not in ln] == [ln for ln in their_lines if '"""' not in ln], name

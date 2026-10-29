@@ -48,4 +48,6 @@ def _no_core_vocab(monkeypatch, tmp_path):
     app_mod = sys.modules.get("app")
     if app_mod is not None and hasattr(app_mod, "CORE_VOCAB_PATH"):
         monkeypatch.setattr(app_mod, "CORE_VOCAB_PATH", tmp_path / "no-core-vocab.json")
-        monkeypatch.setattr(app_mod, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음"})
+        # 박스 덧씌우기도 늘 '없음' — 실제 표를 읽는 시험에도 박스의 core_vocab.local.json 이 끼어들지 않게 한다(E-7 ②)
+        monkeypatch.setattr(app_mod, "CORE_VOCAB_LOCAL_PATH", tmp_path / "no-core-vocab.local.json")
+        monkeypatch.setattr(app_mod, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "overlay": None})

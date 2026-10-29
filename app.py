@@ -248,7 +248,39 @@ SYSTEM_PROMPT = _SP_HEAD + _CORE_RULES_DEFAULT + _SP_TAIL
 # 그 파일을 직접 읽는다. 바뀐 시각이 다르면 다시 읽고 코어 규칙 글을 새로 만든다. 없거나 꼴이 틀리면 위 기본 글(SYSTEM_PROMPT 그대로)로
 # 돌고, 그 사실을 /health 의 core_vocab 에 싣는다.
 CORE_VOCAB_PATH = Path(__file__).resolve().parent.parent / "HWAXPortal" / "backend" / "config" / "core_vocab.json"
-_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음"}
+# 박스 덧씌우기(HWAXPortal docs/request-1029 E-7 ② — gitignore) — 발동 낱말 · 정본 · 앱 역할을 cae00 에서 커밋 없이 고친다. 게이트웨이와 같은
+# JSON merge patch(RFC 7386)이고 지문 셈법도 같다 — 두 서비스의 /health core_vocab.fingerprint 가 같아야 한 표를 본다(update-all §6 이 견준다).
+CORE_VOCAB_LOCAL_PATH = CORE_VOCAB_PATH.with_name("core_vocab.local.json")
+_CORE_VOCAB: dict = {"mtime": None, "data": None, "error": "아직 읽지 않음", "overlay": None}
+
+
+def _merge_patch(target, patch):
+    """JSON merge patch(RFC 7386) — 객체는 재귀로 합치고, 그 밖은 바꾸며, null 은 그 칸을 지운다(목록은 통째로 바뀐다). 게이트웨이와 같다."""
+    if not isinstance(patch, dict):
+        return patch
+    out = dict(target) if isinstance(target, dict) else {}
+    for k, v in patch.items():
+        if v is None:
+            out.pop(k, None)
+        else:
+            out[k] = _merge_patch(out.get(k), v)
+    return out
+
+
+def _json_fp(obj) -> str:
+    """값의 지문 — 키 차례 JSON 의 sha256 앞 12자(설명 칸 _doc 은 뺀다). 게이트웨이 gateway._json_fp 와 같은 셈이다."""
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if k != "_doc"}
+    return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
+
+
+def _patch_paths(patch: dict) -> list[str]:
+    out = []
+    for k, v in patch.items():
+        if k == "_doc":
+            continue
+        out += [f"{k}.{kk}" for kk in v] if isinstance(v, dict) and v else [k]
+    return out
 
 
 def _core_rules_text(d: dict) -> str:
@@ -283,16 +315,36 @@ def _core_vocab() -> dict | None:
             print(f"[agent] ⚠ 코어 어휘표가 없다({CORE_VOCAB_PATH}) — 코어 규칙은 기본 글로 돈다")
         _CORE_VOCAB.update(mtime=None, data=None, error="없음")
         return None
-    if mt != _CORE_VOCAB["mtime"]:
+    try:
+        lmt = CORE_VOCAB_LOCAL_PATH.stat().st_mtime_ns
+    except OSError:
+        lmt = None
+
+    def build(d: dict) -> dict:
+        return {"version": d.get("version"), "rule_words": len(d["rule_words"]), "canonical": d["canonical"]["app"],
+                "rules": _core_rules_text(d)}
+    if (mt, lmt) != _CORE_VOCAB["mtime"]:
         try:
-            d = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
-            data = {"version": d.get("version"), "rule_words": len(d["rule_words"]), "canonical": d["canonical"]["app"],
-                    "rules": _core_rules_text(d)}
+            raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
+            data = build(raw)
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             print(f"[agent] ⚠ 코어 어휘표를 못 읽었다({CORE_VOCAB_PATH}) — 코어 규칙은 기본 글로 돈다: {exc!r}"[:400])
-            _CORE_VOCAB.update(mtime=mt, data=None, error=f"못 읽음({type(exc).__name__})")
+            _CORE_VOCAB.update(mtime=(mt, lmt), data=None, error=f"못 읽음({type(exc).__name__})", overlay=None)
         else:
-            _CORE_VOCAB.update(mtime=mt, data=data, error=None)
+            eff, overlay = raw, {"present": lmt is not None}
+            if lmt is not None:
+                try:
+                    patch = json.loads(CORE_VOCAB_LOCAL_PATH.read_text(encoding="utf-8"))
+                    if not isinstance(patch, dict):
+                        raise TypeError("덧씌우기는 객체여야 한다")
+                    merged = _merge_patch(raw, patch)
+                    data, eff = build(merged), merged
+                    overlay.update(fingerprint=_json_fp(patch), changed=_patch_paths(patch)[:40])
+                except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                    overlay["error"] = f"덧씌우기를 버렸다({type(exc).__name__}: {str(exc)[:120]})"
+                    print(f"[agent] ⚠ 코어 어휘표 덧씌우기({CORE_VOCAB_LOCAL_PATH})를 버리고 기본 표로 돈다: {exc!r}"[:400])
+            data = {**data, "fingerprint": _json_fp(eff), "base_fingerprint": _json_fp(raw)}
+            _CORE_VOCAB.update(mtime=(mt, lmt), data=data, error=None, overlay=overlay)
     return _CORE_VOCAB["data"]
 
 
@@ -322,7 +374,10 @@ def _core_vocab_health() -> dict:
     d = _core_vocab()
     if d is None:
         return {"loaded": False, "error": _CORE_VOCAB["error"]}
-    return {"loaded": True, "version": d["version"], "rule_words": d["rule_words"], "canonical": d["canonical"]}
+    return {"loaded": True, "version": d["version"], "rule_words": d["rule_words"], "canonical": d["canonical"],
+            # 덧씌운 표 · 기본 표의 지문과 박스 덧씌우기 — 게이트웨이 /health core_vocab 과 같아야 한다(E-7 ③)
+            "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
+            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False})}
 
 
 def _parse_servers(spec: str) -> dict:
