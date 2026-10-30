@@ -245,17 +245,24 @@ def test_A9_목록_파일이_없으면_바닥_목록만_돈다(turn_ctx, monkeyp
     assert _run(_gw("insert_block", reached), {"doc_id": "D1"}) == "gateway called insert_block", "운영자 정의가 없으면 쓰기 목록도 없다"
     assert [c["kind"] for c in ctx.pending] == ["job", "job", "job"]
     lists = a._confirm_health()["lists"]
-    assert lists["loaded"] is False and lists["error"] == "없음" and lists["jobs"] == len(a._CONFIRM_JOB_TOOLS) == 24
+    assert lists["loaded"] is False and lists["error"] == "없음" and lists["jobs"] == len(a._CONFIRM_JOB_TOOLS) == 25
     assert (lists["writes"], lists["confirm"]) == (0, 0)
 
 
-def test_A9b_꼴이_틀린_정본은_통째로_버리고_까닭을_적는다(gate):
+def test_A9b_꼴이_틀린_항목은_건너뛰고_통째로_못_읽으면_마지막_목록을_쥔_채_까닭을_적는다(gate):
+    """항목 하나의 실수가 좋은 목록까지 버리면 박스 전체의 쓰기 · 확인 부류가 카드 없이 나간다(반대 검토 2차)."""
     gate.write_text(json.dumps({"personas": [{"key": "x", "apps": ["a"], "writes": [1]}]}), encoding="utf-8")
     lists = a._confirm_health()["lists"]
-    assert lists["loaded"] is False and lists["error"].startswith("못 읽음(") and lists["writes"] == 0
+    assert lists["loaded"] is False and lists["error"] == "항목 1개를 건너뜀(꼴이 틀렸다)" and lists["writes"] == 0
     gate.write_text(json.dumps(HE_TEAM), encoding="utf-8")
     os.utime(gate, ns=(time.time_ns(), time.time_ns() + 1_000_000_000))
     assert a._confirm_health()["lists"]["loaded"] is True, "바뀐 시각이 다르면 재기동 없이 다시 읽는다"
+    good = a._confirm_health()["lists"]
+    gate.write_text("{깨진 JSON", encoding="utf-8")
+    os.utime(gate, ns=(time.time_ns(), time.time_ns() + 2_000_000_000))
+    bad = a._confirm_health()["lists"]
+    assert bad["loaded"] is False and bad["error"].startswith("못 읽음(") and (bad["writes"], bad["confirm"]) == (good["writes"], good["confirm"])
+    assert a._confirm_class("delete_project") == ("confirm", "delete_project"), "마지막으로 읽은 목록으로 돈다"
 
 
 def test_A10_접두_별칭만_적어도_맨_이름까지_막고_겹치면_confirm_이다(turn_ctx):
@@ -875,7 +882,7 @@ def test_health_에_confirm_gate_가_실린다(gate, monkeypatch, tmp_path):
     reached = []
     _card_turn(monkeypatch, {"run_job": _gw("run_job", reached)}, [("run_job", P1_GRAPH)])
     h = TestClient(a.app).get("/health").json()["confirm_gate"]
-    assert h == {"on": True, "lists": {"loaded": True, "error": None, "jobs": 24, "writes": len(a._confirm_lists()["writes"]),
+    assert h == {"on": True, "lists": {"loaded": True, "error": None, "jobs": 25, "writes": len(a._confirm_lists()["writes"]),
                                        "confirm": len(a._confirm_lists()["confirm"])},
                  "pending": 1, "counts": {"cards": 1, "held_calls": 1, "approved": 0, "executed": 0, "declined": 0,
                                           "unknown_reply": 0, "ordered": 0}}
@@ -1035,3 +1042,254 @@ def test_rv2_승인_실행_안내는_기다림이_켜져_있으면_상태_조회
         assert "상태 조회 도구를 한 번 부르라 — 코드가 끝날 때까지 기다린다" in human and "볼 수 있다" not in human
     else:
         assert "상태 조회 도구로 진행을 볼 수 있다" in human and "코드가 끝날 때까지" not in human, "꺼져 있으면 기다려 준다고 말하지 않는다"
+
+
+# ── 반대 검토 2차(rv2) — HA-29: 잡 주문의 동사 · 대상 묶기 · 자유 글 칸 · 카드의 답 · 핀 · 바닥 목록 · 인자 · 자격 · 앱 · 기본값 · 보낸 호출 ·
+#    재시도 길 · 목록 읽기 · 자격 거절 · 새어 나온 호출 ──────────────────────────────────────────────────────────────────────────────
+DECK = {"project_id": "P1", "kind": "deck_step", "params": {"deck": "raw/board.k", "name": "보드 낙하 검토", "run": "detect"}}
+RV2_ORDER = [
+    # 대상 낱말과 동사가 따로 놀면 주문이 아니다(DW-03 재발 꼴)
+    ("drop_check 결과로 표 만들어줘", "run_job", P1_DROP, False),
+    ("drop_check 결과 표로 만들어줘", "run_job", P1_DROP, False),
+    ("drop_check run 결과 보여줘", "run_job", P1_DROP, False),
+    ("지난번 drop_check run 이력 정리해줘", "run_job", P1_DROP, False),
+    ("Show me the last run of drop_check", "run_job", P1_DROP, False),
+    ("drop_check 잡 취소해줘", "run_job", P1_DROP, False),
+    ("drop_check 결과 파일 삭제해줘", "run_job", P1_DROP, False),
+    ("drop_check 는 내일 실행해줘", "run_job", P1_DROP, False),
+    ("graph 결과로 보고서 만들어줘", "run_job", P1_GRAPH, False),
+    ("어제 run_job 으로 돌린 거 표로 만들어줘", "run_job", P1_GRAPH, False),
+    # 모델이 지어 넣은 자유 글 칸(새 과제 이름)은 대상이 아니다
+    ("보드 낙하 검토 결과 정리해서 보고서 만들어줘", "run_job", DECK, False),
+    ("보드 낙하 검토 돌려줘", "run_job", DECK, False),
+    ("board.k 에 어떤 파트가 있는지 표로 만들어줘", "run_job", DECK, False),
+    # 정당한 주문은 그대로 간다
+    ("board.k 돌려줘", "run_job", DECK, True),
+    ("drop_check 잡을 지금 돌려줘", "run_job", P1_DROP, True),
+    ("판 전체 drop_check 한 번 실행해줘", "run_job", P1_DROP, True),
+    ("drop_check 를 run 해줘", "run_job", P1_DROP, True),
+    ("Please run the drop_check job.", "run_job", P1_DROP, True),
+    ("`drop_check` 돌려줘", "run_job", P1_DROP, True),
+    ("이 표를 블록으로 추가해줘", "insert_block", {"doc_id": "D1"}, True),           # 쓰기는 종전대로 주문 동사면 된다
+]
+
+
+@pytest.mark.parametrize("msg,tool,args,passes", RV2_ORDER, ids=[f"{i}-{v[1]}" for i, v in enumerate(RV2_ORDER)])
+def test_rv2_잡_주문은_그_일의_낱말_바로_뒤의_잡_동사로만_친다(turn_ctx, msg, tool, args, passes):
+    ctx = turn_ctx(msg)
+    reached = []
+    out = _run(_gw(tool, reached), args)
+    assert bool(reached) is passes, (msg, out)
+    assert bool(ctx.pending) is (not passes)
+
+
+@pytest.mark.parametrize("msg", ["이번 주 결과로 보고서 만들어줘", "아까 그 표 다시 만들어줘", "graph 잡은 취소해줘"])
+def test_rv2_대화에_남은_핀은_잡을_거는_동사_없이는_잡을_열지_않는다(turn_ctx, msg):
+    """포털은 핀을 대화에 둬 다음 말에도 싣는다 — 핀 하나로 아무 주문 동사에나 run_job 이 카드 없이 나갔다."""
+    ctx = turn_ctx(msg, pinned_tools=["run_job"])
+    reached = []
+    assert _held(_run(_gw("run_job", reached), P1_DROP)) and reached == [] and len(ctx.pending) == 1
+
+
+def test_rv2_핀은_그_도구에만_먹고_다른_앱의_같은_꼬리_잡은_열지_않는다(turn_ctx):
+    reached = []
+    turn_ctx("돌려줘", pinned_tools=["appa_run_job"])
+    assert _held(_run(_gw("appb_run_job", reached), P1_GRAPH)), "한 앱의 run_job 핀이 다른 앱의 run_job 을 열었다"
+    assert _run(_gw("appa_run_job", reached), P1_GRAPH) == "gateway called appa_run_job"
+    turn_ctx("돌려줘", pinned_tools=["heaxstep_forge_run_job"])
+    assert _run(_gw("run_job", reached), P1_GRAPH) == "gateway called run_job", "핀이 별칭이고 부른 것이 맨 이름이면 같은 도구다"
+
+
+@pytest.mark.parametrize("name", ["extract_surface_to_cad", "heaxstep_forge_extract_surface_to_cad"])
+def test_rv2_StepForge_의_다섯째_잡_넣기도_바닥_목록이다(turn_ctx, name):
+    ctx = turn_ctx("이 덱 파일에 어떤 파트가 있는지 알려줘")
+    reached = []
+    assert a._confirm_class(name) == ("job", "extract_surface_to_cad")
+    assert _held(_run(_gw(name, reached), {"project_id": "P1", "deck": "board.k"})) and reached == [] and ctx.pending[0]["kind"] == "job"
+
+
+@pytest.mark.parametrize("msg", ["{cid} 이게 무슨 잡이야?", "{cid} 대신 graph 만 돌려줘", ".", "~", "!", "어...", "확인", "{cid} 는 나중에 생각해볼게",
+                                 "{cid} 카드 왜 떴어", "{cid}"])
+def test_rv2_승인이_아닌_말은_승인이_아니다(gate, msg):
+    cid = "cf-0123456789ab"
+    hist = [{"role": "assistant", "content": f"…(확인 번호 `{cid}` · 30분)"}]
+    assert a._confirm_reply(a.ChatRequest(message=msg.format(cid=cid), history=hist)) is None, msg
+
+
+def test_rv2_단추_글과_번호를_든_짧은_승인_거절은_그대로다(gate):
+    cid = "cf-0123456789ab"
+    hist = [{"role": "assistant", "content": f"…(확인 번호 `{cid}` · 30분)"}]
+
+    def reply(m):
+        return a._confirm_reply(a.ChatRequest(message=m, history=hist))
+    assert reply(f"실행 — 확인 번호 {cid}") == reply(f"{cid} 실행") == reply(f"확인 번호 {cid} 실행해줘") == ("approve", cid)
+    assert reply(f"취소 — 확인 번호 {cid} 는 실행하지 않음") == reply(f"{cid} 취소") == ("decline", cid)
+
+
+def test_rv2_번호를_든_다른_지시는_저장한_잡을_보내지_않고_새_주문으로_간다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_DROP)])
+    ag = _GateAgent(tools, steps=[[("run_job", P1_GRAPH)]], say="graph 를 걸었습니다.")
+    _turn(monkeypatch, ag, tools, f"{card['id']} 대신 graph 만 돌려줘", hist)
+    assert reached == [("run_job", P1_GRAPH)], "drop_check 은 나가지 않고, 이번 말이 시킨 graph 만"
+    assert card["id"] not in a._CONFIRM_PENDING
+
+
+def test_rv2_카드_글은_인자를_잎까지_펼치고_사건은_인자_전부를_싣는다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    full = {"project_id": "P1", "kind": "measure", "params": {"tool": "drop_check", "args": {"select": "BGA*", "part": "U1"}}}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", full)])
+    c = card["calls"][0]
+    assert "params.args.select=BGA*" in c["args_text"] and "params.args.part=U1" in c["args_text"], c["args_text"]
+    assert json.loads(c["args"]) == full, "화면이 펼쳐 보일 인자 전부(정규 JSON)"
+    script = "#!/bin/bash\n# 안전한 조회만 합니다\n" + "echo ok\n" * 20 + "rm -rf /data\n"
+    txt = a._confirm_args_text({"script": script})
+    assert "⏎" in txt and f"…({len(script):,}자)" in txt and "\n" not in txt, "잘랐으면 잘렸다고 적는다 · 줄바꿈은 카드 글에 넣지 않는다"
+    assert a._confirm_args_text({"angles": list(range(26)), "model": "m.k"}) == "angles=[0, 1, 2, 3, 4, … 26개] · model=m.k"
+    many = a._confirm_args_text({f"k{i:02d}": "v" * 40 for i in range(30)})
+    assert many.endswith("칸") and "… 외 " in many and len(many) < 700
+
+
+def test_rv2_카드_턴엔_있던_사용자_자격이_승인_턴에_없으면_보내지_않고_다시_카드다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)], user_pat="pat-card-turn")
+    evs, seen = _turn(monkeypatch, _GateAgent(tools, steps=[], say="보내지 못했습니다."), tools, card["approve_text"], hist, user_pat="")
+    assert reached == [] and seen == [], "도구 목록도 받지 않는다 — 서비스 계정 연결로 나가지 않는다"
+    again = [d for e, d in evs if e == "confirm"]
+    assert len(again) == 1 and "사용자 자격이 실리지 않아" in again[0]["calls"][0]["workload"], again
+    # 카드 턴도 자격 없이 돌았으면(서비스 계정 박스) 그 자격 그대로 보낸다
+    _evs, card2, hist2 = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    _turn(monkeypatch, _GateAgent(tools, steps=[], say="걸었습니다."), tools, card2["approve_text"], hist2)
+    assert reached == [("run_job", P1_GRAPH)]
+
+
+def test_rv2_승인_때_이름이_가리키는_앱이_카드_때와_다르면_보내지_않는다(gate, monkeypatch, maps):
+    """submit_job 이 카드 때는 ste(24대), 승인 때는 smart-twin-mcp(stcx 356대)를 가리킨다 — 사람이 승인하지 않은 앱으로 가지 않는다."""
+    reached = []
+    tools = {"submit_job": _gw("submit_job", reached)}
+    maps({"submit_job": "ste"}, {"ste": {"label": "ste 클러스터(24대)"}})
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("submit_job", {"script": "drop.sh", "nodes": 4})], message="낙하 해석 준비해 줘")
+    assert a._CONFIRM_PENDING[card["id"]]["calls"][0]["app_key"] == "ste"
+    maps({"submit_job": "smart-twin-mcp"}, {"smart-twin-mcp": {"label": "SmartTwinMCP"}})
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[], say="보내지 않았습니다."), tools, card["approve_text"], hist)
+    assert reached == [], "다른 앱으로 보내지 않았다"
+    again = [d for e, d in evs if e == "confirm"]
+    assert len(again) == 1 and "카드 때(ste)와 달라(smart-twin-mcp)" in again[0]["calls"][0]["workload"], again
+    maps({"submit_job": "ste"}, {"ste": {"label": "ste 클러스터(24대)"}})
+    _evs, card3, hist3 = _card_turn(monkeypatch, tools, [("submit_job", {"script": "drop.sh", "nodes": 4})], message="낙하 해석 준비해 줘")
+    _turn(monkeypatch, _GateAgent(tools, steps=[], say="걸었습니다."), tools, card3["approve_text"], hist3)
+    assert reached == [("submit_job", {"script": "drop.sh", "nodes": 4})], "같은 앱이면 그대로 보낸다"
+
+
+def test_rv2_챗_인자_기본값이_걸린_승인은_모델이_처음_인자로_다시_불러도_두_번_나가지_않는다(gate, monkeypatch):
+    monkeypatch.setattr(a, "_CHAT_ARG_DEFAULTS", {"run_job": ({"priority": "low"}, "기본은 low")})
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[[("run_job", P1_GRAPH)]]), tools, card["approve_text"], hist)
+    assert reached == [("run_job", {**P1_GRAPH, "priority": "low"})], "서버가 보낸 한 번뿐"
+    again = [d for e, d in evs if e == "confirm"]
+    assert len(again) == 1 and again[0]["calls"][0]["again"] is True
+
+
+def test_rv2_한_단계에_보낸_잡과_막은_잡이_함께면_카드_글이_보낸_잡을_밝힌다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached, reply=lambda n, x: json.dumps({"job_id": "J-77", "status": "pending"}))}
+    ag = _GateAgent(tools, steps=[[("run_job", P1_DROP), ("run_job", P1_GRAPH)]])
+    evs, _ = _turn(monkeypatch, ag, tools, "drop_check 돌려줘")
+    res = _result(evs)
+    assert reached == [("run_job", P1_DROP)] and len([d for e, d in evs if e == "confirm"]) == 1
+    assert "이 턴에 보낸 호출" in res and "J-77" in res.split("**확인이 필요합니다**")[1], res
+
+
+class _RetryAgent(_GateAgent):
+    """첫 흐름이 글 한 자 없이 터지고(상류 502), 자동 재시도(ainvoke)가 그래프를 다시 돌며 모델이 시키지 않은 잡을 부른다."""
+
+    async def astream_events(self, inputs, version=None, config=None):
+        self.inputs.append(inputs)
+        yield self._start(0)
+        raise RuntimeError("upstream 502 Bad Gateway")
+
+    async def ainvoke(self, payload, config=None):
+        self.ainvoked += 1
+        self.retry_out = await self.tools["run_job"].ainvoke(P1_GRAPH)
+        return {"messages": [types.SimpleNamespace(type="ai", content="확인 카드를 띄웠습니다. 실행을 누르면 잡을 겁니다.")]}
+
+
+@pytest.mark.parametrize("self_check", [False, True])
+def test_rv2_자동_재시도_안에서_막힌_호출도_카드가_선다(gate, monkeypatch, self_check):
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1" if self_check else "0")
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+    monkeypatch.setattr(a.app.state, "chat_llm", _Reviewer(), raising=False)
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    ag = _RetryAgent(tools, steps=[])
+    evs, _ = _turn(monkeypatch, ag, tools, "이 판의 낙하에 취약한 부품을 알려줘")
+    assert ag.ainvoked == 1 and _held(ag.retry_out) and reached == []
+    cards = [d for e, d in evs if e == "confirm"]
+    assert len(cards) == 1, [e for e, _ in evs]
+    res = _result(evs)
+    assert res.startswith("확인 카드를 띄웠습니다.") and res.count(cards[0]["id"]) == 1 and cards[0]["id"] in a._CONFIRM_PENDING
+    assert [e for e, _ in evs if e == "error"] == []
+
+
+def test_rv2_운영자_정의의_항목_하나가_틀려도_나머지_목록으로_돈다(gate):
+    assert a._confirm_class("delete_project") == ("confirm", "delete_project") and a._confirm_class("insert_block") == ("write", "insert_block")
+    bad = {"personas": [*HE_TEAM["personas"], {"key": "x", "apps": ["a"], "optional": [{"writes": ["new_write_tool"]}]}]}
+    gate.write_text(json.dumps(bad), encoding="utf-8")
+    os.utime(gate, ns=(time.time_ns(), time.time_ns() + 3_000_000_000))
+    lists = a._confirm_health()["lists"]
+    assert lists["loaded"] is False and lists["error"] == "항목 1개를 건너뜀(꼴이 틀렸다)", lists
+    assert a._confirm_class("delete_project") == ("confirm", "delete_project") and a._confirm_class("insert_block") == ("write", "insert_block")
+    assert a._confirm_class("new_write_tool") == ("write", "new_write_tool"), "app 이 빠진 선택 앱의 목록도 넣는다(접두를 뗀 꼴만 못 짓는다)"
+
+
+def test_rv2_시킨_잡이_사용자_자격_401_이면_서비스_계정_재시도를_자격_거절로_막고_카드를_띄우지_않는다(gate):
+    import deliberation as D
+
+    class _Resp:
+        status_code = 401
+
+    class _Rejected(Exception):
+        response = _Resp()
+
+    user_reached, svc_reached = [], []
+
+    def user_reply(n, args):
+        raise _Rejected("401 Unauthorized")
+    user_tool = _gw("run_job", user_reached, reply=user_reply)
+    svc_tool = _gw("run_job", svc_reached)
+
+    async def svc_tools():
+        return {"run_job": svc_tool}
+    guarded = D._svc_fallback(user_tool, svc_tools, {})
+    ctx = a._confirm_ctx(a.ChatRequest(message="drop_check 돌려줘", groups=[], user_email=USER, conversation_id=CONV))
+    tok = a._turn_confirm.set(ctx)
+    try:
+        out = asyncio.run(D._call({"run_job": guarded}, "run_job", P1_DROP))
+    finally:
+        a._turn_confirm.reset(tok)
+    assert user_reached == [("run_job", P1_DROP)] and svc_reached == [], "서비스 계정으로는 보내지 않는다"
+    assert a._AUTH_REJECT_MARK in out and not _held(out) and "이미 보냈다" not in out, out
+    assert ctx.pending == [] and ctx.held == 0, "보내지 않은 잡을 '이미 보냈다' 카드로 띄우지 않는다"
+
+
+def test_rv2_새어_나온_호출이_막히면_호출문을_본문에_남기지_않는다(gate, monkeypatch):
+    reached, llm = [], []
+
+    async def fake_llm_text(_llm, system, user, *a_, **k_):
+        llm.append(system)
+        return "요약"
+    monkeypatch.setattr(a, "_llm_text", fake_llm_text)
+    monkeypatch.setattr(a.app.state, "chat_llm", object(), raising=False)
+    tools = {"run_job": _gw("run_job", reached)}
+    leak = '<tool_call>{"name": "run_job", "arguments": {"project_id": "P1", "kind": "graph"}}</tool_call>'
+    ag = _GateAgent(tools, steps=[], say=leak)
+    ag.again_say = leak
+    evs, _ = _turn(monkeypatch, ag, tools, "이 판의 낙하에 취약한 부품을 알려줘")
+    res = _result(evs)
+    assert reached == [] and llm == [] and len([d for e, d in evs if e == "confirm"]) == 1
+    assert "<tool_call>" not in res and res.startswith("`run_job` 를 부르려 했습니다"), res[:200]

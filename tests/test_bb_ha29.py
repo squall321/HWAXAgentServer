@@ -83,11 +83,13 @@ GRAPH = {"project_id": "P1", "kind": "graph"}                                   
 DROP = {"kind": "measure", "params": {"tool": "drop_check"}}
 FINAL = "잡을 걸었습니다 J-1"
 HELD = "[확인 대기]"
-# 설계 2.2 의 바닥 목록(24개) — 운영자 목록 파일이 없어도 막힌다
+# 설계 2.2 의 바닥 목록(24개) + StepForge 의 다섯째 잡 넣기 extract_surface_to_cad(반대 검토 2차 — deck_step 잡을 단일 러너에 넣는다) — 운영자
+# 목록 파일이 없어도 막힌다
 _FLOOR = ("run_job", "run_checklist", "run_analysis", "run_compare", "run_curvature", "docforge_convert",
           "submit_job", "slurm_submit_job", "smarttwin_submit", "submit_lsdyna_job", "fullangle_drop_simulation",
           "single_drop_simulation", "job_rerun", "catalog_run", "recipe_run", "run_recipe", "run_operation",
-          "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job")
+          "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job",
+          "extract_surface_to_cad")
 # StepForge 도구 → 앱 — 작업량 묻기는 앱이 heax-step_forge 이거나 접두가 heaxstep_forge_ 인 run_job 에만 선다(설계 6절 (가))
 _SF_MAP = {n: "heax-step_forge" for n in ("run_job", "heaxstep_forge_run_job", "estimate_cost", "heaxstep_forge_estimate_cost",
                                             "list_projects", "heaxstep_forge_job_status")}
@@ -616,7 +618,7 @@ def test_A9_목록_파일이_없으면_바닥_목록만으로_돌고_health_가_
     assert s.reached == [("insert_block", block)]
     assert [p["base"] for p in _ctx_pending(ctx)] == ["run_job", "docforge_convert", "submit_job"]
     lists = a.health()["confirm_gate"]["lists"]
-    assert lists["loaded"] is False and lists["error"] and lists["jobs"] == 24, lists
+    assert lists["loaded"] is False and lists["error"] and lists["jobs"] == len(_FLOOR), lists
 
 
 def test_A10_별칭만_적어도_맨_이름까지_막고_writes_와_겹치면_confirm_이다(monkeypatch, tmp_path):
@@ -685,7 +687,7 @@ def test_A11_손잡이를_0_으로_다시_읽으면_관문이_서지_않고_넷�
     assert Path(on["path"]) == portal.resolve(), on["path"]
     if portal.exists():
         lists = on["lists"]
-        assert lists["loaded"] is True and lists["error"] is None and lists["jobs"] == 24, lists
+        assert lists["loaded"] is True and lists["error"] is None and lists["jobs"] == len(_FLOOR), lists
         assert lists["writes"] > 0 and lists["confirm"] > 0, lists
 
 
@@ -700,7 +702,7 @@ def test_A12_정규_인자는_빈_칸을_빼고_키_차례_JSON_이다():
     assert a._confirm_canon("not json") == a._confirm_canon("not json") != a._confirm_canon("not json!")
 
 
-def test_바닥_목록_24개는_목록_파일이_없어도_이름으로도_별칭으로도_카드다(monkeypatch, tmp_path):
+def test_바닥_목록은_목록_파일이_없어도_이름으로도_별칭으로도_카드다(monkeypatch, tmp_path):
     """요청서가 이름 댄 잡 · 클러스터 제출 · StepForge 의 다른 잡 넣기 · 심의와 리스크 잡(설계 2.2) — 별칭(<앱키>_<도구>)도 접미로 맞는다."""
     _gate_on(monkeypatch)
     _set_lists(monkeypatch, tmp_path, None)
@@ -1144,7 +1146,7 @@ def test_health_confirm_gate_는_목록_보류_카드_승인_거절_주문_통�
     h0 = a.health()["confirm_gate"]
     assert h0["on"] is True, h0
     lists = h0["lists"]
-    assert lists["loaded"] is True and lists["error"] is None and lists["jobs"] == 24, lists
+    assert lists["loaded"] is True and lists["error"] is None and lists["jobs"] == len(_FLOOR), lists
     assert lists["writes"] > 0 and lists["confirm"] > 0, lists
     keys = {"cards", "held_calls", "approved", "executed", "declined", "unknown_reply", "ordered"}
     assert keys <= set(h0["counts"]), h0["counts"]
