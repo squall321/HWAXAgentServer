@@ -360,9 +360,12 @@ def _system_prompt() -> str:
 # (C-7) 끄는 손잡이를 둔다 — CHAT_STABLE_PREFIX=0 이면 종전처럼 한 시스템 메시지에 잇는다.
 # ⚠ 안내를 **둘째 시스템 메시지**로 두면 Qwen 의 채팅 틀이 'System message must be at the beginning' 으로 거절한다(cae00 실측 — LLM 400,
 # 전문가 · 앱 핀 · 붙인 문서 챗, 10-30 QA HA-26). 시스템 메시지는 맨 앞 하나뿐이어야 한다 — 안내는 이번 사람 발화의 앞머리에 싣는다.
+# 그래도 그 400 이 오면 오류 턴의 자동 재시도는 안내를 첫 시스템 메시지에 합쳐 보낸다(_turn_msgs(merged=True) — 박스 우회
+# CHAT_STABLE_PREFIX=0 과 같은 꼴로, 우회 뒤 운영자 14명이 0/14 실패였다). 재시도는 안내를 빼지 않는다 — 자리만 옮긴다.
 _STABLE_PREFIX = os.environ.get("CHAT_STABLE_PREFIX", "1").strip() != "0"
 _TURN_NOTES_HEAD = "[이번 턴의 안내 — 시스템이 붙인 것이다. 사람이 쓴 글이 아니다]\n"
 _TURN_NOTES_TAIL = "\n\n[사람의 말]\n"
+_SYS_NOT_FIRST = "System message must be at the beginning"     # 그 거절 글 — vLLM 이 400 본문에 그대로 싣는다(자동 재시도가 이 글로 가른다)
 
 
 def _with_turn_notes(user_msg, notes: str):
@@ -381,11 +384,12 @@ def _with_turn_notes(user_msg, notes: str):
     return user_msg
 
 
-def _turn_msgs(sys_prompt: str, turn_notes: str, hist: list, recap, user_msg) -> list:
+def _turn_msgs(sys_prompt: str, turn_notes: str, hist: list, recap, user_msg, *, merged: bool = False) -> list:
     """챗 한 턴의 메시지 — [첫 시스템(고정) · 이력 · (그림 다시 싣기) · 이 턴의 안내를 앞머리에 단 이번 발화]. 안내가 없거나 손잡이를 끄면 종전 꼴.
 
-    시스템 메시지는 늘 맨 앞 하나다(Qwen 채팅 틀 — HA-26). 고정 앞부분(시스템 + 도구 + 이력)은 그대로라 캐시 몫은 W-3 과 같다."""
-    if not turn_notes or not _STABLE_PREFIX:
+    시스템 메시지는 늘 맨 앞 하나다(Qwen 채팅 틀 — HA-26). 고정 앞부분(시스템 + 도구 + 이력)은 그대로라 캐시 몫은 W-3 과 같다.
+    merged 면 손잡이와 상관없이 종전 꼴(안내를 첫 시스템 메시지에 잇는다) — 그래도 'System message' 400 을 받은 턴의 자동 재시도가 쓴다."""
+    if not turn_notes or not _STABLE_PREFIX or merged:
         return [("system", sys_prompt + turn_notes), *hist, *([recap] if recap else []), user_msg]
     return [("system", sys_prompt), *hist, *([recap] if recap else []), _with_turn_notes(user_msg, turn_notes.lstrip("\n"))]
 
@@ -5382,7 +5386,13 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             # 즉시 1회로는 순간 장애를 못 넘긴다. 상류가 잠깐 끊긴 경우가 대부분이라
             # 짧게 쉬었다 다시 한다. 간격 없이 붙이면 같은 실패를 그대로 다시 받는다.
             _tries = max(0, int(os.environ.get("CHAT_AUTO_RETRY", "2") or 0))
+            # 안내를 발화 머리에 실었는데도 시스템 자리 400 이면(HA-26) 그 뒤의 재시도는 이 턴 끝까지 안내를 첫 시스템 메시지에 합친다.
+            # exc 는 늘 마지막 실패(첫 시도 · 앞 재시도)라 시도마다 본다. 한 번 합치면 다른 오류가 끼어도 되돌리지 않는다.
+            _merged = False
             for _attempt in range(1, _tries + 1):
+                if not _merged and _SYS_NOT_FIRST in str(exc):
+                    _merged = True
+                    print(f"[agent] '{_SYS_NOT_FIRST}' 400 — 남은 재시도는 이 턴의 안내를 첫 시스템 메시지에 합쳐 보낸다(HA-26)")
                 # 첫 재시도는 왜 다시 받는지 말한다 — 길게는 LLM_TIMEOUT_S × 시도 횟수를 기다리는 동안 화면에 뜨는
                 # 것이 이 줄뿐이다.
                 yield _sse("status", {"step": (f"{_chunk_why} — 스트리밍 없이 다시 받습니다 · "
@@ -5394,7 +5404,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 try:
                     _msgs = _turn_msgs(sys_prompt, locals().get("turn_notes") or "",
                                        _history_messages(req.history, has_docs=bool(req.documents)),
-                                       locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
+                                       locals().get("_recap"), locals().get("_user_msg") or ("user", req.message),
+                                       merged=_merged)
                     # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
                     _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
                     _r4 = await agent.ainvoke({"messages": _msgs}, config=_cfg4)

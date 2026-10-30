@@ -397,3 +397,79 @@ def test_HA26_실제_Qwen_채팅_틀은_둘째_시스템_메시지를_거절하�
     for notes in ("\n\n[페르소나]\n품질 전문가", "\n\n[사용자 지정 우선 앱]\nsignalforge", "\n\n[붙인 문서]\n본문"):
         qwen_template_check(a._turn_msgs("고정 시스템", notes, hist, None, ("user", "질문")))
 
+
+# ── HA-26 재시도 몫 — 그래도 'System message' 400 이면 자동 재시도는 안내를 첫 시스템 메시지에 합친다(HWAXPortal docs/request_261030.md) ──────
+_HA26_DOC = "붙인 문서의 본문 글"
+
+
+def _ha26_doc_turns(monkeypatch) -> None:
+    """이 시험의 챗 턴마다 문서를 붙이고(이 턴의 안내가 생긴다) 자동 재시도 둘을 연다 — _turn 은 재시도를 0 으로 닫는다."""
+    monkeypatch.setenv("CHAT_SELF_CHECK", "0")
+    orig = a._agent_stream
+
+    def with_doc(app_, req):
+        monkeypatch.setenv("CHAT_AUTO_RETRY", "2")
+        return orig(app_, req.model_copy(update={"documents": [{"name": "a.txt", "text": _HA26_DOC}]}))
+    monkeypatch.setattr(a, "_agent_stream", with_doc)
+
+
+def _script_acts(base: str, acts: list) -> None:
+    """대본을 거동째로 — 오류 거동(system_not_first · http_400)을 끼운다(_script 는 글만 받는다)."""
+    import httpx
+    with httpx.Client(timeout=5, trust_env=False) as c:
+        c.post(f"{base}/_script", json={"script": acts}).raise_for_status()
+
+
+def _notes_at(st: dict, i: int) -> str:
+    """i 번째 요청에서 이 턴의 안내(붙인 문서)가 실린 자리 — head(사람 발화 앞머리) · system(첫 시스템 메시지). 빠지거나 두 곳이면 실패."""
+    head = _HA26_DOC in st["humans"][i] and st["humans"][i].startswith(a._TURN_NOTES_HEAD)
+    system = _HA26_DOC in (st["first_system"][i] or "")
+    assert head != system, f"{i}번째 요청 — 발화 머리 {head} · 첫 시스템 {system}(안내는 꼭 한 곳에 있어야 한다)"
+    return "head" if head else "system"
+
+
+def test_HA26_merged_는_손잡이와_상관없이_안내를_첫_시스템_메시지에_잇고_발화는_그대로다(monkeypatch):
+    """CHAT_STABLE_PREFIX=0 과 같은 꼴이다 — 그림이 든 발화도 손대지 않는다. 안내가 없으면 merged 여도 종전 한 칸이다."""
+    from langchain_core.messages import HumanMessage
+    monkeypatch.setattr(a, "_STABLE_PREFIX", True)
+    hist, user, notes = [("user", "앞 질문"), ("assistant", "앞 답")], ("user", "이번 질문"), "\n\n[붙인 문서]\n본문"
+    assert a._turn_msgs("고정 시스템", notes, hist, None, user, merged=True) == [("system", "고정 시스템" + notes), *hist, user]
+    img = HumanMessage(content=[{"type": "text", "text": "이 그림을 봐"},
+                                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}])
+    m = a._turn_msgs("고정 시스템", notes, hist, ("user", "그림"), img, merged=True)
+    assert m[:-1] == [("system", "고정 시스템" + notes), *hist, ("user", "그림")] and m[-1] is img, "그림이 든 발화는 그대로"
+    assert a._turn_msgs("고정 시스템", "", hist, None, user, merged=True) == [("system", "고정 시스템"), *hist, user]
+
+
+def test_HA26_실제_경로_그래도_시스템_자리_400_이면_재시도는_안내를_첫_시스템_메시지에_합쳐_답한다(monkeypatch, fake_llm, capsys):
+    """첫 시도는 그대로(안내는 발화 머리)다. 가짜 서버가 그 차례를 꼴과 상관없이 'System message must be at the beginning.' 400 으로
+    거절하면(system_not_first) 자동 재시도는 안내를 첫 시스템 메시지에 합쳐(CHAT_STABLE_PREFIX=0 꼴) 보내고 답을 낸다."""
+    _ha26_doc_turns(monkeypatch)
+    _script_acts(fake_llm, ["system_not_first", {"behavior": "oracle", "text": "합친 꼴로 받은 답"}])
+    evs = _turn(monkeypatch, fake_llm, "붙인 문서를 요약해 줘")
+    st = _stats(fake_llm)
+    assert st["behaviors"] == ["system_not_first", "oracle"], st["behaviors"]
+    assert [_notes_at(st, i) for i in (0, 1)] == ["head", "system"], "첫 시도는 그대로 · 재시도는 첫 시스템 메시지에"
+    assert st["first_system"][1].startswith(st["first_system"][0]) and len(st["first_system"][1]) > len(st["first_system"][0]), \
+        "합친 첫 시스템 메시지는 고정 시스템 글 뒤에 이 턴의 안내"
+    assert st["humans"][1] == "붙인 문서를 요약해 줘", "재시도의 발화는 사람의 말 그대로"
+    assert _text(evs, "token") == "합친 꼴로 받은 답" and not [d for e, d in evs if e == "error"]
+    assert "남은 재시도는 이 턴의 안내를 첫 시스템 메시지에 합쳐 보낸다(HA-26)" in capsys.readouterr().out, "운영 로그에 한 줄"
+
+
+# 갈래마다 시험 하나(가짜 서버 하나)다 — 한 시험에서 _turn 을 두 번 부르면 둘째 턴은 첫 턴의 에이전트를 쓰고(_agent_for 가 바꿔 끼운 채다),
+# 첫 턴이 풀에 남긴 연결은 닫힌 이벤트 루프의 것이라 둘째 턴의 첫 요청이 대본 한 칸을 먹고 연결 오류로 넘김(VLLM_*)된다.
+@pytest.mark.parametrize("acts, want", [
+    (["http_400", "system_not_first"], ["head", "head", "system"]),    # 다른 오류의 재시도는 앞부분 고정 꼴 그대로(캐시 몫)
+    (["system_not_first", "http_400"], ["head", "system", "system"]),  # 한 번 합치면 다른 오류가 끼어도 이 턴 끝까지 합친 꼴
+])
+def test_HA26_실제_경로_합치기는_그_400_을_받은_뒤의_재시도부터_이_턴_끝까지다(monkeypatch, fake_llm, acts, want):
+    """첫 시도는 늘 발화 머리다. 'System message' 400 을 받기 전의 재시도는 그대로 두고, 받은 뒤의 재시도는 다른 오류가 끼어도 합친다."""
+    _ha26_doc_turns(monkeypatch)
+    _script_acts(fake_llm, [*acts, {"behavior": "oracle", "text": "셋째에 받은 답"}])
+    evs = _turn(monkeypatch, fake_llm, "붙인 문서를 요약해 줘")
+    st = _stats(fake_llm)
+    assert st["behaviors"] == [*acts, "oracle"], st["behaviors"]
+    assert [_notes_at(st, i) for i in range(3)] == want
+    assert _text(evs, "token") == "셋째에 받은 답" and not [d for e, d in evs if e == "error"]
+

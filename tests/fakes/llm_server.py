@@ -15,7 +15,8 @@ VLLM_BASE_URL 을 여기로 돌리면, 리스크 앱 → 포털 중계 → 엔�
 POST /_hold?s=<초>(--capacity 자리 하나를 그만큼 쥔다) · GET /_stats {calls, active, peak, behaviors, capacity, waiting,
 waited_peak, images, humans, systems, max_tokens, affinity, first_system — 뒤 여섯은 요청마다(최근 20건)}.
 오류 거동 — http_NNN 은 그 상태 코드로 답하고, timeout 은 답하지 않고 기다린다(호출자의 시간 한도가 먼저 걸린다).
-unreachable 은 서버가 흉내 낼 수 없다 — 닫힌 포트를 가리켜라(여기서는 503 으로 답한다).
+unreachable 은 서버가 흉내 낼 수 없다 — 닫힌 포트를 가리켜라(여기서는 503 으로 답한다). system_not_first 는 메시지 꼴과 상관없이
+그 차례를 맨 앞 시스템 400 으로 거절한다(꼴로 거절하는 검사와 같은 본문 — 그래도 그 400 이 오는 챗 턴의 재시도 시험, HA-26).
 9009(떠 있는 에이전트 서버)에는 뜨지 않는다.
 """
 from __future__ import annotations
@@ -32,7 +33,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # tests/ — fakes 패키지
 
-from fakes.llm import HTTP_ERRORS, act, ctx_overflow_body, respond, usage_of  # noqa: E402
+from fakes.llm import HTTP_ERRORS, act, ctx_overflow_body, respond, system_not_first_body, usage_of  # noqa: E402
 
 HANG_S = 24 * 3600
 
@@ -157,8 +158,7 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
         del state["first_system"][:-20]                              # 첫 시스템 메시지만(W-3 — 턴을 가로질러 같아야 한다)
         # 진짜 꼴(가짜는 진짜 꼴로) — Qwen 의 채팅 틀은 시스템 메시지가 맨 앞이 아니면 예외를 던지고 vLLM 은 400 으로 답한다(cae00 실측 HA-26).
         if any(m.get("role") == "system" for m in msgs[1:]):
-            return JSONResponse({"error": {"message": "System message must be at the beginning.", "type": "BadRequestError",
-                                           "param": None, "code": 400}}, status_code=400)
+            return JSONResponse(system_not_first_body(), status_code=400)
         if n_img and not vision:
             return JSONResponse({"error": {"message": f"{model} is not a multimodal model", "type": "BadRequestError",
                                            "param": None, "code": 400}}, status_code=400)
@@ -168,7 +168,7 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
         state["calls"] += 1
         state["behaviors"].append(a.behavior)
         if body.get("stream") and not (a.text is None and (a.behavior in HTTP_ERRORS or a.behavior
-                                                           in ("unreachable", "timeout", "ctx_overflow"))):
+                                                           in ("unreachable", "timeout", "ctx_overflow", "system_not_first"))):
             return StreamingResponse(stream(a, system, human, think), media_type="text/event-stream")
         await take()
         state["active"] += 1
@@ -180,6 +180,8 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
                 await asyncio.sleep(HANG_S)
             if a.text is None and a.behavior == "ctx_overflow":   # vLLM 은 스트리밍 요청도 흘리기 전에 이 400(JSON)으로 거절한다
                 return JSONResponse(ctx_overflow_body(ctx, ctx + 1, int(body.get("max_tokens") or 1)), status_code=400)
+            if a.text is None and a.behavior == "system_not_first":   # 채팅 틀의 거절도 흘리기 전의 400(JSON)이다
+                return JSONResponse(system_not_first_body(), status_code=400)
             if a.text is None and (a.behavior in HTTP_ERRORS or a.behavior == "unreachable"):
                 code = HTTP_ERRORS.get(a.behavior, 503)
                 return JSONResponse({"error": {"message": f"fake {code}", "type": "fake", "code": code}},

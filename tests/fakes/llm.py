@@ -14,7 +14,8 @@ summary_skip_cover(꼭 다룰 행 둘을 빠뜨림) · summary_skip_one(가리�
 4라운드(RB3B)에서 더한 것 — first_fail_fakequote(첫 카드만 FAIL·지어낸 인용) · noinput_retract(가리킨 영향 줄을 검증된 인용의
 '영향 없음' 으로 다시 냄). 6라운드(RB3D)에서 더한 것 — alias_words(판정을 별칭 표의 낱말로 — 'FAILED'·'통과') ·
 coerced_clash(첫 카드에 표 밖 낱말 '보류중' 의 줄을 하나 더). 10-18 에 더한 것 — ctx_overflow(vLLM 의 '창이 모자라다' 400 — 본문은
-vLLM 0.23.0 원문 꼴, ctx_overflow_body).
+vLLM 0.23.0 원문 꼴, ctx_overflow_body). 10-30 에 더한 것 — system_not_first(Qwen 채팅 틀의 'System message must be at the
+beginning.' 400 — 메시지 꼴과 상관없이 그 차례를 거절한다, 그래도 그 400 이 오는 챗 턴의 자동 재시도 시험 HA-26, system_not_first_body).
 카드 대조가 아닌 프롬프트(심의 좌석·의장 등 — 쟁점 패널)는 거동과 상관없이 심의 대본(delib_respond)으로 답한다. position_bias · flip_on_solo(계측기 검증, 리스크 앱 품질 수치 몫)는 아직 없다.
 대본이 다 떨어지면 마지막 거동을 되풀이한다.
 """
@@ -26,7 +27,7 @@ import re
 from dataclasses import dataclass
 
 HTTP_ERRORS = {f"http_{c}": c for c in (400, 401, 403, 404, 413, 422, 429, 500, 503)}
-ERROR_BEHAVIORS = ("timeout", "unreachable", "ctx_overflow", *HTTP_ERRORS)
+ERROR_BEHAVIORS = ("timeout", "unreachable", "ctx_overflow", "system_not_first", *HTTP_ERRORS)
 TEXT_BEHAVIORS = ("oracle", "broken_line", "array_collapse", "truncate", "truncate_empty", "skip_middle",
                   "all_ok_noquote", "all_ok_fakequote", "fabricate_alias", "duplicate_rows", "prose_only",
                   "wrong_enum", "cross_card_quote", "invented_number", "obey_injection", "empty", "slow",
@@ -434,6 +435,11 @@ def ctx_overflow_body(ctx: int, prompt_tokens: int, max_tokens: int) -> dict:
                       "type": "BadRequestError", "param": "input_tokens", "code": 400}}
 
 
+def system_not_first_body() -> dict:
+    """Qwen 채팅 틀이 맨 앞이 아닌 시스템 메시지에 던진 예외를 vLLM 이 400 으로 낸 본문 — 문구는 cae00 실측 그대로(HA-26)."""
+    return {"error": {"message": "System message must be at the beginning.", "type": "BadRequestError", "param": None, "code": 400}}
+
+
 def _status_error(code: int):
     """openai 가 그 상태 코드에 올리는 예외 그대로(ChatOpenAI 를 지난 것과 같은 모양)."""
     import httpx
@@ -463,6 +469,10 @@ def raise_for(a: Act):
             raise openai.APIConnectionError(request=req) from e
     if a.behavior == "ctx_overflow":
         body = ctx_overflow_body(262_144, 262_145, 1)
+        raise openai.BadRequestError(f"Error code: 400 - {body}", response=httpx.Response(400, request=req, json=body),
+                                     body=body["error"])
+    if a.behavior == "system_not_first":
+        body = system_not_first_body()
         raise openai.BadRequestError(f"Error code: 400 - {body}", response=httpx.Response(400, request=req, json=body),
                                      body=body["error"])
     raise _status_error(HTTP_ERRORS[a.behavior])
