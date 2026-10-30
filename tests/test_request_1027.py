@@ -94,6 +94,69 @@ def test_HA08_켜진_위키의_다른_실패와_성공은_단마다_그대로다
     assert "src_4f1e" in first and "src_4f1e" in second and len(ok.calls) == 2, "원천은 단마다 남긴다(P8)"
 
 
+# ── HA-08(다시) — MX 백서 MCP 문구로도 꺼짐을 읽는다(10-30 요청 HWAXPortal docs/request_261030.md) ─────────────────────────────
+# MX 백서는 같은 꺼짐을 두 문구로 말한다 — API 는 '…열리지 않았다', 게이트웨이로 오는 MCP 는 '…열리지 않았습니다' 이고 wiki_disabled 는
+# 예외의 code 칸에만 두어 글에는 없다. FastMCP 는 그 예외를 'Error executing tool <이름>: <메시지>' 로 싸 isError 로 돌려준다.
+import ast  # noqa: E402
+
+import pytest  # noqa: E402
+
+_MXWP = Path(__file__).resolve().parents[2] / "MXWhitePaper"
+_MCP_OFF = "Error executing tool wiki_submit_source: MX 백서 AI 위키는 아직 열리지 않았습니다 — 문서 찾기는 search_documents 를 쓰세요"
+
+
+def test_HA08_다시_MCP_문구와_API_문구_모두_꺼짐으로_읽고_다시_부르지_않는다():
+    """종전 글귀('…열리지 않았다')는 MCP 문구를 못 찾아, 위키 도구가 실린 채 꺼진 박스에서 결정문 단마다 오류 문구가 다시 붙었다."""
+    for raw in (_MCP_OFF, "(tool wiki_submit_source error: MX 백서 AI 위키는 아직 열리지 않았다)"):
+        assert "wiki_disabled" not in raw, "글귀만으로 읽는지 본다"
+        t = _WikiTool(raw)
+        first, second = _two_stages({d._WIKI_TOOL: t})
+        assert first == d._WIKI_OFF_NOTE and second == "" and len(t.calls) == 1, raw
+
+
+def test_HA08_다시_다른_도구_결과의_같은_글귀로는_꺼짐을_읽지_않는다():
+    """꺼짐은 이 심의가 부른 wiki_submit_source 의 응답에서만 읽는다 — 좌석이 부른 다른 도구의 결과(봉투의 근거로 실린다)에 같거나
+    비슷한 글귀가 있어도 위키는 켜져 있고 단마다 남긴다."""
+    ok = _WikiTool('{"id": "4f1e", "short": "src_4f1e", "dedup": false, "ingest_state": "queued"}')
+    other = _WikiTool("문서 2건 — 안내문 초안 'MX 백서 AI 위키는 아직 열리지 않았습니다' · 포털 오류(루틴 저장소가 열리지 않았습니다)")
+    tools = {d._WIKI_TOOL: ok, "search_documents": other}
+
+    async def go():
+        d._wiki_bind("CAEG", "job-1")
+        said = await d._call(tools, "search_documents", {"query": "위키 안내문"})
+        kw = {**_KW, "pool": [(1, "mech-a", "search_documents", "{}", said)]}
+        first = await d._wiki_submit(tools, user="u1@corp.example", chair_failed=None, **kw)
+        second = await d._wiki_submit(tools, user="u1@corp.example", chair_failed=None, **{**kw, "stage": "s2"})
+        return first, second, d._WIKI_STATE.get()
+
+    first, second, st = asyncio.run(go())
+    assert "src_4f1e" in first and "src_4f1e" in second and len(ok.calls) == 2 and st == {"off": False}
+    ev = ok.calls[0]["envelope"]["body"]["evidence"]
+    assert any("위키는 아직 열리지 않았습니다" in e["excerpt"] for e in ev), "같은 글귀가 위키로 보낸 봉투의 근거에 실렸다"
+
+
+def _mxwp_const(rel: str, name: str, cls: str = "") -> str:
+    """MX 백서의 글귀 상수 — 실행하지 않고 원문에서 읽는다. 형제 리포가 없으면 건너뛴다."""
+    p = _MXWP / rel
+    if not p.exists():
+        pytest.skip(f"형제 리포 없음: {p}")
+    scope = ast.parse(p.read_text(encoding="utf-8"))
+    if cls:
+        scope = next((n for n in scope.body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+    for n in getattr(scope, "body", []):
+        if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == name for t in n.targets):
+            return ast.literal_eval(n.value)
+    raise AssertionError(f"{rel} 에 {cls + '.' if cls else ''}{name} 가 없다 — MX 백서 꺼짐 문구의 자리가 바뀌었다")
+
+
+def test_HA08_다시_꺼짐_글귀는_MX_백서의_두_문구를_원문에서_찾는다():
+    """두 리포의 문구가 따로 바뀌어 어긋난 것이 이 결함의 뿌리다 — 형제 리포 원문(API · MCP)과 맞대 본다."""
+    for rel, name, cls in (("apps/api/app/routers/wiki.py", "message", "_WikiDisabledError"),
+                           ("dist/llm-docx-toolkit/mcp/api_client.py", "WIKI_OFF_MESSAGE", "")):
+        msg = _mxwp_const(rel, name, cls)
+        assert any(h in msg for h in d._WIKI_OFF_HINTS), f"{rel}: {msg!r}"
+
+
 # ── HA-24 — 챗 경로의 plm_defect_search 는 enrich 를 주지 않으면 0(사용자 결정 D-3 — 챗 쪽만 먼저) ──────────────────────
 def _plm_tool(name="plm_defect_search"):
     """진짜 MCP 어댑터 도구와 같은 꼴 — args_schema 가 JSON 스키마 dict 이고 coroutine 이 받은 인자만 넘긴다(langchain_mcp_adapters).

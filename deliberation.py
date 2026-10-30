@@ -3291,7 +3291,11 @@ _WIKI_TITLE_MAX = 120
 # 결정문 끝마다 내부 오류 문구를 붙이지 않고 한 줄만 남긴다 — 다단 심의는 단마다 부르므로 꺼짐을 한 번 알렸으면 다음 단은 조용히
 # 건너뛴다(HWAXPortal docs/request-1027 HA-08). 상태는 심의 하나의 것이다(입구가 _wiki_bind 로 새로 세운다).
 _WIKI_STATE: contextvars.ContextVar = contextvars.ContextVar("wiki_state", default=None)
-_WIKI_OFF_HINTS = ("wiki_disabled", "위키는 아직 열리지 않았다")
+# 꺼짐 글귀는 MX 백서의 두 문구가 함께 쓰는 줄기까지다 — API 는 '…열리지 않았다'(MXWhitePaper apps/api/app/routers/wiki.py), 게이트웨이로
+# 오는 MCP 는 '…열리지 않았습니다'(dist/llm-docx-toolkit/mcp/api_client.py WIKI_OFF_MESSAGE)이고 wiki_disabled 는 예외의 code 칸에만 두어
+# 글에 없다. 종전 글귀는 MCP 문구를 못 찾아 단마다 오류 문구가 다시 붙었다(HWAXPortal docs/request_261030.md HA-08(다시)). 이 심의가
+# 부른 wiki_submit_source 의 응답에서만 찾는다 — 다른 도구의 결과(봉투의 근거)에 같은 글귀가 있어도 꺼짐으로 읽지 않는다.
+_WIKI_OFF_HINTS = ("wiki_disabled", "위키는 아직 열리지 않았")
 _WIKI_OFF_NOTE = ("\n\nℹ MX 백서 위키에 남기지 않았다 — 이 박스의 MX 백서 위키가 꺼져 있거나(위키 도구가 없다) "
                   f"MX 백서 권한({_WIKI_PLAT})이 없다.")
 
