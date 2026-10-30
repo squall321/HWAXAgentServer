@@ -485,7 +485,7 @@ def test_B15_글로_승인(gate, monkeypatch, answer, sent):
     _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
     _turn(monkeypatch, _GateAgent(tools, steps=[], say="알겠습니다."), tools, answer, hist)
     assert reached == ([("run_job", P1_GRAPH)] if sent else []), answer
-    assert (card["id"] in a._CONFIRM_PENDING) is (not sent), "승인이 아니면 카드를 꺼내지 않는다"
+    assert card["id"] not in a._CONFIRM_PENDING, "승인이면 꺼냈고, 답이 아니면 지웠다(다른 말을 하면 보내지 않는다)"
 
 
 def test_B16_지난_카드에는_답할_수_없다(gate, monkeypatch):
@@ -759,8 +759,31 @@ def test_B27_카드_뒤의_재촉은_이어하기도_승인도_아니다(gate, m
     _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
     ag = _GateAgent(tools, steps=[], say="무엇을 계속할까요?")
     evs, _ = _turn(monkeypatch, ag, tools, "계속", hist)
-    assert "직전 요청 이어서 진행" not in _steps(evs) and reached == [] and card["id"] in a._CONFIRM_PENDING
+    assert "직전 요청 이어서 진행" not in _steps(evs) and reached == [] and card["id"] not in a._CONFIRM_PENDING
     assert ag.inputs[0]["messages"][-1][1].endswith("계속")
+
+
+def test_B27c_다른_대화의_말은_이_대화의_카드를_지우지_않는다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    _turn(monkeypatch, _GateAgent(tools, steps=[], say="네."), tools, "다른 대화의 질문", conv="c2")
+    _turn(monkeypatch, _GateAgent(tools, steps=[], say="네."), tools, "다른 사람의 질문", user="v@x.com")
+    assert card["id"] in a._CONFIRM_PENDING
+    _turn(monkeypatch, _GateAgent(tools, steps=[], say="걸었습니다."), tools, card["approve_text"], hist)
+    assert reached == [("run_job", P1_GRAPH)]
+
+
+def test_B27b_모델이_옛_번호를_다시_적어도_다음_말로_승인되지_않는다(gate, monkeypatch, capsys):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    parrot = f"다른 질문의 답입니다. 앞의 확인 번호는 {card['id']} 였습니다. 그대로 진행할까요?"
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[], say=parrot), tools, "다른 질문", hist)
+    hist += [{"role": "user", "content": "다른 질문"}, {"role": "assistant", "content": _result(evs)}]
+    assert card["id"] not in a._CONFIRM_PENDING and f"[confirm] 카드 {card['id']} 지움" in capsys.readouterr().out
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[], say="네."), tools, "응", hist)
+    assert reached == [] and any("확인 번호를 찾지 못했다" in s for s in _steps(evs)), "이력 끝에 번호가 있어도 그 카드는 이미 지나갔다"
 
 
 @pytest.mark.parametrize("answer", ["button", "실행해줘", "네 실행해 주세요"])

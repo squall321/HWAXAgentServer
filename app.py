@@ -3493,12 +3493,26 @@ def _confirm_take(cid: str, req) -> dict | None:
     return card if card["exp"] > time.time() else None
 
 
+def _confirm_drop(req) -> None:
+    """이 사용자 · 대화의 카드를 지운다 — 카드는 바로 다음 말로만 답한다(카드 글 '다른 말을 하면 보내지 않습니다'). 이력 끝만 보는 판정으로는 모자라다
+    — 모델이 다음 답에 아직 저장된 옛 번호를 다시 적으면 그다음 사람의 '응' 이 그 카드를 승인한다."""
+    user, conv = (req.user_email or "").strip().lower(), (req.conversation_id or "").strip()
+    with _CONFIRM_LOCK:
+        gone = [k for k, v in _CONFIRM_PENDING.items() if (v["user"], v["conv"]) == (user, conv)]
+        for k in gone:
+            del _CONFIRM_PENDING[k]
+    if gone:
+        print(f"[confirm] 카드 {', '.join(gone)} 지움 — 다음 말이 그 카드의 답이 아니다", flush=True)
+
+
 def _confirm_ctx(req) -> _ConfirmCtx:
     """이 턴의 확인 맥락. 앞 카드의 답이면 저장분을 꺼내(나란한 두 요청이 같은 카드를 승인해도 한쪽만 — 꺼내기에 await 가 없다) 승인 · 거절을 정한다.
-    승인이면 그 카드의 호출이 approved 에 든다(메시지를 짓기 전에 서버가 보낸다 — _confirm_send). 거절이면 이 턴의 안내에 그 사실을 싣는다."""
+    승인이면 그 카드의 호출이 approved 에 든다(메시지를 짓기 전에 서버가 보낸다 — _confirm_send). 거절이면 이 턴의 안내에 그 사실을 싣는다. 답이
+    아니면 이 대화의 카드를 지운다(_confirm_drop)."""
     ctx = _ConfirmCtx(req.message or "", req.pinned_tools or [])
     reply = _confirm_reply(req)
     if reply is None:
+        _confirm_drop(req)
         return ctx
     verdict, cid = reply
     ctx.utterance = ""
