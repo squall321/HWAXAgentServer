@@ -982,10 +982,23 @@ async def lifespan(app: FastAPI):
                     # 내려가는 중 — 곧 도는 심의가 전부 취소되며 자리가 난다. 그 자리에 줄 선 심의를
                     # 띄우지 않게 먼저 닫는다(띄우면 뜨자마자 죽고 결정문 없는 done 으로 남는다).
                     _delib_mcp_module.unbind()
+                    await _stop_routines()
             return
         except Exception:  # noqa: BLE001
             logging.getLogger("agent").exception("[agent] 심의 MCP lifespan 실패 — /mcp 없이 계속")
-    yield
+    try:
+        yield
+    finally:
+        await _stop_routines()
+
+
+async def _stop_routines() -> None:
+    """내려가는 중 — 살아 있는 분석 루틴 작업을 멈춘다(원장은 running 으로 남는다 — 사람 PAT 가 사라지므로 사람이 '이어서', R3-D8)."""
+    try:
+        import routine  # noqa: PLC0415 — routine 이 app 을 늦게 읽는다(순환 import 회피)
+        await routine.shutdown()
+    except Exception:  # noqa: BLE001 — 내려가는 길을 막지 않는다
+        logging.getLogger("agent").exception("[agent] 분석 루틴 작업 정리 실패")
 
 
 # 심의를 MCP 도구로 노출한다(게이트웨이 백엔드). import 실패는 치명적이지 않다 —
@@ -1070,11 +1083,14 @@ class ChatRequest(BaseModel):
     # 심의·Thinking 트리거 판정은 여기 있으므로 포털이 아니라 이쪽이 막는다. None 은 권한을 모르는
     # 옛 호출이라 막지 않는다(포털은 늘 보낸다) — '안 보냄'과 '권한 없음'을 구분해야 해서다.
     entitlements: list[str] | None = None
+    # 분석 루틴(HWAXPortal docs/analysis-routines R3) — {id, version?, inputs}(새 실행) 또는 {run_id}(이어서 · 다시 붙기). delib_opts 처럼 원 사전으로
+    # 받고 실행기(routine.py)가 검사한다. 포털 ChatRequest 에도 같은 칸이 있어야 한다 — 어느 한쪽이라도 빠지면 조용히 버려져 일반 챗이 돈다.
+    routine: dict | None = None
 
 
 # 기능 권한 이름(사람용) — 포털 access.yaml 의 label 과 같다.
 _FEATURE_LABEL = {"feat:deliberation": "전문가 심의", "feat:thinking": "Thinking",
-                  "feat:expert-chat": "전문가와 대화"}
+                  "feat:expert-chat": "전문가와 대화", "feat:routines": "분석 루틴"}
 
 
 def _denied_feature(req: "ChatRequest") -> str | None:
@@ -1083,7 +1099,9 @@ def _denied_feature(req: "ChatRequest") -> str | None:
         return None
     have = set(req.entitlements)
     m = req.message
-    if is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
+    if req.routine is not None:
+        need = "feat:routines"          # 루틴 가지가 맨 앞이다(chat()) — 그 턴은 슬래시 · 띵킹을 보지 않는다
+    elif is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
         need = "feat:deliberation"
     elif is_agent_search(m):
         need = "feat:expert-chat"
@@ -5676,6 +5694,12 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         return StreamingResponse(_deny_stream(denied), media_type="text/event-stream", headers=SSE_HEADERS)
     # 호출 추적의 자리 id — 이 턴의 LLM·도구 호출이 한 묶음이 된다(심의·띵킹은 엔진이 kind 를 고쳐 단다). 꺼져 있으면 아무것도 안 한다.
     _call_trace.tag(kind="chat", turn=_call_trace.new_id())
+    if req.routine is not None:
+        # 분석 루틴(HWAXPortal docs/analysis-routines R3-design §4) — 코드가 단계를 도는 떼어 낸 작업이다. 심의 멈춤 · 슬래시 · 띵킹보다 먼저
+        # 가른다(슬래시가 이기면 루틴 요청이 일반 턴이 된다). _pinged_stream 으로 감싸지 않는다 — 그 감싸개는 구독이 끊기면 턴을 취소한다(챗 중지).
+        # 루틴은 브라우저가 떠나도 돈다 — 구독 · ping · 다시 붙기 · 심의 멈춤 · 동시 상한은 routine 이 맡는다.
+        import routine as _routine  # noqa: PLC0415 — routine 이 app 을 늦게 읽는다(순환 import 회피)
+        return StreamingResponse(_routine.run_routine(app, req), media_type="text/event-stream", headers=SSE_HEADERS)
     # 누가 띄운 심의인가 — 리스크 앱 러너의 패널은 app(카드 대조 관문의 절반 판정에 세지 않는다 — M3.md #26).
     started_by = _started_by(req.delib_opts.get("started_by") if isinstance(req.delib_opts, dict) else None)
     # 새 심의 멈춤(HWAXPortal docs/delib-ops R1) — 웹 세 트리거도 MCP 두 도구와 같이 막는다. 앱이 띄운 리스크 패널은 막지 않는다 — 엔진이
@@ -6851,9 +6875,24 @@ def search_capability() -> dict:
     return _search_capability()
 
 
+def _routine_health() -> dict:
+    """/health 의 분석 루틴 칸 — 도는 실행 수(쉬는 실행은 빼고) · 쉬는 실행 수 · 동시 상한(HWAXPortal docs/analysis-routines R3-D7 · R3-design §8).
+    쉬는 실행(parked — 새 심의 멈춤이 풀리길 · 줄 선 심의가 시작되길 기다린다)은 routine_active 에 세지 않는다. 모듈을 못 붙이면 0 · None(/health 는
+    늘 답한다)."""
+    try:
+        import routine  # noqa: PLC0415 — routine 이 app 을 늦게 읽는다(순환 import 회피)
+        return {"routine_active": routine.active_count(), "routine_parked": routine.parked_count(),
+                "routine_max": routine.ROUTINE_MAX_RUNNING}
+    except Exception:  # noqa: BLE001
+        return {"routine_active": 0, "routine_parked": 0, "routine_max": None}
+
+
 def _delib_load() -> tuple[int, int]:
-    """(진행 중, 대기) 심의 수 — 웹 경로(분리 태스크)와 MCP 잡 원장을 합친다."""
-    active = len(_DETACHED_TASKS)
+    """(진행 중, 대기) 심의 수 — 웹 경로(분리 태스크)와 MCP 잡 원장을 합친다. 도는 분석 루틴도 진행 중에 더한다(R3-D7 — update-all · start.sh ·
+    deploy-all 의 기다림이 고침 없이 루틴을 기다린다). 쉬는 루틴(parked — 새 심의 멈춤 · 줄 선 심의를 기다린다)은 더하지 않는다 — update-all 이
+    건 멈춤이 그 루틴의 심의를 붙잡고 있어 세면 기다림이 끝나지 않는다(R3-design §8). 카드 대조의 절반 판정(_delib_human)에는 세지 않는다 —
+    루틴은 챗 LLM 이다."""
+    active = len(_DETACHED_TASKS) + _routine_health()["routine_active"]
     try:
         import delib_jobs  # noqa: PLC0415 — 심의 MCP 가 비활성이어도 /health 는 답해야 한다
         return active + delib_jobs.running_count(), len(delib_jobs._PENDING)
@@ -7135,6 +7174,9 @@ def health() -> dict:
         # 재기동을 건너뛴다(강행은 AGENT_RESTART_FORCE=1). 이름을 바꾸면 그쪽이 '모름' 으로 읽고 그대로 내린다.
         "delib_active": _active,
         "delib_queued": _queued,
+        # 도는 분석 루틴 수 · 쉬는 루틴 수 · 동시 상한(routine_active · routine_parked · routine_max — R3-D7 · R3-design §8). routine_active 는 위
+        # delib_active 에도 들어 있고, 쉬는 루틴(새 심의 멈춤 · 줄 선 심의를 기다린다)은 어디에도 더하지 않는다(update-all 의 기다림이 수렴하게).
+        **_routine_health(),
         # 동시 심의 한도 셋과 출처 — 박스 덮개(POST /limits)가 env 위에 덮인다(HWAXPortal docs/delib-ops R4).
         "limits": _limits_health(),
         # 새 심의 멈춤(delib_paused · delib_pause — R1) · 줄이 재기동을 넘기나(delib_queue_durable — 참이면 재기동 판정이 줄 선 수를 막는 수로
