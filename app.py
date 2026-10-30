@@ -6215,7 +6215,7 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
     ⚠ 세 가지를 뭉개지 않는다(무음 결함의 공통 패턴 — '빈 결과'와 '못 물어봄'이 같아 보인다).
       · unavailable — 이 사용자에게 search_voc 가 없다(권한·미연결)
       · degraded    — 물어봤는데 도구가 실패했다(결과를 읽지 못한 것도 — HA-33)
-      · items=[]    — 물어봤고 정말 없다(SignalForge 가 준 까닭은 note 에)"""
+      · items=[]    — 물어봤고 보일 것이 없다(SignalForge 가 준 까닭 · 본문 없이 받은 수는 note 에)"""
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     if "search_voc" not in tools:
         return {"items": [], "keywords": [], "unavailable": True,
@@ -6239,15 +6239,19 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
         found = [v for v in _parse_json_multi(raw) if isinstance(v, dict)]
         env = next((v for v in found if isinstance(v.get("results"), list)), None)
         rows = [_voc_row(v, kw) for v in (env["results"] if env else found) if isinstance(v, dict)]
-        if env is not None and not env["results"]:
-            # 펼쳐도 0건 — 까닭(시도한 경로 · 범위 · 기간)을 미리보기에 싣는다. SF 는 0건을 'VOC 가 없다' 로 단정하지 말라고 한다.
+        if env is not None and not any(r["text"] for r in rows):
+            # 펼쳐도 보일 글이 0건 — SF 는 답했으니 실패가 아니다. 까닭(시도한 경로 · 범위 · 기간)을 미리보기에 싣는다. SF 는 0건을
+            # 'VOC 가 없다' 로 단정하지 말라고 한다. 받은 행에 본문이 없으면 그 수를 앞에 둔다 — SF 키워드 경로(mcp-server/tools/query.py
+            # _search_rows)는 번역문만 골라 번역 전 글은 본문 없이 오고, 수를 안 실으면 '정말 없음' 과 같아 보인다.
             notes = env.get("notes")
             notes = [str(n) for n in (notes if isinstance(notes, list) else [notes]) if n]
+            if env["results"]:
+                notes.insert(0, f"받은 {len(env['results'])}건에 보일 본문이 없습니다")
             if notes:
                 empty_notes.append(f"'{kw}' 0건 — " + " · ".join(notes))
         elif not any(r["text"] for r in rows) and isinstance(raw, str) and raw.strip() not in ("", "[]"):
-            # 읽을 글이 한 건도 없는데 결과 글은 왔다(모르는 꼴 · 실패 문구 · 본문 없는 행) — 0건으로 두면 '정말 없음' 과 같아 보이니
-            # 실패로 센다. '[]' 는 옛 꼴의 0건이다(내용 블록 0개를 도구 래퍼 _cap 이 그 글로 만든다).
+            # 펼칠 것이 없고 읽을 글도 없는데 결과 글은 왔다(모르는 꼴 · 실패 문구 · 옛 꼴의 본문 없는 행) — 0건으로 두면 '정말 없음' 과
+            # 같아 보이니 실패로 센다. '[]' 는 옛 꼴의 0건이다(내용 블록 0개를 도구 래퍼 _cap 이 그 글로 만든다).
             print(f"[voc] search_voc({kw!r}) 결과를 읽지 못해 실패로 센다 — 앞 160자 {raw.strip()[:160]!r}")
             failed += 1
             rows = []

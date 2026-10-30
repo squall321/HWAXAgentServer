@@ -110,6 +110,38 @@ def test_펼친_뒤에도_0건이면_notes_를_미리보기에_싣는다(monkeyp
     assert out["degraded"] is False and out["partial"] is False
 
 
+def test_notes_가_글_하나로_와도_글자로_쪼개지_않는다(monkeypatch):
+    """SF 는 notes 를 목록으로 주지만 꼴이 이미 한 번 바뀐 계약이다(HA-33) — 글 하나로 와도 통째로 싣는다."""
+    why = "해석한 조건에 맞는 글이 없다(최근 90일)"
+
+    async def call(tools, name, args):
+        return json.dumps({"total": 0, "results": [], "strategy": "semantic", "notes": why}, ensure_ascii=False)
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["zzz"]})
+    assert out["note"] == f"'zzz' 0건 — {why}", out.get("note")
+
+
+@pytest.mark.parametrize("bare", [
+    [{**_voc(i, "x"), "content_translated": None} for i in (1, 2)],   # 번역 전 글 — 본문 칸이 비어 온다
+    ["모르는 행", 2],                                                   # 모르는 행 꼴 — 읽을 행이 없어도 받은 수는 싣는다
+])
+def test_받은_행에_본문이_없으면_실패가_아니라_받은_수와_까닭을_싣는다(monkeypatch, bare):
+    """SF 키워드 경로는 번역문(content_translated)만 골라 번역 전 글은 본문 없이 온다. SF 는 답했고 펼칠 것도 있었으니 실패(화면의
+    '못 물어봄')가 아니라 '0건 + 까닭' 이다 — 받은 수를 안 실으면 '정말 없음' 과 같아 보인다(HA-33 반대 검토)."""
+    why = "'phrase' 로 0건이라 'all_tokens'(낱말 모두 · 순서 무관)로 찾았다"
+    data = {"hinge": _envelope([_voc(9, "hinge")]), "힌지 소음": _envelope(bare, [why], "keyword")}
+
+    async def call(tools, name, args):
+        return data[args["keyword"]]
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["힌지 소음"]})
+    assert out["items"] == [] and out["degraded"] is False and out["partial"] is False, out
+    assert "'힌지 소음'" in out["note"] and "받은 2건" in out["note"] and why in out["note"], out.get("note")
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["hinge", "힌지 소음"]})
+    assert [x["id"] for x in out["items"]] == [9] and out["partial"] is False and "받은 2건" in out["note"], out
+
+
 @pytest.mark.parametrize("junk", [json.dumps({"message": "검색 점검 중"}, ensure_ascii=False),
                                   f"{a._TOOL_FAIL_MARK} 도구 search_voc 호출 실패: 1,800초 안에 답하지 않았다"])
 def test_펼칠_것이_없는데_글이_왔으면_0건이_아니라_실패로_센다(monkeypatch, junk):
