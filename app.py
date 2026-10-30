@@ -1128,7 +1128,7 @@ def _denied_feature(req: "ChatRequest") -> str | None:
         need = "feat:routines"          # 루틴 가지가 맨 앞이다(chat()) — 그 턴은 슬래시 · 띵킹을 보지 않는다
     elif is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
         need = "feat:deliberation"
-    elif is_agent_search(m):
+    elif is_agent_search(m, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))):   # chat() 과 같은 판정이어야 한다(HA-31)
         need = "feat:expert-chat"
     elif is_thinking(m) or req.thinking:
         need = "feat:thinking"
@@ -2707,13 +2707,39 @@ def _area_catalog(tools: dict) -> list[dict]:
 _AGENT_SEARCH_TRIGGERS = ("/전문가", "/에이전트", "/agents", "/agent")
 _AGENT_SEARCH_RE = re.compile(
     r"(전문가|에이전트|agent)\w*\s*(검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)", re.IGNORECASE)
+# 자연어는 '누가 있나' 만 묻는 질문일 때만 가로챈다 — 목록 답은 LLM 을 거치지 않아 다른 물음을 말없이 버린다(HWAXPortal docs/request-1030
+# HA-31 · DW-13 — '…전문가 에이전트를 추천하고, 추천 근거가 된 기록 수를 알려줘.' 가 목록만 받았다). 수 · 근거 · 비교 · 조건, 찾는 말 뒤에
+# '-고' 로 이은 둘째 요청이 보이면 챗 에이전트로 보낸다. 잘못 보내도 챗이 recommend_agents 로 답하지만 잘못 가로채면 물음이 사라진다.
+_AGENT_SEARCH_OTHER_ASK_RE = re.compile(
+    r"몇|개수|갯수|건수|횟수|인원수|얼마|(?<![가-힣])수(?!\s*도?\s*[있없])(?:[를는가도만]|(?![가-힣]))"  # 수('할 수 있' 은 아니다)
+    r"|근거(?!리)|기록|출처|이유|왜(?!곡)"                                               # 근거('근거리' · '왜곡' 은 분야 낱말)
+    r"|비교|차이|누가\s*더|어느\s*(?:쪽|것|게|편)|\bvs\b"                                 # 비교
+    r"|조건|경우|만약|만일|(?:이|라|다)면(?![가-힣])"                                     # 조건
+    r"|(?:검색|추천|찾|알려|보여)[가-힣]*?(?:\s*주)?고(?![가-힣])(?!\s*[싶있])",          # 둘째 요청('찾고 싶어' 는 아니다)
+    re.IGNORECASE)
 
 
-def is_agent_search(message: str) -> bool:
+def is_agent_search(message: str, pinned: bool = False) -> bool:
+    """전문가 목록으로 답할 턴인가. 빗금 트리거는 사람이 대놓고 적은 의도라 늘 그렇다(전문가를 고른 대화에서도 — 목록 카드에서 바꿔 고른다).
+    자연어는 80자 이하 · 다른 물음 없음 · 고른 전문가 없음(pinned — 운영자 포함, _persona_keys)일 때만이다. 고른 대화의 질문은 그
+    전문가가 답한다(DW-13 은 AI 데이터 허브 운영자를 고른 대화에서도 가로챘다)."""
     m = (message or "").strip()
     if any(m.startswith(t) for t in _AGENT_SEARCH_TRIGGERS):
         return True
-    return len(m) <= 80 and bool(_AGENT_SEARCH_RE.search(m))
+    if pinned or len(m) > 80:
+        return False
+    return bool(_AGENT_SEARCH_RE.search(m)) and not _AGENT_SEARCH_OTHER_ASK_RE.search(m)
+
+
+# 추천 질의에서 찾는 말을 뺀다 — '전문가 · 추천해 · 줘' 는 분야가 아니라 요청이라, 그대로 넘기면 설명에 그 낱말이 든 사람마다 겹침 점수가
+# 붙어 무관한 전문가가 오른다(HA-31 · AIDataHub AD-19). 다 빠져 비면 추천 없이 명부 · 분야만 낸다(종전엔 요청 낱말로 추천했다).
+_AGENT_QUERY_ASK_RE = re.compile(
+    r"(?:전문가|에이전트|(?<![a-z])agents?(?![a-z])|검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)[가-힣]*[?!.~,]*"
+    r"|(?<!\S)(?:좀|해|줘|주세요|줄래요?|부탁[가-힣]*)[?!.~,]*(?!\S)", re.IGNORECASE)
+
+
+def _agent_search_query(text: str) -> str:
+    return " ".join(_AGENT_QUERY_ASK_RE.sub(" ", text or "").split())
 
 
 def strip_agent_trigger(message: str) -> str:
@@ -2726,6 +2752,7 @@ def strip_agent_trigger(message: str) -> str:
 
 async def run_agent_search(app: FastAPI, query: str, groups: list[str]):
     """전문가 카탈로그 SSE — 추천(관련도순) + 분야별 인원 요약을 결정적으로 만든다."""
+    query = _agent_search_query(query)      # 찾는 말을 뺀 분야 낱말로 추천하고 화면에도 그것을 '검색' 으로 보인다
     yield _sse("status", {"step": "전문가 검색 중", "tool": "recommend_agents"})
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 결과를 코드가 파싱 — 절단 금지
@@ -5789,8 +5816,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
                                  req.user_email, req.user_pat)
-    elif is_agent_search(req.message):
-        # "전문가 뭐 있어" 류 → 추천+분야 요약을 코드가 결정적으로 생성(LLM 나열 절단 방지).
+    elif is_agent_search(req.message, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))):
+        # "전문가 뭐 있어" 류 → 추천+분야 요약을 코드가 결정적으로 생성(LLM 나열 절단 방지). 전문가를 고른 대화의 자연어는 그 전문가에게 간다(HA-31).
         stream = run_agent_search(app, strip_agent_trigger(req.message), req.groups)
     elif is_tool_search(req.message):
         # "/도구 <질의>" 또는 '도구 뭐 있어' 류 → 도구 카탈로그+추천을 SSE tools 이벤트로(결정적).
