@@ -46,6 +46,9 @@ def test_HA05_invoke_tool_로도_패널_도구를_부르지_못하고_까닭을_
 
 # ── HA-08 — 위키가 꺼진 박스에서는 부르지 않고 한 줄만, 다단 심의는 한 번만 ─────────────────────────────────────
 import deliberation as d  # noqa: E402
+from langchain_mcp_adapters.tools import load_mcp_tools  # noqa: E402
+from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.shared.memory import create_connected_server_and_client_session  # noqa: E402
 
 _KW = dict(question="q", decision="결정문", stage="default", personas=[{"key": "mech-a", "role": "기구"}], last_list=[],
            rid=None, evidence=[], pool=[])
@@ -70,6 +73,38 @@ def _two_stages(tools, bind=True):
     return asyncio.run(go())
 
 
+class _ApiError(RuntimeError):
+    """MX 백서 api_client.ApiError 와 같은 꼴 — 글은 메시지뿐이고 status · code 는 칸에만 있다."""
+
+    def __init__(self, message: str, *, status: int = 0, code: str = ""):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
+def _mcp_stages(message: str, *, status: int = 404, code: str = "wiki_disabled"):
+    """진짜 사슬로 두 단 — wiki_submit_source 가 MX 백서처럼 ApiError 를 올리면 FastMCP 가 isError 로 싸고, 메모리 MCP 세션 →
+    langchain-mcp-adapters → app._prep_tool(심의 도구와 같은 래퍼)을 거쳐 엔진의 _call 에 닿는다.
+    → (엔진이 받은 글, 첫 단, 둘째 단, 두 단에서 위키 도구를 부른 수)"""
+    calls = []
+    srv = FastMCP("mxwp-fake")
+
+    @srv.tool(name=d._WIKI_TOOL)
+    def wiki_submit_source(envelope: dict, ingest: bool = True) -> dict:
+        calls.append(envelope)
+        raise _ApiError(message, status=status, code=code)
+
+    async def go():
+        async with create_connected_server_and_client_session(srv) as s:
+            tools = {t.name: a._prep_tool(t) for t in await load_mcp_tools(s)}
+            seen = await d._call(tools, d._WIKI_TOOL, {"envelope": {}, "ingest": True})
+            calls.clear()
+            d._wiki_bind("CAEG", "job-1")
+            first = await d._wiki_submit(tools, user="u1@corp.example", chair_failed=None, **_KW)
+            second = await d._wiki_submit(tools, user="u1@corp.example", chair_failed=None, **{**_KW, "stage": "s2"})
+            return seen, first, second
+    return (*asyncio.run(go()), len(calls))
+
+
 def test_HA08_위키_도구가_없으면_부르지_않고_한_줄_다음_단은_조용하다():
     """MX 백서는 위키가 꺼지면 wiki_* 를 싣지 않는다(MW-01) — 종전엔 결정문 끝마다(다단이면 단마다) '⚠ 남기지 못했다 …' 가 붙었다."""
     first, second = _two_stages({})
@@ -79,10 +114,11 @@ def test_HA08_위키_도구가_없으면_부르지_않고_한_줄_다음_단은_
 
 
 def test_HA08_도구가_실려도_wiki_disabled_면_꺼짐으로_읽고_다시_부르지_않는다():
-    """API 가 늦게 떠 mxwp-mcp 가 위키 도구를 실은 채 위키가 꺼진 경우 — 부른 결과가 wiki_disabled 다."""
-    t = _WikiTool("(tool wiki_submit_source error: 404 wiki_disabled — MX 백서 AI 위키는 아직 열리지 않았다)")
-    first, second = _two_stages({d._WIKI_TOOL: t})
-    assert first == d._WIKI_OFF_NOTE and second == "" and len(t.calls) == 1
+    """API 가 늦게 떠 mxwp-mcp 가 위키 도구를 실은 채 위키가 꺼진 경우. 꺼짐 문구로 바꾸기 전의 MX 백서 MCP(10-24 ef08d36 ~ 10-27 76297b6 앞)는
+    API 오류를 일반 꼴 'HTTP 404 <code>: <API 문구>' 로 냈고 그때 API 문구('위키가 꺼져 있다(WIKI_ENABLED)')에는 꺼짐 글귀가 없다 — code 로 읽는다."""
+    seen, first, second, n = _mcp_stages("HTTP 404 wiki_disabled: 위키가 꺼져 있다(WIKI_ENABLED)")
+    assert "wiki_disabled" in seen, seen
+    assert first == d._WIKI_OFF_NOTE and second == "" and n == 1
 
 
 def test_HA08_켜진_위키의_다른_실패와_성공은_단마다_그대로다():
@@ -96,22 +132,32 @@ def test_HA08_켜진_위키의_다른_실패와_성공은_단마다_그대로다
 
 # ── HA-08(다시) — MX 백서 MCP 문구로도 꺼짐을 읽는다(10-30 요청 HWAXPortal docs/request_261030.md) ─────────────────────────────
 # MX 백서는 같은 꺼짐을 두 문구로 말한다 — API 는 '…열리지 않았다', 게이트웨이로 오는 MCP 는 '…열리지 않았습니다' 이고 wiki_disabled 는
-# 예외의 code 칸에만 두어 글에는 없다. FastMCP 는 그 예외를 'Error executing tool <이름>: <메시지>' 로 싸 isError 로 돌려준다.
+# 예외의 code 칸에만 두어 글에는 없다. 엔진이 받는 글은 진짜 사슬(_mcp_stages — FastMCP · MCP 세션 · 어댑터 · app._prep_tool)로 만든다.
 import ast  # noqa: E402
 
 import pytest  # noqa: E402
 
 _MXWP = Path(__file__).resolve().parents[2] / "MXWhitePaper"
-_MCP_OFF = "Error executing tool wiki_submit_source: MX 백서 AI 위키는 아직 열리지 않았습니다 — 문서 찾기는 search_documents 를 쓰세요"
+_MCP_OFF = "MX 백서 AI 위키는 아직 열리지 않았습니다 — 문서 찾기는 search_documents 를 쓰세요"   # api_client.WIKI_OFF_MESSAGE
 
 
 def test_HA08_다시_MCP_문구와_API_문구_모두_꺼짐으로_읽고_다시_부르지_않는다():
-    """종전 글귀('…열리지 않았다')는 MCP 문구를 못 찾아, 위키 도구가 실린 채 꺼진 박스에서 결정문 단마다 오류 문구가 다시 붙었다."""
-    for raw in (_MCP_OFF, "(tool wiki_submit_source error: MX 백서 AI 위키는 아직 열리지 않았다)"):
-        assert "wiki_disabled" not in raw, "글귀만으로 읽는지 본다"
-        t = _WikiTool(raw)
-        first, second = _two_stages({d._WIKI_TOOL: t})
-        assert first == d._WIKI_OFF_NOTE and second == "" and len(t.calls) == 1, raw
+    """종전 글귀('…열리지 않았다')는 MCP 문구를 못 찾아, 위키 도구가 실린 채 꺼진 박스에서 결정문 단마다 오류 문구가 다시 붙었다.
+    이 경우 도구는 실려 한 번 불렸다 — 한 줄이 '위키 도구가 없다' 고 하면 거짓이다."""
+    for msg in (_MCP_OFF, "MX 백서 AI 위키는 아직 열리지 않았다"):
+        seen, first, second, n = _mcp_stages(msg)
+        assert seen.startswith(a._TOOL_FAIL_MARK) and msg in seen and "wiki_disabled" not in seen, seen
+        assert first == d._WIKI_OFF_NOTE and second == "" and n == 1, msg
+        assert "도구가 없다" not in first, first
+
+
+def test_HA08_다시_위키_도구의_다른_실패는_같은_말투여도_꺼짐이_아니다():
+    """꺼짐 글귀는 '위키는 아직' 까지 본다 — wiki_submit_source 자신의 다른 실패가 같은 말투('…저장소가 열리지 않았습니다' — 포털 저장소
+    503 과 같은 꼴)여도 위키는 켜져 있으니 단마다 사유를 알리고 다시 부른다. 줄기를 '열리지 않았' 로 줄이면 이 실패를 꺼짐으로 삼킨다."""
+    _seen, first, second, n = _mcp_stages("HTTP 503 : 원천 저장소가 열리지 않았습니다", status=503, code="")
+    for note in (first, second):
+        assert "⚠ MX 백서 위키에 남기지 못했다" in note and "원천 저장소가 열리지 않았습니다" in note, note
+    assert n == 2
 
 
 def test_HA08_다시_다른_도구_결과의_같은_글귀로는_꺼짐을_읽지_않는다():

@@ -3287,16 +3287,19 @@ _WIKI_PLAT = "plat:mxwhitepaper"
 _WIKI_EXCERPT_MAX = 300      # 근거 발췌 상한 — MX 백서 인용 상한(V10) · 포털 챗 '위키에 남기기'(wiki_send.EXCERPT_MAX)와 같은 값
 _WIKI_TITLE_MAX = 120
 # 위키가 꺼진 박스 — MX 백서는 위키가 꺼지면 wiki_* 를 싣지 않고(MXWhitePaper MW-01 — mxwp-mcp 가 뜰 때 /api/v1/wiki/health 의 404
-# wiki_disabled 를 본다), 그때 API 가 늦게 떠 도구가 실렸으면 부른 결과가 wiki_disabled 다. 포털 화면(HP-16)이 읽는 신호와 같은 근원이다.
+# wiki_disabled 를 본다), 그때 API 가 늦게 떠 도구가 실렸으면 부른 결과가 꺼짐을 말한다(_WIKI_OFF_HINTS). 포털 화면(HP-16)이 읽는 신호와 같은 근원이다.
 # 결정문 끝마다 내부 오류 문구를 붙이지 않고 한 줄만 남긴다 — 다단 심의는 단마다 부르므로 꺼짐을 한 번 알렸으면 다음 단은 조용히
 # 건너뛴다(HWAXPortal docs/request-1027 HA-08). 상태는 심의 하나의 것이다(입구가 _wiki_bind 로 새로 세운다).
 _WIKI_STATE: contextvars.ContextVar = contextvars.ContextVar("wiki_state", default=None)
 # 꺼짐 글귀는 MX 백서의 두 문구가 함께 쓰는 줄기까지다 — API 는 '…열리지 않았다'(MXWhitePaper apps/api/app/routers/wiki.py), 게이트웨이로
 # 오는 MCP 는 '…열리지 않았습니다'(dist/llm-docx-toolkit/mcp/api_client.py WIKI_OFF_MESSAGE)이고 wiki_disabled 는 예외의 code 칸에만 두어
-# 글에 없다. 종전 글귀는 MCP 문구를 못 찾아 단마다 오류 문구가 다시 붙었다(HWAXPortal docs/request_261030.md HA-08(다시)). 이 심의가
-# 부른 wiki_submit_source 의 응답에서만 찾는다 — 다른 도구의 결과(봉투의 근거)에 같은 글귀가 있어도 꺼짐으로 읽지 않는다.
+# 글에 없다. 종전 글귀는 MCP 문구를 못 찾아 단마다 오류 문구가 다시 붙었다(HWAXPortal docs/request_261030.md HA-08(다시)). 'wiki_disabled' 는
+# code 가 글에 실린 꼴이다 — 꺼짐 문구로 바꾸기 전의 MX 백서 MCP(10-24 ef08d36 ~ 10-27 76297b6 앞)는 'HTTP 404 wiki_disabled: 위키가 꺼져
+# 있다(WIKI_ENABLED)' 를 냈다(글귀가 없어 code 로만 읽힌다). 줄기를 '열리지 않았' 로 더 줄이지 않는다 — 켜진 위키의 다른 실패가 같은 말투면
+# 꺼짐으로 삼킨다. 이 심의가 부른 wiki_submit_source 의 응답에서만 찾는다 — 다른 도구의 결과(봉투의 근거)에 같은 글귀가 있어도 꺼짐으로 읽지 않는다.
 _WIKI_OFF_HINTS = ("wiki_disabled", "위키는 아직 열리지 않았")
-_WIKI_OFF_NOTE = ("\n\nℹ MX 백서 위키에 남기지 않았다 — 이 박스의 MX 백서 위키가 꺼져 있거나(위키 도구가 없다) "
+# 한 줄은 도구가 없을 때와 실린 도구가 꺼짐을 답했을 때 함께 쓴다 — 둘 다에 참인 말만 싣는다('위키 도구가 없다' 는 뒤쪽에서 거짓이다).
+_WIKI_OFF_NOTE = ("\n\nℹ MX 백서 위키에 남기지 않았다 — 이 박스의 MX 백서 위키가 꺼져 있거나 "
                   f"MX 백서 권한({_WIKI_PLAT})이 없다.")
 
 
