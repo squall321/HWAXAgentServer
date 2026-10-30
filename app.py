@@ -6214,8 +6214,8 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
 
     ⚠ 세 가지를 뭉개지 않는다(무음 결함의 공통 패턴 — '빈 결과'와 '못 물어봄'이 같아 보인다).
       · unavailable — 이 사용자에게 search_voc 가 없다(권한·미연결)
-      · degraded    — 물어봤는데 도구가 실패했다
-      · items=[]    — 물어봤고 정말 없다"""
+      · degraded    — 물어봤는데 도구가 실패했다(결과를 읽지 못한 것도 — HA-33)
+      · items=[]    — 물어봤고 정말 없다(SignalForge 가 준 까닭은 note 에)"""
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     if "search_voc" not in tools:
         return {"items": [], "keywords": [], "unavailable": True,
@@ -6226,14 +6226,32 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
         return {"items": [], "keywords": [], "note": "검색어를 뽑지 못했습니다 — 영어 검색어를 직접 넣어 주세요."}
     per_kw: list[list[dict]] = []
     failed = 0
+    empty_notes: list[str] = []
     for kw in kws:
         raw = await _call(tools, "search_voc", {"keyword": kw, "limit": 10})
         if isinstance(raw, str) and raw.strip() and not _tool_text_ok(raw):
             failed += 1
             per_kw.append([])
             continue
-        # 목록 도구 — 원소별 블록이 이어져 온다(_parse_json 은 마지막 하나만 읽는다).
-        per_kw.append([_voc_row(v, kw) for v in _parse_json_multi(raw) if isinstance(v, dict)])
+        # 목록 도구 — 원소별 블록이 이어져 온다(_parse_json 은 마지막 하나만 읽는다). 지금 SignalForge search_voc 는 늘 객체 하나
+        # {total, results, strategy, match_mode, notes} 라 그 results 를 펼친다 — 안 펼치면 객체가 본문 없는 한 건으로 읽혀 아래에서
+        # 걸러지고, 실패 표시 없이 0건이었다(HWAXPortal docs/request_261030.md HA-33). 옛 꼴(원소별 블록 · 배열)은 그대로 읽는다.
+        found = [v for v in _parse_json_multi(raw) if isinstance(v, dict)]
+        env = next((v for v in found if isinstance(v.get("results"), list)), None)
+        rows = [_voc_row(v, kw) for v in (env["results"] if env else found) if isinstance(v, dict)]
+        if env is not None and not env["results"]:
+            # 펼쳐도 0건 — 까닭(시도한 경로 · 범위 · 기간)을 미리보기에 싣는다. SF 는 0건을 'VOC 가 없다' 로 단정하지 말라고 한다.
+            notes = env.get("notes")
+            notes = [str(n) for n in (notes if isinstance(notes, list) else [notes]) if n]
+            if notes:
+                empty_notes.append(f"'{kw}' 0건 — " + " · ".join(notes))
+        elif not any(r["text"] for r in rows) and isinstance(raw, str) and raw.strip() not in ("", "[]"):
+            # 읽을 글이 한 건도 없는데 결과 글은 왔다(모르는 꼴 · 실패 문구 · 본문 없는 행) — 0건으로 두면 '정말 없음' 과 같아 보이니
+            # 실패로 센다. '[]' 는 옛 꼴의 0건이다(내용 블록 0개를 도구 래퍼 _cap 이 그 글로 만든다).
+            print(f"[voc] search_voc({kw!r}) 결과를 읽지 못해 실패로 센다 — 앞 160자 {raw.strip()[:160]!r}")
+            failed += 1
+            rows = []
+        per_kw.append(rows)
     # 검색어마다 번갈아 뽑는다 — 한 검색어가 목록을 독점하면 나머지 증상이 안 보인다.
     items, seen = [], set()
     for i in range(max((len(x) for x in per_kw), default=0)):
@@ -6243,12 +6261,12 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
                 items.append(rows[i])
     total = len(items)
     items = items[:_VOC_PREVIEW_MAX]
+    note = ([f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."] if total > len(items) else []) + empty_notes
     return {"keywords": kws, "items": items, "total": total,
             "degraded": failed == len(kws),
             "partial": 0 < failed < len(kws),
             "tools_used": ["search_voc"],
-            **({"note": f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."}
-               if total > len(items) else {})}
+            **({"note": " / ".join(note)} if note else {})}
 
 
 # ── 심의 전 되묻기 — 메커니즘 분석에 필요한 최소 정보가 비었으면 몇 가지를 묻는다 ──────────
