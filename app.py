@@ -284,20 +284,23 @@ def _patch_paths(patch: dict) -> list[str]:
 
 
 def _core_rules_text(d: dict) -> str:
-    """코어 규칙 글 — 발동 낱말(R-1) · 첫 걸음은 정본 resolve 하나(R-7) · 관계 대응(R-8) · 코어가 아닌 앱(R-2)을 어휘표에서 만든다. 나머지
-    줄은 기본 글과 같다. 10-29 QA 에서 발동 낱말이 '부품 · 모델 · 과제 · 불량' 뿐이라 고장모드 · 시험항목 · 가상검증 · 관리 기준 · 물성
-    질문 다섯이 코어를 건너뛰었고(OT-06 ~ 10), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다. 시스템 프롬프트는 호출마다 실리므로 짧게 둔다."""
+    """코어 규칙 글 — 발동 낱말(R-1) · 첫 걸음은 정본 resolve 하나(R-7) · 타입 이름 대응(10-30 HA-32) · 관계 대응(R-8) · 코어가 아닌 앱(R-2)을
+    어휘표에서 만든다. 나머지 줄은 기본 글과 같다. 10-29 QA 에서 발동 낱말이 '부품 · 모델 · 과제 · 불량' 뿐이라 고장모드 · 시험항목 · 가상검증 ·
+    관리 기준 · 물성 질문 다섯이 코어를 건너뛰었고(OT-06 ~ 10), FMEA · ARP · ODB 허브가 코어 질문을 가로챘다. 10-30 QA 에서는 없는 타입 이름을
+    지어내 불렀다(DW-22 — object_resolve(type_slug='management_standard'), 실제는 criterion). 시스템 프롬프트는 호출마다 실리므로 짧게 둔다."""
     apps = list((d.get("apps") or {}).values())
     sib = " · ".join(a["label"] for a in apps if a.get("role") == "sibling") or "FailureTrace 등"
     non = " · ".join(f"{a['label']}({a['note']})" if a.get("note") else a["label"] for a in apps if a.get("role") == "noncore")
     rel = " · ".join(f"{r['phrase']} = {r['relation']}" for r in d.get("relations") or [])
+    typ = " · ".join(f"{w} = {s}" for w, s in (d.get("types") or {}).items())
     return (
         f"[코어 데이터 규칙] {' · '.join(d['rule_words'])} 같은 코어 객체를 물으면 이렇게 하세요. "
         "이 낱말이 나오면 첫 걸음은 정본의 object_resolve 하나입니다 — 여러 앱을 한꺼번에 훑지 말고, 사례 · 실측 · 규격 원문은 그 뒤에 "
         "다른 앱에서 덧붙이세요. "
         f"① 정본은 {d['canonical']['label']}입니다 — 이름 · 코드는 먼저 object_resolve 로 풀고, 결과가 candidates(여럿)면 "
         "고르지 말고 사용자에게 어느 것인지 물으세요. "
-        "② PLM 과제(plm_task)의 식별자는 과제명입니다 — 과제코드는 별칭 · task_code 로 대조하세요. "
+        + (f"타입 이름(type_slug)은 지어내지 말고 이 대응을 쓰세요 — {typ}. " if typ else "")
+        + "② PLM 과제(plm_task)의 식별자는 과제명입니다 — 과제코드는 별칭 · task_code 로 대조하세요. "
         "③ 개수는 목록을 세지 말고 응답의 total 이나 objects_summary 로 답하세요. "
         "④ 무엇이 무엇과 이어져 있는지는 graph_neighbors 로 보세요" + (f" — 자주 묻는 관계는 {rel} 입니다. " if rel else ". ")
         + f"⑤ 다른 허브({sib})로 건널 때는 앞 허브의 id 를 그대로 쓰지 말고 key 로 그 허브에서 다시 resolve 하세요. "

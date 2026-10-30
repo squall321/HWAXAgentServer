@@ -581,8 +581,9 @@ fallback). Tests: `tests/test_chat_llm.py` (real lifespan, fake servers — clos
 The chat's core-data rules (`[코어 데이터 규칙]` in the system prompt) are built from the portal's canonical vocabulary,
 `../HWAXPortal/backend/config/core_vocab.json` — the sibling repo on the same box (dev `~/claude`, cae00 `~/Projects`).
 The trigger words (`rule_words`), the first step (one `object_resolve` on the canonical hub before other apps), the
-relation map (`relations`, rule ④) and the apps that hold no core objects (`apps` with role `noncore`, rule ⑦) come from
-it. The file is re-read when its mtime changes. Missing or malformed → the built-in text (`SYSTEM_PROMPT`, byte for
+type-name map (`types`, one line at the end of rule ① — `word = type_slug`, so the model stops inventing type names;
+portal docs/request-1030 HA-32), the relation map (`relations`, rule ④) and the apps that hold no core objects (`apps`
+with role `noncore`, rule ⑦) come from it. The file is re-read when its mtime changes. Missing or malformed → the built-in text (`SYSTEM_PROMPT`, byte for
 byte). `/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
 Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test).
 
