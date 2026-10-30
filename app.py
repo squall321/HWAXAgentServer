@@ -31,10 +31,12 @@ import hashlib
 import itertools
 import asyncio
 import contextvars
+import copy
 import json
 import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 없었다 — 심의가 터지면 오류 처리 자체가 NameError 로 죽었다
 import os
 import re
+import secrets
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -133,6 +135,15 @@ from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
 USER_HEADER = "X-HWAX-User"      # 호출자 이메일 — 게이트웨이가 사용자별 백엔드 자격증명으로 갈아탄다
+# 확인 관문(HWAXPortal docs/request-1030 HA-29) — 사람이 이번 말로 시키지 않은 잡 · 쓰기는 코드가 확인 카드로 멈춘다(아래 _confirm_gate). 기동 때
+# 한 번 읽는다(CHAT_STABLE_PREFIX 와 같은 꼴). 0 이면 관문이 아무것도 막지 않고 시스템 프롬프트 넷째 규칙도 종전 글이다 — 박스에서 관문이
+# 오작동하면 코드 되돌림 없이 끄는 길이다.
+CHAT_CONFIRM_GATE = os.environ.get("CHAT_CONFIRM_GATE", "1").strip() != "0"
+# 넷째 규칙 둘 — 관문이 켜져 있으면 확인을 글로 따로 묻지 않게 한다(모델이 글로 묻고 사람이 '응' 한 뒤 다시 카드가 뜨는 이중 확인을 막는다).
+_SP_CONFIRM_OLD = "등록·발행·삭제·잡 제출처럼 되돌리기 어려운 도구는 무엇을 어디에 하는지 사용자에게 먼저 확인하고 호출하세요. "
+_SP_CONFIRM_GATE = ("잡 시작·등록·발행·삭제처럼 상태를 바꾸는 도구는 사용자가 이번 말로 그 일을 시킨 것이 아니면 서버가 보내지 않고 사용자에게 "
+                    "확인 카드를 띄웁니다 — 확인을 글로 따로 묻지 말고, 무엇을 왜 하려는지 한 줄 말한 뒤 호출하세요. 확인 번호를 지어내거나 "
+                    "카드를 흉내 내지 마세요. ")
 _SP_HEAD = (
     # 질문의 언어로 답한다 — 영어 질문에도 한국어로만 답했다(온톨로지 시험 OT-07 — HWAXPortal docs/request-1027 HA-15). 중국어로 새는 것
     # (Qwen · GLM 의 버릇)은 계속 막는다.
@@ -160,9 +171,8 @@ _SP_HEAD = (
     "desc_match·matched_sections·low_confidence 를 보고 판단하세요. "
     # ③ 근거 블록이 수치를 대조하려면 답에 출처가 있어야 사람이 따라갈 수 있다.
     "도구 결과에서 가져온 수치·사실에는 출처(record_id·문서 제목 등)를 함께 적으세요. "
-    # ④ 웹 챗에서도 등록·발행·삭제·잡 제출 도구가 그대로 바인딩된다.
-    "등록·발행·삭제·잡 제출처럼 되돌리기 어려운 도구는 무엇을 어디에 하는지 사용자에게 먼저 "
-    "확인하고 호출하세요. "
+    # ④ 웹 챗에서도 등록·발행·삭제·잡 제출 도구가 그대로 바인딩된다. 관문(HA-29)이 켜져 있으면 코드가 확인 카드로 멈춘다.
+    + (_SP_CONFIRM_GATE if CHAT_CONFIRM_GATE else _SP_CONFIRM_OLD) +
     "조회 도구는 항상 좁게 호출하세요 — limit(기본 10 이하)·필터·기간을 지정하고, "
     "대량 데이터가 필요하면 요약/집계 도구를 우선 사용하세요. "
     # RA 는 70개짜리 저작 워크플로 API 라 입구에서 헤맨다(비슷한 이름 다수 + 21인자 조회).
@@ -1152,7 +1162,7 @@ def _denied_feature(req: "ChatRequest") -> str | None:
         need = None                     # chat() 은 /보고서 를 전문가 검색보다 먼저 저장으로 보낸다 — 결론 글의 '전문가 추천' 은 검색이 아니다
     elif is_agent_search(m, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))):   # chat() 과 같은 판정이어야 한다(HA-31)
         need = "feat:expert-chat"
-    elif is_thinking(m) or req.thinking:
+    elif (is_thinking(m) or req.thinking) and not _confirm_reply(req):   # 확인 카드의 답은 chat() 처럼 일반 챗이다(HA-29 · C-10)
         need = "feat:thinking"
     else:
         need = None
@@ -2229,7 +2239,11 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
             _xmsg = _cross_hub_id_msg(_target, _targs)
             if _xmsg:
                 return _refuse(tool, _xmsg)
-        # ── G5 확인 카드(HA-29) 자리
+        # ── G5 확인 카드(HA-29) — 사람이 이번 말로 시키지 않은 잡 · 쓰기, 되돌리기 어려운 호출은 보내지 않는다(턴이 끝에 카드를 띄운다).
+        # 인자가 틀린 호출(G3 · G4)에 카드를 띄우면 사람이 틀린 대상을 승인하므로 이 걸음이 마지막이다. 열쇠는 기본값(G6) 앞 인자로 잰다.
+        _held = _confirm_gate(tool, a, kw)
+        if _held:
+            return _refuse(tool, _held)
         # ── G6 챗 인자 기본값
         if _own:
             for _k, _v in _own[0].items():
@@ -3256,6 +3270,608 @@ def _agent_external_call(name, args) -> bool:
         path = str(args.get("path") or "").strip().split("?", 1)[0].split("#", 1)[0]
         return bool(_RISK_JOB_PATH.search(path)) and _picks_external(body)
     return False
+
+
+# ── 확인 관문(HWAXPortal docs/request-1030 HA-29 · design-ha29.md) ─────────────────────────────────────────────────────────────
+# DW-03(10-30 QA) — StepForge run_job 을 사람에게 묻지 않고 두 번(graph · 판 전체 drop_check) 걸었다. drop_check 는 10% 에서 1,812초를 돌다 사용자가
+# 취소했다(단일 러너를 잡고 있었다). 프롬프트의 '먼저 확인' 은 지켜지지 않았다 — 그래서 코드가 막는다. 막는 도구는 셋으로 가른다.
+#   job     — 잡을 시작하는 도구(아래 바닥 목록). 엄하게 — 주문 동사에 더해 그 일을 글자로 불러야(도구 이름 · 무엇 칸 값 · 파일 이름 · 콕 집은
+#             도구) 통과한다. 잡은 단일 러너 · 클러스터 · GLM 을 몇 분 ~ 몇 시간 잡는다.
+#   write   — 운영자 정의(포털 infra/personas/he-team.json)의 writes. 너그럽게 — 질문 · 부정이 없는 주문 동사면 통과한다(저작 흐름이 쓰기마다
+#             끊기면 박스에서 관문을 끄게 되고, 그러면 DW-03 도 돌아온다).
+#   confirm — 운영자 정의의 confirm(지우기 · 권한 · 되돌리기 어려운 것). 늘 카드다.
+# 게이트웨이의 쓰기 표지(/tools-map write)는 쓰지 않는다 — 이름 낱말 규칙이라 docforge_convert · 낙하 제출을 놓치고 읽기를 쓰기로 적는다(dev 실측).
+# 막으면 부르지 않고 글을 돌려준다(던지면 턴의 except 로 가 자동 재시도가 그래프를 다시 돈다). 그 단계가 끝나면 다음 모델 호출 앞에서 턴을 끊고
+# 턴 끝에 결정적인 확인 카드(SSE confirm + 본문 끝 글, 번호 cf-…)를 낸다. 승인은 다음 사람 말로 받고, 서버가 저장한 호출을 처음 꼴 그대로 한 번
+# 보낸다. 심의 좌석 · 띵킹 · 분석 루틴 · 카탈로그는 이 턴 맥락이 없어 관문이 서지 않는다.
+# 목록의 정본은 포털 리포다 — 에이전트 서버 · 포털은 늘 한 박스에 형제 리포로 있어(dev ~/claude · cae00 ~/Projects) 그 파일을 직접 읽는다(코어
+# 어휘표와 같은 선례). CONFIRM_LISTS_PATH 로 다른 파일을 가리킬 수 있고, 상대 경로는 이 리포 루트가 앵커다.
+_CONFIRM_LISTS_ENV = os.environ.get("CONFIRM_LISTS_PATH", "").strip()
+CONFIRM_LISTS_PATH = (Path(__file__).resolve().parent / Path(_CONFIRM_LISTS_ENV).expanduser() if _CONFIRM_LISTS_ENV
+                      else Path(__file__).resolve().parent.parent / "HWAXPortal" / "infra" / "personas" / "he-team.json")
+_CONFIRM_LISTS: dict = {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "아직 읽지 않음"}
+# 잡 시작 바닥 목록 — 운영자 정의 없이도 막는다(요청서가 이름 댄 잡 · 클러스터 제출 · StepForge 의 다른 잡 넣기 — 같은 단일 러너 · 심의 · 리스크 잡).
+# 이름 규칙은 거절 관문과 같다(_named — 그대로이거나 게이트웨이 별칭 · 충돌 접두를 단 꼴).
+_CONFIRM_JOB_TOOLS = (
+    "run_job", "run_checklist", "run_analysis", "run_compare", "run_curvature", "docforge_convert",
+    "submit_job", "slurm_submit_job", "smarttwin_submit", "submit_lsdyna_job", "fullangle_drop_simulation",
+    "single_drop_simulation", "job_rerun", "catalog_run", "recipe_run", "run_recipe", "run_operation",
+    "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job")
+# '이번 말이 시켰다' 판정 — 주문 동사 · 질문 · 부정. 질문 · 부정은 주문을 지운다(어긋나면 카드 쪽으로 간다 — 엄한 쪽이 틀려도 카드가 하나 더 뜰 뿐이다).
+_ORDER_RE = re.compile(
+    r"(?:실행|재실행|제출|시작|변환|등록|생성|저장|업로드|추가|수정|변경|삭제|취소|적용|반입|게시)\s*(?:을|를)?\s*"
+    r"(?:해\s*(?:줘|주세요|주십시오|줄래|봐)|하자|합시다|하세요|해라|하라|해(?=\s*[.!~]*\s*$))"
+    r"|(?:돌려|걸어|만들어|올려|지워|넣어|바꿔|고쳐|붙여)\s*(?:줘|주세요|주십시오|줄래|봐|라)"
+    r"|(?:돌려|걸어|만들어|올려|지워|넣어|바꿔|고쳐|붙여|돌리자|걸자)(?=\s*[.!~]*\s*$)"
+    r"|(?:^|[\s,.;!])(?:please\s+)?(?:run|rerun|submit|start|launch|execute|convert|create|register|upload|save|delete|remove|cancel|apply)\b",
+    re.I | re.M)
+_ASK_RE = re.compile(r"\?|(?:까요?|나요|니|냐|는지|을지|ㄹ지|어때|되나|돼|될까|가능해|가능할까)\s*[.!~]*\s*$", re.M)
+_NEG_RE = re.compile(r"(?:지\s*마|지\s*말|하지\s*않|말고|말아|안\s*(?:돼|된|해|함)|금지|멈춰|중지|그만|아니(?:요|야|오)?(?=[\s.,!~]|$)|아뇨"
+                     r"|\bno\b|\bnope\b|don'?t|do\s+not|never|\bstop\b)", re.I)
+# 카드의 답 — 번호가 없는 짧은 답(말 전체가 이 꼴일 때만).
+_AFFIRM_RE = re.compile(
+    r"^(?:(?:응|어|네|넵|넹|예|그래|좋아|좋아요|ㅇㅇ|ㅇㅋ|오케이|ok|okay|yes|y|go)[\s,.!~]*)?"
+    r"(?:(?:실행|진행|확인|승인|돌려|걸어|시작)\s*(?:해|해요|하자|합니다|할게|하세요|해라|해\s*줘|해\s*주세요|줘|주세요)?)?[\s.!~]*$", re.I)
+_DECLINE_RE = re.compile(r"^(?:아니(?:요|야|오)?|아뇨|no|nope|취소|그만|됐어|괜찮아|하지\s*마|안\s*해)[\s.!~]*$", re.I)
+_CF_ID_RE = re.compile(r"\bcf-[0-9a-f]{12}\b")
+# '그 일을 글자로 불렀나' 에 쓰는 무엇 칸 — 식별자 칸(project_id · job_id …)은 쓰지 않는다('P1 돌려줘' 가 그 과제의 아무 잡이나 통과시키면 DW-03 이
+# 그대로 남는다).
+_CONFIRM_WHAT_KEYS = ("kind", "operation", "tool", "job", "recipe", "name", "action", "scenario", "template")
+_CONFIRM_FILE_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+_CONFIRM_MARK = "[확인 대기]"            # 막은 호출의 결과 글 표지 — _TOOL_FAIL_MARK 로 시작해 _result_ok 가 거짓이다(활동 · 절차 원장이 성공으로 접지 않는다)
+_CONFIRM_TTL_S = 1800                    # 카드 수명 — 포털의 PAT 창 · AGENT_CACHE_TTL_S 와 같은 30분(승인된 호출은 승인한 턴의 새 자격으로 나간다)
+_CONFIRM_MAX = 256                       # 카드 저장 상한 — 넘으면 오래된 것부터
+_CONFIRM_WORKLOAD_S = 15.0               # 예상 작업량 묻기(목록 받기 + estimate_cost) 전체 — 게이트웨이 600초 · 엔진 900초보다 안쪽이다
+_CONFIRM_LOCK = threading.Lock()         # /health 는 스레드 풀에서, 카드 · 셈은 이벤트 루프에서 돈다(_HUB_FOLD_LOCK 과 같다)
+_CONFIRM_PENDING: "OrderedDict[str, dict]" = OrderedDict()
+_CONFIRM_STAT: Counter = Counter()
+_CONFIRM_COUNT_KEYS = ("cards", "held_calls", "approved", "executed", "declined", "unknown_reply", "ordered")
+# 이번 챗 턴의 확인 맥락 — None 이면 챗 밖(심의 좌석 · 띵킹 · 루틴 · 카탈로그 · 시험)이라 관문이 서지 않는다(_turn_ids 와 같은 꼴).
+_turn_confirm: contextvars.ContextVar = contextvars.ContextVar("turn_confirm", default=None)
+
+
+def _confirm_count(key: str, n: int = 1) -> None:
+    with _CONFIRM_LOCK:
+        _CONFIRM_STAT[key] += n
+
+
+def _confirm_lists() -> dict:
+    """운영자 정의의 writes · confirm 두 목록 — he-team.json 의 바뀐 시각이 다르면 다시 읽는다(재기동 없이 HP-53 이 채운 목록이 들어온다).
+    선택 앱(optional[])의 목록도 넣고, 접두 별칭(<앱 키에서 하이픈을 뺀 것>_<이름> — sync-he-personas.py 가 받는 꼴)은 접두를 뗀 꼴도 넣는다(모델이
+    맨 이름으로 불러도 맞게). 없거나 꼴이 틀리면 두 목록이 비고(바닥 목록만 돈다) 까닭은 error 다 — 로그는 처음 한 번."""
+    try:
+        st = CONFIRM_LISTS_PATH.stat()
+    except OSError:
+        if _CONFIRM_LISTS["error"] != "없음":
+            print(f"[confirm] ⚠ 운영자 정의가 없다({CONFIRM_LISTS_PATH}) — 확인 관문은 잡 시작 바닥 목록만으로 돈다", flush=True)
+        _CONFIRM_LISTS.update(key=None, writes=frozenset(), confirm=frozenset(), error="없음")
+        return _CONFIRM_LISTS
+    key = (str(CONFIRM_LISTS_PATH), st.st_mtime_ns, st.st_size)
+    if key != _CONFIRM_LISTS["key"]:
+        try:
+            got: dict = {"writes": set(), "confirm": set()}
+            for p in json.loads(CONFIRM_LISTS_PATH.read_text(encoding="utf-8"))["personas"]:
+                opts = p.get("optional") or []
+                pre = [str(a).replace("-", "").lower() + "_" for a in [*(p.get("apps") or []), *(o["app"] for o in opts)] if a]
+                for fld in ("writes", "confirm"):
+                    for n in [*(p.get(fld) or []), *(x for o in opts for x in (o.get(fld) or []))]:
+                        n = n.strip().lower()       # 글이 아니면 AttributeError — 꼴이 틀린 정본은 통째로 버린다
+                        got[fld].add(n)
+                        got[fld].update(n[len(x):] for x in pre if n.startswith(x) and len(n) > len(x))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            print(f"[confirm] ⚠ 운영자 정의를 못 읽었다({CONFIRM_LISTS_PATH}) — 확인 관문은 잡 시작 바닥 목록만으로 돈다: {exc!r}"[:400],
+                  flush=True)
+            _CONFIRM_LISTS.update(key=key, writes=frozenset(), confirm=frozenset(), error=f"못 읽음({type(exc).__name__})")
+        else:
+            _CONFIRM_LISTS.update(key=key, writes=frozenset(got["writes"]), confirm=frozenset(got["confirm"]), error=None)
+    return _CONFIRM_LISTS
+
+
+def _confirm_class(name) -> tuple:
+    """(부류, 맞은 목록 이름) — 부류는 confirm > job > write(겹치면 더 엄한 쪽), 목록 밖이면 (None, ""). 맞은 이름은 그 부류에서 가장 긴 것이고
+    승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠)."""
+    n = str(name or "").strip().lower()
+    if not n:
+        return None, ""
+    lists = _confirm_lists()
+    for kind, names in (("confirm", lists["confirm"]), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
+        hit = [t for t in names if n == t or n.endswith("_" + t)]
+        if hit:
+            return kind, max(hit, key=len)
+    return None, ""
+
+
+def _confirm_canon(args) -> str:
+    """승인 · 중복 판정 열쇠의 인자 칸 — dict(JSON 글이면 풀어서)에서 값이 None · "" · [] · {} 인 칸을 재귀로 빼고 키 차례 JSON 으로 적는다.
+    못 읽는 글은 그대로 쓴다(같은 글일 때만 같다)."""
+    v = args
+    if isinstance(v, str):
+        try:
+            v = json.loads(v) if v.strip() else {}
+        except ValueError:
+            return v
+
+    def prune(x):
+        if isinstance(x, dict):
+            out = {}
+            for k, y in x.items():
+                y = prune(y)
+                if y is not None and y != "" and y != [] and y != {}:
+                    out[str(k)] = y
+            return out
+        return [prune(y) for y in x] if isinstance(x, (list, tuple)) else x
+    return json.dumps(prune({} if v is None else v), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _confirm_targets(args) -> list:
+    """'그 일을 글자로 불렀나' 에 견줄 인자 낱말 — 무엇 칸의 글 값(3 ~ 64자)과 파일 이름('/' 가 있고 확장자로 끝나는 글 값의 끝 조각). 맨 위 칸과
+    한 단계 아래 dict(params.tool 꼴 — JSON 글이면 풀어서)까지 본다."""
+    top = _arg_dict(args) or {}
+    out = []
+    for d in (top, *(x for x in (_arg_dict(v) for v in top.values()) if x)):
+        for k, v in d.items():
+            if not isinstance(v, str):
+                continue
+            s = v.strip()
+            if str(k).strip().lower() in _CONFIRM_WHAT_KEYS and 3 <= len(s) <= 64:
+                out.append(s)
+            if "/" in s and _CONFIRM_FILE_RE.search(s):
+                out.append(s.rstrip("/").rsplit("/", 1)[-1])
+    return out
+
+
+def _confirm_said(low: str, word) -> bool:
+    w = str(word or "").strip().lower()
+    return bool(w) and re.search(rf"(?<![a-z0-9_]){re.escape(w)}(?![a-z0-9_])", low) is not None
+
+
+def _confirm_ordered(ctx, kind: str, name, base: str, args) -> bool:
+    """이번 사람 말(원문)이 이 호출을 분명히 시켰나. write 는 질문 · 부정 없는 주문 동사면 되고, job 은 더해서 그 일을 글자로 불러야 한다 — 도구
+    이름(노출 · 맨 이름) · 무엇 칸 값 · 파일 이름 가운데 하나가 말에 있거나, 사람이 그 도구를 콕 집었다(pinned_tools — 앱 핀은 치지 않는다,
+    앱 하나에 잡이 여럿이다). confirm 은 늘 거짓이다."""
+    u = ctx.utterance
+    if kind not in ("job", "write") or not u or not _ORDER_RE.search(u) or _ASK_RE.search(u) or _NEG_RE.search(u):
+        return False
+    if kind == "write":
+        return True
+    if any(_named(name, [p]) or _named(p, [base]) for p in ctx.pinned):
+        return True
+    low = u.lower()
+    return any(_confirm_said(low, w) for w in (name, base, *_confirm_targets(args)))
+
+
+class _ConfirmCtx:
+    """한 챗 턴의 확인 맥락(_turn_confirm) — 값은 변하는 객체 하나라 도구 작업(복사된 문맥)과 턴이 같은 객체를 본다(_turn_ids 와 같은 길).
+    utterance — 주문 판정 글(이번 사람 말 원문, 카드의 답이면 빈 글 — 확인 답은 새 주문이 아니다) · pinned — 사람이 콕 집은 도구 ·
+    approved — 이번에 승인된 호출 {(맞은 이름, 정규 인자): 호출} · used — 이 턴에 이미 나간 호출의 열쇠 · pending — 막은 호출(턴 끝 카드에 실린다) ·
+    note — 이 턴의 안내에 붙일 글 · status — 턴 머리의 상태줄 · card — 본문 끝에 붙인 카드 글 · card_id — 승인된 카드 번호 · sent — 서버가 보낸 수."""
+    __slots__ = ("utterance", "pinned", "approved", "used", "pending", "note", "status", "card", "card_id", "sent")
+
+    def __init__(self, utterance: str = "", pinned=()):
+        self.utterance = utterance
+        self.pinned = frozenset(str(p).strip().lower() for p in pinned if str(p).strip())
+        self.approved, self.used, self.pending = {}, set(), []
+        self.note = self.status = self.card = self.card_id = ""
+        self.sent = 0
+
+
+def _confirm_reply(req) -> tuple | None:
+    """이번 말이 이력 끝 카드의 답인가 → ('approve' | 'decline', 카드 번호), 아니면 None. 확인은 바로 다음 말로만 한다 — 이력의 마지막 항목이 카드를
+    실은 어시스턴트 글일 때만 본다. 번호가 든 말(단추 글)은 그 카드의 번호여야 하고(지난 카드의 번호는 무시), 부정이거나 '취소' 로 시작하면 거절이다.
+    번호가 없으면 말 전체가 짧은 승인 · 거절 꼴일 때만이다. 저장분은 보지 않는다(순수) — chat() 과 _denied_feature 가 같은 판정으로 가른다
+    (design-integration C-10)."""
+    if not CHAT_CONFIRM_GATE:
+        return None
+    hist = req.history or []
+    last = hist[-1] if hist else None
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return None
+    ids = _CF_ID_RE.findall(str(last.get("content") or ""))
+    if not ids:
+        return None
+    msg = (req.message or "").strip()
+    if _CF_ID_RE.search(msg):
+        said = [i for i in _CF_ID_RE.findall(msg) if i in ids]
+        if not said:
+            return None
+        return ("decline" if _NEG_RE.search(msg) or msg.startswith("취소") else "approve"), said[0]
+    if _DECLINE_RE.match(msg):
+        return "decline", ids[-1]
+    if msg and len(msg) <= 30 and _AFFIRM_RE.match(msg) and not _NEG_RE.search(msg):
+        return "approve", ids[-1]
+    return None
+
+
+def _confirm_take(cid: str, req) -> dict | None:
+    """저장분을 꺼낸다(한 번만) — 번호 · 사용자 · 대화가 맞고 기한 안일 때. 다른 사람 · 다른 대화의 답은 꺼내지 않는다(그 카드는 주인에게 남는다)."""
+    user, conv = (req.user_email or "").strip().lower(), (req.conversation_id or "").strip()
+    with _CONFIRM_LOCK:
+        card = _CONFIRM_PENDING.get(cid)
+        if card is None or card["user"] != user or card["conv"] != conv:
+            return None
+        del _CONFIRM_PENDING[cid]
+    return card if card["exp"] > time.time() else None
+
+
+def _confirm_ctx(req) -> _ConfirmCtx:
+    """이 턴의 확인 맥락. 앞 카드의 답이면 저장분을 꺼내(나란한 두 요청이 같은 카드를 승인해도 한쪽만 — 꺼내기에 await 가 없다) 승인 · 거절을 정한다.
+    승인이면 그 카드의 호출이 approved 에 든다(메시지를 짓기 전에 서버가 보낸다 — _confirm_send). 거절이면 이 턴의 안내에 그 사실을 싣는다."""
+    ctx = _ConfirmCtx(req.message or "", req.pinned_tools or [])
+    reply = _confirm_reply(req)
+    if reply is None:
+        return ctx
+    verdict, cid = reply
+    ctx.utterance = ""
+    card = _confirm_take(cid, req)
+    if card is None:
+        _confirm_count("unknown_reply")
+        ctx.status = (f"확인 번호를 찾지 못했다({_CONFIRM_TTL_S // 60}분이 지났거나 서버가 다시 떴다) — 필요하면 다시 확인 카드가 뜬다")
+        print(f"[confirm] 답한 카드 {cid} 를 찾지 못했다(기한 · 재기동 · 다른 사람 · 다른 대화)", flush=True)
+        return ctx
+    if verdict == "decline":
+        _confirm_count("declined")
+        ctx.status = f"확인 카드 {cid} 거절 — 그 호출은 보내지 않습니다"
+        ctx.note = f"[확인 카드 {cid} 거절 — 사용자가 그 호출을 원하지 않는다. 같은 호출을 다시 하지 마라]"
+        print(f"[confirm] 거절 {cid}", flush=True)
+        return ctx
+    _confirm_count("approved")
+    ctx.card_id = cid
+    ctx.approved = {(c["base"], c["canon"]): c for c in card["calls"]}
+    ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다"
+    return ctx
+
+
+def _confirm_schema_limits(tool) -> dict:
+    """도구 스키마의 time_limit(Slurm 시간 상한) · wait_sec(결과까지 기다리는 상한) 기본값 — 카드의 예상 작업량에 싣는다."""
+    sc = getattr(tool, "args_schema", None)
+    props = sc.get("properties") if isinstance(sc, dict) else None
+    if not isinstance(props, dict):
+        return {}
+    return {k: props[k]["default"] for k in ("time_limit", "wait_sec")
+            if isinstance(props.get(k), dict) and props[k].get("default") not in (None, "")}
+
+
+def _confirm_refusal(name, kind: str, again: bool) -> str:
+    why = ("되돌리기 어려운 작업이라 사람의 확인 전에는 보내지 않는다" if kind == "confirm" else
+           "이 턴에 같은 호출을 이미 보냈다 — 다시 보내면 하나 더 선다" if again else
+           "사용자가 이번 말로 시킨 작업이 아니라 보내지 않았다")
+    return (f"{_TOOL_FAIL_MARK} 도구 {str(name)[:80]} 호출 보류: {_CONFIRM_MARK} — {why}. 서버가 사용자에게 확인 카드를 띄운다.\n"
+            "이번 턴에는 이 도구를 다시 부르지 말고(인자를 바꿔도 같다) 무엇을 왜 하려 했는지 한 줄로 말하고 끝내라. 인자 문제가 아니다.")
+
+
+def _confirm_held_text(txt) -> bool:
+    """도구 결과가 확인 관문이 막은 글인가 — 머리만 본다(_result_ok 와 같은 까닭 — 뒤쪽의 같은 글귀는 남의 것이다)."""
+    head = txt.lstrip()[:200] if isinstance(txt, str) else ""
+    return head.startswith(_TOOL_FAIL_MARK) and f"호출 보류: {_CONFIRM_MARK}" in head
+
+
+def _confirm_gate(tool, a, kw) -> str | None:
+    """G5 — 이번 사람 말이 시키지 않은 잡 · 쓰기와 되돌리기 어려운 호출은 보내지 않고 모델에게 돌려줄 글을 낸다(통과면 None). 판정은 노출 이름이고
+    invoke_tool 이면 안쪽 이름 · 안쪽 인자다. 승인된 호출(서버가 보낸다)과 주문으로 통과한 호출은 이 턴에 한 번만 간다 — 같은 열쇠가 다시 오면 카드다
+    (예외 뒤 자동 재시도가 그래프를 다시 돌려도 이미 보낸 잡을 또 걸지 않는다). 판정 · 표시는 await 없이 한 번에 한다(나란한 호출도 한 이벤트 루프라
+    경합이 없다). 열쇠는 모델이 준 인자(챗 인자 기본값 앞)로 잰다."""
+    ctx = _turn_confirm.get()
+    if ctx is None or not CHAT_CONFIRM_GATE:
+        return None
+    via = getattr(tool, "name", "") == "invoke_tool"
+    args = kw if kw else next((x for x in a if isinstance(x, dict)), kw)
+    name, targs = (args.get("name"), args.get("arguments")) if via else (getattr(tool, "name", ""), args)
+    kind, base = _confirm_class(name)
+    if kind is None:
+        return None
+    key = (base, _confirm_canon(targs))
+    if key in ctx.approved and key not in ctx.used:
+        ctx.used.add(key)
+        return None
+    if key not in ctx.used and _confirm_ordered(ctx, kind, name, base, targs):
+        ctx.used.add(key)
+        _confirm_count("ordered")
+        print(f"[confirm] 주문 통과 {str(name)[:80]}", flush=True)
+        return None
+    again = key in ctx.used
+    if not any((c["base"], c["canon"]) == key for c in ctx.pending):
+        try:
+            kept = copy.deepcopy(targs)
+        except Exception:  # noqa: BLE001 — 복사 못 하는 값은 그대로 쥔다
+            kept = targs
+        ctx.pending.append({"name": str(name), "via": via, "base": base, "kind": kind, "args": kept, "canon": key[1],
+                            "again": again, "limits": {} if via else _confirm_schema_limits(tool)})
+    return _confirm_refusal(name, kind, again)
+
+
+def _confirm_store(req, calls: list) -> tuple:
+    """막은 호출을 카드로 둔다 → (번호, 기한) — 번호는 추측할 수 없다(secrets). 같은 사용자 · 대화의 옛 카드와 기한이 지난 것은 지우고, 상한을 넘으면
+    오래된 것부터 버린다. 프로세스 하나(uvicorn 단일 — 루틴 레지스트리와 같은 전제)라 메모리로 충분하다 — 재기동하면 사라지고 그때 답은 '찾지
+    못했다' 다(닫힌 쪽)."""
+    user, conv = (req.user_email or "").strip().lower(), (req.conversation_id or "").strip()
+    now = time.time()
+    cid = "cf-" + secrets.token_hex(6)
+    with _CONFIRM_LOCK:
+        for k in [k for k, v in _CONFIRM_PENDING.items() if (v["user"], v["conv"]) == (user, conv) or v["exp"] <= now]:
+            del _CONFIRM_PENDING[k]
+        _CONFIRM_PENDING[cid] = {"user": user, "conv": conv, "exp": now + _CONFIRM_TTL_S, "at": now, "calls": calls}
+        while len(_CONFIRM_PENDING) > _CONFIRM_MAX:
+            _CONFIRM_PENDING.popitem(last=False)
+    return cid, now + _CONFIRM_TTL_S
+
+
+def _confirm_args_text(args) -> str:
+    """카드에 보이는 인자 — 정규 인자의 맨 위 글 · 수 칸은 k=v, 한 단계 아래 dict 는 k.sub=v, 목록은 k=[N개]. 값은 60자, 줄은 300자에서 자른다
+    (전체 인자는 저장분에 있다)."""
+    canon = _confirm_canon(args)
+    try:
+        d = json.loads(canon)
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        s = canon
+    else:
+        def val(v) -> str:
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, list):
+                return f"[{len(v)}개]"
+            if isinstance(v, dict):
+                return f"{{{len(v)}칸}}"
+            return str(v) if len(str(v)) <= 60 else str(v)[:60] + "…"
+        parts: list = []
+        for k, v in d.items():
+            parts += [f"{k}.{sk}={val(sv)}" for sk, sv in v.items()] if isinstance(v, dict) else [f"{k}={val(v)}"]
+        s = " · ".join(parts)
+    return s if len(s) <= 300 else s[:300] + "…"
+
+
+def _confirm_limit_hint(args, limits) -> str:
+    """인자 · 스키마 기본값의 time_limit · wait_sec 한 줄(없으면 빈 글)."""
+    d = _arg_dict(args) or {}
+    for k, fmt in (("time_limit", "Slurm 시간 상한 {}"), ("wait_sec", "결과까지 최대 {}초 기다린다")):
+        v, tag = d.get(k), ""
+        if v in (None, ""):
+            v, tag = (limits or {}).get(k), "(기본값)"
+        if v not in (None, ""):
+            return fmt.format(v) + tag
+    return ""
+
+
+def _confirm_sf_job(c: dict) -> bool:
+    """StepForge 의 run_job 인가 — 접두 별칭이거나 /tools-map 이 그 이름을 StepForge 앱으로 적었다."""
+    n = str(c["name"]).strip().lower()
+    return c["base"] == "run_job" and (n.startswith("heaxstep_forge_")
+                                       or (_TOOLS_MAP_CACHE.get("map") or {}).get(c["name"]) == "heax-step_forge")
+
+
+def _confirm_estimate_text(d) -> str:
+    """StepForge estimate_cost 의 답 → 카드 한 줄. 근거(cost_basis)와 '하한일 수 있다' 를 늘 함께 적는다(ST-12 — 60초 예상이 1,812초였다).
+    잡의 판정(gateway_verdict)은 async_job 이라 넘침 판정(over · may_exceed)만 싣는다."""
+    if not isinstance(d, dict) or not d:
+        return "예상 작업량을 읽지 못했다"
+
+    def num(x) -> str:
+        return f"{x:,.0f}" if abs(x) >= 10 else f"{x:g}"
+
+    def isnum(x) -> bool:
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+    exp, lo, hi = d.get("expected_s"), d.get("low_s"), d.get("high_s")
+    if isnum(exp):
+        rng = f"{num(lo)} ~ {num(hi)}초 · " if isnum(lo) and isnum(hi) else ""
+        s = f"약 {num(exp)}초({rng}근거 {d.get('cost_basis') or '모름'}) — 추정이며 하한일 수 있다"
+    else:
+        s = "예상 시간 없음 — " + _cut_mark(str(d.get("basis_note") or "근거가 없다").strip(), 160)
+    if d.get("gateway_verdict") in ("over", "may_exceed"):
+        s += f" · 판정 {d['gateway_verdict']}"
+    if isinstance(d.get("advice"), str) and d["advice"].strip():
+        s += " · " + _cut_mark(d["advice"].strip(), 160)
+    return s
+
+
+async def _confirm_sf_estimate(tmap: dict, c: dict) -> str:
+    """StepForge run_job 의 시작 전 작업량 — 읽기 도구 estimate_cost(project_id, job, args)를 접두 별칭으로 invoke_tool 로 묻는다(다른 앱에 같은
+    이름이 붙은 박스에서도 StepForge 것에 닿는다 — 게이트웨이는 별칭을 늘 받는다)."""
+    a = _arg_dict(c["args"]) or {}
+    pid, kind = a.get("project_id"), a.get("kind")
+    if not pid or not kind:
+        return "예상 작업량을 묻지 못했다(과제 · 잡 종류가 인자에 없다)"
+    out = await _call(tmap, "invoke_tool", {"name": "heaxstep_forge_estimate_cost",
+                                             "arguments": {"project_id": pid, "job": kind, "args": _arg_dict(a.get("params")) or {}}})
+    txt = "" if out is None else str(out)
+    if not txt or not _result_ok(txt):
+        return "예상 작업량을 받지 못했다" + (f" — {_tool_preview(txt, 120)}" if txt else "(invoke_tool 이 없다)")
+    try:
+        return _confirm_estimate_text(_first_dict(_parse_json(txt)))
+    except Exception:  # noqa: BLE001 — 읽지 못한 답이 카드를 막지 않는다
+        return "예상 작업량을 읽지 못했다"
+
+
+def _confirm_workload_local(calls: list) -> list:
+    """카드에 싣는 예상 작업량(잡 부류) — 잡을 거는 호출의 응답은 시작 **뒤**에 오므로, 시작 전에 알 수 있는 둘만 싣는다. (가) StepForge run_job 은
+    estimate_cost 를 묻고(_confirm_workload), (나) 인자 · 스키마 기본값의 time_limit · wait_sec 은 여기서 싣는다. 나머지는 '미리 알려 주지 않는다'
+    다. 묻지 않고 알 수 있는 것은 채우고, 도구 목록이 필요한 호출(StepForge 견적 · invoke_tool 의 안쪽 도구 스키마)을 돌려준다."""
+    need = []
+    for c in calls:
+        hint = "" if _confirm_sf_job(c) else _confirm_limit_hint(c["args"], c.get("limits"))
+        if hint:
+            c["workload"] = hint
+        elif _confirm_sf_job(c) or c["via"]:
+            need.append(c)
+        else:
+            c["workload"] = "이 도구는 작업량을 미리 알려 주지 않는다"
+    return need
+
+
+async def _confirm_workload(app_, req, calls: list) -> None:
+    """도구 목록이 필요한 예상 작업량을 묻는다 — StepForge estimate_cost(StepForge 답 10-30 — 칸 expected_s · cost_basis · gateway_verdict · basis_note
+    · advice)와 invoke_tool 로 부른 도구의 스키마 기본값. 목록 받기 + 묻기 전체를 _CONFIRM_WORKLOAD_S 초로 묶는다 — 넘거나 실패하면 그렇게 적고
+    카드는 그대로 선다. 읽기라 자격은 기본값이다(design-integration C-11)."""
+    async def probe():
+        tmap = await _tools_by_name(app_, req.groups, user=req.user_email, user_pat=req.user_pat)
+        for c in calls:
+            c["workload"] = (await _confirm_sf_estimate(tmap, c) if _confirm_sf_job(c)
+                             else _confirm_limit_hint(c["args"], _confirm_schema_limits(tmap.get(c["name"])))
+                             or "이 도구는 작업량을 미리 알려 주지 않는다")
+    miss = ""
+    try:
+        await asyncio.wait_for(probe(), _CONFIRM_WORKLOAD_S)
+    except asyncio.TimeoutError:
+        miss = f"예상 작업량을 {_CONFIRM_WORKLOAD_S:g}초 안에 받지 못했다"
+    except Exception as exc:  # noqa: BLE001 — 묻기가 실패해도 카드는 선다
+        miss = f"예상 작업량을 받지 못했다({type(exc).__name__})"
+    if miss:
+        print(f"[confirm] {miss}", flush=True)
+        for c in calls:
+            if not c.get("workload"):
+                c["workload"] = miss
+
+
+def _confirm_card_text(cid: str, calls: list) -> str:
+    """본문 끝의 결정적 카드 글 — 다른 기기 · 서버 사본 · 단추 없는 화면에서도 글로 확인할 수 있고, 그 안의 번호가 다음 턴 이력으로 돌아와 승인을
+    잇는다. 끝이 확인 번호라 끊긴 턴 표지(_INTERRUPTED_RE)에 걸리지 않는다."""
+    kinds = {c["kind"] for c in calls}
+    head = ("되돌리기 어려운 작업이라 보내기 전에 확인합니다." if kinds == {"confirm"} else
+            "이번 말로 시키지 않은 작업이라 보내지 않았습니다." if "confirm" not in kinds else
+            "이번 말로 시키지 않았거나 되돌리기 어려운 작업이라 보내지 않았습니다.")
+    lines = ["\n\n---", f"**확인이 필요합니다** — {head}"]
+    for i, c in enumerate(calls, start=1):
+        s = f"{i}. " + (f"{c['app']} " if c.get("app") else "") + f"`{c['name']}`" + (f" · {c['args_text']}" if c.get("args_text") else "")
+        if c.get("workload"):
+            s += f" — 예상 작업량: {c['workload']}"
+        if c.get("again"):
+            s += " (이 턴에 같은 호출을 이미 보냈다 — 다시 보내면 하나 더 선다)"
+        lines.append(s)
+    lines.append(f"실행하려면 **실행** 을 누르거나 '실행' 이라고 답하세요. 다른 말을 하면 보내지 않습니다. "
+                 f"(확인 번호 `{cid}` · {_CONFIRM_TTL_S // 60}분)")
+    return "\n".join(lines)
+
+
+async def _confirm_card(app_, req, ctx):
+    """턴 끝의 확인 카드 — 막은 호출의 예상 작업량을 묻고(잡 부류만) 서버 메모리에 둔 뒤 SSE confirm 사건을 낸다. 본문 끝에 붙일 글은 ctx.card 에
+    둔다(답 본문은 다음 턴 이력으로 돌아온다 — meta 는 이력에 실리지 않는다). 화면 단추는 사건의 approve_text · decline_text 를 그대로 보낸다(꼴이
+    두 리포에 두 벌로 생기지 않는다)."""
+    calls = ctx.pending
+    for c in calls:
+        c["app"] = _app_label_cached(c["name"])
+        c["args_text"] = _confirm_args_text(c["args"])
+    need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
+    if need:
+        yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
+        await _confirm_workload(app_, req, need)
+    cid, exp = _confirm_store(req, calls)
+    ctx.card = _confirm_card_text(cid, calls)
+    _confirm_count("cards")
+    _confirm_count("held_calls", len(calls))
+    print(f"[confirm] 카드 {cid} — " + ", ".join(f"{c['name']}({c['kind']})" for c in calls)[:300], flush=True)
+    yield _sse("confirm", {"id": cid, "expires_at": int(exp * 1000),
+                           "calls": [{"tool": c["name"], **({"app": c["app"]} if c.get("app") else {}), "kind": c["kind"],
+                                      "args_text": c["args_text"], **({"workload": c["workload"]} if c.get("workload") else {}),
+                                      "again": bool(c.get("again"))} for c in calls],
+                           "approve_text": f"실행 — 확인 번호 {cid}", "decline_text": f"취소 — 확인 번호 {cid} 는 실행하지 않음"})
+
+
+def _confirm_with_defaults(name, targs):
+    """승인 실행이 보낼 인자 — 챗 인자 기본값(_CHAT_ARG_DEFAULTS)을 처음 호출 때처럼 더한다(준 값이 이긴다, design-integration C-12). 승인 실행은
+    챗 래퍼가 아닌 도구로 나가 G6 을 타지 않는다 — 표가 잡 도구로 늘어도 처음 호출과 같은 꼴이 나가게."""
+    own = _arg_defaults_for(name, _CHAT_ARG_DEFAULTS)
+    if not own:
+        return targs
+    if isinstance(targs, str):
+        d = _arg_dict(targs or "{}")
+        return json.dumps({**own[0], **d}, ensure_ascii=False) if d is not None else targs
+    return {**own[0], **(targs or {})} if targs is None or isinstance(targs, dict) else targs
+
+
+async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
+    """승인된 카드의 호출을 서버가 보낸다 — 카드에 적힌 차례대로 처음 부른 꼴 그대로 한 번(invoke_tool 이면 invoke_tool 로 — 게이트웨이의 파괴 ·
+    제어 이름 거절은 그대로 걸린다). 이 호출도 래퍼를 지나고(G1 ~ G4 를 다시 지난다 — 승인은 '사람이 시켰다' 이지 'id 가 맞다' 가 아니다) G5 는
+    승인 열쇠로 통과한다. 사용자 자격만 쓴다 — svc_fallback=False(사람이 승인한 잡 · 쓰기가 말없이 서비스 계정으로 나가지 않는다, C-11). 결과는
+    이 턴의 안내(ctx.note)와 근거(turn_calls · turn_out)에 싣는다. 도구 목록을 못 받으면 그 호출을 다시 카드로 돌린다(턴 끝에 새 카드가 선다)."""
+    cid, calls = ctx.card_id, list(ctx.approved.values())
+    try:
+        tmap = await _tools_by_name(app_, req.groups, user=req.user_email, user_pat=req.user_pat, svc_fallback=False)
+    except Exception as exc:  # noqa: BLE001 — 사용자 자격 거절(넘김 없음이라 로드 실패가 그대로 온다) · 게이트웨이 불통
+        print(f"[confirm] 승인 {cid} — 도구 목록을 받지 못했다: {type(exc).__name__}: {exc}"[:300], flush=True)
+        tmap = {}
+    if not tmap:
+        ctx.approved = {}
+        ctx.pending.extend({**c, "again": False, "workload": "승인했지만 도구 목록을 받지 못해 보내지 못했다"} for c in calls)
+        ctx.note = (f"[확인 카드 {cid} 승인 — 그러나 서버가 도구 목록을 받지 못해(사용자 자격 거절이거나 게이트웨이 불통) 승인된 호출을 보내지 "
+                    "못했다. 그 호출을 다시 부르지 말고 사용자에게 보내지 못했다고 알려라 — 이 턴 끝에 확인 카드가 다시 뜬다]")
+        yield _sse("status", {"step": f"확인 카드 {cid} — 도구 목록을 받지 못해 승인된 호출을 보내지 못했습니다", "tool": None})
+        return
+    lines = []
+    for i, c in enumerate(calls, start=1):
+        name = c["name"]
+        targs = _confirm_with_defaults(name, c["args"])
+        via = c["via"] or name not in tmap        # 목록에서 없어진 직접 도구는 invoke_tool 로
+        ctx.approved[(c["base"], _confirm_canon(targs))] = c     # 기본값을 더한 꼴도 승인 열쇠로 — 관문은 보내는 인자로 잰다
+        call_id = f"{cid}-{i}"
+        shown = _arg_dict(targs) if isinstance(targs, str) else targs
+        detail = _tool_preview(targs if shown is None else shown)
+        yield _sse("status", {"step": f"도구 호출: {name}", "tool": name, **({"via": "invoke_tool"} if via else {}),
+                              "call": call_id, **({"detail": detail} if detail else {})})
+        t0 = time.monotonic()
+        out = await (_call(tmap, "invoke_tool", {"name": name, "arguments": targs}) if via else _call(tmap, name, targs))
+        ctx.used.add((c["base"], c["canon"]))
+        if out is None:
+            txt, ok = f"{_TOOL_FAIL_MARK} 도구 {name} 호출 실패: 이 서버의 도구 목록에 그 도구도 invoke_tool 도 없어 보내지 못했다", False
+        else:
+            txt = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, default=str)
+            ok = _result_ok(txt)
+            ctx.sent += 1
+            _confirm_count("executed")
+            turn_calls.append((name, detail or ""))
+            _turn_out_add(turn_out, txt)
+        prev, hand = _tool_preview(txt), _handoff_text(txt)
+        yield _sse("status", {"step": f"도구 완료: {name}", "tool": name, **({"via": "invoke_tool"} if via else {}), "ok": ok,
+                              "ts": int(time.time() * 1000), "ms": round((time.monotonic() - t0) * 1000), "call": call_id,
+                              **({"result_preview": prev} if prev else {}), **({"result_full": hand} if len(hand) > len(prev) else {})})
+        lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → {_cut_mark(txt, 6000)}")
+    print(f"[confirm] 승인 {cid} — {ctx.sent}건 보냄", flush=True)
+    ctx.note = (f"[확인 카드 {cid} 승인 — 서버가 사람의 승인으로 이 호출을 보냈다]\n" + "\n".join(lines)
+                + "\n이 호출을 다시 하지 마라(같은 잡이 하나 더 선다). 결과(잡 id · 상태)를 사용자에게 알리고, 잡이면 상태 조회 도구로 진행을 볼 수 있다.")
+
+
+def _confirm_strip(text: str, card) -> str:
+    """수 대조(근거 블록의 '출처 없는 수')에 쓸 답 — 카드 글을 뗀다. 카드의 예상 작업량('약 1,812초')은 조회 결과가 아니다(design-integration C-14)."""
+    return text.replace(card, "") if card else text
+
+
+async def _confirm_events(events):
+    """챗 흐름을 그대로 흘린다 — 막은 호출(확인 대기)이 생긴 뒤 흐름이 오류로 끝나면(재귀 한도 등이 끊기와 겹쳤다) 삼키고 끝낸다. 턴의 except 로
+    가면 자동 재시도가 그래프를 처음부터 다시 돌려 카드 대신 재시도 · 오류 문구로 끝난다."""
+    try:
+        async for ev in events:
+            yield ev
+    except Exception as exc:  # noqa: BLE001
+        ctx = _turn_confirm.get()
+        if ctx is None or not ctx.pending:
+            raise
+        print(f"[confirm] 막은 호출이 있는 턴의 흐름 오류 — 재시도 대신 카드로 끝낸다: {type(exc).__name__}: {exc}"[:300], flush=True)
+    finally:
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+async def _confirm_close(events) -> None:
+    """끊은 흐름을 닫는다 — 막 시작한 모델 호출은 langgraph 의 취소로 접힌다. 닫다가 난 예외는 로그 한 줄로 삼킨다(턴의 except 로 가면 자동 재시도가
+    그래프를 다시 돈다)."""
+    try:
+        await events.aclose()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[confirm] 끊은 흐름을 닫다가 오류 — 무시하고 카드로 끝낸다: {type(exc).__name__}: {exc}"[:300], flush=True)
+
+
+def _confirm_health() -> dict:
+    """/health 의 confirm_gate — 켜짐 · 목록(읽었나 · 까닭 · 부류별 수 — 접두를 뗀 꼴 포함) · 살아 있는 카드 수 · 기동 뒤 셈. 경로는 싣지 않는다(박스
+    배치가 드러난다 — core_vocab 과 같은 까닭). lists.loaded 가 거짓이면 바닥 목록만 돈다(형제 리포 경로부터 본다)."""
+    lists = _confirm_lists()
+    now = time.time()
+    with _CONFIRM_LOCK:
+        pending = sum(1 for v in _CONFIRM_PENDING.values() if v["exp"] > now)
+        counts = {k: _CONFIRM_STAT.get(k, 0) for k in _CONFIRM_COUNT_KEYS}
+    return {"on": CHAT_CONFIRM_GATE,
+            "lists": {"loaded": lists["error"] is None, "error": lists["error"], "jobs": len(_CONFIRM_JOB_TOOLS),
+                      "writes": len(lists["writes"]), "confirm": len(lists["confirm"])},
+            "pending": pending, "counts": counts}
 
 
 async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
@@ -5015,7 +5631,11 @@ async def _self_checked_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
         return
     calls, outputs = box.get("calls") or [], box.get("outputs") or []
     t0 = time.monotonic()
-    if _self_check_skip(req, draft, calls):
+    if box.get("confirm"):
+        # 확인 카드로 멈춘 턴(HA-29) — 검토자를 부르지 않는다(카드 글 · 번호를 고치지 못하게). 앞서 조회한 도구가 있어도 같다(_self_check_skip
+        # 만으로는 검토가 돈다).
+        final, check, vmodel = draft, {"status": "skipped", "reason": "확인 카드로 멈춘 턴 — 검증할 답이 없다"}, None
+    elif _self_check_skip(req, draft, calls):
         final, check, vmodel = draft, {"status": "skipped", "reason": "근거(조회 · 붙인 문서 · 그림)도 수치도 없는 짧은 답"}, None
     else:
         yield _sse("status", {"step": "답을 검증하는 중 — 질문 · 근거 · 수치를 대조합니다", "tool": None})
@@ -5034,7 +5654,8 @@ async def _self_checked_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
     text = final
     if calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0":
         try:
-            _bad = _unsourced_numbers(final, "\n".join(outputs) + "\n" + (req.message or ""), limit=0)
+            _bad = _unsourced_numbers(_confirm_strip(final, box.get("confirm")), "\n".join(outputs) + "\n" + (req.message or ""),
+                                      limit=0)   # 카드 글(예상 작업량)은 수 대조에서 뺀다(C-14)
             _ev = _evidence_block(calls, _bad)
             if _ev:
                 text += _ev
@@ -5205,6 +5826,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     # ── 10-30 턴 상태 자리 — 재촉 → 이어하기가 req.message 를 바꾸기 전에 건다(HA-30 · HA-28 · HA-29 · HA-27, design-integration 3절)
     _turn_hub_ids.set({} if _XHUB_GATE else None)          # HA-30 — 턴마다 새로(앞 턴에 배운 것은 남지 않는다)
     _turn_status_wait.set(_status_wait_mod.new_turn() if _status_wait_mod.on() else None)       # HA-28
+    _turn_confirm.set(_confirm_ctx(req) if CHAT_CONFIRM_GATE else None)   # HA-29 — 주문 판정은 원문을 본다 · 앞 카드의 승인 · 거절도 여기서 가린다
+    _cctx = _turn_confirm.get() or _ConfirmCtx()     # 관문이 꺼져 있으면 빈 맥락(막지도 보내지도 않는다)
+    for _c in _cctx.approved.values():
+        _seed_ids |= _int_tokens(_c["args"])          # 승인된 인자의 정수는 사람이 카드에서 본 값이다 — 유령 ID 관문의 출처로
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
     # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
@@ -5218,6 +5843,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 + (f"\n[끊긴 지점까지 나온 내용]\n{_resume_part(_part)}" if _part else ""))})
             print(f"[agent] nudge→resume: {_orig[:60]!r}")
     yield _sse("status", {"step": "분석 중", "tool": None})
+    if _cctx.status:
+        yield _sse("status", {"step": _cctx.status, "tool": None})     # 확인 카드의 승인 · 거절 · 찾지 못함(HA-29)
     try:
         # 지정 전문가 — 역할·운영 설정을 도구 선별보다 먼저 읽는다. HE팀 운영자는 자기 앱 도구를
         # 묶어야 해서 _agent_for 전에 알아야 한다(예전엔 역할 문구만 붙고 그 앱 도구는 따라오지 않아,
@@ -5515,13 +6142,21 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         _user_msg, _recap = await _turn_image_messages(app, req, _turn_vision)
         async for _ev in _drain_image_events(_turn_image_events):
             yield _ev
+        # 확인 카드(HA-29) — 앞 카드를 승인했으면 서버가 그 호출을 처음 꼴 그대로 한 번 보낸다(모델 재현에 기대지 않는다 — 칸 하나 차이로 카드가
+        # 되풀이되거나 아예 안 불러 단추가 헛돈다). 승인 · 거절의 결과는 이 턴의 안내로 싣는다.
+        if _cctx.approved:
+            async for _ev in _confirm_send(app, req, _cctx, turn_calls, turn_out):
+                yield _ev
+        if _cctx.note:
+            turn_notes += "\n\n" + _cctx.note
         messages = _turn_msgs(sys_prompt, turn_notes, _hist_msgs, _recap, _user_msg)
         inputs = {"messages": messages}
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
         # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
-        # blocked: 유령 ID · 다른 허브 id 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
-        _budget = {"calls": 0, "blocked": 0, "seen": {}}
+        # blocked: 유령 ID · 다른 허브 id 게이트 · 확인 관문이 실행을 막은 호출 수 — 실효 호출 수에서 뺀다. calls 는 서버가 승인으로 보낸 수부터 센다 — 안 세면
+        # 모델이 결과만 알리고 끝난 턴이 '도구 0회' 로 읽혀 강제 재시도 · 확정 종결이 돈다.
+        _budget = {"calls": _cctx.sent, "blocked": 0, "seen": {}}
         _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT,
                 # 도구 그림을 그 결과 뒤에 실을지 — 프롬프트 갈고리(_loop_fit_prompt)가 읽는다(문맥 변수는 LangGraph 실행 맥락을 넘지 못한다).
@@ -5531,9 +6166,16 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 챗 전용 LLM 은 스트리밍인데 넘겨받은 VLLM_* 가 비스트리밍(GLM 우회)이면, 종전처럼 서버 전체 값(llm_nostream) 하나만
         # 보면 넘겨받은 답의 글이 화면에 안 나갔다(docs/chat-llm-stcx).
         _streamed_runs: set = set()
-        async for event in _timed_events(agent.astream_events(inputs, version="v2", config=_cfg)):
+        # 확인 관문(HA-29)이 이 턴의 호출을 막았나 — 막았으면 그 단계(나란한 도구)가 끝난 뒤 다음 모델 호출 앞에서 흐름을 끊는다. 모델이 '걸었다' 고
+        # 지어내거나 다른 잡을 이어 거는 길을 닫는다. 막은 호출은 조회한 것으로 남기지 않는다(호출 → turn_calls 의 그 항목).
+        _hold = False
+        _held_at: dict = {}
+        _evs = _confirm_events(_timed_events(agent.astream_events(inputs, version="v2", config=_cfg)))
+        async for event in _evs:
             kind = event["event"]
             if kind == "on_chat_model_start":
+                if _hold:
+                    break
                 # 이 턴의 호출마다 답한 모델 — 넘김(챗 서버 → VLLM_*)이 일어나면 같은 질문에 답의 깊이가 달라지므로 메시지마다 보인다(C3).
                 _mn = str((event.get("metadata") or {}).get("ls_model_name") or event.get("name") or "?")
                 _turn_models[_mn] = _turn_models.get(_mn, 0) + 1
@@ -5609,6 +6251,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # 두는 것과 같은 이유이고 같은 상한을 쓴다. 표시용보다 길 때만 싣는다.
                 _args_full = _handoff_text(_in)
                 turn_calls.append((_tname or "?", args or ""))
+                if event.get("run_id"):
+                    _held_at[str(event["run_id"])] = turn_calls[-1]
                 # `run_id` 는 **같은 호출의 시작·완료에 같은 값**으로 온다. 이게 없어서
                 # 인자와 결과를 짝지을 수 없었고, 화면은 도구 **이름**으로 묶어 같은 도구
                 # N번 호출이 한 줄로 합쳐졌다(§5-5 predict_sed 다섯 번).
@@ -5623,6 +6267,23 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # 넘지 못해(실측 빈 값) 스트림 쪽에서 직접 회수한다.
                 _raw = event.get("data", {}).get("output")
                 _txt = getattr(_raw, "content", _raw)
+                if _confirm_held_text(_txt):
+                    # 확인 관문(HA-29)이 막은 호출 — 보내지 않았다. '도구를 썼다' 로 세지 않고(blocked), 근거 블록 · 자기검증 · 다음 턴 출처에
+                    # '조회한 것' 으로 남기지 않는다(turn_calls 에서 빼고 turn_out 에 넣지 않는다). '도구 완료' 대신 '확인 대기' 로 알린다 —
+                    # 화면에 '도는 중' 으로 남지 않게. 카드는 턴 끝에 선다.
+                    _budget["blocked"] += 1
+                    _hold = True
+                    _cidh = str(event.get("run_id") or "")
+                    _t0_by_call.pop(_cidh, None)
+                    _hc = _held_at.pop(_cidh, None)
+                    if _hc in turn_calls:
+                        turn_calls.remove(_hc)
+                    _tnh, _ivh = _inner_tool(str(event.get("name") or ""), (event.get("data") or {}).get("input"))
+                    yield _sse("status", {"step": f"확인 대기: {_tnh} — 사람의 확인 전에는 보내지 않습니다", "tool": _tnh,
+                                          **({"via": "invoke_tool"} if _ivh is not None else {}), "ok": False,
+                                          "ts": int(time.time() * 1000), **({"call": _cidh} if _cidh else {}),
+                                          "result_preview": _tool_preview(_raw)})
+                    continue
                 if isinstance(_txt, str):
                     # 수치 대조용 원문 적재 — 좁은 창은 앞부분·총량을 묶고, 넓은 창은 모델이 본 그대로 싣는다(_turn_out_add).
                     _turn_out_add(turn_out, _txt)
@@ -5684,7 +6345,24 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                          if _t03 is not None else {}),
                                       **({"call": _cid3} if _cid3 else {}),
                                       "result_preview": _tool_preview(_emsg)})
+        if _hold:
+            await _confirm_close(_evs)      # 끊었다 — 막 시작한 모델 호출은 접힌다(같은 단계의 나란한 도구 결과는 이미 받았다)
     except Exception as exc:
+        if _cctx.pending:
+            # 막은 호출이 있는 턴(HA-29) — 자동 재시도 · 오류 문구 대신 카드로 끝낸다. 재시도는 그래프를 처음부터 다시 돌린다(흐름의 오류는
+            # _confirm_events 가 이미 삼킨다 — 여기는 그 밖에서 난 오류다). 근거 블록은 감싸개가 있으면 감싸개가 붙인다.
+            print(f"[confirm] 막은 호출이 있는 턴의 오류 — 재시도 대신 카드로 끝낸다: {exc!r}"[:300], flush=True)
+            text = "".join(full)
+            async for _fr in _confirm_card(app, req, _cctx):
+                yield _fr
+            text += _cctx.card
+            if box is not None:
+                box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), confirm=_cctx.card)
+            else:
+                yield _sse("token", {"delta": _cctx.card})
+            yield _sse("result", {"type": "text", "content": text})
+            yield _sse("done", {})
+            return
         # 상세는 서버 로그에만(내부 유출 방지). 단 AGENT_DEBUG_ERRORS=1 이면 예외 타입·메시지를
         # 브라우저 응답에도 실어 운영자가 바로 원인을 본다(기본 꺼짐 — 켜면 재시작 필요).
         print(f"[agent] chat error: {exc!r}")
@@ -5811,7 +6489,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _fabricated = _no_tool and _looks_fabricated_tool_result(text)
     # 자작 표/차트도 같은 취급 — _no_tool 이 앞에 있으므로 도구를 부른 뒤의 자작은 영향 없다.
     _own_chart = _no_tool and _drew_own_chart(req.message, text)
-    if _no_tool and (_announced_without_calling(text) or _fabricated or _own_chart):
+    # 아래 구제 길 넷(강제 재시도 · 확정 종결 · 새어 나온 호출 · 빈 답 구제)은 확인 관문이 막은 호출이 있으면 건너뛴다(HA-29) — 그 턴은 카드로
+    # 끝난다. 구제 길이 다시 부르면 막은 잡을 또 고르거나, 막은 것을 모델이 '걸었다' 로 요약한다.
+    if _no_tool and not _cctx.pending and (_announced_without_calling(text) or _fabricated or _own_chart):
         _why = "날조 표지" if _fabricated else ("자작 표·차트" if _own_chart else "예고만")
         print(f"[agent] 도구 미호출({_why}) — 강제 지시로 1회 재시도")
         yield _sse("status", {"step": "도구를 실제로 호출하도록 다시 시도합니다", "tool": None})
@@ -5847,7 +6527,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     # 사용자 요구(2026-08-05): 스트림이 애매하게 꺼지지 말 것 — 도구가 있는지 없는지 판별될
     # 때까지 진행해서, 있으면 코드가 직접 1회 호출해 결과로 답하고, 없으면 '없다'고 명시하고
     # 끝낸다. 어느 쪽이든 사용자는 결론을 받는다(누출 케이스는 아래 기존 경로가 처리).
-    if ((_budget["calls"] - _budget["blocked"]) <= 0
+    if ((_budget["calls"] - _budget["blocked"]) <= 0 and not _cctx.pending
             and (_announced_without_calling(text) or not text.strip())
             and not _looks_like_leaked_tool_call(text, _no_tool)):
         yield _sse("status", {"step": "도구 유무 확인 — 확정 종결 절차", "tool": None})
@@ -5894,26 +6574,30 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 except Exception as exc:  # noqa: BLE001
                     _out = f"{_TOOL_FAIL_MARK} (tool {_tn} error: {exc})"
                 _out = _cap(str(_out))
+                # 확인 관문(HA-29)이 이 직접 실행을 막았다 — 결과를 LLM 으로 요약하지 않는다(막은 글을 '걸었다' 로 읽는다). 카드가 턴 끝에 선다.
+                _held3 = _confirm_held_text(_out)
                 # ⚠ `except` 로는 못 잡는다 — `_call` 이 예외를 문자열로 삼켜 돌려준다.
                 # 문자열을 봐야 실패를 안다(그래서 위 try 에서 _ok 를 정하지 않는다).
                 _ok = _result_ok(_out)
                 _prev3, _hand3 = _tool_preview(_out), _handoff_text(_out)
-                yield _sse("status", {"step": f"도구 완료: {_tn}", "tool": _tn,
+                yield _sse("status", {"step": (f"확인 대기: {_tn} — 사람의 확인 전에는 보내지 않습니다" if _held3
+                                               else f"도구 완료: {_tn}"), "tool": _tn,
                                       "call": _cid, "ok": _ok,
                                       "result_preview": _prev3,
                                       # 핸드오프용 날것 — 종전엔 이 경로만 미리보기 220자뿐이었다
                                       **({"result_full": _hand3} if len(_hand3) > len(_prev3) else {})})
-                try:
-                    _final = (await _llm_text(
-                        _chat_llm_of(app),
-                        "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
-                        "호출하겠다고 말하지 말고, 아래 결과만으로 답하라. 결과가 오류라면 오류라고 "
-                        "명확히 알리고 다음 행동을 제안하라.",
-                        f"[사용자 질문]\n{req.message}\n\n[{_tn} 결과]\n{_out}")).strip()
-                except Exception:  # noqa: BLE001
-                    _final = f"[{_tn} 결과]\n{_out[:1500]}"
-                text = (text + "\n\n" + _final).strip()
-                yield _sse("token", {"delta": "\n\n" + _final})
+                if not _held3:
+                    try:
+                        _final = (await _llm_text(
+                            _chat_llm_of(app),
+                            "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
+                            "호출하겠다고 말하지 말고, 아래 결과만으로 답하라. 결과가 오류라면 오류라고 "
+                            "명확히 알리고 다음 행동을 제안하라.",
+                            f"[사용자 질문]\n{req.message}\n\n[{_tn} 결과]\n{_out}")).strip()
+                    except Exception:  # noqa: BLE001
+                        _final = f"[{_tn} 결과]\n{_out[:1500]}"
+                    text = (text + "\n\n" + _final).strip()
+                    yield _sse("token", {"delta": "\n\n" + _final})
         else:
             _near = ""
             if _tmap:
@@ -5926,7 +6610,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             text = (text + _close).strip()
             yield _sse("token", {"delta": _close})
 
-    if _looks_like_leaked_tool_call(text, _no_tool):
+    if not _cctx.pending and _looks_like_leaked_tool_call(text, _no_tool):
         print(f"[agent] tool-call leaked into text (도구 실행 {_budget['calls']}회) — 비스트리밍 재시도")
         yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})
         try:
@@ -5954,8 +6638,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
 
         # 재시도해도 여전히 누출이면 모델의 호출 능력에 기대지 않는다 — 새어 나온 호출을
         # 코드가 직접 실행하고 그 결과로 답을 만든다. 작은 모델에서도 도구가 '잡히게' 하는
-        # 마지막 방어선이다(모델이 구조화 호출을 영영 못 내도 사용자는 결과를 받는다).
-        if _looks_like_leaked_tool_call(text, _no_tool):
+        # 마지막 방어선이다(모델이 구조화 호출을 영영 못 내도 사용자는 결과를 받는다). 재시도 안에서 확인 관문이 막았으면 그 턴은 카드로 끝난다.
+        if not _cctx.pending and _looks_like_leaked_tool_call(text, _no_tool):
             calls = _extract_leaked_calls(text, _no_tool)
             if calls:
                 try:
@@ -5981,6 +6665,11 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                         r = await _call(_tmap, c["name"], c["arguments"])
                     except Exception as exc:  # noqa: BLE001
                         r = f"(tool {c['name']} error: {exc})"
+                    if _confirm_held_text(str(r)):
+                        # 확인 관문(HA-29)이 막았다 — 요약에 싣지 않는다(카드가 턴 끝에 선다)
+                        yield _sse("status", {"step": f"확인 대기: {c['name']} — 사람의 확인 전에는 보내지 않습니다", "tool": c["name"],
+                                              "ok": False})
+                        continue
                     results.append((c["name"], _cap(str(r))))
                 if results:
                     joined = "\n\n".join(f"[{n} 결과]\n{v}" for n, v in results)
@@ -6012,7 +6701,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     # "먼저 가이드와 템플릿을 확인하겠습니다" 하고 도구를 부른 뒤 결과를 받고도 아무 말 없이
     # 끝난다(실측 신고: 보고서 작성이 늘 그 문장에서 멈췄다). ②는 text 가 비어 있지 않아
     # 예전 조건을 그대로 통과했고, 사용자에겐 '중간에 끊긴 응답'으로 보였다.
-    if _needs_final_rescue(turn_calls, text, _post_tool_chars):
+    if not _cctx.pending and _needs_final_rescue(turn_calls, text, _post_tool_chars):
         _names = ", ".join(dict.fromkeys(n for n, _ in turn_calls))
         _excerpt = _rescue_excerpt(turn_out)
         _before = text   # 구제로 뭐라도 보탰는지 판정용(예고만 남은 턴은 text 가 비지 않는다)
@@ -6058,15 +6747,23 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             text = (text + _fallback) if text.strip() else _fallback
             yield _sse("token", {"delta": _fallback})
             print("[agent] empty-final retry 실패 — 원문 발췌로 대체")
+    if _cctx.pending:
+        # 확인 카드(HA-29) — 근거 블록 앞. 감싸개가 있는 길은 카드 글을 초안에만 넣는다(초안은 '생각' 칸으로 가 두 번 보이지 않는다 — 감싸개는
+        # 카드 턴을 검토하지 않고 초안을 본문으로 낸다).
+        async for _fr in _confirm_card(app, req, _cctx):
+            yield _fr
+        text += _cctx.card
+        if box is None:
+            yield _sse("token", {"delta": _cctx.card})
     if box is not None:
-        box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out))
+        box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), confirm=_cctx.card or None)
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
     # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.
     if turn_calls and os.environ.get("CHAT_EVIDENCE_BLOCK", "1") != "0" and box is None:
         try:
             _src = "\n".join(turn_out) + "\n" + (req.message or "")
-            _bad = _unsourced_numbers(text, _src, limit=0)   # 전부 센다 — 블록이 6건만 보이고 총 건수를 적는다
+            _bad = _unsourced_numbers(_confirm_strip(text, _cctx.card), _src, limit=0)   # 전부 센다 — 블록이 6건만 보이고 총 건수를 적는다 · 카드 글은 빼고(C-14)
             _ev = _evidence_block(turn_calls, _bad)
             if _ev:
                 text += _ev
@@ -6135,10 +6832,11 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # "/도구 <질의>" 또는 '도구 뭐 있어' 류 → 도구 카탈로그+추천을 SSE tools 이벤트로(결정적).
         # 프론트가 선택 UI 를 그리고, 고른 도구는 다음 발화부터 pinned_tools 로 우선 사용된다.
         stream = run_tool_search(app, strip_tool_trigger(req.message), req.groups)
-    elif is_thinking(req.message) or req.thinking:
+    elif (is_thinking(req.message) or req.thinking) and not _confirm_reply(req):
         # 띵킹 모드 — 답할 수 있는 전문가만 각자 답하고, 못 하는 좌석은 넘길 곳을 지목한다.
         # 명시 슬래시 트리거(/심의·/도구 등)보다 **뒤**에 둔다: 모드가 켜져 있어도 그 턴에
-        # 사용자가 대놓고 /심의 를 치면 그 의도가 이긴다.
+        # 사용자가 대놓고 /심의 를 치면 그 의도가 이긴다. 확인 카드의 답(단추 · '실행')은 일반 챗으로 간다 — 승인된 호출은 챗 턴이 보낸다
+        # (HA-29, 권한 판정 _denied_feature 도 같은 판정이다 — C-10).
         stream = run_thinking(app, strip_thinking_trigger(req.message), req.groups,
                               req.user_email, req.user_pat, req.history, req.documents)
     else:
@@ -7619,6 +8317,8 @@ def health() -> dict:
         "self_check": _sc_health(),
         # 챗 상태 기다림 — 켜짐 · 간격 · 턴 합 상한 · 기동 뒤 시작한 기다림 · 끝 · 상한 · 실패(꼴 바뀜 포함) 수(HWAXPortal docs/request-1030 HA-28)
         "status_wait": _status_wait_mod.health(),
+        # 확인 관문(HA-29) — 켜짐 · 운영자 목록을 읽었나(loaded 가 거짓이면 잡 시작 바닥 목록만 돈다 — 형제 리포 경로부터) · 살아 있는 카드 수 · 셈
+        "confirm_gate": _confirm_health(),
         # 다른 허브 id 막이 — 손잡이(CHAT_XHUB_ID_GATE)와 기동 뒤 막은 호출 수(HWAXPortal docs/request-1030 HA-30 · design-integration C-8). 재시험
         # OT-07 은 이 수와 로그의 '[gate] … 다른 허브 id' 줄을 함께 본다.
         "xhub_gate": _xhub_gate_health(),

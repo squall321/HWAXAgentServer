@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX)를 지우며, 챗 자기검증(CHAT_SELF_CHECK)을 끈다, 형제 포털 리포의 코어 어휘표는 시험마다 '없음' 으로 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections import OrderedDict
 
 import pytest
 
@@ -49,6 +50,11 @@ os.environ["CHAT_SELF_CHECK"] = "0"
 # tests/test_status_wait.py · HWAXPortal docs/request-1030 HA-28 · design-integration C-5).
 os.environ["CHAT_STATUS_WAIT_MAX_S"] = "0"
 
+# 확인 관문(CHAT_CONFIRM_GATE — 기본 켬, app 이 import 때 한 번 읽는다)도 같은 까닭으로 끈다 — 챗 턴 시험들이 잡 · 쓰기 꼴 도구 대역(run_job ·
+# submit_job …)을 부르고 호출 수 · 흘린 글을 센다. 관문을 보는 시험은 제 손으로 켠다(app.CHAT_CONFIRM_GATE — tests/test_confirm_gate.py ·
+# HWAXPortal docs/request-1030 design-integration C-5).
+os.environ["CHAT_CONFIRM_GATE"] = "0"
+
 
 @pytest.fixture(autouse=True)
 def _no_core_vocab(monkeypatch, tmp_path):
@@ -61,3 +67,15 @@ def _no_core_vocab(monkeypatch, tmp_path):
         # 박스 덧씌우기도 늘 '없음' — 실제 표를 읽는 시험에도 박스의 core_vocab.local.json 이 끼어들지 않게 한다(E-7 ②)
         monkeypatch.setattr(app_mod, "CORE_VOCAB_LOCAL_PATH", tmp_path / "no-core-vocab.local.json")
         monkeypatch.setattr(app_mod, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "overlay": None})
+
+
+@pytest.fixture(autouse=True)
+def _no_confirm_lists(monkeypatch, tmp_path):
+    """확인 관문의 운영자 정의(형제 포털 리포 infra/personas/he-team.json) 격리 — 기본은 '없음'(잡 시작 바닥 목록만)이다. 목록을 보는 시험은 본문에서
+    app.CONFIRM_LISTS_PATH 를 다시 건다(tests/test_confirm_gate.py). 안 걸면 포털 리포의 목록이 관문 판정을 바꾸고, 읽은 목록 · 카드 저장분은 모듈
+    상태라 앞 시험의 것이 뒤 시험에 남는다(코어 어휘표 _no_core_vocab 와 같은 꼴 — HWAXPortal docs/request-1030 design-integration C-5)."""
+    app_mod = sys.modules.get("app")
+    if app_mod is not None and hasattr(app_mod, "CONFIRM_LISTS_PATH"):
+        monkeypatch.setattr(app_mod, "CONFIRM_LISTS_PATH", tmp_path / "no-he-team.json")
+        monkeypatch.setattr(app_mod, "_CONFIRM_LISTS", {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "없음"})
+        monkeypatch.setattr(app_mod, "_CONFIRM_PENDING", OrderedDict())
