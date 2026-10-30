@@ -7759,6 +7759,10 @@ class VocPreviewRequest(BaseModel):
 
 
 _VOC_PREVIEW_MAX = int(os.environ.get("VOC_PREVIEW_MAX", "24"))
+# SignalForge 의 주의 줄 머리(SG-04 `ec40075`) — 해석한 제품 코드가 PLM 프로젝트 여럿에 걸리거나 질의가 다른 프로젝트를 짚으면 해석
+# notes 끝에 '주의 — <plm_caution.note>' 한 줄을 달고(shared/ontology.py interpret), search_voc 봉투의 notes 가 그 해석 notes 다
+# (mcp-server/server.py search_voc). 봉투에는 plm_caution 칸이 없고 이 줄뿐이다.
+_VOC_CAUTION = "주의 — "
 
 
 async def _voc_keywords(llm, message: str) -> list[str]:
@@ -7816,6 +7820,7 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
     per_kw: list[list[dict]] = []
     failed = 0
     empty_notes: list[str] = []
+    cautions: dict[str, list[str]] = {}      # 행이 있는 검색어가 받은 주의 줄 → 그 검색어들(처음 받은 차례)
     for kw in kws:
         raw = await _call(tools, "search_voc", {"keyword": kw, "limit": 10})
         if isinstance(raw, str) and raw.strip() and not _tool_text_ok(raw):
@@ -7838,6 +7843,16 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
                 notes.insert(0, f"받은 {len(env['results'])}건에 보일 본문이 없습니다")
             if notes:
                 empty_notes.append(f"'{kw}' 0건 — " + " · ".join(notes))
+        elif env is not None:
+            # 행이 있어도 SignalForge 의 주의 줄(_VOC_CAUTION)은 싣는다 — notes 를 0건일 때만 실으면 다른 프로젝트 제품의 VOC 가 섞였을 수
+            # 있다는 말이 행이 보이는 미리보기, 그 말이 가장 필요한 때에 닿지 않는다(HWAXPortal docs/request-1030 HA-33 덧붙임). 다른 notes 는
+            # 종전처럼 싣지 않는다. 0건 갈래는 위에서 notes 를 통째로 실으므로 그대로 둔다. 같은 줄은 검색어끼리 한 번만 싣는다.
+            cs = env.get("notes")
+            for n in (cs if isinstance(cs, list) else [cs]):
+                if isinstance(n, str) and n.startswith(_VOC_CAUTION):
+                    ks = cautions.setdefault(n, [])
+                    if kw not in ks:
+                        ks.append(kw)
         elif not any(r["text"] for r in rows) and isinstance(raw, str) and raw.strip() not in ("", "[]"):
             # 펼칠 것이 없고 읽을 글도 없는데 결과 글은 왔다(모르는 꼴 · 실패 문구 · 옛 꼴의 본문 없는 행) — 0건으로 두면 '정말 없음' 과
             # 같아 보이니 실패로 센다. '[]' 는 옛 꼴의 0건이다(내용 블록 0개를 도구 래퍼 _cap 이 그 글로 만든다).
@@ -7854,7 +7869,9 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
                 items.append(rows[i])
     total = len(items)
     items = items[:_VOC_PREVIEW_MAX]
-    note = ([f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."] if total > len(items) else []) + empty_notes
+    # 주의 줄이 맨 앞이다 — 보이는 행이 어느 제품의 것인지에 대한 말이다. 검색어를 앞에 달아 어느 행에 걸리는지 화면의 검색어 표지로 맞춘다.
+    note = ([" · ".join(f"'{k}'" for k in ks) + f" {c}" for c, ks in cautions.items()]
+            + ([f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."] if total > len(items) else []) + empty_notes)
     return {"keywords": kws, "items": items, "total": total,
             "degraded": failed == len(kws),
             "partial": 0 < failed < len(kws),

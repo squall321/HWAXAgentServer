@@ -176,3 +176,78 @@ def test_도구_래퍼를_지난_진짜_꼴로도_읽는다(monkeypatch, blocks,
     out = asyncio.run(a.deliberate_voc_preview(a.VocPreviewRequest(message="x", keywords=["zzz"])))
     assert [x["id"] for x in out["items"]] == ids, out
     assert out["degraded"] is False and out["partial"] is False, out
+
+
+# ── SignalForge SG-04 주의 줄 — 행이 있어도 미리보기에 싣는다(HWAXPortal docs/request-1030 HA-33 덧붙임, SignalForge ec40075) ────────
+# SF 해석(shared/ontology.py interpret)은 해석한 제품 코드가 PLM 프로젝트 여럿에 걸리거나 질의가 다른 프로젝트를 짚으면 notes 끝에
+# '주의 — <plm_caution.note>' 를 달고, search_voc 봉투의 notes 가 그 해석 notes 다(mcp-server/server.py search_voc — 봉투에 plm_caution 칸은
+# 없다). 종전엔 notes 를 0건일 때만 실어, 다른 제품의 VOC 가 섞였을 수 있다는 말이 행이 보이는 미리보기에 닿지 않았다.
+# 아래 글은 SF plm_caution 의 note 꼴 그대로다. 프로젝트 이름은 SF 시험처럼 지어낸 이름(알파 · 베타), 제품 코드도 지어낸 것이다.
+_SG04 = " (제품 행을 프로젝트별로 나눌지는 데이터 결정 대기 — SG-04)"
+_MODEL_NOTE = "모델 하나로 봤다 — 같은 세대 전부는 '<모델> 시리즈' 로 검색"     # 같은 notes 에 오는 다른 해석 줄(ontology.py)
+
+
+def _caution_multi(code, projects):
+    """제품 코드가 PLM 프로젝트 여럿의 개발모델에 걸리는 갈래."""
+    return (f"주의 — {code} 는 PLM 프로젝트 {len(projects)}개({', '.join(sorted(projects))})의 개발모델에 걸린다 — 이 제품 코드의 "
+            "VOC 는 그 프로젝트들을 가르지 않고 함께 센다" + _SG04)
+
+
+def _caution_foreign(code, named, own):
+    """질의의 이름 · 모델이 짚은 프로젝트가 해석한 제품의 프로젝트가 아닌 갈래."""
+    return (f"주의 — 질의의 이름·모델은 PLM 프로젝트 {named} 인데 해석한 제품({code})의 개발모델은 프로젝트 {own} 것이다 — "
+            "다른 제품의 VOC 일 수 있다" + _SG04)
+
+
+C_PX1 = _caution_multi("PX1", ["알파", "베타"])
+C_PX2 = _caution_foreign("PX2", "알파", "베타")
+
+
+@pytest.mark.parametrize("notes", [[_MODEL_NOTE, C_PX1, "사전에 없는 표현이라 LLM 이 증상을 추론했다: 발열"], C_PX1],
+                         ids=["list", "text"])
+def test_SG04_주의_줄은_행이_있어도_미리보기에_싣고_다른_notes_는_싣지_않는다(monkeypatch, notes):
+    """notes 가 글 하나로 와도(꼴이 한 번 바뀐 계약이다 — 위 시험) 그 줄을 통째로 본다."""
+    async def call(tools, name, args):
+        rows = [_voc(1, "px1 hinge"), _voc(2, "px1 hinge")]
+        return json.dumps({"total": 2, "results": rows, "strategy": "semantic", "match_mode": "semantic", "notes": notes},
+                          ensure_ascii=False, indent=2)
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 hinge"]})
+    assert [x["id"] for x in out["items"]] == [1, 2]
+    assert out["note"] == f"'px1 hinge' {C_PX1}", out.get("note")
+    assert not out["degraded"] and not out["partial"]
+
+
+def test_SG04_같은_주의는_검색어끼리_한_번만_싣고_받은_검색어를_모두_단다(monkeypatch):
+    data = {"px1 hinge": _envelope([_voc(1, "px1 hinge"), _voc(2, "px1 hinge")], [C_PX1]),
+            "px1 crease": _envelope([_voc(3, "px1 crease")], [_MODEL_NOTE, C_PX1]),
+            "px2 battery": _envelope([_voc(4, "px2 battery")], [C_PX2]),
+            "screen flicker": _envelope([_voc(5, "screen flicker")], [_MODEL_NOTE])}
+
+    async def call(tools, name, args):
+        return data[args["keyword"]]
+
+    monkeypatch.setattr(a, "_VOC_PREVIEW_MAX", 3)
+    kws = list(data) + ["px1 hinge"]              # 사람이 같은 검색어를 두 번 넣어도 검색어 표지는 한 번
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": kws})
+    assert out["note"] == (f"'px1 hinge' · 'px1 crease' {C_PX1} / 'px2 battery' {C_PX2} / 5건 중 3건만 보입니다 — 검색어를 좁혀 보세요."), \
+        "주의 줄이 맨 앞 · 받은 차례대로 · 같은 줄은 한 번"
+    assert out["note"].count(C_PX1) == 1 and _MODEL_NOTE not in out["note"]
+
+
+def test_SG04_0건_검색어의_글은_종전_그대로다(monkeypatch):
+    """0건 갈래는 notes 를 통째로 싣던 그대로다(주의 줄도 그 안에 든다) — 그 검색어로 따로 주의 줄을 만들지 않는다. 행이 있는 다른 검색어가 같은
+    주의를 받았으면 그 검색어의 줄은 따로 선다(어느 행에 걸리는 주의인지 검색어로 말한다)."""
+    why = "해석한 조건에 맞는 글이 없다(최근 90일) — 기간·시장·채널을 넓히거나 semantic=False 로 키워드 검색을 해 보라"
+    data = {"px1 hinge": _envelope([_voc(1, "px1 hinge")], [C_PX1]), "px1 zzz": _envelope([], [C_PX1, why])}
+
+    async def call(tools, name, args):
+        return data[args["keyword"]]
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 zzz"]})
+    assert out["items"] == [] and out["note"] == f"'px1 zzz' 0건 — {C_PX1} · {why}", out.get("note")
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 hinge", "px1 zzz"]})
+    assert [x["id"] for x in out["items"]] == [1]
+    assert out["note"] == f"'px1 hinge' {C_PX1} / 'px1 zzz' 0건 — {C_PX1} · {why}", out.get("note")
+    assert not out["degraded"] and not out["partial"]
