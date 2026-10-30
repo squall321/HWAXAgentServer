@@ -6588,18 +6588,17 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 except Exception as exc:  # noqa: BLE001
                     _out = f"{_TOOL_FAIL_MARK} (tool {_tn} error: {exc})"
                 _out = _cap(str(_out))
-                # 확인 관문(HA-29)이 이 직접 실행을 막았다 — 결과를 LLM 으로 요약하지 않는다(막은 글을 '걸었다' 로 읽는다). 카드가 턴 끝에 선다.
-                _held3 = _confirm_held_text(_out)
                 # ⚠ `except` 로는 못 잡는다 — `_call` 이 예외를 문자열로 삼켜 돌려준다.
                 # 문자열을 봐야 실패를 안다(그래서 위 try 에서 _ok 를 정하지 않는다).
                 _ok = _result_ok(_out)
                 _prev3, _hand3 = _tool_preview(_out), _handoff_text(_out)
-                yield _sse("status", {"step": (f"확인 대기: {_tn} — 사람의 확인 전에는 보내지 않습니다" if _held3
-                                               else f"도구 완료: {_tn}"), "tool": _tn,
+                yield _sse("status", {"step": f"{'확인 대기' if _confirm_held_text(_out) else '도구 완료'}: {_tn}", "tool": _tn,
                                       "call": _cid, "ok": _ok,
                                       "result_preview": _prev3,
                                       # 핸드오프용 날것 — 종전엔 이 경로만 미리보기 220자뿐이었다
                                       **({"result_full": _hand3} if len(_hand3) > len(_prev3) else {})})
+                # 확인 관문(HA-29)이 막은 결과는 LLM 으로 요약하지 않는다(막은 글을 '걸었다' 로 읽는다) — 카드가 턴 끝에 선다
+                _held3 = _confirm_held_text(_out)
                 if not _held3:
                     try:
                         _final = (await _llm_text(

@@ -343,7 +343,8 @@ def test_근거_블록은_여섯_건만_보이고_총_건수를_적는다():
 def test_챗은_출처없는_수치를_전부_세어_근거_블록에_넘긴다():
     """세는 쪽이 6건에서 멈추면 블록은 총 건수를 알 길이 없다. 챗 스트림은 모델·게이트웨이 없이 못
     돌리므로 넘기는 자리의 소스를 본다."""
-    assert "_unsourced_numbers(text, _src, limit=0)" in APP.read_text(encoding="utf-8")
+    # 확인 카드 글(HA-29)은 대조에서 뺀다 — 카드의 예상 작업량은 조회 결과가 아니다(HWAXPortal docs/request-1030 design-integration C-14)
+    assert "_unsourced_numbers(_confirm_strip(text, _cctx.card), _src, limit=0)" in APP.read_text(encoding="utf-8")
 
 
 # ── 재촉 → 이어하기 ───────────────────────────────────────────────────────────
