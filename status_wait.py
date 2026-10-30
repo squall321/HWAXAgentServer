@@ -188,6 +188,16 @@ def _ids(d) -> set:
             if isinstance(k, str) and _ID_KEY.match(k) and isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip()}
 
 
+def job_record(text) -> bool:
+    """결과 글이 잡 하나의 상태인가 — JSON 객체이고, 상태 낱말을 읽은 사전에 id 칸이 있고, 맨 위가 ok:false 가 아니다. 끝 낱말(failed ·
+    error …)이어도 참이다 — '그 잡은 실패했다' 는 조회가 성공해 돌려준 사실이다(자기검증 원문 색인이 쓴다 — 호출 실패와 가른다)."""
+    obj = _obj(text)
+    if obj is None or obj.get("ok") is False:
+        return False
+    got = _state(obj)
+    return bool(got and _ids(got[0]))
+
+
 def born_ids(text) -> set:
     """잡 시작 결과에서 이 턴에 건 잡의 id — '도는 중' 상태를 읽은 그 사전의 id 칸 값들(글). 목록 속 잡 · 끝난 잡 · 긴 글은 빈 집합."""
     if not isinstance(text, str) or len(text) > BORN_TEXT_MAX:

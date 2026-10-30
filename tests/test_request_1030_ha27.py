@@ -314,8 +314,9 @@ def test_사본의_절단_표지_수는_근거가_아니고_덧붙인_근거는_
         {"role": "assistant", "content": f"조회한 답 88.5\n{a._EVIDENCE_MARK}", "evidence": [{"tool": "t", "result": "앞 턴 결과 98.5"}]}])
     idx = a._sc_index(req, [big, a._cut_mark("가" * 300, 100)], None)
     assert not idx.has(len(src)) and not idx.has(100) and not idx.has(300), "도구 결과 상한 · 근거 몫 표지의 자 수는 근거가 아니다"
-    assert all(idx.has(v, strong=True) for v in (41.5, 77.5, 55.5, 88.5, 98.5))
+    assert all(idx.has(v, strong=True) for v in (41.5, 77.5, 55.5, 98.5))
     assert not idx.has(66.5), "근거 블록 없는 어시스턴트 발화는 근거가 아니다(세탁 길)"
+    assert not idx.has(88.5), "근거 블록이 있어도 어시스턴트 글은 근거가 아니다 — 앞 턴의 도구 결과(98.5)만(반대 검토 2차)"
 
 
 # ── E 턴 끝까지 ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -396,3 +397,129 @@ def test_H2_건너뛴_턴만이면_fixed_비율은_없다(monkeypatch):
     assert h["fixed_ratio"] is None and h["gate"]["turns"] == 0
     monkeypatch.setenv("CHAT_SELF_CHECK_GATE", "num")
     assert a._sc_health()["gate"]["mode"] == "num"
+
+
+# ── 반대 검토 2차(rv2) — 색인의 세탁 길 · 잡 실패 조회 · 색인 차례 · [짚은 점] 읽기 · 카탈로그 붙잡기 ─────────────────────────────────────
+def test_rv2_근거_블록이_있는_앞_답의_수도_근거가_아니고_실패한_이력_근거는_뺀다():
+    """앞 답의 '777.7' 은 근거 블록의 ⚠ 줄이 '확인되지 않았다' 고 짚은 수다 — 종전엔 그 답이 통째로 강한 근거라 이번 턴의 312.5 로 바로잡는 쌍이
+    버려지고 '검증 ✓' 였다. 앞 턴의 도구 결과는 이력의 evidence 로 온다(포털이 '[호출 실패]' 를 단 실패한 호출은 뺀다)."""
+    prev = ("A 부품의 최대 응력은 777.7 MPa 입니다.\n\n---\n" + a._EVIDENCE_MARK + "\n- `query_stress` · part=A\n\n"
+            "> ⚠ 다음 수치는 위 조회 결과에서 확인되지 않았습니다 — 추론이거나 계산된 값일 수 있으니 그대로 인용하지 마십시오: `777.7`")
+    req = a.ChatRequest(message="A 부품 응력 다시 정리해 줘", groups=[], history=[
+        {"role": "user", "content": "A 부품 응력은?"},
+        {"role": "assistant", "content": prev, "evidence": [
+            {"tool": "query_stress", "result": '{"max": 312.5}'},
+            {"tool": "count_defects", "result": f"[호출 실패] {a._TOOL_FAIL_MARK} 도구 count_defects 호출 실패: limit 4321 을 넘는 요청이다"}]}])
+    idx = a._sc_index(req, ['{"max": 312.5}'], {"texts": ['{"max": 312.5}'], "chars": 14, "partial": False})
+    assert not idx.has(777.7) and not idx.has(4321) and idx.has(312.5, strong=True)
+    draft = "A 부품의 최대 응력은 777.7 MPa 입니다."
+    ans, sc = a._self_check_judge(draft, "fixed", ["777.7 → 312.5(조회 결과 1)"], [("최대 응력은 777.7 MPa", "최대 응력은 312.5 MPa")], False,
+                                  idx=idx, message=req.message)
+    assert ans == "A 부품의 최대 응력은 312.5 MPa 입니다." and sc["status"] == "fixed", sc
+
+
+def test_rv2_잡이_실패했다는_상태_조회는_성공한_조회라_색인에_들고_호출_실패는_여전히_뺀다():
+    body = '{"job_id": "j-7", "status": "failed", "progress": 45, "error": "RSS 29.7GB OOM", "log_last": "합치기 211형상"}'
+    req = a.ChatRequest(message="잡 어떻게 됐어?", groups=[])
+    idx = a._sc_index(req, ["[이 결과는 StepForge 앱의 job_status 이다]\n" + body], {"texts": [body], "chars": len(body), "partial": False})
+    assert idx.has(29.7) and idx.has(211) and idx.has(45, strong=True)
+    got = g.gate_patches([("메모리 29.7GB 초과(합치기 211형상)", "메모리 초과(근거 없음 — 추정)")], idx,
+                         draft="잡은 45% 에서 실패했습니다 — 메모리 29.7GB 초과(합치기 211형상).")
+    assert tuple(got[0])[:2] == ("drop", "drop_sourced_number"), got
+    for bad in ('{"ok": false, "status": "failed", "job_id": "j-7", "error": "3건"}', '{"status": 403, "job_id": "j", "error": "권한 3"}',
+                '{"status": "error", "data": null, "errors": ["3건 실패"]}', f"{a._TOOL_FAIL_MARK} 도구 job_status 호출 실패: 3"):
+        assert not a._sc_result_ok(bad), bad
+    assert a._sc_result_ok('{"task_id": "t1", "status": "error", "message": "solver diverged at 3.2 ms"}'), "잡이 오류로 끝났다는 조회"
+
+
+def test_rv2_색인은_모델이_본_사본과_사람_발화를_큰_원문보다_먼저_넣는다(monkeypatch):
+    monkeypatch.setattr(g, "NUMS_MAX", 2_000)
+    field = json.dumps({"node_stress": [round(i * 0.013, 4) for i in range(3_000)]})
+    summary = '{"max_stress": 312.5, "limit": 400}'
+    req = a.ChatRequest(message="허용 응력 275.5 기준으로 봐 줘", groups=[])
+    idx = a._sc_index(req, [summary], {"texts": [field, summary], "chars": len(field) + len(summary), "partial": False})
+    assert idx.partial and idx.has(312.5) and idx.has(275.5, strong=True)
+
+
+@pytest.mark.parametrize("line", ["없음", "없음.", "해당 없음", "없습니다.", "짚을 곳 없음", "(없음)", "없음 — 근거와 모두 일치", "특이 사항 없음",
+                                  "N/A"])
+def test_rv2_짚은_점의_없음_꼴은_짚은_곳이_아니다(line):
+    assert a._self_check_flags(f"[판정] 고칠 것 없음\n[고친 점]\n- 없음\n[짚은 점]\n- {line}\n") == [], line
+
+
+def test_rv2_없음_뒤에_다른_말이_붙으면_짚은_곳이다():
+    assert a._self_check_flags("[판정] 고칠 것 없음\n[짚은 점]\n- 없음 — 다만 3행 값이 의심스럽다\n") == ["없음 — 다만 3행 값이 의심스럽다"]
+
+
+@pytest.mark.parametrize("head", ["**[짚은 점]**", "## [짚은 점]", "  _[짚은 점]_", "> [짚은 점]"])
+def test_rv2_꾸민_짚은_점_머리도_마지막_새_글에_섞이지_않는다(head):
+    out = f"[판정] 고침\n[고친 점]\n- a\n[바꿀 곳]\n[원문]\n결론은 A 다.\n[새 글]\n결론은 B 다.\n{head}\n- 표의 3행 값이 의심스럽다"
+    assert a._self_check_parse(out) == ("fixed", ["a"], [("결론은 A 다.", "결론은 B 다.")]), head
+    assert a._self_check_flags(out) == ["표의 3행 값이 의심스럽다"], head
+
+
+def _catalog_tool(seen):
+    async def search(**_kw):
+        seen.append(1)
+        return json.dumps({"hits": [{"card": "K-1", "text": "허용 응력 41.5 MPa · 시험 7회 · " + "x" * 500}]}, ensure_ascii=False)
+    return a._prep_tool(StructuredTool(name="agent_search", description="d", coroutine=search, args_schema={"type": "object", "properties": {}}),
+                        a.CATALOG_RESULT_MAX)
+
+
+def test_rv2_sc_raw_off_안의_카탈로그_도구는_그릇에_넣지_않고_그릇을_되돌린다():
+    seen: list = []
+    cat = _catalog_tool(seen)
+    box = dict(BOX0, texts=[])
+    tok = a._turn_sc_raw.set(box)
+    try:
+        asyncio.run(a._sc_raw_off(cat.ainvoke({})))
+        assert a._turn_sc_raw.get() is box, "다녀온 뒤에는 그릇이 그대로다"
+    finally:
+        a._turn_sc_raw.reset(tok)
+    assert seen == [1] and box["texts"] == []
+
+
+def test_rv2_지정_전문가의_카탈로그_조회는_원문_그릇에_넣지_않고_모델이_본_발췌만_넣는다(monkeypatch):
+    seen: list = []
+    cat = _catalog_tool(seen)
+
+    async def meta(_app, _groups, key):
+        await cat.ainvoke({})       # get_agent_session 대역 — 심의 · 카탈로그와 같은 chat=False 래퍼
+        return {"key": key, "name": "응력 전문가", "role": "응력을 본다", "operator": False, "apps": [], "key_tools": [], "note": ""}
+
+    async def know(_app, _groups, _key, _q):
+        await cat.ainvoke({})
+        return "- K-1 허용 응력 41.5 MPa"
+    monkeypatch.setattr(a, "_persona_meta", meta)
+    monkeypatch.setattr(a, "_persona_knowledge", know)
+    _with_agent(monkeypatch, _CallAgent(_tool_of("list_models", '{"total": 34}'), "허용 응력은 41.5 MPa 이고 모델은 34개입니다."))
+    box: dict = {}
+
+    async def go():
+        req = a.ChatRequest(message="개발모델 몇 개?", groups=["portal-admin"], pinned_agent="stress")
+        return [c async for c in a._agent_stream_turn(a.app, req, box)]
+    asyncio.run(go())
+    assert seen == [1, 1], "역할 · 지식카드를 물었다"
+    assert box["raw"]["texts"] == ["- K-1 허용 응력 41.5 MPa", '{"total": 34}'], box["raw"]
+
+
+def test_rv2_E_해석_결과_312_를_지우는_검토는_턴_끝까지_버려지고_코드_대조에_312_가_없다(monkeypatch):
+    """OT-09 변형 — 사본이 잘려 312 가 안 보이는 턴. 종전엔 '결과 312' 가 가려져 [코드 대조] 가 312 를 '출처 없음' 으로 보내고, 검토자가 지운 쌍이
+    답에 들어갔다."""
+    from test_chat_self_check import _Reviewer as _Rv  # noqa: PLC0415
+    big = json.dumps({"rows": [{"node": i, "s": round(i * 0.37, 2)} for i in range(60)], "max_stress": 312, "limit": 400})
+    monkeypatch.setattr(a, "TOOL_RESULT_MAX", 200)
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1")
+    _with_agent(monkeypatch, _CallAgent(_tool_of("query_stress", big), "해석 결과 312 MPa 로 기준 400 MPa 이내입니다."))
+    rv = _Rv("[판정] 고침\n[고친 점]\n- 312 는 조회 결과에서 확인되지 않아 추정으로 표시\n[바꿀 곳]\n[원문]\n해석 결과 312 MPa 로\n[새 글]\n"
+             "해석 결과 (근거 없음 — 추정) 로")
+    monkeypatch.setattr(a.app.state, "chat_llm", rv, raising=False)
+
+    async def go():
+        req = a.ChatRequest(message="응력 기준 이내야?", groups=["portal-admin"], history=[])
+        return [c async for c in a._agent_stream(a.app, req)]
+    evs = _events(asyncio.run(go()))
+    sc = [d for e, d in evs if e == "meta"][-1]["self_check"]
+    result = [d for e, d in evs if e == "result"][-1]["content"]
+    assert result.startswith("해석 결과 312 MPa 로 기준 400 MPa 이내입니다.") and sc["status"] == "ok" and len(sc["dropped"]) == 1, sc
+    assert "`312`" not in rv.calls[0][0][1].content, "원문에 있는 수는 [코드 대조] 에서 빠진다"

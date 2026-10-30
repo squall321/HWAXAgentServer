@@ -693,9 +693,10 @@ def test_HA27_E_짚기만_한_검토는_flagged_이고_관문을_꺼도_같다(m
         assert _answer(evs) == draft and sc["status"] == "flagged" and sc["flags"] == [note] and sc["fixes"] == [note], (mode, sc)
 
 
-# 6.2 덧붙인 근거 — 사람 발화 · 이력의 사람 발화 · 근거 블록이 있는 어시스턴트 발화 · 이력 evidence[*].result 는 근거이고, 근거 블록 없는
-# 어시스턴트 발화는 근거가 아니다(지어낸 수가 다음 턴의 근거가 되는 세탁 길). 검토자가 4321 에 '근거 없음' 을 달면, 4321 이 근거에 있으면 버리고
-# (drop_marks_sourced → ok, 초안 그대로) 없으면 넣는다(fixed).
+# 6.2 덧붙인 근거 — 사람 발화 · 이력의 사람 발화 · 이력 evidence[*].result 는 근거이고, 어시스턴트 발화는 근거가 아니다(지어낸 수가 다음 턴의
+# 근거가 되는 세탁 길). 설계는 근거 블록이 있는 어시스턴트 발화를 근거로 넣었지만, 그 글에도 지어낸 수가 들고 근거 블록의 ⚠ 줄이 출처 없는 수를
+# 다시 적어 세탁 길이 그대로 열려 있었다 — 반대 검토 2차에서 뒤집었다(앞 턴의 도구 결과는 evidence 로 따로 온다). 검토자가 4321 에 '근거 없음' 을
+# 달면, 4321 이 근거에 있으면 버리고(drop_marks_sourced → ok, 초안 그대로) 없으면 넣는다(fixed).
 _X_DRAFT = "불량 4321건의 주원인은 납땜 불량입니다."
 _X_MARKED = "불량 4321건(근거 없음 — 추정)의 주원인은 납땜 불량입니다."
 _X_FIX = "[판정] 고침\n[고친 점]\n- 4321 은 조회 결과에 없다\n[바꿀 곳]\n[원문]\n불량 4321건의\n[새 글]\n불량 4321건(근거 없음 — 추정)의"
@@ -721,12 +722,12 @@ def test_HA27_X1_사람_발화의_수는_근거다(monkeypatch):
 
 @pytest.mark.parametrize("history, want", [
     ([_X_ASK, {"role": "assistant", "content": "불량은 4321건입니다."}], "fixed"),                       # 근거 블록 없는 답 — 세탁 길
-    ([_X_ASK, {"role": "assistant", "content": f"불량은 4321건입니다.\n\n---\n{a._EVIDENCE_MARK}\n- `count_defects`"}], "ok"),
+    ([_X_ASK, {"role": "assistant", "content": f"불량은 4321건입니다.\n\n---\n{a._EVIDENCE_MARK}\n- `count_defects`"}], "fixed"),  # 반대 검토 2차
     ([_X_ASK, {"role": "assistant", "content": "불량은 4321건입니다.",
                "evidence": [{"tool": "count_defects", "args": "", "result": '{"count": 4321}'}]}], "ok"),   # 앞 턴의 도구 결과
     ([{"role": "user", "content": "불량 4321건 기준으로 봐 줘"}, {"role": "assistant", "content": "네."}], "ok"),   # 이력의 사람 발화
 ], ids=["근거_블록_없는_답", "근거_블록_있는_답", "이력_조회_결과", "이력_사람_발화"])
-def test_HA27_X2_이력은_사람_발화_근거_블록_조회_결과만_근거다(monkeypatch, history, want):
+def test_HA27_X2_이력은_사람_발화와_조회_결과만_근거다(monkeypatch, history, want):
     _x_check(monkeypatch, _req("그 불량의 주원인은?", history), want)
 
 

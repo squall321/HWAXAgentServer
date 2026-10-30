@@ -5375,10 +5375,20 @@ _SC_ASK_GATE_LINE = ("서버가 [바꿀 곳] 의 쌍을 조회 결과 원문(자
                      "쌍은 버리고, 원문에서 확인되지 않는 새 수치나 원문 값을 바꾸는 쌍은 넣지 않고 짚은 곳으로 돌린다.")
 _SC_ASK_GATE_LINE_NUM = _SC_ASK_GATE_LINE.replace("새 수치나 원문 값을 바꾸는 쌍은", "새 수치를 쓰는 쌍은")
 _SC_VERDICT = re.compile(r"\[판정\]\s*([^\n]*)")
-_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[(?:바꿀 곳|짚은\s*점)\]|\Z)", re.S)
+# 절 머리 앞의 꾸밈 — 검토자가 '**[짚은 점]**' · '## [짚은 점]' 처럼 굵게 · 머리글로 쓰면 종전 꼴로는 마지막 [새 글] 이 그 머리에서 끊기지 않아
+# 짚은 점 칸 전체가 답 본문에 들어갔다(반대 검토 2차). 줄머리의 공백 · * · _ · # · > 를 건너뛴다.
+_SC_HEAD_PAD = r"\n[ \t*_#>]*"
+_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=" + _SC_HEAD_PAD + r"\[(?:바꿀 곳|짚은\s*점)\]|\Z)", re.S)
 # [짚은 점] — 고치지 않고 사람이 볼 곳(HA-27). [바꿀 곳] 앞이든 뒤든 읽고, 쌍의 [새 글] 은 이 머리 앞에서 끊는다(새 글에 섞이지 않게).
-_SC_FLAGS = re.compile(r"\[짚은\s*점\][^\n]*\n(.*?)(?=\n\s*\[(?:바꿀 곳|고친 점|판정|원문)\]|\Z)", re.S)
-_SC_NEW_END = re.compile(r"\n\s*\[(?:짚은\s*점|고친 점|판정)\]")
+_SC_FLAGS = re.compile(r"\[짚은\s*점\][^\n]*\n(.*?)(?=" + _SC_HEAD_PAD + r"\[(?:바꿀 곳|고친 점|판정|원문)\]|\Z)", re.S)
+_SC_NEW_END = re.compile(_SC_HEAD_PAD + r"\[(?:짚은\s*점|고친 점|판정)\]")
+# [짚은 점] 의 '없음' 줄 — 낱말만 바꾼 꼴('해당 없음' · '없습니다.' · '짚을 곳 없음' · '(없음)' · '없음 — 근거와 모두 일치')도 짚은 곳이 아니다. 종전엔
+# '없음' · '없음.' 둘만 버려 맞는 답이 flagged 가 되고 /health 의 flagged · reviewer_flags 가 부풀었다(반대 검토 2차). '없음 — 다만 …' 처럼 뒤에
+# 다른 말이 붙으면 짚은 곳이다.
+_SC_NONE_LINE = re.compile(
+    r"[(\[]?\s*(?:해당\s*(?:사항\s*)?|짚을\s*(?:곳|점)(?:이|은)?\s*|특이\s*사항\s*|문제(?:점)?\s*|의심(?:스러운)?\s*(?:곳|점)?(?:은|이)?\s*)?"
+    r"(?:없음|없습니다|없다|없어요|none|n/?a)\s*[)\]]?\s*[.。!]*"
+    r"(?:\s*[—–\-:]\s*(?:근거와\s*)?(?:모두|전부|다)\s*(?:일치|맞(?:음|다|습니다)|확인(?:됨|했다|했습니다))\s*(?:함|한다|합니다)?\s*[.。!]*)?", re.I)
 _SC_IMG = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
@@ -5414,6 +5424,17 @@ def _sc_raw_box() -> dict | None:
     return {"texts": [], "chars": 0, "partial": False} if _sc_gate_mode() != "0" and _sc_raw_cap() > 0 else None
 
 
+async def _sc_raw_off(coro):
+    """카탈로그 조회(지정 전문가의 역할 원문 get_agent_session · 지식카드 검색 agent_search)는 원문 그릇에 넣지 않고 부른다 — 설계 4.2 의 '카탈로그
+    조회는 그릇이 없다'. 그 길의 도구도 capped(R5)를 지나는데 R5 는 문맥 변수만 보아, 챗 턴 안에서는 결과 하나 최대 200만 자의 검색 원문이 그릇
+    600만 자 몫을 먹고(뒤 결과가 partial) 강한 수를 늘렸다(반대 검토 2차). 모델이 실제로 본 발췌는 턴이 따로 붙잡는다(_sc_keep_raw)."""
+    tok = _turn_sc_raw.set(None)
+    try:
+        return await coro
+    finally:
+        _turn_sc_raw.reset(tok)
+
+
 def _sc_keep_raw(raw) -> None:
     """도구 결과 원문을 이번 턴 그릇에 — 턴 합 _sc_raw_cap() · 결과 하나 _SC_RAW_ITEM 자까지(넘으면 앞부분 + partial). 병렬 도구 코루틴은 같은
     이벤트 루프에서 await 없이 더하므로 자물쇠가 필요 없다. 자르지 않는 한 이미 메모리에 있던 글의 참조다."""
@@ -5437,20 +5458,38 @@ _SC_CAP_LINE = re.compile(r"\n" + re.escape(_CAP_MARK) + r"[^\n]*")
 _SC_CUT_TAIL = re.compile(r" …\[[0-9,]+자 중 앞 [0-9,]+자\]$")
 
 
+# 이력 근거에서 실패한 호출의 머리 — 포털이 붙인다(HWAXPortal frontend/src/components/chat/history.ts turnEvidence 의 '[호출 실패] ').
+_HIST_FAIL_HEAD = "[호출 실패]"
+
+
+def _sc_result_ok(t) -> bool:
+    """원문 색인에 넣을 결과인가 — 성공한 결과(_result_ok)이거나, 잡 상태 조회가 '그 잡은 failed' 를 돌려준 결과(status_wait.job_record — 잡 id 와
+    상태 낱말이 한 사전에, ok:false 아님)다. _result_ok 는 status failed · error 칸을 실패 봉투로 읽어, 잡이 실패했다는 성공한 조회(StepForge
+    job_status · DocForge docforge_status 의 끝 상태)를 통째로 뺐다 — 초안의 실패 설명 수치(진행 45 · RSS 29.7GB)를 지우는 쌍이 넣음이 됐다
+    (반대 검토 2차). 거르는 것은 호출 실패다(✖ · 유령 ID · {ok:false} · 첫 줄 error: · 막은 글)."""
+    if _result_ok(t):
+        return True
+    s = t.lstrip() if isinstance(t, str) else ""
+    return bool(s) and not s.startswith(_TOOL_FAIL_MARK) and _status_wait_mod.job_record(s)
+
+
 def _sc_index(req: ChatRequest, outputs: list, raw: dict | None):
-    """원문 색인(sc_gate.RawIndex) — 그릇의 원문 + 모델 사본(그릇이 빈 턴 · 상한을 넘긴 결과 · 사본에만 있는 코드 글) + 덧붙인 근거(사람 발화 ·
-    붙인 문서 · 이력의 사람 발화 · 근거 블록이 있는 어시스턴트 발화 · 이력의 도구 결과, 합 _SC_EXTRA_CHARS). 실패한 결과(_result_ok 가 거짓 —
-    ✖ 거절 · 실패 봉투 · 유령 ID)는 근거가 아니라 뺀다(design-integration C-13). 근거 블록 없는 어시스턴트 발화는 넣지 않는다 — 유령 ID 씨앗과
-    같은 까닭(지어낸 수가 다음 턴의 근거가 되는 세탁 길)."""
-    texts = [t for t in (raw or {}).get("texts") or [] if _result_ok(t)]
+    """원문 색인(sc_gate.RawIndex) — 모델 사본(그릇이 빈 턴 · 상한을 넘긴 결과 · 사본에만 있는 코드 글) + 그릇의 원문 + 덧붙인 근거(사람 발화 ·
+    붙인 문서 · 이력의 사람 발화 · 이력의 도구 결과, 합 _SC_EXTRA_CHARS). 사본을 원문보다 앞에 둔다 — 색인이 상한에 차면 뒤 글을 건너뛰는데,
+    모델이 본 글이 먼저 들어야 한다(반대 검토 2차). 실패한 결과(_sc_result_ok 가 거짓 — ✖ 거절 · 실패 봉투 · 유령 ID)는 근거가 아니라 뺀다
+    (design-integration C-13). 어시스턴트 발화는 근거 블록이 있어도 넣지 않는다 — 그 글에는 지어낸 수가 들 수 있고 근거 블록의 ⚠ 줄이 출처 없는
+    수를 다시 적어, 다음 턴에 그 수가 '원문에 있다' 가 되는 세탁 길이었다(반대 검토 2차 — 설계 6.2 를 뒤집는다). 앞 턴의 도구 결과는 이력의
+    evidence[].result 로 따로 온다 — 실패한 호출('[호출 실패]' 머리)은 뺀다."""
+    texts: list[str] = []
     for o in outputs:
         o = o if isinstance(o, str) else str(o)
         body = _sc_gate.strip_heads(o)            # 앱 머리 뒤의 실패 봉투도 본다(머리가 있으면 _result_ok 가 첫 줄로 머리를 읽는다)
-        if not (_result_ok(body) and (body is o or _result_ok(o))):
+        if not (_sc_result_ok(body) and (body is o or _sc_result_ok(o))):
             continue
         if _CAP_MARK in o:
             o = _SC_CAP_LINE.sub("", o)
         texts.append(_SC_CUT_TAIL.sub("", o) if o.endswith("자]") else o)
+    texts += [t for t in (raw or {}).get("texts") or [] if _sc_result_ok(t)]
     extra: list[str] = []
     room = _SC_EXTRA_CHARS
 
@@ -5467,11 +5506,10 @@ def _sc_index(req: ChatRequest, outputs: list, raw: dict | None):
     for h in reversed(req.history or []):               # 최근 것부터 — 몫이 모자라면 오래된 것이 빠진다
         if not isinstance(h, dict):
             continue
-        c = str(h.get("content") or "")
-        if h.get("role") == "user" or (h.get("role") == "assistant" and _EVIDENCE_MARK in c):
-            add(c)
+        if h.get("role") == "user":
+            add(h.get("content"))
         for e in (h.get("evidence") if isinstance(h.get("evidence"), list) else []):
-            if isinstance(e, dict):
+            if isinstance(e, dict) and not str(e.get("result") or "").startswith(_HIST_FAIL_HEAD):
                 add(e.get("result"))
     return _sc_gate.RawIndex.build(texts, extra, partial=bool((raw or {}).get("partial")))
 
@@ -5724,14 +5762,15 @@ def _self_check_parse(out: str) -> tuple[str | None, list, list | None]:
 
 
 def _self_check_flags(out: str) -> list[str]:
-    """검토자의 [짚은 점] — 고치지 않고 사람이 확인할 곳(HA-27). '없음' 은 버리고 20줄 × 400자까지. _self_check_parse 의 돌려주는 꼴은 그대로다."""
+    """검토자의 [짚은 점] — 고치지 않고 사람이 확인할 곳(HA-27). '없음' 꼴(_SC_NONE_LINE)은 버리고 20줄 × 400자까지. _self_check_parse 의 돌려주는
+    꼴은 그대로다."""
     m = _SC_FLAGS.search(out or "")
     flags = []
     for line in (m.group(1).splitlines() if m else []):
         t = line.strip()
         if t.startswith("-"):
             t = t[1:].strip()
-            if t and t not in ("없음", "없음."):
+            if t and not _SC_NONE_LINE.fullmatch(t):
                 flags.append(t[:400])
     return flags[:20]
 
@@ -6195,14 +6234,15 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # _keys 가 한 원소가 되어 그대로다.
         _keys = _persona_keys(req.pinned_agents, req.pinned_agent)
         agent_key = _keys[0] if _keys else ""
-        persona = await _persona_meta(app, req.groups, agent_key) if agent_key else {}
+        # 카탈로그 조회(역할 원문 · 지식카드)는 원문 그릇에 넣지 않는다(_sc_raw_off — HA-27 설계 4.2)
+        persona = await _sc_raw_off(_persona_meta(app, req.groups, agent_key)) if agent_key else {}
         operator = bool(persona.get("operator"))
         op_apps = list(persona.get("apps") or []) if operator else []
         # 보조 전문가 — 운영자는 앱·입구도구를, 도메인 전문가는 역할(판단 기준)을 빌려준다.
         helpers: list[tuple[str, dict]] = []
         helper_apps: list[str] = []
         for _k in _keys[1:]:
-            _m = await _persona_meta(app, req.groups, _k)
+            _m = await _sc_raw_off(_persona_meta(app, req.groups, _k))
             helpers.append((_k, _m))
             if _m.get("operator"):
                 helper_apps.extend(_m.get("apps") or [])
@@ -6385,8 +6425,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             # _sel_q(최근 히스토리 + 현재 발화) 를 쓴다 — 현재 발화만 넣으면 '그럼 더 자세히' 같은
             # 후속 질의에서 관련도가 무너지는 문제가 도구 선별에서 이미 실측됐다.
             yield _sse("status", {"step": f"{agent_key} 지식카드 검색", "tool": "agent_search"})
-            know = await _persona_knowledge(app, req.groups, agent_key, _sel_q)
+            know = await _sc_raw_off(_persona_knowledge(app, req.groups, agent_key, _sel_q))
             if know:
+                _sc_keep_raw(know)       # 모델이 본 발췌는 근거다 — 자기검증 관문이 그 수를 지우는 고침을 버린다(검색 원문은 넣지 않는다)
                 turn_notes += (f"\n\n[{agent_key} 지식카드 — 이번 질문 연관 발췌]\n{know}\n"
                                f"이 발췌는 그 전문가가 실제로 보유한 사내 지식이다. 답변에 해당하는 내용이 "
                                f"있으면 반드시 근거로 인용하되, 발췌에 없는 것을 있는 것처럼 말하지 마라. "

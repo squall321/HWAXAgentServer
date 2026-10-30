@@ -247,3 +247,97 @@ def test_L1_600만_자_원문_색인과_쌍_20개가_10초_안에_끝난다():
     pairs = [(f"값은 {i * 7}.5 이다", f"값은 {i * 7 + 1}.5 이다") for i in range(20)]
     out = g.gate_patches(pairs, idx, draft="\n".join(p[0] for p in pairs))
     assert len(out) == 20 and time.monotonic() - t0 < 10, time.monotonic() - t0
+
+
+# ── 반대 검토 2차(rv2) — 가림 · 날짜 · 차례 · 배수 · 표지 · 수의 경계 · 셈 상한 · 합계 · 색인 차례 ─────────────────────────────────────
+def test_rv2_결과_뒤의_수는_인용_꼴일_때만_가린다():
+    """'해석 결과 312 MPa' 의 312 는 수다 — 종전엔 '결과' 뒤 정수를 거의 다 가려 그 수를 바꾸는 쌍 · 지어낸 수를 더하는 쌍이 넣음이 됐다."""
+    assert [x.key for x in N("해석 결과 312 MPa 로 · 측정 결과 85 dB · 조회 결과 34가지 · 시험 결과 120 N")] == ["312", "85", "34", "120"]
+    assert N("(조회 결과 2) · 조회 결과 1 에 따르면 · 결과 #3 · 조회 결과 2에서 보듯 · 결과 4 참고 · [결과 5]") == [], "인용 꼴은 그대로 가린다"
+    raw, draft = '{"max_stress": 312, "limit": 400}', "해석 결과 312 MPa 로 기준 400 MPa 이내입니다."
+    assert _gate(raw, [("해석 결과 312 MPa", "해석 결과 321 MPa")], draft=draft) == [("drop", "drop_sourced_number", "312")]
+    assert _gate(raw, [("해석 결과 312 MPa 로", "해석 결과 (근거 없음 — 추정) 로")], draft=draft)[0][:2] == ("drop", "drop_sourced_number")
+    assert _gate(raw, [("이내입니다.", "이내입니다(해석 결과 999 MPa).")], draft=draft) == [("demote", "demote_unsourced_number", "999")]
+    assert g.sourced_in("해석 결과 312 MPa 로", g.RawIndex.build([raw])) == {"312"}, "[코드 대조] 도 그 수를 본다"
+
+
+def test_rv2_만_억_천_뒤에_조사가_붙어도_배수다():
+    assert [x.key for x in N("1.2억으로 · 34만에 · 10만을 · 5천만의 · 10만 점")] == ["120000000", "340000", "100000", "50000000", "100000"]
+    assert [x.key for x in N("3만큼 · 3천만큼")] == ["3", "3000"], "'만큼' 만 배수가 아니다"
+    raw = '{"revenue": 120000000, "prev": 95000000}'
+    got = _gate(raw, [("에서 1.2억으로 늘었습니다.", "에서 늘었습니다(근거 없음 — 추정).")], draft="매출은 9,500만 원에서 1.2억으로 늘었습니다.")
+    assert got[0][:2] == ("drop", "drop_sourced_number"), got
+
+
+def test_rv2_날짜와_식별자는_통째로_원문과_견준다():
+    """날짜 조각 03 이 같은 날짜의 13 − 10 · 다른 날짜의 07 로 '셈' 되어 정당한 날짜 고침이 늘 버려졌다(id 도 같다)."""
+    idx = g.RawIndex.build(['{"inspected": "2026-10-13", "created": "2026-09-07", "items": [{"id": "FM-0021", "rpn": 12}]}'])
+    def gate(pairs, draft):
+        return [tuple(d) for d in g.gate_patches(pairs, idx, draft=draft)]
+    assert gate([("점검일은 2026-10-03", "점검일은 2026-10-13")], "점검일은 2026-10-03 입니다.") == [("keep", "keep", "")]
+    assert gate([("점검일은 2026-10-07", "점검일은 2026-10-13")], "점검일은 2026-10-07 입니다.") == [("keep", "keep", "")]
+    assert gate([("2026년 10월 3일", "2026년 10월 13일")], "점검은 2026년 10월 3일이다.") == [("keep", "keep", "")], "꼴이 달라도 같은 날짜다"
+    assert gate([("점검일은 2026-10-13", "점검일은 2026-09-07")], "점검일은 2026-10-13 입니다.") == \
+        [("demote", "demote_removes_value", "2026-10-13")], "원문의 날짜끼리 바꾸면 어느 항목의 날짜인지 모른다 — 짚는다"
+    assert gate([("점검일은 2026-10-13 입니다", "점검일은 입니다")], "점검일은 2026-10-13 입니다.") == [("drop", "drop_sourced_number", "2026-10-13")]
+    assert gate([("점검일은 2026-10-13", "점검일은 2026-10-23")], "점검일은 2026-10-13 입니다.")[0][:2] == ("drop", "drop_sourced_number")
+    assert gate([("점검일 미정", "점검일 2026-11-30")], "점검일 미정.") == [("demote", "demote_unsourced_number", "2026-11-30")]
+    assert gate([("FM-0012 의 RPN", "FM-0021 의 RPN")], "FM-0012 의 RPN 은 12 다.") == [("keep", "keep", "")], "원문의 id 로 고친다"
+    assert gate([("FM-0021 의 RPN", "FM-0099 의 RPN")], "FM-0021 의 RPN 은 12 다.") == [("demote", "demote_removes_value", "FM-0021")]
+    assert gate([("점검일은 2026-10-13", "점검일은 2026-10-13(확인 필요)")], "점검일은 2026-10-13 입니다.")[0][:2] == \
+        ("drop", "drop_marks_sourced"), "원문의 날짜에 의심 표시를 달면 버린다"
+
+
+def test_rv2_한_쌍_안에서_수_값을_서로_바꾸거나_단위만_바꾸면_넣지_않는다():
+    raw = '[{"item": "X-01", "defects": 3, "dept": "품질기술팀"}, {"item": "X-02", "defects": 5, "dept": "신뢰성그룹"}]'
+    got = _gate(raw, [("X-01 불량 3건, X-02 불량 5건", "X-01 불량 5건, X-02 불량 3건")])
+    assert got[0][:2] == ("drop", "drop_sourced_number"), "수의 자리를 바꿨다(다중집합은 그대로)"
+    got = _gate(raw, [("X-01 담당은 품질기술팀, X-02 담당은 신뢰성그룹", "X-01 담당은 신뢰성그룹, X-02 담당은 품질기술팀")])
+    assert got[0][:2] == ("demote", "demote_removes_value"), "원문 값의 자리를 바꿨다(OT-08 의 바꿈 꼴)"
+    st = '{"max_stress": 312.5, "disp": 1.8}'
+    assert _gate(st, [("312.5 MPa", "312.5 kPa")])[0][:2] == ("drop", "drop_sourced_number"), "단위만 바꿔도 그 수를 바꾼 것이다"
+    assert _gate(st, [("변위 1.8 mm", "변위 1.8 cm")])[0][:2] == ("drop", "drop_sourced_number")
+    assert _gate(st, [("응력 312.5", "응력 312.5 MPa")]) == [("keep", "keep", "")], "없던 단위를 다는 것은 바꿈이 아니다"
+    assert _gate(st, [("321.5 MPa", "312.5 MPa")], draft="최대 응력은 321.5 MPa 입니다.") == [("keep", "keep", "")], "정당한 고침은 그대로"
+
+
+def test_rv2_새로_다는_의심_표시도_근거_없음_표지다():
+    for mark in ("(미확인)", "(출처 불명)", "(확인 필요)", "(검증되지 않음)", "(불확실)"):
+        assert _gate('{"limit": 20}', [("기준은 20 이다", f"기준은 20{mark} 이다")])[0][:2] == ("drop", "drop_marks_sourced"), mark
+    assert _gate('{"limit": 25}', [("기준은 20 이다", "기준은 20(미확인) 이다")]) == [("keep", "keep", "")], "원문에 없는 수의 표시는 넣는다"
+
+
+def test_rv2_쌍이_초안의_수_한가운데를_자르면_수의_경계까지_넓혀_본다():
+    raw = '{"total": 34, "pages": 5}'
+    assert _gate(raw, [("4개", "5개")], draft="개발모델은 34개입니다.") == [("drop", "drop_sourced_number", "34")], "답이 35개가 되는 쌍이다"
+    assert _gate(raw, [(".5 MPa", ".7 MPa")], draft="응력은 312.5 MPa 다.") == [("demote", "demote_unsourced_number", "312.7")]
+    idx = g.RawIndex.build(['{"inspected": "2026-10-13"}'])
+    got = [tuple(d) for d in g.gate_patches([("03 입니다", "13 입니다")], idx, draft="점검일은 2026-10-03 입니다.")]
+    assert got == [("keep", "keep", "")], "날짜 한가운데를 자른 쌍은 날짜 통째로 본다"
+    assert _gate(raw, [("개입니다", "개입니다 — 확인")], draft="개발모델은 34개입니다.") == [("keep", "keep", "")], "수 밖에서 시작하면 그대로"
+
+
+def test_rv2_셈_상한을_다_쓰면_지운_수는_나온다로_본다_그리고_줄의_합계():
+    raw = '{"prev": 120, "cur": 150}'
+    draft = "\n".join([f"근거 없는 값 {500 + i}.5 이다." for i in range(45)] + ["직전 120 → 이번 150 (+30)."])
+    pairs = [(f"근거 없는 값 {500 + i}.5 이다.", "") for i in range(45)] + [(" (+30).", ".")]
+    assert _gate(raw, pairs, draft=draft)[-1][:2] == ("drop", "drop_sourced_number"), "셈 상한 뒤의 지움도 보수적으로 — 버린다"
+    assert g.derivable(num("47"), [34.0, 13.0], [0], spent=True) and not g.derivable(num("47"), [34.0, 13.0], [0])
+    rows = '{"rows": [{"line": "A", "n": 120}, {"line": "B", "n": 135}, {"line": "C", "n": 148}]}'
+    d2 = "A 120 · B 135 · C 148, 합계 403건입니다."
+    assert _gate(rows, [(", 합계 403건입니다.", "입니다.")], draft=d2)[0][:2] == ("drop", "drop_sourced_number"), "셋 이상의 합계"
+    assert _gate(rows, [("C 148,", "C 148, 합계 403건,")], draft="A 120 · B 135 · C 148, 끝.") == [("keep", "keep", "")], "줄의 합계를 더하는 고침"
+    assert g.summed(num("250"), [120, 135, 148, 7]) is False and g.summed(num("403"), [120, 135, 148, 7]), "넷이면 하나 뺀 합도"
+
+
+def test_rv2_덧붙인_근거를_먼저_넣어_상한에_차도_사람이_말한_수는_근거다(monkeypatch):
+    monkeypatch.setattr(g, "NUMS_MAX", 2_000)
+    field = json.dumps({"node_stress": [round(i * 0.013, 4) for i in range(3_000)]})
+    idx = g.RawIndex.build(['{"max_stress": 312.5}', field], ["허용 응력 275.5 기준으로"])
+    assert idx.partial and idx.has(275.5, strong=True) and idx.has(312.5), "앞에 둔 글 · 사람 발화는 상한에 걸려도 남는다"
+
+
+def test_rv2_원문_식별자_훑기는_긴_영숫자에서도_선형이다():
+    t0 = time.monotonic()
+    idx = g.RawIndex.build(['{"blob": "' + "a1" * 200_000 + '", "id": "FM-0012"}'])
+    assert time.monotonic() - t0 < 5 and idx.has_unit("i:fm-0012")
