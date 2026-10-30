@@ -5610,8 +5610,8 @@ def _self_check_on() -> bool:
 
 
 # ── 자기검증 관문(HWAXPortal docs/request-1030 HA-27) — 검토자의 바꿀 곳을 넣기 전에 이번 턴 도구 결과 원문(접기 · 자르기 전)과 다시 대조해
-# 넣음 · 짚음 · 버림을 정한다(sc_gate). 원문은 _cap_tool.capped 의 R5 가 턴 그릇에 붙잡는다. 손잡이 둘은 CHAT_SELF_CHECK 처럼 턴마다 읽는다
-# (재기동이 필요 없다) — CHAT_SELF_CHECK_GATE 1(수 + 원문 값) · num(수만 — OT-08 줄 끔) · 0(끔 — 원문을 붙잡지 않고 바꿀 곳을 종전대로 다 넣는다),
+# 넣음 · 짚음 · 버림을 정한다(sc_gate). 원문은 _cap_tool.capped 의 R5 가 턴 그릇에 붙잡는다. 손잡이 둘은 CHAT_SELF_CHECK 처럼 턴마다 프로세스 환경을
+# 읽지만 .env 는 start.sh 가 기동 때 한 번 싣는다 — 박스에서 바꾸면 재기동해야 먹는다 — CHAT_SELF_CHECK_GATE 1(수 + 원문 값) · num(수만 — OT-08 줄 끔) · 0(끔 — 원문을 붙잡지 않고 바꿀 곳을 종전대로 다 넣는다),
 # CHAT_SELF_CHECK_RAW_CHARS 턴마다 붙잡는 원문 합(자, 0 이면 붙잡지 않고 모델 사본으로만 대조).
 _SC_RAW_ITEM = 2_000_000          # 결과 하나에서 붙잡는 원문(자) — CATALOG_RESULT_MAX 와 같은 크기
 _SC_EXTRA_CHARS = 1_000_000       # 덧붙인 근거(사람 발화 · 붙인 문서 · 이력)의 합(자)
