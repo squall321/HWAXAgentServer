@@ -1876,6 +1876,11 @@ def _chat_result_note(name: str) -> tuple[str, str]:
     return head, tail + "]"
 
 
+def _refuse(tool, msg: str):
+    """막은 · 실패한 호출의 반환 — content_and_artifact 도구는 2-튜플을 요구한다(실측). `capped` 의 관문 걸음과 호출 실패가 함께 쓴다."""
+    return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
+
+
 def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     """도구 결과를 절단해 LLM 컨텍스트를 보호한다 — 대량 조회(예: VOC 수천 건)가 그대로
     프롬프트에 들어가면 'maximum context length' 400 으로 채팅이 죽는다(실측 16385/16384).
@@ -1931,7 +1936,10 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         return s
 
     async def capped(*a, **kw):
-        # 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
+        # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
+        # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G3 유령 ID →
+        # G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
+        # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
             for _args in (kw, *(x for x in a if isinstance(x, dict))):
@@ -1946,9 +1954,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                         print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
                         msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
                                "워크플로만 쓴다 — 이 대화의 에이전트는 부를 수 없다. 인자 문제가 아니다 — 다시 부르지 마라")
-                    return ((msg, None)
-                            if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
-        # 외부 응답자 심의는 사람의 클라이언트에서만 연다(X-D6) — 심의 시작·이어하기에 외부 선택(advanced.llm=external)이나 반출 동의
+                    return _refuse(tool, msg)
+        # ── G2 외부 응답자 심의는 사람의 클라이언트에서만 연다(X-D6) — 심의 시작·이어하기에 외부 선택(advanced.llm=external)이나 반출 동의
         # 칸(consent_external)을 실은 호출은 보내지 않는다. 직접 묶인 그 도구로도, invoke_tool 의 안쪽 이름으로도 같다.
         _via_inv = getattr(tool, "name", "") == "invoke_tool"
         for _args in (kw, *(x for x in a if isinstance(x, dict))):
@@ -1961,9 +1968,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                        "(consent_external)는 사람이 자기 클라이언트에서 고른다 — 이 대화의 에이전트는 그 칸을 실을 수 없어 이 호출은 "
                        "보내지 않았다. 사용자가 외부 응답자 심의를 원하면 리스크 앱이나 자기 Claude Code 에서 직접 열라고 알려라. 인자 "
                        "문제가 아니다 — 그 칸을 실어 다시 부르지 마라")
-                return ((msg, None)
-                        if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
-        # 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
+                return _refuse(tool, msg)
+        # ── G3 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
         if src is not None:
@@ -1980,8 +1986,9 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                            f"list_*/search_* 도구로 이름을 조회해 ID 를 확인한 뒤 다시 호출하라. "
                            f"조회할 때는 이름 조각만 넣고 필터는 지어내지 마라 — 결과가 비면 "
                            f"필터를 빼고 더 짧은 조각으로 다시 찾아라.")
-                    return ((msg, None)
-                            if getattr(tool, "response_format", "") == "content_and_artifact" else msg)
+                    return _refuse(tool, msg)
+        # ── G4 다른 허브 id(HA-30) · G5 확인 카드(HA-29) 자리
+        # ── G6 챗 인자 기본값
         if _own:
             for _k, _v in _own[0].items():
                 kw.setdefault(_k, _v)
@@ -1998,6 +2005,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                     kw["arguments"] = json.dumps({**_inner_def, **_parsed}, ensure_ascii=False)
             elif _inner_def and (_ia is None or isinstance(_ia, dict)):
                 kw["arguments"] = {**_inner_def, **(_ia or {})}
+        # ── C 호출 — 예외면 ✖ 글로 끝난다(아래 R 걸음을 타지 않는다)
         try:
             out = await orig(*a, **kw)
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
@@ -2044,20 +2052,24 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                 msg += ("\n[안내] 인자 문제가 아니라 도구 백엔드 연결/시간초과다. "
                         "같은 도구를 인자만 바꿔 다시 호출하지 말고, 다른 방법으로 답하거나 "
                         "사용자에게 해당 백엔드가 일시적으로 불가하다고 알려라.")
-            # response_format 계약 준수 — content_and_artifact 도구는 2-튜플을 요구한다(실측).
-            return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
-        # 접기 · 앱 머리 · 되풀이 꼬리는 경유(invoke_tool)면 안쪽 도구 이름으로 본다
+            return _refuse(tool, msg)
+        # ── R1 접기 · 앱 머리 · 되풀이 꼬리는 경유(invoke_tool)면 안쪽 도구 이름으로 본다
         _eff = getattr(tool, "name", "")
         if _eff == "invoke_tool" and isinstance(kw.get("name"), str):
             _eff = kw["name"]
+        # ── R2 상태 기다림(HA-28) 자리
+        # ── R3 앱 머리 · 되풀이 꼬리
         _head, _tail = _chat_result_note(_eff) if chat else ("", "")
-        if isinstance(out, tuple) and len(out) == 2:  # (content, artifact) 형식 보존
-            body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, _norm(out[0]), _via_inv), result_max))
-            _learn_ids(body)
-            return (_head + body + _tail, out[1])
-        body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, _norm(out), _via_inv), result_max))
+        # ── R4 (content, artifact) 꼴이면 글만 다루고 artifact 는 그대로 돌려준다 — 한 갈래
+        _pair = isinstance(out, tuple) and len(out) == 2
+        raw = _norm(out[0] if _pair else out)
+        # ── R5 원문 붙잡기(HA-27) 자리
+        # ── R6 접기 → 자르기 → 인자 힌트
+        body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, raw, _via_inv), result_max))
+        # ── R7 id 배우기
         _learn_ids(body)
-        return _head + body + _tail
+        # ── R8 머리 + 본문 + 꼬리
+        return (_head + body + _tail, out[1]) if _pair else _head + body + _tail
 
     tool.coroutine = capped
     return tool
@@ -4940,6 +4952,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         _seed_ids |= _int_tokens(_hc)
     _turn_ids.set(_seed_ids)
     _turn_tool_calls.set(Counter())
+    # ── 10-30 턴 상태 자리 — 재촉 → 이어하기가 req.message 를 바꾸기 전에 건다(HA-30 · HA-28 · HA-29 · HA-27, design-integration 3절)
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
     # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
