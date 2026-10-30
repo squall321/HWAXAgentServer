@@ -105,6 +105,7 @@ from thinking import is_thinking, run_thinking, strip_thinking_trigger
 import call_trace as _call_trace
 import external_llm as _external_llm
 import vision as _vision
+import sc_gate as _sc_gate   # 자기검증 관문 — 바꿀 곳을 이번 턴 도구 결과 원문과 다시 대조한다(HWAXPortal docs/request-1030 HA-27)
 import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 — 이름으로 가져오면 엔진을 다시 읽은 뒤(시험의 reload) 다른 문맥 변수를 쥔다
 import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
@@ -2324,7 +2325,9 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # ── R4 (content, artifact) 꼴이면 글만 다루고 artifact 는 그대로 돌려준다 — 한 갈래
         _pair = isinstance(out, tuple) and len(out) == 2
         raw = _norm(out[0] if _pair else out)
-        # ── R5 원문 붙잡기(HA-27) 자리
+        # ── R5 원문 붙잡기(HA-27) — 접기 · 자르기 전 원문을 이번 챗 턴 그릇에(턴 밖 · 관문 끔이면 아무것도 안 한다). 자기검증 관문이 검토자의
+        # 바꿀 곳을 이 원문과 다시 대조한다 — 검토자 사본은 아래 접기 · 상한을 지나 원문의 수가 빠져 있었다(OT-04 34 → 13).
+        _sc_keep_raw(raw)
         # ── R6 접기 → 자르기 → 인자 힌트
         body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, raw, _via_inv), result_max))
         # ── R7 id 배우기 — 정수(유령 ID 막이) · UUID → 허브(HA-30, 모델이 보는 글에서 · 경유면 안쪽 이름으로)
@@ -4482,13 +4485,14 @@ def _handoff_text(v) -> str:
 def _turn_out_add(turn_out: list, txt: str) -> None:
     """결정문·답변 수치 대조의 원문(turn_out)에 도구 결과를 싣는다. 좁은 창은 종전대로 결과마다 앞 120,000자·합
     400,000자, 넓은 창은 결과를 자르지 않고(모델이 본 그대로 — _cap 이 이미 TOOL_RESULT_MAX 로 묶었다) 합은 창이
-    담는 글자 수까지다. 종전엔 모델이 200,000자까지 본 결과의 뒤쪽 수치가 '출처 없음' 으로 찍혔다."""
+    담는 글자 수까지다. 종전엔 모델이 200,000자까지 본 결과의 뒤쪽 수치가 '출처 없음' 으로 찍혔다.
+    좁은 창에서 자른 결과에는 원문 길이 표지(_cut_mark)를 단다 — 자기검증 검토자가 그 결과 머리에 '(잘림 — 근거 몫' 을 본다(HA-27)."""
     if _wide():
         item, total = 0, max(400_000, int(_model_context_tokens() * 1.05))
     else:
         item, total = 120_000, 400_000
     if sum(len(x) for x in turn_out) < total:
-        turn_out.append(txt[:item] if item else txt)
+        turn_out.append(_cut_mark(txt, item) if item else txt)
 
 # 붙인 문서(추출문) 주입 예산. 원본 파일은 오지 않는다 — DRM 문서는 그 PC 에서만 복호화되므로
 # 추출은 사용자 PC 의 Office COM 에서 끝난다(HWAXPortal docs/doc-deliberate).
@@ -5313,35 +5317,150 @@ _DRAFT_HEAD = "\n\n— 초안(검증 전) —\n"
 _CHECK_HEAD = "\n\n— 검증 —\n"
 _SELF_CHECK_SYS = ("당신은 답변 검토자입니다. 어시스턴트가 쓴 답 초안을 근거와 대조해 틀린 곳만 고칩니다. 근거는 아래 [사용자 질문] · "
                    "[이번 턴 조회 결과] · [붙인 문서] · [앞 대화] 뿐입니다 — 근거에 없는 사실을 새로 지어 넣지 않습니다. 한국어로 씁니다.")
+# ② 줄 — 도구 · 문서가 있는 턴에만 실린다(아래 _SELF_CHECK_ASK_NO_EVIDENCE 가 통째로 바꿔 끼운다 — 그래서 ASK 는 이 줄을 그대로 잇는다).
+# 10-30 재시험에서 검토자가 사본에서 잘린 수를 '근거 없음' 으로 읽고 맞는 초안 값을 지웠고(OT-09 · DW-05), 보이는 항목을 세어 total 을
+# 고쳤다(OT-04) — 조회 결과의 값은 지우지 말고, 잘린 결과에서 온 값은 짚기만 하라고 밝힌다(HWAXPortal docs/request-1030 HA-27 ③).
+# _SC_CUT_WORD 는 잘린 결과의 머리(_sc_result_head)와 이 줄이 함께 쓰는 낱말이다 — 한쪽만 바꾸면 지시가 가리키는 머리가 없어진다.
+_SC_CUT_WORD = "(잘림"
+_SC_ASK_EVIDENCE_LINE = (
+    "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라. 조회 결과에 "
+    f"나오는 수치 · 값은 지우지도 '근거 없음' 으로 바꾸지도 마라. 머리에 '{_SC_CUT_WORD}' 이 붙은 결과는 뒷부분을 보지 못한 것이다 — 그 결과에서 온 "
+    "수치 · 개수 · 항목의 값은 틀려 보여도 [바꿀 곳] 에 쓰지 말고 [짚은 점] 에만 적어라. 개수 · 합계는 total · count 같은 칸으로 확인하고 "
+    "보이는 항목을 세어 고치지 마라. [새 글] 에 새로 쓰는 수치는 조회 결과에 있는 값이나 그 값들의 합 · 차 · 비율만 쓴다.\n")
 _SELF_CHECK_ASK = (
     "다음을 검토하라.\n"
     "① 질문의 모든 부분에 답했나 — 빠진 부분을 근거로 답할 수 있으면 채우고, 없으면 '근거가 없어 답하지 못했다' 고 밝혀라.\n"
-    "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라.\n"
-    "③ 근거와 어긋나는 말 — 근거대로 고쳐라.\n"
+    + _SC_ASK_EVIDENCE_LINE +
+    "③ 근거와 어긋나는 말 — 근거대로 고쳐라. 어느 항목의 값(부서 · 담당 · 상태 · 이름)을 바꿀 때는 같은 결과의 그 항목 행에서 확인한 것만 "
+    "고치고, 아니면 [짚은 점] 에 적어라.\n"
     "④ 계산 · 단위 — 다시 계산해 틀리면 고쳐라.\n"
     "⑤ 조회해 놓고 빠뜨린 중요한 결과 — 답에 더하라.\n"
     "고칠 곳만 고치고 나머지는 글자 그대로 둔다. 말투 · 형식(표 · 목록 · 그림 링크 ![…](…) · 출처 표기)을 바꾸지 마라. 근거가 잘려 있으면"
     "(…[N자 중 앞 M자]) 그 뒤에 있을 수 있는 내용은 지우지 말고 그대로 둔다.\n\n"
     "아래 꼴로만 답하라. 고친 답 전체를 다시 쓰지 마라 — 바꿀 곳만 적으면 초안에 넣어 준다.\n"
     "[판정] 고칠 것 없음  또는  [판정] 고침\n"
-    "[고친 점]\n- 한 줄에 하나(무엇을 왜 — 근거). 고칠 것이 없으면 '- 없음'\n"
+    "[고친 점]\n- [바꿀 곳] 의 쌍마다 한 줄, 같은 차례로(무엇을 왜 — 근거). 고칠 것이 없으면 '- 없음'\n"
+    "[짚은 점](고치지 않고 사람이 확인할 곳이 있을 때만 쓴다. 고칠 것 없이 짚기만 하면 [판정] 고칠 것 없음 과 이 칸만 쓴다)\n"
+    "- 한 줄에 하나(무엇이 왜 의심스러운가 — 근거)\n"
     "[바꿀 곳](고칠 것이 없으면 이 칸을 쓰지 않는다. 바꿀 곳마다 [원문] · [새 글] 한 쌍을 쓴다)\n"
     "[원문]\n초안의 글을 글자 그대로(초안에 한 번만 나오도록 앞뒤 낱말을 조금 넣는다)\n"
     "[새 글]\n그 글을 고친 것(지우려면 비워 둔다. 더하려면 원문을 그대로 쓰고 그 뒤에 이어 쓴다)")
 # 조회 결과도 붙인 문서도 없는 턴 — ② 를 '일반 지식 수치는 표시하지 않는다' 로 바꾼다. 위 ② 를 그대로 주면 '도구 없는 턴' 머리(① ③ ④ 만
 # 본다)와 어긋나, 검토자가 일반 지식 수치마다 '(근거 없음 — 추정)' 을 달고 '고침' 으로 판정했다(HWAXPortal docs/request-1027 HA-12).
-_SC_ASK_EVIDENCE_LINE = "② 수치 · 사실이 근거에 있나 — 근거에 없는 수치는 지우거나 '(근거 없음 — 추정)' 으로 표시하라. [코드 대조] 목록을 먼저 보라.\n"
 _SELF_CHECK_ASK_NO_EVIDENCE = _SELF_CHECK_ASK.replace(
     _SC_ASK_EVIDENCE_LINE,
     "② 이번 턴에는 대조할 조회 결과 · 붙인 문서가 없다 — 일반 지식으로 쓴 수치 · 사실에 표시를 달지 말고 지우지도 마라"
     "(앞 대화와 어긋나는 것만 ③ 으로 고친다).\n")
+# 관문이 켜져 있고 도구를 부른 턴에만 맨 끝에 — 꺼져 있으면 사실이 아니라 싣지 않는다(HA-27). num 은 원문 값 줄을 끈 꼴이라 그 말을 뺀다.
+_SC_ASK_GATE_LINE = ("서버가 [바꿀 곳] 의 쌍을 조회 결과 원문(자르기 전)과 다시 대조한다 — 원문에 있는 수치를 지우거나 '근거 없음' 으로 바꾸는 "
+                     "쌍은 버리고, 원문에서 확인되지 않는 새 수치나 원문 값을 바꾸는 쌍은 넣지 않고 짚은 곳으로 돌린다.")
+_SC_ASK_GATE_LINE_NUM = _SC_ASK_GATE_LINE.replace("새 수치나 원문 값을 바꾸는 쌍은", "새 수치를 쓰는 쌍은")
 _SC_VERDICT = re.compile(r"\[판정\]\s*([^\n]*)")
-_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[바꿀 곳\]|\Z)", re.S)
+_SC_FIXES = re.compile(r"\[고친 점\][^\n]*\n(.*?)(?=\n\s*\[(?:바꿀 곳|짚은\s*점)\]|\Z)", re.S)
+# [짚은 점] — 고치지 않고 사람이 볼 곳(HA-27). [바꿀 곳] 앞이든 뒤든 읽고, 쌍의 [새 글] 은 이 머리 앞에서 끊는다(새 글에 섞이지 않게).
+_SC_FLAGS = re.compile(r"\[짚은\s*점\][^\n]*\n(.*?)(?=\n\s*\[(?:바꿀 곳|고친 점|판정|원문)\]|\Z)", re.S)
+_SC_NEW_END = re.compile(r"\n\s*\[(?:짚은\s*점|고친 점|판정)\]")
 _SC_IMG = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
 def _self_check_on() -> bool:
     return os.environ.get("CHAT_SELF_CHECK", "1") != "0"
+
+
+# ── 자기검증 관문(HWAXPortal docs/request-1030 HA-27) — 검토자의 바꿀 곳을 넣기 전에 이번 턴 도구 결과 원문(접기 · 자르기 전)과 다시 대조해
+# 넣음 · 짚음 · 버림을 정한다(sc_gate). 원문은 _cap_tool.capped 의 R5 가 턴 그릇에 붙잡는다. 손잡이 둘은 CHAT_SELF_CHECK 처럼 턴마다 읽는다
+# (재기동이 필요 없다) — CHAT_SELF_CHECK_GATE 1(수 + 원문 값) · num(수만 — OT-08 줄 끔) · 0(끔 — 원문을 붙잡지 않고 바꿀 곳을 종전대로 다 넣는다),
+# CHAT_SELF_CHECK_RAW_CHARS 턴마다 붙잡는 원문 합(자, 0 이면 붙잡지 않고 모델 사본으로만 대조).
+_SC_RAW_ITEM = 2_000_000          # 결과 하나에서 붙잡는 원문(자) — CATALOG_RESULT_MAX 와 같은 크기
+_SC_EXTRA_CHARS = 1_000_000       # 덧붙인 근거(사람 발화 · 붙인 문서 · 이력)의 합(자)
+_SC_NOTE_MAX, _SC_NOTE_CHARS = 20, 300      # meta 의 flags · dropped 줄 수 · 줄 길이
+# 이번 챗 턴의 원문 그릇 {texts, chars, partial} — _turn_ids 와 같은 꼴(턴이 그릇을 걸고 도구 코루틴이 그 그릇에 넣는다). None 이면 붙잡지 않는다
+# (자기검증 끔 · 관문 끔 · 심의 · 띵킹 · 루틴 · 카탈로그 — 이 함수를 지나지 않는 길).
+_turn_sc_raw: contextvars.ContextVar = contextvars.ContextVar("turn_sc_raw", default=None)
+
+
+def _sc_gate_mode() -> str:
+    v = (os.environ.get("CHAT_SELF_CHECK_GATE", "1") or "1").strip().lower()
+    return "0" if v == "0" else "num" if v == "num" else "1"
+
+
+def _sc_raw_cap() -> int:
+    try:
+        return max(0, int(os.environ.get("CHAT_SELF_CHECK_RAW_CHARS", "6000000") or 6_000_000))
+    except ValueError:
+        return 6_000_000
+
+
+def _sc_raw_box() -> dict | None:
+    return {"texts": [], "chars": 0, "partial": False} if _sc_gate_mode() != "0" and _sc_raw_cap() > 0 else None
+
+
+def _sc_keep_raw(raw) -> None:
+    """도구 결과 원문을 이번 턴 그릇에 — 턴 합 _sc_raw_cap() · 결과 하나 _SC_RAW_ITEM 자까지(넘으면 앞부분 + partial). 병렬 도구 코루틴은 같은
+    이벤트 루프에서 await 없이 더하므로 자물쇠가 필요 없다. 자르지 않는 한 이미 메모리에 있던 글의 참조다."""
+    box = _turn_sc_raw.get()
+    if box is None:
+        return
+    s = raw if isinstance(raw, str) else str(raw)          # _cap 과 같은 문자열화
+    room = _sc_raw_cap() - box["chars"]
+    if room <= 0:
+        box["partial"] = True
+        return
+    take = min(room, _SC_RAW_ITEM)
+    if len(s) > take:
+        s, box["partial"] = s[:take], True
+    box["texts"].append(s)
+    box["chars"] += len(s)
+
+
+# 모델 사본에 코드가 붙인 절단 표지 — 그 수(자 수)는 근거가 아니다. 색인 전에 뗀다.
+_SC_CAP_LINE = re.compile(r"\n" + re.escape(_CAP_MARK) + r"[^\n]*")
+_SC_CUT_TAIL = re.compile(r" …\[[0-9,]+자 중 앞 [0-9,]+자\]$")
+
+
+def _sc_index(req: ChatRequest, outputs: list, raw: dict | None):
+    """원문 색인(sc_gate.RawIndex) — 그릇의 원문 + 모델 사본(그릇이 빈 턴 · 상한을 넘긴 결과 · 사본에만 있는 코드 글) + 덧붙인 근거(사람 발화 ·
+    붙인 문서 · 이력의 사람 발화 · 근거 블록이 있는 어시스턴트 발화 · 이력의 도구 결과, 합 _SC_EXTRA_CHARS). 실패한 결과(_result_ok 가 거짓 —
+    ✖ 거절 · 실패 봉투 · 유령 ID)는 근거가 아니라 뺀다(design-integration C-13). 근거 블록 없는 어시스턴트 발화는 넣지 않는다 — 유령 ID 씨앗과
+    같은 까닭(지어낸 수가 다음 턴의 근거가 되는 세탁 길)."""
+    texts = [t for t in (raw or {}).get("texts") or [] if _result_ok(t)]
+    for o in outputs:
+        o = o if isinstance(o, str) else str(o)
+        body = _sc_gate.strip_heads(o)            # 앱 머리 뒤의 실패 봉투도 본다(머리가 있으면 _result_ok 가 첫 줄로 머리를 읽는다)
+        if not (_result_ok(body) and (body is o or _result_ok(o))):
+            continue
+        if _CAP_MARK in o:
+            o = _SC_CAP_LINE.sub("", o)
+        texts.append(_SC_CUT_TAIL.sub("", o) if o.endswith("자]") else o)
+    extra: list[str] = []
+    room = _SC_EXTRA_CHARS
+
+    def add(t) -> None:
+        nonlocal room
+        t = str(t or "")
+        if t and room > 0:
+            extra.append(t[:room])
+            room -= min(len(t), room)
+    add(req.message)
+    for d in req.documents or []:
+        if isinstance(d, dict):
+            add(d.get("text"))
+    for h in reversed(req.history or []):               # 최근 것부터 — 몫이 모자라면 오래된 것이 빠진다
+        if not isinstance(h, dict):
+            continue
+        c = str(h.get("content") or "")
+        if h.get("role") == "user" or (h.get("role") == "assistant" and _EVIDENCE_MARK in c):
+            add(c)
+        for e in (h.get("evidence") if isinstance(h.get("evidence"), list) else []):
+            if isinstance(e, dict):
+                add(e.get("result"))
+    return _sc_gate.RawIndex.build(texts, extra, partial=bool((raw or {}).get("partial")))
+
+
+def _sc_prepare(req: ChatRequest, draft: str, calls: list, outputs: list, raw: dict | None, mode: str):
+    """검토자 입력과 원문 색인 — 스레드 한 번(관문 계산이 이벤트 루프를 막지 않게). 관문은 켜져 있고 도구를 부른 턴에만 선다(Q11)."""
+    idx = _sc_index(req, outputs, raw) if calls and mode != "0" else None
+    return _self_check_messages(req, draft, calls, outputs, idx), idx
 
 
 # 자기검증 런타임 — /health 의 self_check(HWAXPortal docs/request-1027 HA-13). 운영자가 검토자의 실패 · 지연을 알 길이 없었다.
@@ -5352,6 +5471,11 @@ _SC_STAT: dict = {"counts": Counter(), "ms": [], "last_error": None}
 _SC_MS_KEEP = 200
 
 
+# 관문 계수(HA-27) — 관문이 돈 턴 · 그 가운데 검토자가 '고침' 이라 한 턴(관문 앞의 버릇 — 지시 ③ 의 효과) · 원문이 상한에 걸린 턴 · 쌍 단위의
+# 코드별 수. 턴 상태(counts)는 관문 뒤의 결과로 센다 — 그래야 fixed_ratio 가 '답이 실제로 바뀐 턴' 이다.
+_SC_GATE_KEYS = ("applied", *_sc_gate.CODES, "reviewer_flags")
+
+
 def _sc_record(check: dict) -> None:
     st = str(check.get("status") or "?")
     with _SC_LOCK:
@@ -5360,15 +5484,31 @@ def _sc_record(check: dict) -> None:
             _SC_STAT["ms"] = (_SC_STAT["ms"] + [check["ms"]])[-_SC_MS_KEEP:]
         if st in ("failed", "unreadable", "suspect"):
             _SC_STAT["last_error"] = {"status": st, "reason": str(check.get("reason") or "")[:200], "at": int(time.time())}
+        g = check.get("gate")
+        if isinstance(g, dict):
+            # 시험이 _SC_STAT 를 gate 칸 없이 바꿔 끼운다(HA-13) — 없으면 만든다
+            agg = _SC_STAT.setdefault("gate", {"turns": 0, "reviewer_fixed": 0, "raw_partial": 0, "counts": Counter()})
+            agg["turns"] += 1
+            agg["reviewer_fixed"] += int(bool(g.get("reviewer_fixed")))
+            agg["raw_partial"] += int(bool(g.get("raw_partial")))
+            for k in _SC_GATE_KEYS:
+                agg["counts"][k] += int(g.get(k) or 0)
 
 
 def _sc_health() -> dict:
     with _SC_LOCK:
         counts, ms, last = dict(_SC_STAT["counts"]), sorted(_SC_STAT["ms"]), _SC_STAT["last_error"]
+        g = _SC_STAT.get("gate") or {}
+        gate = {"mode": _sc_gate_mode(), "turns": int(g.get("turns", 0)), "reviewer_fixed": int(g.get("reviewer_fixed", 0)),
+                "raw_partial": int(g.get("raw_partial", 0)),
+                "counts": {k: int((g.get("counts") or {}).get(k, 0)) for k in _SC_GATE_KEYS}}
 
     def pct(q: float):
         return ms[min(len(ms) - 1, int(round(q * (len(ms) - 1))))] if ms else None
-    return {"on": _self_check_on(), "counts": counts, "ms": {"n": len(ms), "p50": pct(0.5), "p95": pct(0.95)}, "last_error": last}
+    # fixed 비율 — 검증한 턴(건너뛴 것 빼고) 가운데 답이 실제로 바뀐 턴. 셀 턴이 없으면 None(HA-27 — 재시험이 이 값이 내려가는지 본다)
+    den = sum(counts.values()) - counts.get("skipped", 0)
+    return {"on": _self_check_on(), "counts": counts, "ms": {"n": len(ms), "p50": pct(0.5), "p95": pct(0.95)}, "last_error": last,
+            "fixed_ratio": round(counts.get("fixed", 0) / den, 3) if den > 0 else None, "gate": gate}
 
 
 def _sse_parse(frame) -> tuple[str, dict]:
@@ -5451,24 +5591,61 @@ def _sc_shares(need: dict, room: int) -> dict:
         got.update({k: need[k] for k in fit})
 
 
-def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: list) -> list:
+_SC_RES_HEAD = 16      # 결과 머리 줄 몫(토큰) — 잘림 머리는 더 길지만 room 의 여유(2,000)가 받는다
+
+
+def _sc_fit_results(outputs: list, tokens: int) -> list[tuple[str, bool]]:
+    """조회 결과를 결과마다 몫을 나눠 담는다(물 채우기) → [(실을 글, 이 함수가 줄였나)], 들어온 차례대로. 합이 몫 안이면 그대로, 넘치면 필요량
+    (_est_tokens_all + 머리 몫)이 작은 결과부터 min(필요량, 남은 몫 ÷ 남은 결과 수) 를 주고, 모자란 결과만 앞부분으로 줄인다(_cut_mark 표지).
+    종전엔 이어 붙인 글 전체를 앞에서 잘라 앞 결과가 몫을 다 먹으면 뒤 결과가 통째로 빠지고 표지는 끝에 하나뿐이었다(HA-27)."""
+    need = [_est_tokens_all(o) + _SC_RES_HEAD for o in outputs]
+    if sum(need) <= tokens:
+        return [(o, False) for o in outputs]
+    got = [0] * len(outputs)
+    left = max(0, tokens)
+    order = sorted(range(len(outputs)), key=lambda i: need[i])
+    for n, i in enumerate(order):
+        got[i] = min(need[i], left // (len(order) - n))
+        left -= got[i]
+    return [(o, False) if got[i] >= need[i] else (_sc_fit(o, max(1, got[i] - _SC_RES_HEAD)), True) for i, o in enumerate(outputs)]
+
+
+def _sc_result_head(i: int, out: str, cut: bool) -> str:
+    """결과 머리 — 잘렸으면 까닭을 밝힌다(줄이기 전 사본에서 가린다). _SC_CUT_WORD 는 지시 ②(_SC_ASK_EVIDENCE_LINE)가 가리키는 낱말이다."""
+    why = []
+    if _CAP_MARK in out:
+        why.append("도구 결과 상한")
+    if "[포털 챗이 허브 응답을 접었다" in out[:400]:
+        why.append("허브 응답 접기")
+    if _SC_CUT_TAIL.search(out[-64:]):
+        why.append("근거 몫")
+    if cut:
+        why.append("검토 몫")
+    return f"─ 결과 {i} {_SC_CUT_WORD} — {' · '.join(why)}: 뒷부분은 보이지 않는다) ─" if why else f"─ 결과 {i} ─"
+
+
+def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: list, idx=None) -> list:
     """검토자 입력 — 이 턴의 창(_model_context_tokens — 챗 턴은 두 서버 중 작은 창) 안에서. 고친 답을 쓸 출력 몫을 먼저 떼고, 남는 몫에
-    다 들면 그대로, 넘치면 조회 결과 55% · 붙인 문서 25% · 앞 대화 20% 로 나눈다(쓰지 않는 몫은 넘치는 쪽으로 — _sc_shares)."""
+    다 들면 그대로, 넘치면 조회 결과 55% · 붙인 문서 25% · 앞 대화 20% 로 나눈다(쓰지 않는 몫은 넘치는 쪽으로 — _sc_shares). 조회 결과는
+    결과마다 몫을 나누고 잘린 결과의 머리에 까닭을 밝힌다. idx(원문 색인 — HA-27)가 있으면 [코드 대조] 에서 원문에 있거나 원문 값의 셈으로
+    나오는 수를 뺀다(원문에는 있는데 사본에서 잘린 수가 '출처 없는 수' 로 가서 검토자를 '지우기' 쪽으로 밀었다)."""
     win = _model_context_tokens()
     out_room = _SC_OUT_CAP                   # 검토자 호출에 보내는 출력 상한 그대로 — 입력 + 상한이 창에 들어야 한다
     room = max(3000, win - out_room - _est_tokens_all(_SELF_CHECK_SYS + _SELF_CHECK_ASK) - _est_tokens_all(draft) - 2000)
     q = _sc_fit(req.message or "", max(500, room // 10))
     room -= _est_tokens_all(q)
-    res = "\n\n".join(f"─ 결과 {i} ─\n{o}" for i, o in enumerate(outputs, start=1)) if calls else ""
+    res_need = sum(_est_tokens_all(o) + _SC_RES_HEAD for o in outputs) if calls else 0
     docs = [d for d in (req.documents or []) if isinstance(d, dict) and str(d.get("text") or "").strip()]
     dtext = "\n\n".join(f"── {str(d.get('name') or '문서')[:200]} ──\n{d.get('text')}" for d in docs)
     hist = _history_messages(req.history)[-8:]
-    cap = _sc_shares({"res": _est_tokens_all(res), "doc": _est_tokens_all(dtext),
+    cap = _sc_shares({"res": res_need, "doc": _est_tokens_all(dtext),
                       "hist": sum(_est_tokens_all(f"어시스턴트: {c}") for _r, c in hist)}, room)
     blocks = [f"[사용자 질문]\n{q}"]
     if calls:
         lines = [f"{i}. {n}{f'({a})' if a else ''}" for i, (n, a) in enumerate(calls, start=1)]
-        blocks.append("[이번 턴 조회 결과]\n" + "\n".join(lines) + ("\n\n" + _sc_fit(res, cap["res"]) if res else ""))
+        res = "\n\n".join(f"{_sc_result_head(i, o, cut)}\n{f}"
+                          for i, (o, (f, cut)) in enumerate(zip(outputs, _sc_fit_results(outputs, cap["res"])), start=1))
+        blocks.append("[이번 턴 조회 결과]\n" + "\n".join(lines) + ("\n\n" + res if res else ""))
     else:
         blocks.append("[이번 턴 조회 결과]\n(이번 턴에는 도구를 부르지 않았다 — 근거 대조는 붙인 문서 · 앞 대화로만 한다. 일반 지식으로 쓴 설명은 "
                       "지우지 말고, ① 빠진 물음 ③ 앞뒤가 어긋나는 말 ④ 계산 · 단위만 본다)")
@@ -5480,6 +5657,9 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
     if req.images or _vision.history_images(req.history):
         blocks.append("[그림]\n이 턴에는 그림이 실렸다 — 검토자는 그림을 보지 못한다. 그림에서 읽은 내용(수치 포함)은 지우지 말고 그대로 둔다.")
     bad = _unsourced_numbers(draft, "\n".join(outputs) + "\n" + (req.message or ""), limit=0)
+    if bad and idx is not None:
+        _ok = _sc_gate.sourced_in(draft, idx, message=req.message or "")
+        bad = [v for v in bad if v.replace(",", "") not in _ok]
     if calls and bad:
         blocks.append("[코드 대조 — 답의 수치 중 조회 결과 · 사용자 발화에서 찾지 못한 것]\n"
                       + ", ".join(f"`{v}`" for v in bad[:_SELF_CHECK_NUMS]) + (f" 외 {len(bad) - _SELF_CHECK_NUMS}건" if len(bad) > _SELF_CHECK_NUMS else ""))
@@ -5489,7 +5669,11 @@ def _self_check_messages(req: ChatRequest, draft: str, calls: list, outputs: lis
                       + ", ".join(f"`{w}`" for w in alien)
                       + "\n— 질문의 언어로 바꿔라(뜻을 그대로). 고칠 것이 이것뿐이어도 [판정] 고침 이다.")
     blocks.append(f"[답 초안]\n{draft}")
-    blocks.append(_SELF_CHECK_ASK if (calls or docs) else _SELF_CHECK_ASK_NO_EVIDENCE)
+    ask = _SELF_CHECK_ASK if (calls or docs) else _SELF_CHECK_ASK_NO_EVIDENCE
+    mode = _sc_gate_mode()
+    if calls and mode != "0":
+        ask += "\n" + (_SC_ASK_GATE_LINE if mode == "1" else _SC_ASK_GATE_LINE_NUM)
+    blocks.append(ask)
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
     return [SystemMessage(content=_SELF_CHECK_SYS), HumanMessage(content="\n\n".join(blocks))]
 
@@ -5515,8 +5699,22 @@ def _self_check_parse(out: str) -> tuple[str | None, list, list | None]:
             patches = None
             break
         old, new = part.split("[새 글]", 1)
+        new = _SC_NEW_END.split(new, 1)[0]        # [바꿀 곳] 뒤에 온 [짚은 점] · [고친 점] 이 마지막 새 글에 섞이지 않게(HA-27)
         patches.append((old.strip(), new.strip()))
     return verdict, fixes[:20], patches
+
+
+def _self_check_flags(out: str) -> list[str]:
+    """검토자의 [짚은 점] — 고치지 않고 사람이 확인할 곳(HA-27). '없음' 은 버리고 20줄 × 400자까지. _self_check_parse 의 돌려주는 꼴은 그대로다."""
+    m = _SC_FLAGS.search(out or "")
+    flags = []
+    for line in (m.group(1).splitlines() if m else []):
+        t = line.strip()
+        if t.startswith("-"):
+            t = t[1:].strip()
+            if t and t not in ("없음", "없음."):
+                flags.append(t[:400])
+    return flags[:20]
 
 
 def _sc_apply(draft: str, patches: list) -> tuple[str, str]:
@@ -5541,8 +5739,19 @@ def _sc_apply(draft: str, patches: list) -> tuple[str, str]:
     return out, ""
 
 
-def _self_check_judge(draft: str, verdict: str | None, fixes: list, patches: list | None, cut: bool) -> tuple[str, dict]:
-    """검토자 판정 → (낼 답, meta.self_check). 바꿀 곳을 못 넣거나 고친 답이 수상하면 초안을 그대로 내고 까닭을 적는다(고칠 점은 보인다)."""
+def _sc_pair_desc(old: str, new: str) -> str:
+    """[고친 점] 줄과 쌍의 수가 다를 때 코드가 만드는 쌍의 설명."""
+    return f"'{' '.join(old.split())[:60]}' → '{' '.join(new.split())[:60] or '(지움)'}'"
+
+
+def _self_check_judge(draft: str, verdict: str | None, fixes: list, patches: list | None, cut: bool, *,
+                      idx=None, flags=(), values: bool = True, message: str = "") -> tuple[str, dict]:
+    """검토자 판정 → (낼 답, meta.self_check). 바꿀 곳을 못 넣거나 고친 답이 수상하면 초안을 그대로 내고 까닭을 적는다(고칠 점은 보인다).
+    idx(이번 턴 원문 색인 — HA-27)가 있으면 쌍마다 원문과 다시 대조해 넣음 쌍만 넣는다(sc_gate.gate_patches). flags 는 검토자의 [짚은 점].
+    idx 도 flags 도 없으면 종전과 글자까지 같은 (답, check) 다(관문 끔 · 도구 없는 턴)."""
+    flags = [str(f) for f in (flags or ()) if str(f).strip()]
+    if idx is not None or flags:
+        return _sc_judge_gated(draft, verdict, fixes, patches, cut, idx, flags, values, message)
     if verdict is None:
         return draft, {"status": "unreadable", "reason": "검토자 답을 읽지 못했다 — 초안을 그대로 냈다"}
     if verdict == "ok":
@@ -5555,13 +5764,7 @@ def _self_check_judge(draft: str, verdict: str | None, fixes: list, patches: lis
     elif not patches:
         why = "고친다고 했지만 바꿀 곳이 없다"
     else:
-        ans, why = _sc_apply(draft, patches)
-    if not why and len(ans) < len(draft) * _SELF_CHECK_MIN_RATIO:
-        why = f"고친 답이 초안보다 지나치게 짧다({len(draft):,}자 → {len(ans):,}자)"
-    if not why:
-        lost = [u for u in dict.fromkeys(_SC_IMG.findall(draft)) if u not in ans]
-        if lost:
-            why = f"고친 답이 초안의 그림 {len(lost)}개를 잃었다"
+        ans, why = _sc_put(draft, patches)
     if why:
         return draft, {"status": "suspect", "reason": why + " — 초안을 그대로 냈다", "fixes": fixes}
     if ans.strip() == draft.strip():
@@ -5569,16 +5772,107 @@ def _self_check_judge(draft: str, verdict: str | None, fixes: list, patches: lis
     return ans, {"status": "fixed", "fixes": fixes}
 
 
-async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: list, outputs: list, res: dict):
-    """검토자를 부른다 — 글은 '생각 중' 칸으로 흘리고, 끝나면 res 에 final · check 를 둔다. 실패해도 초안이 나간다."""
+def _sc_put(draft: str, patches: list) -> tuple[str, str]:
+    """바꿀 곳을 넣고 고친 답이 수상한지 본다 → (고친 답, '') 또는 (_, 까닭) — 못 넣음(_sc_apply) · 지나치게 짧음 · 그림 잃음."""
+    ans, why = _sc_apply(draft, patches)
+    if not why and len(ans) < len(draft) * _SELF_CHECK_MIN_RATIO:
+        why = f"고친 답이 초안보다 지나치게 짧다({len(draft):,}자 → {len(ans):,}자)"
+    if not why:
+        lost = [u for u in dict.fromkeys(_SC_IMG.findall(draft)) if u not in ans]
+        if lost:
+            why = f"고친 답이 초안의 그림 {len(lost)}개를 잃었다"
+    return ans, why
+
+
+# flagged 의 까닭 — 고정 글이다(_sc_record 가 사유를 원장에 싣는다 — 사용자 글을 싣지 않는다).
+_SC_WHY_GATED = "검토자의 고침을 조회 결과 원문과 대조해 답에 넣지 않았다 — 짚은 곳만 보인다"
+_SC_WHY_FLAGS = "검토자가 고치지 않고 짚기만 했다"
+_SC_WHY_DROPPED = "검토자의 고침이 조회 결과 원문에 있는 값을 지우거나 바꿔 버렸다 — 초안을 그대로 냈다"
+
+
+def _sc_judge_gated(draft: str, verdict: str | None, fixes: list, patches: list | None, cut: bool, idx, flags: list,
+                    values: bool, message: str) -> tuple[str, dict]:
+    """관문 길(HWAXPortal docs/request-1030/design-ha27.md 6.6) — 원문 색인이 있거나 검토자가 [짚은 점] 을 썼을 때. 상태는 관문 뒤의 결과다 —
+    넣음 쌍만 넣고(다 넣거나 하나도 넣지 않는다 — C-24 그대로), 넣음이 없으면 짚음 · [짚은 점] 이 있을 때 flagged(답 = 초안), 버림만이면 ok.
+    meta 에 flags(검토자 [짚은 점] + 짚음이 된 쌍) · dropped(버린 쌍 — 화면에는 보이지 않는다) · gate(관문이 돈 턴만)를 싣는다. 관문 뒤에
+    검토자에게 다시 묻지 않는다(턴 시간 · 모델 호출 수가 늘지 않는다)."""
+    gate = ({"applied": 0, "reviewer_flags": len(flags), "reviewer_fixed": verdict == "fixed", "raw_partial": bool(idx.partial)}
+            if idx is not None else None)
+
+    def done(ans: str, check: dict) -> tuple[str, dict]:
+        if gate is not None:
+            check["gate"] = gate
+        return ans, check
+
+    def cap(lines: list) -> list:
+        return [str(x)[:_SC_NOTE_CHARS] for x in lines][:_SC_NOTE_MAX]
+
+    def flagged(lines: list, why: str, dropped: list = ()) -> dict:
+        # fixes 에도 같은 줄 — 옛 화면은 flagged 를 '그 밖의 상태' 로 보고 fixes 를 '검토자가 짚은 곳(반영하지 않음)' 으로 보인다
+        return {"status": "flagged", "fixes": lines, "flags": lines, **({"dropped": dropped} if dropped else {}), "reason": why}
+
+    if verdict is None:
+        return draft, {"status": "unreadable", "reason": "검토자 답을 읽지 못했다 — 초안을 그대로 냈다"}
+    if verdict == "ok":
+        return done(draft, flagged(cap(flags), _SC_WHY_FLAGS) if flags else {"status": "ok"})
+    why = ("검토자 답이 출력 상한에서 끊겼다" if cut else
+           "바꿀 곳의 꼴을 읽지 못했다([원문] 뒤에 [새 글] 이 없다)" if patches is None else
+           "고친다고 했지만 바꿀 곳이 없다" if not patches and not flags else "")
+    if why:
+        return done(draft, {"status": "suspect", "reason": why + " — 초안을 그대로 냈다", "fixes": fixes,
+                            **({"flags": cap(flags)} if flags else {})})
+    if not patches:                                   # 고친다고 했지만 바꿀 곳 없이 짚기만 했다
+        return done(draft, flagged(cap(flags), _SC_WHY_FLAGS))
+    decisions = (_sc_gate.gate_patches(patches, idx, draft=draft, message=message, values=values) if idx is not None
+                 else [_sc_gate.KEEP] * len(patches))
+    paired = len(fixes) == len(patches)           # [고친 점] 줄이 쌍과 같은 차례로 짝을 이룬다(지시가 약속한다)
+    desc = [fixes[i] if paired else _sc_pair_desc(o, w) for i, (o, w) in enumerate(patches)]
+    keep = [p for p, d in zip(patches, decisions) if d.action == "keep"]
+    demoted = [f"{desc[i]} — 반영 안 함: {_sc_gate.reason(d)}" for i, d in enumerate(decisions) if d.action == "demote"]
+    dropped = cap([f"{desc[i]} — 버림: {_sc_gate.reason(d)}" for i, d in enumerate(decisions) if d.action == "drop"])
+    if gate is not None:
+        for d in decisions:
+            if d.action != "keep":
+                gate[d.code] = gate.get(d.code, 0) + 1
+    shown = cap(flags + demoted)
+    extra = {**({"flags": shown} if shown else {}), **({"dropped": dropped} if dropped else {})}
+    if not keep:
+        if shown:
+            return done(draft, flagged(shown, _SC_WHY_GATED, dropped))
+        return done(draft, {"status": "ok", "dropped": dropped, "reason": _SC_WHY_DROPPED})
+    ans, why = _sc_put(draft, keep)
+    if why:
+        return done(draft, {"status": "suspect", "reason": why + " — 초안을 그대로 냈다",
+                            "fixes": [fixes[i] for i, d in enumerate(decisions) if d.action != "drop"] if paired else fixes, **extra})
+    if ans.strip() == draft.strip():                  # 넣었지만 바뀐 글자가 없다
+        return done(draft, flagged(shown, _SC_WHY_GATED if len(keep) < len(patches) else _SC_WHY_FLAGS, dropped) if shown
+                    else {"status": "ok", **extra})
+    if gate is not None:
+        gate["applied"] = len(keep)
+    kept = fixes if len(keep) == len(patches) else [desc[i] for i, d in enumerate(decisions) if d.action == "keep"]
+    return done(ans, {"status": "fixed", "fixes": kept, **extra})
+
+
+async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: list, outputs: list, res: dict,
+                             raw: dict | None = None):
+    """검토자를 부른다 — 글은 '생각 중' 칸으로 흘리고, 끝나면 res 에 final · check 를 둔다. 실패해도 초안이 나간다. raw 는 이번 턴의 원문
+    그릇(HA-27) — 관문이 켜져 있고 도구를 부른 턴이면 검토자 입력과 같은 스레드에서 원문 색인을 짓고, 검토자의 바꿀 곳을 넣기 전에 그 색인과
+    다시 대조한다(관문 계산은 스레드 두 번 — 이벤트 루프 · 15초 ping 을 막지 않는다)."""
     llm = _chat_llm_of(app)
     acc, cut = "", False
     model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
     kw = {"max_tokens": _SC_OUT_CAP}
     if os.environ.get("CHAT_SELF_CHECK_THINK", "0") != "1":
         kw["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    mode = _sc_gate_mode()
     try:
-        msgs = await asyncio.to_thread(_self_check_messages, req, draft, calls, outputs)
+        msgs, idx = await asyncio.to_thread(_sc_prepare, req, draft, calls, outputs, raw, mode)
+    except Exception as exc:  # noqa: BLE001 — 검토 준비 실패가 답을 못 죽인다(관문 없이 넣지 않는다 — 초안을 낸다)
+        print(f"[self-check] 검토 준비 실패 — {type(exc).__name__}: {exc}"[:300])
+        res.update(final=draft, check={"status": "failed", "reason": f"검토자 입력 · 원문 대조를 준비하지 못했다({type(exc).__name__}) — "
+                                                                     "초안을 그대로 냈다"}, model=None)
+        return
+    try:
         yield _sse("reasoning", {"delta": _CHECK_HEAD})
         async for ch in llm.astream(msgs, **kw):
             rc = (getattr(ch, "additional_kwargs", None) or {}).get("reasoning_content")
@@ -5602,7 +5896,14 @@ async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: 
                    model=None)
         return
     verdict, fixes, patches = _self_check_parse(acc)
-    final, check = _self_check_judge(draft, verdict, fixes, patches, cut)
+    try:
+        final, check = await asyncio.to_thread(_self_check_judge, draft, verdict, fixes, patches, cut, idx=idx,
+                                               flags=_self_check_flags(acc), values=mode == "1", message=req.message or "")
+    except Exception as exc:  # noqa: BLE001 — 관문 실패가 답을 못 죽인다(관문 없이 넣지 않는다 — 초안을 낸다)
+        print(f"[self-check] 원문 대조 실패 — {type(exc).__name__}: {exc}"[:300])
+        final, check = draft, {"status": "failed", "reason": f"검토자의 고침을 원문과 대조하지 못했다({type(exc).__name__}) — 초안을 그대로 냈다"}
+    if isinstance(check.get("gate"), dict):
+        check["gate"]["raw_chars"] = int((raw or {}).get("chars") or 0)     # 0 이면 이 턴에 원문을 붙잡지 못했다(사본으로만 대조)
     res.update(final=final, check=check, model=str(model) if model else None)
 
 
@@ -5660,7 +5961,7 @@ async def _self_checked_turn(app: FastAPI, req: ChatRequest) -> AsyncIterator[by
     else:
         yield _sse("status", {"step": "답을 검증하는 중 — 질문 · 근거 · 수치를 대조합니다", "tool": None})
         out: dict = {}
-        sc = _self_check_stream(app, req, draft, calls, outputs, out)
+        sc = _self_check_stream(app, req, draft, calls, outputs, out, box.get("raw"))
         try:
             async for fr in sc:
                 yield fr
@@ -5847,6 +6148,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _turn_hub_ids.set({} if _XHUB_GATE else None)          # HA-30 — 턴마다 새로(앞 턴에 배운 것은 남지 않는다)
     _turn_status_wait.set(_status_wait_mod.new_turn() if _status_wait_mod.on() else None)       # HA-28
     _turn_confirm.set(_confirm_ctx(req) if CHAT_CONFIRM_GATE else None)   # HA-29 — 주문 판정은 원문을 본다 · 앞 카드의 승인 · 거절도 여기서 가린다
+    _turn_sc_raw.set(_sc_raw_box() if box is not None else None)       # HA-27 — 자기검증 감싸개가 준 턴만(원문 그릇)
     _cctx = _turn_confirm.get() or _ConfirmCtx()     # 관문이 꺼져 있으면 빈 맥락(막지도 보내지도 않는다)
     for _c in _cctx.approved.values():
         _seed_ids |= _int_tokens(_c["args"])          # 승인된 인자의 정수는 사람이 카드에서 본 값이다 — 유령 ID 관문의 출처로
@@ -6775,7 +7077,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         if box is None:
             yield _sse("token", {"delta": _cctx.card})
     if box is not None:
-        box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), confirm=_cctx.card or None)
+        box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), raw=_turn_sc_raw.get(), confirm=_cctx.card or None)
     # 근거 블록 — 코드가 실행 기록에서 만든다. 모델이 쓰는 게 아니라 지어낼 수 없고,
     # 답변의 수치를 도구 출력 원문과 대조해 출처 없는 값을 함께 표시한다.
     # 사용자 발화도 출처로 인정한다 — 사용자가 준 치수를 되풀이한 것을 날조로 보면 안 된다.

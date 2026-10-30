@@ -85,7 +85,9 @@ def test_좁은_창의_수치_대조_원문은_종전대로_결과마다_120000�
     out: list = []
     for _ in range(5):
         app._turn_out_add(out, "가" * 150000)
-    assert [len(x) for x in out] == [120000] * 4, [len(x) for x in out]
+    # 자른 결과에는 원문 길이 표지가 붙는다 — 자기검증 검토자가 결과 머리에서 '(잘림 — 근거 몫' 을 본다(HWAXPortal docs/request-1030 HA-27)
+    mark = " …[150,000자 중 앞 120,000자]"
+    assert len(out) == 4 and all(x == "가" * 120000 + mark for x in out), [len(x) for x in out]
 
 
 def test_넓은_창의_수치_대조_원문은_모델이_본_결과를_자르지_않는다():
