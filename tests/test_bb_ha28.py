@@ -264,7 +264,7 @@ def test_1_끄면_어떤_이름도_상태_도구가_아니다(sw, monkeypatch):
     ({"state": "GENERATED"}, False),
     ({"ok": False, "error": "잡이 없다", "status": 404}, False),        # DocForge 도구 오류 — 숫자 status 는 낱말이 아니다
     ({"status": "ok", "state": "running"}, True),                       # 첫 낱말이 표 밖이면 다음 칸
-    ({"status": 404, "state": "running"}, True),
+    ({"status": 404, "state": "running"}, False),                      # 숫자 status 는 도구 오류다 — 다른 칸의 낱말을 읽지 않고 기다리지 않는다(DocForge 답 10-30)
     ({"job": {"status": "queued"}}, True), ({"data": {"job_state": "in-progress"}}, True),
     ([{"status": "running"}], False),                                   # 배열
     ("✖ 도구 get_task 호출 실패: 연결 거절", False),                     # 평문

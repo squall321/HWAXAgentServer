@@ -988,7 +988,9 @@ def test_B26_StepForge_잡은_estimate_cost_로_물은_예상_작업량을_싣�
     assert "약 60초" in str(card["calls"][0].get("workload")), card
     assert card["calls"][0].get("app") in ("StepForge", "heax-step_forge"), "카드 줄에 앱을 싣는다(설계 5.2 · 5.5)"
     assert _said(evs, "예상 작업량을 묻는 중"), "묻는 동안 상태줄을 낸다(설계 5.2)"
-    assert asked and asked[0].get("project_id") == "P1" and asked[0].get("tool") == "drop_check", asked
+    # StepForge 꼴 — run_job(project_id, kind, params) 의 작업량은 estimate_cost(project_id, job=kind, args=params) 로 묻는다(StepForge 답 10-30).
+    assert asked and asked[0].get("project_id") == "P1" and asked[0].get("job") == "measure" \
+        and (asked[0].get("args") or {}).get("tool") == "drop_check", asked
     assert _hits(w, "run_job") == []
 
 
