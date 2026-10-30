@@ -589,20 +589,35 @@ def test_T22_앞_턴에_배운_것은_다음_턴에_남지_않는다(monkeypatch
 
 # ── 반대 검토 2차(rv2) — 이 호출이 실어 보낸 id 의 메아리는 배우지 않는다 · invoke_tool 의 안쪽 이름 앞 공백 ──────────────────────────────────
 # StandardPlatform 백엔드가 실제로 내는 성공 꼴의 '없다' 답 — 받은 id 를 되풀이한다(modules/objects/resolve.py · search/routes.py · objects/schemas.py
-# ResolveOneOut · objects/routes.py 의 0건 진단)
+# ResolveOneOut · objects/routes.py 의 0건 진단). 꼴은 StandardPlatform main 778db2f(0.4.67)의 응답 모델 그대로다 — 묶음 풀이의 줄도 hint 로, 0건
+# 진단의 message · next_steps 도 그 조건 글로 한 번 더 되풀이한다. 0.4.66(418af00)부터 search 는 게시판 글(posts)도 싣고, 글의 snippet 은 본문에서
+# q 가 든 자리 앞뒤라(board/services.py snippet) 그 id 를 적은 글이 있으면 거기서도 되풀이된다. 글의 id 는 그 허브의 글이다.
+U_POST = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"     # FailureTrace 게시판 글
+_SEARCH_NONE = {"q": U_RD, "total": 0, "types": [], "records": 0, "items": [], "limit": 20, "offset": 0, "min_query": 2}
+_COND = f"failure_mode eq {U_RD}"
 RV2_ECHO = {
     "resolve_none_hint": ("failuretrace_object_resolve", {"type_slug": "failure_mode", "name": U_RD},
                           json.dumps({"match": "none", "object": None, "candidates": [], "hint": f"그 id 의 고장모드이(가) 없습니다: {U_RD}",
                                       "truncated": False}, ensure_ascii=False)),
     "search_q": ("failuretrace_search", {"q": U_RD},
-                 json.dumps({"q": U_RD, "total": 0, "types": [], "records": 0, "items": [], "limit": 20, "offset": 0, "min_query": 2},
-                            ensure_ascii=False)),
+                 json.dumps({**_SEARCH_NONE, "posts": [], "posts_total": 0}, ensure_ascii=False)),
+    "search_post_snippet": ("failuretrace_search", {"q": U_RD},
+                            json.dumps({**_SEARCH_NONE, "posts_total": 1, "posts": [
+                                {"id": U_POST, "title": "솔더 접합 크랙 재현 메모", "author_name": "작성자 A", "created_at": "2026-10-29T08:00:00Z",
+                                 "comment_count": 1, "snippet": f"…정본에서 받은 id {U_RD} 로 다시 찾아 보니 그래프에 이어진 부품이…"}]},
+                                       ensure_ascii=False)),
     "resolve_many_name": ("failuretrace_objects_resolve_many", {"type_slug": "failure_mode", "names": [U_RD]},
-                          json.dumps({"items": [{"name": U_RD, "match": "none", "object": None, "candidates": [], "truncated": False}],
+                          json.dumps({"items": [{"match": "none", "object": None, "candidates": [],
+                                                 "hint": f"그 id 의 고장모드이(가) 없습니다: {U_RD}", "truncated": False, "name": U_RD}],
                                       "counts": {"exact": 0, "candidates": 0, "none": 1}}, ensure_ascii=False)),
     "list_diagnosis": ("failuretrace_objects_list", {"type_slug": "pd_defect", "conditions": [{"field": "failure_mode", "op": "eq", "value": U_RD}]},
-                       json.dumps({"items": [], "total": 0, "diagnosis": {"total": 0, "reason": "filters",
-                                                                          "filters": [{"name": "f0", "label": f"failure_mode eq {U_RD}", "remaining": 12}]}},
+                       json.dumps({"items": [], "total": 0, "limit": 50, "offset": 0, "files": {}, "diagnosis": {
+                           "total": 0, "reason": "filters",
+                           "message": f"불량에 보이는 것은 12건인데 조건이 좁아 0건이 됐습니다. 「{_COND}」 하나만 빼면 12건입니다.",
+                           "type_total": 12, "hidden": 0,
+                           "filters": [{"name": "f.failure_mode.eq#0", "label": _COND, "remaining": 12, "unknown": 0}],
+                           "next_steps": [f"「{_COND}」 을(를) 빼고 다시 묻는다.",
+                                          "칸 이름이 맞는지 object_fields 로 확인한다 — 값이 비어 있는 칸일 수 있다."]}},
                                   ensure_ascii=False)),
 }
 MAP_RV2 = {**MAP, "failuretrace_objects_resolve_many": "failuretrace", "rootdesigndatahub_object_get": "rootdesigndatahub"}
