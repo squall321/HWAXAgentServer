@@ -173,6 +173,9 @@ VECTORS = [
     ("이 표를 문서에 블록으로 추가해줘", "insert_block", {"doc_id": "D1", "text": "표"}, True),   # write 는 주문 동사면 된다
     ("이 문서 요약해줘", "insert_block", {"doc_id": "D1", "text": "요약"}, False),
     ("블록 추가해도 될까", "insert_block", {"doc_id": "D1"}, False),
+    ("이 표를 블록으로 추가해 줄래", "insert_block", {"doc_id": "D1"}, True),
+    ("이 표를 블록으로 추가해 줄래?", "insert_block", {"doc_id": "D1"}, False),   # 주문 동사가 있어도 질문이면 카드
+    ("drop_check 돌려줄래?", "run_job", P1_DROP, False),
     ("delete_project 로 P1 지워줘", "delete_project", {"project_id": "P1"}, False),     # confirm 은 늘 카드
     ("이 판 질량 알려줘", "list_projects", {}, True),                         # 목록 밖 — 관문과 무관
     ("이 판 질량 알려줘", "mass_estimate", {"project_id": "P1"}, True),
@@ -358,7 +361,9 @@ class _GateAgent:
 
     async def ainvoke(self, payload, config=None):
         self.ainvoked += 1
-        return {"messages": [types.SimpleNamespace(type="ai", content="run_job 을 호출하겠습니다")]}
+        return {"messages": [types.SimpleNamespace(type="ai", content=self.again_say)]}
+
+    again_say = "run_job 을 호출하겠습니다"      # 구제 · 재시도 호출의 답
 
 
 def _turn(monkeypatch, agent, tools, message, history=(), *, user=USER, conv=CONV, via_chat=False, tbn_boom=None, **kw):
@@ -396,7 +401,8 @@ def _card_turn(monkeypatch, tools, step, message="이 판의 낙하에 취약한
 def test_B13_카드_턴은_보내지_않고_끊고_카드를_낸다(gate, monkeypatch):
     reached = []
     tools = {"run_job": _gw("run_job", reached)}
-    ag = _GateAgent(tools, steps=[[("run_job", P1_GRAPH)]], pre="낙하 그래프 잡을 걸겠습니다. ")
+    # 예고 글('호출하겠습니다')이라 구제 길(강제 재시도 · 확정 종결)이 설 자리다 — 막은 호출이 있으면 건너뛰어야 한다
+    ag = _GateAgent(tools, steps=[[("run_job", P1_GRAPH)]], pre="낙하 그래프 잡 run_job 을 호출하겠습니다. ")
     evs, seen = _turn(monkeypatch, ag, tools, "이 판의 낙하에 취약한 부품을 알려줘")
     assert seen == [] and "확인 카드 — 예상 작업량을 묻는 중" not in _steps(evs), "StepForge 가 아닌 잡은 묻지 않는다(목록도 받지 않는다)"
     assert [d for e, d in evs if e == "confirm"][0]["calls"][0]["workload"] == "이 도구는 작업량을 미리 알려 주지 않는다"
@@ -409,7 +415,7 @@ def test_B13_카드_턴은_보내지_않고_끊고_카드를_낸다(gate, monkey
     assert card["approve_text"] == f"실행 — 확인 번호 {card['id']}" and card["decline_text"] == f"취소 — 확인 번호 {card['id']} 는 실행하지 않음"
     assert 0 < card["expires_at"] / 1000 - time.time() <= a._CONFIRM_TTL_S
     res = _result(evs)
-    assert res.startswith("낙하 그래프 잡을 걸겠습니다.") and res.count(card["id"]) == 1 and "**확인이 필요합니다**" in res
+    assert res.startswith("낙하 그래프 잡 run_job 을 호출하겠습니다.") and res.count(card["id"]) == 1 and "**확인이 필요합니다**" in res
     assert res.endswith(f"(확인 번호 `{card['id']}` · 30분)"), "끝이 확인 번호 — 끊긴 턴 표지에 걸리지 않는다"
     assert not a._INTERRUPTED_RE.search(res)
     assert "잡을 걸었습니다" not in res and ag.after_cut is False, "끊은 뒤의 모델 글은 없다"
@@ -428,7 +434,9 @@ def test_B14_단추로_승인하면_첫_모델_호출_전에_서버가_그대로
     tools = {"run_job": _gw("run_job", reached)}
     _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
     at_start: list = []
-    ag = _GateAgent(tools, steps=[], say="잡 J-1 을 걸었습니다.", on_start=lambda: at_start.append(list(reached)))
+    # 끝 글에 예고('확인하겠습니다')가 있어도 보낸 수를 호출로 세므로 '도구 0회' 구제가 서지 않는다
+    ag = _GateAgent(tools, steps=[], say="잡 J-1 을 걸었습니다. 진행은 상태 조회로 확인하겠습니다.",
+                    on_start=lambda: at_start.append(list(reached)))
     evs, seen = _turn(monkeypatch, ag, tools, card["approve_text"], hist)
     assert reached == [("run_job", P1_GRAPH)] and at_start == [[("run_job", P1_GRAPH)]], "첫 모델 호출 전에 보낸다"
     steps = [(e, d) for e, d in evs if e == "status"]
@@ -600,6 +608,7 @@ def test_B21_자기검증_켬이면_카드_턴은_검토하지_않고_근거_블
         "나란한 읽기는 근거에 남고 막은 잡은 아니다(설계 9절 23)"
     assert "1,812" not in res.split(a._EVIDENCE_MARK)[1], "카드의 예상 작업량은 '출처 없는 수' 가 아니다(C-14)"
     assert ("list_projects", {}) in reached and not any(n == "run_job" for n, _ in reached)
+    assert ag.ainvoked == 0, "조회 뒤 끊긴 턴이라도 빈 답 구제가 서지 않는다(막은 호출이 있다)"
     assert ("heaxstep_forge_estimate_cost", {"project_id": "P1", "job": "graph", "args": {}}) in reached
     assert {"user": USER, "svc_fallback": True} in seen, "작업량 묻기(읽기)는 기본 자격"
     if self_check:
@@ -610,14 +619,18 @@ def test_B21_자기검증_켬이면_카드_턴은_검토하지_않고_근거_블
 
 
 def test_B22_끊긴_흐름이_닫히며_오류를_내도_오류_재시도_없이_카드로_끝난다(gate, monkeypatch):
+    """닫다가 난 오류(_confirm_close) · 막은 뒤 흐름의 오류(_confirm_events)는 삼켜 정상 끝맺음을 탄다 — 나란한 읽기의 근거 블록과 meta 가 남는다
+    (턴 except 의 카드 끝맺음은 그 밖에서 난 오류의 그물이라 근거 블록 · meta 가 없다)."""
     for kw in ({"boom_on_close": True}, {"boom_after_tool": True}):
         reached = []
-        tools = {"run_job": _gw("run_job", reached)}
-        ag = _GateAgent(tools, steps=[[("run_job", P1_GRAPH)]], **kw)
+        tools = {"run_job": _gw("run_job", reached), "list_projects": _gw("list_projects", reached)}
+        ag = _GateAgent(tools, steps=[[("list_projects", {}), ("run_job", P1_GRAPH)]], **kw)
         evs, _ = _turn(monkeypatch, ag, tools, "이 판의 낙하에 취약한 부품을 알려줘")
         assert [e for e, _ in evs if e == "error"] == [] and not any("자동 재시도" in s for s in _steps(evs)), kw
-        assert len([d for e, d in evs if e == "confirm"]) == 1 and ag.ainvoked == 0 and reached == [], kw
-        assert "내부 오류" not in _result(evs) and [e for e, _ in evs][-1] == "done"
+        assert len([d for e, d in evs if e == "confirm"]) == 1 and ag.ainvoked == 0 and reached == [("list_projects", {})], kw
+        res = _result(evs)
+        assert "내부 오류" not in res and [e for e, _ in evs][-1] == "done"
+        assert a._EVIDENCE_MARK in res and "`list_projects`" in res and "meta" in [e for e, _ in evs], kw
 
 
 def test_B22b_흐름_밖의_오류도_카드가_섰으면_재시도_대신_카드로_끝낸다(gate, monkeypatch):
@@ -655,6 +668,24 @@ def test_B24_확정_종결의_직접_실행도_막히면_요약하지_않고_카
     assert any(s.startswith("확인 대기: run_job") for s in _steps(evs))
     res = _result(evs)
     assert "요약 — 잡을 걸었습니다" not in res and len([d for e, d in evs if e == "confirm"]) == 1
+
+
+def test_B24b_새어_나온_호출의_직접_실행도_막히면_요약하지_않고_카드로_끝난다(gate, monkeypatch):
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    llm = []
+
+    async def fake_llm_text(_llm, system, user, *a_, **k_):
+        llm.append(system)
+        return "요약 — 잡을 걸었습니다"
+    monkeypatch.setattr(a, "_llm_text", fake_llm_text)
+    monkeypatch.setattr(a.app.state, "chat_llm", object(), raising=False)
+    leak = '<tool_call>{"name": "run_job", "arguments": {"project_id": "P1", "kind": "graph"}}</tool_call>'
+    ag = _GateAgent(tools, steps=[], say=leak)
+    ag.again_say = leak                  # 비스트리밍 재시도도 또 샌다 — 코드가 직접 실행하는 마지막 길
+    evs, _ = _turn(monkeypatch, ag, tools, "이 판의 낙하에 취약한 부품을 알려줘")
+    assert reached == [] and llm == [] and ag.ainvoked == 1, "막은 결과를 요약하지 않는다"
+    assert any(s.startswith("확인 대기: run_job") for s in _steps(evs)) and len([d for e, d in evs if e == "confirm"]) == 1
 
 
 def test_B25_띵킹이_켜져_있어도_카드의_답은_일반_챗으로_가_승인된다(gate, monkeypatch):
@@ -732,12 +763,14 @@ def test_B27_카드_뒤의_재촉은_이어하기도_승인도_아니다(gate, m
     assert ag.inputs[0]["messages"][-1][1].endswith("계속")
 
 
-def test_B28_승인_말은_새_주문이_아니다(gate, monkeypatch):
+@pytest.mark.parametrize("answer", ["button", "실행해줘", "네 실행해 주세요"])
+def test_B28_승인_말은_새_주문이_아니다(gate, monkeypatch, answer):
     reached = []
     tools = {"run_job": _gw("run_job", reached), "insert_block": _gw("insert_block", reached)}
     _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
-    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[[("insert_block", {"doc_id": "D1"})]]), tools, card["approve_text"], hist)
-    assert reached == [("run_job", P1_GRAPH)], "승인 말 '실행 — …' 의 '실행' 이 쓰기를 통과시키지 않는다"
+    msg = card["approve_text"] if answer == "button" else answer      # '실행해줘' 는 승인이면서 주문 동사 꼴이다
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[[("insert_block", {"doc_id": "D1"})]]), tools, msg, hist)
+    assert reached == [("run_job", P1_GRAPH)], "승인 말의 '실행' 이 쓰기를 통과시키지 않는다"
     assert [c["calls"][0]["tool"] for c in (d for e, d in evs if e == "confirm")] == ["insert_block"]
 
 
@@ -772,6 +805,24 @@ def test_C12_승인_실행은_챗_인자_기본값을_처음_호출처럼_더한
     evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[], say="걸었습니다."), tools, card["approve_text"], hist)
     assert reached == [("run_job", {**P1_GRAPH, "priority": "low"})] and not [d for e, d in evs if e == "confirm"], \
         "기본값을 더한 꼴도 승인 열쇠라 다시 카드가 서지 않는다"
+
+
+def test_B30_승인된_인자의_정수는_유령_ID_출처가_된다(gate, monkeypatch):
+    """카드 글에는 근거 블록 표지가 없어 그 정수가 다음 턴 출처가 되지 못한다 — 사람이 카드에서 본 값이니 서버가 출처로 넣는다(설계 5.4)."""
+    reached = []
+    tools = {"heaxstep_forge_cancel_job": _gw("heaxstep_forge_cancel_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("heaxstep_forge_cancel_job", {"job_id": 7340291})], message="7340291 잡은 그만 세워 줘")
+    assert card["calls"][0]["kind"] == "confirm" and "job_id=7340291" in hist[1]["content"]
+    evs, _ = _turn(monkeypatch, _GateAgent(tools, steps=[], say="세웠습니다."), tools, card["approve_text"], hist[1:])
+    assert reached == [("heaxstep_forge_cancel_job", {"job_id": 7340291})], _steps(evs)
+
+
+def test_루트_conftest_가_관문을_끄고_목록을_없음으로_돌린다():
+    """다른 챗 턴 시험이 잡 꼴 도구 대역을 부르고 호출 수를 센다 — 이 격리가 빠지면 그 시험들이 카드로 끝난다(design-integration C-5)."""
+    assert os.environ.get("CHAT_CONFIRM_GATE") == "0" and a.CHAT_CONFIRM_GATE is False
+    assert a.CONFIRM_LISTS_PATH.name == "no-he-team.json" and not a.CONFIRM_LISTS_PATH.exists()
+    assert a._confirm_health()["lists"]["error"] == "없음"
+    assert a._SP_CONFIRM_OLD in a._SP_HEAD, "꺼진 관문의 시스템 프롬프트는 종전 글"
 
 
 def test_health_에_confirm_gate_가_실린다(gate, monkeypatch, tmp_path):
