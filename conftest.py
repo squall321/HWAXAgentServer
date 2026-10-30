@@ -44,6 +44,11 @@ os.environ.pop("CHAT_STABLE_PREFIX", None)
 # 켠다(tests/test_chat_self_check.py · HWAXPortal docs/chat-self-check).
 os.environ["CHAT_SELF_CHECK"] = "0"
 
+# 챗 상태 기다림(CHAT_STATUS_WAIT_MAX_S — 기본 600초)도 시험에서 끈다 — 켜 두면 상태 도구가 '도는 중' 을 준 턴 시험이 10초씩 자고, 되풀이 꼬리 ·
+# 반복 경고를 보는 시험의 글이 바뀐다. status_wait 가 import 때 한 번 읽는 값이다. 기다림을 보는 시험은 제 손으로 켠다(모듈 속성 —
+# tests/test_status_wait.py · HWAXPortal docs/request-1030 HA-28 · design-integration C-5).
+os.environ["CHAT_STATUS_WAIT_MAX_S"] = "0"
+
 
 @pytest.fixture(autouse=True)
 def _no_core_vocab(monkeypatch, tmp_path):

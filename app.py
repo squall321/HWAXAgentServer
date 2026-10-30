@@ -47,6 +47,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
@@ -104,6 +105,7 @@ import external_llm as _external_llm
 import vision as _vision
 import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 — 이름으로 가져오면 엔진을 다시 읽은 뒤(시험의 reload) 다른 문맥 변수를 쥔다
 import review_gate as _review_gate
+import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -1436,6 +1438,9 @@ _turn_ids: contextvars.ContextVar = contextvars.ContextVar("turn_ids", default=N
 # 10-29 QA 에서 objects_summary 를 한 턴에 7번(셋은 조건 주소 오류) · failuretrace_objects_summary 를 10번(각 약 10만 자) 불렀다.
 _turn_tool_calls: contextvars.ContextVar = contextvars.ContextVar("turn_tool_calls", default=None)
 _TOOL_REPEAT_NOTE_AT = 4
+# 이번 턴의 상태 기다림(HWAXPortal docs/request-1030 HA-28) — status_wait.new_turn() 의 {born, seen, spent_s}. None 이면(챗 턴 밖 · 기능 꺼짐)
+# 기다리지도 잡 id 를 배우지도 않는다. 도구 코루틴은 복사된 문맥에서 같은 사전을 고친다(_turn_ids 와 같은 길).
+_turn_status_wait: contextvars.ContextVar = contextvars.ContextVar("turn_status_wait", default=None)
 # 식별자 인자 이름 — id, test_id, material_id, job_id …
 _ID_ARG_RE = re.compile(r"^(id|.*_id)$")
 # 독립된 정수 토큰만 — \d+ 로 잡으면 "Al6061-T6" 의 부분수열 1 이 test_id=1 을 통과시킨다.
@@ -2051,17 +2056,18 @@ def _app_label_cached(name: str) -> str:
     return (a.get("label") or "").strip() or _GROUP_LABEL.get(key) or _pretty_group(key)
 
 
-def _chat_result_note(name: str) -> tuple[str, str]:
+def _chat_result_note(name: str, polled: bool = False) -> tuple[str, str]:
     """챗 도구 결과의 (머리, 꼬리). 머리는 '이 결과는 ○○ 앱' 이다(HWAXPortal docs/request-1029 R-10) — 도구 설명 앞 라벨만으로는 접두 없는
     이름(DynaForge 의 list_tasks · ontology_sync_state …)을 다른 앱 것으로 읽었다(EX-05). 꼬리는 같은 도구를 이 턴에 네 번째부터 부를 때
-    '앞 결과를 써라' 다(W-5). 허브의 개수 · 목록 도구에는 조건 주소를 object_fields 로 보라고 덧붙인다(OT-11 APP-OBJECTS-0073 셋)."""
+    '앞 결과를 써라' 다(W-5). 허브의 개수 · 목록 도구에는 조건 주소를 object_fields 로 보라고 덧붙인다(OT-11 APP-OBJECTS-0073 셋).
+    polled 면(상태 도구이고 결과에서 상태 낱말을 읽었다 — HA-28) 꼬리를 달지 않는다 — 상태는 다시 부르면 바뀐다. 호출 수는 그대로 센다."""
     label = _app_label_cached(name)
     head = f"[이 결과는 {label} 앱의 {name} 이다]\n" if label else ""
     cnt = _turn_tool_calls.get()
     if cnt is None:
         return head, ""
     cnt[name] += 1
-    if cnt[name] < _TOOL_REPEAT_NOTE_AT:
+    if cnt[name] < _TOOL_REPEAT_NOTE_AT or polled:
         return head, ""
     tail = (f"\n[이 턴에 {name} 를 {cnt[name]}번째 불렀다 — 앞 결과로 답할 수 있는지 먼저 보라. 같은 조건으로 다시 부르면 결과가 같다")
     n = name.lower()
@@ -2073,6 +2079,39 @@ def _chat_result_note(name: str) -> tuple[str, str]:
 def _refuse(tool, msg: str):
     """막은 · 실패한 호출의 반환 — content_and_artifact 도구는 2-튜플을 요구한다(실측). `capped` 의 관문 걸음과 호출 실패가 함께 쓴다."""
     return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
+
+
+# `capped` 의 실행 설정 인자 기본값 — LangChain 은 코루틴에 RunnableConfig 형 인자가 있으면 그 이름으로 실행 설정을 넣는다(상태 기다림의 진행 줄이
+# 그것으로 사건을 낸다). ⚠ 기본값을 None 으로 두지 마라 — 파이썬 3.10 의 get_type_hints 가 Optional[RunnableConfig] 로 읽어 넣지 않는다.
+_NO_RC: RunnableConfig = {}
+
+
+def _status_tool(name: str) -> bool:
+    """상태 도구인가(HA-28) — 앱 키 · routine_read 는 캐시만 본다(망 호출 없음). 기능이 꺼져 있으면 늘 거짓."""
+    m = _TOOLS_MAP_CACHE
+    return _status_wait_mod.is_status_tool(name, (m.get("map") or {}).get(name) or None, m.get("routine_read"))
+
+
+async def _status_wait(name: str, kw: dict, out, again, rc, chat: bool) -> tuple:
+    """`capped` 의 R2(HWAXPortal docs/request-1030 HA-28 · design-integration C-3 · C-4) — (결과, 기다림 안내, polled). 상태 도구이고 chat 이면
+    잡이 끝나기를 기다리고(status_wait.handle), 아니면 잡 시작 결과에서 id 를 배운다 — 턴 상태만 있으면 래퍼 종류와 상관없이(확정 종결 ·
+    새어 나온 호출 · 승인 실행이 건 잡도). 턴 상태가 없으면(심의 · 카탈로그 · 시험의 직접 호출) 그대로 돌려준다. 경유(invoke_tool)면 안쪽
+    이름 · 인자로 본다. 진행 줄은 실행 설정(rc)의 콜백으로 낸다 — 콜백이 없으면 내지 않고, 부모 실행이 없어 내지 못하면 한 줄 남기고 기다림은
+    그대로 간다(status_wait._emit)."""
+    turn = _turn_status_wait.get()
+    if turn is None:
+        return out, "", False
+    inner, args = _inner_tool(name, kw)
+    m = _TOOLS_MAP_CACHE
+
+    async def emit(data):
+        if (rc or {}).get("callbacks") is not None:
+            await adispatch_custom_event(_status_wait_mod.EVENT, data, config=rc)
+
+    return await _status_wait_mod.handle(
+        inner, (m.get("map") or {}).get(inner) or None, m.get("routine_read"), kw if args is None else args, out, again, turn,
+        chat=chat, emit=emit,
+        stop=lambda: False)      # 멈춤 술어(C-4) — 확인 카드(HA-29)가 섰으면 참이 되게 합칠 때 잇는다. 지금은 늘 거짓
 
 
 def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
@@ -2129,7 +2168,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                 return s + f"\n[인자 스키마 — 이 형식으로 교정해 다시 호출하세요]\n{hint}"
         return s
 
-    async def capped(*a, **kw):
+    async def capped(*a, _hwax_rc: RunnableConfig = _NO_RC, **kw):
         # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
         # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G3 유령 ID →
         # G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
@@ -2260,9 +2299,11 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         _eff = getattr(tool, "name", "")
         if _eff == "invoke_tool" and isinstance(kw.get("name"), str):
             _eff = kw["name"]
-        # ── R2 상태 기다림(HA-28) 자리
-        # ── R3 앱 머리 · 되풀이 꼬리
-        _head, _tail = _chat_result_note(_eff) if chat else ("", "")
+        # ── R2 상태 기다림(HA-28) — 상태 도구가 '도는 중' 을 주면 이 턴에 건 잡이거나 같은 호출의 되풀이일 때 코드가 기다린다(chat 일 때만).
+        # 다시 조회는 orig 를 같은 인자로 직접 부른다(관문을 다시 지나지 않고 _hwax_rc 도 새지 않는다). 아래 걸음은 마지막 결과에 한 번만 돈다.
+        out, _wait_note, _polled = await _status_wait(getattr(tool, "name", ""), kw, out, lambda: orig(*a, **kw), _hwax_rc, chat)
+        # ── R3 앱 머리 · 되풀이 꼬리(상태를 읽은 상태 도구는 꼬리를 달지 않는다)
+        _head, _tail = _chat_result_note(_eff, polled=_polled) if chat else ("", "")
         # ── R4 (content, artifact) 꼴이면 글만 다루고 artifact 는 그대로 돌려준다 — 한 갈래
         _pair = isinstance(out, tuple) and len(out) == 2
         raw = _norm(out[0] if _pair else out)
@@ -2272,8 +2313,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # ── R7 id 배우기 — 정수(유령 ID 막이) · UUID → 허브(HA-30, 모델이 보는 글에서 · 경유면 안쪽 이름으로)
         _learn_ids(body)
         _learn_hub_ids(_eff, body)
-        # ── R8 머리 + 본문 + 꼬리
-        return (_head + body + _tail, out[1]) if _pair else _head + body + _tail
+        # ── R8 머리 + 본문 + 기다림 안내 + 꼬리
+        return (_head + body + _wait_note + _tail, out[1]) if _pair else _head + body + _wait_note + _tail
 
     tool.coroutine = capped
     return tool
@@ -2760,7 +2801,9 @@ def _lex_scores(tools, qtok: set) -> dict:
 # 도구 → 소유 MCP 앱(백엔드) 매핑 — 166개가 평평하게 쏟아지면 고르기 어려워, 게이트웨이의
 # /tools-map 으로 '어느 앱의 기능인지'를 붙여 계층 선택이 되게 한다(짧은 TTL 캐시).
 _GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
-_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}}
+# routine_read — 게이트웨이가 읽기로 확인한 노출 이름(frozenset). 옛 게이트웨이는 그 칸이 없어 None('모름')이다. 상태 기다림(HA-28)의 울타리로만
+# 쓰고, 읽는 쪽은 .get 으로 읽는다(시험이 그 칸 없는 사전으로 통째로 바꿔 끼운다).
+_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}, "routine_read": None}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
@@ -2827,9 +2870,12 @@ def _tools_map() -> dict:
         if m:
             # 영역(tool_areas.json)도 같은 응답에 온다 — 따로 받지 않는다. 구 게이트웨이면 빈 채로
             # 두어 도구가 '미분류' 로 보인다(분류를 지어내지 않는다).
+            _rr = data.get("routine_read")
             _TOOLS_MAP_CACHE.update({"at": now, "map": m, "areas": data.get("areas") or {},
                                      "area_meta": {a["area"]: a for a in (data.get("area_meta") or [])
-                                                   if isinstance(a, dict) and a.get("area")}})
+                                                   if isinstance(a, dict) and a.get("area")},
+                                     "routine_read": (frozenset(x for x in _rr if isinstance(x, str))
+                                                      if isinstance(_rr, list) else None)})
     except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
         print(f"[tools] map fetch failed — {_GW_RETRY_S:.0f}초 뒤 다시 묻는다: {exc!r}")
         _TOOLS_MAP_CACHE["retry_at"] = time.monotonic() + _GW_RETRY_S
@@ -5158,6 +5204,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _turn_tool_calls.set(Counter())
     # ── 10-30 턴 상태 자리 — 재촉 → 이어하기가 req.message 를 바꾸기 전에 건다(HA-30 · HA-28 · HA-29 · HA-27, design-integration 3절)
     _turn_hub_ids.set({} if _XHUB_GATE else None)          # HA-30 — 턴마다 새로(앞 턴에 배운 것은 남지 않는다)
+    _turn_status_wait.set(_status_wait_mod.new_turn() if _status_wait_mod.on() else None)       # HA-28
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
     # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
@@ -5535,12 +5582,16 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                                       "실었습니다 — 그 결과의 뒷부분은 모델이 보지 못했습니다. 조건을 좁혀 "
                                                       "나눠 조회하면 다 볼 수 있습니다.",
                                            "knob": "TOOL_RESULT_MAX"})
+            elif kind == "on_custom_event" and event.get("name") == _status_wait_mod.EVENT:
+                # 상태 도구의 코드 기다림(HA-28) — 도구가 도는 동안 진행 줄을 흘린다. tool 은 비운다(서버 사본 활동 · 다음 턴 근거에 섞이지 않게).
+                yield _sse("status", _status_wait_mod.frame(event.get("data") or {}))
             elif kind == "on_tool_start":
                 _budget["calls"] += 1
                 _fp = f"{event.get('name')}|{json.dumps(event.get('data', {}).get('input'), sort_keys=True, ensure_ascii=False, default=str)[:400]}"
                 _budget["seen"][_fp] = _budget["seen"].get(_fp, 0) + 1
-                if _budget["seen"][_fp] == TOOL_REPEAT_WARN:
-                    # 같은 도구·같은 인자 반복 — 더 해도 결과가 달라지지 않는다.
+                if (_budget["seen"][_fp] == TOOL_REPEAT_WARN
+                        and not _status_tool(_inner_tool(str(event.get("name") or ""), event.get("data", {}).get("input"))[0])):
+                    # 같은 도구·같은 인자 반복 — 더 해도 결과가 달라지지 않는다. 상태 도구는 결과가 바뀐다 — 경고하지 않는다(HA-28).
                     yield _sse("status", {"step": f"같은 호출 반복 감지({event.get('name')}) — 결과가 바뀌지 않습니다",
                                           "tool": event.get("name")})
                 _in = event.get("data", {}).get("input")
@@ -7566,6 +7617,8 @@ def health() -> dict:
         "chat_llm": _chat_llm_health(),
         # 챗 자기검증 — 켜짐 · 상태별 수 · 걸린 ms · 마지막 실패(HA-13 — 포털 update-all §7 스모크가 읽는다)
         "self_check": _sc_health(),
+        # 챗 상태 기다림 — 켜짐 · 간격 · 턴 합 상한 · 기동 뒤 시작한 기다림 · 끝 · 상한 · 실패(꼴 바뀜 포함) 수(HWAXPortal docs/request-1030 HA-28)
+        "status_wait": _status_wait_mod.health(),
         # 다른 허브 id 막이 — 손잡이(CHAT_XHUB_ID_GATE)와 기동 뒤 막은 호출 수(HWAXPortal docs/request-1030 HA-30 · design-integration C-8). 재시험
         # OT-07 은 이 수와 로그의 '[gate] … 다른 허브 id' 줄을 함께 본다.
         "xhub_gate": _xhub_gate_health(),
