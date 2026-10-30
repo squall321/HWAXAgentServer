@@ -400,6 +400,7 @@ def test_HA26_실제_Qwen_채팅_틀은_둘째_시스템_메시지를_거절하�
 
 # ── HA-26 재시도 몫 — 그래도 'System message' 400 이면 자동 재시도는 안내를 첫 시스템 메시지에 합친다(HWAXPortal docs/request_261030.md) ──────
 _HA26_DOC = "붙인 문서의 본문 글"
+_HA26_LOG = f"[agent] '{a._SYS_NOT_FIRST}' 400 — 남은 재시도는 이 턴의 안내를 첫 시스템 메시지에 합쳐 보낸다(HA-26)"   # 합칠 때의 운영 로그 — README 도 이 줄 그대로
 
 
 def _ha26_doc_turns(monkeypatch) -> None:
@@ -454,7 +455,7 @@ def test_HA26_실제_경로_그래도_시스템_자리_400_이면_재시도는_�
         "합친 첫 시스템 메시지는 고정 시스템 글 뒤에 이 턴의 안내"
     assert st["humans"][1] == "붙인 문서를 요약해 줘", "재시도의 발화는 사람의 말 그대로"
     assert _text(evs, "token") == "합친 꼴로 받은 답" and not [d for e, d in evs if e == "error"]
-    assert "남은 재시도는 이 턴의 안내를 첫 시스템 메시지에 합쳐 보낸다(HA-26)" in capsys.readouterr().out, "운영 로그에 한 줄"
+    assert _HA26_LOG in capsys.readouterr().out, "운영 로그에 한 줄"
 
 
 # 갈래마다 시험 하나(가짜 서버 하나)다 — 한 시험에서 _turn 을 두 번 부르면 둘째 턴은 첫 턴의 에이전트를 쓰고(_agent_for 가 바꿔 끼운 채다),
@@ -472,4 +473,15 @@ def test_HA26_실제_경로_합치기는_그_400_을_받은_뒤의_재시도부�
     assert st["behaviors"] == [*acts, "oracle"], st["behaviors"]
     assert [_notes_at(st, i) for i in range(3)] == want
     assert _text(evs, "token") == "셋째에 받은 답" and not [d for e, d in evs if e == "error"]
+
+
+def test_HA26_README_의_W3_절은_안내의_자리와_합치는_재시도를_코드_그대로_적는다():
+    """사람은 코드가 아니라 문서를 따른다 — 박스 우회(CHAT_STABLE_PREFIX=0, OB-91)를 걷을지 보는 사람이 이 절을 읽는다. 둘째 시스템 메시지라고
+    적혀 있으면 HA-26 이 걷어 낸 꼴을 지금 설계로 읽고, 로그 줄이 코드와 다르면 cae00 로그에서 찾지 못한다."""
+    text = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    i = text.index("**Stable prompt prefix (W-3).**")
+    para = " ".join(text[i:text.index("\n\n", i)].split())
+    assert "second system message right before" not in para, "HA-26 이 걷어 낸 꼴(둘째 시스템 메시지)"
+    for must in (a._TURN_NOTES_HEAD.strip(), a._TURN_NOTES_TAIL.strip(), _HA26_LOG):
+        assert must in para, must
 

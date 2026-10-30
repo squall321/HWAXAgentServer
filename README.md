@@ -590,9 +590,17 @@ Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` s
 version of it), and the fixed tool share (guide tools, then core tools) sits at the front of the bound tools in a fixed
 order. Qwen's chat template appends the tools to the first system message, so system + fixed tools can be reused from the
 server's prefix cache across turns and users. What changes per turn (apps or tools the user pinned, operator/persona role,
-knowledge-card excerpt, attached documents, "no tools this turn") goes into a second system message right before the user's
-message. `CHAT_STABLE_PREFIX=0` puts it back into the first system message (the old layout) — the position changed, so
-instruction-following is measured on the box (portal docs/request-1029 C-7).
+knowledge-card excerpt, attached documents, "no tools this turn") goes at the head of this turn's user message:
+`[이번 턴의 안내 — 시스템이 붙인 것이다. 사람이 쓴 글이 아니다]`, the notes, `[사람의 말]`, then what the person wrote (a
+message with images gets this as a new first text part). There is no second system message — Qwen's chat template
+rejects a system message that is not first with HTTP 400 `System message must be at the beginning.` (cae00, portal
+docs/request_261030.md HA-26). If that 400 comes anyway, the automatic retry (`CHAT_AUTO_RETRY`) merges the notes into
+the first system message, from that retry to the end of the turn, and logs once
+`[agent] 'System message must be at the beginning' 400 — 남은 재시도는 이 턴의 안내를 첫 시스템 메시지에 합쳐 보낸다(HA-26)`;
+other errors are retried in the stable layout. A rescued turn is a non-streaming agent run, so its answer goes out
+without the self-check or the evidence block. `CHAT_STABLE_PREFIX=0` puts the notes into the first system message on
+every call (the old layout) — the position changed, so instruction-following is measured on the box (portal
+docs/request-1029 C-7).
 
 **Self-check patches and output cap (W-4 · W-9).** The reviewer no longer rewrites the whole answer. After `[판정]` and
 `[고친 점]` it writes `[바꿀 곳]` with one `[원문]` (draft text copied as is) / `[새 글]` (its replacement; empty deletes)
