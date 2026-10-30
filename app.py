@@ -1128,6 +1128,8 @@ def _denied_feature(req: "ChatRequest") -> str | None:
         need = "feat:routines"          # 루틴 가지가 맨 앞이다(chat()) — 그 턴은 슬래시 · 띵킹을 보지 않는다
     elif is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
         need = "feat:deliberation"
+    elif is_report_save(m):
+        need = None                     # chat() 은 /보고서 를 전문가 검색보다 먼저 저장으로 보낸다 — 결론 글의 '전문가 추천' 은 검색이 아니다
     elif is_agent_search(m, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))):   # chat() 과 같은 판정이어야 한다(HA-31)
         need = "feat:expert-chat"
     elif is_thinking(m) or req.thinking:
@@ -2708,15 +2710,29 @@ _AGENT_SEARCH_TRIGGERS = ("/전문가", "/에이전트", "/agents", "/agent")
 _AGENT_SEARCH_RE = re.compile(
     r"(전문가|에이전트|agent)\w*\s*(검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)", re.IGNORECASE)
 # 자연어는 '누가 있나' 만 묻는 질문일 때만 가로챈다 — 목록 답은 LLM 을 거치지 않아 다른 물음을 말없이 버린다(HWAXPortal docs/request-1030
-# HA-31 · DW-13 — '…전문가 에이전트를 추천하고, 추천 근거가 된 기록 수를 알려줘.' 가 목록만 받았다). 수 · 근거 · 비교 · 조건, 찾는 말 뒤에
-# '-고' 로 이은 둘째 요청이 보이면 챗 에이전트로 보낸다. 잘못 보내도 챗이 recommend_agents 로 답하지만 잘못 가로채면 물음이 사라진다.
+# HA-31 · DW-13 — '…전문가 에이전트를 추천하고, 추천 근거가 된 기록 수를 알려줘.' 가 목록만 받았다). 수 · 근거 · 비교 · 기준 · 조건,
+# 둘째 요청(이음 낱말 · 문장이 둘 · 찾는 말 앞에 맺은 요청 · 뒤에 이은 요청)이 보이면 챗 에이전트로 보낸다. 잘못 보내도 챗이
+# recommend_agents 로 답하지만 잘못 가로채면 물음이 사라진다 — 의심스러우면 챗이다.
 _AGENT_SEARCH_OTHER_ASK_RE = re.compile(
-    r"몇|개수|갯수|건수|횟수|인원수|얼마|(?<![가-힣])수(?!\s*도?\s*[있없])(?:[를는가도만]|(?![가-힣]))"  # 수('할 수 있' 은 아니다)
+    r"몇|개수|갯수|건수|횟수|인원수|명수|점수|얼마|(?:카드|전문가|에이전트|사람|문서|표본|샘플)수|\d+\s*(?:명|개|건|위)"  # 수(붙여 쓴 꼴 · 'N명만')
+    r"|(?<![가-힣])수(?!\s*[가는도만]?\s*[있없])(?:[를는가도만와과로의에]|까지|이?랑|하고|별|만큼|보다)?(?![가-힣])"  # ('할 수 있' 은 아니다)
     r"|근거(?!리)|기록|출처|이유|왜(?!곡)"                                               # 근거('근거리' · '왜곡' 은 분야 낱말)
     r"|비교|차이|누가\s*더|어느\s*(?:쪽|것|게|편)|\bvs\b"                                 # 비교
-    r"|조건|경우|만약|만일|(?:이|라|다)면(?![가-힣])"                                     # 조건
-    r"|(?:검색|추천|찾|알려|보여)[가-힣]*?(?:\s*주)?고(?![가-힣])(?!\s*[싶있])",          # 둘째 요청('찾고 싶어' 는 아니다)
+    r"|제일|가장|최고|순위|랭킹|순으로|순서|상위|신뢰도"                                   # 기준 — 목록은 관련도순으로만 줄을 세운다
+    r"|조건|경우|만약|만일"                                                              # 조건
+    r"|(?<![있없])(?:으|하|되|나|크|오|가|보|쓰|리|르|기|우|이|라|다)면(?![가-힣])"         # '-면' 은 활용 꼴만(표면 · 계면 · 도면은 분야 낱말,
+    r"|(?:어|아|워|려|라|커|꺼|깨|해|서)지면(?![가-힣])"                                    # 접지면 · 지면도 그렇고 '주시면' 은 부탁이다)
+    r"|[있없](?:으|다)면(?![가-힣])(?!\s*(?:좀\s*)?(?:알려|추천|보여|소개|찾|말해))"          # '있으면 알려줘' 는 조건이 아니라 '있나' 다
+    r"|(?:검색|추천|찾|알려|보여)[가-힣]*?(?:\s*주)?고(?![가-힣])(?!\s*[싶있])"             # 둘째 요청('찾고 싶어' 는 아니다)
+    r"|그리고|그러고|그다음|그런데|근데|이어서|아울러|또한"
+    r"|[.?!;…](?![0-9A-Za-z])\s*[^\s.?!;~…)]|\n\s*\S",                                # 문장이 둘('2.5D' · 'v1.2' 의 점은 아니다)
     re.IGNORECASE)
+# 찾는 말(_AGENT_SEARCH_RE) 앞에 맺은 요청('…알려줘 전문가도' · '…설명하고 전문가'), 뒤에 이은 요청(쉼표 · 이음 어미 -고 · -서 · -며 뒤의 글,
+# '카드도' 같은 덧붙임, '다음 · 뒤 · 후 · 또'). 앞은 분야 낱말 자리라 맺은 꼴만 본다 — 이음 어미를 다 보면 '센서 · 사고' 가 걸린다.
+_AGENT_SEARCH_PREV_ASK_RE = re.compile(r"줘|주세요|줄래|주실래|[하되](?:고|며|면서)(?![가-힣])(?!\s*(?:싶|있|계))|[해돼]서(?![가-힣])")
+_AGENT_SEARCH_NEXT_ASK_RE = re.compile(
+    r",\s*[^\s,.?!~]|(?:고(?!\s*(?:싶|있|계))|서|며)(?![가-힣])\s*[^\s.?!~]|[가-힣]도(?![가-힣])"
+    r"|(?:(?<![가-힣])|(?<=[한은는인]))(?:다음|뒤|후|또)(?:에|엔|로)?(?![가-힣])")
 
 
 def is_agent_search(message: str, pinned: bool = False) -> bool:
@@ -2728,31 +2744,43 @@ def is_agent_search(message: str, pinned: bool = False) -> bool:
         return True
     if pinned or len(m) > 80:
         return False
-    return bool(_AGENT_SEARCH_RE.search(m)) and not _AGENT_SEARCH_OTHER_ASK_RE.search(m)
+    mt = _AGENT_SEARCH_RE.search(m)
+    return bool(mt) and not (_AGENT_SEARCH_OTHER_ASK_RE.search(m) or _AGENT_SEARCH_PREV_ASK_RE.search(m[:mt.start()])
+                             or _AGENT_SEARCH_NEXT_ASK_RE.search(m[mt.end():]))
 
 
-# 추천 질의에서 찾는 말을 뺀다 — '전문가 · 추천해 · 줘' 는 분야가 아니라 요청이라, 그대로 넘기면 설명에 그 낱말이 든 사람마다 겹침 점수가
-# 붙어 무관한 전문가가 오른다(HA-31 · AIDataHub AD-19). 다 빠져 비면 추천 없이 명부 · 분야만 낸다(종전엔 요청 낱말로 추천했다).
-_AGENT_QUERY_ASK_RE = re.compile(
-    r"(?:전문가|에이전트|(?<![a-z])agents?(?![a-z])|검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있)[가-힣]*[?!.~,]*"
-    r"|(?<!\S)(?:좀|해|줘|주세요|줄래요?|부탁[가-힣]*)[?!.~,]*(?!\S)", re.IGNORECASE)
+# 추천 질의는 분야 낱말이다 — '전문가 · 추천해 · 줘' 는 요청이라 그대로 넘기면 설명에 그 낱말이 든 사람마다 겹침 점수가 붙어 무관한 전문가가
+# 오른다(HA-31 · AIDataHub AD-19). 찾는 말 앞에서는 '어떤' 과 끝에 붙은 전문가 · 에이전트만, 뒤에서는 찾는 말의 남은 활용과 부탁 낱말만
+# 뺀다 — 분야 낱말이 찾는 말로 시작하거나 그것을 품어도('검색 엔진' · '체크리스트' · 'he-agent-builder') 남는다. 다 빠져 비면 추천 없이
+# 명부 · 분야만 낸다(종전엔 요청 낱말로 추천했다).
+_AGENT_QUERY_HEAD_RE = re.compile(r"(?<!\S)(?:어떤|무슨|어느|좀)(?!\S)|(?:\s*(?:전문가|에이전트)[가-힣]*)+\s*$")
+_AGENT_QUERY_TAIL_RE = re.compile(
+    r"(?<!\S)(?:(?:검색|추천|찾|알려|목록|리스트|보여|뭐|무엇|어떤|있|부탁|감사|고맙|싶|좋겠|가능|주[세시실]|줄래)[가-힣]*|좀|해|줘|줘요|수)"
+    r"[?!.~,]*(?!\S)")
 
 
 def _agent_search_query(text: str) -> str:
-    return " ".join(_AGENT_QUERY_ASK_RE.sub(" ", text or "").split())
+    m = (text or "").strip()
+    mt = _AGENT_SEARCH_RE.search(m)
+    if not mt:
+        return m
+    head = _AGENT_QUERY_HEAD_RE.sub(" ", m[:mt.start()])
+    tail = _AGENT_QUERY_TAIL_RE.sub(" ", re.sub(r"^\w*[?!.~,]*", "", m[mt.end():]))   # 찾는 말의 남은 활용(추천'해' · 있'는지')부터 뺀다
+    return " ".join(f"{head} {tail}".split())
 
 
 def strip_agent_trigger(message: str) -> str:
+    """전문가 검색의 추천 질의. 빗금 트리거면 그 뒤에 사람이 적은 글 그대로다(정리하지 않는다 — 'he-agent-builder' 같은 키도 온다),
+    자연어면 찾는 말을 뺀 분야 낱말이다(_agent_search_query)."""
     m = (message or "").strip()
     for t in _AGENT_SEARCH_TRIGGERS:
         if m.startswith(t):
             return m[len(t):].strip()
-    return m
+    return _agent_search_query(m)
 
 
 async def run_agent_search(app: FastAPI, query: str, groups: list[str]):
     """전문가 카탈로그 SSE — 추천(관련도순) + 분야별 인원 요약을 결정적으로 만든다."""
-    query = _agent_search_query(query)      # 찾는 말을 뺀 분야 낱말로 추천하고 화면에도 그것을 '검색' 으로 보인다
     yield _sse("status", {"step": "전문가 검색 중", "tool": "recommend_agents"})
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX)  # 결과를 코드가 파싱 — 절단 금지
