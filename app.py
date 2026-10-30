@@ -1717,6 +1717,28 @@ _HUB_FOLD = (("objects_summary", ("group_options",), False), ("objects_list", ("
 _HUB_FOLD_LISTS = ("graph_neighbors", "object_fields", "object_references")
 _HUB_BIG_CHARS = 60_000
 _HUB_LIST_HEAD = 50
+# 접기의 흔적(HWAXPortal docs/request-1030 HA-34) — 접은 표지가 LLM 에 가는 결과 글 머리에만 있어, 10-29 · 10-30 재시험이 접기가 실제로
+# 걸렸는지 가리지 못했다. 글이 바뀐 접기마다 로그 한 줄(도구 이름 · 원문 자 수 · 접은 뒤 자 수)과 /health 의 hub_fold(기동 뒤 횟수 · 원문
+# 자 수 합 · 접은 뒤 자 수 합). /health 는 스레드 풀에서, 접기는 이벤트 루프에서 돈다 — 자물쇠로 묶는다(_SC_LOCK 과 같다).
+_HUB_FOLD_LOCK = threading.Lock()
+_HUB_FOLD_STAT: dict = {"count": 0, "chars_in": 0, "chars_out": 0}
+
+
+def _hub_fold_note(name, before: str, after: str) -> str:
+    """접은 글을 그대로 돌려준다 — 글이 바뀌었을 때만 세고 로그 한 줄을 남긴다."""
+    if after == before:
+        return after
+    with _HUB_FOLD_LOCK:
+        _HUB_FOLD_STAT["count"] += 1
+        _HUB_FOLD_STAT["chars_in"] += len(before)
+        _HUB_FOLD_STAT["chars_out"] += len(after)
+    print(f"[agent] 허브 응답 접음 — {str(name)[:80]}: 원문 {len(before):,}자 → {len(after):,}자")
+    return after
+
+
+def _hub_fold_health() -> dict:
+    with _HUB_FOLD_LOCK:
+        return dict(_HUB_FOLD_STAT)
 
 
 def _fold_hub_lists(text: str) -> str:
@@ -1751,7 +1773,7 @@ def _fold_hub_result(name, text):
     n = str(name or "").strip().lower()
     if (isinstance(text, str) and text.lstrip().startswith(("{", "["))
             and any(n == t or n.endswith("_" + t) for t in _HUB_FOLD_LISTS)):
-        return _fold_hub_lists(text)
+        return _hub_fold_note(name, text, _fold_hub_lists(text))
     rule = next((r for r in _HUB_FOLD if n == r[0] or n.endswith("_" + r[0])), None)
     if rule is None or not isinstance(text, str) or not text.lstrip().startswith(("{", "[")):
         return text
@@ -1798,7 +1820,8 @@ def _fold_hub_result(name, text):
     if not cut:
         return text
     what = " · ".join(f"관계 항목 {v:,}건" if k == "related" else f"{k} {v:,}곳" for k, v in cut.items())
-    return f"[포털 챗이 허브 응답을 접었다 — {what} 뺐다 · 원문 {len(text):,}자]\n" + json.dumps(folded, ensure_ascii=False)
+    return _hub_fold_note(name, text, f"[포털 챗이 허브 응답을 접었다 — {what} 뺐다 · 원문 {len(text):,}자]\n"
+                          + json.dumps(folded, ensure_ascii=False))
 
 
 def _app_label_cached(name: str) -> str:
@@ -7223,6 +7246,9 @@ def health() -> dict:
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
+        # 허브 응답 접기 — 기동 뒤 글이 바뀐 접기의 횟수 · 원문 자 수 합 · 접은 뒤 자 수 합(HWAXPortal docs/request-1030 HA-34). 챗 · 심의의
+        # 도구 결과를 함께 센다(같은 래퍼다). count 가 0 이면 아직 한 번도 접지 않았다.
+        "hub_fold": _hub_fold_health(),
         # 그림을 받는가 — 서버(호스트 · 모델)마다 탐침 결과(None 은 아직 모름 — 첫 그림 턴에 묻는다). docs/chat-depth-context T5.
         "vision": _vision.state(),
         # 심의 좌석이 조회로 받은 그림의 판독 — 지금 상한 · 그 값을 준 손잡이 · 판독기가 엔진에 달렸나(HA-17)
