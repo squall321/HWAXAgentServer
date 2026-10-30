@@ -2118,10 +2118,13 @@ async def _status_wait(name: str, kw: dict, out, again, rc, chat: bool) -> tuple
         if (rc or {}).get("callbacks") is not None:
             await adispatch_custom_event(_status_wait_mod.EVENT, data, config=rc)
 
+    # 멈춤 술어(C-4) — 이 턴에 확인 관문(HA-29)이 막은 호출이 있으면 참이다. 그 턴은 이 단계가 끝난 뒤 다음 모델 호출 앞에서 끊기고 카드로 끝나므로
+    # 기다림의 결과를 모델이 끝내 보지 못한다 — 잠 · 다시 조회 앞에서 접어 카드가 최대 600초 늦게 서지 않게 한다. 맥락은 턴과 나눠 쥔 객체라
+    # 나란한 도구가 막은 것도 보인다. 관문이 꺼졌거나 챗 밖이면 맥락이 None 이라 늘 거짓이다.
     return await _status_wait_mod.handle(
         inner, (m.get("map") or {}).get(inner) or None, m.get("routine_read"), kw if args is None else args, out, again, turn,
         chat=chat, emit=emit,
-        stop=lambda: False)      # 멈춤 술어(C-4) — 확인 카드(HA-29)가 섰으면 참이 되게 합칠 때 잇는다. 지금은 늘 거짓
+        stop=lambda: bool(getattr(_turn_confirm.get(), "pending", None)))
 
 
 def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
