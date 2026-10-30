@@ -960,3 +960,21 @@ def test_진짜_그래프에서도_끊기면_모델의_뒷말이_없고_카드�
     assert len(card) == 1 and card[0]["id"] in res and reached == []
     assert "잡을 걸었습니다" not in res and [e for e, _ in evs if e == "error"] == []
     assert any(s.startswith("확인 대기: run_job") for s in _steps(evs))
+
+
+def test_카드_작업량은_work_outlook_이_있으면_모형_값과_같은_인자의_끝난_잡을_싣는다():
+    """StepForge ST-12(b2c70f1) — 시작 전 work_outlook 의 model_s 는 '모형 값' 이지 예상 시간이 아니다(하한도 상한도 아니다). 가장 나은 근거는
+    seen_s(같은 인자로 끝난 잡)다. 옛 판처럼 '약 N초 — 하한일 수 있다' 로 적으면 사람이 모형 값을 예상 시간으로 읽는다."""
+    d = {"expected_s": None, "cost_basis": None, "gateway_verdict": "async_job",
+         "work_outlook": {"stage": "board_fuse", "tool": "drop_check", "shapes": 3658, "box_pairs": 12000, "model_s": 106.0,
+                          "model_note": "모형", "seen_s": {"n": 3, "median_s": 126.0, "max_s": 195.0},
+                          "holds_runner": True, "runner_slots": 1, "progress": "elapsed", "note": ""}}
+    line = a._confirm_estimate_text(d)
+    assert "합칠 형상 3,658개" in line
+    assert "모형 값 106초(예상 시간이 아니다" in line and "하한일 수 있다" not in line and "약 106초" not in line
+    assert "같은 인자로 끝난 잡 3번 — 가운데 126초 · 가장 길게 195초" in line
+    assert "러너를 오래 잡을 수 있다(동시 1칸)" in line
+    # 모형을 못 셌으면 그 까닭을, 끝난 잡이 없으면 그 줄을 싣지 않는다
+    d2 = {"work_outlook": {"shapes": 211, "model_s": None, "model_why": "기하 캐시가 맞지 않아 세지 않았다", "seen_s": None, "holds_runner": False}}
+    line2 = a._confirm_estimate_text(d2)
+    assert "모형 값 없음 — 기하 캐시가 맞지 않아 세지 않았다" in line2 and "끝난 잡" not in line2 and "러너" not in line2

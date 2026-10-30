@@ -3664,7 +3664,9 @@ def _confirm_sf_job(c: dict) -> bool:
 
 
 def _confirm_estimate_text(d) -> str:
-    """StepForge estimate_cost 의 답 → 카드 한 줄. 근거(cost_basis)와 '하한일 수 있다' 를 늘 함께 적는다(ST-12 — 60초 예상이 1,812초였다).
+    """StepForge estimate_cost 의 답 → 카드 한 줄. `work_outlook`(StepForge ST-12 `b2c70f1`)이 있으면 그것을 싣는다 — `model_s` 는 '모형 값' 이지
+    예상 시간이 아니고(하한도 상한도 아니다 — StepForge 실측 실제/모형 0.1 ~ 1.2), 가장 나은 근거는 같은 인자로 끝난 잡의 `seen_s` 다(StepForge 답
+    10-30). 옛 판(work_outlook 없음)은 expected_s 를 근거(cost_basis)와 '하한일 수 있다' 와 함께 적는다(60초 예상이 1,812초였다).
     잡의 판정(gateway_verdict)은 async_job 이라 넘침 판정(over · may_exceed)만 싣는다."""
     if not isinstance(d, dict) or not d:
         return "예상 작업량을 읽지 못했다"
@@ -3675,7 +3677,24 @@ def _confirm_estimate_text(d) -> str:
     def isnum(x) -> bool:
         return isinstance(x, (int, float)) and not isinstance(x, bool)
     exp, lo, hi = d.get("expected_s"), d.get("low_s"), d.get("high_s")
-    if isnum(exp):
+    wo = d.get("work_outlook")
+    if isinstance(wo, dict) and wo:
+        parts = []
+        if isnum(wo.get("shapes")):
+            parts.append(f"합칠 형상 {num(wo['shapes'])}개")
+        if isnum(wo.get("model_s")):
+            parts.append(f"모형 값 {num(wo['model_s'])}초(예상 시간이 아니다 — 하한도 상한도 아니다)")
+        elif isinstance(wo.get("model_why"), str) and wo["model_why"].strip():
+            parts.append("모형 값 없음 — " + _cut_mark(wo["model_why"].strip(), 120))
+        seen = wo.get("seen_s")
+        if isinstance(seen, dict) and isnum(seen.get("median_s")):
+            top = seen.get("max_s") if isnum(seen.get("max_s")) else seen["median_s"]
+            parts.append(f"같은 인자로 끝난 잡 {num(seen['n']) if isnum(seen.get('n')) else '?'}번 — 가운데 {num(seen['median_s'])}초 · "
+                         f"가장 길게 {num(top)}초")
+        if wo.get("holds_runner"):
+            parts.append("러너를 오래 잡을 수 있다" + (f"(동시 {num(wo['runner_slots'])}칸)" if isnum(wo.get("runner_slots")) else ""))
+        s = " · ".join(parts) or "작업 전망을 읽지 못했다"
+    elif isnum(exp):
         rng = f"{num(lo)} ~ {num(hi)}초 · " if isnum(lo) and isnum(hi) else ""
         s = f"약 {num(exp)}초({rng}근거 {d.get('cost_basis') or '모름'}) — 추정이며 하한일 수 있다"
     else:
