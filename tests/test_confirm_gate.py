@@ -978,3 +978,60 @@ def test_카드_작업량은_work_outlook_이_있으면_모형_값과_같은_인
     d2 = {"work_outlook": {"shapes": 211, "model_s": None, "model_why": "기하 캐시가 맞지 않아 세지 않았다", "seen_s": None, "holds_runner": False}}
     line2 = a._confirm_estimate_text(d2)
     assert "모형 값 없음 — 기하 캐시가 맞지 않아 세지 않았다" in line2 and "끝난 잡" not in line2 and "러너" not in line2
+
+
+# ── 반대 검토 2차(rv2) — HA-28 맞물림: 멈춤 술어는 G5 가 막은 호출만 · 승인 안내는 상태 조회를 시킨다 ─────────────────────────────────────
+import status_wait as sw  # noqa: E402
+
+
+def _wait_tool(name, respond, calls):
+    """챗 래퍼(chat=True)의 상태 도구 대역 — 진짜 어댑터 꼴(content_and_artifact)."""
+    async def call(**kw):
+        calls.append(dict(kw))
+        return ([{"type": "text", "text": json.dumps(respond(len(calls)), ensure_ascii=False)}], None)
+    t = StructuredTool(name=name, description="d", coroutine=call, args_schema={"type": "object", "properties": {"task_id": {"type": "string"}}},
+                       response_format="content_and_artifact")
+    return a._prep_tool(t, arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True)
+
+
+def test_rv2_승인_실행이_다시_카드로_돌린_턴은_끊기지_않으니_상태_조회의_되풀이를_기다린다(gate, monkeypatch):
+    """승인 실행이 도구 목록을 못 받으면 그 호출을 pending 에 다시 싣는다 — 그 턴은 끊기지 않고 끝까지 돈다. 멈춤 술어가 pending 을 보면 되풀이
+    상태 조회가 0초에 접히고 '다른 까닭으로 먼저 멈춘다' 는 틀린 안내를 받았다(LLM 폴링을 막는 것은 재귀 한도뿐이었다)."""
+    monkeypatch.setattr(sw, "MAX_S", 0.6)
+    monkeypatch.setattr(sw, "POLL_S", 0.05)
+    monkeypatch.setattr(sw, "TELL_S", 0.0)
+    monkeypatch.setattr(sw, "_STAT", {"waits": 0, "ended": 0, "capped": 0, "failed": 0})
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    polls, outs = [], []
+    st = _wait_tool("get_task", lambda n: {"task_id": "t5", "status": "running", "progress": 0.5}, polls)
+    orig = st.ainvoke
+
+    async def spy(args, *x, **k):
+        r = await orig(args, *x, **k)
+        outs.append(str(r))
+        return r
+    object.__setattr__(st, "ainvoke", spy)
+    ag = _GateAgent({"get_task": st}, steps=[[("get_task", {"task_id": "t5"})], [("get_task", {"task_id": "t5"})]], say="아직 도는 중입니다.")
+    evs, _ = _turn(monkeypatch, ag, tools, card["approve_text"], hist, tbn_boom=RuntimeError("401 사용자 자격 거절"))
+    assert reached == [] and len([d for e, d in evs if e == "confirm"]) == 1, "보내지 못한 승인은 다시 카드"
+    assert ag.after_cut is True, "그 턴은 끊기지 않았다"
+    assert not any("기다리다 접었다" in o for o in outs), outs
+    assert len(polls) >= 3 and "상한" in outs[1], ("되풀이(두 번째) 호출은 기다린다", len(polls), outs[1][-200:])
+
+
+@pytest.mark.parametrize("wait_on", [True, False])
+def test_rv2_승인_실행_안내는_기다림이_켜져_있으면_상태_조회를_한_번_부르라고_시킨다(gate, monkeypatch, wait_on):
+    monkeypatch.setattr(sw, "MAX_S", 5.0 if wait_on else 0.0)
+    reached = []
+    tools = {"run_job": _gw("run_job", reached)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    ag = _GateAgent(tools, steps=[], say="잡 J-1 을 걸었습니다.")
+    _turn(monkeypatch, ag, tools, card["approve_text"], hist)
+    human = ag.inputs[0]["messages"][-1][1]
+    assert reached == [("run_job", P1_GRAPH)]
+    if wait_on:
+        assert "상태 조회 도구를 한 번 부르라 — 코드가 끝날 때까지 기다린다" in human and "볼 수 있다" not in human
+    else:
+        assert "상태 조회 도구로 진행을 볼 수 있다" in human and "코드가 끝날 때까지" not in human, "꺼져 있으면 기다려 준다고 말하지 않는다"

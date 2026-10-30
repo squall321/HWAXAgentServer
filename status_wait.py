@@ -81,6 +81,18 @@ def new_turn() -> dict:
     return {"born": set(), "seen": Counter(), "spent_s": 0.0}
 
 
+def retry(turn, quiet_s=None) -> None:
+    """그래프를 처음부터 다시 도는 길(자동 재시도 · 강제 재시도 · 새어 나온 호출의 재시도 · 빈 답 구제 — agent.ainvoke) 앞. '같은 호출의 되풀이'
+    셈(seen)을 비운다 — 재시도의 첫 조회가 앞 흐름의 호출과 겹쳐 되풀이로 읽혀, 상태만 물은 질문이 상한까지 기다렸다(반대 검토 2차). born ·
+    spent_s 는 둔다(이 턴에 건 잡 · 이 턴에 기다린 합). quiet_s 를 주면 그 길의 기다림 합을 그 초까지로 묶는다 — 그 길은 진행 줄을 받을 스트림이
+    없어 ping 을 끈 박스에서는 기다리는 내내 침묵이다(포털 중계의 침묵 한도 900초)."""
+    if turn is None:
+        return
+    turn["seen"].clear()
+    if quiet_s is not None:
+        turn["quiet"] = {"cap": max(0.0, float(quiet_s)), "spent": 0.0}
+
+
 def health() -> dict:
     with _LOCK:
         stat = dict(_STAT)
@@ -238,17 +250,18 @@ def _note_snapshot(st: dict, left: float) -> str:
             f"같은 인자로 한 번 더 부르라 — 코드가 {_dur(POLL_S)}마다 다시 보며 최대 {_dur(left)} 기다린다(그 사이 LLM 을 부르지 않는다)]")
 
 
-def _note_budget(st: dict) -> str:
-    return (f"[코드 기다림 — 이 턴의 기다림 상한({_dur(MAX_S)})을 이미 다 써 기다리지 않았다. 아직 끝나지 않았다({_now_txt(st)}). "
-            "예전 결과로 대신 답하지 말고 지금 상태를 알려라]")
+def _note_budget(st: dict, limit=None) -> str:
+    return (f"[코드 기다림 — 이 턴의 기다림 상한({_dur(MAX_S if limit is None else limit)})을 이미 다 써 기다리지 않았다. 아직 끝나지 않았다"
+            f"({_now_txt(st)}). 예전 결과로 대신 답하지 말고 지금 상태를 알려라]")
 
 
-def _note(outcome: str, tool: str, st: dict, elapsed: float, polls: int, why: str) -> str:
+def _note(outcome: str, tool: str, st: dict, elapsed: float, polls: int, why: str, limit=None) -> str:
     if outcome == "end":
         return (f"[코드 기다림 — {tool} 를 {_dur(elapsed)} 기다려({_dur(POLL_S)}마다 {polls}번 다시 조회) 끝난 상태({st['word']})를 받았다. "
                 "위가 끝난 뒤의 결과다 — 이 결과로 답하라]")
     if outcome == "cap":
-        return (f"[코드 기다림 — {tool} 를 {_dur(elapsed)} 기다렸지만 이 턴의 상한({_dur(MAX_S)})에 닿았다. 아직 끝나지 않았다({_now_txt(st)}). "
+        return (f"[코드 기다림 — {tool} 를 {_dur(elapsed)} 기다렸지만 이 턴의 상한({_dur(MAX_S if limit is None else limit)})에 닿았다. "
+                f"아직 끝나지 않았다({_now_txt(st)}). "
                 "위는 끝나기 전의 마지막 조회다 — 이번 잡의 결과는 아직 없다. 예전에 저장된 결과를 이번 결과처럼 답하지 말고, 지금 상태와 "
                 "'끝난 뒤 다시 물어 달라' 를 알려라. 이 턴에는 더 기다리지 않는다]")
     if outcome == "fail":
@@ -322,17 +335,38 @@ async def handle(name, app_key, routine_read, args, out, again, turn, *, chat: b
         return out, "", False
     if st["phase"] == "end" or not chat:
         return out, "", True
-    left = MAX_S - turn["spent_s"]
+    left, limit = MAX_S - turn["spent_s"], MAX_S
+    q = turn.get("quiet")                        # 스트림이 없는 재시도 길의 묶음(retry)
+    if q is not None and q["cap"] - q["spent"] < left:
+        left, limit = q["cap"] - q["spent"], q["cap"]
     mine = bool(_ids(args) & turn["born"]) or turn["seen"][key] >= 2
     if left <= 0:
-        return out, "\n" + _note_budget(st), True
+        return out, "\n" + _note_budget(st, limit), True
     if not mine:
         return out, "\n" + _note_snapshot(st, left), True
-    last, note = await _wait(str(name), st, out, again, turn, left, emit, stop or (lambda: False))
+    last, note = await _wait(str(name), st, out, again, turn, left, emit, stop or (lambda: False), limit)
     return last, "\n" + note, True
 
 
-async def _wait(tool: str, st: dict, out, again, turn: dict, budget: float, emit, stop) -> tuple:
+async def _poll_once(again, lim: float):
+    """다시 조회 한 번 — lim 초 안에 답하지 않으면 그 호출을 취소하고(끝나기를 기다린다 — 그 안의 정리가 같은 태스크에서 끝난다) TimeoutError.
+    asyncio.wait_for 를 쓰지 않는다 — 3.10 의 wait_for 는 안쪽 호출이 막 끝난 박자에 온 취소를 삼키고 결과를 돌려준다(except CancelledError:
+    if fut.done(): return fut.result()). 그러면 중지 뒤에도 고리가 끝 · 상한까지 POLL_S 마다 다시 조회했다(반대 검토 2차 — app 의 _detach_stream 도
+    같은 까닭으로 피한다)."""
+    t = asyncio.ensure_future(again())
+    try:
+        done, _ = await asyncio.wait({t}, timeout=lim)
+    except asyncio.CancelledError:
+        t.cancel()
+        raise
+    if not done:
+        t.cancel()
+        await asyncio.wait({t})
+        raise asyncio.TimeoutError
+    return t.result()
+
+
+async def _wait(tool: str, st: dict, out, again, turn: dict, budget: float, emit, stop, limit=None) -> tuple:
     t0 = time.monotonic()
     polls, last, told, outcome, why = 0, out, t0, "cap", ""
     _count("waits")
@@ -348,7 +382,7 @@ async def _wait(tool: str, st: dict, out, again, turn: dict, budget: float, emit
                 break
             lim = min(POLL_CALL_MAX_S, max(POLL_S, budget - (time.monotonic() - t0)))
             try:
-                nxt = await asyncio.wait_for(again(), timeout=lim)     # 한도에 걸리면 그 호출을 취소한다(읽기라 안전하다)
+                nxt = await _poll_once(again, lim)                      # 한도에 걸리면 그 호출을 취소한다(읽기라 안전하다)
             except asyncio.TimeoutError:
                 outcome, why = "fail", f"{_dur(lim)} 안에 답하지 않았다"
                 break
@@ -379,9 +413,11 @@ async def _wait(tool: str, st: dict, out, again, turn: dict, budget: float, emit
         raise
     elapsed = time.monotonic() - t0
     turn["spent_s"] += elapsed
+    if turn.get("quiet") is not None:
+        turn["quiet"]["spent"] += elapsed
     if outcome in _STAT_OF:
         _count(_STAT_OF[outcome])
     await _emit(emit, _data(outcome, tool, st, elapsed, budget, polls, why))
     print(f"[status-wait] {tool}: {outcome} — {elapsed:.0f}초 · 다시 조회 {polls}번 · 상태 {st['word']}" + (f" · {why}" if why else ""),
           flush=True)
-    return last, _note(outcome, tool, st, elapsed, polls, why)
+    return last, _note(outcome, tool, st, elapsed, polls, why, limit)

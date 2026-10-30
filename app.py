@@ -2119,13 +2119,22 @@ async def _status_wait(name: str, kw: dict, out, again, rc, chat: bool) -> tuple
         if (rc or {}).get("callbacks") is not None:
             await adispatch_custom_event(_status_wait_mod.EVENT, data, config=rc)
 
-    # 멈춤 술어(C-4) — 이 턴에 확인 관문(HA-29)이 막은 호출이 있으면 참이다. 그 턴은 이 단계가 끝난 뒤 다음 모델 호출 앞에서 끊기고 카드로 끝나므로
-    # 기다림의 결과를 모델이 끝내 보지 못한다 — 잠 · 다시 조회 앞에서 접어 카드가 최대 600초 늦게 서지 않게 한다. 맥락은 턴과 나눠 쥔 객체라
-    # 나란한 도구가 막은 것도 보인다. 관문이 꺼졌거나 챗 밖이면 맥락이 None 이라 늘 거짓이다.
+    # 멈춤 술어(C-4) — 이 턴에 확인 관문(HA-29)의 G5 가 호출을 막았으면 참이다. 그 턴은 이 단계가 끝난 뒤 다음 모델 호출 앞에서 끊기고 카드로
+    # 끝나므로 기다림의 결과를 모델이 끝내 보지 못한다 — 잠 · 다시 조회 앞에서 접어 카드가 최대 600초 늦게 서지 않게 한다. 맥락은 턴과 나눠 쥔
+    # 객체라 나란한 도구가 막은 것도 보인다. 관문이 꺼졌거나 챗 밖이면 맥락이 None 이라 늘 거짓이다. pending(카드에 실을 호출)을 보지 않는다 —
+    # 승인 실행이 도구 목록을 못 받아 다시 카드로 돌린 호출도 거기 들지만 그 턴은 끊기지 않고 끝까지 돈다(반대 검토 2차 — 그 턴의 되풀이 상태
+    # 조회가 0초에 접히고 '다른 까닭으로 먼저 멈춘다' 는 틀린 안내를 받았다).
     return await _status_wait_mod.handle(
         inner, (m.get("map") or {}).get(inner) or None, m.get("routine_read"), kw if args is None else args, out, again, turn,
         chat=chat, emit=emit,
-        stop=lambda: bool(getattr(_turn_confirm.get(), "pending", None)))
+        stop=lambda: bool(getattr(_turn_confirm.get(), "held", 0)))
+
+
+def _status_wait_retry() -> None:
+    """그래프를 처음부터 다시 도는 길(agent.ainvoke — 자동 재시도 · 강제 재시도 · 새어 나온 호출의 재시도 · 빈 답 구제) 앞 — 상태 기다림의 턴 상태를
+    그 길에 맞춘다(status_wait.retry — '같은 호출의 되풀이' 셈을 비운다). 이 길은 진행 줄을 낼 스트림이 없다 — ping 을 끈 박스(DELIB_HEARTBEAT_S
+    ≤ 0)에서는 그 길의 기다림 합을 POLL_CALL_MAX_S 로 묶는다(design-ha28 4.12 의 '침묵은 150초를 넘지 않는다' 가 이 길에서도 서게 — 반대 검토 2차)."""
+    _status_wait_mod.retry(_turn_status_wait.get(), _status_wait_mod.POLL_CALL_MAX_S if DELIB_HEARTBEAT_S <= 0 else None)
 
 
 def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
@@ -3451,7 +3460,7 @@ class _ConfirmCtx:
     utterance — 주문 판정 글(이번 사람 말 원문, 카드의 답이면 빈 글 — 확인 답은 새 주문이 아니다) · pinned — 사람이 콕 집은 도구 ·
     approved — 이번에 승인된 호출 {(부른 이름, 맞은 이름, 정규 인자): 호출} · used — 이 턴에 이미 나간 호출의 열쇠(맞은 이름 · 승인 열쇠) · pending — 막은 호출(턴 끝 카드에 실린다) ·
     note — 이 턴의 안내에 붙일 글 · status — 턴 머리의 상태줄 · card — 본문 끝에 붙인 카드 글 · card_id — 승인된 카드 번호 · sent — 서버가 보낸 수."""
-    __slots__ = ("utterance", "pinned", "approved", "used", "pending", "note", "status", "card", "card_id", "sent")
+    __slots__ = ("utterance", "pinned", "approved", "used", "pending", "note", "status", "card", "card_id", "sent", "held")
 
     def __init__(self, utterance: str = "", pinned=()):
         self.utterance = utterance
@@ -3459,6 +3468,7 @@ class _ConfirmCtx:
         self.approved, self.used, self.pending = {}, set(), []
         self.note = self.status = self.card = self.card_id = ""
         self.sent = 0
+        self.held = 0           # 이 턴에 G5 가 막은 호출 수 — 상태 기다림의 멈춤 술어(C-4)가 본다(pending 은 다시 카드로 돌린 호출도 든다)
 
 
 def _confirm_reply(req) -> tuple | None:
@@ -3599,6 +3609,7 @@ def _confirm_gate(tool, a, kw) -> str | None:
             kept = targs
         ctx.pending.append({"name": str(name), "via": via, "base": base, "kind": kind, "args": kept, "canon": key[1],
                             "again": again, "limits": {} if via else _confirm_schema_limits(tool)})
+    ctx.held += 1
     return _confirm_refusal(name, kind, again)
 
 
@@ -3867,8 +3878,13 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
                               **({"result_preview": prev} if prev else {}), **({"result_full": hand} if len(hand) > len(prev) else {})})
         lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → {_cut_mark(txt, 6000)}")
     print(f"[confirm] 승인 {cid} — {ctx.sent}건 보냄", flush=True)
+    # 상태 기다림(HA-28)이 켜져 있으면 결과를 물은 사람에게는 상태 조회를 한 번 부르라고 시킨다 — '볼 수 있다' 처럼 허용만 하면 모델이 queued 로 답하고
+    # 끝내 이 턴에 배운 잡 id(born)로 기다릴 기회가 사라진다(반대 검토 2차 — DW-02 의 '돌려서 결과 알려줘'). 꺼져 있으면 기다려 준다고 말하지 않는다.
+    follow = ("결과(잡 id · 상태)를 사용자에게 알려라. 잡이고 사람이 결과를 물었으면(예 '돌려서 결과 알려줘') 이 잡 id 로 상태 조회 도구를 한 번 "
+              "부르라 — 코드가 끝날 때까지 기다린다(그 사이 LLM 을 부르지 않는다)." if _status_wait_mod.on() else
+              "결과(잡 id · 상태)를 사용자에게 알리고, 잡이면 상태 조회 도구로 진행을 볼 수 있다.")
     ctx.note = (f"[확인 카드 {cid} 승인 — 서버가 사람의 승인으로 이 호출을 보냈다]\n" + "\n".join(lines)
-                + "\n이 호출을 다시 하지 마라(같은 잡이 하나 더 선다). 결과(잡 id · 상태)를 사용자에게 알리고, 잡이면 상태 조회 도구로 진행을 볼 수 있다.")
+                + "\n이 호출을 다시 하지 마라(같은 잡이 하나 더 선다). " + follow)
 
 
 def _confirm_strip(text: str, card) -> str:
@@ -6807,6 +6823,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                        merged=_merged)
                     # _cfg 는 try 안에서 정의되므로 그 전에 터진 예외에서는 없다.
                     _cfg4 = locals().get("_cfg") or {"recursion_limit": AGENT_RECURSION_LIMIT}
+                    _status_wait_retry()
                     _r4 = await agent.ainvoke({"messages": _msgs}, config=_cfg4)
                     for m in reversed((_r4 or {}).get("messages") or []):
                         if getattr(m, "type", "") != "ai":
@@ -6884,6 +6901,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                  "차트·표를 직접 작성하지 말고 데이터 조회 도구를 먼저 호출하라.",
                                  _history_messages(req.history, has_docs=bool(req.documents)),
                                  locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
+            _status_wait_retry()
             _r2 = await agent.ainvoke({"messages": _forced}, config=_cfg)
             for m in reversed((_r2 or {}).get("messages") or []):
                 if getattr(m, "type", "") != "ai":
@@ -6995,6 +7013,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         print(f"[agent] tool-call leaked into text (도구 실행 {_budget['calls']}회) — 비스트리밍 재시도")
         yield _sse("status", {"step": "도구 호출을 다시 시도합니다", "tool": None})
         try:
+            _status_wait_retry()
             retry = await agent.ainvoke(inputs)
             _msgs = (retry or {}).get("messages") or []
             _last = ""
@@ -7098,6 +7117,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                 "결과가 비었으면 비었다고 말하라."),
                      ("user", f"[사용자 질문]\n{req.message}\n\n[조회한 도구]\n{_names}\n\n"
                               f"[조회 결과]\n{_excerpt}\n\n위 결과로 질문에 답하라.")]
+            _status_wait_retry()
             _r3 = await agent.ainvoke({"messages": _msgs}, config=_cfg)
             _c3 = None
             for m in reversed((_r3 or {}).get("messages") or []):

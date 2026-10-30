@@ -635,3 +635,129 @@ def test_상태_도구의_같은_호출_세_번은_반복_경고를_내지_않�
     assert len(calls) == 3
     warned = [d for e, d in evs if e == "status" and "같은 호출 반복 감지" in str(d.get("step"))]
     assert (warned == []) is on, warned
+
+
+# ── 반대 검토 2차(rv2) — 중지가 다시 조회의 끝과 겹쳐도 멈춘다 · 재시도 길의 되풀이 셈 · ping 을 끈 박스의 재시도 길 ─────────────────────────────
+def test_rv2_다시_조회가_끝나는_박자에_온_중지도_삼키지_않는다():
+    """3.10 의 asyncio.wait_for 는 안쪽 호출이 막 끝난 박자에 온 취소를 삼키고 결과를 돌려줬다 — 중지 뒤에도 상한까지 POLL_S 마다 다시 조회했다."""
+    calls, holder = [], {}
+
+    async def again():
+        calls.append(time.monotonic())
+        if len(calls) == 2:
+            holder["task"].cancel()          # 중지(턴 취소)가 이 조회가 끝나는 바로 그 박자에 닿는다
+        return ([{"type": "text", "text": json.dumps(ODB_RUN(0.5))}], None)
+
+    async def go():
+        turn = sw.new_turn()
+        turn["born"].add("t1")
+        holder["task"] = asyncio.current_task()
+        try:
+            await sw.handle("get_task", None, None, {"task_id": "t1"}, ([{"type": "text", "text": json.dumps(ODB_RUN(0.4))}], None),
+                            again, turn, chat=True)
+            return "returned"
+        except asyncio.CancelledError:
+            return "cancelled"
+    assert _run(go()) == "cancelled" and len(calls) == 2, f"취소 뒤 다시 조회 {len(calls) - 2}번"
+
+
+@pytest.mark.parametrize("k", [0, 1, 2])
+def test_rv2_실제_사슬에서도_중지가_다시_조회와_겹치면_곧바로_멈춘다(monkeypatch, _ctx, k):
+    monkeypatch.setattr(sw, "MAX_S", 1.5)
+    monkeypatch.setattr(sw, "POLL_S", 0.05)
+    monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", 15.0)
+    holder: dict = {}
+
+    async def respond_async(_kw, n):
+        if n == 3 and "consumer" in holder:          # 두 번째 다시 조회(첫 호출 1 · 다시 조회 2, 3 …)
+            holder["consumer"].cancel()              # 브라우저 중지 — 응답 태스크를 접는 자리
+            for _ in range(k):
+                await asyncio.sleep(0)
+        return ODB_RUN(0.3, "t-77")
+
+    start, _ = _fake("run_checklist", _seq(ODB_START), {"job_id": {"type": "string"}})
+    status, calls = _fake("get_task", lambda kw, n: respond_async(kw, n))
+    llm = _Script(steps=[[("run_checklist", {"job_id": "j1"})], [("get_task", {"task_id": "t-77"})], "답"])
+    req = _build(monkeypatch, llm, (start, status))
+
+    async def go():
+        async def consume():
+            async for _c in a._pinged_stream(a._agent_stream(a.app, req)):
+                pass
+        t = asyncio.create_task(consume())
+        holder["consumer"] = t
+        await asyncio.gather(t, return_exceptions=True)
+        await asyncio.sleep(4 * sw.POLL_S)
+    asyncio.run(go())
+    assert len(calls) - 3 <= 0, f"k={k}: 중지 뒤에도 {len(calls) - 3}번 더 조회했다"
+
+
+class _StatusRetryAgent:
+    """첫 흐름 — 모델이 get_task(42) 를 한 번 부르고 다음 모델 호출에서 글 없이 터진다(상류 502). 자동 재시도(ainvoke)는 그래프를 처음부터 다시
+    돌아 모델이 같은 get_task(42) 를 한 번 부른다 — 되풀이가 아니라 그래프가 다시 돈 것이다."""
+
+    def __init__(self, tool):
+        self.tool, self.ainvoked, self.retry_out, self.retry_s = tool, 0, "", 0.0
+
+    async def astream_events(self, inputs, version=None, config=None):
+        yield {"event": "on_chat_model_start", "name": "fake", "metadata": {"ls_model_name": "fake"}, "run_id": "m0"}
+        yield {"event": "on_tool_start", "name": "get_task", "data": {"input": {"task_id": "42"}}, "run_id": "t0"}
+        out = await self.tool.ainvoke({"task_id": "42"})
+        yield {"event": "on_tool_end", "name": "get_task", "data": {"input": {"task_id": "42"}, "output": out}, "run_id": "t0"}
+        raise RuntimeError("upstream 502 Bad Gateway")
+
+    async def ainvoke(self, payload, config=None):
+        self.ainvoked += 1
+        t0 = time.monotonic()
+        self.retry_out = str(await self.tool.ainvoke({"task_id": "42"}))
+        self.retry_s = time.monotonic() - t0
+        return {"messages": [types.SimpleNamespace(type="ai", content="잡 42 는 아직 running 입니다.")]}
+
+
+def _retry_turn(monkeypatch, tool):
+    ag = _StatusRetryAgent(tool)
+
+    async def built(*_a, **_k):
+        return ag
+    monkeypatch.setattr(a, "_agent_for", built)
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+    req = a.ChatRequest(message="잡 42 어떻게 돼 가?", groups=["portal-admin"], history=[])
+    return ag, _turn_events(req)
+
+
+def test_rv2_자동_재시도의_첫_상태_조회는_되풀이가_아니라_기다리지_않는다(monkeypatch, _ctx):
+    monkeypatch.setattr(sw, "MAX_S", 4.0)
+    monkeypatch.setattr(sw, "POLL_S", 2.0)
+    monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", 15.0)
+    status, calls = _fake("get_task", _seq({"task_id": "42", "status": "running", "progress": 40}))
+    ag, evs = _retry_turn(monkeypatch, _chat(status))
+    assert ag.ainvoked == 1 and len(calls) == 2 and ag.retry_s < 1.0, (len(calls), ag.retry_s)
+    assert "한 번 더 부르라" in ag.retry_out, "상태만 물은 질문 — 지금 상태와 안내"
+
+
+def test_rv2_ping_을_끈_박스의_재시도_길은_기다림을_짧게_묶는다(monkeypatch, _ctx):
+    """그 길은 진행 줄을 낼 스트림이 없다 — ping 이 꺼져 있으면 기다리는 내내 침묵이라 POLL_CALL_MAX_S 로 묶는다(design-ha28 4.12)."""
+    monkeypatch.setattr(sw, "MAX_S", 3.0)
+    monkeypatch.setattr(sw, "POLL_S", 0.05)
+    monkeypatch.setattr(sw, "POLL_CALL_MAX_S", 0.4)
+    for hb, short in ((0.0, True), (15.0, False)):
+        monkeypatch.setattr(a, "DELIB_HEARTBEAT_S", hb)
+        status, _calls = _fake("get_task", _seq({"task_id": "42", "status": "running", "progress": 40}))
+        tool = _chat(status)
+
+        class _Born(_StatusRetryAgent):
+            async def ainvoke(self, payload, config=None):
+                a._turn_status_wait.get()["born"].add("42")          # 재시도 그래프가 그 잡을 걸었다(born)
+                return await super().ainvoke(payload, config)
+        ag = _Born(tool)
+
+        async def built(*_a, **_k):
+            return ag
+        monkeypatch.setattr(a, "_agent_for", built)
+        monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+        _turn_events(a.ChatRequest(message="잡 42 돌려서 결과 알려줘", groups=["portal-admin"], history=[]))
+        assert ag.ainvoked == 1 and "[코드 기다림 —" in ag.retry_out, hb
+        if short:
+            assert ag.retry_s < 1.5 and "상한" in ag.retry_out, (hb, ag.retry_s)
+        else:
+            assert ag.retry_s >= 2.5, ("ping 이 켜져 있으면 그 길도 턴 상한까지 기다린다", ag.retry_s)
