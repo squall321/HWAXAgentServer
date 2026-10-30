@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*)과 호출 추적 스위치(CALL_TRACE_URL)를 지우며, 챗 자기검증(CHAT_SELF_CHECK)을 끈다, 형제 포털 리포의 코어 어휘표는 시험마다 '없음' 으로 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX)를 지우며, 챗 자기검증(CHAT_SELF_CHECK)을 끈다, 형제 포털 리포의 코어 어휘표는 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -34,6 +34,11 @@ for _k in [k for k in os.environ if k.startswith("EXTERNAL_LLM_") and k != "EXTE
 # 호출 추적 스위치(CALL_TRACE_URL)도 같은 까닭으로 지운다 — 켠 셸에서 돌리면 시험의 LLM·도구 호출 기록이 그 셸이 가리키는 Phoenix 로 간다.
 # 켜야 하는 시험은 제 손으로 켠다(tests/test_call_trace.py).
 os.environ.pop("CALL_TRACE_URL", None)
+
+# 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX)도 같은 까닭으로 지운다 — app 이 import 때 한 번 읽는 값이라, 박스 우회 값(=0, HWAXPortal
+# docs/request_261030.md OB-91)을 내보낸 셸에서 돌리면 기본 꼴(안내는 사람 발화 머리)을 보는 W-3 · HA-26 시험이 붉어진다. 끈 꼴을 보는 시험은
+# 제 손으로 app._STABLE_PREFIX 를 바꾼다(tests/test_request_1029.py).
+os.environ.pop("CHAT_STABLE_PREFIX", None)
 
 # 챗 자기검증(CHAT_SELF_CHECK — 기본 켬)은 시험에서 끈다 — 챗 턴 시험들이 LLM 호출 수 · 흘린 글을 그대로 센다. 검증을 보는 시험은 제 손으로
 # 켠다(tests/test_chat_self_check.py · HWAXPortal docs/chat-self-check).

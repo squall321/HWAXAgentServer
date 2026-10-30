@@ -485,3 +485,21 @@ def test_HA26_README_의_W3_절은_안내의_자리와_합치는_재시도를_�
     for must in (a._TURN_NOTES_HEAD.strip(), a._TURN_NOTES_TAIL.strip(), _HA26_LOG):
         assert must in para, must
 
+
+# ── 셸이 내보낸 손잡이는 시험에 닿지 않는다(conftest) — 박스 우회 값(CHAT_STABLE_PREFIX=0)을 내보낸 셸에서는 W-3 · HA-26 시험 여섯이 붉었다 ──
+def test_HA26_셸의_앞부분_고정_손잡이는_시험_세션에_없다():
+    """아래 시험이 새 pytest 프로세스로 이 시험 하나를 손잡이를 끈 셸에서 돌린다 — conftest 가 import 전에 지웠으면 app 은 기본값(켬)을
+    읽었다. 평소 세션에서도 같아야 한다."""
+    assert "CHAT_STABLE_PREFIX" not in os.environ and a._STABLE_PREFIX is True
+
+
+def test_HA26_손잡이를_끈_셸에서_돌려도_시험은_기본_꼴을_본다():
+    """검토 — app 은 손잡이를 import 때 한 번 읽는다. 셸의 값이 닿으면 코드가 맞아도 기본 꼴을 보는 시험이 붉다(거짓 실패). 끈 꼴을 보는
+    시험은 제 손으로 app._STABLE_PREFIX 를 바꾼다."""
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    node = f"{Path(__file__).resolve().relative_to(root)}::test_HA26_셸의_앞부분_고정_손잡이는_시험_세션에_없다"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node], cwd=str(root),
+                       env={**os.environ, "CHAT_STABLE_PREFIX": "0"}, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and "1 passed" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
