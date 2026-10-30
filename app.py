@@ -1701,7 +1701,7 @@ def _hub_of(name) -> str:
     """도구 노출 이름 → 허브 키(허브가 아니면 빈 값). 게이트웨이 /tools-map 캐시만 본다 — 도구 호출마다 부르므로 묻지 않는다(_app_label_cached 와
     같다). 맵에 있으면 그 백엔드가 허브일 때만 그 키, 없으면(별칭 · 캐시가 빈 때) 이름이 '<허브 키에서 - 를 뺀 것>_' 로 시작하는지로 가른다 — 세
     허브는 도구 이름이 같아 게이트웨이가 그 접두를 단다(_aggregate)."""
-    n = str(name or "")
+    n = str(name or "").strip()          # 게이트웨이도 invoke_tool 의 name 을 strip() 해서 찾는다 — 앞 공백 하나로 막이를 비켜 갔다(반대 검토 2차)
     hubs = _hub_apps()
     key = (_TOOLS_MAP_CACHE.get("map") or {}).get(n)
     if key:
@@ -1754,10 +1754,14 @@ def _hub_id_meta(text: str) -> dict:
     return out
 
 
-def _learn_hub_ids(name, text) -> None:
+def _learn_hub_ids(name, text, carried=()) -> None:
     """이번 턴에 허브 도구가 성공으로 돌려준 결과의 UUID 를 '어느 허브에서 본 id 인가' 로 적는다. name 은 경유면 안쪽 이름, text 는 모델이 보는 글
     (접기 · 자르기 · 인자 힌트 뒤 — 모델이 보지 않은 id 는 배우지 않는다). 실패 결과(✖ · 오류 봉투 · 막은 글)에서는 배우지 않는다 — 오류 글은 받은
-    id 를 되풀이해, 배우면 그 허브 것으로 잘못 적는다. ⚠ _learn_ids 처럼 자식(도구 코루틴) 쪽에서 부른다."""
+    id 를 되풀이해, 배우면 그 허브 것으로 잘못 적는다. carried 는 이 호출이 인자로 실어 보낸 UUID 다 — 성공 꼴의 '없다' 답도 받은 id 를
+    되풀이한다(StandardPlatform object_resolve none 의 hint · search 의 q · objects_resolve_many 의 name · objects_list 0건 진단의 label). 그래서 그
+    id 는 허브가 객체 행(id · object_id 에 key 나 label)으로 돌려줄 때만 배운다 — 메아리를 배우면 사람이 친 id · 앞 턴의 id 를 먼저 다른 허브에
+    물은 뒤 진짜 주인 허브의 호출이 막히고, 반대로 공유 id 가 되어 OT-07 꼴이 지났다(반대 검토 2차). 놓치는 쪽(fail-open)이 대가다 — 참조 id 조건으로
+    걸러 받은 목록은 그 참조 id 를 가르치지 않는다. ⚠ _learn_ids 처럼 자식(도구 코루틴) 쪽에서 부른다."""
     st = _turn_hub_ids.get()
     if st is None or not isinstance(text, str):
         return
@@ -1769,6 +1773,8 @@ def _learn_hub_ids(name, text) -> None:
         return
     meta = _hub_id_meta(text)
     for u in ids:
+        if u in carried and u not in meta:
+            continue                 # 이 호출이 실어 보낸 id 의 메아리 — 그 허브 것으로 배우지 않는다
         e = st.get(u)
         if e is not None:
             e["apps"].add(hub)
@@ -2344,7 +2350,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, raw, _via_inv), result_max))
         # ── R7 id 배우기 — 정수(유령 ID 막이) · UUID → 허브(HA-30, 모델이 보는 글에서 · 경유면 안쪽 이름으로)
         _learn_ids(body)
-        _learn_hub_ids(_eff, body)
+        _learn_hub_ids(_eff, body, set(_uuids(json.dumps(kw, ensure_ascii=False, default=str))) if _turn_hub_ids.get() is not None else ())
         # ── R8 머리 + 본문 + 기다림 안내 + 꼬리
         return (_head + body + _wait_note + _tail, out[1]) if _pair else _head + body + _wait_note + _tail
 

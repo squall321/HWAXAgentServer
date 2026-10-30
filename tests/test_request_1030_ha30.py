@@ -585,3 +585,93 @@ def test_T22_앞_턴에_배운_것은_다음_턴에_남지_않는다(monkeypatch
     assert log and log[0][:2] == ("failuretrace_graph_neighbors", {"object_id": U_RD}), "새 턴은 빈 상태 — 그 id 를 모른다"
     assert log[0][2] == set(), "턴마다 새 사전"
     assert [d["ok"] for d in _done(evs, "failuretrace_graph_neighbors")] == [True]
+
+
+# ── 반대 검토 2차(rv2) — 이 호출이 실어 보낸 id 의 메아리는 배우지 않는다 · invoke_tool 의 안쪽 이름 앞 공백 ──────────────────────────────────
+# StandardPlatform 백엔드가 실제로 내는 성공 꼴의 '없다' 답 — 받은 id 를 되풀이한다(modules/objects/resolve.py · search/routes.py · objects/schemas.py
+# ResolveOneOut · objects/routes.py 의 0건 진단)
+RV2_ECHO = {
+    "resolve_none_hint": ("failuretrace_object_resolve", {"type_slug": "failure_mode", "name": U_RD},
+                          json.dumps({"match": "none", "object": None, "candidates": [], "hint": f"그 id 의 고장모드이(가) 없습니다: {U_RD}",
+                                      "truncated": False}, ensure_ascii=False)),
+    "search_q": ("failuretrace_search", {"q": U_RD},
+                 json.dumps({"q": U_RD, "total": 0, "types": [], "records": 0, "items": [], "limit": 20, "offset": 0, "min_query": 2},
+                            ensure_ascii=False)),
+    "resolve_many_name": ("failuretrace_objects_resolve_many", {"type_slug": "failure_mode", "names": [U_RD]},
+                          json.dumps({"items": [{"name": U_RD, "match": "none", "object": None, "candidates": [], "truncated": False}],
+                                      "counts": {"exact": 0, "candidates": 0, "none": 1}}, ensure_ascii=False)),
+    "list_diagnosis": ("failuretrace_objects_list", {"type_slug": "pd_defect", "conditions": [{"field": "failure_mode", "op": "eq", "value": U_RD}]},
+                       json.dumps({"items": [], "total": 0, "diagnosis": {"total": 0, "reason": "filters",
+                                                                          "filters": [{"name": "f0", "label": f"failure_mode eq {U_RD}", "remaining": 12}]}},
+                                  ensure_ascii=False)),
+}
+MAP_RV2 = {**MAP, "failuretrace_objects_resolve_many": "failuretrace", "rootdesigndatahub_object_get": "rootdesigndatahub"}
+
+
+@pytest.mark.parametrize("form", list(RV2_ECHO))
+def test_rv2_다른_허브의_없다_답에_되풀이된_id_는_그_허브_것으로_배우지_않는다(monkeypatch, turn, form):
+    """사람이 친 id(이 턴의 허브 결과에 아직 없다)를 먼저 FailureTrace 에 물어 '없다' 를 받은 뒤 진짜 주인 허브(정본)를 부른다 — 종전엔 메아리를
+    FailureTrace 것으로 배워 정본 호출이 막히고 '정본에서는 이 id 로 찾지 못한다' 는 거짓 안내를 받았다."""
+    _cache(monkeypatch, MAP_RV2, LABELS)
+    tool, args, body = RV2_ECHO[form]
+    log = []
+    _call(_rec(tool, body, log), args)
+    assert U_RD not in turn, "메아리는 배우지 않는다"
+    out = _call(_rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log), {"object_id": U_RD})
+    assert _names(log) == [tool, "rootdesigndatahub_graph_neighbors"] and a._XHUB_ID_MARK not in out, out[:300]
+
+
+@pytest.mark.parametrize("echo_first", [True, False])
+def test_rv2_메아리는_공유_id_를_만들지_않아_OT07_꼴이_막힌다(monkeypatch, turn, echo_first):
+    _cache(monkeypatch, MAP_RV2, LABELS)
+    log = []
+    echo = _rec("failuretrace_search", RV2_ECHO["search_q"][2], log)
+    owner = _rec("rootdesigndatahub_object_resolve", RD_RESOLVE, log)
+    for t, args in ((echo, {"q": U_RD}), (owner, RESOLVE_ARGS))[::(1 if echo_first else -1)]:
+        _call(t, args)
+    assert turn[U_RD]["apps"] == {"rootdesigndatahub"}, turn[U_RD]
+    out = _call(_rec("failuretrace_graph_neighbors", FT_GRAPH, log), {"object_id": U_RD})
+    assert "failuretrace_graph_neighbors" not in _names(log) and a._XHUB_ID_MARK in out
+
+
+def test_rv2_실어_보낸_id_라도_허브가_객체_행으로_돌려주면_배운다(monkeypatch, turn):
+    _cache(monkeypatch, MAP_RV2, LABELS)
+    log = []
+    got = json.dumps({"object": _hit(U_RD), "relations": []}, ensure_ascii=False)
+    _call(_rec("rootdesigndatahub_object_get", got, log), {"object_id": U_RD})
+    assert turn[U_RD]["apps"] == {"rootdesigndatahub"} and turn[U_RD]["key"] == "JNT-SLD-01"
+    out = _call(_rec("failuretrace_graph_neighbors", FT_GRAPH, log), {"object_id": U_RD})
+    assert a._XHUB_ID_MARK in out
+
+
+def test_rv2_invoke_tool_의_안쪽_이름_앞_공백으로도_막이를_비켜_가지_못한다(monkeypatch, turn):
+    """게이트웨이는 invoke_tool 의 name 을 strip() 해서 찾는다 — 막이도 같은 이름으로 본다."""
+    _cache(monkeypatch, MAP_RV2, LABELS)
+    log = []
+    _call(_rec("rootdesigndatahub_object_resolve", RD_RESOLVE, log), RESOLVE_ARGS)
+    out = _call(_rec("invoke_tool", FT_GRAPH, log), {"name": " failuretrace_graph_neighbors", "arguments": {"object_id": U_RD}})
+    assert _names(log) == ["rootdesigndatahub_object_resolve"] and a._XHUB_ID_MARK in out
+    assert a._hub_of("  failuretrace_graph_neighbors ") == "failuretrace"
+
+
+def test_rv2_실제_턴_사람이_친_id_를_먼저_다른_허브에_물어도_주인_허브는_닿는다(monkeypatch):
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    _cache(monkeypatch, MAP_RV2, LABELS)
+    log = []
+    tool, args, body = RV2_ECHO["resolve_none_hint"]
+    tools = (_rec(tool, body, log), _rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log))
+    llm = _HubLLM(script=[(tool, args), ("rootdesigndatahub_graph_neighbors", {"object_id": U_RD}), "답 글."])
+    agent = _agent(monkeypatch, llm, tools=tools)
+
+    async def _built(*_a, **_k):
+        return agent
+    monkeypatch.setattr(a, "_agent_for", _built)
+    req = a.ChatRequest(message=f"{U_RD} 이 고장모드가 FailureTrace 에 있는지 보고, 정본에서는 무엇과 이어져 있는지 알려줘",
+                        groups=["portal-admin"], history=[])
+
+    async def run():
+        return [c async for c in a._agent_stream(a.app, req)]
+    asyncio.run(run())
+    assert _names(log) == [tool, "rootdesigndatahub_graph_neighbors"], "정본 그래프 호출이 닿았다"
+    last = [m for m in llm.seen[2] if isinstance(m, ToolMessage)][-1].content
+    assert a._XHUB_ID_MARK not in last and U_PART in last, last[:300]
