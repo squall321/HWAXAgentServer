@@ -477,6 +477,21 @@ def test_B14c_invoke_tool_로_막은_호출은_승인도_invoke_tool_로_처음_
     assert [d.get("via") for e, d in evs if e == "status" and d.get("step") == "도구 호출: run_job"] == ["invoke_tool"]
 
 
+def test_B14d_다른_앱의_같은_꼬리_잡은_각각_카드에_서고_승인하면_각각_한_번씩_간다(gate, monkeypatch):
+    """승인 열쇠가 맞은 목록 이름(run_job)뿐이면 두 앱의 run_job 이 한 열쇠라 하나만 보냈다. 똑같은 호출을 나란히 두 번 부른 것만 한 줄이다."""
+    reached = []
+    tools = {n: _gw(n, reached) for n in ("appa_run_job", "appb_run_job")}
+    step = [("appa_run_job", P1_GRAPH), ("appb_run_job", P1_GRAPH), ("appa_run_job", P1_GRAPH)]
+    _evs, card, hist = _card_turn(monkeypatch, tools, step)
+    assert [c["tool"] for c in card["calls"]] == ["appa_run_job", "appb_run_job"]
+    ag = _GateAgent(tools, steps=[[("appa_run_job", P1_GRAPH)]], say="둘 다 걸었습니다.")
+    evs, _ = _turn(monkeypatch, ag, tools, card["approve_text"], hist)
+    assert reached == [("appa_run_job", P1_GRAPH), ("appb_run_job", P1_GRAPH)]
+    again = [d for e, d in evs if e == "confirm"]
+    assert len(again) == 1 and again[0]["calls"][0]["again"] is True, "보낸 뒤 모델이 또 부르면 되풀이 카드"
+    assert a._CONFIRM_STAT["executed"] == 2
+
+
 @pytest.mark.parametrize("answer,sent", [("응", True), ("네 실행해 주세요", True), ("실행", True), ("ok", True),
                                          ("응 근데 kind 는 mesh 로", False)])
 def test_B15_글로_승인(gate, monkeypatch, answer, sent):

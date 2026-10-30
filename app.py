@@ -3443,7 +3443,7 @@ def _confirm_ordered(ctx, kind: str, name, base: str, args) -> bool:
 class _ConfirmCtx:
     """한 챗 턴의 확인 맥락(_turn_confirm) — 값은 변하는 객체 하나라 도구 작업(복사된 문맥)과 턴이 같은 객체를 본다(_turn_ids 와 같은 길).
     utterance — 주문 판정 글(이번 사람 말 원문, 카드의 답이면 빈 글 — 확인 답은 새 주문이 아니다) · pinned — 사람이 콕 집은 도구 ·
-    approved — 이번에 승인된 호출 {(맞은 이름, 정규 인자): 호출} · used — 이 턴에 이미 나간 호출의 열쇠 · pending — 막은 호출(턴 끝 카드에 실린다) ·
+    approved — 이번에 승인된 호출 {(부른 이름, 맞은 이름, 정규 인자): 호출} · used — 이 턴에 이미 나간 호출의 열쇠(맞은 이름 · 승인 열쇠) · pending — 막은 호출(턴 끝 카드에 실린다) ·
     note — 이 턴의 안내에 붙일 글 · status — 턴 머리의 상태줄 · card — 본문 끝에 붙인 카드 글 · card_id — 승인된 카드 번호 · sent — 서버가 보낸 수."""
     __slots__ = ("utterance", "pinned", "approved", "used", "pending", "note", "status", "card", "card_id", "sent")
 
@@ -3530,7 +3530,7 @@ def _confirm_ctx(req) -> _ConfirmCtx:
         return ctx
     _confirm_count("approved")
     ctx.card_id = cid
-    ctx.approved = {(c["base"], c["canon"]): c for c in card["calls"]}
+    ctx.approved = {(c["name"].strip().lower(), c["base"], c["canon"]): c for c in card["calls"]}
     ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다"
     return ctx
 
@@ -3574,8 +3574,11 @@ def _confirm_gate(tool, a, kw) -> str | None:
     if kind is None:
         return None
     key = (base, _confirm_canon(targs))
-    if key in ctx.approved and key not in ctx.used:
-        ctx.used.add(key)
+    # 승인 열쇠는 부른 이름까지 — 맞은 목록 이름만 보면 다른 앱의 같은 꼬리 도구(appA_run_job · appB_run_job)가 한 열쇠라, 두 호출을 승인해도
+    # 서버가 하나만 보낸다. 되풀이(again)는 맞은 이름 열쇠로 본다(경유 · 별칭으로 다시 불러도 같은 잡이다).
+    akey = (str(name).strip().lower(), *key)
+    if akey in ctx.approved and akey not in ctx.used:
+        ctx.used.update((akey, key))
         return None
     if key not in ctx.used and _confirm_ordered(ctx, kind, name, base, targs):
         ctx.used.add(key)
@@ -3583,7 +3586,7 @@ def _confirm_gate(tool, a, kw) -> str | None:
         print(f"[confirm] 주문 통과 {str(name)[:80]}", flush=True)
         return None
     again = key in ctx.used
-    if not any((c["base"], c["canon"]) == key for c in ctx.pending):
+    if not any((c["name"].strip().lower(), c["base"], c["canon"]) == akey for c in ctx.pending):     # 똑같은 호출(나란히 두 번)만 한 줄로
         try:
             kept = copy.deepcopy(targs)
         except Exception:  # noqa: BLE001 — 복사 못 하는 값은 그대로 쥔다
@@ -3815,7 +3818,7 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
         name = c["name"]
         targs = _confirm_with_defaults(name, c["args"])
         via = c["via"] or name not in tmap        # 목록에서 없어진 직접 도구는 invoke_tool 로
-        ctx.approved[(c["base"], _confirm_canon(targs))] = c     # 기본값을 더한 꼴도 승인 열쇠로 — 관문은 보내는 인자로 잰다
+        ctx.approved[(name.strip().lower(), c["base"], _confirm_canon(targs))] = c     # 기본값을 더한 꼴도 승인 열쇠로 — 관문은 보내는 인자로 잰다
         call_id = f"{cid}-{i}"
         shown = _arg_dict(targs) if isinstance(targs, str) else targs
         detail = _tool_preview(targs if shown is None else shown)
