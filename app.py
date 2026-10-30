@@ -336,7 +336,11 @@ def _core_vocab() -> dict | None:
 
     def build(d: dict) -> dict:
         return {"version": d.get("version"), "rule_words": len(d["rule_words"]), "canonical": d["canonical"]["app"],
-                "rules": _core_rules_text(d)}
+                "rules": _core_rules_text(d),
+                # 허브 키 → 라벨 — 정본과 role sibling(다른 허브 id 막이 _hub_apps, HWAXPortal docs/request-1030 HA-30). /health 에는 싣지 않는다.
+                "hubs": {d["canonical"]["app"]: d["canonical"].get("label") or d["canonical"]["app"],
+                         **{k: (a or {}).get("label") or k for k, a in (d.get("apps") or {}).items()
+                            if (a or {}).get("role") == "sibling"}}}
     if (mt, lmt) != _CORE_VOCAB["mtime"]:
         try:
             raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
@@ -1636,6 +1640,196 @@ def _phantom_id_arg(args: dict, src: set):
     return None
 
 
+# ── 다른 허브의 id(HWAXPortal docs/request-1030 HA-30 · design-ha30) ────────────────────────────────────────────────────────
+# 허브(자주검증 Datahub · FailureTrace · CAE 그룹 Datahub — 같은 틀의 설치 셋)의 객체 id 는 설치마다 따로 만든 UUID 라 같은 객체도 허브마다 id 가
+# 다르고 key 만 같다. 10-30 OT-07 에서 failuretrace_graph_neighbors 에 자주검증 허브의 id 를 넘겨 APP-GRAPH-0001 이었다(10-27 N-13 도 같은 꼴) —
+# 코어 규칙 ⑤('key 로 그 허브에서 다시 resolve')는 프롬프트 글뿐이라 두 번 다 지켜지지 않았고, 유령 ID 막이는 정수만 봐 UUID 글은 처음부터 지났다.
+# 그래서 이 턴에 허브 도구가 성공으로 돌려준 결과에서 UUID → 허브를 배우고(_learn_hub_ids), 허브 도구 인자 어디에든(칸 이름 · 깊이와 상관없다 —
+# conditions 안 · '|' 로 이은 값도) 다른 허브에서만 본 UUID 가 있으면 보내지 않고 대상 허브의 object_resolve(type_slug, key) 로 다시 풀라고
+# 돌려준다(_cross_hub_id_msg). 코드가 대신 다시 풀지 않는다 — key · type 을 모르는 id, 다른 type slug, candidates(규칙 ①), 쓰기 도구의 말없는
+# 대상 바꾸기, 근거 · 활동 · 감사에 안 보이는 숨은 호출이 걸린다(설계 5절).
+# 끄는 손잡이 CHAT_XHUB_ID_GATE=0 — 턴 상태를 None 으로 둬 종전과 글자 하나 다르지 않다. 기동 때 읽는다(바꾸면 재기동, CHAT_STABLE_PREFIX 와 같다).
+_XHUB_GATE = os.environ.get("CHAT_XHUB_ID_GATE", "1").strip() != "0"
+# 이번 턴에 허브 결과에서 본 UUID — {uuid(소문자): {"apps": {허브 키}, "hub": 처음 본 허브, "tool": 처음 낸 도구, "key", "type", "label"}}.
+# None 이면(심의 · 카탈로그 · 루틴 · 띵킹 · 턴 밖의 시험) 배우지도 막지도 않는다(유령 ID 막이와 같은 fail-open). 변하는 dict 하나라 병렬 도구 호출의
+# 자식 문맥에서 더한 것이 같은 턴의 다음 호출에 보인다(_learn_ids 와 같은 길).
+_turn_hub_ids: contextvars.ContextVar = contextvars.ContextVar("turn_hub_ids", default=None)
+# 코어 어휘표가 없거나 깨졌을 때의 허브 표(키 → 라벨) — 어휘표의 canonical 과 role sibling 이다. role staging(시험 사본)은 허브가 아니다(도구 · id 꼴이 다르다).
+_HUB_APPS_DEFAULT = {"rootdesigndatahub": "자주검증 Datahub(rootdesign)", "failuretrace": "FailureTrace",
+                     "caegroupdatahub": "CAE 그룹 Datahub"}
+_UUID_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Fa-f])")
+_HUB_IDS_MAX = 20_000        # 한 턴에 적는 id 상한 — 넘으면 새 id 는 모르는 id 가 되어 지나간다(이미 있는 id 에 허브를 더하는 것은 늘 한다)
+_HUB_TAG_DEPTH = 12          # 이름표(key · type · label)를 찾는 JSON 깊이
+_HUB_TAG_CHARS = 80          # 글에 싣는 이름표 한 칸의 길이
+_XHUB_SHOW = 3               # 막은 글에 한 줄씩 보이는 id 수 — 나머지는 수만 적는다
+# 막은 글의 표지 — 챗 스트림이 이것으로 막은 호출을 blocked 로 센다(design-integration C-6). 유령 ID 막이의 _PHANTOM_ID_MARK 는 싣지 않는다 —
+# 그것은 심의가 '실행되지 않은 호출' 로 읽는 다른 계약이다.
+_XHUB_ID_MARK = "는 다른 허브의 id 다"
+# /health 의 xhub_gate — 기동 뒤 막은 호출 수(design-integration C-8). /health 는 스레드 풀에서, 막이는 이벤트 루프에서 돈다(_HUB_FOLD_LOCK 과 같다).
+_XHUB_LOCK = threading.Lock()
+_XHUB_STAT: dict = {"blocked": 0}
+
+
+def _uuids(text) -> list[str]:
+    """글의 UUID — 소문자로 맞추고 처음 나온 차례로 겹침을 뺀다."""
+    s = text if isinstance(text, str) else str(text)
+    return list(dict.fromkeys(m.lower() for m in _UUID_RE.findall(s)))
+
+
+def _hub_apps() -> dict:
+    """허브 키 → 라벨 — 코어 어휘표의 hubs(canonical · role sibling — 박스 덧씌우기로 sibling 을 더하면 커밋 없이 는다). 어휘표가 없거나 깨졌으면 기본표."""
+    return (_core_vocab() or {}).get("hubs") or _HUB_APPS_DEFAULT
+
+
+def _hub_of(name) -> str:
+    """도구 노출 이름 → 허브 키(허브가 아니면 빈 값). 게이트웨이 /tools-map 캐시만 본다 — 도구 호출마다 부르므로 묻지 않는다(_app_label_cached 와
+    같다). 맵에 있으면 그 백엔드가 허브일 때만 그 키, 없으면(별칭 · 캐시가 빈 때) 이름이 '<허브 키에서 - 를 뺀 것>_' 로 시작하는지로 가른다 — 세
+    허브는 도구 이름이 같아 게이트웨이가 그 접두를 단다(_aggregate)."""
+    n = str(name or "")
+    hubs = _hub_apps()
+    key = (_TOOLS_MAP_CACHE.get("map") or {}).get(n)
+    if key:
+        return key if key in hubs else ""
+    low = n.lower()
+    return next((h for h in hubs if low.startswith(h.replace("-", "") + "_")), "")
+
+
+def _hub_tool(hub: str, base: str) -> str:
+    """대상 허브의 그 도구 노출 이름(돌려주는 글에 싣는다) — 접두 이름이 맵에 있으면 그것, 맵의 맨 이름이 그 허브 것이면 맨 이름(허브 하나 박스),
+    둘 다 아니면 접두 이름(게이트웨이 별칭이라 invoke_tool 로 늘 닿는다)."""
+    m = _TOOLS_MAP_CACHE.get("map") or {}
+    pre = f"{hub.replace('-', '')}_{base}"
+    if pre in m:
+        return pre
+    return base if m.get(base) == hub else pre
+
+
+def _hub_id_meta(text: str) -> dict:
+    """허브 결과 글의 이름표 — {uuid: {"key", "type", "label"}}. JSON 으로 읽힐 때만 얻는다(접기 머리 줄은 떼고 읽는다). 두 꼴만 본다 — {id,
+    key|label, type_slug}(resolve · 목록 · 검색 · 그래프 노드)와 {object_id, object_key|object_label, object_type_slug}(object_get 의 관련 객체).
+    처음 본 것을 남긴다. 못 읽으면(상한에서 잘린 글 · JSON 이 아닌 글) 빈 사전이고 id 는 이름표 없이 적힌다. 글에 실을 값이라 공백을 한 칸으로
+    줄이고 '"' 를 "'" 로 바꾸고 _HUB_TAG_CHARS 자로 자른다."""
+    s = text.split("\n", 1)[1] if text.startswith("[포털 챗이 허브 응답을 접었다") and "\n" in text else text
+    try:
+        data = json.loads(s)
+    except ValueError:
+        return {}
+    out: dict = {}
+
+    def clip(v) -> str:
+        return " ".join(v.split()).replace('"', "'")[:_HUB_TAG_CHARS] if isinstance(v, str) else ""
+
+    def walk(v, depth: int) -> None:
+        if depth > _HUB_TAG_DEPTH:
+            return
+        if isinstance(v, dict):
+            for pre in ("", "object_"):
+                u = v.get("id" if not pre else "object_id")
+                if isinstance(u, str) and _UUID_RE.fullmatch(u.strip()) and u.strip().lower() not in out:
+                    key, label = clip(v.get(pre + "key")), clip(v.get(pre + "label"))
+                    if key or label:
+                        out[u.strip().lower()] = {"key": key, "type": clip(v.get(pre + "type_slug")), "label": label}
+            for x in v.values():
+                walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+    walk(data, 0)
+    return out
+
+
+def _learn_hub_ids(name, text) -> None:
+    """이번 턴에 허브 도구가 성공으로 돌려준 결과의 UUID 를 '어느 허브에서 본 id 인가' 로 적는다. name 은 경유면 안쪽 이름, text 는 모델이 보는 글
+    (접기 · 자르기 · 인자 힌트 뒤 — 모델이 보지 않은 id 는 배우지 않는다). 실패 결과(✖ · 오류 봉투 · 막은 글)에서는 배우지 않는다 — 오류 글은 받은
+    id 를 되풀이해, 배우면 그 허브 것으로 잘못 적는다. ⚠ _learn_ids 처럼 자식(도구 코루틴) 쪽에서 부른다."""
+    st = _turn_hub_ids.get()
+    if st is None or not isinstance(text, str):
+        return
+    hub = _hub_of(name)
+    if not hub or not _result_ok(text):
+        return
+    ids = _uuids(text)
+    if not ids:
+        return
+    meta = _hub_id_meta(text)
+    for u in ids:
+        e = st.get(u)
+        if e is not None:
+            e["apps"].add(hub)
+            if not (e["key"] or e["label"]) and u in meta:     # 앞에서 이름표 없이 본 id(간선 끝 등) — 이번 결과가 이름표를 준다
+                e.update(meta[u])
+        elif len(st) < _HUB_IDS_MAX:
+            m = meta.get(u) or {}
+            st[u] = {"apps": {hub}, "hub": hub, "tool": str(name)[:80],
+                     "key": m.get("key", ""), "type": m.get("type", ""), "label": m.get("label", "")}
+
+
+def _cross_hub_id_msg(target, args) -> str | None:
+    """허브 도구 호출의 인자에 이 턴에 다른 허브의 결과에서만 본 UUID 가 있으면 돌려줄 글(보내지 않는다), 없으면 None. 상태에 없는 id(사람이 친 것 ·
+    앞 턴의 것 · 처음 보는 것)와 대상 허브의 결과에도 나온 id(제 것 · 공유 id)는 지난다. 칸 이름 · 깊이와 상관없이 인자 글 전체에서 UUID 를 찾는다 —
+    숨은 자리(objects_list 의 conditions[].value · resolve 의 name · search 의 q)의 다른 허브 id 는 오류가 아니라 0건으로 돌아와 '없다' 로 읽힌다.
+    args 는 인자 사전이거나 invoke_tool 의 arguments(JSON 글일 수 있다)다. 막으면 로그 한 줄을 남기고 /health xhub_gate.blocked 를 센다."""
+    st = _turn_hub_ids.get()
+    if not st:
+        return None                  # 이 턴에 허브 결과가 아직 없다 — 허브와 상관없는 턴의 비용은 여기까지다
+    dst = _hub_of(target)
+    if not dst:
+        return None
+    bad = [u for u in _uuids(args if isinstance(args, str) else json.dumps(args, ensure_ascii=False, default=str))
+           if u in st and dst not in st[u]["apps"]]
+    if not bad:
+        return None
+    top = args
+    if isinstance(top, str):
+        try:
+            top = json.loads(top)
+        except ValueError:
+            top = None
+
+    def field(u: str) -> str:
+        """그 UUID 가 든 맨 위 인자 이름 — 못 가르면 arguments."""
+        for k, v in (top.items() if isinstance(top, dict) else ()):
+            if u in (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)).lower():
+                return str(k)[:40]
+        return "arguments"
+    hubs = _hub_apps()
+    tgt, dl = str(target)[:80], hubs.get(dst) or dst
+    parts = []
+    for u in bad[:_XHUB_SHOW]:
+        e = st[u]
+        who = (f"key 「{e['key']}」" if e["key"] else f"key 없음 · 이름 「{e['label']}」" if e["label"] else "key 를 결과에서 읽지 못했다")
+        if (e["key"] or e["label"]) and e["type"]:
+            who += f" · type_slug {e['type']}"
+        parts.append(f"{field(u)}={u} {_XHUB_ID_MARK} — 이 턴에 {hubs.get(e['hub']) or e['hub']} 의 {e['tool']} 결과에서 나왔다({who}).")
+    if len(bad) > _XHUB_SHOW:
+        parts.append(f"그 밖에 {len(bad) - _XHUB_SHOW}개도 다른 허브의 id 다.")
+    parts.append(f"허브마다 같은 객체도 id 가 달라 {dl} 에서는 이 id 로 찾지 못한다.")
+    res, many, srch = (_hub_tool(dst, b) for b in ("object_resolve", "objects_resolve_many", "search"))
+    e0 = st[bad[0]]
+    nm = e0["key"] or e0["label"]
+    if len(bad) == 1 and nm and e0["type"]:
+        parts.append(f'{res}(type_slug="{e0["type"]}", name="{nm}") 로 {dl} 의 id 를 받아 그 id 로 다시 불러라'
+                     f'(그 타입이 없다고 하면 {srch}(q="{nm}")).')
+    elif len(bad) == 1 and nm:
+        parts.append(f'{srch}(q="{nm}") 로 {dl} 에서 그 객체를 찾아 그 id 로 다시 불러라.')
+    else:
+        parts.append(f"각 객체의 key 로 {res}(type_slug, name=key) — 여럿이면 {many}(type_slug, names=[…]) — 를 불러 {dl} 의 id 를 받아 "
+                     "다시 불러라. key 를 모르는 id 는 앞 허브의 결과에서 그 객체의 key 를 찾는다.")
+    parts.append(f"candidates 면 고르지 말고 사용자에게 묻고, none 이면 '{dl} 에서 찾지 못했다' 고 말하라. 인자 문제가 아니다 — 같은 id 로 다시 "
+                 "부르지 마라.")
+    # 운영 가시성 — 재시험(OT-07)은 이 줄로 막은 수를 본다. 바로 흘린다(손 기동 · 감시 크론으로 뜬 서버는 stdout 이 블록 버퍼링된다 — HA-34 와 같다).
+    print(f"[gate] {tgt}({field(bad[0])}={bad[0][:8]}…) 차단 — {e0['hub']} 의 id 를 {dst} 에 실었다(다른 허브 id {len(bad)}개)", flush=True)
+    with _XHUB_LOCK:
+        _XHUB_STAT["blocked"] += 1
+    return f"{_TOOL_FAIL_MARK} 도구 {tgt} 호출 실패(보내지 않았다): " + " ".join(parts)
+
+
+def _xhub_gate_health() -> dict:
+    """/health 의 xhub_gate — 손잡이(CHAT_XHUB_ID_GATE)와 기동 뒤 막은 호출 수. 손잡이를 끈 박스를 밖에서 가린다(design-integration C-8)."""
+    with _XHUB_LOCK:
+        return {"on": _XHUB_GATE, "blocked": _XHUB_STAT["blocked"]}
+
+
 ARTIFACT_KEEP = int(os.environ.get("ARTIFACT_KEEP", "500"))
 
 
@@ -1987,7 +2181,16 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                            f"조회할 때는 이름 조각만 넣고 필터는 지어내지 마라 — 결과가 비면 "
                            f"필터를 빼고 더 짧은 조각으로 다시 찾아라.")
                     return _refuse(tool, msg)
-        # ── G4 다른 허브 id(HA-30) · G5 확인 카드(HA-29) 자리
+        # ── G4 다른 허브 id(HWAXPortal docs/request-1030 HA-30) — 이 턴에 다른 허브의 결과에서만 본 UUID 를 허브 도구에 실은 호출은 보내지 않고
+        # key 로 다시 풀라고 돌려준다(_cross_hub_id_msg). 직접 묶인 도구로도, invoke_tool 의 안쪽 이름으로도 같다. 턴 상태가 없으면 지난다.
+        # G5 확인 카드보다 앞이다 — 틀린 id 의 호출로 사람에게 확인을 받으면 확인 뒤에 여기서 막혀 사람의 확인이 헛것이 된다.
+        for _args in (kw, *(x for x in a if isinstance(x, dict))):
+            _target, _targs = ((_args.get("name"), _args.get("arguments")) if _via_inv
+                               else (getattr(tool, "name", ""), _args))
+            _xmsg = _cross_hub_id_msg(_target, _targs)
+            if _xmsg:
+                return _refuse(tool, _xmsg)
+        # ── G5 확인 카드(HA-29) 자리
         # ── G6 챗 인자 기본값
         if _own:
             for _k, _v in _own[0].items():
@@ -2066,8 +2269,9 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # ── R5 원문 붙잡기(HA-27) 자리
         # ── R6 접기 → 자르기 → 인자 힌트
         body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, raw, _via_inv), result_max))
-        # ── R7 id 배우기
+        # ── R7 id 배우기 — 정수(유령 ID 막이) · UUID → 허브(HA-30, 모델이 보는 글에서 · 경유면 안쪽 이름으로)
         _learn_ids(body)
+        _learn_hub_ids(_eff, body)
         # ── R8 머리 + 본문 + 꼬리
         return (_head + body + _tail, out[1]) if _pair else _head + body + _tail
 
@@ -4953,6 +5157,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _turn_ids.set(_seed_ids)
     _turn_tool_calls.set(Counter())
     # ── 10-30 턴 상태 자리 — 재촉 → 이어하기가 req.message 를 바꾸기 전에 건다(HA-30 · HA-28 · HA-29 · HA-27, design-integration 3절)
+    _turn_hub_ids.set({} if _XHUB_GATE else None)          # HA-30 — 턴마다 새로(앞 턴에 배운 것은 남지 않는다)
     # 재촉 → 이어하기. "야! 하라니까!" 는 그 자체로 내용이 없어, 그대로 넘기면 모델이 새 질문으로
     # 읽고 "무엇을 도와드릴까요" 로 답한다. 직전 턴이 실제로 끊겼을 때만 원래 질문을 복원한다
     # (정상 답변 뒤의 '계속' 은 더 말해달라는 새 요구이므로 건드리지 않는다).
@@ -5268,7 +5473,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 호출 예산 — 작은 모델은 같은 도구를 같은 인자로 반복 호출하다 그래프 재귀 한도에
         # 부딪히고, 그러면 그때까지 스트리밍된 내용까지 버려진 채 '응답 생성 실패'만 남는다
         # (감사 확인). 모델의 자제력에 기대지 말고 코드가 상한을 건다.
-        # blocked: 유령 ID 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
+        # blocked: 유령 ID · 다른 허브 id 게이트가 실행을 막은 호출 수 — 실효 호출 수에서 뺀다.
         _budget = {"calls": 0, "blocked": 0, "seen": {}}
         _loop_fit_told = 0      # 루프 입력 맞추기가 줄였다고 알린 도구 결과 수 — 늘 때만 다시 알린다(호출마다 원문에서 다시 잰다)
         _cfg = {"recursion_limit": AGENT_RECURSION_LIMIT,
@@ -5384,7 +5589,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                     # 게이트에 막힌 호출은 '도구를 썼다'로 세면 안 된다. 세면 그 턴이 no-tool 로
                     # 잡히지 않아 강제 재시도가 발동하지 않고, 모델이 "list_materials 를 부르겠다"
                     # 고 말만 하고 끝난다(실측 Q3: 유일한 호출이 차단된 plot_curve 였다).
-                    if _PHANTOM_ID_MARK in _txt:
+                    # 다른 허브 id 막이(HA-30)도 같다 — 표지가 달라 글 머리 400자에서 따로 찾는다(design-integration C-6).
+                    if _PHANTOM_ID_MARK in _txt or _XHUB_ID_MARK in _txt[:400]:
                         _budget["blocked"] += 1
                 out = _tool_preview(_raw)
                 # 심의 핸드오프용 날것 — 표시용보다 길 때만 싣는다(짧은 결과에 중복 페이로드 금지).
@@ -7360,6 +7566,9 @@ def health() -> dict:
         "chat_llm": _chat_llm_health(),
         # 챗 자기검증 — 켜짐 · 상태별 수 · 걸린 ms · 마지막 실패(HA-13 — 포털 update-all §7 스모크가 읽는다)
         "self_check": _sc_health(),
+        # 다른 허브 id 막이 — 손잡이(CHAT_XHUB_ID_GATE)와 기동 뒤 막은 호출 수(HWAXPortal docs/request-1030 HA-30 · design-integration C-8). 재시험
+        # OT-07 은 이 수와 로그의 '[gate] … 다른 허브 id' 줄을 함께 본다.
+        "xhub_gate": _xhub_gate_health(),
         # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
         "core_vocab": _core_vocab_health(),
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
