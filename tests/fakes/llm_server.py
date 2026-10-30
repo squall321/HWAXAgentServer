@@ -155,6 +155,10 @@ def make_app(*, ctx: int, model: str, script, capacity: int = 0, vision: bool = 
         del state["affinity"][:-20]
         state.setdefault("first_system", []).append(_text(msgs[0].get("content")) if msgs and msgs[0].get("role") == "system" else None)
         del state["first_system"][:-20]                              # 첫 시스템 메시지만(W-3 — 턴을 가로질러 같아야 한다)
+        # 진짜 꼴(가짜는 진짜 꼴로) — Qwen 의 채팅 틀은 시스템 메시지가 맨 앞이 아니면 예외를 던지고 vLLM 은 400 으로 답한다(cae00 실측 HA-26).
+        if any(m.get("role") == "system" for m in msgs[1:]):
+            return JSONResponse({"error": {"message": "System message must be at the beginning.", "type": "BadRequestError",
+                                           "param": None, "code": 400}}, status_code=400)
         if n_img and not vision:
             return JSONResponse({"error": {"message": f"{model} is not a multimodal model", "type": "BadRequestError",
                                            "param": None, "code": 400}}, status_code=400)

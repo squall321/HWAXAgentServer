@@ -28,9 +28,13 @@ PLAIN_SESSION = {"agent_type": "rel-drop-impact", "name": "낙하 전문가", "d
 
 
 def _sys(sink) -> str:
-    """모델이 받은 시스템 안내 전부 — 이 턴의 안내는 첫 시스템 메시지가 아니라 이번 발화 바로 앞의 시스템 칸에 있다(HWAXPortal
-    docs/request-1029 W-3 · 프롬프트 앞부분 고정)."""
-    return "\n".join(c for r, c in sink["messages"] if r == "system")
+    """모델이 받은 안내 전부 — 첫 시스템 메시지 + 이 턴의 안내. 이 턴의 안내는 이번 사람 발화의 앞머리에 실린다(시스템 메시지는 맨 앞
+    하나뿐 — Qwen 채팅 틀, 10-30 QA HA-26 · HWAXPortal docs/request-1029 W-3 프롬프트 앞부분 고정)."""
+    out = [c for r, c in sink["messages"] if r == "system"]
+    for r, c in sink["messages"]:
+        if r == "user" and isinstance(c, str) and c.startswith(a._TURN_NOTES_HEAD):
+            out.append(c.split(a._TURN_NOTES_TAIL, 1)[0])
+    return "\n".join(out)
 
 def _prime_tools_map(monkeypatch, mapping, areas=None):
     monkeypatch.setitem(a._TOOLS_MAP_CACHE, "at", time.time())

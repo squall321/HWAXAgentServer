@@ -358,15 +358,36 @@ def _system_prompt() -> str:
 # 안내(쓸 수 있는 앱 · 핀 · 페르소나 · 지식카드 발췌 · 붙인 문서)가 첫 시스템 메시지에 붙어 있으면 그것이 바뀔 때마다 '시스템 + 도구' 앞부분이
 # 캐시에서 깨진다. 그래서 바뀌는 안내는 이번 사람 발화 바로 앞의 시스템 칸에 둔다. 안내의 자리가 바뀌어 지시를 따르는 정도가 달라질 수 있어
 # (C-7) 끄는 손잡이를 둔다 — CHAT_STABLE_PREFIX=0 이면 종전처럼 한 시스템 메시지에 잇는다.
+# ⚠ 안내를 **둘째 시스템 메시지**로 두면 Qwen 의 채팅 틀이 'System message must be at the beginning' 으로 거절한다(cae00 실측 — LLM 400,
+# 전문가 · 앱 핀 · 붙인 문서 챗, 10-30 QA HA-26). 시스템 메시지는 맨 앞 하나뿐이어야 한다 — 안내는 이번 사람 발화의 앞머리에 싣는다.
 _STABLE_PREFIX = os.environ.get("CHAT_STABLE_PREFIX", "1").strip() != "0"
+_TURN_NOTES_HEAD = "[이번 턴의 안내 — 시스템이 붙인 것이다. 사람이 쓴 글이 아니다]\n"
+_TURN_NOTES_TAIL = "\n\n[사람의 말]\n"
+
+
+def _with_turn_notes(user_msg, notes: str):
+    """이번 발화 앞머리에 이 턴의 안내를 싣는다 — 글이면 글 앞에, 그림이 든 HumanMessage 면 첫 글 조각으로."""
+    head = _TURN_NOTES_HEAD + notes
+    if isinstance(user_msg, tuple):
+        role, content = user_msg
+        if isinstance(content, str):
+            return (role, head + _TURN_NOTES_TAIL + content)
+        return (role, [{"type": "text", "text": head + _TURN_NOTES_TAIL}, *list(content or [])])
+    content = getattr(user_msg, "content", None)
+    if isinstance(content, str):
+        return user_msg.model_copy(update={"content": head + _TURN_NOTES_TAIL + content})
+    if isinstance(content, list):
+        return user_msg.model_copy(update={"content": [{"type": "text", "text": head + _TURN_NOTES_TAIL}, *content]})
+    return user_msg
 
 
 def _turn_msgs(sys_prompt: str, turn_notes: str, hist: list, recap, user_msg) -> list:
-    """챗 한 턴의 메시지 — [첫 시스템(고정) · 이력 · (그림 다시 싣기) · 이 턴의 안내(시스템) · 이번 발화]. 안내가 없거나 손잡이를 끄면 종전 꼴."""
+    """챗 한 턴의 메시지 — [첫 시스템(고정) · 이력 · (그림 다시 싣기) · 이 턴의 안내를 앞머리에 단 이번 발화]. 안내가 없거나 손잡이를 끄면 종전 꼴.
+
+    시스템 메시지는 늘 맨 앞 하나다(Qwen 채팅 틀 — HA-26). 고정 앞부분(시스템 + 도구 + 이력)은 그대로라 캐시 몫은 W-3 과 같다."""
     if not turn_notes or not _STABLE_PREFIX:
         return [("system", sys_prompt + turn_notes), *hist, *([recap] if recap else []), user_msg]
-    return [("system", sys_prompt), *hist, *([recap] if recap else []),
-            ("system", "[이번 턴의 안내]\n" + turn_notes.lstrip("\n")), user_msg]
+    return [("system", sys_prompt), *hist, *([recap] if recap else []), _with_turn_notes(user_msg, turn_notes.lstrip("\n"))]
 
 
 def _core_vocab_health() -> dict:

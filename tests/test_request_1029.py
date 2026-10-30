@@ -225,11 +225,14 @@ def test_W1_실제_경로_한_턴의_챗_호출과_검토자_호출이_같은_�
 
 
 # ── W-3 — 프롬프트 앞부분 고정(첫 시스템 메시지 · 도구의 고정 몫이 턴을 가로질러 같다) ─────────────────────────────────────────
-def test_W3_바뀌는_안내는_사람_발화_바로_앞의_시스템_칸에_두고_끄면_종전_꼴이다(monkeypatch):
+def test_W3_바뀌는_안내는_사람_발화_앞머리에_싣고_시스템은_맨_앞_하나다_끄면_종전_꼴이다(monkeypatch):
+    """둘째 시스템 메시지는 Qwen 채팅 틀이 400 으로 거절한다(HA-26 — 'System message must be at the beginning')."""
     hist, user = [("user", "앞 질문"), ("assistant", "앞 답")], ("user", "이번 질문")
     m = a._turn_msgs("고정 시스템", "\n\n[사용자 지정 우선 도구]\nx", hist, None, user)
-    assert m[0] == ("system", "고정 시스템") and m[-1] == user and m[1:3] == hist
-    assert m[-2] == ("system", "[이번 턴의 안내]\n[사용자 지정 우선 도구]\nx")
+    assert m[0] == ("system", "고정 시스템") and m[1:3] == hist and len(m) == 4
+    assert [r for r, _ in m].count("system") == 1, "시스템 메시지는 맨 앞 하나"
+    role, text = m[-1]
+    assert role == "user" and text.startswith("[이번 턴의 안내") and "[사용자 지정 우선 도구]\nx" in text and text.endswith("이번 질문")
     assert a._turn_msgs("고정 시스템", "", hist, None, user) == [("system", "고정 시스템"), *hist, user], "안내가 없으면 한 칸"
     monkeypatch.setattr(a, "_STABLE_PREFIX", False)
     assert a._turn_msgs("고정 시스템", "\n\nX", hist, ("user", "그림"), user) == \
@@ -264,7 +267,8 @@ def test_W3_실제_경로_턴을_가로질러_첫_시스템_메시지가_바이�
     _turn(monkeypatch, fake_llm, "둘째 질문")
     st = _stats(fake_llm)
     assert st["calls"] == 2 and st["first_system"][0] == st["first_system"][1], "바뀌는 안내가 첫 시스템 메시지에 섞였다"
-    assert "붙인 문서의 본문 글" in st["systems"][1] and "붙인 문서의 본문 글" not in st["first_system"][1]
+    # 안내는 이번 사람 발화의 앞머리에 — 시스템 메시지는 맨 앞 하나뿐이다(HA-26, 가짜 서버가 둘째 시스템을 400 으로 거절한다)
+    assert "붙인 문서의 본문 글" in st["humans"][1] and "붙인 문서의 본문 글" not in st["systems"][1]
 
 
 # ── W-2 — 캡 없는 길의 도구 설명 예산 손잡이(기본값은 그대로) ───────────────────────────────────────────────────────────────
@@ -365,3 +369,31 @@ def test_E7_합치기와_지문은_게이트웨이와_글자까지_같다():
         mine_lines = [ln for ln in code.splitlines() if ln.strip() and not ln.strip().startswith(("JSON", "값의"))]
         their_lines = [ln for ln in theirs.splitlines() if ln.strip() and not ln.strip().startswith(('"""', "JSON", "값의", "#"))]
         assert [ln for ln in mine_lines if '"""' not in ln] == [ln for ln in their_lines if '"""' not in ln], name
+
+
+def test_HA26_그림이_든_발화도_안내를_첫_글_조각으로_싣고_시스템은_하나다():
+    """그림을 올린 턴의 발화는 글 조각 목록이다 — 안내를 첫 글 조각으로 앞에 붙이고 그림 조각은 그대로 둔다."""
+    from langchain_core.messages import HumanMessage
+    img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    user = HumanMessage(content=[{"type": "text", "text": "이 그림을 봐"}, img])
+    recap = HumanMessage(content=[{"type": "text", "text": "앞 대화의 그림"}, img])
+    m = a._turn_msgs("고정 시스템", "\n\n[붙인 문서]\n본문", [("user", "앞")], recap, user)
+    assert [getattr(x, "type", None) or x[0] for x in m].count("system") == 1 and m[0] == ("system", "고정 시스템")
+    assert m[-2] is recap
+    last = m[-1]
+    assert isinstance(last, HumanMessage) and last.content[0]["type"] == "text" and last.content[0]["text"].startswith("[이번 턴의 안내")
+    assert "[붙인 문서]\n본문" in last.content[0]["text"] and last.content[1:] == user.content, "그림 조각은 그대로"
+
+
+def test_HA26_실제_Qwen_채팅_틀은_둘째_시스템_메시지를_거절하고_고친_꼴은_받는다():
+    """가짜는 진짜 꼴로 — Qwen3 의 chat_template 이 하는 검사(시스템 메시지가 맨 앞이 아니면 예외)를 그대로 흉내 내 바뀌는 안내 셋(전문가 · 앱 핀 · 붙인 문서)을 넣어 본다."""
+    def qwen_template_check(msgs):
+        roles = [getattr(x, "type", None) or x[0] for x in msgs]
+        roles = ["system" if r == "system" else r for r in roles]
+        for i, r in enumerate(roles):
+            if r == "system" and i != 0:
+                raise ValueError("System message must be at the beginning.")
+    hist = [("user", "앞 질문"), ("assistant", "앞 답")]
+    for notes in ("\n\n[페르소나]\n품질 전문가", "\n\n[사용자 지정 우선 앱]\nsignalforge", "\n\n[붙인 문서]\n본문"):
+        qwen_template_check(a._turn_msgs("고정 시스템", notes, hist, None, ("user", "질문")))
+
