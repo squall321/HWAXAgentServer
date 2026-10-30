@@ -582,10 +582,13 @@ The chat's core-data rules (`[코어 데이터 규칙]` in the system prompt) ar
 `../HWAXPortal/backend/config/core_vocab.json` — the sibling repo on the same box (dev `~/claude`, cae00 `~/Projects`).
 The trigger words (`rule_words`), the first step (one `object_resolve` on the canonical hub before other apps), the
 type-name map (`types`, one line at the end of rule ① — `word = type_slug`, so the model stops inventing type names;
-portal docs/request-1030 HA-32), the relation map (`relations`, rule ④) and the apps that hold no core objects (`apps`
-with role `noncore`, rule ⑦) come from it. The file is re-read when its mtime changes. Missing or malformed → the built-in text (`SYSTEM_PROMPT`, byte for
-byte). `/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
-Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test).
+a word outside the map is checked in the canonical `search` result's `types[]`; portal docs/request-1030 HA-32), the
+relation map (`relations`, rule ④) and the apps that hold no core objects (`apps` with role `noncore`, rule ⑦) come
+from it. The file is re-read when its mtime changes. Missing or malformed → the built-in text (`SYSTEM_PROMPT`, byte
+for byte); a `types` value that is not a hub slug (`[a-z][a-z0-9_]{0,31}`) makes the table malformed.
+`/health` `core_vocab`: `{loaded, version, rule_words, canonical}` or `{loaded: false, error}` (no path).
+Tests: `tests/test_request_1029.py` (reads the real portal file; `conftest.py` sets it to missing for every other test)
+and `tests/test_core_vocab_types.py` (the `types` line; its real-file case skips until the portal file has `types`).
 
 **Stable prompt prefix (W-3).** The first system message is the same on every turn (`SYSTEM_PROMPT`, or the vocabulary
 version of it), and the fixed tool share (guide tools, then core tools) sits at the front of the bound tools in a fixed

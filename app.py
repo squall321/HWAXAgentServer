@@ -292,14 +292,25 @@ def _core_rules_text(d: dict) -> str:
     sib = " · ".join(a["label"] for a in apps if a.get("role") == "sibling") or "FailureTrace 등"
     non = " · ".join(f"{a['label']}({a['note']})" if a.get("note") else a["label"] for a in apps if a.get("role") == "noncore")
     rel = " · ".join(f"{r['phrase']} = {r['relation']}" for r in d.get("relations") or [])
-    typ = " · ".join(f"{w} = {s}" for w, s in (d.get("types") or {}).items())
+    # 타입 이름은 허브 slug 꼴이다(StandardPlatform ontology SLUG_RE). 꼴이 아니면 그 판을 버린다(다른 칸처럼) — 종전엔 박스 덧씌우기의 오타가
+    # 객체 · 숫자면 repr 꼴로 프롬프트에 실리고 빈 목록이면 줄이 조용히 빠졌는데, 게이트웨이는 types 를 읽지 않아 지문도 같았다(10-30 반대 검토).
+    types = d.get("types")
+    if types is not None and not isinstance(types, dict):
+        raise TypeError(f"types 는 낱말 → 타입 이름의 객체여야 한다({type(types).__name__})")
+    for w, s in (types or {}).items():
+        if not (w.strip() and isinstance(s, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,31}", s)):
+            raise TypeError(f"types 의 {w!r} = {s!r} — 타입 이름은 허브 slug 꼴(소문자로 시작하는 영문 · 숫자 · 밑줄 32자 이내)이어야 한다")
+    typ = " · ".join(f"{w} = {s}" for w, s in (types or {}).items())
     return (
         f"[코어 데이터 규칙] {' · '.join(d['rule_words'])} 같은 코어 객체를 물으면 이렇게 하세요. "
         "이 낱말이 나오면 첫 걸음은 정본의 object_resolve 하나입니다 — 여러 앱을 한꺼번에 훑지 말고, 사례 · 실측 · 규격 원문은 그 뒤에 "
         "다른 앱에서 덧붙이세요. "
         f"① 정본은 {d['canonical']['label']}입니다 — 이름 · 코드는 먼저 object_resolve 로 풀고, 결과가 candidates(여럿)면 "
         "고르지 말고 사용자에게 어느 것인지 물으세요. "
-        + (f"타입 이름(type_slug)은 지어내지 말고 이 대응을 쓰세요 — {typ}. " if typ else "")
+        # 대응에 없는 발동 낱말(부품 · 원인 · 시험군 …)도 허브 object_resolve 는 type_slug 가 필수다 — 허브 안내의 '타입을 모르면 search' 는 이 서버가
+        # MCP 서버 안내를 읽지 않아 웹 챗에 닿지 않는다(위 _CORE_RULES_DEFAULT 주석). search 의 types[] 가 타입별 type_slug · 건수다.
+        + (f"타입 이름(type_slug)은 지어내지 말고 이 대응을 쓰세요 — {typ}. "
+           "대응에 없는 낱말은 짐작하지 말고 정본의 search 결과 types[] 에서 타입 이름을 확인하세요. " if typ else "")
         + "② PLM 과제(plm_task)의 식별자는 과제명입니다 — 과제코드는 별칭 · task_code 로 대조하세요. "
         "③ 개수는 목록을 세지 말고 응답의 total 이나 objects_summary 로 답하세요. "
         "④ 무엇이 무엇과 이어져 있는지는 graph_neighbors 로 보세요" + (f" — 자주 묻는 관계는 {rel} 입니다. " if rel else ". ")
