@@ -235,11 +235,13 @@ def test_SG04_같은_주의는_검색어끼리_한_번만_싣고_받은_검색�
     assert out["note"].count(C_PX1) == 1 and _MODEL_NOTE not in out["note"]
 
 
-def test_SG04_0건_검색어의_글은_종전_그대로다(monkeypatch):
+def test_SG04_0건_검색어의_글은_종전_그대로고_주의_줄로_실린_글만_뺀다(monkeypatch):
     """0건 갈래는 notes 를 통째로 싣던 그대로다(주의 줄도 그 안에 든다) — 그 검색어로 따로 주의 줄을 만들지 않는다. 행이 있는 다른 검색어가 같은
-    주의를 받았으면 그 검색어의 줄은 따로 선다(어느 행에 걸리는 주의인지 검색어로 말한다)."""
+    주의를 받았으면 그 검색어의 줄이 따로 서고, 0건 줄에서는 그 글만 뺀다 — 150자 남짓한 같은 주의가 안내 한 줄에 두 번 나왔다(반대 검토 10-31).
+    0건 검색어는 주의 줄의 검색어 표지에 달지 않는다(보이는 행이 없다). 다른 까닭이 없어도 0건이었다는 것은 남긴다."""
     why = "해석한 조건에 맞는 글이 없다(최근 90일) — 기간·시장·채널을 넓히거나 semantic=False 로 키워드 검색을 해 보라"
-    data = {"px1 hinge": _envelope([_voc(1, "px1 hinge")], [C_PX1]), "px1 zzz": _envelope([], [C_PX1, why])}
+    data = {"px1 hinge": _envelope([_voc(1, "px1 hinge")], [C_PX1]), "px1 zzz": _envelope([], [C_PX1, why]),
+            "px1 none": _envelope([], [C_PX1])}
 
     async def call(tools, name, args):
         return data[args["keyword"]]
@@ -249,5 +251,9 @@ def test_SG04_0건_검색어의_글은_종전_그대로다(monkeypatch):
 
     out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 hinge", "px1 zzz"]})
     assert [x["id"] for x in out["items"]] == [1]
-    assert out["note"] == f"'px1 hinge' {C_PX1} / 'px1 zzz' 0건 — {C_PX1} · {why}", out.get("note")
+    assert out["note"] == f"'px1 hinge' {C_PX1} / 'px1 zzz' 0건 — {why}", out.get("note")
+    assert out["note"].count(C_PX1) == 1
     assert not out["degraded"] and not out["partial"]
+
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 hinge", "px1 none"]})
+    assert out["note"] == f"'px1 hinge' {C_PX1} / 'px1 none' 0건", out.get("note")
