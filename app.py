@@ -37,6 +37,7 @@ import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 �
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -353,7 +354,10 @@ def _core_vocab() -> dict | None:
                 # 허브 키 → 라벨 — 정본과 role sibling(다른 허브 id 막이 _hub_apps, HWAXPortal docs/request-1030 HA-30). /health 에는 싣지 않는다.
                 "hubs": {d["canonical"]["app"]: d["canonical"].get("label") or d["canonical"]["app"],
                          **{k: (a or {}).get("label") or k for k, a in (d.get("apps") or {}).items()
-                            if (a or {}).get("role") == "sibling"}}}
+                            if (a or {}).get("role") == "sibling"}},
+                # 페르소나 연결(personas — HWAXPortal docs/request-1029 design-e5 E5-4)은 줄마다 검증한다(_persona_links). 틀린 줄이 표 전체를
+                # 버리지 않게 여기서는 원본과 타입 대응만 들고 간다. /health 에는 검증한 수만 싣는다.
+                "personas_raw": d.get("personas"), "types_map": dict(d.get("types") or {})}
     if (mt, lmt) != _CORE_VOCAB["mtime"]:
         try:
             raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
@@ -433,7 +437,61 @@ def _core_vocab_health() -> dict:
     return {"loaded": True, "version": d["version"], "rule_words": d["rule_words"], "canonical": d["canonical"],
             # 덧씌운 표 · 기본 표의 지문과 박스 덧씌우기 — 게이트웨이 /health core_vocab 과 같아야 한다(E-7 ③)
             "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
-            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False})}
+            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False}),
+            # 페르소나 연결 — 줄 수 · 버린 줄과 까닭 · 대조 못 한 표 · 줄 없는 조직도 도메인 · 그림자 기록(design-e5 E5-4, 고르기는 바꾸지 않는다)
+            "personas": _persona_links_health()}
+
+
+# ── 페르소나 연결(코어 어휘표 personas — HWAXPortal docs/request-1029 design-e5 E5-4) ─────────────────────────────────────
+# 지금은 읽기 · 검증 · /health · 그림자 기록뿐이다 — 좌석 · 도구 · '맡은 사람이 없다' 고르기는 그대로다(관문 G0 전 — 사용자 결정 10-31).
+# 대조 표 셋(어휘표 types · 조직도 domain_label · 게이트웨이 도구 지도)이 바뀌면 다시 셈한다. 도구 지도는 받아 둔 것만 본다(/health 가 게이트웨이를
+# 두드리지 않는다) — 아직 못 받았으면 영역 · 앱 대조를 건너뛰고 unchecked 에 적는다.
+_PERSONA_LINKS: dict = {"key": None, "v": None}
+
+
+def _persona_links() -> dict | None:
+    """검증한 페르소나 연결 — 어휘표가 없으면 None. 칸이 없으면 present 거짓."""
+    d = _core_vocab()
+    if d is None:
+        return None
+    import persona_links as _pl  # noqa: PLC0415
+    areas = frozenset(_TOOLS_MAP_CACHE.get("area_meta") or ()) or None
+    apps = frozenset(set((_TOOLS_MAP_CACHE.get("map") or {}).values()) | set(_APPS_CACHE.get("apps") or {})) or None
+    key = (d.get("fingerprint"), areas, apps, _pl.org_mtime())
+    if _PERSONA_LINKS["key"] != key:
+        _PERSONA_LINKS.update(key=key, v=_pl.validate(d.get("personas_raw"), types_map=d.get("types_map") or {},
+                                                      domains_known=_pl.org_domains(), areas_known=areas, apps_known=apps))
+    return _PERSONA_LINKS["v"]
+
+
+def _persona_links_health() -> dict:
+    try:
+        import persona_links as _pl  # noqa: PLC0415
+        return _pl.health(_persona_links())
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"present": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _persona_shadow_tools(key: str, persona: dict, sel_q: str, names: list, prefer: list) -> None:
+    """챗 지목 전문가 — 연결 표가 골랐을 우선 도구를 지금 고른 것(prefer)과 나란히 적기만 한다. prefer 는 그대로 쓰인다. 실패는 삼킨다."""
+    try:
+        v = _persona_links()
+        if not v or not v.get("present") or not key or persona.get("operator"):
+            return
+        import persona_links as _pl  # noqa: PLC0415
+        _pl.shadow_tools(v, site="chat", key=key, question=sel_q, names=names, prefer_now=prefer,
+                         tool_app=(_TOOLS_MAP_CACHE.get("map") or {}).get, tool_area=lambda n: _area_of(n)[0])
+    except Exception as exc:  # noqa: BLE001 — 그림자가 챗을 막지 않는다
+        print(f"[persona-links] 그림자(챗 도구)를 적지 못했다: {exc!r}"[:300])
+
+
+def _persona_shadow_seats(site: str, question: str, keys: list, want: int) -> None:
+    """심의 첫 좌석 · 띵킹 소집 — 연결 표가 덮었을 도메인을 적기만 한다(deliberation._persona_shadow 가 부른다). 좌석은 그대로다."""
+    v = _persona_links()
+    if not v or not v.get("present"):
+        return
+    import persona_links as _pl  # noqa: PLC0415
+    _pl.shadow_seats(v, site=site, question=question, seats=list(keys), want=want)
 
 
 def _parse_servers(spec: str) -> dict:
@@ -6569,6 +6627,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             _names = list(await asyncio.to_thread(_tools_map))
             if _names:
                 prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
+                # 연결 표(personas)가 골랐을 것을 적기만 한다 — prefer 는 그대로다(design-e5 E5-4 그림자)
+                _persona_shadow_tools(agent_key, persona, _sel_q, _names, prefer)
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
                                  # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.
@@ -7450,6 +7510,46 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     yield _sse("done", {})
 
 
+def _seat_q_source(req: ChatRequest, started_by: str) -> tuple[str, str, list] | None:
+    """이 발화가 기준선 H 의 재료인가 → (출처, 질문 글, 사람이 고른 전문가). 갈래 차례는 chat() 과 같다(design-e5 2.2 H 의 출처 넷).
+    좌석을 지정해 연 심의의 화두만(이어하기는 앞 회차 화두라 빼고, 지정 좌석은 싣지 않는다 — 웹 심의 화면은 추천 상위를 기본으로 골라 두어 사람이
+    고친 것인지 모른다, L6) · 빗금으로 부른 '/전문가' 만 · 지목 대화는 앞선 사람 발화가 없을 때만이다. 앱이 띄운 리스크 패널은 사람의 화두가 아니다."""
+    m = req.message or ""
+    if is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
+        o = req.delib_opts if isinstance(req.delib_opts, dict) else {}
+        seats = [k for k in (_delib_engine._seat_key(p) for p in (o.get("personas") or []) if isinstance(p, dict)) if k]
+        if started_by == "app" or not seats or o.get("continue_summary"):
+            return None
+        q = (strip_sim_trigger(m) if is_sim_deliberation(m) else strip_test_plan_trigger(m) if is_test_plan(m)
+             else strip_trigger(m))
+        return "delib", q, []
+    if is_report_save(m):
+        return None
+    if m.strip().startswith(_AGENT_SEARCH_TRIGGERS):
+        return "expert_cmd", strip_agent_trigger(m), []
+    if is_agent_search(m, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))) or is_tool_search(m):
+        return None
+    if (is_thinking(m) or req.thinking) and not _confirm_reply(req):
+        return "thinking", strip_thinking_trigger(m), []
+    keys = _persona_keys(req.pinned_agents, req.pinned_agent)
+    if keys and not any(isinstance(h, dict) and h.get("role") == "user" for h in (req.history or [])):
+        return "persona", m, keys
+    return None
+
+
+def _seat_q_note(req: ChatRequest, started_by: str) -> None:
+    """기준선 H 재료를 박스 파일에 — 꺼져 있으면(기본) 아무것도 하지 않는다. 사람 · 대화는 적지 않는다(seat_questions). 실패는 삼킨다."""
+    import seat_questions as _sq  # noqa: PLC0415
+    if not _sq.enabled():
+        return
+    try:
+        got = _seat_q_source(req, started_by)
+        if got:
+            _sq.note(got[0], got[1], user=req.user_email, picked=got[2])
+    except Exception as exc:  # noqa: BLE001 — 모으기가 챗을 막지 않는다
+        print(f"[seat-questions] 발화를 남기지 못했다: {exc!r}"[:300])
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
     # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
@@ -7474,6 +7574,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         _paused = _delib_pause_info()
         if _paused:
             return StreamingResponse(_paused_stream(_paused), media_type="text/event-stream", headers=SSE_HEADERS)
+    _seat_q_note(req, started_by)      # 전문가 고르기 기준선 H 의 재료(기본 꺼짐 — design-e5 E5-2) — 이 턴의 길은 그대로다
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
@@ -8972,6 +9073,85 @@ async def post_limits(request: Request):
     return out
 
 
+# ── 실사용 질문 모으기 · 사람 표시(HWAXPortal docs/request-1029 design-e5 E5-2) ─────────────────────────────────────────────
+# GET /seat-questions · POST /seat-questions/label · POST /seat-questions/ingest — 모으기는 기본 꺼짐이다(seat_questions). 공유 비밀을 요구한다 —
+# 게이트웨이 연결의 Authorization(Bearer <GW_TOKEN>), 포털 GATEWAY_SHARED_TOKEN 과 같은 값이다(게이트웨이 /search-eval 과 같은 꼴, seat_box).
+# /drain · /limits 처럼 루프백만 믿지 않는 까닭 — 질문 원문을 낸다.
+def _seat_auth(request: Request):
+    import seat_box  # noqa: PLC0415
+    st, why = seat_box.authorized(app, request.headers.get("authorization", ""))
+    return JSONResponse({"error": why}, status_code=st) if st else None
+
+
+@app.get("/seat-questions")
+def seat_questions_view(request: Request, src: str = "", by: str = "", limit: int = 100, offset: int = 0):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if src and src not in _sq.SOURCES:
+        return JSONResponse({"error": f"src 는 {list(_sq.SOURCES)} 가운데 하나다"}, status_code=422)
+    return _sq.view(src or None, by or None, limit=limit, offset=offset)
+
+
+@app.post("/seat-questions/label")
+async def seat_questions_label(request: Request):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"error": "본문이 JSON 이 아니다"}, status_code=422)
+    st, out = _sq.label(body)
+    return JSONResponse(out, status_code=st)
+
+
+@app.post("/seat-questions/ingest")
+async def seat_questions_ingest(request: Request):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"error": "본문이 JSON 이 아니다"}, status_code=422)
+    if not isinstance(body, dict) or sorted(set(body) - {"items"}):
+        return JSONResponse({"error": "본문은 {items: [...]} 다"}, status_code=422)
+    st, out = _sq.ingest(body.get("items"))
+    return JSONResponse(out, status_code=st)
+
+
+def _seat_questions_health() -> dict:
+    """/health 의 seat_questions — 모으기가 켜졌나 · 창 날 수 · 이번 기동에 적은 수 · 받는 표시자 수(질문 글은 싣지 않는다)."""
+    try:
+        import seat_questions as _sq  # noqa: PLC0415
+        return _sq.health()
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"collect": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+# ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
+# POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
+# AIDataHub 를 수백 번 부른다.
+@app.post("/seat-eval")
+async def seat_eval(request: Request):
+    import seat_probe  # noqa: PLC0415
+    st, body = await seat_probe.handle(app, sys.modules[__name__], request.headers, await request.body())
+    return JSONResponse(body, status_code=st)
+
+
+def _seat_eval_health() -> dict:
+    """/health 의 seat_eval — 창구 비밀이 있나 · 평가가 도나."""
+    try:
+        import seat_probe  # noqa: PLC0415
+        return seat_probe.health(app)
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _limits_health() -> dict:
     """/health 의 limits — 지금 걸린 동시 한도 셋과 출처(file · env). 모듈을 못 붙였으면 빈 사전(/health 는 늘 답한다)."""
     try:
@@ -9032,6 +9212,8 @@ def health() -> dict:
         "xhub_gate": _xhub_gate_health(),
         # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
         "core_vocab": _core_vocab_health(),
+        # 실사용 질문 모으기(기본 꺼짐) — 켜졌나 · 창 · 적은 수(HWAXPortal docs/request-1029 design-e5 E5-2)
+        "seat_questions": _seat_questions_health(),
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
@@ -9062,4 +9244,6 @@ def health() -> dict:
         # 비어 있으면 최근 로드가 전부 성공. 값이 있으면 401/타임아웃 등 실사유가 찍힌다.
         "tool_load_errors": {" ".join(sorted(g)) or "(none)": v
                              for g, v in (getattr(app.state, "tool_load_error", None) or {}).items()},
+        # 전문가 고르기 기준선 창구 — 비밀이 있나 · 평가가 도나(HWAXPortal docs/request-1029 design-e5 E5-1)
+        "seat_eval": _seat_eval_health(),
     }

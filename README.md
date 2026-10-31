@@ -97,6 +97,10 @@ ChatDock (portal frontend)
   by its owner, kept 7 days for an interrupted job. Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line
   and stops — the fold is then the state up to that line, with a warning. Seat-level resume (S1 · S2) is not here.
 
+- `POST /seat-eval` · `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — the seat-choice
+  baseline windows (shared secret; see "Seat-choice baseline" below). `/health.seat_eval` `{secret, busy}`,
+  `/health.seat_questions` `{collect, days, written, error, labelers}`, `/health.core_vocab.personas`.
+
 ## Run (dev)
 
 ```bash
@@ -644,6 +648,102 @@ keeps the draft. The main chat answer has no cap (portal decision D-6).
 the chat window (about 88,000 tokens on a 262,144 window). `CHAT_TOOL_SCHEMA_BUDGET` (estimated tokens) sets it to a fixed
 value instead; empty or 0 keeps the 45%. The default is unchanged on purpose (portal decision D-3) — compare 30,000 and
 40,000 on the box with the same 16 questions first. A smaller bundle means more `search_tools` → `invoke_tool` round trips.
+
+### Seat-choice baseline (portal docs/request-1029 design-e5 — E5-0 · E5-1 · E5-2 · E5-4)
+
+Measures who gets picked — deliberation first seats, thinking candidates and screening, the pinned expert's preferred
+tools — **with the engine's own functions**, before anything about seat choice changes (gate G0; user decision 10-31).
+Nothing here changes a seat, a tool or the "nobody owns this" outcome.
+
+- **Box place** — `SEAT_EVAL_DIR`, default the job ledger's sibling `seat-eval/` (`<realpath(ARTIFACT_DIR)>/../seat-eval`,
+  outside the repo). Sub-folders `sets/` (eval sets), `runs/` (window records), `questions/` (real-use questions and
+  labels), `shadow/` (shadow log). Folders 0700, files 0600. `conftest.py` points it at a temp dir for every test.
+- **Shared secret** for the windows below (`seat_box`): the `Authorization` value of the gateway connection in `MCP_CONFIG`
+  (`Bearer <GW_TOKEN>` — the portal's `GATEWAY_SHARED_TOKEN`, the same form as the gateway's `/search-eval`). No secret →
+  503, wrong → 401. Not loopback-only like `/drain` · `/limits`: they hand out question text or call AIDataHub hundreds of times.
+- `POST /seat-eval {items: [{qid, q, expert?}] (1–50), layers?, run?, concurrency? (1–4), summon_k?}` — per query, the
+  layers `rec` (`recommend_agents(q, top_k=40)` as returned: operators included and marked `op`, `score` · `desc_match` ·
+  `matched_*` · `low_confidence`), `discover` (`deliberation._discover(tools, q, N_PERSONAS)` — default top_k, so the
+  first seats can come short after operators are dropped), `summon` (`thinking._summon(tools, q, THINK_CANDIDATES)`, or
+  `summon_k` — 3 for the referral hop), `screen` (`thinking._screen_one` per candidate; `asked` = the first
+  `THINK_MAX_ANSWERS` that passed), `tools` (the chat's `_persona_meta` → `_seat_tool_prefer(…, CHAT_PERSONA_PREFER_N)`
+  for `expert`, plus what the persona links would pick, when present). LLM layers — `judge` (thinking self-judgement on
+  the asked seats), `counter` (`_counter_seats`), `axes` (`_seat_axes` on the one question) — are refused (409) while a
+  deliberation runs. Layers run in the order summon → screen → rec → discover → tools → LLM layers, so the thinking
+  summon is the query's first `recommend_agents` call, as in real thinking (`summon.first` says whether this window
+  process sent the query before — AIDataHub/DB warm-up is not visible). Every tool is wrapped for the request: read tools
+  (`recommend_agents` · `get_agent_session` · `agent_search` · `list_agents` · `list_agent_domains`) run and are counted
+  in `calls`; any other tool is not run and is counted in `blocked`; `read_only` is "zero blocked". While the request
+  runs, the engine's own `_tools_by_name` (e.g. `_persona_meta`) returns the same wrapped dict (`deliberation._TOOLS_OVERRIDE`
+  — a context variable, so concurrent chats and deliberations keep their own tools). A tool failure (exception, failure
+  text, AIDataHub's empty `fallback`) is attached to that layer as `tool_error`. One run at a time (409). Each answer
+  carries a version fingerprint — agent and AIDataHub commits, a sha of the sibling AIDataHub checkout's
+  `recommend_svc.py`, AIDataHub version · build · embedder slot (version and build are fixed per deploy), field-terms
+  sha, pool fingerprint (keys · updated_at), core-vocab fingerprint, tool-map sha, the selection knobs. With `run`,
+  every item is appended to `runs/<run>.jsonl` without the question text.
+- **Eval sets** — `python -m tools.seat_evalset build [--experts ../ExpertAgents] [--c-queries <AIDataHub ko-search
+  queries.jsonl>] [--pool-file <keys>] [--seed 20261031]` writes `A.jsonl` (600 authored confusions from
+  `routing.anti_examples` `# → target` comments, filters L1 · L2 (the answer's key or a name piece — the Korean and English
+  names without their role tail and parentheses, and each parenthetical alias; spaces, hyphens and case ignored,
+  three-letter acronyms only within word bounds) · generic/unknown/self targets, quotas HW 12×30 · xd 60 ·
+  std/oss/misc all · sw 120 with the rest to HW, then xd, then sw; ≤ 2 per answer expert, ≤ 1 per (answer, author);
+  dev/test split by answer expert), `A-name.jsonl` (the name bundle), `P.jsonl` (300 referral phrases from
+  `expertise.out_of_scope`), `C.jsonl` (card-derived queries, title copies removed), `rels.jsonl` (key pairs and relation
+  names only), `manifest.json` and `SEAL.txt` (`A-test sha256=…` over the sorted test qids). Same seed → same qids. No
+  sibling ExpertAgents → skipped (exit 0). It refuses to write inside this repo — the sets travel by Drive (decision
+  D-E5-8), never into a public repo or AIDataHub. `seal <dir>` re-checks the seal.
+- **Runner** — `python -m tools.seat_eval run --sets <dir> [--only A,P,C,H,N,T] [--layers …] [--run <id>] [--split test|dev|all]`
+  sends the sets in batches (the secret is read from `MCP_CONFIG`), keeps `<set>.results.jsonl` / `<set>.version.json`
+  (no question text) under `runs/<id>/` and prints numbers only: acc@1 · acc@3 · MRR@10 (strict · lenient), discover
+  hit@5 · short seats · domain cover, summon recall · screening · asked-seat hit, confusion (confuser above the answer),
+  "nobody" precision · recall · F0.5 per signal, N3 (answer domain and relation experts removed), labeler agreement
+  (primary overlap over pairs where both gave primaries, "none" agreement apart, domain κ) and picked-vs-label (pinned-expert
+  chat only — a "none" label counts as a miss), guards (operators · unknown keys · errors) and thinking latency p50 · p95
+  (first `recommend_agents` call of the query vs repeated) — per branch (hw · sw · xd · other), lexical band (answer
+  `desc_match` ≥ 0.40) and H source. **A-dev and A-test never mix** (L7): `--split` (default `test` — the gate) sends,
+  reports and compares one half; tuning runs use `--split dev` and never send or print A-test; `all` reports the two halves
+  apart (`A:dev` · `A:test`). A layer with `tool_error` (or `rec.error` · `fallback`) is a failure, not a wrong answer: its
+  metrics and the layers that depend on it are left out of the denominators and counted in `guard.errors` · `dropped`.
+  The lexical band is decided once: `bands <B0 off-side run>` writes `<sets>/bands.json` (qid → hi|lo, never overwritten
+  without `--force`); report and compare use it (compare falls back to the off side's band, report to its own run). When H
+  is in the same run, report adds the A headline weighted by H's band shares (`weighted`). `compare <off> <on> [--split test|dev]`
+  pairs two runs per qid (McNemar — exact below 25 discordant pairs, else χ² with continuity correction clipped at 0),
+  overall and per group (branch · band · source — gate 3), with the number of queries dropped for tool failures, and
+  names any fingerprint field that differs across **every batch** of both runs (`off:`/`on:` for drift inside a run; same
+  day, same pool — L8). Report keeps every batch fingerprint and warns on drift inside a run. dev is a smoke; the verdict
+  is measured on cae00 (C-31).
+- **Real-use questions (E5-2, off by default)** — `SEAT_QUESTIONS_COLLECT=1` on the box (the user's permission comes first,
+  like the tool-search query collection) records the first utterance of a pinned-expert chat, thinking questions, the
+  topic of a deliberation opened with given seats (web `delib_opts.personas` · MCP `deliberate_start(personas)`; not a
+  continuation; the seats are not kept — the web picker pre-selects the top recommendations, so they may not be a
+  person's pick) and `/전문가` queries into `questions/q-YYYY-MM-DD.jsonl`: date, source, the text with e-mails · JWTs ·
+  `Bearer` tokens · uuids · job ids · long hex ids (conversation ids — also when a Korean particle follows) · phone numbers ·
+  the caller's e-mail name parts removed, and, for a pinned-expert chat, the experts the person pinned. No time, user or
+  conversation. Other people's names are only removed by the portal when it shows the text (the ledger is there).
+  Day files older than `SEAT_QUESTIONS_DAYS` (60) are deleted — also with collection off, on the read paths (view ·
+  `/health` · label · ingest, once a day). `GET /seat-questions?src=&by=&limit=&offset=`
+  (the labeling screen's feed — never ranks, scores, current seats or the picked experts; short, non-standalone and
+  near-duplicate (3-gram Jaccard ≥ 0.8) questions are only counted; sources interleaved; `mine` is the given labeler's
+  label, others only as a count), `POST /seat-questions/label {qid, by, primary (1–3) | none (core_data · out_of_pool) |
+  unsure, also (0–5), via {key: tree|search}, memo, remove?}` (kept with the question text in `questions/labels.jsonl` —
+  the H set outlives the 60 days; when the last label of a question is removed, its text is taken out of `labels.jsonl`
+  and it is no longer offered), `POST /seat-questions/ingest {items: [{src, text, ts?, picked?}]}` (the portal's
+  backfill of the last 60 days; fields that point at a person or a conversation are refused). Who labels is a human
+  decision — `SEAT_QUESTIONS_LABELERS` (comma list; empty = anyone) names the accepted `by` values.
+- **Persona links (E5-4)** — the core vocabulary's `personas` field (`domains` · `experts` · `data_types` · `no_tools`) is
+  validated line by line: domains against the org chart labels (`../HWAXPortal/frontend/src/components/chat/orgTaxonomy.json`),
+  types against the vocabulary's `types`, areas and apps against the gateway tool map already fetched; operators (`he`)
+  are refused. A bad line is dropped alone; `/health` `core_vocab.personas` shows the counts, the dropped lines with
+  reasons, the tables it could not check, org-chart domains with no line, and the shadow log. Shadow log
+  (`shadow/s-YYYY-MM-DD.jsonl`, 30 days) is real-use data, so it follows the collection rule — **off by default**,
+  `PERSONA_SHADOW_LOG=1` on a box that has the user's permission: for a pinned expert's chat turn, the current preferred
+  tools next to what the links would pick; for deliberation first seats and thinking candidates, the detected core types,
+  the domains that own them, the domains the seats miss, short seats, and whether all types are data types. No question
+  text, time or question hash (the date is the file name). Old files are also removed when `/health` is read. Every
+  failure is swallowed — selection is untouched.
+
+Tests: `tests/test_seat_evalset.py`, `tests/test_seat_eval_window.py`, `tests/test_seat_questions.py`, `tests/test_persona_links.py`
+(`HWAX_PORTAL_ROOT` · `HWAX_GATEWAY_ROOT` point the sibling-file check at unmerged work trees).
 
 ### Images (portal docs/chat-depth-context T5)
 

@@ -14,3 +14,7 @@ artifacts/
 
 # 심의 잡 원장(MCP 경로) — ARTIFACT_DIR 미설정 시 리포 안에 생긴다. /data 로 가면 여기 안 생긴다
 /delib-jobs
+
+# 전문가 고르기 기준선 박스 자리(seat_probe.box_dir — 평가셋 · 평가 기록 · 실사용 질문 · 그림자 기록) — 잡 원장의 형제라 ARTIFACT_DIR 이 /data 로 가지
+# 않은 박스에서는 리포 안에 생긴다. 질문 원문이 든다 — 추적하지 않는다(HWAXPortal docs/request-1029 design-e5 · 결정 D-E5-8)
+/seat-eval

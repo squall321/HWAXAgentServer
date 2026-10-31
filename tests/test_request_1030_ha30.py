@@ -418,7 +418,8 @@ def test_임시_어휘표의_sibling_이_허브가_되고_health_꼴은_그대�
                              "apps": {"x": {"role": "sibling", "label": "X허브"}, "y": {"role": "staging", "label": "Y"},
                                       "z": {"role": "noncore", "label": "Z"}}}, ensure_ascii=False), encoding="utf-8")
     assert a._hub_apps() == {"hub": "허브", "x": "X허브"}
-    assert set(a._core_vocab_health()) == {"loaded", "version", "rule_words", "canonical", "fingerprint", "base", "overlay"}, \
+    # personas — 페르소나 연결의 검증한 수(HWAXPortal docs/request-1029 design-e5 E5-4). 원본 칸(personas_raw · types_map)은 싣지 않는다
+    assert set(a._core_vocab_health()) == {"loaded", "version", "rule_words", "canonical", "fingerprint", "base", "overlay", "personas"}, \
         "/health core_vocab 은 칸을 골라 싣는다 — hubs 는 싣지 않는다"
     assert a._hub_of("x_object_resolve") == "x" and a._hub_of("failuretrace_object_resolve") == "", "어휘표가 허브를 정한다"
 

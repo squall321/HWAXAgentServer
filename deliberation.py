@@ -2002,6 +2002,12 @@ async def _load_tools(scoped: dict) -> list:
     return await _get_tools_retry(scoped, tries=_TOOL_LOAD_TRIES)
 
 
+# 전문가 고르기 기준선 창구(seat_probe — POST /seat-eval)가 요청이 도는 동안만 세우는 도구 사전. 서 있으면 _tools_by_name 이 그 사전을
+# 돌려준다 — 엔진 함수가 스스로 받는 사전(_persona_meta 등)도 창구의 읽기 전용 사전과 같아진다. 그 요청의 문맥에서 갈라진 일만 물려받으므로
+# 함께 도는 챗 · 심의에는 닿지 않는다(HWAXPortal docs/request-1029 design-e5 E5-1 · 반대 검토 10-31).
+_TOOLS_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar("tools_override", default=None)
+
+
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
                          user_pat: str = "", svc_fallback: bool = True, as_of: str | None = None) -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
@@ -2011,6 +2017,9 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다.
     as_of 는 심의의 로드만 준다(기준일 'YYYY-MM-DD' · 없으면 '') — agent_search 를 결과 상한 **앞에서** _as_of_guard 로 감싸 기준일 두 칸을 엔진이
     정한다(있으면 박고, 없으면 모델이 넣은 것을 걷는다). 서비스 계정 폴백 도구도 같다. 안 주면(None — 심의 밖의 로드) 종전 그대로다."""
+    override = _TOOLS_OVERRIDE.get()
+    if override is not None:
+        return dict(override)
     conns = app.state.connections
     if not conns:
         return {}
@@ -4592,6 +4601,16 @@ async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
     return out
 
 
+def _persona_shadow(site: str, question: str, keys: list, want: int) -> None:
+    """페르소나 연결의 그림자(HWAXPortal docs/request-1029 design-e5 E5-4) — 코어 어휘표 personas 가 덮었을 도메인 · 모자란 좌석 수를 박스 자리에
+    적기만 한다. 좌석 · 순서는 그대로고, 어떤 실패도 삼킨다(관문 G0 전에는 고르기를 바꾸지 않는다 — 사용자 결정 10-31)."""
+    try:
+        from app import _persona_shadow_seats  # noqa: PLC0415 — 순환 방지용 늦은 import(_restore_role 과 같은 방식)
+        _persona_shadow_seats(site, question, keys, want)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: int) -> list:
     """착석 좌석이 보지 못하는 원인 축을 명명하게 하고, 그 축의 짧은 질의로 좌석을 발굴한다.
 
@@ -5693,6 +5712,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                       "tool": "recommend_agents"})
     else:
         personas = await _discover(tools, question, N_PERSONAS, origin="primary")
+        _persona_shadow("delib", question, [p["key"] for p in personas], N_PERSONAS)   # 적기만 한다 — 좌석은 그대로다
         # 반대 도메인 좌석(F1) — 질문의 어휘가 도메인을 고정하면 그 밖의 가설은 발생 경로가 없다.
         # 착석 좌석이 못 보는 원인 축을 명명하게 하고 그 축으로 발굴한다(_counter_seats 주석에
         # 실측 근거). DELIB_COUNTER_SEATS=0 으로 종전 동작 복귀.

@@ -34,6 +34,7 @@ from deliberation import (
     _first_dict,
     _llm_text,
     _parse_json,
+    _persona_shadow,
     _restore_role,
     _sse,
     _tools_by_name,
@@ -669,6 +670,7 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
 
     try:
         first = await _summon(tools, sq, CANDIDATES, seen_keys)
+        _persona_shadow("think", sq, [s["key"] for s in first], CANDIDATES)   # 연결 표가 덮었을 도메인을 적기만 한다(E5-4)
         if not first:
             msg = ("이 질문에 맞는 전문가를 풀에서 찾지 못했습니다. "
                    "질문을 도메인 용어로 좁혀 다시 물어보세요.")
