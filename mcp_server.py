@@ -254,6 +254,12 @@ _ADV_DESC = (
     f"{', '.join(sorted(_engine._KN_SYNTH)) or '없음'})) · "
     "knowledge_query(좌석 지식카드 검색어: 문자열 하나 또는 {좌석 키: 검색어, \"*\": 기본}. 안 주면 화두로 찾는다. "
     f"값마다 {_engine._KNOWLEDGE_Q_MAX}자까지이고 넘으면 앞부분만 쓰고 evidence_omitted 로 알린다) · "
+    # 기준일 — 거르는 것과 거르지 않는 것은 엔진 문구에서 읽어 적는다(봉인과 같은 까닭 — 손으로 적으면 이 글만 낡는다).
+    "as_of(기준일 'YYYY-MM-DD' — 주면 이 잡의 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 지정 도구 · 좌석 자유 조회)이 그 날까지의 "
+    f"카드만 찾는다. 날짜 없는 카드는 남기고 '{_engine._AS_OF_UNDATED}' 으로 표시한다. 지식 허브가 거름을 확인해 주지 않으면(옛 판) 그 "
+    "조회의 카드를 버리고 알린다. 날짜와 셈이 결정문 머리에 남는다. 틀린 꼴은 잡을 만들기 전에 거절한다. 질문에 든 날짜를 대신 쓰지 "
+    "않는다 — 기준일은 이 값으로만 준다(안 주면 좌석이 agent_search 에 날을 넣어도 엔진이 걷는다). "
+    f"{_engine._AS_OF_OPEN}) · "
     f"chair_template(의장 산출 틀: {'·'.join(_engine._CHAIR_ITEMS)} — job 이 'default' 가 아니면 "
     "job 이 정한 틀이 이긴다. job='default' 에서 틀만 바꿀 때 쓴다) · "
     "sealed(봉인: 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다 — "
@@ -693,8 +699,9 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
 # timeout_s(LLM 호출 1회 한도)도 이어받는다 — 큰 패널이라 한도를 올려 돈 심의를 이어가면 서버 기본값으로
 # 돌아가, 첫 회차에 멀쩡하던 좌석이 이어하기에서 시간 초과로 빠졌다. 원장에는 상한에서 죈 값이 적혀 있다.
 # wiki(MX 백서 위키에 결정문 남기기)는 save_report 와 같은 까닭으로 이어받는다 — 위키에 남기던 심의의 다음 결정문도 남는다.
+# as_of(기준일)도 이어받는다 — 기준일로 거른 소급 검증을 이어가면서 놓으면 다음 회차의 좌석이 오늘의 지식카드를 받는다.
 _CONT_CARRY = ("sealed", "voc", "free_tools", "persona_knowledge", "evidence_prepass", "search_sources",
-               "apps", "save_report", "timeout_s", "wiki")
+               "apps", "save_report", "timeout_s", "wiki", "as_of")
 _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 advanced 와 같다). 비우면 이전 회차의 손잡이(" + "·".join(_CONT_CARRY)
                     + ")를 이어받고 여기 적은 것이 그 위에 덮인다. sealed 는 풀 수 없다.")
 

@@ -22,7 +22,9 @@ ChatDock (portal frontend)
 - `GET /health` — `{status, delib_active, delib_queued, model, vllm, mcp, tool_scoping, …}`.
   `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
   `start.sh` reads them before it replaces a running instance, and any unattended restart
-  (the portal's update-all) should do the same.
+  (the portal's update-all) should do the same. `delib_as_of: true` says this build takes the deliberation reference
+  date (`delib_opts.as_of`, portal `docs/request-1027` HA-11); the portal refuses a dated web deliberation when the
+  running instance does not say so (an older build drops the key silently and filters nothing).
 - `GET /limits` · `POST /limits` — the deliberation job limits without a restart (portal `docs/delib-ops` R4).
   A box file `<DELIB_JOB_DIR>/state/limits.json` overlays `DELIB_JOB_MAX_RUNNING` · `DELIB_JOB_MAX_RUNNING_PER_USER` ·
   `DELIB_JOB_QUEUE_MAX` and is read at every start and queue decision (a person may edit it by hand too).
