@@ -1677,6 +1677,7 @@ _UUID_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f
 _HUB_IDS_MAX = 20_000        # 한 턴에 적는 id 상한 — 넘으면 새 id 는 모르는 id 가 되어 지나간다(이미 있는 id 에 허브를 더하는 것은 늘 한다)
 _HUB_TAG_DEPTH = 12          # 이름표(key · type · label)를 찾는 JSON 깊이
 _HUB_TAG_CHARS = 80          # 글에 싣는 이름표 한 칸의 길이
+_HUB_POST_TEXT = ("title", "snippet")   # search 가 싣는 게시판 글(posts[])의 사람이 쓴 글 칸 — 여기에만 나온 UUID 는 배우지 않는다(R9 ②)
 _XHUB_SHOW = 3               # 막은 글에 한 줄씩 보이는 id 수 — 나머지는 수만 적는다
 # 막은 글의 표지 — 챗 스트림이 이것으로 막은 호출을 blocked 로 센다(design-integration C-6). 유령 ID 막이의 _PHANTOM_ID_MARK 는 싣지 않는다 —
 # 그것은 심의가 '실행되지 않은 호출' 로 읽는 다른 계약이다.
@@ -1720,15 +1721,30 @@ def _hub_tool(hub: str, base: str) -> str:
     return base if m.get(base) == hub else pre
 
 
-def _hub_id_meta(text: str) -> dict:
-    """허브 결과 글의 이름표 — {uuid: {"key", "type", "label"}}. JSON 으로 읽힐 때만 얻는다(접기 머리 줄은 떼고 읽는다). 두 꼴만 본다 — {id,
-    key|label, type_slug}(resolve · 목록 · 검색 · 그래프 노드)와 {object_id, object_key|object_label, object_type_slug}(object_get 의 관련 객체).
-    처음 본 것을 남긴다. 못 읽으면(상한에서 잘린 글 · JSON 이 아닌 글) 빈 사전이고 id 는 이름표 없이 적힌다. 글에 실을 값이라 공백을 한 칸으로
-    줄이고 '"' 를 "'" 로 바꾸고 _HUB_TAG_CHARS 자로 자른다."""
-    s = text.split("\n", 1)[1] if text.startswith("[포털 챗이 허브 응답을 접었다") and "\n" in text else text
+_JSON_HEAD = json.JSONDecoder()
+
+
+def _json_head(text: str):
+    """허브 결과 글 맨 앞의 JSON 값 하나와 그 뒤의 꼬리 — (값, 꼬리). 못 읽으면 (None, 글). 래퍼는 성공한 결과 뒤에도 '[인자 스키마 — …]' 를
+    붙인다(_maybe_repair_hint — 머리 600자에 인자 검증 낱말이 있으면. search 의 q · 객체 이름표에 그 낱말이 든 성공한 답에도 붙는다). 글 전체를
+    json.loads 로 읽으면 그 꼬리 하나로 이름표(_hub_id_meta)와 글에만 나온 UUID(_hub_post_only_ids)를 둘 다 잃었다(반대 검토 10-31 R9 2차). 상한에서
+    잘린 글은 맨 앞 값도 끝나지 않아 종전처럼 못 읽는다."""
+    s = text.lstrip()
     try:
-        data = json.loads(s)
+        data, end = _JSON_HEAD.raw_decode(s)
     except ValueError:
+        return None, text
+    return data, s[end:]
+
+
+def _hub_id_meta(text: str) -> dict:
+    """허브 결과 글의 이름표 — {uuid: {"key", "type", "label"}}. JSON 으로 읽힐 때만 얻는다(접기 머리 줄은 떼고 · 뒤에 붙은 인자 힌트는 두고 맨 앞
+    값만 읽는다 — _json_head). 두 꼴만 본다 — {id, key|label, type_slug}(resolve · 목록 · 검색 · 그래프 노드)와 {object_id, object_key|object_label,
+    object_type_slug}(object_get 의 관련 객체). 처음 본 것을 남긴다. 못 읽으면(상한에서 잘린 글 · JSON 이 아닌 글) 빈 사전이고 id 는 이름표 없이
+    적힌다. 글에 실을 값이라 공백을 한 칸으로 줄이고 '"' 를 "'" 로 바꾸고 _HUB_TAG_CHARS 자로 자른다."""
+    s = text.split("\n", 1)[1] if text.startswith("[포털 챗이 허브 응답을 접었다") and "\n" in text else text
+    data, _tail = _json_head(s)
+    if data is None:
         return {}
     out: dict = {}
 
@@ -1754,6 +1770,36 @@ def _hub_id_meta(text: str) -> dict:
     return out
 
 
+def _hub_post_only_ids(name, text: str) -> set:
+    """허브 search 결과의 게시판 글(posts[] 의 title · snippet)에만 나온 UUID(HWAXPortal docs/request-1030 design-ha30 R9 — 사용자 결정 10-31
+    갈래 ②). StandardPlatform 0.4.66(418af00)부터 search 는 게시판 글을 posts 로 싣고(SearchPostOut — id · title · author_name · created_at ·
+    comment_count · snippet) snippet 은 본문에서 q 가 든 자리 앞뒤다. 사람이 쓴 글이라 다른 허브 객체의 UUID 를 적을 수 있는데, 그것을 이 허브
+    것으로 배우면 그 id 로 진짜 주인 허브를 부르는 호출이 그 턴 내내 막히고 막은 글의 'key 는 앞 허브의 결과에서 찾는다' 도 거짓이 된다(글에는
+    key 가 없다 — 반대 검토 2차가 메아리 id 에서 닫은 것과 같은 꼴). 글 id(posts[].id)와 글 밖에도 나온 UUID(이름표가 있는 객체 행 등)는 빼지
+    않는다. 이 꼴(이름이 search · <접두>_search 인 도구 · JSON 맨 위의 posts 목록 · 그 항목의 title · snippet 글)이 아니면 빈 집합이다 — 칸 이름이
+    바뀌면 지금 동작으로 돌아갈 뿐이다."""
+    n = str(name or "").strip().lower()
+    if not (n == "search" or n.endswith("_search")):
+        return set()
+    data, tail = _json_head(text)        # 뒤에 붙은 인자 힌트는 두고 맨 앞 값만 읽는다 — 꼬리는 '글 밖' 으로 센다
+    posts = data.get("posts") if isinstance(data, dict) else None
+    if not isinstance(posts, list):
+        return set()
+    inside: set = set()
+    for p in posts:
+        for f in _HUB_POST_TEXT:
+            v = p.get(f) if isinstance(p, dict) else None
+            if isinstance(v, str):
+                inside.update(_uuids(v))
+    if not inside:
+        return inside
+    # 글 밖에도 나온 UUID 는 빼지 않는다 — title · snippet 글만 걷은 사본과 맨 앞 값 뒤의 꼬리에서 다시 찾는다. ensure_ascii 를 끄는 까닭은
+    # \uXXXX 의 끝 자리(16진)가 바로 뒤의 UUID 를 가려서다.
+    rest = {**data, "posts": [{k: v for k, v in p.items() if not (k in _HUB_POST_TEXT and isinstance(v, str))} if isinstance(p, dict) else p
+                              for p in posts]}
+    return inside - set(_uuids(json.dumps(rest, ensure_ascii=False) + "\n" + tail))
+
+
 def _learn_hub_ids(name, text, carried=()) -> None:
     """이번 턴에 허브 도구가 성공으로 돌려준 결과의 UUID 를 '어느 허브에서 본 id 인가' 로 적는다. name 은 경유면 안쪽 이름, text 는 모델이 보는 글
     (접기 · 자르기 · 인자 힌트 뒤 — 모델이 보지 않은 id 는 배우지 않는다). 실패 결과(✖ · 오류 봉투 · 막은 글)에서는 배우지 않는다 — 오류 글은 받은
@@ -1761,7 +1807,8 @@ def _learn_hub_ids(name, text, carried=()) -> None:
     되풀이한다(StandardPlatform object_resolve none 의 hint · search 의 q · objects_resolve_many 의 name · objects_list 0건 진단의 label). 그래서 그
     id 는 허브가 객체 행(id · object_id 에 key 나 label)으로 돌려줄 때만 배운다 — 메아리를 배우면 사람이 친 id · 앞 턴의 id 를 먼저 다른 허브에
     물은 뒤 진짜 주인 허브의 호출이 막히고, 반대로 공유 id 가 되어 OT-07 꼴이 지났다(반대 검토 2차). 놓치는 쪽(fail-open)이 대가다 — 참조 id 조건으로
-    걸러 받은 목록은 그 참조 id 를 가르치지 않는다. ⚠ _learn_ids 처럼 자식(도구 코루틴) 쪽에서 부른다."""
+    걸러 받은 목록은 그 참조 id 를 가르치지 않는다. search 결과의 게시판 글(posts[] 의 title · snippet)에만 나온 UUID 도 같은 까닭으로 배우지 않는다
+    (_hub_post_only_ids — 반대 검토 10-31 R9). ⚠ _learn_ids 처럼 자식(도구 코루틴) 쪽에서 부른다."""
     st = _turn_hub_ids.get()
     if st is None or not isinstance(text, str):
         return
@@ -1772,9 +1819,12 @@ def _learn_hub_ids(name, text, carried=()) -> None:
     if not ids:
         return
     meta = _hub_id_meta(text)
+    post_only = _hub_post_only_ids(name, text)
     for u in ids:
         if u in carried and u not in meta:
             continue                 # 이 호출이 실어 보낸 id 의 메아리 — 그 허브 것으로 배우지 않는다
+        if u in post_only:
+            continue                 # 사람이 쓴 게시판 글에만 적힌 id — 그 허브 것이라는 근거가 없다(다른 허브 객체를 적었을 수 있다)
         e = st.get(u)
         if e is not None:
             e["apps"].add(hub)
