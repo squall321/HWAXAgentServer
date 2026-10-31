@@ -311,6 +311,15 @@ def test_옛_허브면_그_좌석의_카드를_싣지_않고_알린다(monkeypat
     assert all("기준일 거름을 확인하지 못해" in r["step"] for r in rows), [r["step"] for r in rows]
 
 
+def test_감싸지_않은_도구가_와도_사전_검색은_메아리를_다시_본다(monkeypatch):
+    """도구 감싸기(_as_of_guard)를 거치지 않은 agent_search 가 메아리 없이 카드를 주면 — 사전 검색이 따로 다시 보고 싣지 않는다(닫힌 쪽)."""
+    raw = json.dumps({"hits": _hits("mech-a", "힌지", dated=False), "refused": False, "applied_config": {"top_k": 10}},
+                     ensure_ascii=False)
+    events = _stream(monkeypatch, {"as_of": AS_OF}, tools={"agent_search": _Tool("agent_search", answer=raw)})
+    assert not [c for c in _cards(events, included=True) if c["source"].endswith("· 지식카드")], "메아리 없는 카드를 실었다"
+    assert [x for ev, x in events if ev == "warning" and x.get("code") == "as_of_unconfirmed"], "버리고도 말하지 않았다"
+
+
 def test_기준일이_없으면_좌석_검색은_종전대로다(monkeypatch, hubs):
     """특성화 — 구현 전 코드에서 초록이었다."""
     events = _delib(monkeypatch, hubs["new"], {})
