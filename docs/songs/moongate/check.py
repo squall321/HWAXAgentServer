@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+"Moongate" 사전 점검 린터.  실행: python3 check.py   (빌드 후)
+
+빌드가 "돌아간다"와 "곡으로 성립한다"는 다르다. 이번 작업에서 뒤늦게 발견해
+되돌아갔던 항목들을 전부 자동 검사로 고정해 둔다 — 다음 곡에서 다시 발견하지 않기 위해.
+"""
+import collections
+import importlib.util
+import os
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location('mg', os.path.join(HERE, 'build.py'))
+mg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mg)
+
+N = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+nm = lambda p: f'{N[p % 12]}{p // 12 - 1}'
+FAIL, WARN = [], []
+
+
+def check(ok, msg, hard=True):
+    print(('  ✔ ' if ok else ('  ✘ ' if hard else '  ▲ ')) + msg)
+    if not ok:
+        (FAIL if hard else WARN).append(msg)
+
+
+# ── 1. 편성 음역표 ─────────────────────────────────────────────
+# (트랙, 이 곡에서 써도 되는 음역, 악기의 물리적 음역, 근거)
+RANGES = {
+    'Lead Vocal (guide)':        ((62, 76), (55, 79), '여성 메조: D4–E5. E5 는 전조 후 클라이맥스 한 음'),
+    'Vocal Harmony (3rd below)': ((55, 73), (55, 79), '같은 가수가 겹녹음. 상한 C#5 = 킬 포인트 D5 의 3도 아래가 전조로 올라간 값'),
+    'Vocal Harmony (3rd above)': ((62, 78), (55, 79), '리드보다 한 음 위까지. 킬 포인트에서는 규칙상 비어 리드가 혼자 남는다'),
+    'Signature Whistle':         ((62, 86), (62, 86), '★로우 D 휘슬 D4–D6. 일반 틴휘슬은 D5 가 최저음'),
+    'Rhodes':                    ((40, 88), (28, 100), 'MK1'),
+    'Guitar (16th chops)':       ((52, 84), (40, 88), '6현 기타'),
+    'Bass':                      ((28, 60), (28, 67), '★하한 E1(28)=41.2Hz — 기획서 "40Hz 이하 없다"를 지키는 최저선. rev03 에서 A1(55Hz)에서 내렸다: 저역이 전 구간 0%라 기음의 무게가 없었다'),
+    # 캐릭터 레이어는 저역을 담당하지 않는다 — 믹스에서 250Hz 아래를 자르므로
+    # 음역 하한을 베이스와 같이 볼 이유가 없다. 같은 음을 치니 범위는 동일하다.
+    'Bass Character':            ((28, 60), (28, 67), '픽 베이스 배음 레이어 — 250Hz 아래는 믹스에서 제거'),
+    'Celtic Harp':               ((48, 96), (24, 103), ''),
+    'Strings':                   ((55, 96), (55, 103), '소편성'),
+    # 퍼커션을 킷에서 뗀 이유는 믹스에서 고역만 따로 올리기 위해서다(에어 대역이 비어 있었다).
+    # 상한 82 = GM 셰이커. rev06 까지 70(마라카스)을 셰이커로 잘못 쓰고 있었다.
+    'Percussion':                ((42, 82), (35, 82), 'GM 드럼맵 — 하이햇·셰이커'),
+    # 고역 좌우상관이 0.85 라 소스를 갈랐다. 탬버린(54)·라이드(51)를 반대편에 앉힌다.
+    'Percussion Hi':             ((51, 54), (35, 82), 'GM 드럼맵 — 탬버린(54)·라이드(51)'),
+    # 킥을 뗀 이유는 90~120Hz 봉우리를 EQ 로 깎기 위해서다. 킷에 있으면 스네어·탐까지 같이 깎인다.
+    'Kick':                      ((36, 36), (35, 82), 'GM 드럼맵 — 킥(36) 단독'),
+    'Drums':                     ((37, 49), (35, 81), 'GM 드럼맵 — 스네어·림·탐·크래시(킥 제외)'),
+}
+
+
+def parse(path):
+    d = open(path, 'rb').read()
+    assert d[:4] == b'MThd', 'MThd 없음'
+    _, _, ntrk, div = struct.unpack('>IHHH', d[4:14])
+    i, out = 14, []
+
+    def vlq(j):
+        n = 0
+        while True:
+            byte = d[j]; j += 1; n = (n << 7) | (byte & 0x7F)
+            if not byte & 0x80:
+                return n, j
+
+    for _ in range(ntrk):
+        assert d[i:i + 4] == b'MTrk', 'MTrk 없음'
+        ln = struct.unpack('>I', d[i + 4:i + 8])[0]; i += 8; end = i + ln
+        t, name, run, ev, lyr, inst = 0, '', None, [], [], []
+        while i < end:
+            dt, i = vlq(i); t += dt; s = d[i]
+            if s == 0xFF:
+                mt = d[i + 1]; l, j = vlq(i + 2)
+                if mt == 0x03:
+                    name = d[j:j + l].decode('utf8', 'replace')
+                if mt == 0x04:
+                    inst.append(d[j:j + l].decode('utf8', 'replace'))
+                if mt == 0x05:
+                    lyr.append(d[j:j + l].decode('utf8', 'replace'))
+                i = j + l; continue
+            if s < 0x80:
+                s = run
+            else:
+                i += 1; run = s
+            k = s & 0xF0
+            if k in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
+                ev.append((t, k, s & 0xF, d[i], d[i + 1])); i += 2
+            elif k in (0xC0, 0xD0):
+                i += 1
+        assert i == end, '트랙 길이 불일치'
+        out.append((name, ev, t, lyr, inst))
+    return div, out
+
+
+def lead_pitches():
+    ps = [p for data in (mg.VERSE_MEL, mg.PRE_MEL, mg.CHORUS_MEL, mg.BRIDGE_MEL)
+          for *_x, p, _s in [(d[0], d[1], d[2], d[3], d[4]) for d in data]]
+    ps += [p + 2 for *_x, p, _s in [(d[0], d[1], d[2], d[3], d[4]) for d in mg.CHORUS_MEL]]
+    ps += [p for _bt, _d, p in mg.MOTIF if _bt < 12.0] + [p for _bt, _d, p, _s in mg.POST_TAG]
+    return ps
+
+
+def fit_report(lo_in, hi_in):
+    """가수 음역을 주면, 어느 조옮김이 그 안에 들어오는지 표로 보여준다."""
+    def pitch(x):
+        if x.lstrip('-').isdigit():
+            return int(x)
+        acc = 1 if '#' in x else (-1 if 'b' in x else 0)
+        letter = x[0].upper()
+        octv = int(x[-1] if x[-1] != '-' else x[-2:])
+        return 12 * (octv + 1) + N.index(letter) + acc
+
+    lo_s, hi_s = pitch(lo_in), pitch(hi_in)
+    lead = lead_pitches()
+    ch = mg.mel_events(mg.CHORUS_MEL, 17)
+    harm = [p for _b, _d, p in mg.harmonize(ch, below=True)] + \
+           [p + 2 for _b, _d, p in mg.harmonize(ch, below=True)] + \
+           [p for _b, _d, p in mg.harmonize(ch, below=False)] + \
+           [p + 2 for _b, _d, p in mg.harmonize(ch, below=False)]
+    KEYS = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    WHISTLE = (62, 86)                      # 로우 D 휘슬
+    print(f'\n가수 음역 {nm(lo_s)}–{nm(hi_s)} 기준 조옮김 적합도\n')
+    print('| TRANSPOSE | 조 | 리드 | 하모니 전체 | 가수 음역 | 로우휘슬 |')
+    print('|---|---|---|---|---|---|')
+    for t in range(-6, 7):
+        l1, l2 = min(lead) + t, max(lead) + t
+        h1, h2 = min(harm) + t, max(harm) + t
+        v_ok = lo_s <= min(l1, h1) and max(l2, h2) <= hi_s
+        w1, w2 = min(p for _b, _d, p in mg.MOTIF) + t, max(p for _b, _d, p in mg.MOTIF) + t + 2
+        w_ok = WHISTLE[0] <= w1 and w2 <= WHISTLE[1]
+        mark = '★' if t == mg.TRANSPOSE else ' '
+        print(f'| {mark}{t:+d} | {KEYS[(2 + t) % 12]} | {nm(l1)}–{nm(l2)} | {nm(h1)}–{nm(h2)} | '
+              f'{"✔" if v_ok else "✘"} | {"✔" if w_ok else "✘ 옥타브 위로 더블링 필요"} |')
+    print('\n★ = 현재 설정. 두 열이 모두 ✔ 인 줄이 후보다.')
+
+
+if len(sys.argv) > 1 and sys.argv[1] == '--fit':
+    fit_report(sys.argv[2], sys.argv[3])
+    sys.exit(0)
+
+print('\n[1] MIDI 구조 · 미결 노트')
+R = f'_rev{mg.REV:02d}'
+div, tracks = parse(os.path.join(HERE, 'out', f'03_full{R}.mid'))
+played = {}
+for name, ev, _, _l, _i in tracks:
+    hung = collections.Counter(); orphan = 0; ps = []
+    for t, k, ch, a, b2 in ev:
+        if k == 0x90 and b2 > 0:
+            hung[(ch, a)] += 1; ps.append(a)
+        elif k == 0x80 or (k == 0x90 and b2 == 0):
+            if hung[(ch, a)] == 0:
+                orphan += 1
+            else:
+                hung[(ch, a)] -= 1
+    if ps:
+        played[name] = ps
+        check(sum(hung.values()) == 0 and orphan == 0, f'{name}: 노트 온/오프 정합')
+
+print('\n[8] 가사 이벤트 커버리지 — Synthesizer V 임포트용')
+for name, ev, _t, lyr, _i in tracks:
+    if 'Vocal' not in name:
+        continue
+    notes = sum(1 for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0)
+    check(notes == len(lyr) and notes > 0,
+          f'{name}: 노트 {notes}개 / 가사 {len(lyr)}개 — 전 노트에 음절이 붙어 있음')
+
+print('\n[2] 음역 — 편곡 스펙 및 실제 악기 물리 음역')
+for name, ps in played.items():
+    lo, hi = min(ps), max(ps)
+    (slo, shi), (ilo, ihi), why = RANGES[name]
+    slo, shi = slo + mg.TRANSPOSE, shi + mg.TRANSPOSE   # 스펙은 조옮김을 따라간다
+                                                        # (물리 음역은 따라가지 않는다 — 그게 요점)
+    check(slo <= lo and hi <= shi,
+          f'{name}: {nm(lo)}–{nm(hi)} (스펙 {nm(slo)}–{nm(shi)})' + (f' — {why}' if why else ''))
+    check(ilo <= lo and hi <= ihi, f'{name}: 악기 물리 음역 안', hard=True)
+
+print('\n[11] 인스트루멘털 — 보컬이 빠진 자리를 악기가 이어받는가')
+_, itr = parse(os.path.join(HERE, 'out', f'06_instrumental{R}.mid'))
+lead = set()
+for nme, ev, _t, _l, _i in itr:
+    if nme in ('Signature Whistle', 'Celtic Harp'):       # 선율을 쥘 수 있는 파트만
+        lead.update(int(t / div / 4) + 1 for t, k, _c, _a, b2 in ev if k == 0x90 and b2 > 0)
+gaps, cur = [], None
+for bar in range(1, mg.BARS + 1):
+    if bar not in lead:
+        cur = (cur[0], bar) if cur else (bar, bar)
+    elif cur:
+        gaps.append(cur); cur = None
+if cur:
+    gaps.append(cur)
+big = [(a, b2) for a, b2 in gaps if b2 - a + 1 >= 4]
+tot = sum(b2 - a + 1 for a, b2 in gaps)
+check(tot <= 8, f'선율 공백 {tot}마디 ({tot / mg.BARS * 100:.0f}%)')
+check(big == [(61, 64)], f'4마디 이상 구멍은 61~64(낙사비, 로즈 단독)뿐: {big}')
+
+print('\n[10] 의도한 악기 이름(FF 04) 이 파일에 남아 있는가')
+for name, ev, _t, _l, inst in tracks:
+    if not any(k == 0x90 and b2 > 0 for _tt, k, _c, _a, b2 in ev):
+        continue
+    check(len(inst) == 1 and inst[0] == mg.INSTRUMENTS.get(name),
+          f'{name}: {inst[0] if inst else "★없음"}')
+
+print('\n[9] 휴머나이즈 — 악기만 흔들렸고 보컬은 격자 위에 있는가')
+GRID = div // 4                                    # 16분음표
+for name, ev, _t, _l, _i in tracks:
+    ons = [(t, b2) for t, k, ch, a, b2 in ev if k == 0x90 and b2 > 0]
+    if not ons:
+        continue
+    off = sum(1 for t, _v in ons if t % GRID) / len(ons)
+    vels = {v for _t, v in ons}
+    if 'Vocal' in name:
+        check(off == 0, f'{name}: 전 노트가 16분 격자 위 (휴머나이즈 금지 — SynthV 가 처리한다)')
+    elif name in mg.GROOVE:
+        check(off > 0 or len(vels) > 3,
+              f'{name}: 격자 이탈 {off * 100:.0f}% · 벨로시티 {len(vels)}종')
+
+print('\n[12] 아웃트로 페이드 — 73마디부터 실제로 줄어드는가')
+def vel_sum(track_name, bar_lo, bar_hi):
+    for name, ev, _t, _l, _i in tracks:
+        if name != track_name:
+            continue
+        return sum(b2 for t, k, ch, a, b2 in ev
+                   if k == 0x90 and b2 > 0 and bar_lo <= t / div / 4 + 1 < bar_hi)
+    return 0
+for name in ('Rhodes', 'Bass', 'Drums'):
+    a = vel_sum(name, 69, 73)      # 마디당 평균 벨로시티 총합 (69~72)
+    b2 = vel_sum(name, 73, 77)     # (73~76)
+    check(b2 < a, f'{name}: 69~72 합계 {a} -> 73~76 합계 {b2} (감소해야 한다)')
+
+print('\n[3] 섹션 타임코드 · 전체 길이')
+sec_per_bar = 4 * 60 / mg.BPM
+for label, rng in mg.SECTIONS.items():
+    st = (rng[0] - 1) * sec_per_bar
+    print(f'  · {label:9s} {rng[0]:>2}–{rng[-1]:<2}마디  {int(st // 60)}:{int(st % 60):02d}')
+total = mg.BARS * sec_per_bar
+check(150 <= total <= 210, f'전체 {int(total // 60)}:{int(total % 60):02d} — 현대 팝 길이(2:30~3:30) 안')
+
+print('\n[4] 보컬 하모니 — 음정 · 성부 교차')
+ch = mg.mel_events(mg.CHORUS_MEL, 17)
+lo_h = mg.harmonize(ch, below=True)
+hi_h = mg.harmonize(ch, below=False)
+lead = {round(b, 3): p for b, d, p in ch}
+bad = []
+for evs, below in ((lo_h, True), (hi_h, False)):
+    for bt, d, p in evs:
+        iv = (lead[round(bt, 3)] - p) if below else (p - lead[round(bt, 3)])
+        if not 3 <= iv <= 5:
+            bad.append((nm(p), iv, below))
+check(not bad, f'모든 하모니가 단3도~완전4도(3~5반음) 안: {bad or "예외 없음"}')
+pair = collections.defaultdict(dict)
+for bt, d, p in lo_h:
+    pair[round(bt, 3)]['lo'] = p
+for bt, d, p in hi_h:
+    pair[round(bt, 3)]['hi'] = p
+cross = [k for k, v in pair.items() if 'lo' in v and 'hi' in v and v['hi'] - v['lo'] < 3]
+check(not cross, '성부 교차/과밀 없음')
+
+print('\n[5] 하모니 vs 로즈 보이싱 반음 충돌')
+# 리드 멜로디 자신이 이미 만드는 rub 은 화성 언어이지 결함이 아니다 -> 승인 목록으로 고정
+ACCEPTED = {
+    ('Gmaj9', 'G', 'F#'): 'maj7 보이싱 위의 근음 rub — 리드도 같은 관계를 만든다',
+    ('Bm9', 'C#', 'D'):   'm9 고유의 rub. 8분음 2개뿐이고 코러스 밀도 안에서 허용',
+}
+lead_rubs = {(mg.chord_at(bt), N[p % 12], N[v % 12])
+             for bt, d, p in ch for v in mg.CH[mg.chord_at(bt)][0] if abs(p - v) == 1}
+found = {(mg.chord_at(bt), N[p % 12], N[v % 12])
+         for evs in (lo_h, hi_h) for bt, d, p in evs
+         for v in mg.CH[mg.chord_at(bt)][0] if abs(p - v) == 1}
+for key in sorted(found):
+    if key in ACCEPTED:
+        print(f'  ▷ 승인됨 {key[0]} {key[1]}–{key[2]}: {ACCEPTED[key]}')
+    elif key in lead_rubs:
+        print(f'  ▷ 리드도 만드는 rub {key[0]} {key[1]}–{key[2]}')
+check(not (found - set(ACCEPTED) - lead_rubs), '미승인 반음 충돌 없음')
+
+print('\n[6] 가사 음절 그리드 — 1절 대 2절')
+# 당김 음(3.5박)은 뒤따르는 마디의 프레이즈에 속한다 — 그렇게 세야 가사 그리드가 맞는다
+per_bar = collections.Counter(bar + (1 if beat >= 3.5 else 0)
+                              for bar, beat, *_ in mg.VERSE_MEL)
+v2 = mg.VERSE2_WORDS[:]
+ok = True
+for bar in sorted(per_bar):
+    want = per_bar[bar]
+    got, v2 = v2[:want], v2[want:]
+    if len(got) != want:
+        ok = False
+    print(f'  · {bar}마디 음절 {want}개  ←  {" ".join(got)}')
+check(ok and not v2, f'2절이 1절 음절 그리드에 정확히 맞음 (남은 단어: {v2 or "없음"})')
+
+print('\n[7] 보컬 최고음 — 전조를 반영한 실제 상한')
+peak = max(p for _b, _d, p in ch)
+check(peak + 2 <= 76, f'코러스 최고음 {nm(peak)} → 전조 후 {nm(peak + 2)} (상한 E5)')
+
+print('\n[14] 기타-로즈 음역 관계 — 기타가 로즈 위에 뜨되 너무 멀지 않은가')
+# ★rev12 에서 잡은 버그를 못박는다. 기타를 로즈 위로 올린 건 겹침을 피하려던 것인데,
+# rev04 에서 로즈를 한 옥타브 내리면서 기타에는 보정을 넣어 **원래 자리에 못 박아** 뒀다.
+# 로즈가 내려갔으면 기타도 내려와야 했다. 그대로 둔 결과 기타가 F#5/A5 에서 16분음표로
+# 초당 6번씩 울렸고(1056음 중 966음이 C5 이상), 곡 내내 "띠리릭"거리는 소리가 났다.
+# 두 트랙의 중앙값 간격으로 검사한다 — 겹치지도(3반음 미만), 멀지도(15반음 초과) 않아야 한다.
+def _median_pitch(tname):
+    ps = sorted(a for t in tracks if t[0] == tname
+                for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0)
+    return ps[len(ps) // 2] if ps else None
+_rh, _gt = _median_pitch('Rhodes'), _median_pitch('Guitar (16th chops)')
+if _rh is not None and _gt is not None:
+    _d = _gt - _rh
+    check(3 <= _d <= 15,
+          f'로즈 중앙값 {nm(_rh)} → 기타 중앙값 {nm(_gt)} = {_d:+d}반음 (3~15 이어야 한다)')
+    _hi = sum(1 for t in tracks if t[0] == 'Guitar (16th chops)'
+              for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0 and a >= 72)
+    _all = sum(1 for t in tracks if t[0] == 'Guitar (16th chops)'
+               for _t, k, _c, a, b in t[1] if k == 0x90 and b > 0)
+    check(_hi * 100 // max(_all, 1) <= 20,
+          f'기타 C5 이상 비율 {_hi}/{_all} ({_hi*100//max(_all,1)}%) — 20% 이하여야 한다')
+
+print('\n[13] 보컬 레가토 — 프레이즈 안에서 음이 붙어 있는가 (SynthV 임포트용)')
+# rev09 에서 잡은 것 둘을 못박는다.
+#  · 인접음마다 8틱을 벌려 놨다. 사람 귀엔 안 들리지만 SynthV 에겐 "끊어라"는 지시라
+#    음마다 성문 폐쇄가 들어가 프레이즈가 계단처럼 들렸다.
+#  · 반대로 같은 음이 이어지는 자리는 간격이 정확히 0 이었다. 노트 오프와 온이 같은 틱에
+#    겹치면 임포터가 두 음을 한 음으로 합쳐 음절이 통째로 사라질 수 있다.
+for _tname in ('Lead Vocal (guide)', 'Vocal Harmony (3rd below)', 'Vocal Harmony (3rd above)'):
+    _tr = next((t for t in tracks if t[0] == _tname), None)
+    if _tr is None:
+        continue
+    _pend, _notes = {}, []
+    for _t, _k, _c, _a, _b in sorted(_tr[1], key=lambda e: (e[0], 0 if e[1] == 0x80 else 1)):
+        if _k == 0x90 and _b > 0:
+            _rec = [_t, _a, None]; _pend.setdefault(_a, []).append(_rec); _notes.append(_rec)
+        elif _pend.get(_a):
+            _pend[_a].pop(0)[2] = _t
+    _notes.sort()
+    _merge = _step = 0
+    for _x, _y in zip(_notes, _notes[1:]):
+        if _x[2] is None:
+            continue
+        _gap = _y[0] - _x[2]
+        if _gap > 24:                      # 진짜 쉼표(숨자리)는 검사 대상이 아니다
+            continue
+        if _x[1] == _y[1] and _gap <= 0:
+            _merge += 1                    # 같은 음인데 붙어 있다 -> 합쳐질 수 있다
+        elif _x[1] != _y[1] and _gap > 0:
+            _step += 1                     # 다른 음인데 벌어져 있다 -> 계단처럼 들린다
+    check(_merge == 0 and _step == 0,
+          f'{_tname}: 같은음 겹침 {_merge}곳 · 다른음 사이 틈 {_step}곳 (둘 다 0이어야 한다)')
+
+print('\n' + ('✘ 실패 %d건' % len(FAIL) if FAIL else '✔ 전 항목 통과')
+      + (f' / ▲ 경고 {len(WARN)}건' if WARN else ''))
+sys.exit(1 if FAIL else 0)

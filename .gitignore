@@ -6,5 +6,12 @@ __pycache__/
 mcp_servers.json
 artifacts/
 
-# 스템 배포용 zip 은 stems_revNN/ 에서 다시 만들 수 있다
-docs/song/*.zip
+# ── 곡 프로젝트 (docs/songs/<곡>/) ────────────────────────────────
+# out/ 은 빌드 산출물이다. `python3 build.py` 로 다시 생기고, 빌드가 결정적이라
+# 같은 소스에서 바이트 동일한 결과가 나온다. 리비전마다 MP3 를 커밋해 .git 이 127M
+# 까지 불었던 것을 여기서 끊는다.
+docs/songs/*/out/
+# 납품본(release/)은 추적한다 — 다만 MP3 는 용량이 커서 뺀다.
+# 다시 만들려면: apt-get install fluidsynth musescore-general-soundfont-lossless
+#              후 `python3 render_sf.py` (자세한 건 그 곡의 README)
+docs/songs/*/release/*.mp3

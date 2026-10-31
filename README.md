@@ -54,3 +54,13 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 
 Same code; point `VLLM_BASE_URL` at the B300 host running Qwen 72B. dev/prod differ
 by that URL only.
+
+## 곡 프로젝트
+
+`docs/songs/` — 곡마다 디렉토리 하나, 세션도 곡마다 하나.
+목록과 공통 규칙은 `docs/songs/README.md`.
+
+| 곡 | 위치 |
+|---|---|
+| **Moongate** | `docs/songs/moongate/` (이 저장소에서 코드로 생성) |
+| **보고있었니** | `docs/songs/bogoisseonni/` (파일은 사용자 컴퓨터) |

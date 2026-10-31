@@ -1,0 +1,449 @@
+# Moongate
+
+3:00 · 112 BPM · D major → E major(61마디) · 84마디
+보컬은 Synthesizer V (Mai 2, English). 곡 소개는 `ABOUT.md`.
+
+## 디렉토리
+
+```
+build.py                빌드 — 이것만 실행하면 out/ 에 MIDI 가 다 나온다
+check.py                스펙 린터 (14개 항목)
+quality.py              편곡 품질 (자기유사도·섹션 진입·대역 점유)
+interplay.py            보컬-반주 상호작용 (콜앤리스폰스·밀도·필 충돌·마스킹)
+analyze.py              화성·리듬 분석
+audit.py                프로덕션 감사 — 상업 팝 규범 16개 항목과 대조
+render.py               확인용 렌더러 (numpy 만. 가산합성이라 음질은 참고용)
+render_sf.py            듣기용 렌더러 (fluidsynth + 사운드폰트)
+out/                    빌드 산출물 — .gitignore. `python3 build.py` 로 다시 생긴다
+release/                현재 리비전 납품물 — 추적 (MP3 는 용량 때문에 제외)
+```
+
+## ★ 환경 복구 — 컨테이너는 의존성을 잃는다
+
+컨테이너가 재생성되면 **numpy·lameenc·fluidsynth·사운드폰트가 전부 사라진다.**
+빌드(`build.py`)는 표준 라이브러리만 쓰므로 그대로 돌지만, **렌더는 못 한다.**
+
+```bash
+# ① 파이썬 패키지
+#    주의: /usr/local/bin/pip 이 python3.13 을, python3 이 3.11 을 가리키는 경우가 있다.
+#    반드시 `python3 -m pip` 으로 설치할 것.
+python3 -m pip install --break-system-packages numpy lameenc
+
+# ② fluidsynth + 사운드폰트 (489MB)
+apt-get update -qq
+apt-get install -y --no-install-recommends fluidsynth musescore-general-soundfont-lossless
+```
+
+### 선택 — fluidsynth 2.6.0 (apt 는 2.3.4 고정)
+
+`release/` 의 MP3 는 소스 빌드한 **2.6.0** 으로 구운 것이다. 재현하려면:
+
+```bash
+git clone --depth 1 --branch v2.6.0 https://github.com/FluidSynth/fluidsynth /tmp/fs
+git clone --depth 1 https://github.com/kthohr/gcem /tmp/fs/gcem    # 프록시가 cmake 다운로드를 막는다
+apt-get install -y --no-install-recommends cmake libglib2.0-dev libsndfile1-dev build-essential
+cmake -S /tmp/fs -B /tmp/fs/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -Denable-jack=off -Denable-pulseaudio=off -Denable-alsa=off -Denable-sdl2=off \
+      -Denable-oss=off -Denable-readline=off -Denable-dbus=off -Denable-lash=off
+cmake --build /tmp/fs/build -j"$(nproc)" && cmake --install /tmp/fs/build && ldconfig
+```
+
+`render_sf.py` 는 `/usr/local/bin/fluidsynth` 가 있으면 그걸 먼저 쓰고,
+**실행할 때마다 어떤 바이너리·버전으로 구웠는지 찍는다.**
+
+## 실행
+
+```bash
+python3 build.py          # out/ 에 01~06 MIDI + stems_revNN/
+python3 check.py          # 전 항목 통과해야 한다
+python3 render_sf.py      # out/05_instruments_revNN.mp3  (보컬 얹을 반주)
+python3 render_sf.py --inst   # out/06_instrumental_revNN.mp3  (선율까지 악기가 맡는 완성곡)
+python3 audit.py          # 반주판 감사 / --inst 로 완성곡판
+```
+
+리비전을 올릴 때는 `build.py`·`render.py` 의 `REV` 를 같이 올린다.
+무엇을 왜 고쳤는지는 `REVISIONS.md` 에 적는다.
+
+## 문서
+
+| | |
+|---|---|
+| `ABOUT.md` / `ABOUT-en.md` | 곡 소개 (한 줄·스트리밍·한 문단·라이너 노트) |
+| `PLAN.md` | 최초 기획서 |
+| `REVISIONS.md` | rev01~15 의 변경과 **그 근거가 된 측정값** |
+| `VOCAL-MAI2.md` | SynthV Mai 2 — 보컬 모드 배정·발음·레가토 |
+| `DAW-MAC.md` | Logic/GarageBand 반입 — 스템·악기 배정·믹스 출발값 |
+| `INSTRUMENTS.md` | 편성 의도 |
+| `ORIGINALITY.md` | 표절 위험 점검 |
+| `PREFLIGHT.md` | 작업 전 점검표 |
+| `IMPROVEMENT-rev03.md` | rev03 개선안 (이력) |
+
+---
+
+# "Moongate" — 왕도적 작곡 순서 작업 일지 & 악보
+
+기획서: [`../song-plan-moongate.md`](../song-plan-moongate.md)
+빌더: [`moongate_build.py`](moongate_build.py) — `python3 moongate_build.py` 로 MIDI 3종 재생성
+검사: [`check.py`](check.py) — 빌드 후 `python3 check.py`
+렌더: [`render.py`](render.py) — `python3 render.py 05_instruments.mid out.mp3`
+분석: [`analyze.py`](analyze.py) — 킬 포인트·당김/밀기·밀도·공백·베이스 충돌
+사전 점검 프로토콜 · 잔여 작업: [`PREFLIGHT.md`](PREFLIGHT.md)
+보컬(Synthesizer V Mai 2): [`VOCAL-MAI2.md`](VOCAL-MAI2.md)
+악기 지정: [`INSTRUMENTS.md`](INSTRUMENTS.md)
+
+| 파일 | 단계 | 내용 |
+|---|---|---|
+| `01_motif.mid` | STEP 1 | 시그니처 모티프 8마디 (휘슬 + 로즈) |
+| `02_structure.mid` | STEP 2 | 76마디 전체 구조 골격 — 코드·베이스·드럼만, 멜로디 없음 |
+| `03_full.mid` | STEP 3–7 | 전곡 10트랙 |
+| `04_vocals.mid` | 작업용 분리본 | **보컬 3트랙만 → Synthesizer V (Mai 2)**. 전 노트에 가사 포함 |
+| `05_instruments.mid` | 작업용 분리본 | **악기 7트랙만 → DAW**. 보컬판의 반주 |
+| `06_instrumental.mid` | 납품물 | **인스트루멘털** — 보컬 선율을 악기가 이어받는다 |
+
+**03_full.mid 트랙 구성** — 10트랙 (괄호는 GM 프로그램)
+
+1 Lead Vocal 가이드 (54) · 2 **Vocal Harmony 3rd below** (54) · 3 **Vocal Harmony 3rd above** (54) ·
+4 Signature Whistle (73) · 5 Rhodes (4) · 6 Guitar 16th chops (27) · 7 Bass (33) ·
+8 Celtic Harp (46) · 9 Strings (48) · 10 Drums (ch10)
+
+**보컬 스펙(확정)** — 여성 메조소프라노 1인 다중녹음.
+리드 D4–E5 · 아래 하모니 B3–B4 · 위 하모니 G4–E5. 세 성부를 한 사람이 부를 수 있는 음역에
+묶어 두께가 아니라 **밀도**로 들리게 한다. E5는 마지막 코러스 클라이맥스 한 음뿐(믹스보이스).
+
+> DAW에서 열고 각 트랙을 기획서 §5 음색 팔레트대로 교체하면 그대로 편곡 베드가 된다.
+> 휘슬은 틴/로우 휘슬, 로즈는 MK1, 스트링스는 소편성으로.
+
+---
+
+## 왕도 순서대로 실제 결정된 것
+
+### STEP 1 — 모티프 먼저 (외워지지 않으면 나머지는 무의미)
+
+4마디, `G△7 | A7 | F#m7 | Bm7` 위. 이 곡의 전부.
+
+```
+A4(♪) B4(♪) D5(롱톤 2박) | C#5 B4 A4 F#4 | F#4(♩.) → D5(♩. 6도 도약) C#5 B4 | A4 B4(롱톤 3박)
+```
+
+장치는 셋뿐 —
+① 1마디 상행 후 **D5 롱톤 착지**, ② 2마디 **하행 4음(C#–B–A–F#) 한숨**,
+③ 3마디 **F#4→D5 6도 도약**(F#m7 위의 D는 ♭13 → C#로 해결하는 애포지아투라 = JRPG 특유의 애수).
+음역 F#4~D5, 한 옥타브 미만 — 누구나 흥얼거릴 수 있는 상한.
+
+### STEP 2 — 구조를 시간으로 먼저 확정 (가사·멜로디 없이)
+
+76마디 / 112BPM / **2:42**. `02_structure.mid` 로 길이 감각을 먼저 검증했다.
+
+| 마디 | 섹션 | 편성 처리 |
+|---|---|---|
+| 1–4 | Intro | 휘슬 모티프 + 하프, 드럼 없음(셰이커만) |
+| 5–12 | Verse 1 | 브로큰 킥 + 림샷, 기타 16비트 커팅 |
+| 13–16 | Pre 1 | 16비트 하이햇 가속 |
+| 17–24 | **Chorus 1** | 4-on-the-floor 전환 + 크래시 |
+| 25–28 | Post-Chorus 1 | **휘슬 + 보컬 보칼리즈 유니즌** |
+| 29–36 | Verse 2 | V1 편성 + 셰이커 |
+| 37–40 | Pre 2 | |
+| 41–48 | **Chorus 2** | |
+| 49–52 | Post-Chorus 2 | |
+| 53–60 | Bridge | 53–56 로즈+보컬만(드럼 아웃) → 57–60 스트링스 합류·빌드 → 60마디 후반 **G.P. + 필** |
+| 61–68 | **Final Chorus (E)** | 61–64 **낙사비**(로즈+보컬, 베이스·드럼 아웃) → 65–68 풀밴드 |
+| 69–76 | Outro | 휘슬 모티프 ×2 (E), 스트링스, 73마디부터 페이드 |
+
+### STEP 3 — 코러스부터 (팝은 훅 우선)
+
+`G△9 | A7 | F#m9 | Bm9 | G△9 | A7 | D6/9 | A7sus4` (왕도진행 + 귀결·턴어라운드)
+
+멜로디 설계 3원칙:
+- 훅 첫 소절의 **"moon"에 최고음 D5** — 제목이 곡의 정점을 가져가야 각인된다.
+- 7마디 "**mor**—ning"에 **G4→B4 도약 + 2박 롱톤**(마디 넘김) = 애니송식 클라이맥스 롱톤.
+- 마지막 "day"는 **A7sus4 위의 D4** — 해결을 미룬 채 포스트코러스로 넘긴다.
+
+### STEP 4 — 프리코러스와 벌스 (역방향)
+
+- **프리**: `Bm9 | C#m7♭5 F#7♭9 | G△9 | A7sus4 A7`. 2마디 끝 **A#4→B4 "(ooh)"** 애드립이
+  F#7♭9의 3음을 훑고 코러스로 밀어 넣는다. 4마디는 G4→A4→B4 상행으로 압력을 만든다.
+- **벌스**: `Em9 | A13 | F#m9 | B7♭13` 순환. 음역 D4~B4로 좁히고 8분 싱커페이션 —
+  코러스와 대비를 만드는 게 유일한 목적. B7♭13의 **D#4**가 시티팝 특유의 반음 색채.
+
+### STEP 5 — 가사 프로소디 정렬
+
+강세 음절을 강박에 올리는 과정에서 원안 두 곳을 고쳤다.
+
+- 코러스 4행 `of another day` → **`of a new day`** (8마디에 음절이 넘쳐 강세가 밀렸다)
+- 벌스 2절 전면 재작성 — 1절과 **마디당 음절 수를 6/6/7/7/6/7/7/7로 일치**시켰다.
+
+### STEP 6 — 편곡·전조
+
+마지막 코러스에서 **D → E (+2도)**. 코러스 최고음 D5는 전조 후 **E5**가 된다(가이드 MIDI 기준).
+지르지 않는 톤을 유지하려면 믹스보이스 전제 — 부담되면 마지막 코러스의 "moon"만 B4(→전조 C#5)로
+내리면 된다. 나머지 음은 그대로 성립한다.
+
+---
+
+## 최종 가사
+
+```
+[Verse 1]
+Rain on the lantern glass, / the harbor turning gold,
+a fiddle in the market / and a story someone told.
+I've worn a hundred names, / but I keep this one for you —
+the one you called me softly / when the summer was still new.
+
+[Pre-Chorus]
+Every ending is a door / I've walked before (ooh)
+count the feathers on the floor —
+one, two, and we begin
+
+[Chorus]  (1·2절 — 아래로 물러선 채 청함)
+Open the moongate, let the evening in,
+I have fallen a thousand times just to land here again.
+Give me one white feather and a reason to stay,
+and I'll find you in the morning of a new day.
+
+[Post-Chorus]   ← 휘슬과 완전 유니즌
+Oh-oh, oh-oh-oh… moongate, take me home.
+
+[Verse 2]
+Smoke from the kettle rings, / the market closing down;
+we camp beside the water / and the fire keeps the cold out.
+The world can end Sunday / and open up on Monday,
+and I'll still be standing here, / growing older, holding on.
+
+[Bridge]
+If this is the last life, tell me now;
+I'll spend it slower, I'll spend it loud.
+No more waiting for the sky to fall —
+you were the reason I came back at all.
+
+[Final Chorus — E major, 앞 4마디는 로즈+보컬만; 3행이 도착한다]
+Open the moongate, let the evening in,
+I have fallen a thousand times just to land here again.
+This is my last white feather, and I'm here to stay,
+and I'll find you in the mor—ning of a new day.
+```
+
+**3행이 이 곡에서 유일하게 바뀌는 가사.** 1·2절의 "Give me one white feather and a reason
+to stay"(청함)가 마지막에만 "This is my last white feather, and I'm here to stay"(선언)로
+바뀐다. 같은 12음절, 같은 멜로디·리듬 — 가사만 다르다. 브릿지의 "If this is the last life,
+tell me now"가 던진 질문에 대한 답이다. 하모니 3트랙도 같은 가사로 맞춰져 있다.
+
+---
+
+## 멜로디 (음절 = 음 · 박)
+
+**Verse** — 음역 D4~B4. 줄 안(홀수→짝수)에서 당기고, 줄 끝 짝수 마디 뒤에 1박 숨. 5마디는 반박 **밀기**
+
+| 마디 | 코드 | 멜로디 (음절 = 음 · 박) |
+|---|---|---|
+| 1 | Em9 | Rain=E4(0.0) · on=G4(0.5) · the=G4(0.75) · lan=A4(1.0) · tern=G4(1.5) · glass=E4(2.0) · the=E4(3.5) ←당김 |
+| 2 | A13 | har=F#4(0.0) · bor=A4(0.5) · turn=G4(1.0) · ing=F#4(1.25) · gold=E4(1.5) |
+| 3 | F#m9 | a=F#4(0.0) · fid=A4(0.5) · dle=A4(0.75) · in=G4(1.0) · the=A4(1.5) · mar=B4(2.0) · ket=A4(2.5) · and=F#4(3.5) ←당김 |
+| 4 | B7♭13 | a=F#4(0.0) · sto=G4(0.5) · ry=F#4(0.75) · some=D#4(1.0) · one=E4(1.5) · told=F#4(2.0) |
+| 5 | Em9 | I've=E4(0.5) · worn=G4(1.0) · a=G4(1.5) · hun=A4(1.75) · dred=G4(2.0) · names=E4(2.5) · but=E4(3.5) ←당김 |
+| 6 | A13 | I=F#4(0.0) · keep=A4(0.5) · this=G4(1.0) · one=F#4(1.25) · for=E4(1.5) · you=D4(2.0) |
+| 7 | F#m9 | the=F#4(0.0) · one=A4(0.5) · you=A4(1.0) · called=B4(1.25) · me=A4(2.0) · soft=F#4(2.5) · ly=E4(3.0) · when=D#4(3.5) ←당김 |
+| 8 | B7♭13 | the=E4(0.0) · sum=F#4(0.5) · mer=E4(1.0) · was=D#4(1.25) · still=E4(1.5) · new=F#4(2.0) |
+
+**Pre-Chorus** — 3마디 천장을 A4 로 낮춰 코러스가 올라갈 자리를 만든다
+
+| 마디 | 코드 | 멜로디 (음절 = 음 · 박) |
+|---|---|---|
+| 1 | Bm9 | Ev=F#4(0.0) · 'ry=F#4(0.5) · end=G4(1.0) · ing=F#4(1.5) · is=E4(2.0) · a=F#4(2.5) · door=D4(3.0) |
+| 2 | C#m7♭5 → F#7♭9 | I've=E4(0.0) · walked=E4(0.5) · be=G4(1.0) · fore=F#4(1.5) · (ooh=A#4(3.0) · ooh)=B4(3.5) ←당김 |
+| 3 | G△9 | count=G4(0.0) · the=G4(0.5) · fea=A4(1.0) · thers=G4(1.5) · on=A4(2.0) · the=G4(2.5) · floor=F#4(3.0) |
+| 4 | A7sus4 → A7 | one=G4(0.0) · two=A4(1.0) · and=A4(2.0) · we=B4(2.5) · be=A4(3.0) · gin=B4(3.5) ←당김 |
+
+**Chorus** — 음역 D4~D5 (전조 후 E4~E5). ★ = 킬 포인트
+
+| 마디 | 코드 | 멜로디 (음절 = 음 · 박) |
+|---|---|---|
+| 1 | G△9 | O=A4(0.0) · pen=B4(0.5) · the=B4(0.75) · moon=D5(1.0) · gate=B4(2.5) · let=A4(3.5) ←당김 |
+| 2 | A7 | the=B4(0.0) · eve=A4(0.5) · ning=F#4(1.5) · in=E4(2.0) |
+| 3 | F#m9 | I=F#4(0.0) · have=F#4(0.5) · fal=A4(1.0) · len=A4(1.25) · a=A4(1.5) · thou=B4(2.0) · sand=A4(2.5) · times=F#4(3.0) · just=E4(3.5) ←당김 |
+| 4 | Bm9 | to=F#4(0.0) · land=A4(0.5) · here=F#4(1.5) · a=E4(2.0) · gain=D4(2.5) · Give=G4(3.5) ←당김 |
+| 5 | G△9 | me=A4(0.0) · one=B4(0.5) · white=B4(1.0) · fea=A4(2.0) · ther=G4(2.5) |
+| 6 | A7 | and=A4(0.0) · a=B4(0.5) · rea=B4(0.75) · son=A4(1.5) · to=G4(2.0) · stay=F#4(2.5) · and=F#4(3.5) ←당김 |
+| 7 | D6/9 | I'll=A4(0.0) · find=B4(0.5) · you=A4(1.0) · in=F#4(1.5) · the=G4(1.75) · mor=D5(2.0) ★ |
+| 8 | A7sus4 | ning=A4(0.0) · of=F#4(0.5) · a=E4(1.0) · new=F#4(1.5) · day=D4(2.0) |
+
+**Bridge** — 음역 D4~B4. 대비를 위해 전부 제자리 진입으로 남겨 두었다
+
+| 마디 | 코드 | 멜로디 (음절 = 음 · 박) |
+|---|---|---|
+| 1 | Bm9 | If=D4(0.0) · this=F#4(0.5) · is=F#4(1.0) · the=F#4(1.5) · last=A4(2.0) · life=F#4(3.0) |
+| 2 | G△9 | tell=G4(0.0) · me=A4(0.5) · now=B4(1.0) |
+| 3 | D/F# | I'll=F#4(0.0) · spend=A4(0.5) · it=A4(1.0) · slow=B4(1.5) · er=A4(2.5) |
+| 4 | Gm6 | I'll=G4(0.0) · spend=A#4(0.5) · it=A4(1.0) · loud=G4(1.5) |
+| 5 | Em9 | No=E4(0.0) · more=F#4(1.0) · wait=G4(1.5) · ing=F#4(2.0) · for=E4(2.5) · the=F#4(3.0) · sky=G4(3.5) ←당김 |
+| 6 | A7sus4 | to=A4(0.0) · fall=B4(0.5) |
+| 7 | A7 | you=A4(0.0) · were=B4(0.5) · the=A4(1.0) · rea=B4(1.5) · son=A4(2.0) · I=G4(2.5) · came=F#4(3.0) · back=E4(3.5) ←당김 |
+| 8 | A7 → G.P. | at=F#4(0.0) · all=A4(0.5) |
+
+### STEP 9 — 듣기 전 분석과 수정 (`analyze.py`)
+
+`python3 analyze.py` 로 여섯 가지를 재고 전부 고쳤다.
+
+| # | 측정된 문제 | 수정 | 전 → 후 |
+|---|---|---|---|
+| 1 | **킬 포인트가 없다** — 최고음(D5 'moon', 1박·뒷박)과 최장음(B4 'mor', 2박)이 따로 놀았다 | 'mor' 를 B4→**D5** 로. 최고음·최장음·강박·5도 도약·마지막 줄이 한 점에 모인다 | 분산 → **7마디 'mor' D5 2박 강박** |
+| 2 | **당김도 밀기도 0** — 전 프레이즈가 1박 정박 시작 | 줄 안에서 당기고(3.5박), 5마디는 반박 밀기 | 제자리 100% → 제자리·당김·밀기 혼합 |
+| 3 | **16분 사용률 0%** — 전부 8분. 16비트 기타 커팅 위에서 평평했다 | 대화체 음절에 16분 (`fid-dle`, `turn-ing`, `fal-len`, `in the`) | 0% → **7%** |
+| 4 | **숨이 없다** — 벌스 8마디 동안 공백 0곳 | 줄 끝마다 1박 숨 | 벌스 0곳 → **4곳**, 코러스 1곳 → 3곳 |
+| 5 | **그 자리를 아무도 안 채운다** | 2절에만 휘슬 응답(모티프의 하행 조각). 1절은 비워 대비를 만든다 | 1절 무응답(의도) / **2절 3곳 응답** |
+| 6 | **베이스가 보컬과 87% 같은 순간을 친다** | 베이스는 손대지 않았다 — 보컬 리듬이 바뀌자 저절로 풀렸다 | 벌스 87% → **53%**, 코러스 60% → 47% |
+
+부수적으로 **프리코러스가 코러스와 같은 천장(B4)** 을 쓰던 것도 고쳤다. 프리 3마디를 A4 로 낮춰
+코러스의 D5 가 실제로 올라간 것으로 들리게 했다.
+
+### STEP 10 — 인스트루멘털은 "보컬 뮤트"가 아니다
+
+보컬을 빼고 재보니 **76마디 중 41마디(88초, 54%)에 선율이 없었다.** 코러스 두 번이 통째로
+17초씩 비었다. 그대로 구우면 인스트가 아니라 반주 트랙이다.
+
+선율을 넘겨받을 파트를 섹션별로 배정했다. **휘슬에 전부 맡기지 않았다** —
+3분 내내 시그니처가 울리면 라이트모티프가 특별하지 않게 된다.
+
+| 구간 | 이어받는 파트 | 이유 |
+|---|---|---|
+| Verse 1·2 | 켈틱 하프 (옥타브 위) | 로즈 보이싱 위로 올려 겹치지 않게 |
+| Pre | 켈틱 하프 (옥타브 위) | 벌스에서 이어짐 |
+| Chorus 1·2 | **시그니처 휘슬** (제자리) | 훅은 이 악기가 가져가야 한다 |
+| Bridge | 로즈 (옥타브 위) | 하프는 이미 아르페지오 중 |
+| Final 61–64 | **로즈 단독** | 낙사비 — 보컬판의 편성 의도를 그대로 |
+| Final 65–68 | 휘슬 (전조) | 정점 |
+
+결과: 선율 공백 **59% → 5%**. 남은 4마디는 61~64 낙사비로, 로즈가 혼자 가는 게 의도다.
+린터 [11]이 이 조건을 검사한다.
+
+### STEP 13 — 다른 프로젝트의 방법론에서 가져온 것
+
+같은 사용자의 다른 노래("보고있었니", 5막 18분)에서 나온 작곡 방법론 문서를 참고해
+Moongate 에 적용했다. **단, 그 문서의 절대 수치는 가져오지 않았다** — 템포·언어·장르가
+다른 곡에서 나온 값이고, 문서 자신도 "방법이 이식되지 값이 이식되는 게 아니다"라고
+못박고 있다. 방법(측정 축)만 가져와 Moongate 자신의 값으로 다시 쟀다.
+
+**여섯 축 실측** — 음절 길이·같은음 반복·순차진행·도약·밀도폭
+
+| 섹션 | 노트 | 중앙길이 | 같은음 | 순차(2도) | 도약(4도+) | 밀도폭 |
+|---|---|---|---|---|---|---|
+| Verse | 53 | 0.27s | 13% | 63% | 0% | 1.6x |
+| Pre | 26 | 0.27s | 16% | 68% | 0% | 1.2x |
+| Chorus | 48 | 0.27s | 15%→**17%** | 53% | 9% | 2.2x |
+| Bridge | 37 | 0.27s | 8%→**11%** | 64% | 3% | 4.0x |
+
+참조 프로젝트 자신의 싱글은 같은음 23% · 순차 48% · 도약 6% · 밀도폭 4.4배였다. Moongate는
+전 섹션에서 같은음 반복이 낮고 순차진행이 높다 — "III막이 87% 순차진행으로 걷기만 한다"고
+지적받은 것과 같은 방향이다. 다만 그 곡은 느린 발라드, Moongate 는 112BPM 네오디스코라
+**같은 목표 수치를 그대로 쫓지 않았다** — 장르가 다르면 리듬의 그루브가 "생동감"을 대신 맡을
+수 있다. 그래서 극단으로 밀지 않고(Ch13 "극단에서 극단으로" 경고), 반복이 가장 낮았던
+**코러스·브릿지에만 최소한으로 심었다**:
+
+- 코러스 2마디 "eve-**ning**": F#4(A7의 경과음) → A4('eve'와 같은음, A7의 근음) — 화성도 개선
+- 브릿지 5마디 "for **the**": F#4 → E4('for'와 같은음, Em9의 근음)
+
+**후크를 심고·도착시킨다** (뒤집는 대신 — 이 곡 분량에선 그걸로 충분했다)
+
+마지막 코러스 3행만 가사를 바꿨다. 같은 12음절, 같은 멜로디·리듬:
+
+```
+1·2절   Give me one white feather and a reason to stay     ← 청함
+마지막  This is my last white feather, and I'm here to stay ← 선언
+```
+
+브릿지의 "If this is the last life, tell me now"가 던진 질문에 이 한 줄이 답한다. 하모니
+3트랙도 같은 텍스트로 맞췄다(`FINAL_LINE3_OVERRIDE`, 절대 박자 기준 사전 조회).
+
+**Mai2 발음 가이드를 정량화했다** — `VOCAL-MAI2.md` 의 "손봐야 할 자리" 목록이 정성적
+나열이었던 것을, 전체 164음절 중 16분 이하 13%·위험 어형 108개 중 11%로 **분모와 함께**
+다시 적고, IPA + 수동 편집 지침표로 확장했다.
+
+**재현성 검증** — 빌드를 두 번 돌려 `03/04/05.mid` 가 바이트 단위로 동일한지 확인했다
+(SEED 고정 덕분에 통과). `render.py` 에 `lameenc` 없을 때 WAV 로 대체하는 폴백을 추가했다
+— 이 환경에서 `pip install` 한 인코더는 다른 기기엔 없다.
+
+### STEP 12 — 렌더 (`render.py`) — 사운드폰트 없이 numpy 오실레이터로
+
+DAW·사운드폰트가 없는 환경이라 트랙별로 가산합성 음색을 직접 짰다(Rhodes: 사인+벨 배음+트레몰로,
+기타: 배음 스택+피크 노이즈, 베이스: 사인+2·3배음, 하프: 감쇠 배음 스택, 스트링스: 톱니 배음+디튠 2겹,
+휘슬: **CC1/CC11 을 실제로 읽어** 비브라토·숨을 만든다, 드럼: 노이즈+사인 조합). 실시간 필터 없이
+차분·이동평균·전곡 1회 FFT 컨볼루션 리버브만으로 numpy 벡터 연산을 유지했다 — 3천 개 넘는 노트를
+33초에 렌더한다.
+
+**정직하게 밝혀둘 것** — 이건 `INSTRUMENTS.md` 에 적은 실제 악기(Rhodes MK1, VSL 로우 D 휘슬 등)의
+질감을 흉내낸 프로그램 합성이지 대체재가 아니다. 편곡 밸런스·다이내믹을 미리 듣기 위한 작업용
+렌더이지 발매용 오디오가 아니다.
+
+**렌더가 실제로 결함 하나를 찾아냈다.** 섹션별 RMS 리포트를 넣고 봤더니 **outro 가 곡 전체에서
+가장 시끄러운 섹션**이었다(-16.3dBFS, 코러스보다 큼). README 에는 "73마디부터 페이드"라고
+적어 놓고 `moongate_build.py` 에는 그 구현이 없었다 — 드럼·베이스·로즈가 76마디까지 풀파워로
+갔다. 문서만 있고 코드가 없던 경우다.
+
+`OUTRO_FADE = {73: 0.78, 74: 0.58, 75: 0.40, 76: 0.22}` 로 로즈·베이스 벨로시티를 줄이고,
+드럼은 73~74마디에 킥+셰이커만 남기고 75~76마디는 **인트로와 대칭을 이루는 셰이커만**
+남도록 얇게 했다. 76마디는 베이스도 완전히 빼서 로즈·휘슬·스트링스만 마지막 화음을 받친다.
+
+| | 이전 | 이후 |
+|---|---|---|
+| outro RMS | -16.3dBFS (전곡 중 최대) | -15.7dBFS |
+| 73→76마디 곡선 | 평탄 (-9.2 → -9.3dB, 페이드 없음) | **단조 감소** (-16.5 → -17.4 → -18.5 → -22.5dB) |
+
+린터 [12]가 이 조건(73~76마디 벨로시티 합계가 69~72보다 작아야 한다)을 고정한다.
+
+### STEP 11 — 화성 점검: 진행은 맞았고, 성부가 틀렸다
+
+**멀쩡했던 것 (고치지 않았다)**
+
+- **화성 리듬** — 대부분 1마디 1코드. 네오디스코·시티팝의 관행이다. 프리코러스만 2박으로 가속하고,
+  브릿지 60마디에서 2박 뒤 G.P. 로 끊는다. 균일함이 장르 특성이지 결함이 아니다.
+- **섹션 진입 화음** — 코러스가 **IV(G△9)** 로 들어가고(왕도), 벌스는 **ii(Em9)**,
+  프리·브릿지는 **vi(Bm9)**. 어느 것도 으뜸화음으로 시작하지 않아 계속 떠 있다.
+- **으뜸화음의 위치** — 76마디 중 **5마디뿐**(23·47·67·75·76). 그런데 23·47·67 은 각 코러스의
+  **7마디, 정확히 킬 포인트 자리**다. 곡 전체가 피한 해결이 정점에서 한 번씩만 온다.
+  킬 포인트가 선율뿐 아니라 **화성으로도 받쳐진다.**
+
+**실제 결함이었던 것 — 성부 진행**
+
+보이싱이 코드 이름으로 찾는 룩업 테이블이라 **앞 코드를 보지 않았다.** 재보니 평균 8.9반음,
+그리고 이 곡에서 가장 자주 쓰는 **G△9 → A7 이 매번 17반음씩 통째로 점프**하고 있었다.
+
+전 화음을 '앞 코드에서 가장 적게 움직이는 자리'로 다시 잡았다.
+
+| | 이전 | 이후 |
+|---|---|---|
+| 평균 이동 | 8.9반음/코드 | **3.8반음** |
+| 최대 점프 | 25반음 (61마디 전조점) | **7반음** |
+| G△9 → A7 | 17반음 | **7반음** |
+| 전조점 A7 → A△9 | 25반음 | **1반음** (G→G# 한 성부만) |
+
+전조가 특히 달라졌다. `A7 = G B C# E` 에서 **G 하나만 G# 로 올리면 `A△9`** 가 된다.
+D 조의 V 가 E 조의 IV 로 반음 하나에 갈아타는 피벗이다.
+
+부수 효과로 로즈 최저성부가 **C#4(277Hz) → F#4(370Hz)** 로 올라가 200–400Hz 가 덜 뭉친다(기획서 §7).
+
+다만 새 A7 보이싱이 C#5 를 품게 되면서 6마디 상단 하모니의 D5 서스펜션이 보이싱과 반음이 됐고,
+`harmonize()` 규칙이 그걸 걸러 구멍이 생겼다. 상한을 E5 까지 열어 **4도(E5)로 비켜 가게** 했다.
+킬 포인트의 3도 위(F#5)는 여전히 상한 밖이라 **정점에서는 리드가 혼자 남는다.**
+
+## 모티프의 5회 등장 (라이트모티프 운용)
+
+| 마디 | 편성 | 처리 |
+|---|---|---|
+| 1–4 | 휘슬 + 하프 | 원형 제시 |
+| 25–28 / 49–52 | 휘슬 + **보컬 보칼리즈 유니즌** | 훅 각인 |
+| 56 | 하프 | Gm6 위 하행 한숨을 **단조로**: D5–A#4–A4–G4 |
+| 60 | 휘슬 | 머리 2음(B4–C#5)만 남겨 전조된 마지막 코러스로 밀어 넣음 |
+| 69–76 | 휘슬 + 스트링스 | E major 로 2회 반복 후 페이드 |
+
+## 맥북 DAW 로 굽기
+
+`DAW-MAC.md` — Logic Pro / GarageBand 로 가져가는 방법. 트랙당 MIDI 스템(`stems_revNN/`),
+악기 배정표, GM 드럼맵 주의사항, 믹스 출발값. **GM 사운드폰트보다 이쪽이 낫다.**
+
+## 표절 위험 점검
+
+`ORIGINALITY.md` — 화성(왕도진행은 의도한 관습), 선율 음형, 가사 문구 정확 일치 검색 결과.
+주의할 줄 하나(브릿지 "waiting for the sky to fall")와 **확인하지 못한 것**을 함께 적었다.
+
+## 곡 소개
+
+`ABOUT.md` (국문) · `ABOUT-en.md` (영문) — 한 줄 / 짧게 / 보통 / 라이너 노트, 사양표, 태그.
