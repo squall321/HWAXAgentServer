@@ -3478,6 +3478,17 @@ def envelope_failed(s) -> bool:
     return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
 
+# 챗 도구 결과의 앱 머리(app._chat_result_note — '[이 결과는 ○○ 앱의 도구 이다]'). 포털 '심의로 넘기기' 가 넘기는 근거(delib_opts.evidence)는
+# 챗이 모델에 준 결과 그대로라 이 머리를 달고 공백이 한 칸으로 접혀(app._handoff_text) 온다. 봉투 뒤에는 되풀이 꼬리
+# ('[이 턴에 … 번째 불렀다 …]')가 붙을 수 있다.
+_CHAT_HEAD_RE = re.compile(r"\[이 결과는 [^\]\n]* 앱의 [^\]\s]+ 이다\]\s*")
+# 3상태 봉투의 앞머리 — 맨 위 ok 다음에 data 가, data 안에서는 status 다음에 results 가 온다(WebResearchMCP app/errors.py 의 envelope ·
+# search_data 차례). 챗 활동의 220자 미리보기(포털은 날것 result_full 을 저장 예산에서 떨어뜨리면 이것을 넘긴다 — chatStore
+# keepHandoffBudget)처럼 잘린 글에서도 상태와 빈 결과가 보이는 자리다.
+_WEB_NOEV_HEAD_RE = re.compile(r'\{\s*"ok"\s*:\s*true\s*,\s*"data"\s*:\s*\{\s*"status"\s*:\s*"(?:blocked|empty|degraded)"\s*,'
+                               r'\s*"results"\s*:\s*\[\s*\]', re.IGNORECASE)
+
+
 def _envelope_no_evidence(s) -> bool:
     """웹 리서치 3상태 봉투가 '근거 없음' 을 말하는가 — data.status 가 blocked · empty, 또는 degraded 인데 results 가 0건.
 
@@ -3487,13 +3498,20 @@ def _envelope_no_evidence(s) -> bool:
     '차단은 없음이 아니다' 는 경고째 간다). 다만 **근거로 세면 안 된다** — 세면 근거 프로파일의 '도구 조회' 가 올라 실측
     데이터 0건인 심의가 '가설 단계' 표지 없이 측정에 기댄 꼴로 나간다(HWAXPortal docs/web-research P6). 세는 자리(지정 도구 ·
     챗이 넘긴 근거 · 좌석 자유 조회)가 이 판정으로 거른다.
-    results 가 목록이 아니면 3상태 봉투가 아니다 — 다른 앱의 data.status 는 판정하지 않는다(모르는 꼴은 종전대로 센다)."""
+    results 가 목록이 아니면 3상태 봉투가 아니다 — 다른 앱의 data.status 는 판정하지 않는다(모르는 꼴은 종전대로 센다).
+
+    챗이 넘긴 근거는 앱 머리(_CHAT_HEAD_RE)를 단 채 온다 — 머리 바로 뒤의 봉투를 읽고(raw_decode — 봉투 뒤의 되풀이 꼬리는 읽지 않는다),
+    잘려서 끝까지 못 읽으면 앞머리(_WEB_NOEV_HEAD_RE)로 본다. 종전엔 글 전체를 JSON 으로만 읽어 머리 단 챗 결과는 늘 근거로 셌다 —
+    챗에서 차단된 검색을 '심의로 넘기기' 한 심의에 가설 단계 표지가 빠졌다(반대 검토 10-31). 머리 없는 글은 종전대로 통째로 JSON 일
+    때만 판정한다 — 머리는 그 글이 도구 결과 하나라는 표지라, 다른 글과 섞인 봉투는 판정하지 않는다."""
     if not isinstance(s, str) or not s.strip():
         return False
+    t = s.strip()
+    head = _CHAT_HEAD_RE.match(t)
     try:
-        v = json.loads(s)
+        v = json.JSONDecoder().raw_decode(t, head.end())[0] if head else json.loads(t)
     except (ValueError, TypeError):
-        return False
+        return bool(head and _WEB_NOEV_HEAD_RE.match(t, head.end()))
     data = v.get("data") if isinstance(v, dict) else None
     if not isinstance(data, dict) or not isinstance(data.get("results"), list):
         return False
@@ -5712,7 +5730,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _cut_lines.append(f"[e:{_ei}{'|' + _e['key'] if _e.get('key') else ''}] {_src}: "
                                   f"원문 {_cut_len:,}자 · {_cut_what}")
             yield _delib("evidence", source=f"챗 정리 · {_src}", text=_shown, included=True)
-            if not _envelope_no_evidence(_res):      # 웹 리서치의 차단 · 빈 결과는 좌석에 싣되 근거로 세지 않는다
+            # 웹 리서치의 차단 · 빈 결과는 좌석에 싣되 근거로 세지 않는다(챗이 넘긴 것은 앱 머리째 온다 — _CHAT_HEAD_RE).
+            if not _envelope_no_evidence(_res):
                 ev_count["tool"] += 1
         # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
         if _dropped:
