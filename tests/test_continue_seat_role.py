@@ -528,7 +528,7 @@ def test_끊긴_잡을_이으면_재심사_손잡이가_기본값이어도_앉�
 # 이 단들은 이어하기의 좌석 길(continue_personas)로 고정 좌석을 앉히고 사람 의견 칸에 엔진 지시문(+ 현황 조회)을 싣는다 — 그래서
 # 첫 실행에서도 재심사가 돈다. 그 지시문은 사람이 옮긴 방향이 아니라 검색 축의 재료가 아니다. 호출자가 쓴 의견이 없으면 그 단의
 # 재심사는 B17 전 그대로 한 덩이 질의(질문 + 이전 결론 + 그 단의 의견 칸)로 좌석을 더 찾고(시험 계획의 재료 계열 · 현상 도메인),
-# 호출자가 쓴 의견이 있으면(시험 계획) 그 의견에서만 축을 짓는다.
+# 이어하기에 호출자가 쓴 의견이 있으면(시험 계획) 그 의견에서만 축을 짓는다. 첫 실행은 의견이 있어도 한 덩이다(사용자 결정 10-31).
 _TP_INSTR = "이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마라"     # run_test_plan 의 엔진 지시문 머리
 _SNAP = "가짜 조회 결과 7Q"                                              # 물성 · 자산 현황 조회의 표식
 _STAGE_RANKED = ["xd-milestone-a", "xd-checklist-b", "mat-polymer-c", "disp-encap-d", "rel-life-e", "cam-x", "pcb-y"]
@@ -596,11 +596,35 @@ def test_시험_계획_첫_실행의_재심사는_엔진_지시문으로_축을_
         f"고정 좌석의 계열(rel · xd) 밖에서 재료 계열 · 현상 도메인 좌석을 찾지 못했다: {r.seats}")
 
 
-def test_시험_계획에_호출자가_쓴_의견은_그_의견에서만_재심사_축을_짓는다(monkeypatch):
-    """호출자 의견은 엔진 지시문 뒤에 이어 붙어 좌석에 간다(run_test_plan) — 재심사 축은 그 의견에서만 짓는다(지시문 · 현황 조회는
-    사람이 쓴 것이 아니다)."""
+def test_시험_계획_첫_실행은_호출자_의견이_있어도_축을_짓지_않고_그_의견을_실은_한_덩이로_찾는다(monkeypatch):
+    """축 재심사는 이어하기(이전 결론이 있다)에만 쓴다(사용자 결정 10-31) — 첫 실행은 호출자 의견이 있어도 B17 전 그대로 '질문 +
+    이전 결론 + 의견 칸' 한 덩이로 좌석을 더 찾고, 호출자 의견은 그 덩이(엔진 지시문 뒤)에 실린다."""
     note = "현장 반품의 흡습 열화를 추적하라"
     r = _stage_seats(monkeypatch, d.run_test_plan, {"human_note": note})
+    assert r.axis_prompts == [], "첫 실행에서 호출자 의견으로 검색 축을 지었다"
+    assert len(r.calls) == 1 and "top_k" not in r.calls[0], f"종전 한 덩이 질의(도구 기본 5명)가 아니다: {r.calls}"
+    assert r.calls[0]["q"].startswith("아래 목적을 위한 시험 계획") and note in r.calls[0]["q"], r.calls[0]["q"][:300]
+    assert r.seats == [(k, "primary") for k in d._TEST_FIXED] + [("mat-polymer-c", "new"), ("disp-encap-d", "new")], (
+        f"첫 실행 좌석 구성이 B17 전과 다르다: {r.seats}")
+
+
+def test_일반_심의_첫_실행의_지정_좌석과_사람_의견도_축을_짓지_않고_종전_한_덩이로_더_찾는다(monkeypatch):
+    """지정 좌석은 이어하기의 좌석 길(continue_personas)로 앉아 첫 실행에서도 재심사가 돈다 — 이전 결론이 없으면 B17 전 그대로다
+    (사용자 결정 10-31 — 첫 실행 좌석 구성은 그대로)."""
+    note = "산화 쪽 원인도 따져 보라"
+    seats = [{"key": "mech-hinge-a", "role": ""}, {"key": "disp-crack-b", "role": ""}]
+    r = _stage_seats(monkeypatch, d.run_deliberation, {"personas": seats, "human_note": note})
+    assert r.axis_prompts == [], "첫 실행에서 사람 의견으로 검색 축을 지었다"
+    assert len(r.calls) == 1 and "top_k" not in r.calls[0] and note in r.calls[0]["q"], r.calls
+    assert [k for k, o in r.seats if o == "new"] == ["xd-milestone-a", "xd-checklist-b"], (
+        f"앉은 계열(mech · disp)만 첫 마디로 막고 앞 둘을 더하던 B17 전과 다르다: {r.seats}")
+
+
+def test_시험_계획_이어하기에_호출자가_쓴_의견은_그_의견에서만_재심사_축을_짓는다(monkeypatch):
+    """호출자 의견은 엔진 지시문 뒤에 이어 붙어 좌석에 간다(run_test_plan) — 이어하기의 재심사 축은 그 의견에서만 짓는다(지시문 ·
+    현황 조회는 사람이 쓴 것이 아니다)."""
+    note = "현장 반품의 흡습 열화를 추적하라"
+    r = _stage_seats(monkeypatch, d.run_test_plan, {"human_note": note, "continue_summary": "이전 시험 계획 결론(가짜)"})
     assert len(r.axis_prompts) == 1 and note in r.axis_prompts[0], r.axis_prompts
     assert _TP_INSTR not in r.axis_prompts[0] and _SNAP not in r.axis_prompts[0], (
         "엔진 지시문 · 현황 조회를 사람 의견으로 읽어 검색 축을 지었다")

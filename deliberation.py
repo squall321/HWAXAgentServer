@@ -4869,7 +4869,8 @@ async def _rescreen_seats(tools: dict, llm, question: str, note: str, seated: li
 
 
 async def _rescreen_blob(tools: dict, question: str, summary: str, note: str, seated: list) -> list:
-    """엔진이 사람 의견 칸을 지시문으로 지은 단(시험 계획 · 시뮬 2단 · 구축 3단)에 호출자가 쓴 의견이 없을 때의 재심사 — B17 전 그대로
+    """첫 실행(이전 결론이 없다 — 지정 좌석 · 시험 계획의 고정 좌석)의 재심사, 그리고 엔진이 사람 의견 칸을 지시문으로 지은 단(시험
+    계획 · 시뮬 2단 · 구축 3단)에 호출자가 쓴 의견이 없을 때의 재심사 — B17 전 그대로
     '질문 + 이전 결론 + 그 단의 의견 칸' 한 덩이를 도구 기본 5명으로 묻고, 앉은 계열은 첫 마디 접두로 막는다.
     그 단의 의견 칸은 사람이 옮긴 방향이 아니라 검색 축의 재료가 아니고, 이 재심사는 질문으로 좌석을 더 찾는 몫이다(시험 계획의 재료
     계열 · 현상 도메인 — run_test_plan). 축으로 바꾸면 질문으로는 묻지 않고, 넓은 접두(xd)의 고정 좌석이 그 계열을 막지 않는다."""
@@ -5384,9 +5385,9 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
         yield _sse("done", {}); return
     opts.chair_template = "test-plan"
-    # 고정 좌석을 앞에 세우고, 호출자가 지정한 좌석을 그 뒤에 앉힌다. 나머지는 좌석 재심사가 찾는다 — 호출자 의견이
-    # 없으면 질문으로(재료 계열·현상 도메인 — _rescreen_blob), 있으면 그 의견의 검색 축으로(rescreen_note — 엔진
-    # 지시문 · 물성 현황으로는 축을 짓지 않는다). 사람 의견도 엔진 지시문 뒤에 **이어 붙인다.**
+    # 고정 좌석을 앞에 세우고, 호출자가 지정한 좌석을 그 뒤에 앉힌다. 나머지는 좌석 재심사가 찾는다 — 첫 실행이거나 호출자
+    # 의견이 없으면 질문으로(재료 계열·현상 도메인 — _rescreen_blob, 의견은 그 덩이에 실린다), 이어하기에 호출자 의견이 있으면
+    # 그 의견의 검색 축으로(rescreen_note — 엔진 지시문 · 물성 현황으로는 축을 짓지 않는다). 사람 의견도 엔진 지시문 뒤에 **이어 붙인다.**
     # ⚠ 종전엔 둘 다 덮어썼다 — 호출자의 좌석은 앉지 않았고 의견은 어느 좌석 프롬프트에도 없었는데 카드도
     #   경고도 없었다. 이어하기는 그 의견이 부르는 까닭 전부다. 정본 파이프라인(hwax-test-plan.js)은 처음부터
     #   이 순서로 둘 다 싣는다(FIXED_SEATS 뒤에 personas · BASE_NOTE 뒤에 humanNote).
@@ -5943,9 +5944,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 대한 책임 주체가 사라지기 때문. DELIB_RESCREEN=0 으로 종전 동작(재심사 없음) 복귀.
         # 사람 의견 칸을 엔진 지시문으로 지은 단(시험 계획 · 시뮬 2단 · 구축 3단 — rescreen_note 를 따로 적는다)은 호출자가 쓴 의견에서만
         # 축을 짓는다. 그런 의견이 없으면 그 단의 재심사는 B17 전 그대로 한 덩이 질의다(_rescreen_blob — 질문으로 좌석을 더 찾는 몫).
+        # 축 재심사는 이어하기(이전 결론이 있다)에만 쓴다 — 첫 실행(지정 좌석 · 시험 계획의 고정 좌석)은 의견이 있어도 B17 전 그대로
+        # 한 덩이 질의고, 의견은 그 덩이 안에 실린다(사용자 결정 10-31 — 요청 범위인 이어하기만 바꾸고 첫 실행 좌석 구성은 그대로).
         if opts.rescreen and (opts.continue_summary or opts.human_note):
             _own = str((opts.human_note if opts.rescreen_note is None else opts.rescreen_note) or "").strip()
-            if opts.rescreen_note is not None and not _own:
+            if not opts.continue_summary or (opts.rescreen_note is not None and not _own):
                 added = await _rescreen_blob(tools, question, opts.continue_summary, opts.human_note, personas)
                 personas.extend(added)
                 if added:
