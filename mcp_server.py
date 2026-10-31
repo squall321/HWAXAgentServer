@@ -76,13 +76,22 @@ def bind(app) -> None:
     except Exception:  # noqa: BLE001
         log.exception("잡 원장 정리 실패 — 계속")
     delib_jobs.start_ticker()       # 줄을 주기로 다시 본다 — 멈춤이 풀리거나 한도 덮개를 손으로 고친 것을 따라간다
+    # 종료 신호를 받는 그 자리에서 줄을 닫는다 — uvicorn 은 열린 연결을 AGENT_GRACEFUL_S 까지 기다린 뒤에야 lifespan 종료(unbind)를 돌아, 그 사이
+    # 자리가 나면 내려가는 프로세스가 줄 선 잡을 띄웠다(HA-09 S0 반대 검토 10-31 — R2 의 '같은 차례로 다시 선다' 가 깨졌다)
+    delib_jobs.hook_exit_signals()
 
 
-def unbind() -> None:
-    """서버가 내려간다 — 이제부터 자리가 나도 줄 선 심의를 띄우지 않는다(delib_jobs.closing). 내려가며 접히는 도는 잡은 interrupted 로
-    남는다(사람이 접은 것과 가른다 — 이어하기)."""
+async def unbind() -> None:
+    """서버가 내려간다 — 이제부터 자리가 나도 줄 선 심의를 띄우지 않는다(delib_jobs.closing). 도는 잡은 취소하고 잠깐(delib_jobs.SHUTDOWN_WAIT_S)
+    기다린다 — 접히는 잡은 interrupted 로 남아(사람이 접은 것과 가른다 — 이어하기) 그 자리에서 원장에 진행을 쓴다(HWAXPortal
+    docs/request-1027/design-ha09-ha20.md HA-09 S0). 종전엔 닫기만 해 잡의 finally 가 돌 틈이 없었다 — uvicorn 은 정상 종료 뒤 받은 신호를
+    다시 올려 프로세스가 그 자리에서 끝난다."""
     delib_jobs.closing(True)
     delib_jobs.stop_ticker()
+    try:
+        await delib_jobs.shutdown()
+    except Exception:  # noqa: BLE001 — 내려가는 길을 막지 않는다(못 쓴 진행은 진행 일지로 다음 기동이 접는다)
+        log.exception("도는 심의 잡을 접지 못했다 — 그대로 내려간다")
 
 
 def _need_app():

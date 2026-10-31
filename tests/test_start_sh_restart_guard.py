@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,8 +28,10 @@ import delib_jobs  # noqa: E402
 
 _STUBS = {
     # 시험이 띄운 프로세스가 살아 있는 동안만 그 pid 가 시험 포트를 잡고 있다고 답한다.
+    # closed 가 있으면 리스너만 닫고 살아 있는 꼴이다(uvicorn 은 TERM 을 받자마자 리스너를 닫고 열린 연결을 기다린다 — 아래 _LINGER).
     "ss": '''#!/usr/bin/env bash
 pid="$(cat "$STUB_DIR/pid" 2>/dev/null || true)"
+[ -f "$STUB_DIR/closed" ] && exit 0
 if [ -n "$pid" ] && [ -d "/proc/$pid" ] && ! grep -q '^State:.*Z' "/proc/$pid/status" 2>/dev/null; then
   echo "LISTEN 0 128 127.0.0.1:${STUB_PORT} 0.0.0.0:* users:((\\"uvicorn\\",pid=${pid},fd=3))"
 fi
@@ -58,7 +61,12 @@ exit "${STUB_SLEEP_RC:-0}"
 _VENV = {
     "pip": "#!/usr/bin/env bash\nexit 0\n",
     "uvicorn": ("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$STUB_DIR/uvicorn.args\"\n"
-                "printf '%s\\n' \"${LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S:-없음}\" > \"$STUB_DIR/chunk\"\nexit 0\n"),
+                "printf '%s\\n' \"${LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S:-없음}\" > \"$STUB_DIR/chunk\"\n"
+                # 뜰 때 옛 서버가 살아 있었나 — 좀비(시험이 아직 거두지 않았다)는 끝난 것이다
+                "old=\"$(cat \"$STUB_DIR/pid\" 2>/dev/null || true)\"\n"
+                "st=\"$(ps -o stat= -p \"$old\" 2>/dev/null || true)\"\n"
+                "case \"${st// /}\" in ''|Z*) echo gone ;; *) echo alive ;; esac > \"$STUB_DIR/old_at_start\"\n"
+                "exit 0\n"),
 }
 
 
@@ -92,6 +100,21 @@ class _Box:
     def health(self, body):
         (self.stub / "health").write_text(body, encoding="utf-8")
 
+    def linger(self, drain_s: float):
+        """'떠 있는 서버' 를 uvicorn 꼴로 바꾼다 — TERM 을 받으면 리스너만 닫고(closed) 열린 연결을 drain_s 초 기다린 뒤 스스로 끝난다(크면
+        TERM 을 못 듣는 서버다). 파이썬 한 프로세스라 kill -9 를 맞아도 남는 자식이 없다."""
+        self.close()
+        self.old = subprocess.Popen([sys.executable, "-c", _LINGER, str(drain_s)], env={**self.env})
+        (self.stub / "pid").write_text(str(self.old.pid), encoding="utf-8")
+        t0 = time.monotonic()
+        while not (self.stub / "ready").exists():       # 처리기를 건 뒤에 TERM 을 보내야 한다
+            assert time.monotonic() - t0 < 10 and self.old.poll() is None, "시험용 옛 서버가 뜨지 않았다"
+            time.sleep(0.02)
+
+    def real_sleep(self):
+        """sleep 대역을 걷는다 — 기다리는 시간을 실제로 재는 시험용(옛 서버가 유예 안에 스스로 끝나는지)."""
+        (self.stub / "sleep").unlink()
+
     def run(self, **env):
         r = subprocess.run(["bash", str(self.dir / "start.sh")], env={**self.env, **env}, capture_output=True,
                            text=True, timeout=60)
@@ -111,6 +134,21 @@ class _Box:
         if self.old.poll() is None:
             self.old.kill()
         self.old.wait(timeout=10)
+
+
+# uvicorn 꼴의 옛 서버 — TERM 처리기를 건 뒤 ready 를 남기고, TERM 이면 closed(리스너를 닫았다)를 남기고 drain 초 뒤 0 으로 끝난다
+_LINGER = """
+import os, pathlib, signal, sys, time
+stub, drain = pathlib.Path(os.environ["STUB_DIR"]), float(sys.argv[1])
+def on_term(*_a):
+    (stub / "closed").touch()
+    time.sleep(drain)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+(stub / "ready").touch()
+while True:
+    time.sleep(0.05)
+"""
 
 
 @pytest.fixture
@@ -180,16 +218,65 @@ def test_health_는_루프백으로_프록시_없이_짧게_묻는다(box):
 
 
 # ── 유예 ─────────────────────────────────────────────────────────────────────
-def test_TERM_뒤_유예는_기본_2초이고_설정으로_바꾼다(box):
+def test_TERM_뒤_유예는_기본_4초이고_설정으로_바꾼다(box):
+    """정상 종료 상한(AGENT_GRACEFUL_S 1) + 도는 심의 접기(1초) + 루틴 접기(2초) — 그 안에 내려가야 원장에 진행이 남는다(HA-09 S0, 종전 기본 2).
+    유예는 상한이다 — 옛 프로세스가 먼저 끝나면 거기서 띄운다(아래 시험)."""
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
-    box.run()
-    assert box.read("sleep.args")[0] == "2", box.read("sleep.args")
+    rc, out = box.run()
+    assert rc == 0 and "내려가기를 최대 4초 기다린다" in out, out
 
 
 def test_유예를_설정으로_바꾼다(box):
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
-    box.run(AGENT_STOP_GRACE_S="7")
-    assert box.read("sleep.args")[0] == "7", box.read("sleep.args")
+    rc, out = box.run(AGENT_STOP_GRACE_S="7")
+    assert rc == 0 and "내려가기를 최대 7초 기다린다" in out, out
+
+
+# ── 리스너가 아니라 옛 프로세스를 기다린다(HA-09 S0 반대 검토 10-31) ─────────────────────────────────────────────────────
+# uvicorn 은 TERM 을 받자마자 리스너를 닫고 열린 연결(웹 챗 · 웹 심의 구독)을 AGENT_GRACEFUL_S 까지 기다린 뒤 lifespan 종료(도는 심의 접기)를 돈다.
+# 종전엔 유예 sleep 뒤 리스너로 남은 것을 보고 kill -9 해, 그 사이 옛 프로세스가 살아 있는데 새 것을 띄웠다 — 같은 원장을 둘이 함께 썼다(옛 것이
+# 끊긴 잡을 계속 돌리고 내려가며 새 것이 적은 이어하기 표지를 지워 같은 잡을 두 번 이을 수 있었다).
+def test_리스너가_닫혀도_옛_프로세스가_끝날_때까지_기다렸다_띄운다(box):
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    box.linger(1.5)
+    box.real_sleep()
+    t0 = time.monotonic()
+    rc, out = box.run()
+    took = time.monotonic() - t0
+    assert rc == 0 and box.started(), (rc, out)
+    assert box.read("old_at_start") == ["gone"], "옛 서버가 살아 있는데 새 서버를 띄웠다"
+    assert box.old.wait(timeout=5) == 0, "스스로 내려갈 서버를 유예 안에 kill -9 했다"
+    assert 1.4 < took < 3.9, f"옛 프로세스가 끝나기를 기다리지 않았거나(리스너만 봤다) 유예를 다 썼다 — {took:.1f}초"
+    assert "강제로 내린다" not in out, out
+
+
+def test_유예_안에_안_끝나면_옛_PID_를_kill_9_로_내리고_띄운다(box):
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    box.linger(60)
+    box.real_sleep()
+    t0 = time.monotonic()
+    rc, out = box.run(AGENT_GRACEFUL_S="0", AGENT_STOP_GRACE_S="3")
+    took = time.monotonic() - t0
+    assert rc == 0 and box.started(), (rc, out)
+    assert box.old.wait(timeout=5) == -9, "리스너가 없다고 옛 프로세스를 그대로 두었다"
+    assert box.read("old_at_start") == ["gone"], "옛 서버가 살아 있는데 새 서버를 띄웠다"
+    assert 2.9 < took < 6.5, f"{took:.1f}초"
+    assert "3초 안에 내려가지 않았다 — 강제로 내린다" in out, out
+
+
+@pytest.mark.parametrize("env, want, warned", [
+    ({"AGENT_STOP_GRACE_S": "0.5"}, "4", True),                                # 기본 상한 1 + 3
+    ({"AGENT_GRACEFUL_S": "20"}, "23", True),                                  # 상한을 올렸는데 유예는 기본 4
+    ({"AGENT_GRACEFUL_S": "20", "AGENT_STOP_GRACE_S": "30"}, "30", False),
+    ({"AGENT_STOP_GRACE_S": "5.5"}, "5.5", False),
+])
+def test_유예는_정상_종료_상한과_접기보다_짧지_않다(box, env, want, warned):
+    """TERM 뒤 KILL 까지가 uvicorn 정상 종료 상한(AGENT_GRACEFUL_S) + 도는 심의 접기(1초) + 루틴 접기(2초)보다 짧으면, 옛 프로세스가 그 사이에
+    KILL 을 맞아 잡의 진행을 원장에 쓰지 못한다(진행 일지가 남아 다음 기동이 접기는 한다). 짧게 적었으면 그 합으로 올리고 그렇다고 말한다."""
+    box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    rc, out = box.run(**env)
+    assert rc == 0 and box.started() and f"내려가기를 최대 {want}초 기다린다" in out, out
+    assert ("AGENT_STOP_GRACE_S" in out and "올린다" in out) is warned, out
 
 
 # ── 숫자로 못 읽는 초 단위 손잡이 — 경고하고 기본값으로 돈다 ─────────────────────────────
@@ -222,8 +309,8 @@ def test_유예를_숫자로_못_읽어도_옛_서버만_내리고_끝나지_않
     rc, out = box.run()
     assert rc == 0 and not box.old_alive(), (rc, out)
     assert box.started(), f"옛 서버를 내리고 새 서버를 띄우지 않았다 — {out}"
-    assert box.read("sleep.args")[0] == "2", box.read("sleep.args")
-    assert "AGENT_STOP_GRACE_S" in out and "기본값 2초" in out, out
+    assert "내려가기를 최대 4초 기다린다" in out, out
+    assert "AGENT_STOP_GRACE_S" in out and "기본값 4초" in out, out
 
 
 @pytest.mark.parametrize("bad", _BAD_PROBE)
@@ -241,20 +328,59 @@ def test_묻는_한도를_숫자로_못_읽어도_도는_심의를_끊지_않는
 
 def test_유예_sleep_이_실패해도_새_서버를_띄운다(box):
     """옛 서버를 이미 내린 자리다 — 값이 멀쩡해도 sleep 이 무슨 까닭으로든 실패하면(신호로 끊기는 등) set -e 가
-    거기서 스크립트를 끝내 아무것도 안 떴다."""
+    거기서 스크립트를 끝내 아무것도 안 떴다. 기다리는 동안의 sleep 이 실패해도 횟수로 끝나 kill -9 뒤 새 서버를 띄운다(끝없이 돌지 않는다)."""
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
+    box.linger(60)
     rc, out = box.run(STUB_SLEEP_RC="130")
     assert rc == 0 and not box.old_alive(), (rc, out)
     assert box.started(), f"옛 서버를 내리고 새 서버를 띄우지 않았다 — {out}"
+    assert len(box.read("sleep.args")) <= 60, "기다림이 횟수로 끝나지 않았다"
 
 
 def test_숫자로_읽히는_값에는_경고가_없다(box):
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
-    (box.dir / ".env").write_text("AGENT_STOP_GRACE_S=0.5\nAGENT_HEALTH_PROBE_S=10\n", encoding="utf-8")
+    (box.dir / ".env").write_text("AGENT_STOP_GRACE_S=4.5\nAGENT_HEALTH_PROBE_S=10\n", encoding="utf-8")
     rc, out = box.run()
     assert rc == 0 and box.started(), (rc, out)
-    assert box.read("sleep.args")[0] == "0.5" and "--max-time 10 " in box.read("curl.args")[0]
-    assert "기본값" not in out, out
+    assert "내려가기를 최대 4.5초 기다린다" in out and "--max-time 10 " in box.read("curl.args")[0], out
+    assert "기본값" not in out and "올린다" not in out, out
+
+
+# ── uvicorn 정상 종료 상한(HA-09 S0) ────────────────────────────────────────────
+def _graceful(box) -> str:
+    args = box.read("uvicorn.args")[0].split()
+    assert args.count("--timeout-graceful-shutdown") == 1, args
+    return args[args.index("--timeout-graceful-shutdown") + 1]
+
+
+def test_uvicorn_에_정상_종료_상한을_기본_1초로_주고_설정으로_바꾼다(box):
+    """상한이 없으면(uvicorn 기본) 열린 SSE 하나가 닫히기를 끝없이 기다려 lifespan 종료(도는 심의 접기)에 닿기 전에 KILL 을 맞았다."""
+    box.close()
+    box.run()
+    assert _graceful(box) == "1"
+    box.run(AGENT_GRACEFUL_S="3")
+    assert _graceful(box) == "3"
+    (box.dir / ".env").write_text("AGENT_GRACEFUL_S=0\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and _graceful(box) == "0" and "기본값" not in out, out
+
+
+@pytest.mark.parametrize("bad", ["1.5", "2s", "abc", "1 # 설명", "-1"])
+def test_정상_종료_상한을_정수로_못_읽으면_경고하고_기본값이다(box, bad):
+    """uvicorn 은 --timeout-graceful-shutdown 에 정수만 받는다 — 그대로 넘기면 새 서버가 뜨지 않는다(옛 서버는 이미 내렸다)."""
+    box.close()
+    (box.dir / ".env").write_text(f"AGENT_GRACEFUL_S={bad}\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and box.started() and _graceful(box) == "1", (rc, out)
+    assert "AGENT_GRACEFUL_S" in out and "기본값 1초" in out, out
+
+
+def test_백그라운드_기동도_같은_상한을_준다():
+    """-d(nohup) 갈래와 포그라운드(exec) 갈래가 같은 인자로 뜬다 — 한쪽만 고치면 다른 길로 뜬 서버(손으로 ./start.sh -d · 서비스 매니페스트의
+    ./start.sh)는 종전대로 상한 없이 뜬다."""
+    src = (ROOT / "start.sh").read_text(encoding="utf-8")
+    lines = [ln for ln in src.splitlines() if ".venv/bin/uvicorn app:app" in ln and not ln.lstrip().startswith("#")]
+    assert len(lines) == 2 and all('--timeout-graceful-shutdown "$GRACEFUL_S"' in ln for ln in lines), lines
 
 
 # ── 서버에 넘기는 환경 ───────────────────────────────────────────────────────

@@ -41,6 +41,7 @@ class _Engine:
         self.started, self.seen, self.fail = [], {}, set()   # 시작한 순서 · 화두별 받은 인자 · 터뜨릴 화두
         self.now = self.peak = 0                              # 지금·최대 동시에 도는 수
         self._gates = {}
+        self.script = {}          # 화두 → 문 앞에서 낼 사건(청크 목록) — 진행을 보는 시험(HA-09 S0)이 채운다. 비면 종전과 같다
 
     def gate(self, q):
         return self._gates.setdefault(q, asyncio.Event())
@@ -52,6 +53,8 @@ class _Engine:
         self.peak = max(self.peak, self.now)
         try:
             yield d._sse("status", {"step": f"{q} 시작"})
+            for chunk in self.script.get(q, ()):
+                yield chunk
             await self.gate(q).wait()
             if q in self.fail:
                 raise RuntimeError("엔진이 터졌다")
