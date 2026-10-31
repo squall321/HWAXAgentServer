@@ -717,6 +717,11 @@ _RESCREEN_TOP_K = _env_int("DELIB_RESCREEN_TOP_K", 40)
 _RESCREEN_WIDE_MIN = _env_int("DELIB_RESCREEN_WIDE_MIN", 50)
 _RESCREEN_WIDE = frozenset({"sw", "xd"})
 _RESCREEN_AXES = 3                                     # 재심사 검색 축 수(반대 도메인 좌석 _counter_seats 와 같다)
+# 재심사 축 질의 전체의 벽시계 기한(초). AIDataHub 는 추천을 하나씩 받아 함께 보내도 시간이 더해진다(dev 10-31 — 혼자 9초, 셋을
+# 함께 보내면 23 · 31 · 40초에 끝났다). 기한이 없으면 축마다 게이트웨이 호출 한도(GATEWAY_CALL_TIMEOUT 600초)까지 기다린다 —
+# MCP 스트림의 15초 ping 이 엔진의 읽기 한도를 되감아 엔진 쪽 한도는 걸리지 않는다. 600 은 B17 전 한 덩이 질의 한 번이 기다릴 수
+# 있던 만큼이다(재심사 전체가 그보다 길어지지 않는다). 차면 받은 축까지로 고르고 상태줄에 이 값 · 손잡이 이름과 못 받은 축을 적는다.
+_RESCREEN_TIMEOUT_S = _env_float("DELIB_RESCREEN_TIMEOUT_S", 600.0)
 
 # 얹을 층(2층 Modifier) — chairTemplate(무엇을 산출) 과 직교하는 "어떻게 굴리나" 오버레이.
 # 각 값은 심의 BASE 에 덧붙는 지시 블록. hwax-deliberate.js MODIFIERS 와 키·취지 정합.
@@ -1552,6 +1557,9 @@ def _resolve_opts(req_opts):
         # 이어하기 좌석 재심사 — 요청 단위로 끌 수 있어야 한다. 사람이 이어하기 명단을 **직접 고르면**
         # 포털이 0 을 보낸다: 고른 명단 위에 재심사가 좌석을 몰래 더 얹으면 '고르게 했다'가 거짓이 된다.
         rescreen=_RESCREEN,
+        # 재심사 검색 축을 지을 호출자 의견 — 요청으로 받지 않는 엔진 안쪽 칸이다. None 이면 human_note 가 곧 호출자가 쓴 의견이다.
+        # human_note 를 엔진 지시문으로 짓는 단(시험 계획 · 시뮬 2단 · 구축 3단)만 호출자가 쓴 의견을 여기 따로 적는다(없으면 "").
+        rescreen_note=None,
         # 페르소나 지식카드 조회(결정적 RAG) — 요청 단위로 끌 수 있어야 한다. 종전엔 환경변수뿐이라
         # 끄려면 서버를 다시 띄워야 했고, 그건 그 시각 심의 중인 전원에게 걸린다. 그 시점 자료만으로
         # 다시 심사하는 소급 검증은 지식카드를 빼야 한다 — 카드는 오늘의 카드다(S26U 피드백 1-5).
@@ -4636,12 +4644,22 @@ async def _restore_role(tools: dict, key: str, fallback: str = "", why: dict | N
     return fallback
 
 
-async def _rank_keys(tools: dict, q: str, top_k: int | None = None) -> list:
+async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | None = None) -> list:
     """recommend_agents 의 순위 그대로 좌석 키만 — 도구 운영자(he)와 겹친 키는 뺀다. 도구 실패·빈 결과는 빈 목록이다.
-    top_k 를 주면 그만큼 받는다(안 주면 도구 기본 5명 — AIDataHub mcp_runtime.recommend_agents)."""
+    top_k 를 주면 그만큼 받는다(안 주면 도구 기본 5명 — AIDataHub mcp_runtime.recommend_agents).
+    why 를 주면 도구가 없거나 **실패해** 빈 목록인 질의의 까닭을 {질의: 까닭} 으로 적는다 — 도구 실패는 예외가 아니라 실패 문구로
+    와서(_call) 빈 추천과 같은 빈 목록이 된다(_restore_role 의 why 와 같다)."""
     try:
-        recd = _parse_json(await _call(tools, "recommend_agents", {"q": q} if top_k is None else {"q": q, "top_k": top_k}))
-    except Exception:  # noqa: BLE001
+        raw = await _call(tools, "recommend_agents", {"q": q} if top_k is None else {"q": q, "top_k": top_k})
+        if why is not None and raw is None:
+            why[q] = "recommend_agents 도구가 없다"
+        elif why is not None and isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
+            msg = _RA_FAIL_WRAP.sub("", raw.strip(), count=1)
+            why[q] = (msg[:-1] if raw.lstrip().startswith("(tool ") else msg)[:200]     # '(tool … error: …)' 의 닫는 괄호는 뗀다
+        recd = _parse_json(raw)
+    except Exception as exc:  # noqa: BLE001
+        if why is not None:
+            why[q] = type(exc).__name__
         return []
     if isinstance(recd, list):
         items = recd
@@ -4776,9 +4794,13 @@ async def _rescreen_axes(llm, question: str, note: str, seated_keys: set) -> tup
         return [], type(exc).__name__
     axes = []
     for ln in str(raw or "").splitlines():
-        ln = re.sub(r"^\s*(?:[-*•·]+|\d+[.)])\s*", "", ln).strip(" *`\t")[:60]     # 번호 · 글머리 · 굵게(**) 표지를 뗀다
-        if ln and not ln.startswith("…[") and ln not in axes:     # …[ — 출력 상한 절단 표지(_OUT_CUT_MARK)
-            axes.append(ln)
+        ln = re.sub(r"^\s*(?:[-*•·]+|\d+[.)]|[①-⑳])\s*", "", ln).strip(" *`\t")    # 번호(①~⑳ 포함) · 글머리 · 굵게(**) 표지를 뗀다
+        # 머리말 · 제목 줄은 축이 아니다 — 설명 금지를 어기면 '다음은 검토 축입니다.' · '검토 축:' 이 첫 축 자리를 차지했다.
+        # 축은 명사구라 문장 끝(…다 · …다.)이나 쌍점으로 끝나지 않는다. 자르기(60자) 전에 본다 — 긴 머리말은 잘린 끝이 문장 끝이 아니다.
+        if not ln or ln.startswith("…[") or re.search(r"(?:[:：]|다\.?)$", ln):     # …[ — 출력 상한 절단 표지(_OUT_CUT_MARK)
+            continue
+        if ln[:60] not in axes:
+            axes.append(ln[:60])
         if len(axes) >= _RESCREEN_AXES:
             break
     return axes, ("" if axes else "빈 답")
@@ -4786,36 +4808,77 @@ async def _rescreen_axes(llm, question: str, note: str, seated_keys: set) -> tup
 
 async def _rescreen_seats(tools: dict, llm, question: str, note: str, seated: list) -> tuple[list, dict]:
     """이어하기 좌석 재심사(F10) — 유임 좌석 위에 더할 신규 좌석을 _RESCREEN_SEATS 명까지 고른다.
-    반환 (신규 좌석 [{key, role, origin: new, axis}], {queries: 물은 질의들, why: 축을 못 지은 까닭 — 지었으면 "", candidates: 후보 수}).
+    반환 (신규 좌석 [{key, role, origin: new, axis}], {queries: 물은 질의들, why: 축을 못 지은 까닭 — 지었으면 "", candidates: 후보 수,
+    failed: {추천이 실패한 축: 까닭}, late: 기한 안에 답을 받지 못한 축들}).
 
-    세 가지를 지킨다(HWAXPortal docs/deliberation-quality 42 — 10-31 dev 재실행에서 서비스 운영 · 필드 데이터 신규 좌석이 0 이던 까닭).
+    네 가지를 지킨다(HWAXPortal docs/deliberation-quality 42 — 10-31 dev 재실행에서 서비스 운영 · 필드 데이터 신규 좌석이 0 이던 까닭).
     ① 깊이 — 축 질의마다 top_k 를 준다(_RESCREEN_TOP_K). 안 주면 5명뿐이라 앉은 도메인이 그 다섯을 채우면 새 도메인이 안 보인다.
     ② 짧은 축 질의 — '원 질문 + 이전 결론 + 사람 의견' 한 덩이는 임베딩이 원 어휘 쪽으로 평균된다(_counter_seats 의 실측과 같은 까닭).
-       사람 의견(과 원 질문)에서 축을 받아 축마다 따로 묻고 후보를 합친다. 축을 못 지으면(LLM 실패 · 빈 답) 신규 좌석 없이 돌아간다 —
+       사람 의견(과 원 질문)에서 축을 받아 축마다 따로 묻는다. 축을 못 지으면(LLM 실패 · 빈 답) 신규 좌석 없이 돌아간다 —
        사람 의견을 통째로 한 질의로 물어도 같은 평균이 된다(dev 10-31 — 사람 의견 한 덩이로 물으면 앞의 새 도메인 둘이 필드 · 서비스
        계열이 아니었다).
     ③ 도메인 단위 — 넓은 접두는 둘째 마디까지 견준다(_seat_unit). 신규 좌석끼리도 단위가 겹치지 않는다.
-    고르는 차례는 깊이 우선이다 — 축마다 1위, 그다음 축마다 2위 … 라 한 축이 자리를 독식하지 않는다. 유임 좌석은 건드리지 않는다."""
+    ④ 시간 — 축을 중요한 차례로 하나씩 묻고 자리가 차면 남은 축은 묻지 않는다(AIDataHub 는 추천을 하나씩 받아 함께 보내도 시간이
+       더해진다). 축 질의 전체에 벽시계 기한(_RESCREEN_TIMEOUT_S)을 걸어 차면 받은 축까지로 고른다. 실패한 축은 빈 축과 따로 적는다.
+    고르는 차례 — 축마다 그 축의 첫 새 단위 하나(한 축이 자리를 독식하지 않는다), 그러고도 자리가 남으면 받은 순위에서 깊이 차례로
+    채운다(더 묻지 않는다). 유임 좌석은 건드리지 않는다."""
     seated_keys = {p["key"] for p in seated}
-    queries, why = await _rescreen_axes(llm, question, note, seated_keys)
-    if not queries:
-        return [], {"queries": [], "why": why, "candidates": 0}
-    wide, *ranked = await asyncio.gather(_wide_prefixes(tools),
-                                         *(_rank_keys(tools, q, _RESCREEN_TOP_K) for q in queries))
+    axes, why = await _rescreen_axes(llm, question, note, seated_keys)
+    info = {"queries": [], "why": why, "candidates": 0, "failed": {}, "late": []}
+    if not axes:
+        return [], info
+    loop = asyncio.get_running_loop()
+    end = loop.time() + _RESCREEN_TIMEOUT_S
+
+    async def _in_time(coro):
+        return await asyncio.wait_for(coro, max(0.0, end - loop.time()))
+
+    try:
+        wide = await _in_time(_wide_prefixes(tools))
+    except asyncio.TimeoutError:
+        wide = _RESCREEN_WIDE                     # 분류를 못 받으면 기본 둘(_wide_prefixes 의 실패와 같다)
     taken = {_seat_unit(k, wide) for k in seated_keys}
-    picks = []
-    for depth in range(max((len(r) for r in ranked), default=0)):
-        for q, keys in zip(queries, ranked):
-            unit = _seat_unit(keys[depth], wide) if depth < len(keys) else None
-            if unit is not None and unit not in taken and len(picks) < _RESCREEN_SEATS:
-                taken.add(unit)
-                picks.append({"key": keys[depth], "axis": q})
+    picks, ranked = [], []
+
+    def _take(key: str, axis: str) -> None:
+        taken.add(_seat_unit(key, wide))
+        picks.append({"key": key, "axis": axis})
+
+    for i, q in enumerate(axes):
         if len(picks) >= _RESCREEN_SEATS:
             break
+        try:
+            keys = await _in_time(_rank_keys(tools, q, _RESCREEN_TOP_K, why=info["failed"]))
+        except asyncio.TimeoutError:
+            info["late"] = axes[i:]               # 묻던 축과 아직 묻지 않은 축 — 기한이 찼다
+            break
+        info["queries"].append(q)
+        ranked.append((q, keys))
+        first = next((k for k in keys if _seat_unit(k, wide) not in taken), None)
+        if first:
+            _take(first, q)
+    for depth in range(max((len(ks) for _q, ks in ranked), default=0)):
+        for q, ks in ranked:
+            if len(picks) < _RESCREEN_SEATS and depth < len(ks) and _seat_unit(ks[depth], wide) not in taken:
+                _take(ks[depth], q)
     for p in picks:
         p["role"] = await _restore_role(tools, p["key"])
         p["origin"] = "new"
-    return picks, {"queries": queries, "why": why, "candidates": len({k for r in ranked for k in r})}
+    info["candidates"] = len({k for _q, ks in ranked for k in ks})
+    return picks, info
+
+
+async def _rescreen_blob(tools: dict, question: str, summary: str, note: str, seated: list) -> list:
+    """엔진이 사람 의견 칸을 지시문으로 지은 단(시험 계획 · 시뮬 2단 · 구축 3단)에 호출자가 쓴 의견이 없을 때의 재심사 — B17 전 그대로
+    '질문 + 이전 결론 + 그 단의 의견 칸' 한 덩이를 도구 기본 5명으로 묻고, 앉은 계열은 첫 마디 접두로 막는다.
+    그 단의 의견 칸은 사람이 옮긴 방향이 아니라 검색 축의 재료가 아니고, 이 재심사는 질문으로 좌석을 더 찾는 몫이다(시험 계획의 재료
+    계열 · 현상 도메인 — run_test_plan). 축으로 바꾸면 질문으로는 묻지 않고, 넓은 접두(xd)의 고정 좌석이 그 계열을 막지 않는다."""
+    eff_q = (f"{question}\n\n[이전 결론]\n{(summary or '')[:2000]}"
+             f"\n\n[사람 의견]\n{(note or '')[:1000]}")
+    seated_dom = {_dom_of(p["key"]) for p in seated}
+    return [c for c in await _discover(tools, eff_q, _RESCREEN_SEATS * 3,
+                                       exclude={p["key"] for p in seated}, origin="new")
+            if _dom_of(c["key"]) not in seated_dom][:_RESCREEN_SEATS]
 
 
 def _fit_carry(nn: list, options: list) -> tuple[list, list, str]:
@@ -5213,6 +5276,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         # 결정문(continue_summary)으로 넘어온다. 시험 설계(run_test_plan)는 단이 하나라 지시문 뒤에 싣는다.
         opts_b.human_note = ("사내 보유 도구를 우선 검토하라. 파라미터 식별성 판정과 "
                              "이 해석이 답할 수 없는 것을 비워두지 마라.")
+        opts_b.rescreen_note = ""   # 이 단의 의견 칸은 엔진 지시문이다 — 재심사는 그것으로 축을 짓지 않고 종전 한 덩이 질의다(_rescreen_blob)
         # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
         # 실제 보유 목록과 어긋난다 — 계획서가 없는 도구를 쓰자고 하거나, 있는 물성을 새로
         # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
@@ -5264,6 +5328,7 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
                                 for s in sim_seats]
     opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
                          "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
+    opts_c.rescreen_note = ""   # 엔진 지시문이다 — 재심사는 그것으로 축을 짓지 않는다(2단과 같다)
     build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
     async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
@@ -5319,22 +5384,24 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
         yield _sse("error", {"code": "sealed_unsupported", "message": _SEALED_UNSUPPORTED})
         yield _sse("done", {}); return
     opts.chair_template = "test-plan"
-    # 고정 좌석을 앞에 세우고, 호출자가 지정한 좌석을 그 뒤에 앉힌다. 나머지는 질문으로 발굴하게 둔다
-    # (재료 계열·현상 도메인). 사람 의견도 엔진 지시문 뒤에 **이어 붙인다.**
+    # 고정 좌석을 앞에 세우고, 호출자가 지정한 좌석을 그 뒤에 앉힌다. 나머지는 좌석 재심사가 찾는다 — 호출자 의견이
+    # 없으면 질문으로(재료 계열·현상 도메인 — _rescreen_blob), 있으면 그 의견의 검색 축으로(rescreen_note — 엔진
+    # 지시문 · 물성 현황으로는 축을 짓지 않는다). 사람 의견도 엔진 지시문 뒤에 **이어 붙인다.**
     # ⚠ 종전엔 둘 다 덮어썼다 — 호출자의 좌석은 앉지 않았고 의견은 어느 좌석 프롬프트에도 없었는데 카드도
     #   경고도 없었다. 이어하기는 그 의견이 부르는 까닭 전부다. 정본 파이프라인(hwax-test-plan.js)은 처음부터
     #   이 순서로 둘 다 싣는다(FIXED_SEATS 뒤에 personas · BASE_NOTE 뒤에 humanNote).
     #   지정 좌석은 좌석 상한(MAX_REQ_SEATS)까지이고 고정 좌석은 그 **밖에서** 앉는다(지정 반대석과 같은 규칙).
     _caller_seats = [p for p in opts.continue_personas if p["key"] not in _TEST_FIXED]
     _caller_note = opts.human_note
+    opts.rescreen_note = _caller_note       # 재심사 축은 호출자가 쓴 의견에서만 짓는다(아래 지시문 · 현황은 사람이 쓴 것이 아니다)
     opts.continue_personas = ([{"key": k, "role": "", "origin": "primary"} for k in _TEST_FIXED]
                               + _caller_seats)
     opts.human_note = ("이미 실측이 있는 항목을 다시 측정 대상으로 올리지 마라. "
                        "우선순위는 '민감도 × 근거 공백 × 확보 난이도' 로 서열화하고, "
                        "하나만 먼저 한다면 무엇인지 반드시 답하라. "
                        "경시·수명 항목은 결과까지 수개월이 걸리므로 착수 순서에서 앞에 두라.")
-    # 물성 현황(수천~수만 자)보다 **앞에** 붙인다 — 뒤에 두면 화면의 사람 의견 카드(_EVID_SHOW)와 좌석
-    # 재심사 질의(앞 1,000자)가 보는 창 밖으로 밀려난다.
+    # 물성 현황(수천~수만 자)보다 **앞에** 붙인다 — 뒤에 두면 화면의 사람 의견 카드(_EVID_SHOW)가 보는 창 밖으로
+    # 밀려난다(좌석 재심사는 이 의견을 rescreen_note 로 따로 받는다).
     if _caller_note:
         opts.human_note += "\n\n[호출자가 넣은 사람 의견]\n" + _caller_note
     try:
@@ -5871,19 +5938,35 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("status", {"step": f"⚠ 좌석 상한 {MAX_REQ_SEATS}석 초과 — 제외: "
                                           + ", ".join(opts.seats_clamped), "tool": None})
         # 이어하기 좌석 재심사(F10) — 사람 의견이 주제를 옮겼을 수 있다. 그 의견(과 원 질문)에서 뽑은 짧은 축마다
-        # 좌석을 다시 찾아 새 도메인을 연다(_rescreen_seats — 축 질의 · 깊이 · 도메인 단위).
+        # 좌석을 다시 찾아 새 도메인을 연다(_rescreen_seats — 축 질의 · 깊이 · 도메인 단위 · 기한).
         # 유임은 전원 유지하고 신규만 더한다(정원 확대) — 좌석을 빼면 그 도메인의 이전 발언에
         # 대한 책임 주체가 사라지기 때문. DELIB_RESCREEN=0 으로 종전 동작(재심사 없음) 복귀.
+        # 사람 의견 칸을 엔진 지시문으로 지은 단(시험 계획 · 시뮬 2단 · 구축 3단 — rescreen_note 를 따로 적는다)은 호출자가 쓴 의견에서만
+        # 축을 짓는다. 그런 의견이 없으면 그 단의 재심사는 B17 전 그대로 한 덩이 질의다(_rescreen_blob — 질문으로 좌석을 더 찾는 몫).
         if opts.rescreen and (opts.continue_summary or opts.human_note):
-            yield _sse("status", {"step": "이어하기 재심사 — " + ("사람 의견" if opts.human_note else "원 질문")
-                                          + "에서 검색 축을 짓고 축마다 좌석을 찾는다", "tool": "recommend_agents"})
-            added, _rs = await _rescreen_seats(tools, llm, question, opts.human_note or "", personas)
-            personas.extend(added)
-            yield _sse("status", {"step": (
-                f"이어하기 재심사 — 검색 축을 짓지 못해({_rs['why']}) 신규 좌석 없이 유임 전원으로 간다" if _rs["why"] else
-                "이어하기 재심사 — 신규 좌석 " + ", ".join(f"{p['key']}({p['axis']})" for p in added) if added else
-                f"이어하기 재심사 — 신규 좌석 없음(축 {len(_rs['queries'])}개의 후보 {_rs['candidates']}명이 모두 앉은 좌석 · "
-                "앉은 도메인이거나 추천이 비었다)"), "tool": "recommend_agents"})
+            _own = str((opts.human_note if opts.rescreen_note is None else opts.rescreen_note) or "").strip()
+            if opts.rescreen_note is not None and not _own:
+                added = await _rescreen_blob(tools, question, opts.continue_summary, opts.human_note, personas)
+                personas.extend(added)
+                if added:
+                    yield _sse("status", {"step": "이어하기 재심사 — 신규 좌석 " + ", ".join(p["key"] for p in added),
+                                          "tool": "recommend_agents"})
+            else:
+                yield _sse("status", {"step": "이어하기 재심사 — " + ("사람 의견" if _own else "원 질문")
+                                              + "에서 검색 축을 짓고 축마다 좌석을 찾는다", "tool": "recommend_agents"})
+                added, _rs = await _rescreen_seats(tools, llm, question, _own, personas)
+                personas.extend(added)
+                # 못 받은 축 — 추천이 실패한 축은 빈 추천과 가르고, 기한이 차 답을 받지 못한 축은 기한 · 손잡이와 함께 적는다
+                _miss = "".join((
+                    f" · 추천 실패 축 {len(_rs['failed'])}개(" + "; ".join(f"{q} — {w}" for q, w in _rs["failed"].items()) + ")"
+                    if _rs["failed"] else "",
+                    f" · {_RESCREEN_TIMEOUT_S:g}초 기한(DELIB_RESCREEN_TIMEOUT_S) 안에 답을 받지 못한 축 {len(_rs['late'])}개("
+                    + ", ".join(_rs["late"]) + ")" if _rs["late"] else ""))
+                yield _sse("status", {"step": (
+                    f"이어하기 재심사 — 검색 축을 짓지 못해({_rs['why']}) 신규 좌석 없이 유임 전원으로 간다" if _rs["why"] else
+                    "이어하기 재심사 — 신규 좌석 " + ", ".join(f"{p['key']}({p['axis']})" for p in added) + _miss if added else
+                    f"이어하기 재심사 — 신규 좌석 없음(물은 축 {len(_rs['queries'])}개의 후보 {_rs['candidates']}명이 모두 앉은 좌석 · "
+                    "앉은 도메인이거나 추천이 비었다)" + _miss), "tool": "recommend_agents"})
     else:
         personas = await _discover(tools, question, N_PERSONAS, origin="primary")
         _persona_shadow("delib", question, [p["key"] for p in personas], N_PERSONAS)   # 적기만 한다 — 좌석은 그대로다

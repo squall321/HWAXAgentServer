@@ -462,6 +462,24 @@ def test_결정문에서_끊긴_잡은_2라운드로_잇고_첫_라운드에서_
     assert out["resumed"]["rounds_done"] == 0 and "처음부터" in out["note"]
 
 
+def test_끝난_라운드_뒤를_이으면_재심사를_걸지_않고_처음부터면_처음_인자_그대로다(eng, monkeypatch):
+    """끝난 라운드 뒤를 '엔진이 앉힌 좌석 그대로' 잇는다 — 이어받은 요약이 재심사 조건을 세워도 재심사(신규 좌석)는 걸지 않는다(남은
+    라운드 한가운데 신규 좌석이 끼어들었다). 이번에 적은 손잡이(advanced)는 그 위에 이긴다. 끝난 라운드가 없으면 같은 인자로
+    처음부터라 처음 인자의 손잡이를 건드리지 않는다."""
+    _caps(monkeypatch, 2)
+    job = _interrupted(args_opts=_ORIG)
+    _resume(eng, job["id"])
+    assert eng.seen["힌지 크랙 원인"].opts.get("rescreen") == 0, "끝난 라운드 뒤를 이으며 재심사를 걸었다"
+    eng.seen.clear()
+    asked = _interrupted(args_opts=_ORIG, job_id="default-20261022-010000-cut00d")
+    _resume(eng, asked["id"], advanced={"rescreen": 1})
+    assert eng.seen["힌지 크랙 원인"].opts.get("rescreen") == 1, "이번에 적은 손잡이가 이기지 않았다"
+    eng.seen.clear()
+    first = _interrupted(stage="r1", total=4, args_opts=_ORIG, job_id="default-20261022-010000-cut00e")
+    _resume(eng, first["id"])
+    assert "rescreen" not in eng.seen["힌지 크랙 원인"].opts, "처음부터 도는 잡의 처음 인자를 바꿨다"
+
+
 def test_사람_의견을_주면_처음_의견_뒤에_덧붙이고_화두_종류는_못_바꾼다(eng, monkeypatch):
     _caps(monkeypatch, 2)
     job = _interrupted(args_opts=_ORIG)

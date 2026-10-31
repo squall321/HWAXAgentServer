@@ -644,6 +644,9 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         seats = _carry_seats(prev)
         if seats:
             o["personas"] = seats
+        # 좌석 재심사(이어하기 신규 좌석)는 걸지 않는다 — 좌석은 끊긴 잡이 앉힌 그대로이고(그 잡의 재심사 좌석도 그 안에 있다), 위 요약이
+        # 재심사 조건을 세워 기본값(켬)이면 남은 라운드 한가운데 신규 좌석이 1라운드 지시문으로 끼어들었다. 이번에 적은 advanced 는 이긴다.
+        o["rescreen"] = 0
     elif rounds:
         o["rounds"] = int(rounds)
     if human_note and human_note.strip():
