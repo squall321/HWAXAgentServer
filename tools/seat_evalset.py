@@ -172,16 +172,50 @@ def _git_head(path: Path) -> str | None:
 
 
 # ── 거름 ─────────────────────────────────────────────────────────────────────
+_ROLE_KO = re.compile(r"\s*(?:초?전문가|담당)\s*$")
+# 영문 이름의 역할 꼬리 — dev 773명 가운데 765명이 이 넷으로 끝난다(꼬리를 달고 견주면 질의에 거의 안 맞는다)
+_ROLE_EN = re.compile(r"\s+(?:Specialist|Expert|Agent|Engineer)s?\s*$", re.IGNORECASE)
+_PAREN = re.compile(r"\(([^)]*)\)")
+_ALIAS_SPLIT = re.compile(r"\s*[·,/]\s*")
+NAME_PIECE_MIN = 3              # 조각의 글자 수(띄어쓰기 · 붙임표 뺌) — 'TIM' · '현지화' 는 보고 'IP' · 'SE' 같은 2자 별칭은 보지 않는다
+
+
+def name_pieces(ex: dict) -> list[str]:
+    """L2 가 보는 정답 이름 조각 — 한국어 이름(역할 꼬리 '… 전문가' 를 뗀 것)과 영문 이름(역할 꼬리 Specialist · Expert · Agent · Engineer 를
+    뗀 것)마다 괄호를 뗀 핵심, 괄호 속 별칭 조각(· , / 로 나눈 것). 'TIM(열계면재료) 전문가' → TIM · 열계면재료."""
+    out: list[str] = []
+    for raw, tail in ((ex.get("name_ko") or "", _ROLE_KO), (ex.get("name_en") or "", _ROLE_EN)):
+        name = tail.sub("", str(raw)).strip()
+        if not name:
+            continue
+        for piece in [" ".join(_PAREN.sub(" ", name).split()),
+                      *(x.strip() for inner in _PAREN.findall(name) for x in _ALIAS_SPLIT.split(inner))]:
+            if len(re.sub(r"[\s\-]", "", piece)) >= NAME_PIECE_MIN and piece not in out:
+                out.append(piece)
+    return out
+
+
+def _flat(s: str) -> str:
+    """맞대기 꼴 — 띄어쓰기 · 붙임표를 빼고 소문자('OLED 발광 재료' = 'OLED발광재료', 'Under-Display' = 'underdisplay')."""
+    return re.sub(r"[\s\-]+", "", str(s or "")).lower()
+
+
 def _name_hit(q: str, ex: dict) -> bool:
-    """L2 — 정답의 키 · 영문 이름 · 한국어 이름('… 전문가' 를 뗀 것)이 질의에 그대로 있나."""
-    ql = str(q or "").lower()
-    if ex["id"].lower() in ql:
+    """L2 — 정답의 키나 이름 조각(name_pieces)이 질의에 그대로 있나. 그런 질의는 어휘 점수(이름 · 설명 · 태그)에서 정답을 거저 맞힌다.
+    조각은 띄어쓰기 · 붙임표를 보지 않고 견준다(종전 규칙과 같다 — 'AppWidgetProvider' 에 'App Widget' 이 든다). 3자 영문 약어만 영숫자
+    경계 안에서 본다('TIM' 이 'TIMING' 에 맞지 않게)."""
+    text = str(q or "")
+    if ex["id"].lower() in text.lower():
         return True
-    en = ex["name_en"].strip().lower()
-    if len(en) >= 4 and en in ql:
-        return True
-    ko = re.sub(r"\s*(?:초?전문가|담당)\s*$", "", ex["name_ko"]).strip()
-    return len(ko) >= 4 and re.sub(r"\s+", "", ko) in re.sub(r"\s+", "", str(q or ""))
+    flat = _flat(text)
+    for piece in name_pieces(ex):
+        pf = _flat(piece)
+        if len(pf) > NAME_PIECE_MIN or not pf.isascii():
+            if pf in flat:
+                return True
+        elif re.search(r"(?<![0-9a-z])" + re.escape(pf) + r"(?![0-9a-z])", text.lower()):
+            return True
+    return False
 
 
 def a_candidates(experts: dict, pool: set) -> tuple[list[dict], list[dict], Counter]:

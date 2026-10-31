@@ -175,3 +175,27 @@ def test_실제_ExpertAgents_로_짓는다(tmp_path):
     rows = [json.loads(x) for x in (tmp_path / "sets" / "A.jsonl").read_text(encoding="utf-8").splitlines()]
     assert all(r["answer"] != r["confuser"] for r in rows) and len({r["qid"] for r in rows}) == 600
     assert man == {**man, "seal": man["seal"]} and len(man["seal"]["A-test"]) == 64
+
+
+# ── 반대 검토(10-31) — L2 이름 거름(HWAXPortal docs/request-1029 context-notes C-48) ─────────────────────────────
+def test_R6_L2_이름_거름은_괄호를_뗀_이름_괄호_속_별칭_역할_꼬리를_뗀_영문_이름을_본다():
+    fod = {"id": "disp-fod", "name_ko": "지문 센서(FOD) 전문가", "name_en": "Fingerprint Sensor Specialist"}
+    assert se._name_hit("지문 센서 인식률이 겨울에 떨어진다", fod), "괄호를 뗀 이름"
+    assert se._name_hit("지문센서 인식률", fod), "띄어쓰기는 보지 않는다"
+    assert se._name_hit("FOD 모듈 두께 기준", fod), "괄호 속 별칭"
+    assert se._name_hit("fingerprint sensor 의 인식률", fod), "역할 꼬리(Specialist)를 뗀 영문 이름"
+    tim = {"id": "mech-tim", "name_ko": "TIM(열계면재료) 전문가", "name_en": "Thermal Interface Material Expert"}
+    assert se._name_hit("TIM 두께가 열저항에 주는 영향", tim), "3자 영문 핵심 이름도 경계 안이면"
+    assert se._name_hit("열계면재료 도포 두께", tim)
+    assert se._name_hit("thermal interface material 선정", tim)
+    assert not se._name_hit("TIMING 마진이 부족하다", tim), "영문은 낱말 경계 안에서만"
+    aip = {"id": "rf-aip", "name_ko": "mmWave AiP(안테나 인 패키지) 전문가", "name_en": "mmWave Antenna-in-Package Expert"}
+    assert se._name_hit("mmWave AiP 빔 틸트", aip) and se._name_hit("안테나 인 패키지 방열", aip)
+    assert se._name_hit("mmWave antenna in package 의 손실", aip), "영문 이름의 붙임표는 띄어쓰기와 같게 본다"
+    ip = {"id": "mech-ip", "name_ko": "방수방진(IP) 실링 전문가", "name_en": "Waterproof Sealing Expert"}
+    assert se._name_hit("방수방진 실링 압축률", ip)
+    assert not se._name_hit("IP 주소를 바꿨다", ip), "2자 별칭은 보지 않는다"
+    hpb = {"id": "mem-hpb", "name_ko": "임베디드 스토리지 성능(HPB·WriteBooster) 전문가", "name_en": "Embedded Storage Performance Expert"}
+    assert se._name_hit("WriteBooster 켜면 쓰기 속도", hpb) and se._name_hit("HPB 적중률", hpb), "별칭 조각마다"
+    plain = {"id": "rel-drop", "name_ko": "낙하 신뢰성 전문가", "name_en": "Drop Reliability Expert"}
+    assert not se._name_hit("힌지 크랙 원인", plain) and se._name_hit("rel-drop 키로 부르는 질문", plain)

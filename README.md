@@ -644,30 +644,49 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
   `THINK_MAX_ANSWERS` that passed), `tools` (the chat's `_persona_meta` → `_seat_tool_prefer(…, CHAT_PERSONA_PREFER_N)`
   for `expert`, plus what the persona links would pick, when present). LLM layers — `judge` (thinking self-judgement on
   the asked seats), `counter` (`_counter_seats`), `axes` (`_seat_axes` on the one question) — are refused (409) while a
-  deliberation runs. The engine functions get a tool dict that holds read tools only (`recommend_agents` ·
-  `get_agent_session` · `agent_search` · `list_agents` · `list_agent_domains`); every call is counted in `calls`, and
-  `read_only` must be true. One run at a time (409). Each answer carries a version fingerprint — agent and AIDataHub
-  commits, AIDataHub version · build · embedder slot, field-terms sha, pool fingerprint (keys · updated_at), core-vocab
-  fingerprint, tool-map sha, the selection knobs. With `run`, every item is appended to `runs/<run>.jsonl` without the
-  question text.
+  deliberation runs. Layers run in the order summon → screen → rec → discover → tools → LLM layers, so the thinking
+  summon is the query's first `recommend_agents` call, as in real thinking (`summon.first` says whether this window
+  process sent the query before — AIDataHub/DB warm-up is not visible). Every tool is wrapped for the request: read tools
+  (`recommend_agents` · `get_agent_session` · `agent_search` · `list_agents` · `list_agent_domains`) run and are counted
+  in `calls`; any other tool is not run and is counted in `blocked`; `read_only` is "zero blocked". While the request
+  runs, the engine's own `_tools_by_name` (e.g. `_persona_meta`) returns the same wrapped dict (`deliberation._TOOLS_OVERRIDE`
+  — a context variable, so concurrent chats and deliberations keep their own tools). A tool failure (exception, failure
+  text, AIDataHub's empty `fallback`) is attached to that layer as `tool_error`. One run at a time (409). Each answer
+  carries a version fingerprint — agent and AIDataHub commits, a sha of the sibling AIDataHub checkout's
+  `recommend_svc.py`, AIDataHub version · build · embedder slot (version and build are fixed per deploy), field-terms
+  sha, pool fingerprint (keys · updated_at), core-vocab fingerprint, tool-map sha, the selection knobs. With `run`,
+  every item is appended to `runs/<run>.jsonl` without the question text.
 - **Eval sets** — `python -m tools.seat_evalset build [--experts ../ExpertAgents] [--c-queries <AIDataHub ko-search
   queries.jsonl>] [--pool-file <keys>] [--seed 20261031]` writes `A.jsonl` (600 authored confusions from
-  `routing.anti_examples` `# → target` comments, filters L1 · L2 · generic/unknown/self targets, quotas HW 12×30 · xd 60 ·
+  `routing.anti_examples` `# → target` comments, filters L1 · L2 (the answer's key or a name piece — the Korean and English
+  names without their role tail and parentheses, and each parenthetical alias; spaces, hyphens and case ignored,
+  three-letter acronyms only within word bounds) · generic/unknown/self targets, quotas HW 12×30 · xd 60 ·
   std/oss/misc all · sw 120 with the rest to HW, then xd, then sw; ≤ 2 per answer expert, ≤ 1 per (answer, author);
   dev/test split by answer expert), `A-name.jsonl` (the name bundle), `P.jsonl` (300 referral phrases from
   `expertise.out_of_scope`), `C.jsonl` (card-derived queries, title copies removed), `rels.jsonl` (key pairs and relation
   names only), `manifest.json` and `SEAL.txt` (`A-test sha256=…` over the sorted test qids). Same seed → same qids. No
   sibling ExpertAgents → skipped (exit 0). It refuses to write inside this repo — the sets travel by Drive (decision
   D-E5-8), never into a public repo or AIDataHub. `seal <dir>` re-checks the seal.
-- **Runner** — `python -m tools.seat_eval run --sets <dir> [--only A,P,C,H,N,T] [--layers …] [--run <id>]` sends the sets
-  in batches (the secret is read from `MCP_CONFIG`), keeps `<set>.results.jsonl` / `<set>.version.json` (no question text)
-  under `runs/<id>/` and prints numbers only: acc@1 · acc@3 · MRR@10 (strict · lenient), discover hit@5 · short seats ·
-  domain cover, summon recall · screening · asked-seat hit, confusion (confuser above the answer), "nobody" precision ·
-  recall · F0.5 per signal, N3 (answer domain and relation experts removed), labeler agreement (κ) and picked-vs-label,
-  guards (operators · unknown keys) and thinking latency p50 · p95 — per branch (hw · sw · xd · other), lexical band
-  (answer `desc_match` ≥ 0.40), split and H source. `compare <off> <on>` pairs two runs per qid (McNemar — exact below 25
-  discordant pairs, else χ² with continuity correction) and names any fingerprint field that differs (same day, same pool —
-  L8). dev is a smoke; the verdict is measured on cae00 (C-31).
+- **Runner** — `python -m tools.seat_eval run --sets <dir> [--only A,P,C,H,N,T] [--layers …] [--run <id>] [--split test|dev|all]`
+  sends the sets in batches (the secret is read from `MCP_CONFIG`), keeps `<set>.results.jsonl` / `<set>.version.json`
+  (no question text) under `runs/<id>/` and prints numbers only: acc@1 · acc@3 · MRR@10 (strict · lenient), discover
+  hit@5 · short seats · domain cover, summon recall · screening · asked-seat hit, confusion (confuser above the answer),
+  "nobody" precision · recall · F0.5 per signal, N3 (answer domain and relation experts removed), labeler agreement
+  (primary overlap over pairs where both gave primaries, "none" agreement apart, domain κ) and picked-vs-label (pinned-expert
+  chat only — a "none" label counts as a miss), guards (operators · unknown keys · errors) and thinking latency p50 · p95
+  (first `recommend_agents` call of the query vs repeated) — per branch (hw · sw · xd · other), lexical band (answer
+  `desc_match` ≥ 0.40) and H source. **A-dev and A-test never mix** (L7): `--split` (default `test` — the gate) sends,
+  reports and compares one half; tuning runs use `--split dev` and never send or print A-test; `all` reports the two halves
+  apart (`A:dev` · `A:test`). A layer with `tool_error` (or `rec.error` · `fallback`) is a failure, not a wrong answer: its
+  metrics and the layers that depend on it are left out of the denominators and counted in `guard.errors` · `dropped`.
+  The lexical band is decided once: `bands <B0 off-side run>` writes `<sets>/bands.json` (qid → hi|lo, never overwritten
+  without `--force`); report and compare use it (compare falls back to the off side's band, report to its own run). When H
+  is in the same run, report adds the A headline weighted by H's band shares (`weighted`). `compare <off> <on> [--split test|dev]`
+  pairs two runs per qid (McNemar — exact below 25 discordant pairs, else χ² with continuity correction clipped at 0),
+  overall and per group (branch · band · source — gate 3), with the number of queries dropped for tool failures, and
+  names any fingerprint field that differs across **every batch** of both runs (`off:`/`on:` for drift inside a run; same
+  day, same pool — L8). Report keeps every batch fingerprint and warns on drift inside a run. dev is a smoke; the verdict
+  is measured on cae00 (C-31).
 - **Real-use questions (E5-2, off by default)** — `SEAT_QUESTIONS_COLLECT=1` on the box (the user's permission comes first,
   like the tool-search query collection) records the first utterance of a pinned-expert chat, thinking questions, the
   topic of a deliberation whose seats a person picked (web `delib_opts.personas` · MCP `deliberate_start(personas)`) and

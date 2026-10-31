@@ -1845,6 +1845,12 @@ async def _load_tools(scoped: dict) -> list:
     return await _get_tools_retry(scoped, tries=_TOOL_LOAD_TRIES)
 
 
+# 전문가 고르기 기준선 창구(seat_probe — POST /seat-eval)가 요청이 도는 동안만 세우는 도구 사전. 서 있으면 _tools_by_name 이 그 사전을
+# 돌려준다 — 엔진 함수가 스스로 받는 사전(_persona_meta 등)도 창구의 읽기 전용 사전과 같아진다. 그 요청의 문맥에서 갈라진 일만 물려받으므로
+# 함께 도는 챗 · 심의에는 닿지 않는다(HWAXPortal docs/request-1029 design-e5 E5-1 · 반대 검토 10-31).
+_TOOLS_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar("tools_override", default=None)
+
+
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
                          user_pat: str = "", svc_fallback: bool = True) -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
@@ -1852,6 +1858,9 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     svc_fallback=False 면 사용자 토큰이 거절돼도(로드 때·호출 때 모두) 서비스 계정으로 넘어가지 않는다 — 로드 때는 예외를
     그대로 올리고, 호출 때는 자격 거절 문구(_AUTH_REJECT_MARK)를 그대로 돌려준다. 자격이 만료되면 멈추고 알려야 하는 길
     (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다."""
+    override = _TOOLS_OVERRIDE.get()
+    if override is not None:
+        return dict(override)
     conns = app.state.connections
     if not conns:
         return {}

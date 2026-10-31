@@ -2,7 +2,8 @@
 """재는 법은 design-e5 2.5 · 2.6, 성공 기준은 2.7 이다. tools/delib_ab.py 처럼 dev 는 스모크이고 판정은 cae00 이다(C-31).
 
 묶음 — 평가셋 자리(tools/seat_evalset.py 가 지은 것, Drive 로 받은 것)의 파일과 박스의 사람 표시.
-  A     A.jsonl — 저작 혼동(dev · test 를 따로 낸다). A-name.jsonl 은 이름 묶음(따로)
+  A     A.jsonl — 저작 혼동. dev · test 는 섞지 않는다(L7) — 실행 · 보고 · 짝 비교가 한쪽씩(--split, 기본 test — 관문 2 · 3). 손보기는
+        --split dev 로만 돌린다(A-test 숫자를 보지 않는다). A-name.jsonl 은 이름 묶음(따로)
   P     P.jsonl — 위임 문구 → 띵킹 위임 홉의 소집(top_k 3)에 대상이 드나(진단)
   C     C.jsonl — 카드 유래 → 카드 주인이 추천 상위 5 에 드나(진단)
   H     박스의 사람 표시(seat_questions.export) — 기준. 출처 넷 · '없음' 표시
@@ -12,10 +13,17 @@ H · N 의 질문 글은 박스 밖으로 나가지 않는다 — 결과 파일 
 
   실행:
     python -m tools.seat_eval run --sets <dir> [--only A,P,C,H,N,T] [--layers rec,discover,summon,screen] [--run <id>]
-                                  [--url http://127.0.0.1:9009] [--batch 20] [--limit N] [--by <표시자>]
-    python -m tools.seat_eval report <결과 자리>
-    python -m tools.seat_eval compare <끈 쪽 결과 자리> <켠 쪽 결과 자리>
+                                  [--split test|dev|all] [--url http://127.0.0.1:9009] [--batch 20] [--limit N] [--by <표시자>]
+    python -m tools.seat_eval bands <B0(끈 쪽) 결과 자리> [--force]   # 질의마다 어휘 칸을 한 번 정해 <평가셋>/bands.json 에(L3)
+    python -m tools.seat_eval report <결과 자리> [--split test|dev|all]
+    python -m tools.seat_eval compare <끈 쪽 결과 자리> <켠 쪽 결과 자리> [--split test|dev]
 공유 비밀은 에이전트 서버의 MCP 설정(MCP_CONFIG, 없으면 리포의 mcp_servers.json)의 게이트웨이 Authorization 을 읽는다 — 사람이 옮겨 적지 않는다.
+
+어휘 칸(L3) — 정답의 desc_match 는 추천 40 안에서만 보인다. 실행마다 칸을 셈하면 켠 쪽이 정답을 40 안으로 올린 질의가 칸을 옮겨 두 쪽이 다른
+무리를 견주게 된다. 그래서 칸은 한 번 정한다 — bands 가 B0(끈 쪽)의 결과로 <평가셋>/bands.json 에 적고(이미 적힌 질의는 다시 쓰지 않는다),
+report · compare 가 그것을 쓴다. 적힌 것이 없으면 compare 는 끈 쪽의 칸을, report 는 그 실행의 칸을 쓴다(보고에 출처를 적는다).
+도구 실패(창구의 겹마다 tool_error — 예외 · 실패 글 · 추천 폴백)는 틀린 답이 아니다 — 그 겹의 지표와 짝 비교의 분모에서 빼고 guard.errors ·
+dropped 로 센다. 띵킹 지연은 그 질의의 첫 추천 호출(summon.first)과 다시 부른 것을 따로 낸다.
 """
 from __future__ import annotations
 
@@ -36,6 +44,9 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_URL = "http://127.0.0.1:9009"
 LOW_CONF_DESC = 0.40            # AIDataHub _LOW_CONF_DESC — 어휘 일치 칸의 경계(L3)
 SETS = ("A", "P", "C", "H", "N", "T")
+SPLITS = ("dev", "test")                # A 의 가름(L7) — all 은 실행 · 보고에서만(둘을 따로 낸다)
+# 겹이 기대는 겹 — 앞 겹이 실패하면 뒤 겹의 결과도 믿지 않는다(창구 seat_probe._NEEDS 와 같다)
+DEPENDS = {"screen": ("summon",), "judge": ("summon", "screen"), "counter": ("discover",)}
 LAYERS_OF = {"A": ["rec", "discover", "summon", "screen"], "C": ["rec"], "P": ["summon"], "H": ["rec", "discover", "summon", "screen"],
              "N": ["rec", "discover", "summon", "screen"], "T": ["tools"]}
 LLM = ("judge", "counter", "axes")
@@ -131,7 +142,7 @@ def run(url: str, auth: str, name: str, rows: list[dict], *, layers: list | None
         got = call(url, auth, {"items": items, "layers": lay, "run": f"{run_id}-{name}", "concurrency": concurrency,
                                **body_extra})
         if not got.get("read_only", False):
-            raise RuntimeError(f"창구가 읽기 도구 밖을 불렀다 — {got.get('calls')}")
+            raise RuntimeError(f"창구가 읽기 도구 밖을 부르려 했다 — 막은 이름 {got.get('blocked')} · 부른 도구 {got.get('calls')}")
         vers.append(got.get("version") or {})
         res += got.get("items") or []
         print(f"  {name} {min(i + batch, len(rows))}/{len(rows)} · {time.time() - t0:.1f}초 · 부른 도구 {got.get('calls')}", flush=True)
@@ -163,24 +174,48 @@ def desc_of(res: dict, key: str):
     return None
 
 
+def failed_layers(res: dict) -> set:
+    """도구가 실패한 겹(창구가 단 tool_error · 추천 오류 · AIDataHub 빈 폴백)과 그 겹에 기대는 겹. 그 겹의 지표는 셈하지 않는다 — 실패는 틀린
+    답이 아니다(한쪽 일시 장애가 McNemar 에서 퇴보로 읽히지 않게)."""
+    res = res or {}
+    bad = {k for k, v in res.items() if isinstance(v, dict) and v.get("tool_error")}
+    rec = res.get("rec")
+    if isinstance(rec, dict) and (rec.get("error") or rec.get("fallback")):
+        bad.add("rec")
+    for lay, deps in DEPENDS.items():
+        if lay in res and bad & set(deps):
+            bad.add(lay)
+    return bad
+
+
+def errored(res: dict) -> bool:
+    """이 질의가 도구 실패 · 창구 예외를 겪었나 — guard.errors 로 센다."""
+    return bool((res or {}).get("error")) or bool(failed_layers(res))
+
+
 def item_metrics(row: dict, res: dict) -> dict:
-    """한 질의의 이진 결과 — 짝 비교(McNemar)의 단위다. 그 겹이 없으면 그 칸을 싣지 않는다."""
+    """한 질의의 이진 결과 — 짝 비교(McNemar)의 단위다. 그 겹이 없거나 도구가 실패했으면(failed_layers) 그 칸을 싣지 않는다. 창구 예외로
+    끝난 질의(error)는 아무 칸도 싣지 않는다."""
     m: dict = {}
+    if res.get("error"):
+        return m
+    bad = failed_layers(res)
+    has = {k for k in ("rec", "discover", "summon", "screen", "judge", "counter", "tools") if k in res and k not in bad}
     keys = ranked(res)
     for tag, ans in (("strict", row["answers"]), ("lenient", row["lenient"])):
-        if not ans or "rec" not in res:
+        if not ans or "rec" not in has:
             continue
         rk = rank_of(keys, ans)
         m[f"acc1_{tag}"] = rk == 1
         m[f"acc3_{tag}"] = rk is not None and rk <= 3
         m[f"hit5_{tag}"] = rk is not None and rk <= 5
         m[f"rr10_{tag}"] = (1.0 / rk) if rk and rk <= 10 else 0.0
-    if row.get("confuser") and "rec" in res:
+    if row.get("confuser") and "rec" in has:
         ra, rc = rank_of(keys, row["answers"]), rank_of(keys, [row["confuser"]])
         m["confused"] = rc is not None and (ra is None or rc < ra)
-    if "rec" in res:
+    if "rec" in has:
         m["low_conf"] = bool((res.get("rec") or {}).get("low_confidence"))
-    d = res.get("discover")
+    d = res.get("discover") if "discover" in has else None
     if d is not None:
         seats = d.get("seats") or []
         if row["lenient"]:
@@ -188,22 +223,23 @@ def item_metrics(row: dict, res: dict) -> dict:
             m["discover_hit5_strict"] = bool(set(seats[:5]) & set(row["answers"]))
         m["short"] = len(seats) < int(d.get("want") or 0)
         doms = {dom_of(k) for k in row["lenient"]}
-        if len(doms) >= 2:
-            seated = {dom_of(k) for k in seats} | {dom_of(c["key"]) for c in ((res.get("counter") or {}).get("seats") or [])}
+        if len(doms) >= 2 and ("counter" in has or "counter" not in res):
+            counter = ((res.get("counter") or {}).get("seats") or []) if "counter" in has else []
+            seated = {dom_of(k) for k in seats} | {dom_of(c["key"]) for c in counter}
             m["dom_cover"] = len(doms & seated) / len(doms)
-    s = res.get("summon")
+    s = res.get("summon") if "summon" in has else None
     if s is not None and row["lenient"]:
         m["summon_recall"] = bool({c["key"] for c in s.get("cands") or []} & set(row["lenient"]))
-    sc = res.get("screen")
+    sc = res.get("screen") if "screen" in has else None
     if sc is not None and row["lenient"]:
         m["screen_pass"] = any(x.get("passed") for x in sc.get("seats") or [] if x["key"] in set(row["lenient"]))
         m["asked_hit"] = bool(set(sc.get("asked") or []) & set(row["lenient"]))
-    j = res.get("judge")
+    j = res.get("judge") if "judge" in has else None
     if j is not None:
         m["no_answer"] = bool(j.get("no_answer"))
         if row["lenient"]:
             m["answered_hit"] = bool(set(j.get("answered") or []) & set(row["lenient"]))
-    t = res.get("tools")
+    t = res.get("tools") if "tools" in has else None
     if t is not None:
         prefer = t.get("prefer") or []
         if row.get("apps"):
@@ -214,20 +250,105 @@ def item_metrics(row: dict, res: dict) -> dict:
     return m
 
 
+# ── 어휘 칸(L3) ──────────────────────────────────────────────────────────────
+BANDS_FILE = "bands.json"
+
+
 def band(row: dict, res: dict) -> str:
-    """어휘 일치 칸(L3) — 정답의 desc_match 가 0.40 이상이면 hi(추천 40 밖이면 lo)."""
+    """어휘 일치 칸 — 정답의 desc_match 가 0.40 이상이면 hi(추천 40 밖이면 lo). 한 실행의 결과로 셈한 값이다 — 두 실행을 견줄 때는 band_for 로
+    한 번 정한 칸을 쓴다."""
     vals = [desc_of(res, k) for k in row["answers"]]
     vals = [v for v in vals if isinstance(v, (int, float))]
     return "hi" if vals and max(vals) >= LOW_CONF_DESC else "lo"
 
 
-def groups_of(name: str, row: dict, res: dict) -> list[str]:
+def bands_of(rows: list[dict], results: dict) -> dict:
+    """{qid: 칸} — 정답이 있고 추천 겹이 성한 질의만(B0 끈 쪽 결과로 한 번 정할 때 쓴다)."""
+    out = {}
+    for r in rows:
+        res = results.get(r["qid"])
+        if r.get("answers") and res and "rec" in res and not res.get("error") and "rec" not in failed_layers(res):
+            out[r["qid"]] = band(r, res)
+    return out
+
+
+def load_bands(sets: Path | None) -> dict:
+    """평가셋 자리에 한 번 정해 둔 칸(bands.json) — 없거나 못 읽으면 빈 사전."""
+    if not sets:
+        return {}
+    try:
+        d = json.loads((Path(sets) / BANDS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): v for k, v in d.items() if v in ("hi", "lo")} if isinstance(d, dict) else {}
+
+
+def band_for(row: dict, res: dict | None, fixed: dict | None) -> tuple[str, str]:
+    """(칸, 출처) — 한 번 정해 둔 칸(set)이 먼저, 없으면 주어진 결과로 셈한다(run)."""
+    b = (fixed or {}).get(row["qid"])
+    if b:
+        return b, "set"
+    return band(row, res or {}), "run"
+
+
+def write_bands(d: Path, force: bool = False) -> tuple[Path, int, int]:
+    """B0(끈 쪽) 결과 자리 → <평가셋>/bands.json. 이미 적힌 질의는 다시 쓰지 않는다(force 가 아니면) — 칸은 질의 · 정답의 성질로 한 번만 정한다."""
+    meta = json.loads((d / "run.json").read_text(encoding="utf-8")) if (d / "run.json").is_file() else {}
+    if not meta.get("sets"):
+        raise SystemExit("이 결과 자리는 --sets 없이 돌았다 — 칸을 적을 평가셋 자리가 없다")
+    sets = Path(meta["sets"])
+    got: dict = {}
+    for name in SETS:
+        res = _results(d, name)
+        if res:
+            got.update(bands_of(load_set(name, sets, meta.get("by")), res))
+    have = load_bands(sets)
+    merged = {**have, **got} if force else {**got, **have}
+    added = sum(1 for q in got if q not in have)
+    path = sets / BANDS_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(dict(sorted(merged.items())), ensure_ascii=False, indent=0), encoding="utf-8")
+    tmp.chmod(0o600)
+    os.replace(tmp, path)
+    return path, added, len(merged)
+
+
+def band_shares(rows: list[dict], results: dict, bands: dict | None = None) -> dict | None:
+    """H(맡은 질문)의 어휘 칸 비율 — A 의 머리 숫자를 맞출 무게(L3 의 뒤 절반)."""
+    c: Counter = Counter()
+    for r in rows:
+        res = results.get(r["qid"])
+        if not res or not r.get("answers") or r.get("kind") != "owned":
+            continue
+        if not (bands or {}).get(r["qid"]) and (res.get("error") or "rec" not in res or "rec" in failed_layers(res)):
+            continue
+        c[band_for(r, res, bands)[0]] += 1
+    n = sum(c.values())
+    return {"hi": round(c["hi"] / n, 4), "lo": round(c["lo"] / n, 4), "n": n} if n else None
+
+
+def weighted(groups: dict, shares: dict | None) -> dict:
+    """칸마다의 평균을 무게(shares 의 hi · lo)로 더한다 — 무게가 있는 칸에 값이 없는 지표는 셈하지 않는다."""
+    if not shares:
+        return {}
+    hi, lo = groups.get("band:hi") or {}, groups.get("band:lo") or {}
+    wa, wb = float(shares.get("hi") or 0.0), float(shares.get("lo") or 0.0)
+    out = {}
+    for k in sorted((set(hi) | set(lo)) - {"n"}):
+        a, b = hi.get(k), lo.get(k)
+        if (a is None and wa) or (b is None and wb):
+            continue
+        out[k] = round(float(a or 0.0) * wa + float(b or 0.0) * wb, 4)
+    return out
+
+
+def groups_of(name: str, row: dict, res: dict, bands: dict | None = None) -> list[str]:
+    """갈래 — all · 갈래(branch) · 어휘 칸(band — 한 번 정한 칸이 먼저) · H 출처(src) · 종류(kind). A 의 dev · test 는 묶음을 나눠 내므로
+    (A:dev · A:test) 한 묶음 안에 섞이지 않는다."""
     g = ["all"]
-    if row.get("split"):
-        g.append(f"split:{row['split']}")
     if row["answers"]:
         g.append(f"branch:{branch(dom_of(row['answers'][0]))}")
-        g.append(f"band:{band(row, res)}")
+        g.append(f"band:{band_for(row, res, bands)[0]}")
     if row.get("src"):
         g.append(f"src:{row['src']}")
     if row.get("kind"):
@@ -245,6 +366,10 @@ def _pct(vals, q):
         return None
     v = sorted(vals)
     return v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
+
+
+def _lat(xs: list) -> dict | None:
+    return {"n": len(xs), "p50": _pct(xs, 0.5), "p95": _pct(xs, 0.95)} if xs else None
 
 
 def none_scores(rows: list[dict], per: dict, signal: str) -> dict | None:
@@ -266,7 +391,7 @@ def none_scores(rows: list[dict], per: dict, signal: str) -> dict | None:
 
 def domain_removed(rows: list[dict], results: dict, rels: list[dict]) -> dict | None:
     """N3 — 정답 도메인 전원과 정답의 관계 전문가(sibling · counterpart)를 추천에서 뺀 채 low_confidence 를 다시 센다(추천 40 안의 desc_match 로 —
-    40 밖은 모른다). 기대는 '없음'. 숫자는 잡음 띠와 함께 보는 보조다."""
+    40 밖은 모른다). 기대는 '없음'. 숫자는 잡음 띠와 함께 보는 보조다. 추천 겹이 실패한 질의는 뺀다."""
     rel = defaultdict(set)
     for r in rels:
         if r.get("rel") == "sibling" or "counterpart" in str(r.get("rel") or ""):
@@ -275,7 +400,8 @@ def domain_removed(rows: list[dict], results: dict, rels: list[dict]) -> dict | 
     flagged = n = 0
     for row in rows:
         res = results.get(row["qid"])
-        if not res or not row["answers"] or "rec" not in res or row.get("kind") != "owned":
+        if not res or not row["answers"] or "rec" not in res or row.get("kind") != "owned" or res.get("error") \
+                or "rec" in failed_layers(res):
             continue
         gone = {dom_of(k) for k in row["answers"]}
         drop = set(row["answers"]) | set().union(*(rel[k] for k in row["answers"]))
@@ -287,62 +413,89 @@ def domain_removed(rows: list[dict], results: dict, rels: list[dict]) -> dict | 
 
 
 def agreement(rows: list[dict]) -> dict | None:
-    """H 두 사람 일치 — 주 전문가가 겹치는 비율 · 도메인 일치도(Cohen κ, 첫 주 전문가의 도메인 또는 '없음' 갈래)."""
+    """H 두 사람 일치 — 주 전문가 겹침은 둘 다 주 전문가를 단 짝에서만(primary_n), '없음' 은 따로(none_n — 한쪽이라도 '없음' 을 단 짝에서 둘 다
+    '없음' 이면 맞음), 도메인 일치도(Cohen κ — 첫 주 전문가의 도메인 또는 '없음' 갈래)는 모든 짝에서. 없음/없음 짝을 겹침 0 으로 세면 둘이 다
+    맞게 단 질문이 어긋남으로 읽힌다."""
     pairs = [(r, o) for r in rows for o in r.get("others") or [] if not o.get("unsure")]
     if not pairs:
         return None
 
     def cat(lb):
         return f"none:{lb.get('none')}" if lb.get("none") else (dom_of((lb.get("primary") or [""])[0]) or "?")
-    overlap = sum(1 for r, o in pairs if set(r["answers"]) & set(o.get("primary") or []))
+    prim = [(r, o) for r, o in pairs if r["answers"] and o.get("primary")]
+    nonp = [(r, o) for r, o in pairs if r.get("none") or o.get("none")]
+    overlap = sum(1 for r, o in prim if set(r["answers"]) & set(o.get("primary") or []))
+    none_ok = sum(1 for r, o in nonp if r.get("none") and o.get("none"))
     a = [cat({"none": r.get("none"), "primary": r["answers"]}) for r, _o in pairs]
     b = [cat(o) for _r, o in pairs]
     po = sum(1 for x, y in zip(a, b) if x == y) / len(pairs)
     ca, cb = Counter(a), Counter(b)
     pe = sum(ca[k] * cb[k] for k in set(ca) | set(cb)) / (len(pairs) ** 2)
     kappa = (po - pe) / (1 - pe) if pe < 1 else 1.0
-    return {"n": len(pairs), "primary_overlap": round(overlap / len(pairs), 4), "domain_kappa": round(kappa, 4)}
+    return {"n": len(pairs), "primary_n": len(prim), "primary_overlap": round(overlap / len(prim), 4) if prim else None,
+            "none_n": len(nonp), "none_agree": round(none_ok / len(nonp), 4) if nonp else None, "domain_kappa": round(kappa, 4)}
 
 
 def picked_agreement(rows: list[dict]) -> dict | None:
-    """사람이 고른 전문가(지목 · 지정 좌석)와 표시가 맞는 비율 — 사람이 고른 전문가를 얼마나 믿을 수 있나(design-e5 2.4)."""
-    xs = [r for r in rows if r.get("picked") and r["kind"] == "owned"]
+    """사람이 지목한 전문가(지목 전문가 챗 — src persona)와 표시가 맞는 비율 — 사람이 고른 전문가를 얼마나 믿을 수 있나(design-e5 2.4 '지목
+    전문가 출처는'). 표시가 '없음' 인 줄은 어긋남으로 센다. 심의 화두(delib)는 세지 않는다 — 웹 심의 화면은 추천 상위를 기본으로 골라 두어 좌석이
+    사람이 고른 것인지 모른다(L6 — 시스템이 고른 좌석은 정답이 아니다)."""
+    xs = [r for r in rows if r.get("picked") and r.get("src") == "persona" and r.get("kind") in ("owned", "none")]
     if not xs:
         return None
-    hit = sum(1 for r in xs if set(r["picked"]) & set(r["lenient"]))
+    hit = sum(1 for r in xs if set(r["picked"]) & set(r.get("lenient") or []))
     return {"n": len(xs), "picked_in_label": round(hit / len(xs), 4)}
 
 
-def summarize(name: str, rows: list[dict], results: dict, rels: list[dict] | None = None) -> dict:
-    """묶음 하나의 보고 — 갈래마다 지표 평균(이진은 비율), '없음' 신호, 지킴, 지연. 질문 글은 싣지 않는다."""
+def summarize(name: str, rows: list[dict], results: dict, rels: list[dict] | None = None, bands: dict | None = None) -> dict:
+    """묶음 하나의 보고 — 갈래마다 지표 평균(이진은 비율), '없음' 신호, 지킴, 지연. 질문 글은 싣지 않는다. 도구가 실패한 겹은 그 지표의
+    분모에서 빠지고 dropped 로 센다."""
     per = {r["qid"]: item_metrics(r, results[r["qid"]]) for r in rows if r["qid"] in results}
     by_group: dict = defaultdict(lambda: defaultdict(list))
+    src: Counter = Counter()
     for r in rows:
         if r["qid"] not in per:
             continue
-        for g in groups_of(name, r, results[r["qid"]]):
+        res = results[r["qid"]]
+        if r["answers"]:
+            src[band_for(r, res, bands)[1]] += 1
+        for g in groups_of(name, r, res, bands):
             for k, v in per[r["qid"]].items():
                 by_group[g][k].append(v)
     out = {"n": len(per), "missing": len(rows) - len(per),
            "groups": {g: {"n": max(len(v) for v in ms.values()) if ms else 0, **{k: _mean(v) for k, v in sorted(ms.items())}}
                       for g, ms in sorted(by_group.items())}}
+    if src:
+        out["band_src"] = dict(src)
     sig = {s: none_scores(rows, per, s) for s in ("low_conf", "no_answer")}
     sig = {k: v for k, v in sig.items() if v}
     if sig:
         out["none"] = sig
-    guard = Counter()
-    lat = []
-    for q, res in results.items():
+    guard: Counter = Counter()
+    dropped: Counter = Counter()
+    first, repeat = [], []
+    for r in rows:
+        res = results.get(r["qid"])
+        if res is None:
+            continue
         g = res.get("guard") or {}
         guard["operators"] += int(g.get("operators") or 0)
         guard["unknown"] += int(g.get("unknown") or 0)
-        guard["errors"] += 1 if res.get("error") else 0
-        ms = int((res.get("summon") or {}).get("ms") or 0) + int((res.get("screen") or {}).get("ms") or 0)
-        if res.get("summon"):
-            lat.append(ms)
-    out["guard"] = dict(guard)
-    if lat:
-        out["think_ms"] = {"p50": _pct(lat, 0.5), "p95": _pct(lat, 0.95)}
+        bad = failed_layers(res)
+        if errored(res):
+            guard["errors"] += 1
+            for lay in sorted(bad) or ["all"]:
+                dropped[lay] += 1
+        s, sc = res.get("summon"), res.get("screen")
+        if s and not res.get("error") and not ({"summon", "screen"} & bad):
+            ms = int(s.get("ms") or 0) + int((sc or {}).get("ms") or 0)
+            (first if s.get("first") else repeat).append(ms)
+    out["guard"] = {"operators": guard["operators"], "unknown": guard["unknown"], "errors": guard["errors"]}
+    out["dropped"] = {"queries": guard["errors"], "layers": dict(sorted(dropped.items()))}
+    if first or repeat:
+        # 소집이 그 질의의 첫 추천 호출이다(창구가 겹을 summon → screen → rec → discover 차례로 돈다). first 는 이 창구 프로세스가 그
+        # 질의를 처음 보낸 것 — AIDataHub · DB 쪽 데움은 알 수 없다. 관문의 지연(p95 +10%)은 first 로 견준다.
+        out["think_ms"] = {"first": _lat(first), "repeat": _lat(repeat)}
     if name in ("A", "H") and rels:
         n3 = domain_removed(rows, results, rels)
         if n3:
@@ -357,25 +510,28 @@ def summarize(name: str, rows: list[dict], results: dict, rels: list[dict] | Non
 
 
 def mcnemar(b: int, c: int) -> float:
-    """짝 비교 — b(끈 쪽만 맞음) · c(켠 쪽만 맞음). 엇갈린 짝이 25 아래면 정확 이항(양쪽), 아니면 연속성 보정 χ²(자유도 1)."""
+    """짝 비교 — b(끈 쪽만 맞음) · c(켠 쪽만 맞음). 엇갈린 짝이 25 아래면 정확 이항(양쪽), 아니면 연속성 보정 χ²(자유도 1 — 보정은 0 아래로
+    내려가지 않는다, b = c 면 p = 1)."""
     n = b + c
     if n == 0:
         return 1.0
     if n < 25:
         k = min(b, c)
         return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
-    chi2 = (abs(b - c) - 1) ** 2 / n
+    chi2 = max(0, abs(b - c) - 1) ** 2 / n
     return math.erfc(math.sqrt(chi2 / 2))
 
 
 def paired(rows: list[dict], off: dict, on: dict) -> dict:
-    """끈 쪽 · 켠 쪽을 같은 qid 로 맞대어 이진 지표마다 (끈 쪽 비율, 켠 쪽 비율, 차, b, c, p)."""
+    """끈 쪽 · 켠 쪽을 같은 qid 로 맞대어 이진 지표마다 (끈 쪽 비율, 켠 쪽 비율, 차, b, c, p). 어느 한쪽이라도 그 지표가 없는(겹이 없거나 도구가
+    실패한) 질의는 그 지표의 분모에서 빠진다."""
     out = {}
-    pm_off = {r["qid"]: item_metrics(r, off[r["qid"]]) for r in rows if r["qid"] in off and r["qid"] in on}
-    pm_on = {r["qid"]: item_metrics(r, on[r["qid"]]) for r in rows if r["qid"] in off and r["qid"] in on}
-    keys = sorted({k for m in pm_off.values() for k, v in m.items() if isinstance(v, bool)})
+    both_q = [r for r in rows if r["qid"] in off and r["qid"] in on]
+    pm_off = {r["qid"]: item_metrics(r, off[r["qid"]]) for r in both_q}
+    pm_on = {r["qid"]: item_metrics(r, on[r["qid"]]) for r in both_q}
+    keys = sorted({k for pm in (pm_off, pm_on) for m in pm.values() for k, v in m.items() if isinstance(v, bool)})
     for k in keys:
-        both = [q for q in pm_off if k in pm_off[q] and k in pm_on.get(q, {})]
+        both = [q for q in pm_off if k in pm_off[q] and k in pm_on[q]]
         if not both:
             continue
         b = sum(1 for q in both if pm_off[q][k] and not pm_on[q][k])
@@ -387,17 +543,49 @@ def paired(rows: list[dict], off: dict, on: dict) -> dict:
     return out
 
 
+def paired_groups(name: str, rows: list[dict], off: dict, on: dict, bands: dict | None = None) -> dict:
+    """갈래마다 짝 비교(관문 3 — 갈래 · 어휘 칸 어디도 −5%p 넘게 떨어지지 않는다). 어휘 칸은 한 번 정한 칸(bands — 없으면 끈 쪽의 칸)이라 두 쪽이
+    같은 무리를 견준다 — 켠 쪽이 정답을 40 안으로 올려도 칸이 옮지 않는다."""
+    both = [r for r in rows if r["qid"] in off and r["qid"] in on]
+    fixed = {**{r["qid"]: band(r, off[r["qid"]]) for r in both if r["answers"]}, **(bands or {})}
+    groups: dict = defaultdict(list)
+    for r in both:
+        for g in groups_of(name, r, off[r["qid"]], fixed):
+            if g != "all":
+                groups[g].append(r)
+    return {g: paired(rs, off, on) for g, rs in sorted(groups.items())}
+
+
+_VER_KEYS = ("pool", "field_terms", "tools_map", "knobs")
+# AIDataHub 의 version · build 는 배치마다 고정값이다(0.7.0 · BUILD_SHA=apptainer-deploy) — 형제 리포 커밋과 추천 코드 지문을 함께 본다
+_AIDH_KEYS = ("version", "build", "embed_slot", "repo", "recommend_svc")
+
+
+def _fp(v: dict) -> dict:
+    a = (v or {}).get("aidh") or {}
+    out = {k: (v or {}).get(k) for k in _VER_KEYS}
+    out.update({f"aidh.{k}": a.get(k) for k in _AIDH_KEYS})
+    return {k: json.dumps(x, sort_keys=True, ensure_ascii=False) for k, x in out.items()}
+
+
+def drift(vs: list) -> list[str]:
+    """한 실행 안 묶음들 사이에 바뀐 칸 — 긴 B0 도중의 동기화 · 풀 갱신 · 도구 지도 바뀜(L8). 빈 목록이면 처음부터 끝까지 한 판이다."""
+    fps = [_fp(v) for v in vs or []]
+    if len(fps) < 2:
+        return []
+    return [k for k in fps[0] if any(f[k] != fps[0][k] for f in fps[1:])]
+
+
 def same_version(v0: list, v1: list) -> list[str]:
-    """L8 — 같은 날 같은 풀에서 쟀나. 다른 칸 이름을 돌려준다(빈 목록이면 같다). 에이전트 커밋 · 어휘표 지문은 켠 쪽이 바꾸는 칸이라 견주지 않는다."""
-    a, b = (v0 or [{}])[0], (v1 or [{}])[0]
-    diff = []
-    for k in ("pool", "field_terms", "tools_map", "knobs"):
-        if a.get(k) != b.get(k):
+    """L8 — 같은 날 같은 풀에서 쟀나. 다른 칸 이름을 돌려준다(빈 목록이면 같다). 묶음 지문을 모두 본다 — 한 실행 안에서 바뀐 칸은 off: · on: 을
+    붙이고, 두 실행 사이에 값이 다른 칸은 이름만. 에이전트 커밋 · 어휘표 지문은 켠 쪽이 바꾸는 칸이라 견주지 않는다."""
+    a, b = list(v0 or [{}]), list(v1 or [{}])
+    diff = [f"off:{k}" for k in drift(a)] + [f"on:{k}" for k in drift(b)]
+    fa, fb = [_fp(v) for v in a], [_fp(v) for v in b]
+    for k in fa[0]:
+        if {f[k] for f in fa} != {f[k] for f in fb}:
             diff.append(k)
-    for k in ("version", "build", "embed_slot"):
-        if (a.get("aidh") or {}).get(k) != (b.get("aidh") or {}).get(k):
-            diff.append(f"aidh.{k}")
-    da, db = str(a.get("at") or "")[:10], str(b.get("at") or "")[:10]
+    da, db = str(a[0].get("at") or "")[:10], str(b[0].get("at") or "")[:10]
     if da != db:
         diff.append("day")
     return diff
@@ -408,45 +596,90 @@ def _results(d: Path, name: str) -> dict:
     return {r["qid"]: r for r in _jsonl(d / f"{name}.results.jsonl")}
 
 
-def report(d: Path) -> dict:
-    meta = json.loads((d / "run.json").read_text(encoding="utf-8")) if (d / "run.json").is_file() else {}
+def _meta(d: Path) -> dict:
+    return json.loads((d / "run.json").read_text(encoding="utf-8")) if (d / "run.json").is_file() else {}
+
+
+def _versions(d: Path, name: str) -> list:
+    f = d / f"{name}.version.json"
+    return (json.loads(f.read_text(encoding="utf-8")) or []) if f.is_file() else []
+
+
+def split_sets(name: str, rows: list[dict], split: str) -> list[tuple[str, list[dict]]]:
+    """(보고 이름, 줄) — A 는 dev · test 를 따로(A:dev · A:test, all 이면 둘 다 따로), 나머지 묶음은 그대로(H 는 전부 시험이다)."""
+    if name != "A":
+        return [(name, rows)]
+    sides = SPLITS if split == "all" else (split,)
+    return [(f"A:{s}", [r for r in rows if r.get("split") == s]) for s in sides]
+
+
+def report(d: Path, split: str | None = None) -> dict:
+    meta = _meta(d)
     sets = Path(meta["sets"]) if meta.get("sets") else None
+    split = split or meta.get("split") or "test"
     rels = _jsonl(sets / "rels.jsonl") if sets else []
-    out = {"run": meta.get("run"), "version": {}, "sets": {}}
+    fixed = load_bands(sets)
+    out = {"run": meta.get("run"), "split": split, "version": {}, "drift": {}, "sets": {}}
+    h_shares = None
     for name in SETS:
         res = _results(d, name)
         if not res:
             continue
         rows = load_set(name, sets, meta.get("by"))
-        out["sets"][name] = summarize(name, rows, res, rels)
-        vf = d / f"{name}.version.json"
-        if vf.is_file():
-            out["version"][name] = (json.loads(vf.read_text(encoding="utf-8")) or [{}])[0]
+        for key, rs in split_sets(name, rows, split):
+            if any(r["qid"] in res for r in rs):
+                out["sets"][key] = summarize(name, rs, res, rels, fixed)
+        vs = _versions(d, name)
+        if vs:
+            out["version"][name] = vs                   # 묶음마다의 지문을 모두 둔다(L8)
+            out["drift"][name] = drift(vs)
+        if name == "H":
+            h_shares = band_shares(rows, res, fixed)
+    # L3 의 뒤 절반 — A 의 머리 숫자를 H 의 어휘 칸 비율로 무게를 맞춘다(H 가 이 결과 자리에 있을 때만)
+    for key, s in out["sets"].items():
+        if key.startswith("A:"):
+            s["weighted"] = {"by": "H", "shares": h_shares, "metrics": weighted(s["groups"], h_shares)} if h_shares else None
     return out
 
 
-def compare(d0: Path, d1: Path) -> dict:
-    meta = json.loads((d0 / "run.json").read_text(encoding="utf-8")) if (d0 / "run.json").is_file() else {}
+def compare(d0: Path, d1: Path, split: str = "test") -> dict:
+    """끈 쪽 · 켠 쪽 짝 비교 — A 는 한쪽 가름만(기본 test — 관문 2 · 3, 손보기는 dev). 갈래 · 어휘 칸마다의 짝 비교 · 도구 실패로 뺀 질의 수 ·
+    판 차이를 함께 낸다."""
+    if split not in SPLITS:
+        raise ValueError(f"split 은 {list(SPLITS)} 가운데 하나다")
+    meta = _meta(d0)
     sets = Path(meta["sets"]) if meta.get("sets") else None
-    out = {"sets": {}}
+    fixed = load_bands(sets)
+    out = {"split": split, "sets": {}}
     for name in SETS:
         r0, r1 = _results(d0, name), _results(d1, name)
         if not (r0 and r1):
             continue
         rows = load_set(name, sets, meta.get("by"))
-        v0 = json.loads((d0 / f"{name}.version.json").read_text(encoding="utf-8")) if (d0 / f"{name}.version.json").is_file() else []
-        v1 = json.loads((d1 / f"{name}.version.json").read_text(encoding="utf-8")) if (d1 / f"{name}.version.json").is_file() else []
-        out["sets"][name] = {"paired": paired(rows, r0, r1), "version_diff": same_version(v0, v1)}
+        vdiff = same_version(_versions(d0, name), _versions(d1, name))
+        for key, rs in split_sets(name, rows, split):
+            rs = [r for r in rs if r["qid"] in r0 and r["qid"] in r1]
+            if not rs:
+                continue
+            out["sets"][key] = {"paired": paired(rs, r0, r1), "groups": paired_groups(name, rs, r0, r1, fixed),
+                                "dropped": sum(1 for r in rs if errored(r0[r["qid"]]) or errored(r1[r["qid"]])),
+                                "version_diff": vdiff}
     return out
 
 
 def _print_report(rep: dict) -> None:
-    for name, s in rep["sets"].items():
-        print(f"[{name}] n {s['n']} · 빠짐 {s['missing']} · 지킴 {s.get('guard')} · 띵킹 ms {s.get('think_ms')}")
+    for name, vs in (rep.get("drift") or {}).items():
+        if vs:
+            print(f"⚠ [{name}] 실행 도중 판이 바뀌었다 — {vs}(L8 — 바뀐 뒤의 묶음은 다른 판이다. 같은 판에서 다시 잰다)")
+    for key, s in rep["sets"].items():
+        print(f"[{key}] n {s['n']} · 빠짐 {s['missing']} · 지킴 {s.get('guard')} · 도구 실패로 뺀 질의 {s.get('dropped')}")
+        th = s.get("think_ms")
+        if th:
+            print(f"   띵킹 ms(소집 + 예심) — 그 질의의 첫 추천 호출 {th.get('first')} · 다시 부른 질의 {th.get('repeat')}")
         for g, ms in s["groups"].items():
             cells = " · ".join(f"{k} {v}" for k, v in ms.items() if k != "n" and v is not None)
             print(f"   {g:<16} n {ms['n']:>4} · {cells}")
-        for k in ("none", "n3", "agreement", "picked"):
+        for k in ("band_src", "weighted", "none", "n3", "agreement", "picked"):
             if s.get(k):
                 print(f"   {k}: {s[k]}")
 
@@ -459,29 +692,43 @@ def main(argv=None) -> int:
     r.add_argument("--only", default="A,P,C,H,N,T")
     r.add_argument("--layers", default="")
     r.add_argument("--run", default="")
+    r.add_argument("--split", choices=(*SPLITS, "all"), default="test",
+                   help="A 의 가름(L7) — test(기본 · 관문) · dev(손보기 — A-test 숫자를 내지 않는다) · all(둘을 따로 낸다)")
     r.add_argument("--url", default=DEFAULT_URL)
     r.add_argument("--batch", type=int, default=20)
     r.add_argument("--limit", type=int, default=0)
     r.add_argument("--by", default=None)
     r.add_argument("--concurrency", type=int, default=2)
     r.add_argument("--out", type=Path, default=None)
+    bd = sub.add_parser("bands")
+    bd.add_argument("dir", type=Path)
+    bd.add_argument("--force", action="store_true")
     rp = sub.add_parser("report")
     rp.add_argument("dir", type=Path)
+    rp.add_argument("--split", choices=(*SPLITS, "all"), default=None)
     cp = sub.add_parser("compare")
     cp.add_argument("off", type=Path)
     cp.add_argument("on", type=Path)
+    cp.add_argument("--split", choices=SPLITS, default="test")
     a = ap.parse_args(argv)
+    if a.cmd == "bands":
+        path, added, total = write_bands(a.dir, a.force)
+        print(f"어휘 칸 — 새로 {added}개 · 모두 {total}개 → {path}")
+        return 0
     if a.cmd == "report":
-        rep = report(a.dir)
+        rep = report(a.dir, a.split)
         _print_report(rep)
         (a.dir / "report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
         return 0
     if a.cmd == "compare":
-        cmp_ = compare(a.off, a.on)
+        cmp_ = compare(a.off, a.on, a.split)
         for name, s in cmp_["sets"].items():
-            print(f"[{name}] 판 차이 {s['version_diff'] or '없음'}")
+            print(f"[{name}] 판 차이 {s['version_diff'] or '없음'} · 도구 실패로 뺀 질의 {s['dropped']}")
             for k, v in s["paired"].items():
                 print(f"   {k:<22} {v}")
+            for g, pm in s["groups"].items():
+                cells = " · ".join(f"{k} {v['off']}→{v['on']}(p {v['p']})" for k, v in pm.items())
+                print(f"   [{g}] {cells}")
         return 0
     import seat_box  # noqa: PLC0415
     run_id = a.run or datetime.now().strftime("e5-%Y%m%d-%H%M%S")
@@ -492,10 +739,12 @@ def main(argv=None) -> int:
         print("LLM 겹이 들었다 — 심의가 도는 동안에는 창구가 거절한다(GLM 을 함께 쓴다)")
     out.mkdir(parents=True, exist_ok=True)
     (out / "run.json").write_text(json.dumps({"run": run_id, "sets": str(a.sets) if a.sets else None, "by": a.by,
-                                              "layers": layers, "at": datetime.now().isoformat(timespec="seconds")},
+                                              "layers": layers, "split": a.split, "at": datetime.now().isoformat(timespec="seconds")},
                                              ensure_ascii=False), encoding="utf-8")
     for name in [x for x in a.only.split(",") if x in SETS]:
         rows = load_set(name, a.sets, a.by)
+        if name == "A" and a.split != "all":
+            rows = [x for x in rows if x.get("split") == a.split]      # 손보기(dev)는 A-test 를 보내지도 않는다(L7)
         if a.limit:
             rows = rows[:a.limit]
         if not rows:
