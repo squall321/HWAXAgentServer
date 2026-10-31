@@ -2,8 +2,9 @@
 """받아들이는 기준(design-ha09-ha20.md B6 P1).
 
   · 표지(ui_host="mcp-apps/1")가 있는 턴만 패널 도구가 묶이고, 부르면 ui_resource 사건이 정확히 하나(주소 · 입력 · structuredContent · 결과 _meta).
-  · 표지가 없으면 묶이지 않는다(HA-05 회귀). 손잡이 CHAT_UI_HOST=0 이면 표지를 무시한다.
-  · 심의 · 루틴 · 카탈로그는 늘 안 묶는다. invoke_tool 경유는 막는다.
+  · 표지가 없거나 손잡이 CHAT_UI_HOST=0 이면 HA-20 전 그대로다(HA-05) — 이름 집합만 빼고, 집합 밖의 resourceUri 도구는 종전처럼 묶이고
+    invoke_tool 로도 간다(반대 검토 10-31 — 넓힌 규칙이 손잡이로 되돌릴 수 없는 길을 닫았다). 심의 · 루틴 · 카탈로그도 같다.
+  · invoke_tool 경유는 표지 턴에서만 배운 패널 이름까지 막는다(직접 부르라고 한다).
   · 사건이 상한을 넘으면 result 를 빼고 cut. 자기검증을 켜도 사건은 턴 도중에 나간다. 모델에 가는 결과는 그대로다(결과 _meta 는 모델 ·
     자기검증 · 다음 턴에 가지 않는다).
 
@@ -191,6 +192,13 @@ def _req(**kw):
 
 
 PANEL_NAMES = {"open_fake_panel", "open_workflow_panel", "big_panel", "open_app_only_panel", "panel_upload_begin"}
+HA05_NAMES = {n for n in PANEL_NAMES if a._chat_panel_tool(n)}          # HA-05 이름 집합(_CHAT_PANEL_TOOLS)에 드는 것 — 표지 없는 턴은 이것만 뺀다
+OUT_OF_SET = PANEL_NAMES - HA05_NAMES                                   # 주소(resourceUri)로만 패널인 것 — 표지 없는 턴은 HA-20 전처럼 묶는다
+
+
+def _ha05(conns) -> set:
+    """HA-20 전의 거르기 — 진짜 어댑터 목록에서 _agent_denied(외부 응답자 과제 · HA-05 이름 집합 · 루틴)만 뺀다. 표지 없는 길의 오라클이다."""
+    return {t.name for t in asyncio.run(a.MultiServerMCPClient(conns).get_tools()) if not a._agent_denied(t.name)}
 
 
 # ── 묶음 ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -201,11 +209,14 @@ def test_P1_표지_턴만_패널_도구를_묶고_패널_전용은_모델에_안
     off = {t.name for t in asyncio.run(a._get_tools_retry(conns))}
     assert {"open_fake_panel", "open_workflow_panel", "big_panel", "plain_lookup", "invoke_tool"} <= on, on
     assert not on & {"panel_upload_begin", "open_app_only_panel"}, "visibility 에 model 이 없는 도구는 표지 턴에도 모델에 안 묶는다"
-    assert not off & PANEL_NAMES and {"plain_lookup", "invoke_tool"} <= off, ("표지 없는 턴은 HA-05 그대로 — 집합 밖 이름도 주소로 알아본다", off)
+    assert off == _ha05(conns), ("표지 없는 턴은 HA-20 전 그대로(HA-05 이름 집합만 뺀다)", off)
+    assert not off & HA05_NAMES and OUT_OF_SET <= off, off
     assert ui.known("open_fake_panel") and ui.known("fake-panel_open_fake_panel") and not ui.known("plain_lookup")
 
 
-def test_P1_심의_루틴_카탈로그는_늘_패널_도구를_안_본다(panel_gw, monkeypatch):
+def test_P1_심의_루틴_카탈로그는_HA20_전_그대로다(panel_gw, monkeypatch):
+    """심의 좌석 · 루틴 · /도구 카탈로그는 표지를 받지 않는다 — HA-05 이름 집합만 빼고 나머지는 HA-20 전처럼 본다(B1 기준 3 · B5.6 — 집합 밖의
+    resourceUri 도구를 어떻게 다룰지는 Q-A1 답 뒤 사람 결정이다)."""
     conns, _ = panel_gw
     app_ = types.SimpleNamespace(state=types.SimpleNamespace(connections=conns))
     seat = set(asyncio.run(d._tools_by_name(app_, [])))
@@ -216,7 +227,7 @@ def test_P1_심의_루틴_카탈로그는_늘_패널_도구를_안_본다(panel_
     tools = [dd for ev, dd in asyncio.run(cat()) if ev == "tools"]
     catalog = {t["name"] for t in tools[0]["all"]} if tools else set()
     for name, got in (("심의", seat), ("루틴", rtn), ("카탈로그", catalog)):
-        assert "plain_lookup" in got and not got & PANEL_NAMES, (name, got)
+        assert "plain_lookup" in got and not got & HA05_NAMES and OUT_OF_SET <= got, (name, got)
 
 
 def test_P1_표지_턴의_에이전트와_스냅샷을_표지_없는_턴이_재사용하지_않는다(panel_gw, monkeypatch):
@@ -229,12 +240,12 @@ def test_P1_표지_턴의_에이전트와_스냅샷을_표지_없는_턴이_재�
     first = asyncio.run(_REAL_AGENT_FOR(fake, ["admin"]))
     with_panels = asyncio.run(_REAL_AGENT_FOR(fake, ["admin"], allow_panels=True))
     plain = asyncio.run(_REAL_AGENT_FOR(fake, ["admin"]))
-    assert "open_fake_panel" in with_panels._hwax_tools and plain is first and not set(plain._hwax_tools) & PANEL_NAMES
+    assert "open_workflow_panel" in with_panels._hwax_tools and plain is first and not set(plain._hwax_tools) & HA05_NAMES
     # 게이트웨이가 죽었다 — 표지 없는 턴의 스냅샷 폴백은 표지 없는 턴이 받은 목록이다(나중에 받은 표지 턴의 목록을 집지 않는다)
     state.agent_cache.clear()
     monkeypatch.setattr(a, "_get_tools_retry", _boom)
     down = asyncio.run(_REAL_AGENT_FOR(fake, ["admin"]))
-    assert "plain_lookup" in down._hwax_tools and not set(down._hwax_tools) & PANEL_NAMES, down._hwax_tools
+    assert "plain_lookup" in down._hwax_tools and not set(down._hwax_tools) & HA05_NAMES, down._hwax_tools
 
 
 async def _boom(*_a, **_k):
@@ -277,15 +288,23 @@ def test_P1_표지_턴에_부르면_사건_하나이고_모델은_그대로의_�
 
 @pytest.mark.parametrize("why", ["no-flag", "knob-off", "other-flag"])
 def test_P1_표지가_없거나_손잡이가_끄면_HA05_그대로다(panel_gw, monkeypatch, why):
-    conns, _ = panel_gw
-    llm = _Script(steps=["패널 도구 없이 답합니다."])
+    """HA-20 전과 같다 — HA-05 이름 집합만 묶지 않고 invoke_tool 로도 막는다. 집합 밖의 resourceUri 도구(가짜 앱 · ARP arp_upload_open 꼴)는 종전처럼
+    묶이고 invoke_tool 로도 게이트웨이에 간다(반대 검토 10-31 — 손잡이 CHAT_UI_HOST=0 으로 종전 동작을 되돌릴 수 있어야 한다). 사건은 없다."""
+    conns, calls = panel_gw
+    before = len(calls)
+    llm = _Script(steps=[[("invoke_tool", {"name": "fake-panel_open_fake_panel", "arguments": {"case": "K"}}),
+                          ("invoke_tool", {"name": "open_workflow_panel", "arguments": {}})], "패널 없이 답합니다."])
     seen = _wire(monkeypatch, llm, conns)
     if why == "knob-off":
         monkeypatch.setattr(ui, "ON", False)
     req = _req(ui_host={"no-flag": "", "knob-off": "mcp-apps/1", "other-flag": "mcp-apps/2"}[why])
     evs = _turn(req)
-    assert seen["allow"] == [False] and not set(seen["bound"][0]) & PANEL_NAMES, seen
+    bound = set(seen["bound"][0])
+    assert seen["allow"] == [False] and not bound & HA05_NAMES and OUT_OF_SET <= bound, seen
     assert not [ev for ev, _ in evs if ev == "ui_resource"]
+    tms = {m.tool_call_id: m.content for m in llm.seen[1] if isinstance(m, ToolMessage)}
+    assert ("invoke_tool", "fake-panel_open_fake_panel") in calls[before:], "집합 밖 이름은 invoke_tool 로도 종전처럼 간다"
+    assert ("invoke_tool", "open_workflow_panel") not in calls[before:] and "패널을 그리는 클라이언트 전용 도구" in tms["c1_1"], tms
 
 
 def test_P1_invoke_tool_경유는_표지_턴에도_막고_직접_부르라고_한다(panel_gw, monkeypatch):
@@ -297,12 +316,12 @@ def test_P1_invoke_tool_경유는_표지_턴에도_막고_직접_부르라고_�
     tm = [m for m in llm.seen[1] if isinstance(m, ToolMessage)][-1]
     assert tm.content.startswith(a._TOOL_FAIL_MARK) and "직접 묶인 그 이름으로" in tm.content, tm.content
     assert ("invoke_tool", "open_fake_panel") not in calls[before:] and not [ev for ev, _ in evs if ev == "ui_resource"]
-    # 표지 없는 턴 — 배운 이름(집합 밖)도 종전 HA-05 문구로 막는다
-    llm2 = _Script(steps=[[("invoke_tool", {"name": "fake-panel_open_fake_panel", "arguments": {}})], "끝"])
+    # 표지 턴 — 이름 집합의 패널 도구도 경유로는 막는다(직접 묶여 있다)
+    llm2 = _Script(steps=[[("invoke_tool", {"name": "fake-panel_open_workflow_panel", "arguments": {}})], "끝"])
     _wire(monkeypatch, llm2, conns)
-    _turn(_req())
+    _turn(_req(ui_host="mcp-apps/1"))
     tm2 = [m for m in llm2.seen[1] if isinstance(m, ToolMessage)][-1]
-    assert "패널을 그리는 클라이언트 전용 도구" in tm2.content and ("invoke_tool", "fake-panel_open_fake_panel") not in calls[before:]
+    assert "직접 묶인 그 이름으로" in tm2.content and ("invoke_tool", "fake-panel_open_workflow_panel") not in calls[before:]
 
 
 def test_P1_사건이_상한을_넘으면_결과를_빼고_cut_만_싣는다(panel_gw, monkeypatch):

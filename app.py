@@ -2208,13 +2208,16 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
+            # 패널을 그리는 턴(HA-20)이면 게이트웨이 목록에서 배운 패널 이름(resourceUri)도 막는다 — 직접 묶여 있다. 표지 없는 턴 · 심의 · 루틴은
+            # HA-20 전 그대로다(HA-05 이름 집합만 막는다 — 반대 검토 10-31: 손잡이로 종전 동작을 되돌릴 수 있어야 한다).
+            _ui_on = _ui.TURN.get() is not None
             for _args in (kw, *(x for x in a if isinstance(x, dict))):
                 _inner = _args.get("name") if isinstance(_args, dict) else None
-                if isinstance(_inner, str) and (_agent_denied(_inner) or _ui.known(_inner)):
-                    if _chat_panel_tool(_inner) or _ui.known(_inner):
-                        # 패널 도구는 invoke_tool 로는 늘 막는다 — 사건(ui_resource)이 도구 목록의 `_meta` 를 봐야 해서다(HA-20). 패널을 그리는
+                if isinstance(_inner, str) and (_agent_denied(_inner) or (_ui_on and _ui.known(_inner))):
+                    if _chat_panel_tool(_inner) or (_ui_on and _ui.known(_inner)):
+                        # 패널 도구는 invoke_tool 로는 막는다 — 사건(ui_resource)이 도구 목록의 `_meta` 를 봐야 해서다(HA-20). 패널을 그리는
                         # 턴이면 직접 묶여 있으니 그 이름으로 부르라고 말한다.
-                        if _ui.TURN.get() is not None:
+                        if _ui_on:
                             print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 패널 도구는 이름으로 직접 부른다(경유로는 패널이 안 뜬다)")
                             msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 패널 도구는 invoke_tool 로 부르면 패널이 뜨지 않는다 — "
                                    "이 대화에 직접 묶인 그 이름으로 부른다(묶여 있지 않으면 이 턴에는 쓸 수 없다). 인자 문제가 아니다")
@@ -3266,16 +3269,20 @@ def _ui_host(req: "ChatRequest") -> bool:
 
 
 def _bindable(tool, allow_panels: bool = False) -> bool:
-    """게이트웨이 도구 목록에서 묶을 수 있는 도구인가. 외부 응답자 과제 · 루틴 도구는 늘 뺀다. 패널 도구(HA-05 이름 집합 · `_meta.ui.resourceUri`)는
-    표지가 있는 턴(allow_panels)에 resourceUri 가 있을 때만 남긴다 — 이름 집합이라도 주소가 없으면 부를 패널이 없다(HA-20). `_meta.ui.visibility`
-    에 "model" 이 없는 도구(패널 전용)는 표지 턴에 모델에 묶지 않는다(표지 없는 턴은 지금 그대로 — HA-05 밖은 바꾸지 않는다)."""
+    """게이트웨이 도구 목록에서 묶을 수 있는 도구인가. 표지 없는 턴 · 심의 · 루틴 · 카탈로그(allow_panels 거짓)는 HA-20 전 그대로 `_agent_denied`
+    만 뺀다 — 외부 응답자 과제 · HA-05 이름 집합 · 루틴 도구다. 집합 밖의 resourceUri 도구(가짜 앱 · ARP arp_upload_open 꼴)는 종전처럼 묶인다
+    (반대 검토 10-31 — 넓힌 규칙은 손잡이 CHAT_UI_HOST=0 으로도 되돌릴 수 없었다. 그 도구를 어떻게 다룰지는 Q-A1 답 뒤 사람 결정 — B5.6).
+    표지 턴(allow_panels)은 패널 도구(HA-05 이름 집합 · `_meta.ui.resourceUri`)를 resourceUri 가 있을 때만 남기고 — 이름 집합이라도 주소가 없으면
+    부를 패널이 없다 — `_meta.ui.visibility` 에 "model" 이 없는 도구(패널 전용)는 모델에 묶지 않는다."""
     n = str(getattr(tool, "name", "") or "").strip().lower()
+    if not allow_panels:
+        return not _agent_denied(n)
     if any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or n in _ROUTINE_TOOLS:
         return False
     uri = _ui.resource_uri(tool)
     if uri or _chat_panel_tool(n):
-        return bool(allow_panels and uri and not _ui.model_hidden(tool))
-    return not (allow_panels and _ui.model_hidden(tool))
+        return bool(uri and not _ui.model_hidden(tool))
+    return not _ui.model_hidden(tool)
 
 
 # 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
@@ -4178,7 +4185,7 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
     도구 없이 응답하던 것을 흡수한다(cae00 '될 때도 안 될 때도' 실증). 401/403 인증 실패는
     재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다. 이 서버의 에이전트가 묶지 않는 도구(_AGENT_DENY_TOOLS)는 여기서 뺀다.
     allow_panels 는 표지가 있는 챗 턴만 준다(HA-20) — 그때만 패널 도구를 남기고 원 결과를 붙잡는 인터셉터를 단다. 심의 · 카탈로그 · 루틴은
-    주지 않아 패널 도구를 보지 못한다(_bindable). 주지 않으면 클라이언트를 종전 꼴 그대로 만든다."""
+    주지 않는다 — 주지 않으면 클라이언트도 거르기도 HA-20 전 그대로다(_bindable — HA-05 이름 집합만 뺀다)."""
     import asyncio as _aio
     last = None
     for i in range(max(1, tries)):

@@ -4,9 +4,10 @@
   · 켜는 표지 — 포털이 이번 턴 요청에 `ui_host: "mcp-apps/1"` 을 실었을 때만(화면에 호스트 부품이 있고 · 박스 손잡이가 켜졌고 · feat:panels 가
     있을 때 포털이 싣는다). 손잡이 CHAT_UI_HOST=0 이면 표지를 무시한다(HA-05 그대로 — 박스가 급히 끄는 길).
   · 패널 도구 — 도구 목록의 `_meta.ui.resourceUri`(옛 키 "ui/resourceUri")가 ui:// 인 도구와 HA-05 이름 집합(app._CHAT_PANEL_TOOLS). 표지가 있는
-    턴에만 묶고, 그 밖(옛 화면 · 켜지 않은 박스 · 심의 · 루틴 · 카탈로그)은 지금처럼 묶지 않는다. invoke_tool 로는 늘 막는다 — 사건이 도구
-    목록의 `_meta` 를 봐야 해서다(게이트웨이 지침 1번과 같다). `_meta.ui.visibility` 에 "model" 이 없는 도구(패널 전용)는 표지 턴에도 모델에
-    묶지 않는다.
+    턴은 주소가 있는 것만 묶고 invoke_tool 로 부르면 막는다(직접 부르라고 한다 — 사건이 도구 목록의 `_meta` 를 봐야 해서다, 게이트웨이 지침
+    1번과 같다). 그 밖(옛 화면 · 켜지 않은 박스 · 손잡이 끔 · 심의 · 루틴 · 카탈로그)은 HA-20 전 그대로다 — HA-05 이름 집합만 묶지도 부르지도
+    않고, 집합 밖의 주소 도구는 종전처럼 묶이고 invoke_tool 로도 간다(반대 검토 10-31 — 그 도구를 어떻게 다룰지는 Q-A1 답 뒤 사람 결정).
+    `_meta.ui.visibility` 에 "model" 이 없는 도구(패널 전용)는 표지 턴에 모델에 묶지 않는다.
   · 붙잡기 — 어댑터(langchain-mcp-adapters 0.3)는 호출 결과의 `_meta` 를 버린다. 인터셉터가 원 CallToolResult 의 글 블록 · structuredContent ·
     `_meta` 를 문맥 변수 그릇에 적고 결과는 손대지 않고 넘긴다 — 모델에 가는 결과는 지금과 같다(B-6 (가) — `_meta` 는 패널에만).
   · 사건 — 턴 그릇(Turn)에 쌓고 챗 스트림이 그 도구의 on_tool_end 에서 SSE ui_resource 로 낸다. 사용자 사건(adispatch_custom_event)은
@@ -71,7 +72,7 @@ def model_hidden(tool) -> bool:
 
 
 def learn(tools) -> None:
-    """도구 목록에서 패널 도구 이름을 배운다 — 표지가 없는 길(심의 · 카탈로그 · 루틴)의 목록도 배운다(invoke_tool 막이는 길과 무관하다)."""
+    """도구 목록에서 패널 도구 이름을 배운다 — 표지가 없는 길(심의 · 카탈로그 · 루틴)의 목록도 배운다. 읽는 쪽(invoke_tool 막이)은 표지 턴뿐이다."""
     for t in tools or ():
         if resource_uri(t):
             n = str(getattr(t, "name", "") or "").strip().lower()
