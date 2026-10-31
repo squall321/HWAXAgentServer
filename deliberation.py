@@ -10,7 +10,7 @@ import re
 import asyncio
 import contextvars
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다(풀기는 위키 원천의 주인 이메일)
 
@@ -1194,6 +1194,113 @@ def _seal(req_opts: dict) -> tuple[dict, list]:
     return {**req_opts, **closed, "sealed": 1}, reopen
 
 
+# ── 기준일(as_of) ────────────────────────────────────────────────────────────────
+# 소급 검증에서 그 날 뒤에 쓰인 지식카드가 근거로 잡히던 것(HWAXPortal docs/request-1027 HA-11)을 호출자가 준 날로 거른다 — 사용자 결정 10-31
+# A-keep(HWAXPortal docs/delib-engine-feedback D-15). 주면 그 잡의 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 좌석 자유 조회 · 지정
+# 도구)이 AIDataHub 에 as_of 와 as_of_undated='keep' 을 함께 보낸다. 도구 자체에 박으므로(_as_of_guard) 모델이 빼거나 다른 날을 넣을 수 없다.
+# 날짜 없는 카드는 남기고 '날짜 미확인' 으로 표시해 좌석마다 센다 — 빼면 지식만 가진 좌석이 통째로 빈다(D-15 실측). 옛 AIDataHub 는 모르는 인자를
+# 말없이 버려서 응답의 메아리(applied_config.as_of)가 거름이 걸렸다는 유일한 증거다 — 없으면 그 조회의 카드를 버리고 그렇다고 적는다(닫힌 쪽).
+# 날짜는 호출자가 준 값만 쓴다 — 질문 글에서 짐작하지 않는다. 띵킹 · 페르소나 챗 · 리스크 카드 대조는 이 값을 받지 않는다(범위 밖).
+_AS_OF_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")      # \d 는 유니코드 숫자(아라비아 · 전각 숫자)도 받는다 — ASCII 만
+_AS_OF_UNDATED = "날짜 미확인"
+# 메아리가 없어 카드를 버린 응답의 표지 칸 — 맨 앞 칸이라 결과 상한에 잘리지 않는다. 라운드가 이 칸으로 센다(사전 검색은 메아리를 따로 다시 본다).
+_AS_OF_UNCONFIRMED = "as_of_unconfirmed"
+# 라운드가 자유 조회 결과 글에서 날짜 미확인 히트를 세는 꼴 — _as_of_check 가 json.dumps(ensure_ascii=False) 로 쓴 칸 그대로다. 카드 본문 안의
+# 같은 글은 따옴표가 \" 로 이스케이프돼 이 꼴과 맞지 않는다.
+_AS_OF_UNDATED_MARK = json.dumps({"date_note": _AS_OF_UNDATED}, ensure_ascii=False)[1:-1]
+# 거르지 않은 것 — 기준일을 적는 자리마다 함께 적는다. 감추면 '전부 그 날 기준' 으로 읽힌다(봉인의 _SEALED_OPEN 과 같은 까닭).
+_AS_OF_OPEN = ("날짜로 거르지 않는 것: VOC 환기 · 보고서 · 정량 근거 선주입 · 지정 도구와 자유 조회의 다른 도구(semantic_search 등) · 좌석 역할 "
+               "정의 · 모델이 학습으로 아는 것 — 그때 있던 자료만으로 다시 보는 소급 검증은 봉인 실행이다")
+
+
+def _as_of_ok(v) -> bool:
+    """기준일 꼴인가 — 'YYYY-MM-DD' 글 하나이고 달력에 있는 날이다. 앞뒤 공백 · 일시 · 다른 꼴은 받지 않는다(포털 DelibOpts.as_of 와 같다)."""
+    if not isinstance(v, str) or not _AS_OF_RE.fullmatch(v):
+        return False
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        return False
+    return True
+
+
+def _as_of_refusal(req_opts) -> dict | None:
+    """기준일이 틀린 꼴이면 오류 칸 {code, message}, 아니면(없음 · 빈 값 포함) None — 심의 입구 셋과 MCP 잡 시작이 시작 전에 부른다.
+    못 읽은 날을 버리고 거르지 않은 채 돌면 그 결정문이 기준일로 거른 심의처럼 남는다(닫힌 쪽 — AIDataHub 도 틀린 as_of 는 오류로 낸다)."""
+    v = req_opts.get("as_of") if isinstance(req_opts, dict) else None
+    if v in (None, "") or _as_of_ok(v):
+        return None
+    return {"code": "bad_request",
+            "message": f"delib_opts.as_of(MCP 는 advanced.as_of)는 기준일 'YYYY-MM-DD' 다 — 받은 값 {_delib_preview(v, 40)} 은 그 꼴이 "
+                       "아니거나 달력에 없는 날이다. 이 심의는 시작하지 않았다(기준일을 못 읽은 채 거르지 않고 돌지 않는다)."}
+
+
+def _as_of_guard(tool, as_of: str):
+    """agent_search 도구에 기준일을 박는다 — _tools_by_name 이 결과 상한(_prep_tool) **앞에서** 감싼다. 상한을 지난 글은 끝의
+    applied_config 가 잘려 메아리를 볼 수 없다. as_of 가 비었거나 agent_search 가 아니면 그대로 돌려준다.
+
+    부를 때마다 as_of · as_of_undated='keep' 을 덮어 싣는다 — 모델이 빼도, 다른 날이나 'exclude' 를 넣어도 이 심의의 값으로 간다.
+    응답은 _as_of_check 가 메아리로 확인한다."""
+    orig = getattr(tool, "coroutine", None)
+    if not as_of or orig is None or getattr(tool, "name", "") != "agent_search":
+        return tool
+    pin = {"as_of": as_of, "as_of_undated": "keep"}
+
+    async def dated(*a, **kw):
+        # 어댑터에 따라 인자가 kw 로도, a 의 사전 하나로도 온다(app._cap_tool 과 같은 가정) — 온 자리에 덮는다.
+        if a and isinstance(a[0], dict):
+            asked = a[0].get("as_of")
+            a = ({**a[0], **pin}, *a[1:])
+        else:
+            asked = kw.get("as_of")
+            kw = {**kw, **pin}
+        return _as_of_check(await orig(*a, **kw), as_of, asked)
+
+    tool.coroutine = dated
+    return tool
+
+
+def _as_of_check(out, as_of: str, asked=None):
+    """agent_search 응답 → 기준일을 확인한 응답. 꼴은 받은 그대로다((content, artifact) 면 그 꼴로).
+
+    메아리(applied_config.as_of)가 보낸 날과 같으면 날짜 없는 히트(valid_from null)마다 date_note '날짜 미확인' 을 달고 맨 앞에 as_of_note 를
+    단다. 검색 결과 꼴(hits 칸)인데 메아리가 없거나 다르면 히트를 버리고 _AS_OF_UNCONFIRMED 칸을 맨 앞에 둔 거절로 바꾼다 — 구조화 사본
+    (artifact)도 버린다. 검색 결과 꼴이 아닌 응답(오류 글 따위)은 실린 카드가 없어 그대로 둔다. asked — 부른 쪽이 넣었던 as_of(덮어쓴 값)."""
+    pair = isinstance(out, tuple) and len(out) == 2
+    try:
+        d = json.loads(_as_text(out[0] if pair else out))
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(d, dict) or "hits" not in d:
+        return out
+    cfg = d.get("applied_config") if isinstance(d.get("applied_config"), dict) else {}
+    hits = d["hits"] if isinstance(d["hits"], list) else []
+    if cfg.get("as_of") != as_of:
+        got = cfg.get("as_of")
+        why = (f"메아리가 다른 날({_delib_preview(got, 30)})이다" if got not in (None, "")
+               else "메아리(applied_config.as_of)가 없다")
+        body = json.dumps({_AS_OF_UNCONFIRMED: f"기준일 {as_of} 거름이 걸렸는지 확인하지 못해 이 조회의 지식카드 {len(hits)}장을 싣지 "
+                                               f"않았다 — 지식 허브 응답에 {why}(옛 AIDataHub 는 모르는 인자를 말없이 버린다). 그 날 뒤의 "
+                                               "카드가 섞였을 수 있어서다.",
+                           "hits": [], "hit_count": 0, "refused": True}, ensure_ascii=False)
+        return (body, None) if pair else body
+    undated = 0
+    for h in hits:
+        if isinstance(h, dict) and h.get("valid_from") is None:
+            h["date_note"] = _AS_OF_UNDATED
+            undated += 1
+    ignored = f" — 좌석이 넣은 as_of({_delib_preview(asked, 30)})는 쓰지 않았다" if asked not in (None, "", as_of) else ""
+    note = (f"기준일 {as_of} 까지의 카드만 찾았다(이 심의의 기준일을 엔진이 박았다{ignored}). 날짜 없는 카드 {undated}장은 남기고 "
+            f"date_note '{_AS_OF_UNDATED}' 을 달았다 — 그 날 뒤에 쓰였을 수 있다.")
+    body = json.dumps({"as_of_note": note, **d}, ensure_ascii=False)
+    return (body, out[1]) if pair else body
+
+
+def _as_of_dropped(out) -> bool:
+    """_as_of_check 가 메아리가 없어 카드를 버린 답인가 — 그 칸이 맨 앞이라 결과 상한을 지난 글에서도 보인다."""
+    return isinstance(out, str) and out.lstrip().startswith("{" + json.dumps(_AS_OF_UNCONFIRMED))
+
+
 def _seat_key(p) -> str:
     """지정 좌석 항목의 키, 없으면 빈 문자열. 정본은 `key` 다. 추천 도구(recommend_agents)는 좌석 키를
     `agent_type` 으로 돌려주므로 그 이름으로 온 것도 받는다(발굴 _discover 가 읽는 이름과 같다) — 그 줄을
@@ -1403,6 +1510,9 @@ def _resolve_opts(req_opts):
         # 봉인은 이 값을 닫지 않는다(_SEALED_CLOSE 밖) — 자료를 가져오는 손잡이가 아니라 지식카드 조회의 인자이고,
         # 그 조회는 persona_knowledge 로 닫힌다.
         knowledge_query="",
+        # 기준일('YYYY-MM-DD') — 주면 이 잡의 좌석 지식카드 검색(agent_search)이 그 날까지의 카드만 찾는다(_as_of_guard). 비면 거르지 않는다.
+        # 봉인은 이 값도 닫지 않는다 — knowledge_query 와 같은 까닭(지식카드 조회의 인자다).
+        as_of="",
         # 봉인 실행(소급 검증) 여부와, 봉인이 닫은 손잡이 중 호출자가 열려던 것(스트림이 카드로 알린다).
         sealed=0, sealed_reopen=[],
         # 상한에서 줄인 요청 값 — 요청 키 → 무엇을 얼마나 줄였는지. 스트림이 카드 하나로 알린다.
@@ -1490,6 +1600,13 @@ def _resolve_opts(req_opts):
                                                    "아니거나 비었다 — 그 좌석은 대신 심의 주제로 찾는다)")
         elif kq not in (None, ""):
             o.req_unread["knowledge_query"] = f"knowledge_query={_delib_preview(kq, 40)}(대신 심의 주제로 찾는다)"
+        # 기준일 — 'YYYY-MM-DD' 만 받는다. 틀린 꼴은 입구(_as_of_refusal)가 시작 전에 거절하므로 여기까지 오는 것은 입구를 거치지 않고 읽는
+        # 쪽이다 — 거르지 않고 돈다는 사실을 남긴다. ⚠ 읽는 식(req_opts.get("as_of"))은 포털 계약 시험이 글자 그대로 찾는다.
+        ao = req_opts.get("as_of")
+        if _as_of_ok(ao):
+            o.as_of = ao
+        elif ao not in (None, ""):
+            o.req_unread["as_of"] = f"as_of={_delib_preview(ao, 40)}(대신 기준일 없이 돈다 — 'YYYY-MM-DD')"
         ct = req_opts.get("chair_template")
         if isinstance(ct, str) and ct in _CHAIR_ITEMS:
             o.chair_template = ct
@@ -1846,12 +1963,13 @@ async def _load_tools(scoped: dict) -> list:
 
 
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
-                         user_pat: str = "", svc_fallback: bool = True) -> dict:
+                         user_pat: str = "", svc_fallback: bool = True, as_of: str = "") -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
     결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다.
     svc_fallback=False 면 사용자 토큰이 거절돼도(로드 때·호출 때 모두) 서비스 계정으로 넘어가지 않는다 — 로드 때는 예외를
     그대로 올리고, 호출 때는 자격 거절 문구(_AUTH_REJECT_MARK)를 그대로 돌려준다. 자격이 만료되면 멈추고 알려야 하는 길
-    (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다."""
+    (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다.
+    as_of 를 주면(기준일 심의) agent_search 를 결과 상한 **앞에서** _as_of_guard 로 감싼다 — 서비스 계정 폴백 도구도 같다. 비면 종전 그대로다."""
     conns = app.state.connections
     if not conns:
         return {}
@@ -1874,6 +1992,8 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await _load_tools(scoped)
         via_pat = False
+    # 기준일은 상한 래퍼보다 안쪽에 박는다 — 메아리(applied_config)는 응답 끝에 있어 잘린 글로는 확인할 수 없다(_as_of_guard).
+    tools = [_as_of_guard(t, as_of) for t in tools]
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
@@ -1894,7 +2014,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         async def _svc_tools() -> dict:
             async with _svc_lock:
                 if not _svc:
-                    got = await _load_tools(_with_groups(conns, sorted(groups), user, ""))
+                    got = [_as_of_guard(t, as_of) for t in await _load_tools(_with_groups(conns, sorted(groups), user, ""))]
                     try:
                         from app import _prep_tool  # noqa: PLC0415
                         got = [_prep_tool(t, result_max, desc_max) for t in got]
@@ -3082,6 +3202,9 @@ def _grade_notes(h: dict) -> list[str]:
     cz = str(h.get("causal_status") or "").strip().lower()
     if cz and cz != "validated":
         out.append(_CAUSAL_NOTE.get(cz) or f"인과:{cz}")
+    # 기준일 심의에서 날짜 없이 남긴 카드(_as_of_check 가 단다) — 그 날 뒤에 쓰였을 수 있다. 그 밖의 길에는 이 칸이 오지 않는다.
+    if h.get("date_note") == _AS_OF_UNDATED:
+        out.append(_AS_OF_UNDATED)
     return out
 
 
@@ -3162,6 +3285,54 @@ def fit_knowledge_lines(hits, budget: int) -> tuple:
     return [], len(rows), 0
 
 
+def _undated_lines(hits, n: int) -> int:
+    """fit_knowledge_lines 가 실은 앞 n 줄 가운데 날짜 미확인 카드의 줄 수 — 그 함수와 같은 중복 제거로 센다(같은 줄은 한 번)."""
+    seen, flags = set(), []
+    for h in hits:
+        ln = knowledge_line(h, limit=0)
+        if ln not in seen:
+            seen.add(ln)
+            flags.append(isinstance(h, dict) and h.get("date_note") == _AS_OF_UNDATED)
+    return sum(flags[:n])
+
+
+def _as_of_seat(meta: dict, as_of: str) -> dict:
+    """좌석 사전 검색 하나의 기준일 셈 — meta 는 _agent_search_hits 가 채운 마지막 응답의 칸이다. state 는 ok(메아리가 맞다 — 좌석 범위에서
+    그 날 뒤라 뺀 수 later · 날짜 없이 남긴 수 kept) · unconfirmed(메아리가 없거나 다르다 — 카드를 싣지 않는다) · none(응답을 못 받았다 —
+    실패 사유는 강등 쪽이 알린다) 가운데 하나다."""
+    if "applied" not in meta:
+        return {"state": "none"}
+    cfg = meta["applied"]
+    if cfg.get("as_of") != as_of:
+        return {"state": "unconfirmed"}
+
+    def _n(k):
+        v = cfg.get(k)
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+    return {"state": "ok", "later": _n("as_of_excluded_later"), "kept": _n("as_of_undated_kept"), "undated_in": 0}
+
+
+def _as_of_line(as_of: str, pre: dict, free: dict) -> str:
+    """결정문 머리의 기준일 줄 — 코드가 찍는다(봉인 표지와 같은 까닭 — 결정문은 RA 보고서에 남는 내구 기록이다).
+    pre — 사전 검색 셈 {asked: 물은 좌석 수, lines: 실은 줄, undated: 그 가운데 날짜 미확인, later: 그 날 뒤라 뺀 카드(좌석마다 센 합),
+    unconfirmed: [좌석]}. free — 자유 조회 셈 {좌석: [agent_search 부른 수, 결과의 날짜 미확인 수, 메아리가 없어 버린 수]}."""
+    out = [f"{as_of}. 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 좌석 자유 조회)에 이 날을 박아(호출자가 준 날이다 — 질문에서 "
+           f"짐작하지 않았다) 지식 허브가 그 거름을 확인해 준 카드만 실었다. 날짜 없는 카드는 남기고 '{_AS_OF_UNDATED}' 으로 표시했다 — "
+           "그 날 뒤에 쓰였을 수 있다."]
+    if pre.get("asked"):
+        out.append(f"사전 검색 {pre['asked']}석 — 실은 카드 {pre['lines']}줄 가운데 {_AS_OF_UNDATED} {pre['undated']}줄 · 그 날 뒤라 뺀 카드 "
+                   f"{pre['later']}장(좌석마다 센 합).")
+    if free:
+        out.append(f"자유 조회의 agent_search {sum(v[0] for v in free.values())}건 — 결과에 {_AS_OF_UNDATED} "
+                   f"{sum(v[1] for v in free.values())}장.")
+    unc = sorted(set(pre.get("unconfirmed") or ()) | {k for k, v in free.items() if v[2]})
+    if unc:
+        out.append(f"지식 허브가 거름을 확인해 주지 않아(메아리 applied_config.as_of 없음) 카드를 싣지 않은 좌석: {', '.join(unc)}.")
+    if not pre.get("asked") and not pre.get("unconfirmed") and not free:
+        out.append("이 심의에는 이 거름이 걸린 조회가 없었다(좌석 지식카드 · 자유 조회의 agent_search 를 부르지 않았다).")
+    return " ".join(out) + f" {_AS_OF_OPEN}."
+
+
 def _knowledge_q_for(kq, seat_key: str, question: str) -> tuple[str, str]:
     """이 좌석의 지식카드 검색어와 그 출처 — ('caller' = 호출자가 준 것 | 'question' = 심의 주제)."""
     if isinstance(kq, str) and kq:
@@ -3175,11 +3346,13 @@ def _knowledge_q_for(kq, seat_key: str, question: str) -> tuple[str, str]:
 
 async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
                              mode: str = "hybrid",
-                             timeout_s: float | None = None) -> tuple[list, str]:
+                             timeout_s: float | None = None,
+                             meta: dict | None = None) -> tuple[list, str]:
     """(hits, note) — note 는 강등·실패 사유이고 빈 문자열이면 정상이다.
 
     타임아웃이면 `KNOWLEDGE_FALLBACK_MODE` 로 한 번 되묻는다. 그것도 실패하면 빈 목록과
     사유를 돌려준다 — **조용히 0건으로 만들지 않는다.** 이 함수는 심의·챗·띵킹이 함께 쓴다.
+    meta 를 주면 마지막으로 풀어 읽은 응답의 applied_config 를 meta["applied"] 에 적는다(기준일 심의가 메아리를 다시 본다 — _as_of_seat).
     """
     limit = KNOWLEDGE_TIMEOUT_S if timeout_s is None else timeout_s
 
@@ -3198,6 +3371,8 @@ async def _agent_search_hits(tools: dict, agent_type: str, q: str, *,
         d = _parse_json(raw if isinstance(raw, str) else json.dumps(raw, default=str))
         if not isinstance(d, dict):
             return None, f"{m} 응답을 해석하지 못함"
+        if meta is not None:
+            meta["applied"] = d.get("applied_config") if isinstance(d.get("applied_config"), dict) else {}
         if d.get("refused"):
             return [], ""          # 거절은 정상 판정이다 — 강등이 아니다.
         hits = d.get("hits")
@@ -4698,7 +4873,8 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
     call_trace.tag(kind="sim-delib")
-    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
+    # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
+    _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
@@ -4870,7 +5046,8 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     call_trace.tag(kind="delib")      # 호출 추적의 자리 — 이 제너레이터를 돌리는 태스크(웹 _detach_stream · MCP 잡)에 붙는다
-    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
+    _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {})
@@ -4900,7 +5077,8 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
     call_trace.tag(kind="test-plan")
-    _refused = _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
+    # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
+    _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
         yield _sse("error", _refused)
         yield _sse("done", {}); return
@@ -5007,6 +5185,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                        "했습니다 — 결과가 요청자 시야와 다를 수 있습니다. 포털이 찍는 챗 토큰의 수명이 이 "
                        "심의보다 짧습니다.",
             "knob": "포털 CHAT_PAT_TTL_S"})]
+    # 기준일 — 이 잡의 agent_search 는 전부 이 날로 거른다(엔진의 사전 검색 · 지정 도구는 아래 도구 로드, 좌석 자유 조회는 그 따로 로드)
+    _as_of = getattr(opts, "as_of", "") or ""
     if opts.sealed:
         # 무엇을 닫았는지 먼저 밝힌다. 호출자가 열려던 손잡이는 카드로도 남긴다 — 잡 원장에 실려
         # MCP 호출자가 진행 조회에서 본다(말없이 덮으면 자기가 고른 도구·VOC 가 돈 줄 안다).
@@ -5015,6 +5195,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="봉인이 닫은 요청", included=False,
                          text="봉인 실행이라 호출자가 보낸 다음 손잡이를 닫았다 — "
                               + ", ".join(opts.sealed_reopen))
+    if _as_of:
+        # 기준일도 먼저 밝힌다 — 무엇을 거르고 무엇을 거르지 않는지까지(결정문 머리에는 끝에 코드가 셈과 함께 찍는다)
+        yield _sse("status", {"step": f"기준일 {_as_of} — 좌석 지식카드 검색(agent_search)은 이 날까지의 카드만 찾는다 · "
+                                      f"날짜 없는 카드는 '{_AS_OF_UNDATED}' 으로 남긴다. {_AS_OF_OPEN}", "tool": None})
     if _ext:
         # 외부 응답자로 돈다는 것과 좌석 자유 조회의 길을 먼저 밝힌다 — 카드로도 남긴다(잡 원장의 evidence_omitted · 포털 근거 패널).
         # 여기서는 요청(free_tools)으로 말한다. 쓸 도구가 하나도 없으면 아래 자유 조회 준비가 free_tools_unavailable 로 따로 알리고, 끝의
@@ -5045,7 +5229,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _load_exc = None
     try:
         tools = await _tools_by_name(app, groups, CATALOG_RESULT_MAX, CATALOG_DESC_MAX, user=user,
-                                     user_pat=user_pat)
+                                     user_pat=user_pat, as_of=_as_of)
     except Exception as exc:  # noqa: BLE001
         print(f"[deliberation] 게이트웨이 도구 로드 실패({_TOOL_LOAD_TRIES}회 시도): {exc!r}")
         tools, _load_exc = {}, exc
@@ -5122,9 +5306,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
             _rmax = _free_result_chars(opts.tool_budget)
+            # 기준일 심의면 좌석의 agent_search 에도 그 날을 박는다(_as_of_guard — 모델이 빼거나 바꿀 수 없다)
             _g = {n: _wrap_cached(t, _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, _rmax,
-                                                    user=user, user_pat=user_pat)).items()
+                                                    user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY
                   and not (_risk_chair and n in _RISK_RA_REPORT_TOOLS) and (
                       _free_tool_ok(n)
@@ -5474,8 +5659,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 태그 가중치)를 자동 적용하므로 검색 폭은 전문가 설정을 따르고, 주입량은 문자 예산으로 자른다
     # (카드 전문을 통째로 넣으면 인원수 × 라운드로 곱해져 컨텍스트가 폭발한다).
     knowledge_by_key: dict = {}
+    # 기준일 셈 — 사전 검색(좌석마다)과 좌석 자유 조회(라운드마다)를 모아 결정문 머리의 기준일 줄이 읽는다(_as_of_line). 비면 쓰지 않는다.
+    _ao_pre = {"asked": 0, "lines": 0, "undated": 0, "later": 0, "unconfirmed": []}
+    _ao_free: dict = {}       # {좌석: [agent_search 부른 수, 결과의 날짜 미확인 수, 메아리가 없어 버린 수]}
     if opts.persona_knowledge and "agent_search" in tools:
         _kb_budget = _knowledge_budget()
+        # 기준일 심의는 좌석 지식 블록 머리에 한 줄을 단다 — 좌석이 '날짜 미확인' 의 뜻을 알게. 그 몫은 줄을 담기 전에 예산에서 뗀다.
+        _kb_head = (f"(기준일 {_as_of} 까지의 카드다 — '{_AS_OF_UNDATED}' 카드는 날짜가 없어 그 날 뒤에 쓰였을 수 있다)"
+                    if _as_of else "")
 
         # 챗과 같은 포맷 — 출처·인과상태가 함께 간다. 예산에 담는 방식은 fit_knowledge_lines(띵킹과 같은 함수)다.
         # 합성 지정석(_CHAIR_ADVERSARY)은 레지스트리에 없는 키라 물으면 **매번 404** 다. 폴백까지
@@ -5501,13 +5692,23 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 검색어는 호출자가 준 것(knowledge_query)이 있으면 그것, 없으면 화두다. 돌려주는 값에 실은 줄 수와
             # 검색어 출처를 같이 싣는다 — 받는 자리(아래 as_completed 루프)와 폭이 같아야 한다.
             _q, _qsrc = _knowledge_q_for(opts.knowledge_query, p["key"], question)
+            _meta: dict = {}
             async with _kn_sem:
-                hits, note = await _agent_search_hits(tools, p["key"], _q)
+                hits, note = await _agent_search_hits(tools, p["key"], _q, meta=_meta)
+            # 기준일 — 메아리를 여기서 한 번 더 본다. 없거나 다르면 이 좌석의 카드를 싣지 않는다(닫힌 쪽 — 도구를 감싼 _as_of_guard 가
+            # 이미 버렸어도 · 감싸지 않은 도구가 와도 같다). 기준일이 없으면 None 이고 아래는 종전 그대로다.
+            _ao = _as_of_seat(_meta, _as_of) if _as_of else None
+            if _ao is not None and _ao["state"] == "unconfirmed":
+                hits = []
             if not hits:
-                return p["key"], "", note, 0, _qsrc, 0, 0
+                return p["key"], "", note, 0, _qsrc, 0, 0, _ao
             # 뺀 수·줄인 수를 센다(중복은 빼고) — 종전엔 '확보' 로만 적혀 몇 건을 뺐는지 어디에도 없었다.
-            lines, dropped, trimmed = fit_knowledge_lines(hits, _kb_budget)
-            return p["key"], "\n".join(lines), note, len(lines), _qsrc, dropped, trimmed
+            lines, dropped, trimmed = fit_knowledge_lines(hits, _kb_budget - (len(_kb_head) + 1 if _kb_head else 0))
+            if _ao is not None:
+                _ao["undated_in"] = _undated_lines(hits, len(lines))
+            _blk = "\n".join(lines)
+            return (p["key"], f"{_kb_head}\n{_blk}" if _kb_head and _blk else _blk, note, len(lines), _qsrc, dropped, trimmed,
+                    _ao)
 
         # 호출자가 검색어를 줬을 때만 꼬리를 붙인다 — 안 줬으면 종전 글 그대로다.
         _kq = opts.knowledge_query
@@ -5542,12 +5743,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 기다린다 — 심의가 접히면(잡 취소 · 브라우저 닫힘) 거기서 끊기는데, 남은 조회는 아무도 기다리지
         # 않는 채 끝까지 돌았다. 접힌 자리에서 다음 심의가 곧바로 뜨면(잡 대기열) 그 조회들과 겹쳐
         # 한 번에 도는 수(_KN_CONC)가 깨진다.
+        _ao_rows: list = []     # [(좌석, 실은 줄, 날짜 미확인 줄, 좌석 범위의 날짜 없는 카드, 그 날 뒤라 뺀 카드)] — 기준일 심의만
         try:
             for _fut in asyncio.as_completed(_kn_tasks):
-                _k, _blk, _note, _n, _qsrc, _kd, _kt = await _fut
+                _k, _blk, _note, _n, _qsrc, _kd, _kt, _ao = await _fut
                 _kn_done += 1
                 if _kd or _kt:
                     _kn_cut.append((_k, _n, _n + _kd, _kt))
+                _unc = _ao is not None and _ao["state"] == "unconfirmed"
+                if _unc:
+                    _ao_pre["unconfirmed"].append(_k)
+                elif _ao is not None and _ao["state"] == "ok":
+                    _ao_pre["asked"] += 1
+                    _ao_pre["lines"] += _n
+                    _ao_pre["undated"] += _ao["undated_in"]
+                    _ao_pre["later"] += _ao["later"]
+                    _ao_rows.append((_k, _n, _ao["undated_in"], _ao["kept"], _ao["later"]))
                 if _blk:
                     knowledge_by_key[_k] = _blk
                     ev_count["knowledge"] += 1
@@ -5557,15 +5768,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     print(f"[deliberation] 지식카드 강등({_k}): {_note}")
                 yield _sse("status", {
                     "step": f"지식카드 {_kn_done}/{len(_kn_seats)} — {_k}"
-                            + (f" · {_note}" if _note else (" 확보" if _blk else " 관련 지식 없음"))
+                            + (f" · {_note}" if _note else
+                               " · 기준일 거름을 확인하지 못해(메아리 없음) 카드를 싣지 않았다" if _unc else
+                               (" 확보" if _blk else " 관련 지식 없음"))
                             + (f"({_n + _kd}건 중 {_n}건" + (f" · {_kt}건은 앞부분만" if _kt else "")
-                               + f" — 예산 {_kb_budget:,}자)" if _kd or _kt else ""),
+                               + f" — 예산 {_kb_budget:,}자)" if _kd or _kt else "")
+                            + (f" · 기준일 {_as_of} — {_AS_OF_UNDATED} {_ao['undated_in']}줄"
+                               if _blk and _ao is not None and _ao["state"] == "ok" else ""),
                     "tool": None,
                     # 리스크 앱이 좌석별 적중 수를 세는 원천이다(HWAXRisk engine_client.collect_stream).
                     # 키 넷의 이름을 바꾸면 그쪽 집계가 말없이 비고, tests/test_risk_app_contract_anchors 가 잡는다.
                     # hits 는 검색 건수가 아니라 좌석 프롬프트에 실은 줄 수다(중복 제거·글자 예산 뒤). degraded 는
                     # 강등 사유가 있을 때 참이고, 폴백으로 되물어 줄을 받은 좌석은 hits > 0 과 같이 온다.
-                    "knowledge": {"persona": _k, "hits": _n, "degraded": bool(_note), "query": _qsrc},
+                    # 기준일 거름을 확인하지 못해 카드를 버린 좌석도 강등이다(사유는 아래 as_of_unconfirmed 경고).
+                    "knowledge": {"persona": _k, "hits": _n, "degraded": bool(_note) or _unc, "query": _qsrc},
                     # 시간 한도에 걸린 강등이면 그 한도의 설정 이름을 싣는다(잡 원장이 붙인다). 사유 문구는
                     # _agent_search_hits 가 만든다 — 시간 초과는 '…초 초과' 로 적힌다.
                     **({"knob": "KNOWLEDGE_TIMEOUT_S"} if "초 초과" in _note else {})})
@@ -5575,6 +5791,24 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     _t.cancel()
         yield _sse("status", {"step": f"지식카드 주입 — {len(knowledge_by_key)}/{len(_kn_seats)}명 "
                                       f"관련 지식 확보", "tool": None})
+        if _ao_pre["unconfirmed"]:
+            # 닫힌 쪽으로 버렸다는 것을 말한다 — 말없이 빼면 '지식이 없는 좌석' 과 같아 보인다.
+            _unc_txt = ", ".join(sorted(_ao_pre["unconfirmed"]))
+            yield _sse("warning", {"code": "as_of_unconfirmed",
+                                   "message": f"기준일 {_as_of} 거름이 걸렸다는 확인(메아리)이 지식 허브 응답에 없어 "
+                                              f"{len(_ao_pre['unconfirmed'])}/{len(_kn_seats)}명의 지식카드를 싣지 않았습니다 — "
+                                              f"{_unc_txt}. 옛 AIDataHub 는 기준일을 말없이 버려 그 날 뒤의 카드가 섞였을 수 있습니다."})
+            yield _delib("evidence", source="기준일 거름 확인 안 됨", included=False, notice=True,
+                         text=f"기준일 {_as_of} 로 거른 지식카드 검색인데 지식 허브 응답에 그 메아리(applied_config.as_of)가 없어 "
+                              f"다음 좌석의 지식카드를 싣지 않았다 — {_unc_txt}. 옛 AIDataHub 는 모르는 인자를 말없이 버린다 — 그 "
+                              "좌석은 지식카드 없이 발언한다.")
+        if _ao_rows:
+            # 좌석마다 센 기준일 셈 — 한 장으로 모은다(좌석에 주지 않은 알림 카드다). 결정문 머리에는 합이 찍힌다.
+            yield _delib("evidence", source="기준일 — 좌석 지식카드", included=False, notice=True,
+                         text=f"기준일 {_as_of} — 좌석 지식카드 사전 검색은 그 날까지의 카드만 찾았고 날짜 없는 카드는 "
+                              f"'{_AS_OF_UNDATED}' 으로 남겼다. 좌석별 — "
+                              + " / ".join(f"{k} 실은 {n}줄 중 {_AS_OF_UNDATED} {u}줄(좌석 범위의 날짜 없는 카드 {kept}장 · "
+                                           f"그 날 뒤라 뺀 카드 {later}장)" for k, n, u, kept, later in _ao_rows) + ".")
         if _kn_cut:
             # 좌석마다 내면 원장의 자리를 먼저 채운다 — 한 장으로 모은다. 좌석에 주지 않은 카드다(included=False).
             yield _delib("evidence", source="지식카드 예산 초과", included=False, knob="DELIB_KNOWLEDGE_BUDGET",
@@ -5800,6 +6034,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     gather_lens: dict = {}    # {(라운드, 좌석, 도구, 인자): 원문 길이} — 풀은 쓸 만큼만 담으므로 표식용 길이를 따로 든다
     seat_lookups: list = []   # 좌석이 받은 자기 조회 블록 — 라운드마다 비워지므로 따로 모은다(결정문 수치 대조의 출처)
     _nv_told = False          # 리스크 앱 읽기 도구의 not_visible 을 알렸나 — 심의에 한 번(라운드마다 같은 말을 되풀이하지 않는다)
+    _ao_told = False          # 자유 조회의 기준일 거름 확인 안 됨을 알렸나 — 심의에 한 번(셈은 결정문 머리의 기준일 줄에 다 실린다)
 
     for rnd in range(1, N + 1):
         call_trace.tag(round=rnd)      # 이 라운드에서 만드는 좌석 태스크가 물려받는다(마지막 라운드 뒤의 의장·요약 호출에도 남는다)
@@ -5975,6 +6210,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _prior += f"\n(… 그 앞 {len(_sigs) - len(_keep)}건 생략 — 오래된 순)"
             _gcut: list = []      # [(좌석, 건수, 원문 합, 건당 몫)] — 발언 턴 몫에 맞춰 줄인 좌석
             _nv_round: list = []  # ['좌석·도구'] — 리스크 심사 좌석이 리스크 앱 읽기 도구에서 not_visible 을 받은 것
+            _ao_round: list = []  # [좌석] — 기준일 거름을 확인하지 못해 자유 조회의 agent_search 카드를 버린 좌석(이 라운드)
             # 좌석이 조회로 받은 그림의 판독 셈 — 좌석 태스크마다 같은 사전을 건다(_gather_with_img_acc, T5-b)
             _img_acc = {"read": 0, "fail": 0, "no_model": 0, "over": 0, "err": 0}
             _gt = [asyncio.ensure_future(
@@ -6026,6 +6262,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                         if (opts.chair_template == "risk-review" and _tn in _RISK_READ_TOOLS["heax-hwax_risk"]
                                 and _risk_not_visible(_out) and f"{_k}·{_tn}" not in _nv_round):
                             _nv_round.append(f"{_k}·{_tn}")
+                        # 기준일 — 좌석이 부른 agent_search 를 센다(결정문 머리의 기준일 줄). 메아리가 없어 카드를 버린 답은
+                        # _as_of_guard 가 맨 앞 칸 _AS_OF_UNCONFIRMED 로 바꿔 두었고, 날짜 없는 히트에는 date_note 를 달았다.
+                        if _as_of and _tn == "agent_search":
+                            _af = _ao_free.setdefault(_k, [0, 0, 0])
+                            _af[0] += 1
+                            if _as_of_dropped(_out):
+                                _af[2] += 1
+                                if _k not in _ao_round:
+                                    _ao_round.append(_k)
+                            else:
+                                _af[1] += _out.count(_AS_OF_UNDATED_MARK)
                     _gathered[_k] = _blk
                     if _blk:
                         seat_lookups.append(_blk)
@@ -6057,6 +6304,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 이라 게이트웨이 감사에는 성공으로 남고, 엔진은 좌석마다 ok:false 상태줄 한 줄뿐이라 질문의 diff_id 로 앞세운
             # 변경 전체 보기가 버려진 채 패널이 done 으로 끝났다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
             # 러너가 패널에 옮겨 적는다. 같은 까닭이 라운드마다 되풀이되므로 심의에 한 번만 낸다.
+            if _ao_round and not _ao_told:
+                _ao_told = True
+                _aor = ", ".join(sorted(_ao_round))
+                yield _sse("warning", {"code": "as_of_unconfirmed",
+                                       "message": f"기준일 {_as_of} 거름이 걸렸다는 확인(메아리)이 지식 허브 응답에 없어 좌석 자유 조회의 "
+                                                  f"지식카드 검색 결과를 싣지 않았습니다 — {_aor}. 그 좌석은 그 조회 없이 발언합니다."})
+                yield _delib("evidence", source="기준일 거름 확인 안 됨 — 자유 조회", included=False, notice=True,
+                             text=f"{_dr(rnd)}라운드 좌석 자유 조회의 agent_search 응답에 기준일 {_as_of} 메아리(applied_config.as_of)가 "
+                                  f"없어 그 카드를 버렸다 — {_aor}. 옛 AIDataHub 는 모르는 인자를 말없이 버린다. 뒤 라운드의 같은 일은 "
+                                  "결정문 머리의 기준일 줄에 셈으로만 남는다.")
             if _nv_round and not _nv_told:
                 _nv_told = True
                 _nv_txt = ", ".join(_nv_round)
@@ -6287,8 +6544,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _seal_note = (f"[봉인 실행 — {_SEALED_LINE} 이 줄은 결정문 머리에 따로 찍힌다. (0) 커버리지 한계에 "
                   "'바깥 자료 없이 주어진 근거만으로 판정했다' 는 전제를 적고, 좌석이 도구로 조회·확인했다고 "
                   "쓰지 마라]\n" if opts.sealed else "")
+    # 기준일 — 의장이 전제를 알고 쓰게 한다(봉인과 같다). 표식과 셈은 아래에서 코드가 찍는다.
+    _as_of_note = (f"[기준일 {_as_of} — 좌석 지식카드는 이 날까지의 카드만 실렸다('{_AS_OF_UNDATED}' 카드는 날짜가 없어 그 날 뒤에 "
+                   "쓰였을 수 있다). 이 줄은 결정문 머리에 셈과 함께 따로 찍힌다. 그런 카드에만 기댄 판단이 있으면 그렇다고 적어라]\n"
+                   if _as_of else "")
     chair_tail = (
-        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}"
+        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}{_as_of_note}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
@@ -6454,6 +6715,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _c
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
+    # 기준일 줄도 코드가 찍는다(아래 봉인 표지와 같은 까닭) — 봉인 줄 아래에 온다. 셈은 사전 검색 · 자유 조회에서 모은 것이다.
+    if _as_of:
+        decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free)}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
     # 똑같이 생긴다. 결정문은 이 심의의 내구 기록(RA 보고서)이라 저장 전에, 맨 위에 찍는다.
     if opts.sealed:

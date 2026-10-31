@@ -1013,7 +1013,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("줄이 빠진 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine or waiting
                else "줄이 빠진 뒤 다시 하라."))
 
-    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _external_refusal,  # noqa: PLC0415
+    from deliberation import (_INT_KEYS, _SEALED_UNSUPPORTED, _as_of_refusal, _external_refusal,  # noqa: PLC0415
                               _resolve_opts, _role_req_max, _seal, _seat_key, _started_by)
     entry = _entry(spec)
 
@@ -1032,12 +1032,13 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 근거 본문은 빼고 읽힌다(여기서 맞춰 자를 까닭이 없다 — 기록에는 건수만 남는다).
     _read = _resolve_opts({k: v for k, v in applied.items() if k != "evidence"})
     # timeout_s 도 같다 — 상한에서 죈 값을 적는다(보낸 20000 이 걸린 것처럼 남지 않게). 이어하기가 이 값을 넘긴다.
-    # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게.
+    # knowledge_query 도 같다 — 못 읽어 버린 좌석 항목을 센 수가 남지 않게. as_of(기준일)도 엔진이 읽은 값으로 적는다(틀린 꼴은 아래에서 거절한다).
     applied = {**applied, **{k: getattr(_read, k) for k in applied
-                             if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query")}}
+                             if k in _INT_KEYS or k in ("voc", "timeout_s", "knowledge_query", "as_of")}}
+    # 기준일(advanced.as_of)이 틀린 꼴이면 잡을 만들기 전에 거절한다 — 보낸 값으로 본다(위 applied 는 엔진이 읽은 값이라 틀린 꼴은 이미 비었다).
     # 외부 응답자(advanced.llm=external) — 받을 수 없으면(꺼진 서버·반출 동의 표지 없음·신원 없음) 잡을 만들기 전에 거절한다.
     # 받으면 잡 기록에 판단 LLM 을 적는다.
-    _refused = _external_refusal(app, applied, owner or user_email)
+    _refused = _as_of_refusal(opts) or _external_refusal(app, applied, owner or user_email)
     if _refused:
         raise ValueError(f"{_refused['code']}: {_refused['message']}")
     if _read.llm == "external":
