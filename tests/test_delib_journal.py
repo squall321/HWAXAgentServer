@@ -11,7 +11,9 @@ import asyncio
 import copy
 import json
 import os
+import select
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -239,6 +241,91 @@ def test_끝난_잡은_일지를_지우고_끊긴_잡만_남기며_쓸기는_시
         store.clear()
     m.bind(object())
     assert not delib_jobs._journal_path(jid).exists(), "7일 지난 끊긴 잡의 일지가 남았다"
+
+
+_NO_PID = 4194304 + 7          # 커널의 PID 상한(PID_MAX_LIMIT 2^22) 밖 — 늘 죽은 프로세스다(재사용될 수 없다)
+
+
+def test_고쳐_쓰다_남은_임시_파일은_기동_때_치우고_쓰던_프로세스가_살아_있으면_둔다(monkeypatch, tmp_path):
+    """시작 인자 파일(_write_args)과 제자리 이어하기의 일지(_rewrite_journal)는 임시 파일(.<잡 id>.<pid>.tmp — 0600)에 다 쓴 뒤 바꿔 넣는다. 그 사이에
+    죽으면 임시 파일이 남는데, 쓸기는 진짜 파일(*.json · *.jsonl)만 봐 근거 본문 · 지식카드 · 원 출력이 잡이 끝나도 7일이 지나도 남았다(검토
+    10-31). 기동 정리가 치운다 — 쓰던 프로세스가 아직 살아 있으면(재기동이 겹쳤다) 곧 바꿔 넣으므로 둔다. 진짜 파일은 잡 규칙 그대로다(끊긴 지
+    7일이 안 된 잡의 것은 남는다)."""
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", jobs)
+    for name in ("_JOBS", "_TASKS", "_PENDING"):
+        monkeypatch.setattr(delib_jobs, name, {})
+    jid = "default-20261031-000000-abc123"
+    delib_jobs._persist({"id": jid, "job": "default", "kind": "default", "status": "interrupted", "question": "q", "turns": [],
+                         "finished_at": delib_jobs._now(), "updated_at": delib_jobs._now()})
+    assert delib_jobs._write_args(jid, {"job_kind": "default", "question": "q", "opts": {}})
+    jp = delib_jobs._journal_path(jid)
+    delib_jobs._private_dir(jp.parent)
+    jp.write_bytes(b'{"k": "j:head"}\n')
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        made = {}
+        for sub in ("args", "journal"):
+            for who, pid in (("dead", _NO_PID), ("live", live.pid), ("me", os.getpid())):
+                p = jobs / sub / f".{jid}.{pid}.tmp"
+                p.write_bytes("카드 본문".encode("utf-8"))
+                p.chmod(0o600)
+                made[(sub, who)] = p
+        m.bind(object())
+        left = sorted(k for k, p in made.items() if p.exists())
+    finally:
+        live.kill()
+        live.wait(timeout=10)
+    assert left == [("args", "live"), ("journal", "live")], f"남은 임시 파일 {left} — 죽은 프로세스 · 이 프로세스의 것은 치워야 한다"
+    assert jp.exists() and delib_jobs._args_path(jid).exists(), "끊긴 지 7일이 안 된 잡의 진짜 파일을 지웠다"
+
+
+@pytest.mark.parametrize("what", ["journal", "args"])
+def test_진짜_프로세스가_고쳐_쓰다_죽으면_다음_기동이_임시_파일을_치운다(monkeypatch, tmp_path, what):
+    """진짜 프로세스 — 자식이 일지를 고쳐 쓰다(_rewrite_journal — 제자리 이어하기) · 시작 인자 파일을 쓰다(_write_args) 임시 파일을 다 쓰고 바꿔
+    넣기 직전에 KILL 을 맞는다. 임시 파일(0600)이 남고 진짜 파일은 그대로다. 다음 기동(같은 원장 자리의 재기동 정리)이 임시 파일만 치운다. 자식은
+    이 시험이 띄운 PID 하나이고 끝나면 내린다."""
+    import signal
+
+    jobs = tmp_path / "jobs"
+    jid = "default-20261031-000000-fed987"
+    child = (
+        "import os, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import delib_jobs\n"
+        "def stuck(*_a, **_k):\n"
+        "    print('AT', flush=True)\n"
+        "    time.sleep(60)\n"
+        "os.replace = stuck\n"
+        "if sys.argv[3] == 'journal':\n"
+        "    delib_jobs._rewrite_journal(sys.argv[2], [{'t': 1.0, 'k': 'e:pre', 'sk': 'main', 'knowledge': {'a': '카드 본문' * 2000}}])\n"
+        "else:\n"
+        "    delib_jobs._write_args(sys.argv[2], {'job_kind': 'default', 'question': 'q', 'opts': {'human_note': '사람 의견' * 2000}})\n")
+    env = {**os.environ, "DELIB_JOB_DIR": str(jobs), "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.Popen([sys.executable, "-c", child, str(ROOT), jid, what], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        ready, _w, _x = select.select([proc.stdout], [], [], 60)
+        line = proc.stdout.readline().strip() if ready else ""
+        assert line == "AT", f"자식이 바꿔 넣기 자리에 닿지 않았다 — {line!r} {proc.stderr.read()[-2000:] if proc.poll() is not None else ''}"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+    assert proc.returncode == -signal.SIGKILL
+    sub = jobs / ("journal" if what == "journal" else "args")
+    tmps = list(sub.glob(".*.tmp"))
+    assert [p.name for p in tmps] == [f".{jid}.{proc.pid}.tmp"] and stat.S_IMODE(tmps[0].stat().st_mode) == 0o600, \
+        "시험 전제 — 바꿔 넣기 전에 죽어 임시 파일이 남았다"
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", jobs)
+    for name in ("_JOBS", "_TASKS", "_PENDING"):
+        monkeypatch.setattr(delib_jobs, name, {})
+    delib_jobs._persist({"id": jid, "job": "default", "kind": "default", "status": "interrupted", "question": "q", "turns": [],
+                         "finished_at": delib_jobs._now(), "updated_at": delib_jobs._now()})
+    m.bind(object())                                       # 다음 기동 — 재기동 정리
+    assert not list(sub.glob(".*.tmp")), "죽은 프로세스가 남긴 임시 파일(재개 자료 · 근거 본문)을 치우지 않았다"
 
 
 def test_남이_이으면_일지를_남기고_주인이_이으면_지운다(eng, monkeypatch):

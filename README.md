@@ -83,7 +83,8 @@ ChatDock (portal frontend)
   (or until it is resumed). `/health.delib_queue_durable` is true when every queued job has its file (so a restart loses
   none — `start.sh` and the portal's `lib/delib-busy.sh` then stop counting queued jobs as blocking), and
   `/health.delib_requeued` counts the jobs put back at this startup.
-- **Resume an interrupted job** (R3) — `deliberate_continue(previous_job_id=<interrupted job>)`, no human note needed.
+- **Resume an interrupted job** (R3 — the summary path; the owner's unchanged continue of a job with resume data resumes
+  in place instead, see S1 below) — `deliberate_continue(previous_job_id=<interrupted job>)`, no human note needed.
   The status carries `resume{rounds_done, total_rounds, rounds_left, args, resumed_by}`: rounds done are counted from
   the stage (entering round N means N−1 are done; `decide` · `explain` · `report` mean all). The new job carries each
   seat's last position of the finished rounds as its summary ("결정문은 아직 없다") — fitted **per seat** inside the length the
@@ -92,7 +93,8 @@ ChatDock (portal frontend)
   third) — runs only the remaining rounds (at
   least 2 — the engine's floor), keeps the seats and the round numbering, and reuses the original arguments from the
   args file (a given human note is appended to the original one). Same question and kind only; a job resumes once
-  (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A
+  (`resumed_by` / `resumed_from`); multi-stage jobs (from their last checkpoint) and jobs cut in round 1 start over with
+  the same arguments — test-plan jobs count their finished rounds like single-stage jobs since S4 below. A
   graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
 - **Progress survives a restart** (HA-09 S0 — portal `docs/request-1027/design-ha09-ha20.md` A5.1). The ledger is
   written when a job starts and when it ends; a restart used to skip the end: on TERM uvicorn 0.49 re-raises the signal
@@ -113,8 +115,132 @@ ChatDock (portal frontend)
   requeue). A job's end write leaves the ledger alone when another process has already closed it (a restart sweep,
   maybe with `resumed_by` on it), so an overlapping old process cannot reopen a resumed job for a second resume. The
   journal follows the args-file rules: removed when the job ends or is resumed
-  by its owner, kept 7 days for an interrupted job. Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line
-  and stops — the fold is then the state up to that line, with a warning. Seat-level resume (S1 · S2) is not here.
+  by its owner, kept 7 days for an interrupted job. A temp file left by a process killed while it rewrote the args
+  file or a journal (`args/` · `journal/.<id>.<pid>.tmp`) is removed at startup unless its writer is still alive.
+  Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line and stops — the fold is then the state up to that
+  line, with a warning. Exact resume is the next bullet (S1).
+- **Resume in place at the round boundary** (HA-09 S1 — portal `docs/request-1027/design-ha09-ha20.md` A5.2 – A5.5,
+  user decisions 10-31 A-2 · A-3 · A-4 · A-5 · A-6 (가)). An MCP job (single-stage engine `general` under the stage key
+  `main`; the multi-stage and test-plan engines under their own stage keys since S4 below) also appends the engine's
+  **resume data** to its progress journal, through a
+  context variable that only the job task carries (`delib_resume.journal` — web deliberations have no journal and write
+  nothing): `e:pre` before the round loop (seats with restored roles · origin · lookup hints, knowledge blocks, evidence
+  counts, VOC · prepass · designated-tool blocks, as-of counts, the provenance integers of the phantom-ID gate, free-tool
+  names, groups, window, round count, and SHA-256 digests of the topic blocks `base` · `base_blind` — **not** the
+  caller's evidence bodies, which stay in the args file), `e:gather` after each round's free lookups (per-seat lookup
+  blocks, the pool entries and original lengths it added, as-of counts, notice flags, evidence counts, newly learned
+  integers, cross-exam targets), `e:raw` for each seat's raw JSON output **before** its `turn` event, and `e:round_end`
+  (lost seats · reasons, `fsync`). The journal head carries `rv` (`delib_resume.RESUME_SCHEMA`, bumped by any commit that
+  changes these lines) and `eng` (a digest of `deliberation.py`). Engine lines stop at three quarters of the journal cap
+  with one `e:resume_off` line (public events go on to the cap), so such a job resumes through the summary path.
+  When a job is interrupted (graceful shutdown, `_settle`, or the restart sweep's fold) the ledger gets
+  `seat_resume {ok, sk, round, spoken, todo, why}` from those lines — `round` is the first round to run (all rounds done:
+  rounds + 1, i.e. the chair), `spoken` the seats whose raw output of that round was written, `todo` the remaining seats
+  that round will call (not yet answered or failed — seat order; S2 below). `deliberate_status` · `deliberate_list` show it
+  under `resume.seat_resume`, the error text says so
+  (`INTERRUPTED_MSG_EXACT`), and `rounds_done` now takes the last `e:round_end` when the stage lags behind it.
+  `deliberate_continue` on such a job by its **owner with no changed values** (no human note · rounds · clauses · evidence
+  · advanced) resumes **the same `job_id`**: `delib_jobs.resume_load` parses the journal (head `v` · id · `rv`, no broken
+  line, no `e:resume_off`, `e:pre` present, each restored round's spoken ∪ lost seats = the seats) and checks that the
+  caller's current groups still contain the groups of `e:pre` (A-5), then `delib_jobs.start(..., resume=…)` — a keyword
+  only the MCP entry passes, never a request option — reopens the job synchronously (`interrupted → queued`, one more
+  `attempts {cut_at, resumed_at, by, round, stage}`, turns of the cut round dropped so every seat appears once per round,
+  the journal rewritten atomically to its head plus the carried resume data — the relaunched task does the same
+  temp-file-and-rename rewrite when it opens the journal and appends to it, never truncating it) and sets
+  `delib_resume.restore` on that job task's context only. The engine then skips the pre-round calls (VOC, prepass,
+  designated tools, discovery, role restore, counter seats, knowledge), rebuilds the topic blocks from the same args and
+  compares their digests, re-emits
+  `personas`, restores finished rounds (raw outputs, pool, own lookups, as-of counts, flags, evidence counts, learned
+  integers, round-1 anchors, lost seats) without calling a seat or re-emitting turns, and runs from the cut round with the
+  same prompts the uninterrupted run would have used (same window and engine — a changed window, engine digest, round
+  count or vanished free tool is announced on the `끊긴 심의 되살림` card, never blocked). Restored notices are not
+  re-emitted (the free-lookup preparation's cards and warnings included — the tools are fetched again), so
+  `evidence_omitted` holds each card once plus that card. A checkpoint job (`stop_after_round=1`) never restores round 1
+  as a finished round, so the checkpoint still stops it (S2 continues that round seat by seat). The
+  answer keeps the job id with `resumed {mode: "in_place", sk, round, spoken, todo, rounds_done, attempt}`; a second
+  continue while it runs is refused, and a restart while it waits in the queue
+  re-reads the resume data (`_requeue`) or puts the job back to `interrupted` when it cannot. Anyone else (same
+  affiliation · admin — HA-06: the journal is never read for them), shrunk permissions, a missing · foreign-format ·
+  capped journal, or changed values take the R3 summary path above, with the reason in
+  `resumed.why` and the note (`resumed.mode = "summary"`).
+  The free-lookup result cache is not restored — a resumed round may call a tool the uninterrupted run would have served
+  from the cache. `/health.delib_journal {on, max_mb, errors}` (journal write failures since startup) and
+  `/health.delib_folded` (jobs whose journal the restart sweep folded at this startup) show the journal side.
+- **Resume inside the cut round, seat by seat** (HA-09 S2 — portal design A5.3 third bullet · A6 S2). The cut round (the
+  first round without `e:round_end`) is continued, not re-run: seats whose `e:raw` was written before the cut are not
+  called again — the engine re-emits their turns from the raw output (the ledger dropped that round's turns at the reopen,
+  so a seat whose raw output was written but whose turn never reached the ledger also appears once; when the transcript
+  cap `DELIB_JOB_TURN_MAX` was reached inside that round, its note row and warning go too, so the re-emitted turns fill
+  the cap where the uninterrupted run did) and passes only the
+  remaining seats to `_round_live` (`deliberation._then` puts the restored outputs first). A round's seats never see each
+  other's output of that round, so the remaining seats get the prompts the uninterrupted run would have given them. A
+  seat that failed before the cut has no raw output and is called again — had the job not been cut it would have been
+  lost; one more try is better, and the `끊긴 심의 되살림` card says so. When the cut round's `e:gather` is there (its
+  free lookups had finished), the lookups are not redone: the lookup blocks, pool additions and lengths, as-of counts,
+  notice flags, evidence counts, learned integers and the cross-exam targets come from that line (`_gather_back`, shared
+  with the S1 restore of finished rounds). Raw outputs without `e:gather` mean that round had no lookup phase, so none now
+  either; with neither line the round's lookups run again from the start. The cut round's `e:gather` and `e:raw` lines are
+  carried into the rewritten journal (not an `e:round_end` — the resumed run closes that round), so a second cut in the
+  same round keeps the seats of both attempts. The round transcript keeps completion order — restored seats first, then
+  the rest as they finish — so later rounds match an uninterrupted run in which the remaining seats finished last. The
+  round-head card `좌석 직전 라운드 상한 초과` is not emitted again for a cut round that had progress (it is already in the
+  ledger). `seat_resume.todo` and `resumed.todo` are the remaining seats, `INTERRUPTED_MSG_EXACT` and the in-place note
+  say only those are called, and the `끊긴 심의 되살림` card states the cut-round facts first (the ledger keeps the first 400
+  characters of a card). A checkpoint job (`stop_after_round=1`) cut after round 1 ended continues round 1 as the cut
+  round — nobody is called again — and still stops at the checkpoint. S2 adds no line kind (S3 below raised `RESUME_SCHEMA`).
+- **Decision, report and wiki only once** (HA-09 S3 — portal design A5.3 fourth bullet · A6 S3). After the last round the
+  engine writes five more lines, each when its step has finished (every event of that step is written before it):
+  `e:decision` after the chair (the chair text — the minutes-preserving text when the chair failed — with `failed` ·
+  `knob` · `cause`), `e:plain` after the TL;DR and the plain explanation (the explanation and the decision text with both
+  attached), `e:report_intent` right before the Report Archive call (`save`, `append_to`, the title and the decision text
+  that is saved — web-citation and number checks attached), `e:report_saved` after the report step (`rid` and the note
+  appended to the decision — a failed save too) and `e:wiki_sent` after the wiki step (its note and `off`, whether the
+  wiki is known to be off). They are read only when
+  every round is restored and are carried into the rewritten journal, so a second cut keeps them. Resuming in place skips
+  each step whose line is there — no chair · TL;DR · plain-explanation call, no second save (the number and note are
+  reused), no second wiki submission — and does not emit that step's status lines, cards or warnings again (they precede
+  the line); stage events are emitted, so the ledger's stage ends where an uninterrupted run ends. A job cut between
+  `e:report_intent` and `e:report_saved` may or may not have reached Report Archive, which has no idempotency key (portal
+  C Q-R1): the resumed run emits one `report_maybe_saved` warning (`끝났는지 알 수 없어 …`) and saves again with the same
+  blocks (an append job appends its page again); `save_report=0` writes the intent with `save: false` and never warns. A
+  wiki submission cut in flight is sent again under the same source key (`delib:<job id>:<template>` — the job id does not
+  change in place), which MX WhitePaper deduplicates when the body is the same. A failed chair stays failed: the resumed
+  run saves the minutes and ends with the same `chair_failed` error, as the uninterrupted run would have. A job whose
+  decision event already reached the ledger (cut before the outcome · result events) now resumes in place too instead of
+  taking the summary path. The `끊긴 심의 되살림` card (kept steps first), the status line and the in-place note say what
+  is kept (`보고서는 끊기기 전에 저장돼(#N) 다시 저장하지 않는다` …). `RESUME_SCHEMA` is 2 — a missing line now means "not
+  done yet", which a journal written before these lines (1) cannot tell, so such a journal takes the summary path. Still
+  open: the `의장 전사 상한 초과` card is emitted before the chair call, so a cut during the chair call (no `e:decision`)
+  calls the chair again and emits that card again.
+- **Inside a stage of a multi-stage or test-plan job** (HA-09 S4 — portal design A5.2 last row · A5.3 last bullet ·
+  A6 S4, user decision 10-31 A-4 (가)). `sim-plan` · `build-plan` run their stages under the stage keys `sim-1` ·
+  `sim-2` · `sim-3` and `test-plan` under `tp` (`delib_resume.STAGES`; the single-stage engine keeps `main`), each with
+  the S1 – S3 lines. Right before stage 2, stage 3 and the test plan the engine also writes `e:stage_in` (fsync) with
+  what it fetched outside the stage and what the earlier stage produced: stage 2 — stage 1's decision · clauses · seats
+  (the checkpoint values), the seat switch result (`sim_seats` after discovery and role restore) and the in-house asset
+  snapshot text appended to stage 2's human note; stage 3 — stage 2's decision and the seats; test plan — the material
+  status text appended to its note. Stages 2 and 3 also record `wiki_off` (an earlier stage already reported the wiki
+  as off — HA-08 reports it once per job); a stage entered from `e:stage_in`, like a restored wiki step (`e:wiki_sent`
+  `off`), restores that state, so a later stage does not append the off note again. The cut stage is the stage of the
+  **last stage marker** (`e:stage_in` · `e:pre`): stages run in order, so a later marker means the earlier stages
+  finished. Resuming in place enters the cut stage from
+  its `e:stage_in` — no stage-1 or stage-2 calls, no seat switch (`recommend_agents` · `get_agent_session`), no asset or
+  material snapshot calls, and the carry-cut card `다단 승계 상한 초과` is not emitted again — and inside the stage
+  S1 – S3 apply unchanged. Nothing is restored, and the summary path skips the finished stages by the ledger checkpoint
+  (4c67229, unchanged), when the cut fell between stages: after `e:stage_in` but before that stage's `e:pre` (its
+  pre-round), or after the ledger's checkpoint already names the cut stage (the seat switch and snapshot before the next
+  `e:stage_in` — replaying the finished stage would cost nothing more than the checkpoint skip but could emit the next
+  stage's carry card twice). `seat_resume.why`, `resume_load` and the restart sweep use the same rules. A cut inside
+  stage 1 restores stage 1 and runs the seat switch and later stages as an uninterrupted run would; the clauses a stage
+  passes on (`out["non_negotiables"]`) are now also collected from a restored converge round, so stage 1's checkpoint and
+  stage 2's prompts match. The ledger records where the current stage's turns start (`turns_from`, set on its `personas`
+  event) and the reopen drops only that stage's cut-round turns — every stage numbers its rounds from 1. `attempts[]`
+  gains `sk`; `seat_resume.sk` and `resumed.sk` name the cut stage, as do the in-place note, the status line and the
+  `끊긴 심의 되살림` card. `resume_info` counts `rounds_done` for single-stage jobs (`main` · `tp`), so a test-plan job that
+  takes the summary path (someone else's continue, changed values) continues after its finished rounds instead of from
+  scratch; multi-stage jobs keep `rounds_done` 0 there (a new job cannot apply one stage's rounds — the checkpoint is the
+  summary path's unit). `RESUME_SCHEMA` stays 2: single-stage lines are unchanged and earlier multi-stage · test-plan
+  journals hold no engine line at all (no `e:pre` → summary path).
 
 - `POST /seat-eval` · `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — the seat-choice
   baseline windows (shared secret; see "Seat-choice baseline" below). `/health.seat_eval` `{secret, busy}`,

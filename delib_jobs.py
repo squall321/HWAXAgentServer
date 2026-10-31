@@ -30,6 +30,7 @@ from urllib.parse import unquote
 from pathlib import Path
 
 import call_trace
+import delib_resume
 import review_gate
 
 log = logging.getLogger("agent.delib_jobs")
@@ -125,8 +126,20 @@ _JOURNAL_SYNC = ("stage", "personas", "checkpoint", "decision", "outcome")  # �
 # start.sh 의 uvicorn 정상 종료 상한(AGENT_GRACEFUL_S) 뒤에 오므로 둘의 합이 TERM 뒤 KILL 까지(AGENT_STOP_GRACE_S)보다 작아야 한다.
 SHUTDOWN_WAIT_S = 1.0
 _REQUEUED = 0                 # 이번 기동에서 다시 세운 줄 선 잡 수(/health.delib_requeued — update-all 이 재기동 뒤 찍는다, O2)
+_FOLDED = 0                   # 이번 기동의 재기동 정리가 진행 일지를 접은 잡 수(/health.delib_folded — HA-09 S1 A5.5)
+_JOURNAL_ERRORS = 0           # 기동 뒤 진행 일지 · 재개 자료를 쓰다 실패한 수(/health.delib_journal.errors)
+_JOURNALS: dict = {}          # 도는 잡의 진행 일지(잡 id → _Journal) — 내려갈 때 늦게 접히는 잡의 재개 요약을 여기서 읽는다(shutdown)
 INTERRUPTED_MSG = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 끝난 라운드 뒤부터 남은 라운드만 이어 돈다"
                    "(사람 의견은 비워도 된다 · 처음 인자를 그대로 쓴다). 처음부터 다시 시작하려면 deliberate_start")
+# 재개 자료(일지의 e:* 줄 — HA-09 S1 · S2 · S3 · S4)가 있는 잡의 안내 — 주인이 바꾼 값 없이 이으면 같은 잡이 끊긴 라운드의 이미 말한 좌석 뒤부터
+# 그대로 돌고, 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 보고서 · 위키)를 다시 하지 않는다(A5.4 · A5.3 넷째). 다단 심의 · 시험 설계는 끊긴 단 안에서
+# 잇는다(A5.3 끝).
+INTERRUPTED_MSG_EXACT = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 같은 잡에서 이어 돈다 — 끊기기 전에 끝난 "
+                         "라운드는 좌석 · 근거 · 지식카드 · 발언을 다시 부르지 않고 되살리고, 끊긴 라운드는 이미 말한 좌석을 다시 부르지 않고 "
+                         "나머지 좌석만 불러 원래 라운드 구조(심화 · 수렴) 그대로 잇는다. 의장 결정문 · 보고서 · 위키도 끊기기 전에 끝난 것은 다시 "
+                         "하지 않는다(저장 도중 끊긴 보고서만 경고와 함께 새로 저장한다). 다단 심의 · 시험 설계는 끝난 단과 단 밖의 조회(좌석 전환 · "
+                         "사내 자산 · 물성 근거 현황)도 다시 하지 않고 끊긴 단 안에서 잇는다. 주인이 사람 의견 · 손잡이를 바꾸지 않고 이을 때다 — 아니면 "
+                         "끝난 라운드 뒤부터 요약으로 잇는다. 처음부터 다시 시작하려면 deliberate_start")
 # 외부 응답자 심의(delib_opts.llm=external)의 자리 — 판단 호출이 전부 잡 주인의 Claude Code 워크플로로 가서 이 서버의 LLM 을 물지
 # 않는다. 사람 속도의 워커를 기다리는 그 잡이 전역 자리(MAX_RUNNING)를 쥐면 남의 GLM 심의가 그 몇 시간 동안 줄에 묶였다(X-D6).
 # 그래서 전역 상한·사용자별 상한(GLM 몫)에 세지 않고 주인(과제를 받는 사람)마다 이만큼만 돌린다 — 나머지는 줄에서 그 주인의 것이
@@ -425,27 +438,72 @@ def _journal_form(ev: str, data: dict, turns_before: int) -> dict | None:
     return data
 
 
+def _journal_head(job_id: str) -> dict:
+    """일지 머리 — 일지 꼴 번호 · 잡 id · 재개 자료 꼴 번호(rv) · 엔진 판(eng — deliberation.py 의 지문). 접기는 앞 둘만, 되살리기는 넷 다 본다."""
+    return {"k": "j:head", "v": JOURNAL_V, "id": job_id, "rv": delib_resume.RESUME_SCHEMA, "eng": delib_resume.ENGINE}
+
+
 class _Journal:
     """잡 하나의 진행 일지 — 덧붙이기만 한다(_drive 가 열고 닫는다). 줄마다 os.write 로 커널에 넘기고(사용자 공간 버퍼가 없다 — 프로세스가
     죽어도 쓴 줄은 남는다) 경계 사건(_JOURNAL_SYNC) 뒤에만 fsync 한다. 쓰기가 한 번이라도 실패하면 그 잡은 더 쓰지 않는다 — 경고 한 번이고,
     재기동하면 거기까지 접힌다(일지가 없던 때보다 나빠지지 않는다). 상한(JOURNAL_MAX_BYTES)에 닿으면 그 사실을 한 줄 적고 멈춘다 — 접은 원장이
-    그 줄까지의 메모리와 같게(앞부분만 — 단계 · 턴 · 체크포인트가 서로 어긋나지 않는다)."""
+    그 줄까지의 메모리와 같게(앞부분만 — 단계 · 턴 · 체크포인트가 서로 어긋나지 않는다).
 
-    def __init__(self, job_id: str):
+    엔진의 재개 자료(e:* — delib_resume, HA-09 S1)도 같은 파일에 덧붙인다(engine). 접기는 그 줄을 읽지 않는다. 받은 e:* 줄은 track(좌석 단위
+    재개 요약)이 센다. carry 는 제자리 이어하기가 옮겨 쓸 앞 시도의 재개 자료다 — 머리 뒤에 먼저 적는다(다음 재기동에도 남게)."""
+
+    def __init__(self, job_id: str, carry=()):
         self.job_id, self.fd, self.size = job_id, None, 0
+        self.track = delib_resume.Tracker()
+        self.eoff = ""              # 엔진 줄을 멈춘 까닭(e:resume_off) — 비면 적는다
+        head = _journal_head(job_id)
         try:
             _private_dir(JOB_DIR / _JOURNAL_DIR)
-            # 같은 잡 id 는 한 번만 뜬다(이어하기는 새 잡이다) — 남은 파일이 있으면 앞의 것이 아니라 비운다(두 번 접히지 않게)
-            self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
+            if carry:
+                # 제자리 이어하기(같은 잡 id 가 다시 뜬다) — 앞 시도의 공개 사건은 이미 원장에 접혔고 재개 자료만 carry 로 옮겨 쓴다. 이 파일이 그
+                # 재개 자료의 유일한 사본이라 비우지(O_TRUNC) 않는다 — 머리와 carry 를 임시 파일에 다 쓰고 fsync 한 뒤 바꿔 넣고(_rewrite_journal —
+                # _reopen 과 같다) 그 파일에 덧붙인다. 비우고 다시 적던 동안 죽으면(KILL · 메모리 고갈 · 전원) 끝난 라운드가 디스크에서 사라졌다
+                # (검토 10-31 — 다음 이어하기가 처음부터 돌았다). 어느 때 죽어도 디스크에는 옛 파일이나 새 파일 하나가 통째로 있다.
+                _rewrite_journal(job_id, carry)
+                self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_APPEND)
+                self.size = os.fstat(self.fd).st_size
+            else:
+                # 잡 하나에 일지 하나 — 남은 파일은 앞의 것이 아니라 비운다(두 번 접히지 않게).
+                self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
             os.fchmod(self.fd, 0o600)
         except OSError as exc:
             self._fail(exc)
             return
-        self._line({"k": "j:head", "v": JOURNAL_V, "id": job_id}, sync=True)
+        if carry:
+            for rec in (head, *carry):
+                self.track.feed(rec)
+            return
+        self._line(head, sync=True)
+        if self.fd is not None:
+            self.track.feed(head)
 
     def _fail(self, exc) -> None:
+        global _JOURNAL_ERRORS  # noqa: PLW0603 — 기동 뒤 실패 수(/health)
+        _JOURNAL_ERRORS += 1
         log.warning("[delib-job %s] 진행 일지를 쓰지 못했다 — 재기동하면 여기까지만 원장에 접힌다: %r", self.job_id, exc)
         self.close()
+
+    def _write(self, data: bytes, sync: bool) -> None:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(self.fd, view):]
+            self.size += len(data)
+            if sync:
+                os.fsync(self.fd)
+        except OSError as exc:
+            self._fail(exc)
+
+    def _sync(self) -> None:
+        try:
+            os.fsync(self.fd)
+        except OSError as exc:
+            self._fail(exc)
 
     def _line(self, rec: dict, *, sync: bool = False) -> None:
         if self.fd is None:
@@ -461,21 +519,39 @@ class _Journal:
             self._line({"k": "j:cap", "max_mb": JOURNAL_MAX_BYTES // (1024 * 1024)}, sync=True)
             self.close()
             return
-        try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(self.fd, view):]
-            self.size += len(data)
-            if sync:
-                os.fsync(self.fd)
-        except OSError as exc:
-            self._fail(exc)
+        self._write(data, sync)
 
     def event(self, ev: str, data: dict, t: float, turns_before: int) -> None:
         """_drive 가 _apply 한 사건 하나 — 시각은 그 사건을 반영한 때(updated_at)다(접으면 그 값이 된다)."""
         form = _journal_form(ev, data, turns_before)
         if form is not None:
             self._line({"t": t, "k": ev, "d": form}, sync=ev == "delib" and data.get("kind") in _JOURNAL_SYNC)
+
+    def engine(self, rec: dict, *, sync: bool = False) -> None:
+        """엔진의 재개 자료 한 줄(e:* — delib_resume.write 가 부른다). 일지 상한의 4분의 3에 닿거나 JSON 으로 못 적으면 그 까닭을 한 줄
+        (e:resume_off) 적고 엔진 줄만 멈춘다 — 공개 사건은 상한까지 계속 적어 접기는 그대로 되고, 그 잡의 이어하기는 요약으로 간다(A5.1)."""
+        if self.fd is None or self.eoff:
+            return
+        try:
+            data = (json.dumps({"t": _now(), **rec}, ensure_ascii=False) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            self._engine_off(f"JSON 으로 적지 못했다 — {type(exc).__name__}", error=True)
+            return
+        if self.size + len(data) > JOURNAL_MAX_BYTES - JOURNAL_MAX_BYTES // 4:
+            self._engine_off(f"일지 상한 {JOURNAL_MAX_BYTES // (1024 * 1024)}MB 의 4분의 3에 닿았다 — 설정 DELIB_JOURNAL_MAX_MB")
+            return
+        self._write(data, sync)
+        if self.fd is not None:
+            self.track.feed(rec)
+
+    def _engine_off(self, why: str, *, error: bool = False) -> None:
+        global _JOURNAL_ERRORS  # noqa: PLW0603
+        if error:
+            _JOURNAL_ERRORS += 1
+        self.eoff = why
+        log.warning("[delib-job %s] 재개 자료를 더 적지 않는다(%s) — 이 잡을 이으면 요약으로 잇는다", self.job_id, why)
+        self.track.feed({"k": "e:resume_off", "why": why})
+        self._line({"k": "e:resume_off", "why": why}, sync=True)
 
     def close(self) -> None:
         if self.fd is not None:
@@ -494,13 +570,14 @@ def _journal_rec(raw: bytes):
     return rec if isinstance(rec, dict) else None
 
 
-def _fold_journal(job: dict) -> int:
+def _fold_journal(job: dict, track: "delib_resume.Tracker | None" = None) -> int:
     """재기동 정리 — 끊긴 잡의 진행 일지를 원장에 접는다. 접은 사건 수를 돌려준다.
 
     원장은 도는 동안 띄울 때 모양 그대로다(_launch 뒤로는 끝날 때까지 쓰지 않는다). 그 위에 일지의 사건을 같은 _apply 로 다시 돌리면 죽기
     직전의 메모리와 같아진다 — 단계 · 라운드 · 좌석 · 턴(상한 TURN_MAX 그대로) · 체크포인트 · 결과. 마지막 시각(updated_at)은 마지막 사건의
     시각이다(_close_orphan 이 끝난 시각으로 쓴다 — 종전엔 띄운 시각이 끝난 시각으로 남았다). 반쯤 쓴 마지막 줄(쓰는 도중에 죽었다)은 버린다.
-    머리가 없거나 꼴 번호 · 잡 id 가 다른 일지는 접지 않는다(원장 그대로 — 종전과 같다)."""
+    머리가 없거나 꼴 번호 · 잡 id 가 다른 일지는 접지 않는다(원장 그대로 — 종전과 같다). 엔진의 재개 자료(e:*)는 접지 않고 track 에 센다
+    (좌석 단위 재개 요약 — HA-09 S1)."""
     try:
         raw = _journal_path(job["id"]).read_bytes()
     except FileNotFoundError:
@@ -517,10 +594,14 @@ def _fold_journal(job: dict) -> int:
         return 0
     n = bad = 0
     capped, last = False, None
+    if track is not None:
+        track.feed(head)
     for ln in lines[1:]:
         rec = _journal_rec(ln)
         if rec is None:
             bad += 1
+            if track is not None:
+                track.bad += 1
             continue
         k, d, t = rec.get("k"), rec.get("d"), rec.get("t")
         if k in _JOURNAL_EVENTS and isinstance(d, dict):
@@ -530,6 +611,8 @@ def _fold_journal(job: dict) -> int:
                 last = float(t)
         elif k == "j:cap":
             capped = True
+        elif track is not None:
+            track.feed(rec)         # 재개 자료(e:*) — 원장에 접지 않고 센다(모르는 이름은 Tracker 가 버린다)
     if last is not None:
         job["updated_at"] = last
     notes = ([f"진행 일지가 상한 {JOURNAL_MAX_BYTES // (1024 * 1024)}MB 에 닿아 그 뒤 진행은 원장에 없다 — 이어 돌면 그 앞까지의 끝난 라운드 "
@@ -541,6 +624,59 @@ def _fold_journal(job: dict) -> int:
     log.info("[delib-job %s] 재기동 정리 — 진행 일지 %d건을 원장에 접었다(단계 %s · 턴 %d)", job["id"], n, job.get("stage"),
              len(job.get("turns") or []))
     return n
+
+
+def _journal_track(job_id: str) -> "delib_resume.Tracker":
+    """일지 파일을 읽어 재개 요약을 센다 — 일지를 쥔 _Journal 이 없을 때(줄에서 뜨자마자 접힌 제자리 이어하기 · 늦게 접힌 잡). 머리가 이 잡의
+    것이 아니면 빈 셈이다."""
+    t = delib_resume.Tracker()
+    try:
+        lines = _journal_path(job_id).read_bytes().split(b"\n")
+    except OSError:
+        return t
+    lines.pop()
+    head = _journal_rec(lines[0]) if lines else None
+    if not (head and head.get("k") == "j:head" and head.get("v") == JOURNAL_V and head.get("id") == job_id):
+        return t
+    for ln in lines:
+        rec = _journal_rec(ln)
+        if rec is not None:
+            t.feed(rec)
+        else:
+            t.bad += 1
+    return t
+
+
+def _stages(job: dict) -> tuple:
+    """그 잡의 단 열쇠(delib_resume.STAGES — 엔진 종류로 정해진다): 한 단 심의 (main), 해석 설계 · 구축 계획 (sim-1, sim-2, sim-3), 시험 설계 (tp).
+    모르는 종류면 빈 것이다(되살리지 않는다). 재개 자료는 단 열쇠로 적고 읽는다(HA-09 S4 — 종전엔 한 단 심의만 라운드 · 좌석 단위로 이었다)."""
+    try:
+        return delib_resume.STAGES.get(JOBS[resolve_job(str(job.get("job") or job.get("kind") or "default"))]["engine"], ())
+    except (KeyError, ValueError):
+        return ()
+
+
+def _done_sk(job: dict):
+    """원장의 체크포인트가 말하는 끝난 단(다단 심의 — sim-1 · sim-2). 끊긴 단이 그 단이면 단 사이에서 끊긴 것이다(HA-09 S4)."""
+    ck = job.get("checkpoint")
+    return ck.get("stage") if isinstance(ck, dict) and isinstance(ck.get("stage"), str) else None
+
+
+def _stop_after(job: dict) -> int:
+    try:
+        return int((job.get("opts") or {}).get("stop_after_round") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mark_interrupted(job: dict, track=None) -> None:
+    """도는 잡을 재기동으로 끊긴 것으로 적는다 — 상태 · 안내 · 좌석 단위 재개 요약(seat_resume — HA-09 S1 A5.4). track 은 그 잡의 일지가 받은
+    e:* 줄의 셈이다(없으면 일지 파일을 읽는다). 재개 자료가 있으면 안내가 '같은 잡에서 끊긴 라운드부터' 를 말한다."""
+    if track is None:
+        track = _journal_track(job["id"])
+    sr = track.summary(stages=_stages(job), stop_after_round=_stop_after(job), done_sk=_done_sk(job))
+    job["status"], job["seat_resume"] = "interrupted", sr
+    job["error"] = INTERRUPTED_MSG_EXACT if sr["ok"] else INTERRUPTED_MSG
 
 
 def _limit_value(k: str, v) -> int:
@@ -652,7 +788,7 @@ def _path(job_id: str) -> Path:
 _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from")
+              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts")
 
 
 def _list_path(job_id: str) -> Path:
@@ -909,7 +1045,7 @@ def _settle(job: dict, task: asyncio.Task) -> None:
         return      # _drive 가 제 손으로 끝냈다 — 자리도 거기서 넘겼다
     mine = not _closed_elsewhere(job)
     if _CLOSING:    # 서버가 내려가며 접혔다 — 사람이 접은 것이 아니다(_drive 와 같다)
-        job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+        _mark_interrupted(job)      # 일지를 연 적이 없다 — 제자리 이어하기로 뜨던 잡이면 앞 시도의 일지(재개 자료)가 그대로다
     else:
         job["status"], job["error"] = "cancelled", "취소됨"
         if mine:
@@ -1006,6 +1142,30 @@ def _event_label(event: str, data: dict) -> str:
     return ""
 
 
+# 전사 상한(TURN_MAX)에 닿을 때 전사에 넣는 줄과 같이 내는 경고의 꼬리 — 머리는 '전사 상한 {n}턴 초과'. _apply 가 내고, 제자리 이어하기(_reopen)가
+# 끊긴 라운드의 턴을 뺄 때 같은 머리의 경고를 찾아 걷는다.
+_CAP_NOTE_TAIL = " — 이후 발언은 기록하지 않는다"
+_CAP_WARN_TAIL = (" — 이후 좌석 발언은 원장(deliberate_transcript)에 기록하지 않는다(결정문·보고서 회의록에는 실린다) "
+                  "(설정 DELIB_JOB_TURN_MAX)")
+
+
+def _turn_cap_row(x) -> bool:
+    """전사의 상한 줄인가(_apply 가 넣는 note — 좌석이 없다). 전사에 좌석 없이 드는 줄은 이것뿐이다."""
+    return isinstance(x, dict) and "persona" not in x and "note" in x
+
+
+def _drop_turn_cap_warning(job: dict, note: str) -> None:
+    """상한 줄(note)과 같이 낸 경고 하나를 걷는다(같은 머리 — 마지막 것부터). 경고 창(최근 10건)에서 밀려났어도 전체 수(warnings_total)는 하나
+    줄인다 — 줄과 경고는 늘 같이 났다."""
+    if note.endswith(_CAP_NOTE_TAIL):
+        want, ws = note[:-len(_CAP_NOTE_TAIL)] + _CAP_WARN_TAIL, job.get("warnings") or []
+        for i in range(len(ws) - 1, -1, -1):
+            if ws[i] == want:
+                del ws[i]
+                break
+    job["warnings_total"] = max(0, int(job.get("warnings_total") or 0) - 1)
+
+
 def _apply(job: dict, event: str, data: dict) -> None:
     """SSE 이벤트 하나를 잡 상태에 반영. deliberation.py 의 이벤트 계약을 읽기만 한다."""
     # 마지막으로 일어난 일 — 상태줄뿐 아니라 좌석 발언·근거·단계 전환도 적는다. 상태줄(step)은 라운드가 도는
@@ -1021,6 +1181,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "personas":
             job["seats"] = data.get("personas") or []
             job["total_rounds"] = data.get("totalRounds")
+            # 이 단의 턴이 시작되는 자리(HA-09 S4) — 다단 심의는 단마다 라운드를 1부터 센다. 제자리 이어하기(_reopen)가 끊긴 단의 턴만 뺀다.
+            job["turns_from"] = len(job.get("turns") or [])
         elif kind == "decision":
             job["decision"] = data.get("text") or job.get("decision")
         elif kind == "outcome":
@@ -1037,11 +1199,9 @@ def _apply(job: dict, event: str, data: dict) -> None:
             if len(t) < TURN_MAX:
                 t.append({k: v for k, v in data.items() if k != "kind"})
             elif len(t) == TURN_MAX:
-                t.append({"note": f"전사 상한 {TURN_MAX}턴 초과 — 이후 발언은 기록하지 않는다"})
+                t.append({"note": f"전사 상한 {TURN_MAX}턴 초과{_CAP_NOTE_TAIL}"})
                 # 전사 안의 note 한 줄로는 deliberate_status 를 보는 호출자가 모른다 — 경고로도 한 번 알린다.
-                job["warnings"] = (job.get("warnings") or [])[-9:] + [
-                    f"전사 상한 {TURN_MAX}턴 초과 — 이후 좌석 발언은 원장(deliberate_transcript)에 기록하지 않는다"
-                    "(결정문·보고서 회의록에는 실린다) (설정 DELIB_JOB_TURN_MAX)"]
+                job["warnings"] = (job.get("warnings") or [])[-9:] + [f"전사 상한 {TURN_MAX}턴 초과{_CAP_WARN_TAIL}"]
                 job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
         elif kind == "checkpoint":
             job["checkpoint"] = {k: v for k, v in data.items() if k != "kind"}
@@ -1099,8 +1259,13 @@ def _apply(job: dict, event: str, data: dict) -> None:
 async def _drive(job: dict, gen) -> None:
     """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다.
 
-    반영한 사건은 진행 일지에도 한 줄씩 적는다(HA-09 S0) — 원장은 끝날 때 쓰는데, 프로세스가 죽으면 그 finally 가 돌지 않는다."""
-    jr = _Journal(job["id"])
+    반영한 사건은 진행 일지에도 한 줄씩 적는다(HA-09 S0) — 원장은 끝날 때 쓰는데, 프로세스가 죽으면 그 finally 가 돌지 않는다. 엔진은 같은
+    일지에 재개 자료(e:*)를 덧붙인다 — 일지를 이 태스크의 문맥 변수(delib_resume.journal)에 건다(HA-09 S1). 제자리 이어하기면 되살릴 재개
+    자료(delib_resume.restore — start 가 이 태스크의 문맥에만 건다)를 새 일지 머리 뒤에 먼저 옮겨 쓴다."""
+    res = delib_resume.restore.get()
+    jr = _Journal(job["id"], carry=res.carry if res is not None and res.job_id == job["id"] else ())
+    _JOURNALS[job["id"]] = jr
+    tok = delib_resume.journal.set(jr)
     try:
         async for chunk in gen:
             ev, data = _parse_sse(chunk)
@@ -1114,7 +1279,7 @@ async def _drive(job: dict, gen) -> None:
         if _CLOSING:
             # 서버가 내려가며 접혔다(정상 종료 — 루프가 남은 태스크를 취소한다). 사람이 접은 것이 아니다 — interrupted 로 남기고 시작 인자
             # 파일을 둔다(이어하기 — R3). 종전엔 '취소됨' 으로 남아, 재기동 한 번이 사람이 접은 것과 같아 보였다.
-            job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+            _mark_interrupted(job, jr.track)
         else:
             job["status"] = "cancelled"
             job["error"] = "취소됨"
@@ -1123,7 +1288,9 @@ async def _drive(job: dict, gen) -> None:
         log.exception("[delib-job %s] 심의 태스크 오류", job["id"])
         job["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        delib_resume.journal.reset(tok)
         jr.close()
+        _JOURNALS.pop(job["id"], None)
         job["finished_at"] = _now()
         job["updated_at"] = job["finished_at"]
         if job["status"] == "running":
@@ -1155,8 +1322,13 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
-          owner_aff: str = "") -> dict:
+          owner_aff: str = "", resume: "delib_resume.Resume | None" = None) -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
+
+    resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
+    **키워드로만** 넘긴다(요청 손잡이 delib_opts 로는 받지 않는다 — 받으면 남의 잡 id 로 그 사람의 재개 자료를 읽는 길이 된다). 주면 새 잡을
+    만들지 않고 끊긴 그 잡(resume.job_id)을 같은 줄 규칙으로 다시 세우고(_reopen), 그 잡의 태스크 문맥에만 재개 상태를 건다 — 엔진이 끝난
+    라운드를 되살린다. 상한 · 멈춤 · 거절 판정은 새 잡과 같다(걸리면 그 잡은 끊긴 채 그대로다).
 
     돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
     스스로 시작한다)다. 줄까지 찼으면(또는 QUEUE_MAX 가 0 이면) RuntimeError 로 거절한다.
@@ -1268,8 +1440,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     elif "llm" in applied:
         applied = {**applied, "llm": _read.llm}
 
-    job_id = f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-    job = {
+    job_id = resume.job_id if resume is not None else f"{j}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    job = _reopen(resume) if resume is not None else {
         # 좌석이 앉기 전의 어림 — 좌석 합 상한(max_seats_running)이 앉을 때까지 이 수로 센다(앉으면 seats 의 수).
         "seats_est": _seats_est(opts),
         "id": job_id, "job": j, "kind": j, "label": spec["label"], "question": q,
@@ -1310,6 +1482,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   잡은 앞 심의의 뒷정리 안에서 뜬다 — 그대로 만들면 앞 심의가 세운 요청 단위 표식(자격 강등
     #   _pat_degraded · 유령 ID 출처 _turn_ids)을 달고 돈다. 곧바로 뜨는 잡은 종전과 같은 컨텍스트다.
     groups, ctx = list(groups or []), contextvars.copy_context()
+    if resume is not None:
+        ctx.run(delib_resume.restore.set, resume)      # 이 잡의 태스크만 재개 상태를 본다(요청 문맥에는 걸지 않는다)
     # 외부 응답자 잡은 과제 주인과 잡 id(과제 머리의 job_id — 워크플로가 맡은 잡의 과제만 답한다)를, 위키에 남기는 잡(delib_opts.wiki —
     # HWAXPortal docs/mxwp-wiki P8)은 잡 id(원천 열쇠)와 시작한 사람의 소속(범위)을 따로 넘긴다. 둘 다 아니면 진입 호출은 종전 그대로다.
     ext_kw = {"owner": owner or user_email, "job_id": job_id} if _read.llm == "external" else {}
@@ -1323,6 +1497,94 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         _persist(job)       # 재기동하면 이 기록으로 '줄이 사라졌다' 를 알린다(reap_orphans)
         log.info("[delib-job %s] 대기 %d번째 job=%s q=%.60s", job_id, len(_PENDING), j, q)
     return job
+
+
+def _rewrite_journal(job_id: str, carry: list) -> None:
+    """제자리 이어하기 — 끊긴 잡의 일지를 머리와 되살릴 재개 자료(carry)만으로 고쳐 쓴다(원자적 · 0600). 앞 시도의 공개 사건은 이미 원장에
+    접혔다 — 남겨 두면, 줄에 다시 선 잡이 새 일지를 열기 전에 프로세스가 죽을 때 재기동 정리가 그것을 한 번 더 접는다(턴이 두 번). 못 쓰면
+    OSError 를 올린다(이어하기가 요약으로 간다)."""
+    d = _private_dir(JOB_DIR / _JOURNAL_DIR)
+    tmp = d / f".{job_id}.{os.getpid()}.tmp"
+    data = "".join(json.dumps({"t": _now(), **rec}, ensure_ascii=False) + "\n"
+                   for rec in [_journal_head(job_id), *carry]).encode("utf-8")
+    try:
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _journal_path(job_id))
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _reopen(res: "delib_resume.Resume") -> dict:
+    """제자리 이어하기(HA-09 S1 A5.4 · 사용자 결정 10-31 A-2 (가)) — 끊긴 그 잡을 다시 줄에 세울 꼴로 바꾼다. start 안에서 동기로 돈다 — 상태를
+    보고 바꾸는 사이에 await 가 없어 같은 잡을 두 번 이을 수 없다(두 번째는 interrupted 가 아니라 거절된다). 시도마다 attempts 에 한 줄(끊긴
+    시각 · 이은 시각 · 이은 사람 · 처음 부를 라운드 · 끊긴 단계 · 끊긴 단 sk)을 더한다. 끊긴 라운드에서 끊기기 전에 말한 턴은 원장에서 뺀다 — 엔진이 그
+    좌석을 다시 부르지 않고 일지의 원 출력에서 그 턴을 다시 내고(S2) 나머지 좌석만 부르므로 전사에 좌석마다 한 번이다(원 출력은 적혔는데 턴은
+    원장에 닿기 전에 죽은 좌석도 한 번 — 원 출력이 턴보다 먼저 적힌다). 그 라운드의 카드 · 경고는 남는다. 결정문 뒤에서 끊긴 잡은 뺄 턴이 없다
+    — 엔진이 끝난 단계를 다시 하지 않고 결정문 · 결과를 끊기기 전의 것으로 다시 낸다(S3). 일지를 먼저 고쳐 쓴다 — 못 쓰면 잡은 그대로다."""
+    jid = res.job_id
+    job = _JOBS.get(jid) or _load(jid)
+    if not job:
+        raise ValueError(f"그런 심의 잡이 없다: {jid}")
+    if job.get("status") != "interrupted" or job.get("resumed_by"):
+        raise ValueError(f"{jid} 는 이어 돌릴 끊긴 잡이 아니다(지금 {job.get('status')}"
+                         + (f" · 이어 돈 잡 {job['resumed_by']}" if job.get("resumed_by") else "") + ") — 같은 잡을 두 번 잇지 않는다. "
+                         "deliberate_status 로 본다")
+    _rewrite_journal(jid, res.carry)
+    k, now = int(res.info.get("restored") or 0), _now()
+    job["attempts"] = [*(job.get("attempts") or []), {"cut_at": job.get("finished_at"), "resumed_at": now, "by": res.by or "",
+                                                      "round": k + 1, "stage": job.get("stage"), "sk": res.info.get("sk")}]
+    # 끊긴 단의 턴만 본다(HA-09 S4) — 다단 심의는 단마다 라운드를 1부터 세어, 앞 단의 턴을 라운드 번호로 거르면 앞 단의 뒤 라운드가 빠진다. 끊긴
+    # 단의 턴은 그 단의 personas 사건 뒤에 쌓였다(turns_from — 되살린 단도 그 사건을 다시 낸다). 그 앞의 턴은 앞 단 것이거나 이 단의 되살린
+    # 라운드(k 이하) 것이라 한 단 심의는 종전과 같다.
+    t, tf = job.get("turns") or [], job.get("turns_from")
+    tf = tf if isinstance(tf, int) and not isinstance(tf, bool) and 0 <= tf <= len(t) else 0
+    keep = [x for x in t[tf:] if not (isinstance(x.get("round"), int) and x["round"] > k)]
+    if len(keep) < len(t) - tf:
+        # 뺀 턴이 있으면 전사 상한(TURN_MAX)이 끊긴 라운드 안에서 찼을 수 있다 — 그 줄(round 없는 note — 상한에 닿은 뒤에는 턴이 붙지 않아 뺀
+        # 턴보다 뒤다)과 같이 낸 경고도 걷는다. 남기면 다시 내는 턴이 상한을 또 채워 줄 · 경고가 둘이 되고, 남은 줄이 한 칸을 먹어 끊지 않은
+        # 실행이 적은 턴 하나가 빠진다(검토 10-31). 걷으면 다시 내는 턴이 끊지 않은 실행과 같은 자리에서 상한을 채운다.
+        for x in [x for x in keep if _turn_cap_row(x)]:
+            keep.remove(x)
+            _drop_turn_cap_warning(job, str(x["note"]))
+    job["turns"] = t[:tf] + keep
+    job.update(status="queued", stage="queued", error=None, finished_at=None, round=k, updated_at=now)
+    job.pop("seat_resume", None)
+    return job
+
+
+def resume_load(job: dict, *, groups: list | None) -> tuple:
+    """주인의 이어하기 — 끊긴 잡의 진행 일지에서 되살릴 재개 자료를 읽는다(HA-09 S1). (delib_resume.Resume, "") 또는 (None, 못 쓰는 까닭).
+
+    **남의 이어하기에서는 부르지 않는다**(HA-06 — mcp_server._resume 이 먼저 가른다). groups 를 주면 지금 그룹이 끊기기 전 그룹(e:pre)을 다
+    가졌는지 본다 — 줄었으면 쓰지 않는다(사용자 결정 10-31 A-5 (가) — 그때 본 근거 · 지식카드 · 조회가 지금은 못 볼 것일 수 있다). 재기동
+    정리가 줄에 다시 세울 때(_requeue)는 None 이다(이을 때 봤다). 시작 인자 파일이 없으면 끊기기 전 인자를 그대로 쓸 수 없어 쓰지 않는다."""
+    if _read_args(job["id"]) is None:
+        return None, "시작 인자 파일이 없다 — 끊기기 전 인자를 그대로 쓸 수 없다"
+    try:
+        raw = _journal_path(job["id"]).read_bytes()
+    except FileNotFoundError:
+        return None, "진행 일지가 없다"
+    except OSError as exc:
+        return None, f"진행 일지를 읽지 못했다({type(exc).__name__})"
+    res, why = delib_resume.parse(raw, job["id"], journal_v=JOURNAL_V, stop_after_round=_stop_after(job), stages=_stages(job))
+    if res is None:
+        return None, why
+    if res.info.get("sk") == _done_sk(job):
+        # 끊긴 단이 이미 끝났다(원장의 체크포인트) — 다음 단에 들기 전에 끊겼다. 요약 길이 체크포인트로 건너뛴다(S4 — 진행 조회와 같은 규칙)
+        return None, delib_resume.why_between(res.info["sk"])
+    if groups is not None and not set(groups) >= set(res.groups):
+        return None, ("끊긴 뒤 권한이 줄었다(지금 그룹이 끊기기 전 그룹을 다 갖지 않는다) — 그때 본 근거 · 지식카드 · 조회를 되살리지 "
+                      "않는다")
+    return res, ""
 
 
 def _opts_echo(opts: dict) -> dict:
@@ -1402,7 +1664,7 @@ def reap_orphans(app=None) -> int:
     줄 선 잡(queued)은 app 을 받았고 시작 인자 파일이 있으면 **처음 줄 선 차례대로 다시 세운다**(R2 — 띄우기는 주기 펌프 · 다음
     시작이 한다. 멈춤이 켜져 있으면 그대로 붙잡힌다). 파일이 없거나 깨졌으면(이 판 이전의 잡 · 쓰기 실패) 종전처럼 '시작하지 못했다' 로
     닫는다 — queued 로 두면 호출자는 오지 않을 차례를 영영 기다린다."""
-    global _REQUEUED  # noqa: PLW0603 — 이번 기동의 수(/health)
+    global _REQUEUED, _FOLDED  # noqa: PLW0603 — 이번 기동의 수(/health)
     n, back = 0, []
     _tighten_existing()
     try:
@@ -1418,17 +1680,24 @@ def reap_orphans(app=None) -> int:
             if args is not None:
                 back.append((j, args))
                 continue
+            track = None
             if j["status"] == "running":
-                _fold_journal(j)        # 끊기기 전의 진행 — 원장은 띄울 때 모양이다(HA-09 S0). 닫기 전에 접어야 끝난 시각이 마지막 사건의 시각이다
-            _close_orphan(j)
+                # 끊기기 전의 진행 — 원장은 띄울 때 모양이다(HA-09 S0). 닫기 전에 접어야 끝난 시각이 마지막 사건의 시각이다. 재개 자료(e:*)는
+                # 접지 않고 세어 좌석 단위 재개 요약을 싣는다(S1)
+                track = delib_resume.Tracker()
+                if _fold_journal(j, track):
+                    _FOLDED += 1
+            _close_orphan(j, track=track)
             n += 1
     except OSError:
         pass
     requeued = 0
     for j, args in sorted(back, key=lambda x: x[0].get("queued_at") or x[0].get("updated_at") or 0):
         try:
-            _requeue(app, j, args)
-            requeued += 1
+            if _requeue(app, j, args):
+                requeued += 1
+            else:
+                n += 1          # 제자리 이어하기로 줄 섰던 잡인데 재개 자료를 다시 못 읽었다 — 끊긴 채로 되돌렸다(_requeue)
         except Exception as exc:  # noqa: BLE001 — 한 잡이 깨져도 나머지는 다시 세운다
             log.warning("[delib-job %s] 줄에 다시 세우지 못했다 — 닫는다: %r", j.get("id"), exc)
             _close_orphan(j, why=f"{type(exc).__name__}")
@@ -1442,37 +1711,56 @@ def reap_orphans(app=None) -> int:
     return n
 
 
-def _close_orphan(j: dict, *, why: str = "") -> None:
+def _close_orphan(j: dict, *, why: str = "", track=None) -> None:
     if j["status"] == "queued":
         j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다"
                       + (f"(시작 인자를 다시 읽지 못했다 — {why})" if why else "") + ". deliberate_start 로 다시 시작해야 한다")
         _drop_args(j["id"])
     else:
-        j["error"] = INTERRUPTED_MSG
+        _mark_interrupted(j, track)         # 안내 · 좌석 단위 재개 요약(HA-09 S1)
     j["status"] = "interrupted"
     j["finished_at"] = j.get("updated_at") or _now()
     _persist(j)
 
 
-def _requeue(app, job: dict, args: dict) -> None:
+def _requeue(app, job: dict, args: dict) -> bool:
     """재기동 전 줄 선 잡을 시작 인자 파일로 다시 세운다 — 띄우는 것은 start() 와 같은 _make_spawn 이다. 그룹은 줄에 설 때의 값이다(메모리
-    줄도 같은 값으로 돈다 — HWAXPortal docs/delib-ops DO-D2 ③)."""
+    줄도 같은 값으로 돈다 — HWAXPortal docs/delib-ops DO-D2 ③). 다시 세웠으면 참.
+
+    제자리 이어하기로 줄 섰던 잡(attempts)은 재개 자료를 일지에서 다시 읽어 그 태스크 문맥에 건다(HA-09 S1) — 없이 띄우면 같은 잡이 처음부터
+    돌아 원장에 남은 끝난 라운드의 턴과 겹친다. 못 읽으면(판이 바뀌어 꼴이 다르다 등) 띄우지 않고 끊긴 채로 되돌린다(거짓) — 주인이 다시 이으면
+    요약으로 잇는다."""
     spec = JOBS[resolve_job(str(args.get("job_kind") or job.get("job") or "default"))]
     ext_kw = ({"owner": args.get("owner") or args.get("user_email"), "job_id": job["id"]} if _external(job) else {})
     if (job.get("opts") or {}).get("wiki"):
         ext_kw.update(job_id=job["id"], affiliation=str(job.get("owner_aff") or "").strip())     # start() 와 같은 칸
+    ctx = contextvars.copy_context()
+    if job.get("attempts"):
+        res, why = resume_load(job, groups=None)
+        if res is None:
+            att = job["attempts"][-1] if isinstance(job["attempts"][-1], dict) else {}
+            job.update(status="interrupted", stage=att.get("stage") or job.get("stage"), error=INTERRUPTED_MSG,
+                       finished_at=att.get("cut_at") or _now(),
+                       seat_resume={"ok": False, "sk": None, "round": None, "spoken": [], "todo": [],
+                                    "why": f"제자리 이어하기로 줄 섰다가 재기동했는데 재개 자료를 다시 읽지 못했다({why}) — 이으면 요약으로 잇는다"})
+            log.warning("[delib-job %s] 제자리 이어하기로 줄 섰던 잡의 재개 자료를 다시 읽지 못했다 — 끊긴 채로 되돌린다: %s", job["id"], why)
+            _persist(job)
+            return False
+        res.by = str(job["attempts"][-1].get("by") or "") if isinstance(job["attempts"][-1], dict) else ""
+        ctx.run(delib_resume.restore.set, res)
     spawn = _make_spawn(app, job, _entry(spec), args["question"], list(args.get("groups") or []), dict(args.get("opts") or {}),
-                        str(args.get("user_email") or ""), "", ext_kw, contextvars.copy_context())
+                        str(args.get("user_email") or ""), "", ext_kw, ctx)
     job.update(status="queued", stage="queued", durable=True, requeued=int(job.get("requeued") or 0) + 1, requeued_at=_now())
     _JOBS[job["id"]] = job
     _PENDING[job["id"]] = (job, spawn)
     _persist(job)
+    return True
 
 
 def _sweep_args() -> None:
     """남은 시작 인자 파일 · 진행 일지를 치운다 — 원장이 없거나 끝난 잡(끝남과 지우기 사이에 죽었다)의 것, 끊긴 잡이라도 이어 돌렸거나
     ARGS_KEEP_S 가 지난 것. 근거 본문 · 발언이 원장 옆에 오래 남지 않게 한다. 둘은 잡마다 같은 규칙이다(_drop_args 가 함께 지운다) — 시작
-    인자 파일을 못 쓴 잡(durable 거짓)의 일지도 여기서 본다."""
+    인자 파일을 못 쓴 잡(durable 거짓)의 일지도 여기서 본다. 고쳐 쓰다 남은 임시 파일은 잡 규칙과 따로 늘 치운다(_sweep_tmp)."""
     files = []
     for sub, pat in ((_ARGS_DIR, "*.json"), (_JOURNAL_DIR, "*.jsonl")):
         try:
@@ -1490,41 +1778,96 @@ def _sweep_args() -> None:
         if status == "interrupted" and not rec.get("resumed_by") and now - float(rec.get("finished_at") or now) < ARGS_KEEP_S:
             continue
         _drop_args(jid)
+    _sweep_tmp()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:             # 남의 프로세스(PermissionError) — 살아 있다
+        return True
+    return True
+
+
+def _sweep_tmp() -> None:
+    """고쳐 쓰다 남은 임시 파일(.<잡 id>.<pid>.tmp — 시작 인자 파일 _write_args · 일지 _rewrite_journal)을 치운다. 기동 때 남은 것은 쓰던
+    프로세스가 바꿔 넣기(os.replace) 전에 죽은 것이다(KILL · 메모리 고갈) — 읽는 곳이 없고(진짜 파일은 그대로다) 근거 본문 · 지식카드 · 원
+    출력이 든다. 그 잡의 진짜 파일과 달리 끝나도 7일이 지나도 지우는 길이 없어 남았다(검토 10-31). 쓰던 프로세스가 아직 살아 있으면(재기동이
+    겹쳤다) 둔다 — 그 프로세스가 곧 바꿔 넣거나 스스로 지운다. 이 프로세스의 것은 지운다(기동 정리는 쓰기와 같은 동기 구간에 겹치지 않는다)."""
+    me = os.getpid()
+    for sub in (_ARGS_DIR, _JOURNAL_DIR):
+        try:
+            tmps = list((JOB_DIR / sub).glob(".*.tmp"))
+        except OSError:
+            continue
+        for p in tmps:
+            pid = p.name[:-len(".tmp")].rsplit(".", 1)[-1]
+            if pid.isdigit() and int(pid) != me and _pid_alive(int(pid)):
+                continue
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("고쳐 쓰다 남은 임시 파일 %s/%s 를 못 지웠다: %r", sub, p.name, exc)
 
 
 def resume_info(job: dict) -> dict | None:
     """재기동으로 끊긴(interrupted) 잡을 이어 돌릴 재료 — {rounds_done, total_rounds, rounds_left, args, resumed_by}. 아니면 None.
 
     끝난 라운드는 단계로 센다 — 라운드 N 에 들어서면(stage rN) 앞의 N-1 이 끝난 것이고, 의장 결정 이후 단계(decide · explain · report)면 전부다.
-    단계 rN 에서 끊긴 라운드는 일부 좌석만 말했을 수 있어 세지 않는다. 다단 심의(sim · test-plan)는 단 사이 승계가 엔진 안에 있어 끝난
-    라운드로 잇지 않는다(rounds_done 0 — 같은 인자로 처음부터). rounds_left 는 이어 돌 라운드 수다 — 엔진의 하한이 2 라, 마지막 라운드나
-    결정문에서 끊긴 잡도 2라운드(앞 입장을 이어받은 입장 · 수렴)를 돈다."""
+    단계 rN 에서 끊긴 라운드는 일부 좌석만 말했을 수 있어 세지 않는다. 라운드를 세는 것은 단이 하나인 잡(단 열쇠 main · tp — 한 단 심의 · 시험
+    설계)이다(HA-09 S4 — 종전엔 엔진 general 만 셌다). 다단 심의(sim-plan · build-plan)는 단 사이 승계가 엔진 안에 있어 요약 길(새 잡)이 끝난
+    라운드로 잇지 않는다(rounds_done 0 — 체크포인트로 끝난 단을 건너뛰고 끊긴 단을 처음부터). 그 단 안을 잇는 것은 제자리 이어하기(seat_resume 의
+    sk 가 그 단)다. rounds_left 는 이어 돌 라운드 수다 — 엔진의 하한이 2 라, 마지막 라운드나 결정문에서 끊긴 잡도 2라운드(앞 입장을 이어받은
+    입장 · 수렴)를 돈다."""
     if job.get("status") != "interrupted":
         return None
-    try:
-        general = JOBS[resolve_job(str(job.get("job") or job.get("kind") or "default"))]["engine"] == "general"
-    except (KeyError, ValueError):
-        general = False
+    stages = _stages(job)
+    one = len(stages) == 1                          # 라운드가 한 단의 것인 잡 — 원장의 단계 · 라운드가 그 단의 것이다
     total = int(job.get("total_rounds") or 0)       # 엔진이 좌석을 앉힐 때 적는다 — 그 전에 끊겼으면 끝난 라운드가 없다(목록 색인에도 이 칸뿐이다)
     stage = str(job.get("stage") or "")
     done = 0
-    if general and total:
+    if one and total:
         if stage.startswith("r") and stage[1:].isdigit():
             done = max(0, min(total, int(stage[1:]) - 1))
         elif stage in ("decide", "explain", "report"):
             done = total
+    # 좌석 단위 재개 요약(HA-09 S1) — 끊기는 자리에서 적는다(_mark_interrupted). 없으면(이 판 이전에 끊긴 잡) 재개 자료가 없다고 답한다.
+    # 끝난 라운드는 일지가 더 정확히 안다 — 라운드 끝 줄(e:round_end)은 그 라운드의 턴이 모두 원장에 접힌 뒤에 적히는데, 단계는 다음 라운드에
+    # 들어서야 바뀐다(그 사이에 끊기면 단계로는 한 라운드 덜 센다). 제자리 이어하기로 다시 뜬 잡이 단계에 들기 전에 끊기면 단계는 start 다.
+    sr = (job.get("seat_resume") if isinstance(job.get("seat_resume"), dict)
+          else delib_resume.Tracker().summary(stages=stages, done_sk=_done_sk(job)))
+    if one and total and sr.get("ok") and isinstance(sr.get("round"), int):
+        done = max(done, min(total, sr["round"] - 1))
     ck = job.get("checkpoint")
     return {"rounds_done": done, "total_rounds": total or None,
             "rounds_left": (max(2, min(8, total - done)) if done else None),
             "args": _args_path(job["id"]).exists(), "resumed_by": job.get("resumed_by"),
             # 다단 심의의 끝난 단(HA-09) — 이으면 그 단까지 건너뛴다(sim-1 = 1단 · sim-2 = 2단까지 끝났다)
-            "checkpoint": ck.get("stage") if isinstance(ck, dict) else None}
+            "checkpoint": ck.get("stage") if isinstance(ck, dict) else None,
+            # {ok, sk, round, spoken, todo, why} — ok 면 주인이 바꾼 값 없이 이을 때 같은 잡이 round 라운드부터 돈다(A5.4)
+            "seat_resume": sr}
 
 
 def queue_durability() -> dict:
     """/health 의 delib_queue_durable · delib_requeued — 줄 선 잡이 전부 시작 인자 파일을 가졌으면 참(재기동이 줄을 잃지 않는다 — 재기동
     판정이 줄 선 수를 막는 수로 세지 않는다, R2'). 줄이 비었으면 참이다. 하나라도 파일을 못 썼으면 거짓(그 잡은 재기동에 사라진다)."""
     return {"durable": all(job.get("durable") for job, _spawn in _PENDING.values()), "requeued": _REQUEUED}
+
+
+def journal_health() -> dict:
+    """/health 의 delib_journal — 진행 일지 · 재개 자료를 쓰는 판인가(on) · 한 잡의 일지 상한(max_mb) · 기동 뒤 쓰다 실패한 수(errors)."""
+    return {"on": True, "max_mb": JOURNAL_MAX_BYTES // (1024 * 1024), "errors": _JOURNAL_ERRORS}
+
+
+def folded() -> int:
+    """/health 의 delib_folded — 이번 기동의 재기동 정리가 진행 일지를 원장에 접은 잡 수."""
+    return _FOLDED
 
 
 async def _tick() -> None:
@@ -1575,7 +1918,8 @@ async def shutdown(wait_s: float | None = None) -> int:
         job = _JOBS.get(jid)
         if job is not None and job.get("status") == "running":      # finally 가 아직이다 — 메모리 상태 그대로 남긴다
             mine = not _closed_elsewhere(job)                       # 다른 프로세스가 이미 닫은 원장은 덮지 않는다(재기동이 겹쳤다)
-            job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+            _jr = _JOURNALS.get(jid)                                # 그 잡의 일지가 센 재개 자료(HA-09 S1)
+            _mark_interrupted(job, _jr.track if _jr is not None else None)
             job["finished_at"] = job["updated_at"] = _now()
             if mine:
                 _persist(job)
@@ -1614,6 +1958,9 @@ def summary(job: dict, *, full: bool = False) -> dict:
         out["resume"] = resume_info(job)
     if job.get("resumed_from"):
         out["resumed_from"] = job["resumed_from"]
+    if job.get("attempts"):
+        # 제자리 이어하기의 시도들(HA-09 S1) — [{cut_at, resumed_at, by, round, stage}]. 같은 job_id 로 끊긴 라운드부터 다시 돌았다.
+        out["attempts"] = job["attempts"]
     if job["status"] == "running":
         # 마지막 이벤트 뒤 경과(초)와 그 이벤트. 종전엔 단계·상태줄·걸린 시간뿐이라, 같은 단계가 30분째면
         # LLM 을 기다리는 것인지 멈춘 것인지 알 수 없었다. 심의는 좌석 하나의 발언이 끝날 때까지 이벤트가 없다 —

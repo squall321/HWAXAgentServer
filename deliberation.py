@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다(풀기는 위키 원천의 주인 이메일)
 
 import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
+import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
@@ -2943,6 +2944,13 @@ def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
 
     return check
 
+def _nn_text(o: dict) -> str:
+    """좌석 원 출력의 양보 불가 조항 전문 — 목록으로 오면 항목을 잇는다(종전엔 파이썬 표기 "['…']" 가 그대로 조항이 됐다). 수렴 라운드의 턴과
+    다단 심의가 다음 단에 넘기는 조항(out["non_negotiables"] — 되살린 수렴 라운드도, HA-09 S4)이 같은 식을 쓴다."""
+    raw = o.get("non_negotiable")
+    return "; ".join(str(x).strip() for x in raw if str(x).strip()) if isinstance(raw, list) else str(raw or "")
+
+
 def _rebut_items(o: dict) -> list:
     """발언의 반박을 **구조 그대로** 꺼낸다 — {target, quote, counter, basis}.
 
@@ -3183,6 +3191,19 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
         for t in tasks:
             if not t.done():
                 t.cancel()
+
+
+async def _then(first: list, gen):
+    """first 를 먼저 내고 gen 을 잇는다 — 끊긴 라운드를 이을 때 끊기기 전에 말한 좌석의 원 출력 뒤에 나머지 좌석의 발언(_round_live)을 낸다
+    (HA-09 S2). 그 라운드의 전사 차례는 끝난 차례다 — 끊기기 전에 끝난 좌석이 먼저다. 이것이 닫히면 gen 도 곧바로 닫는다(남은 좌석 호출을
+    접는 _round_live 의 finally 가 한 겹 더 늦지 않게)."""
+    try:
+        for x in first:
+            yield x
+        async for x in gen:
+            yield x
+    finally:
+        await gen.aclose()
 
 
 # 유령 ID 게이트(app._cap_tool)가 '실행하지 않았다'는 뜻으로 돌려주는 표지. 챗과 심의 양쪽에서
@@ -3649,6 +3670,21 @@ async def _wiki_submit(tools: dict, *, user: str, chair_failed, **env_kw) -> str
     note = _wiki_note(raw, env)
     print(f"[deliberation] MX 백서 위키 {env['origin']['ref']}: {note.strip()[:300]}")
     return note
+
+
+def _wiki_off() -> bool:
+    """이 심의가 위키 꺼짐을 이미 알렸나(HA-08 — 다단 심의는 한 번만 알린다). 재개 자료(e:wiki_sent · e:stage_in — HA-09)에 적는 값이다."""
+    st = _WIKI_STATE.get()
+    return bool(st is not None and st.get("off"))
+
+
+def _wiki_off_back(off) -> None:
+    """되살릴 때(HA-09) — 끊기기 전에 이 심의가 위키 꺼짐을 알렸으면(재개 자료의 off · wiki_off) 그 상태를 되돌린다. 알린 단계(위키 단계 ·
+    앞 단)를 다시 돌지 않으므로, 되돌리지 않으면 뒤 단이 꺼짐을 처음 아는 것처럼 결정문 끝에 한 줄을 또 붙인다(끊지 않은 실행에는 없는 줄 —
+    검토 10-31). 그 칸이 없는 줄(이 고침 앞에 적힌 일지)은 종전 읽기 그대로다(꺼지지 않은 것으로 읽는다)."""
+    st = _WIKI_STATE.get()
+    if off is True and st is not None:
+        st["off"] = True
 
 
 def _tool_text_ok(s) -> bool:
@@ -5192,9 +5228,29 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     ckpt = req_opts.pop("resume_checkpoint", None)
     ckpt = ckpt if (isinstance(ckpt, dict) and ckpt.get("stage") in ("sim-1", "sim-2") and str(ckpt.get("decision_a") or "").strip()
                     and (ckpt["stage"] == "sim-1" or (str(ckpt.get("decision_b") or "").strip() and ckpt.get("sim_seats")))) else None
+    # 단 안에서 잇기(HA-09 S4) — 제자리 이어하기의 끊긴 단이 2단 · 3단이면 그 단에 들 때 적은 재개 자료(e:stage_in — 앞 단 결정문 · 조항 · 좌석 ·
+    # 좌석 전환 결과 · 사내 자산 현황 글)로 앞 단 · 좌석 전환 · 현황 조회를 다시 하지 않고 그 단에 든다. 그 단 안은 단 열쇠의 재개 상태로
+    # 되살린다(_deliberation_stream). 둘 다 없으면(끊긴 단이 1단 · 재개 상태 없음) 아래는 지금 길 그대로다.
+    _in2, _in3 = delib_resume.stage_in(delib_resume.SIM2), delib_resume.stage_in(delib_resume.SIM3)
+    # 앞 단이 위키 꺼짐을 이미 알렸으면(그 단에 들 때의 wiki_off) 그 상태도 되돌린다 — 이 단은 끊지 않은 실행처럼 조용히 건너뛴다(HA-08)
+    _wiki_off_back((_in3 or _in2 or {}).get("wiki_off"))
 
     try:
-        if ckpt:
+        if _in3 is not None:
+            # ── 1 · 2단 — 끊기기 전에 끝났다(3단 안에서 끊겼다) ─────────────────────
+            yield _sse("status", {"step": "1 · 2단은 끊기기 전에 끝났다 — 2단 결정문과 좌석을 되살려 3단(구축 계획) 안에서 잇는다"
+                                          "(다시 돌지 않는다)", "tool": None})
+            async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, str(_in3["decision_b"]),
+                                           [dict(x) for x in _in3["seats"]]):
+                yield chunk
+            return
+        if _in2 is not None:
+            # ── 1단 — 끊기기 전에 끝났다(2단 안에서 끊겼다 — 체크포인트와 같은 값) ─────────
+            decision_a, nn_a = str(_in2["decision_a"]), [str(x) for x in _in2["nn_a"]]
+            personas_a = [dict(x) for x in _in2["personas_a"] if isinstance(x, dict)]
+            yield _sse("status", {"step": "1단(메커니즘)은 끊기기 전에 끝났다 — 그 결정문 · 2단 좌석 · 사내 자산 현황을 되살려 2단(해석 설계) "
+                                          "안에서 잇는다(다시 부르지 않는다)", "tool": None})
+        elif ckpt:
             # ── 1단 — 끊기기 전에 끝났다(체크포인트) ─────────────────────────────
             decision_a = str(ckpt["decision_a"])
             personas_a = [x for x in (ckpt.get("personas_a") or []) if isinstance(x, dict) and x.get("key")]
@@ -5206,7 +5262,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             opts_a = _resolve_opts(req_opts)
             opts_a.chair_template = "mechanism"
             async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
-                                                    history, out=out_a):
+                                                    history, out=out_a, sk=delib_resume.SIM1):
                 yield chunk
             decision_a = out_a.get("decision") or ""
             personas_a = out_a.get("personas") or []
@@ -5224,7 +5280,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                                  **({"knob": _knob_a} if _knob_a else {})})
             yield _sse("done", {}); return
 
-        if ckpt and ckpt["stage"] == "sim-2":
+        if ckpt and ckpt["stage"] == "sim-2" and _in2 is None:
             # ── 2단 — 끊기기 전에 끝났다(체크포인트) — 3단(구축 계획)부터 ──────────────
             sim_seats = [x for x in ckpt["sim_seats"] if isinstance(x, dict) and x.get("key")]
             decision_b = str(ckpt["decision_b"])
@@ -5232,29 +5288,33 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, decision_b, sim_seats):
                 yield chunk
             return
-        # ── 좌석 전환 ────────────────────────────────────────────────────────
-        yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
-        tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-        sim_seats, seen = [], set()
+        if _in2 is not None:
+            # 좌석 전환 — 끊기기 전의 결과(S4). 발굴 · 역할 복원을 다시 부르지 않는다
+            sim_seats = [dict(x) for x in _in2["seats"]]
+        else:
+            # ── 좌석 전환 ────────────────────────────────────────────────────────
+            yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
+            tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+            sim_seats, seen = [], set()
 
-        async def _add(key, origin):
-            if not key or key in seen:
-                return
-            seen.add(key)
-            sim_seats.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
+            async def _add(key, origin):
+                if not key or key in seen:
+                    return
+                seen.add(key)
+                sim_seats.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
 
-        for k in _SIM_FIXED_CAE:
-            await _add(k, "new")
-        # 1단 결론의 물리 축으로 발굴 — 현상 어휘가 아니라 계산의 성격으로 찾아야 CAE 가 잡힌다.
-        for cand in await _discover(tools, f"{question}\n\n{decision_a[:1500]}\n\n수치해석 시뮬레이션 모델링",
-                                    3, exclude=seen, origin="new"):
-            await _add(cand["key"], "new")
-        # 물리 유임 — 없으면 해석이 물리에서 떠난다. 1단 좌석 앞에서 강제로 채운다.
-        for pa in personas_a[:max(1, _SIM_CARRY)]:
-            await _add(pa["key"], "carry")
-        n_carry = sum(1 for x in sim_seats if x["origin"] == "carry")
-        yield _sse("status", {"step": f"2단 좌석 {len(sim_seats)}인 (CAE {len(sim_seats) - n_carry} · 물리 유임 {n_carry})",
-                              "tool": None, "personas": [x["key"] for x in sim_seats]})
+            for k in _SIM_FIXED_CAE:
+                await _add(k, "new")
+            # 1단 결론의 물리 축으로 발굴 — 현상 어휘가 아니라 계산의 성격으로 찾아야 CAE 가 잡힌다.
+            for cand in await _discover(tools, f"{question}\n\n{decision_a[:1500]}\n\n수치해석 시뮬레이션 모델링",
+                                        3, exclude=seen, origin="new"):
+                await _add(cand["key"], "new")
+            # 물리 유임 — 없으면 해석이 물리에서 떠난다. 1단 좌석 앞에서 강제로 채운다.
+            for pa in personas_a[:max(1, _SIM_CARRY)]:
+                await _add(pa["key"], "carry")
+            n_carry = sum(1 for x in sim_seats if x["origin"] == "carry")
+            yield _sse("status", {"step": f"2단 좌석 {len(sim_seats)}인 (CAE {len(sim_seats) - n_carry} · 물리 유임 {n_carry})",
+                                  "tool": None, "personas": [x["key"] for x in sim_seats]})
 
         # ── 2단 — 해석 설계 심의 ─────────────────────────────────────────────
         yield _sse("status", {"step": "2단 — 해석 설계 심의", "tool": None})
@@ -5269,8 +5329,9 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         _smax = _summary_max()
         opts_b.continue_summary = decision_a[:_smax]
         opts_b.continue_non_negotiables = nn_a[:_NN_MAX]
-        for _c in _carry_cut_cards("1단 결정문", decision_a, _smax, "2단", nn_a):
-            yield _c
+        if _in2 is None:        # 되살렸으면(S4) 이 카드는 끊기기 전에 이미 원장에 실렸다 — 다시 내지 않는다
+            for _c in _carry_cut_cards("1단 결정문", decision_a, _smax, "2단", nn_a):
+                yield _c
         opts_b.continue_personas = sim_seats
         # 호출자의 사람 의견·지정 좌석은 **1단의 입력**이다(hwax-sim-deliberate.js 의 humanNote 도 '1단에 주입할
         # 사람 의견' 이다). 여기서는 이어 붙이지 않는다 — 1단 좌석 전원이 그 의견을 받았고, 그 방향은 1단
@@ -5281,16 +5342,26 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
         # 실제 보유 목록과 어긋난다 — 계획서가 없는 도구를 쓰자고 하거나, 있는 물성을 새로
         # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
-        try:
-            yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
-            _tools_b = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-            _snap = await _asset_snapshot(_tools_b, question)
-            opts_b.human_note += "\n\n" + _snap
-        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
-            print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
+        if _in2 is not None:
+            opts_b.human_note += _in2["note"]       # 끊기기 전에 붙인 현황 글 그대로(S4) — 다시 조회하지 않는다
+        else:
+            _snap_add = ""          # 사람 의견에 붙인 글 — 2단에 들 때의 재개 자료(e:stage_in)에 그대로 적는다
+            try:
+                yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
+                _tools_b = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+                _snap_add = "\n\n" + await _asset_snapshot(_tools_b, question)
+            except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+                print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
+            opts_b.human_note += _snap_add
+            # 재개 자료(HA-09 S4 — e:stage_in) — 2단에 들 때의 값. 2단 안에서 끊겨 이으면 1단 · 좌석 전환 · 현황 조회를 다시 하지 않고 이 값으로
+            # 든다. 앞 단 산출은 체크포인트와 같은 값이다(요약 길은 원장의 체크포인트를, 제자리 이어하기는 이 줄을 읽는다). wiki_off — 1단이 위키
+            # 꺼짐을 알렸나(되살릴 때 2단이 그 안내를 또 붙이지 않게).
+            delib_resume.write(delib_resume.SIM2, "e:stage_in", sync=True, decision_a=decision_a, nn_a=list(nn_a),
+                               personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
+                               seats=sim_seats, note=_snap_add, wiki_off=_wiki_off())
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat,
-                                                history, out=out_b):
+                                                history, out=out_b, sk=delib_resume.SIM2):
             yield chunk
         decision_b = out_b.get("decision") or ""
         if opts.build_plan and decision_b:
@@ -5313,6 +5384,9 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     build_plan 이 꺼져 있으면 종전 2단 동작 그대로(아무것도 내지 않는다). 2단 체크포인트로 이어 돌 때도 이 길이다(HA-09)."""
     if not (opts.build_plan and decision_b):
         return
+    # 3단 안에서 잇는다(HA-09 S4) — 들 때의 값(decision_b · sim_seats)은 부르는 쪽이 재개 자료(e:stage_in)에서 넘겼다. 아래 카드는 끊기기 전에 이미
+    # 원장에 실렸고 그 줄은 새 일지에 옮겨 적혔다 — 다시 내지도 적지도 않는다.
+    _in3 = delib_resume.stage_in(delib_resume.SIM3)
     yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
     opts_c = _resolve_opts(req_opts)
     opts_c.req_cut = {}
@@ -5323,8 +5397,9 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     # 2단 결정문(sim_spec 포함) — 종전 20,000자가 바닥이고 넓은 창은 이어하기 요약 몫까지(_summary_max).
     _smax_c = max(20000, _summary_max())
     opts_c.continue_summary = decision_b[:_smax_c]
-    for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
-        yield _c
+    if _in3 is None:
+        for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
+            yield _c
     opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
                                 for s in sim_seats]
     opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
@@ -5332,8 +5407,98 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     opts_c.rescreen_note = ""   # 엔진 지시문이다 — 재심사는 그것으로 축을 짓지 않는다(2단과 같다)
     build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
-    async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
+    if _in3 is None:
+        # 재개 자료(HA-09 S4 — e:stage_in) — 3단에 들 때의 값. 3단 안에서 끊겨 이으면 1 · 2단을 다시 돌지 않고 이 값으로 든다. wiki_off 는
+        # 2단 줄과 같다(1 · 2단이 위키 꺼짐을 알렸나).
+        delib_resume.write(delib_resume.SIM3, "e:stage_in", sync=True, decision_b=decision_b,
+                           seats=[{"key": s["key"], "role": s.get("role", ""), "origin": s.get("origin")} for s in sim_seats],
+                           wiki_off=_wiki_off())
+    async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history, sk=delib_resume.SIM3):
         yield chunk
+
+
+def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: str, free_pool: dict, looks: bool) -> list:
+    """되살린 단계의 알림(HA-09 S1 · S2 · S3 · S4 A5.5) — 상태줄 한 줄과 카드 한 장. 다단 심의 · 시험 설계면 끊긴 단(상태줄 머리)과 다시 하지 않은
+    앞 단 · 단 밖 조회(카드)를 함께 말한다. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
+    조회가 끊기기 전의 것이라는 것, 끊긴 라운드(cutd — 라운드 수가 같을 때만 있다)에서 끊기기 전에 말한 좌석은 다시 부르지 않고 나머지만 부른다는
+    것과 그 라운드의 조회를 다시 하는지(looks — 지금 엔진이 그 라운드에서 자유 조회를 하는가), 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 요약 · 쉬운
+    설명 · 보고서 · 위키)를 다시 하지 않는다는 것과 저장 도중 끊긴 보고서는 새로 저장한다는 것, 그리고 끊기기 전과 다른 것(화두 블록 지문 · 엔진 판 ·
+    모델 창 · 사라진 조회 도구 · 라운드 수)이 있으면 그것까지 — 막지 않는다(남은 좌석은 지금 것으로 말한다)."""
+    pre, info = rsv.pre, rsv.info
+    n, ro, n_seats = int(opts.rounds), int(getattr(opts, "rounds_so_far", 0) or 0), len(seats)
+    sk = info.get("sk")         # 끊긴 단(S4) — 다단 심의 · 시험 설계는 그 앞에 끝난 단 · 단 밖의 조회도 되살렸다
+    spoken = [o["persona"] for o in cutd["raw"]] if cutd is not None else []
+    todo = [s for s in seats if s not in spoken]
+    _ks = lambda xs: ", ".join(xs[:4]) + (" …" if len(xs) > 4 else "")     # noqa: E731 — 좌석 이름은 넷까지(원장 카드는 앞 400자만 싣는다)
+    # 결정문 뒤(S3) — 엔진과 같은 조건(전 라운드를 되살렸을 때)에서만 끝난 단계를 말한다
+    post = rsv.post if k >= n else {}
+    sav, it = post.get("e:report_saved"), post.get("e:report_intent")
+    redo = bool(it and it["save"] and not sav)          # 저장 도중 끊겼다 — 새로 저장한다(엔진이 경고 한 번)
+    if post:
+        if sav:
+            step = ("끊기기 전에 보고서 단계까지 끝났다 — 의장 · 보고서를 다시 하지 않고 "
+                    + ("결과만 낸다" if (post.get("e:wiki_sent") or not getattr(opts, "wiki", 0)) else "위키에 남기는 것부터 이어 간다"))
+        elif redo:
+            step = "끊기기 전에 결정문까지 나왔고 보고서를 저장하던 중이었다 — 의장을 다시 부르지 않고 보고서를 새로 저장한다(이미 저장됐을 수 있다)"
+        elif it or post.get("e:plain"):
+            step = "끊기기 전에 결정문까지 나왔다 — 의장 · 요약 · 쉬운 설명을 다시 부르지 않고 보고서 단계부터 이어 간다"
+        else:
+            step = "끊기기 전에 의장 단계가 끝났다 — 의장을 다시 부르지 않고 요약 · 쉬운 설명부터 이어 간다"
+    elif k >= n:
+        step = f"끊기기 전에 {n}라운드가 모두 끝났다 — 좌석을 다시 부르지 않고 의장 결정문부터 이어 간다"
+    elif spoken:
+        step = ((f"끊기기 전에 끝난 {k}라운드와 " if k else "끊기기 전의 좌석 · 근거 · 지식카드와 ")
+                + f"{k + 1 + ro}라운드의 {len(spoken)}/{n_seats}석을 되살렸다 — "
+                + (f"남은 {len(todo)}석만 부른다" if todo else "그 라운드의 좌석은 모두 말해 아무도 다시 부르지 않는다"))
+    elif k:
+        step = f"끊기기 전에 끝난 {k}라운드를 되살렸다 — {k + 1 + ro}라운드부터 좌석 {n_seats}석을 다시 부른다"
+    else:
+        step = f"끊기기 전의 좌석 · 근거 · 지식카드를 되살렸다 — {1 + ro}라운드부터 좌석 {n_seats}석을 부른다"
+    if sk in (delib_resume.SIM1, delib_resume.SIM2, delib_resume.SIM3):
+        step = f"{delib_resume.STAGE_LABEL[sk]} — {step}"
+    stage_t = {delib_resume.SIM2: " 앞 단(1단 메커니즘 심의)과 단 사이의 좌석 전환 · 사내 자산 현황도 끊기기 전의 것을 되살렸다 — 다시 부르지 않았다.",
+               delib_resume.SIM3: " 앞 단(1 · 2단)도 끊기기 전의 것을 되살렸다 — 다시 돌지 않았다.",
+               delib_resume.TP: " 물성 근거 현황도 끊기기 전의 것을 되살렸다 — 다시 조회하지 않았다."}.get(sk, "")
+    # 카드는 끊긴 라운드부터 적는다 — 잡 원장은 카드 글을 앞 400자만 싣는다(delib_jobs.OMITTED_TEXT_MAX). 누구를 다시 부르는지가 먼저다.
+    # 결정문 뒤에서 끊겼으면 끝난 단계(다시 하지 않는 것)가 먼저다.
+    cut_t = ""
+    if post:
+        cut_t = ((" 의장은 끊기기 전에 결정문을 내지 못했다 — 다시 부르지 않고 그대로 잇는다(끊지 않았다면 그렇게 끝났다 — 결정문은 이어하기로 "
+                  "받는다)." if post["e:decision"]["failed"] else
+                  " 의장 결정문" + (" · 요약 · 쉬운 설명" if post.get("e:plain") else "") + "은 끊기기 전의 것을 쓴다 — 다시 부르지 않았다.")
+                 + ((f" Report Archive 보고서는 끊기기 전에 저장돼(#{sav['rid']}) 다시 저장하지 않는다." if sav["rid"] else
+                     " 보고서 단계는 끊기기 전에 끝나 다시 하지 않는다.") if sav else
+                    " 보고서는 저장하던 중에 끊겨 이미 저장됐을 수 있다 — 새로 저장한다(같은 보고서가 둘이면 하나를 지운다)." if redo else "")
+                 + (" MX 백서 위키 단계도 끊기기 전에 끝나 다시 보내지 않는다." if post.get("e:wiki_sent") else ""))
+    if cutd is not None:
+        if spoken:
+            cut_t = (f" 끊긴 {k + 1 + ro}라운드에서 끊기기 전에 말한 {len(spoken)}석({_ks(spoken)})은 다시 부르지 않고 원 출력으로 되살려 턴만 "
+                     "다시 낸다 — "
+                     + (f"나머지 {len(todo)}석({_ks(todo)})만 같은 프롬프트로 부른다(아직 답하지 않았거나 실패한 좌석 — 실패한 좌석은 "
+                        "끊기지 않았다면 유실이었다)." if todo else "좌석이 모두 말해 아무도 다시 부르지 않는다."))
+        if cutd["gather"] is not None:
+            cut_t += f" {k + 1 + ro}라운드의 자유 조회는 끊기기 전에 끝나 다시 하지 않았다."
+        elif looks and not spoken:
+            cut_t += f" {k + 1 + ro}라운드의 자유 조회는 끊기기 전에 끝나지 않아 처음부터 다시 한다."
+    diff = []
+    if pre.get("rounds") != n:
+        diff.append(f"라운드 수가 끊기기 전({pre.get('rounds')})과 달라 끝난 라운드는 되살리지 않았다")
+    if delib_resume.digest(base) != pre.get("base") or delib_resume.digest(base_blind) != pre.get("blind"):
+        diff.append("화두 블록(근거 · 사람 의견 · 조항)을 같은 인자로 다시 만들었는데 끊기기 전과 다르다 — 모델 창이 바뀌면 몫이 달라진다. "
+                    "남은 좌석은 지금 만든 블록으로 말한다")
+    if info.get("eng_changed"):
+        diff.append("엔진 판이 바뀌었다 — 남은 좌석은 지금 판의 프롬프트로 말한다")
+    if isinstance(pre.get("ctx"), int) and pre["ctx"] != _ctx_tokens():
+        diff.append(f"모델 창이 {pre['ctx']:,} → {_ctx_tokens():,} 토큰으로 바뀌었다")
+    gone = sorted(set(x for x in (pre.get("free") or []) if isinstance(x, str)) - set(free_pool or ()))
+    if gone:
+        diff.append(f"끊기기 전에 있던 자유 조회 도구 {len(gone)}개가 지금은 없다 — {', '.join(gone[:8])}{' …' if len(gone) > 8 else ''}")
+    text = ("끊긴 심의를 같은 잡에서 잇는다(시도 기록은 attempts)." + cut_t + stage_t
+            + " 라운드 전 단계(VOC · 정량 근거 선주입 · 지정 도구 · 좌석 발굴 · 역할 복원 · 지식카드)" + (f"와 끝난 {k}라운드" if k else "")
+            + "는 다시 부르지 않고 끊기기 전의 것을 되살렸다 — 근거 · 지식카드 · 조회 결과 · 발언은 끊기기 전의 것이고 다시 조회하지 않았다."
+            + "".join(f" {x}." for x in diff))
+    return [_sse("status", {"step": step, "tool": None}),
+            _delib("evidence", source="끊긴 심의 되살림", included=False, notice=True, text=text)]
 
 
 async def run_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
@@ -5352,7 +5517,8 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     _wiki_bind(affiliation, job_id)
     opts = _resolve_opts(req_opts)
     try:
-        async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat, history):
+        # 단 열쇠 main — 잡이면 재개 자료를 일지에 쓰고, 제자리 이어하기면 끝난 라운드를 되살린다(HA-09 S1). 웹 심의는 둘 다 없다.
+        async for chunk in _deliberation_stream(app, question, groups, opts, user, user_pat, history, sk=delib_resume.STAGE):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[deliberation] fatal: {exc!r}")
@@ -5405,17 +5571,28 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     # 밀려난다(좌석 재심사는 이 의견을 rescreen_note 로 따로 받는다).
     if _caller_note:
         opts.human_note += "\n\n[호출자가 넣은 사람 의견]\n" + _caller_note
+    # 단 안에서 잇기(HA-09 S4) — 제자리 이어하기면 끊기기 전에 붙인 물성 근거 현황 글(e:stage_in)을 그대로 붙이고 다시 조회하지 않는다. 심의 안은
+    # 단 열쇠(tp)의 재개 상태로 되살린다. 없으면 아래는 지금 길 그대로다.
+    _in = delib_resume.stage_in(delib_resume.TP)
     try:
-        # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
-        try:
-            yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
-            _tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-            opts.human_note += "\n\n" + await _material_evidence_snapshot(_tools, question)
-        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
-            print(f"[test-plan] snapshot failed: {exc!r}")
+        if _in is not None:
+            yield _sse("status", {"step": "물성 근거 현황은 끊기기 전의 것을 되살렸다 — 다시 조회하지 않는다", "tool": None})
+            opts.human_note += _in["note"]
+        else:
+            # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
+            _snap_add = ""          # 사람 의견에 붙인 글 — 시험 설계에 들 때의 재개 자료(e:stage_in)에 그대로 적는다
+            try:
+                yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
+                _tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+                _snap_add = "\n\n" + await _material_evidence_snapshot(_tools, question)
+            except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+                print(f"[test-plan] snapshot failed: {exc!r}")
+            opts.human_note += _snap_add
+            # 재개 자료(HA-09 S4 — e:stage_in) — 이 단에 들 때 붙인 현황 글. 심의 안에서 끊겨 이으면 다시 조회하지 않고 이 글을 붙인다.
+            delib_resume.write(delib_resume.TP, "e:stage_in", sync=True, note=_snap_add)
         q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
              f"목적: {question}")
-        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history):
+        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history, sk=delib_resume.TP):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[test-plan] fatal: {exc!r}")
@@ -5426,7 +5603,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
 
 async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_OPTS, user: str = "",
                                user_pat: str = "", history: list | None = None,
-                               out: dict | None = None):
+                               out: dict | None = None, sk: str | None = None):
     """포털 챗 심의 모드의 SSE 제너레이터. 파이프라인(환기→근거→발굴→N라운드→의사결정→쉬운설명→기록)을\n    코드로 돌리고 진행을 스트리밍한다. '쉬운 설명'은 부가물이 아니라 정식 단계 — 결정문이 전문용어로\n    촘촘해 비전문가가 못 읽는 문제를 절차로 해소한다."""
     # out — 다단 심의(시뮬)가 다음 단으로 넘길 산출물을 **직접** 받는 통로다. 예전엔 래퍼가
     # SSE 청크를 문자열로 파싱해 가로챘는데, _sse 가 "event: …\ndata: …" 를 내는데도 가드가
@@ -5437,6 +5614,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         out.setdefault("personas", [])
         out.setdefault("non_negotiables", [])
         out.setdefault("decision", "")
+    # 재개 자료(HA-09 S1 — delib_resume) — sk 는 단 열쇠다(한 단 심의 main). _jon 이면 이 잡의 진행 일지에 재개 자료(e:*)를 덧붙인다(잡 태스크만 —
+    # 웹 심의는 일지가 없다). _pre 는 제자리 이어하기일 때만 있다(MCP 입구가 그 잡의 태스크 문맥에 건 상태 — 요청 손잡이로는 못 청한다) — 그러면
+    # 라운드 전 단계(VOC · 선주입 · 지정 도구 · 발굴 · 역할 복원 · 지식카드)를 부르지 않고 일지 값으로 채우고, 끝난 라운드는 좌석을 부르지 않고
+    # 되살린다. 둘 다 없으면 아래는 지금과 글자까지 같은 길이다(시험이 사건 · 프롬프트로 지킨다).
+    _rsv = delib_resume.stage(sk)
+    _pre = _rsv.pre if _rsv is not None else None
+    _jon = delib_resume.on(sk)
     # 심의 전용 LLM(DELIB_TEMPERATURE 등 env 오버라이드, app.py lifespan) — 미설정이면 본 LLM 그대로.
     # 근거 계수(F2) — 결정문 헤더에 실을 프로파일. 형식의 권위가 근거의 강도를 넘지 않게,
     # 조회 0건 심의가 확정 결론과 같은 모습으로 유통되는 것을 막는다.
@@ -5486,7 +5670,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             "knob": "포털 CHAT_PAT_TTL_S"})]
     # 기준일 — 이 잡의 agent_search 는 전부 이 날로 거른다(엔진의 사전 검색 · 지정 도구는 아래 도구 로드, 좌석 자유 조회는 그 따로 로드)
     _as_of = getattr(opts, "as_of", "") or ""
-    if opts.sealed:
+    # 아래 셋(봉인 · 기준일 · 외부 응답자)의 알림은 끊기기 전에 이미 원장에 있다 — 되살릴 때(_pre)는 다시 내지 않는다(카드가 두 번 실리지 않게)
+    if opts.sealed and _pre is None:
         # 무엇을 닫았는지 먼저 밝힌다. 호출자가 열려던 손잡이는 카드로도 남긴다 — 잡 원장에 실려
         # MCP 호출자가 진행 조회에서 본다(말없이 덮으면 자기가 고른 도구·VOC 가 돈 줄 안다).
         yield _sse("status", {"step": f"봉인 실행 — {_SEALED_LINE}", "tool": None})
@@ -5494,11 +5679,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _delib("evidence", source="봉인이 닫은 요청", included=False,
                          text="봉인 실행이라 호출자가 보낸 다음 손잡이를 닫았다 — "
                               + ", ".join(opts.sealed_reopen))
-    if _as_of:
+    if _as_of and _pre is None:
         # 기준일도 먼저 밝힌다 — 무엇을 거르고 무엇을 거르지 않는지까지(결정문 머리에는 끝에 코드가 셈과 함께 찍는다)
         yield _sse("status", {"step": f"기준일 {_as_of} — 좌석 지식카드 검색(agent_search)은 이 날까지의 카드만 찾는다 · "
                                       f"날짜 없는 카드는 '{_AS_OF_UNDATED}' 으로 남긴다. {_AS_OF_OPEN}", "tool": None})
-    if _ext:
+    if _ext and _pre is None:
         # 외부 응답자로 돈다는 것과 좌석 자유 조회의 길을 먼저 밝힌다 — 카드로도 남긴다(잡 원장의 evidence_omitted · 포털 근거 패널).
         # 여기서는 요청(free_tools)으로 말한다. 쓸 도구가 하나도 없으면 아래 자유 조회 준비가 free_tools_unavailable 로 따로 알리고, 끝의
         # 표지(결정문 머리 · 결과 칸 tool_mode)는 실제로 돈 길로 찍는다.
@@ -5551,7 +5736,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _risk_chair0 = opts.chair_template == "risk-review"
     _unread = _risk_head_unread(question) if _risk_chair0 else ""
     _where = "보고서 검색(좌석 자유 조회·지정 도구·정량 근거 선주입)"
-    if _unread:
+    if _unread and _pre is None:
         yield _sse("warning", {"code": "risk_head_unread",
                                "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해 같은 과제를 가릴 수 "
                                           f"없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 전부 "
@@ -5562,7 +5747,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                      text=f"질문 머리 {_unread} 에서 과제 코드와 target_key 를 읽지 못했다(머리 꼴은 '[리스크심사 <과제코드> "
                           f"<target_key>]'). 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 "
                           f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).")
-    elif _risk_chair0 and _risk_q_code(question) is None:
+    elif _risk_chair0 and _risk_q_code(question) is None and _pre is None:
         yield _sse("warning", {"code": "risk_head_missing",
                                "message": "질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제를 "
                                           f"가릴 수 없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 "
@@ -5582,7 +5767,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 분기하므로 종전엔 fail-open 이었다. 실측: get_material(material_id=6061)·get_mat_card
     # (test_id=1 → SUS201) 처럼 지어낸 ID 가 그대로 나갔다. 출처는 질문 + 도구 결과에서 늘어난다.
     from app import _int_tokens, _turn_ids  # noqa: PLC0415
-    _turn_ids.set(_int_tokens(question) | _int_tokens(opts.human_note or ""))
+    # 되살릴 때는 끊기기 전 라운드 전 단계 끝의 출처 정수(e:pre ids — 그 단계의 도구 결과에서 배운 것까지)로 건다 — 다시 부르지 않은 도구의 id 를
+    # 좌석 조회가 써도 막히지 않게(끊지 않았을 때와 같게)
+    _turn_ids.set(set(_pre["ids"]) if _pre is not None else (_int_tokens(question) | _int_tokens(opts.human_note or "")))
 
     # 자유 조회 에이전트 — 라운드 중 전문가가 직접 데이터를 조회한다(읽기 전용·예산 제한).
     # 결과가 LLM 프롬프트로 들어가므로 여기서는 **기본 캡**(TOOL_RESULT_MAX)으로 다시 로드한다 —
@@ -5648,10 +5835,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                           "tool": None})
                     # 상태줄 한 줄로는 잡 원장의 최근 30줄 창 밖으로 밀려난다(좌석마다 조회 줄이 찍힌다) — 그러면
                     # MCP 호출자에게 남는 것은 지정한 앱이 그대로 적힌 잡 기록뿐이라 좁혀진 줄 안다. 카드로도
-                    # 남긴다(좌석에 안 준 근거가 아니라 알림이다 — notice).
-                    yield _delib("evidence", source="지정 앱 범위 제한 불가", included=False, notice=True,
-                                 text=f"지정한 앱({', '.join(opts.delib_apps)})의 조회 도구를 찾지 못해 좌석 자유 "
-                                      f"조회를 좁히지 못했다 — 전체 범위({len(_g)}종)로 돈다.")
+                    # 남긴다(좌석에 안 준 근거가 아니라 알림이다 — notice). 되살릴 때(_pre)는 내지 않는다 — 이 자유 조회 준비의
+                    # 카드 · 경고는 끊기기 전에 이미 원장에 있다(다른 라운드 전 알림과 같다. 도구는 다시 받고, 끊기기 전에 있던
+                    # 도구가 사라졌으면 되살림 카드가 말한다 — _resume_notes).
+                    if _pre is None:
+                        yield _delib("evidence", source="지정 앱 범위 제한 불가", included=False, notice=True,
+                                     text=f"지정한 앱({', '.join(opts.delib_apps)})의 조회 도구를 찾지 못해 좌석 자유 "
+                                          f"조회를 좁히지 못했다 — 전체 범위({len(_g)}종)로 돈다.")
             # ⚠ 스키마 예산 — 챗 경로엔 TOOL_SCHEMA_BUDGET 이 있는데 **여기엔 없었다.**
             # 174종을 통째로 바인딩하면 좌석 프롬프트가 16K 모델에서 그대로 400 이 나고,
             # 실패는 print 한 줄로만 남아 심의는 정상처럼 끝난다(실측: 7명 전원 400).
@@ -5668,10 +5858,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                               f"{opts.tool_budget}회 · 결과 {_rmax:,}자까지"
                                               + (" · 외부 응답자는 부를 도구를 글(CALL 줄)로 적고 엔진이 실행한다" if _ext else ""),
                                       "tool": None})
-            else:
+            elif _pre is None:
                 # ⚠ 조용히 넘어가면 안 된다. 자유 조회를 켜 놓고 도구가 하나도 안 붙으면 심의는
                 # **자유 조회가 원래 없던 것처럼** 끝나고, 화면은 정상 심의와 구별되지 않는다.
-                # 좌석이 '도구로 확인했다' 고 믿게 만드는 자리라 특히 위험하다.
+                # 좌석이 '도구로 확인했다' 고 믿게 만드는 자리라 특히 위험하다. 되살릴 때(_pre)는 위 카드와 같은 까닭으로 내지 않는다.
                 yield _sse("warning", {"code": "free_tools_unavailable",
                                        "message": "전문가 자유 조회를 켰지만 **쓸 수 있는 조회 도구가 "
                                                   "하나도 없습니다** — 좌석이 도구로 확인하지 않고 "
@@ -5681,15 +5871,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                              text="읽기 전용 도구가 바인딩되지 않아 좌석이 직접 조회하지 못했습니다.")
         except Exception as exc:  # noqa: BLE001 — 자유 조회 불가여도 심의는 종전대로 진행
             print(f"[deliberation] free-tool 준비 실패: {exc!r}")
-            # print 만 하면 사용자는 왜 조회가 없었는지 영원히 모른다.
-            yield _sse("warning", {"code": "free_tools_failed",
-                                   "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
-                                              "좌석이 도구 없이 논의합니다."})
+            # print 만 하면 사용자는 왜 조회가 없었는지 영원히 모른다. 되살릴 때(_pre)는 위 카드와 같은 까닭으로 내지 않는다.
+            if _pre is None:
+                yield _sse("warning", {"code": "free_tools_failed",
+                                       "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
+                                                  "좌석이 도구 없이 논의합니다."})
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
-    stream_head = ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
-    sf_inject = ""
-    if opts.voc == "always" or (opts.voc == "auto" and _has_defect_topic(question, history)):
+    stream_head = _pre["stream_head"] if _pre is not None else ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
+    sf_inject = _pre["sf_inject"] if _pre is not None else ""
+    if _pre is None and (opts.voc == "always" or (opts.voc == "auto" and _has_defect_topic(question, history))):
         yield _delib("stage", stage="recall")
         yield _sse("status", {"step": "최근 불량 이슈 환기 — SignalForge 조회", "tool": "signalforge"})
         try:
@@ -5708,8 +5899,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("token", {"delta": stream_head})
 
     # 0.5) T1 정량 근거 선주입(DELIB_EVIDENCE_PREPASS) — 발언이 인용할 수치를 심의 전에 조달
-    ev_inject = ""
-    if opts.evidence_prepass:
+    ev_inject = _pre["ev_inject"] if _pre is not None else ""
+    if opts.evidence_prepass and _pre is None:
         yield _sse("status", {"step": "정량 근거 수집 — 지식·보고서 검색", "tool": "hybrid_search"})
         try:
             ev_display, ev_inject, ev_used = await _evidence_prepass(tools, llm, question)
@@ -5728,11 +5919,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 0.7) 사용자 지정 도구 실호출(delib_opts.tools) — 자동 파이프라인 도구만 믿지 않고, 사용자가
     #      선정 패널에서 직접 고른 도구를 주제 기반 인자로 실제 호출해 정량 근거로 주입한다.
     #      인자는 LLM 이 도구 스키마를 보고 구성(불가하면 skip) — 도구별 실패는 비치명.
-    tool_inject = ""
+    tool_inject = _pre["tool_inject"] if _pre is not None else ""
     # 기준일 셈 — 지정 도구로 고른 agent_search {calls: 부른 수, undated: 실은 결과의 날짜 미확인 수, dropped: 메아리가 없어 버린 수}. 결정문 머리의
     # 기준일 줄이 읽는다(_as_of_line — 종전엔 이 길을 세지 않아, 거른 결과를 전 좌석에 싣고도 '거름이 걸린 조회가 없었다' 고 적었다).
-    _ao_des = {"calls": 0, "undated": 0, "dropped": 0}
-    if opts.delib_tools:
+    _ao_des = dict(_pre["ao_des"]) if _pre is not None else {"calls": 0, "undated": 0, "dropped": 0}
+    if opts.delib_tools and _pre is None:
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         _tool_unconf = []                     # 기준일 거름을 확인하지 못해(메아리 없음) 결과를 버린 도구 — 인자 문제가 아니라 다시 시키지 않는다
@@ -5884,8 +6075,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
 
     # 1) 발굴 — recommend_agents. 이어하기(continue_personas)는 이전 전문가를 유임시키되,
     #    사람 의견이 주제를 옮겼을 수 있으므로 실효 질문으로 재심사해 신규 좌석을 더한다(F10).
-    yield _delib("stage", stage="discover")
-    if opts.continue_personas:
+    if _pre is None:
+        yield _delib("stage", stage="discover")
+    if _pre is not None:
+        # 되살리기 — 끊기기 전에 앉은 좌석 그대로(복원된 역할 · origin · 조회 지침 · 반대석 축). 발굴 · 역할 복원 · 반대석 LLM 을 다시 부르지 않는다.
+        personas = [dict(p) for p in _pre["personas"]]
+    elif opts.continue_personas:
         personas = [dict(p) for p in opts.continue_personas]
         for p in personas:
             p.setdefault("origin", "carry")
@@ -6004,18 +6199,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if out is not None:
         # 다음 단이 좌석을 승계할 수 있게 **절단하지 않은** role 을 넘긴다(SSE 는 280자 표시용).
         out["personas"] = [{"key": p["key"], "role": p.get("role") or ""} for p in personas]
-    seat_note = _seat_note(personas)
+    seat_note = _pre["seat_note"] if _pre is not None and isinstance(_pre.get("seat_note"), str) else _seat_note(personas)
 
     # 페르소나별 주제 지식 주입(결정적 RAG) — 지식카드를 많이 가진 전문가일수록 "지금 주제와
     # 관련된 것"만 골라 들고 와야 한다(사용자 결정 2026-08-05). 자유 조회(모델 재량)와 달리
     # 항상 수행되는 기본기다. agent_search 가 전문가별 retrieval_config(top_k·score 임계값·
     # 태그 가중치)를 자동 적용하므로 검색 폭은 전문가 설정을 따르고, 주입량은 문자 예산으로 자른다
     # (카드 전문을 통째로 넣으면 인원수 × 라운드로 곱해져 컨텍스트가 폭발한다).
-    knowledge_by_key: dict = {}
+    knowledge_by_key: dict = dict(_pre["knowledge"]) if _pre is not None else {}
     # 기준일 셈 — 사전 검색(좌석마다)과 좌석 자유 조회(라운드마다)를 모아 결정문 머리의 기준일 줄이 읽는다(_as_of_line). 비면 쓰지 않는다.
-    _ao_pre = {"asked": 0, "lines": 0, "undated": 0, "later": 0, "unconfirmed": []}
+    _ao_pre = (dict(_pre["ao_pre"]) if _pre is not None
+               else {"asked": 0, "lines": 0, "undated": 0, "later": 0, "unconfirmed": []})
     _ao_free: dict = {}       # {좌석: [agent_search 부른 수, 결과의 날짜 미확인 수, 메아리가 없어 버린 수]}
-    if opts.persona_knowledge and "agent_search" in tools:
+    if opts.persona_knowledge and "agent_search" in tools and _pre is None:
         _kb_budget = _knowledge_budget()
         # 기준일 심의는 좌석 지식 블록 머리에 한 줄을 단다 — 좌석이 '날짜 미확인' 의 뜻을 알게. 그 몫은 줄을 담기 전에 예산에서 뗀다.
         _kb_head = (f"(기준일 {_as_of} 까지의 카드다 — '{_AS_OF_UNDATED}' 카드는 날짜가 없어 그 날 뒤에 쓰였을 수 있다)"
@@ -6187,7 +6383,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 이어하기 블록(F11) — 조항 승계를 요약 문자열에 의존하지 않는다.
     # 조항·후보안의 합은 carry 몫에 담는다(_fit_carry — 줄였으면 좌석에 주지 않은 카드로 알린다).
     _nn_in, _opt_in, _carry_note = _fit_carry(opts.continue_non_negotiables, opts.options)
-    if _carry_note:
+    # 아래 '좌석에 주지 않은' 알림 카드들은 끊기기 전에 이미 원장에 있다 — 되살릴 때(_pre)는 다시 내지 않는다(evidence_omitted 에 두 번 실리지 않게).
+    # 계산(조항 · 이어하기 블록 · 근거 블록 · 화두 블록)은 그대로 돌린다 — 같은 인자로 다시 만든 화두 블록을 끊기기 전의 지문과 견준다.
+    if _carry_note and _pre is None:
         yield _delib("evidence", source="조항·후보안 몫 초과", included=False, text=_carry_note)
     cont = _cont_block(opts.continue_summary, _nn_in, opts.human_note)
     if opts.continue_non_negotiables:
@@ -6201,7 +6399,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     #   거기서 '앞 N자만 실었다' 고 적으면 거짓이다(아예 안 실린다. 1단에 실렸고 1단이 알렸다). 시험 설계는
     #   엔진 지시문 뒤에 그 의견을 이어 붙이므로 실린 것이다. 길이는 칸 전체가 아니라 **의견의** 길이로 적는다
     #   (칸에는 엔진 지시문과 물성 현황이 같이 들어 있다).
-    if opts.human_note_cut and opts.human_note_cut[1] in opts.human_note:
+    if opts.human_note_cut and opts.human_note_cut[1] in opts.human_note and _pre is None:
         _hn_full, _hn_kept = opts.human_note_cut[0], len(opts.human_note_cut[1])
         # 설정·필드 이름은 글에 넣지 않고 따로 싣는다(knob). 이 글은 웹 화면에도 뜬다 — 포털의 이어하기 칸은
         # 길이 제한이 없어, 길게 쓴 일반 사용자가 'human_note'·'DELIB_HUMAN_NOTE_MAX' 를 읽게 됐다. 그 이름이
@@ -6214,7 +6412,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 키가 없어 앉히지 못한 지정 좌석 — 지정 좌석 갈래(위 `if opts.continue_personas`) **밖**에서 알린다.
     # 전부 걸러지면 그 갈래에 아예 안 들어가 발굴이 대신 앉힌다 — 지정하지 않은 패널로 끝까지 도는 가장
     # 나쁜 경우에 가장 조용했다(본문 없는 근거와 같은 모양이다).
-    if opts.seats_no_key:
+    if opts.seats_no_key and _pre is None:
         _sn, _sbad, _sfields = opts.seats_no_key
         yield _delib("evidence", source="지정 좌석 키 없음", included=False,
                      text=f"지정 좌석 {_sn}석 중 {_sbad}석은 좌석 키(key)가 없어 앉히지 못했다"
@@ -6223,14 +6421,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           + ("키가 있는 좌석만 앉혔다." if opts.continue_personas else
                              "앉힐 좌석이 하나도 없어 서버가 발굴한 좌석으로 돈다 — 지정한 패널이 아니다."))
     # 요청에 실린 나머지 값도 같다 — 상한에서 줄였으면 무엇을 얼마나 줄였는지 카드 하나로 알린다.
-    if opts.req_cut:
+    if opts.req_cut and _pre is None:
         yield _delib("evidence", source="요청 값 상한 초과", included=False,
                      text="요청에 실린 값이 상한을 넘어 앞에서부터 남겼다 — " + " / ".join(opts.req_cut.values())
                           + ". 뒤쪽은 이 심의에 쓰이지 않았다.")
     # 호출당 한도(timeout_s)를 받는 범위로 죄었다 — 같은 이름의 카드로 알리되 글은 따로 쓴다(위 글은 목록을
     # 앞에서부터 남긴 것이라 숫자 하나에는 틀린 말이다). 알림이지 좌석에 안 준 근거가 아니다(notice).
     # 설정·필드 이름은 글에 넣지 않고 knob 으로 싣는다(화면에도 뜨는 글이다 — 잡 원장이 붙인다).
-    if opts.timeout_clamped:
+    if opts.timeout_clamped and _pre is None:
         _t_asked, _t_got = opts.timeout_clamped
         yield _delib("evidence", source="요청 값 상한 초과", included=False, notice=True,
                      knob="timeout_s · 상한 DELIB_TIMEOUT_MAX_S",
@@ -6238,7 +6436,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           f"{DELIB_TIMEOUT_MAX_S:,.0f}초) 밖이라 {_t_got:,.0f}초로 돈다 — LLM 호출 1회의 "
                           "한도이고 심의 전체 시간이 아니다.")
     # 읽지 못한 요청 값 — 기본값으로 돌았다는 것을 알린다. 말없이 넘기면 호출자는 자기가 끈 줄 안다.
-    if opts.req_unread:
+    if opts.req_unread and _pre is None:
         yield _delib("evidence", source="요청 값 해석 불가", included=False,
                      text="요청에 실린 값을 읽지 못해 기본값으로 돈다 — " + " / ".join(opts.req_unread.values())
                           + ". 켜고 끄는 값은 1|0(on|off 도 받는다)으로 보낸다.")
@@ -6273,14 +6471,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if not (_web_meta_tool(_e.get("tool")) or _envelope_no_evidence(_res)):
                 ev_count["tool"] += 1
         # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
-        if _dropped:
+        if _dropped and _pre is None:
             yield _delib("evidence", source="사전 근거 예산 초과",
                          text=f"근거 {len(opts.evidence)}건 중 뒤쪽 {_dropped}건은 예산"
                               f"({_evid_budget():,}자)을 넘겨 좌석에 주지 않았다.", included=False)
         # 줄여 실은 항목 — 좌석은 본문 끝 표식으로 알지만 호출자는 몰랐다. 안내가 '미리 자르지 마라' 고 하니
         # 긴 문서 한 건이 보통의 경우인데, 128K 창에서 65,000자 보고서는 72% 가 빠지고도 잡 기록에는 '근거 1건'
         # 뿐이었다. **실린 항목만** 적는다 — 줄인 뒤 예산을 넘겨 통째로 빠진 항목은 위 예산 카드가 말한다.
-        if _cut_lines:
+        if _cut_lines and _pre is None:
             _icap, _by_item = min(_EVID_ITEM_MAX, _evid_budget()), _EVID_ITEM_MAX <= _evid_budget()
             yield _delib("evidence", source="사전 근거 항목 상한 초과", included=False,
                          # 어느 쪽이 걸렸는지 가려 적는다 — 합계 예산이 걸렸는데 항목 천장을 가리키면 원인이
@@ -6300,7 +6498,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # ⚠ 위 블록 **밖**이다. 전부 버려지면 opts.evidence 가 비어 그 블록에 아예 안 들어간다 —
     #   근거 0건으로 도는 가장 나쁜 경우에 가장 조용해진다.
     _ev_valid = len(opts.evidence) + opts.evidence_over
-    if opts.evidence_dropped_empty:
+    if opts.evidence_dropped_empty and _pre is None:
         yield _delib("evidence", source="사전 근거 본문 없음", included=False,
                      text=f"근거 {_ev_valid + opts.evidence_dropped_empty}건 중 "
                           f"{opts.evidence_dropped_empty}건은 본문이 없어(또는 항목이 객체가 아니어서) "
@@ -6308,7 +6506,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                           f"({'·'.join(_EVID_BODY_KEYS[1:])} 도 차례로 찾는다).")
     # 본문 후보가 여럿이던 항목 — 실은 것만 적는다(예산을 넘겨 통째로 빠진 항목은 위 예산 카드가 말한다).
     _shadow = [x for x in opts.evidence_shadowed if x[0] <= _ev_in]
-    if _shadow:
+    if _shadow and _pre is None:
         yield _delib("evidence", source="사전 근거 본문 후보 여럿", included=False,
                      text=f"근거 {len(_shadow)}건은 본문이 든 키가 둘 이상이라 앞선 키 하나만 좌석에 실었다 — "
                           + " · ".join(f"[e:{_n}] {_k} {_ln:,}자를 싣고 "
@@ -6316,7 +6514,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                        for _n, _k, _ln, _rest in _shadow[:3])
                           + (f" 외 {len(_shadow) - 3}건" if len(_shadow) > 3 else "")
                           + f". 본문은 'result' 하나에 넣는다(찾는 순서 {'·'.join(_EVID_BODY_KEYS)}).")
-    if opts.evidence_over:
+    if opts.evidence_over and _pre is None:
         yield _delib("evidence", source="사전 근거 건수 초과", included=False,
                      text=f"본문이 있는 근거 {_ev_valid}건 중 뒤쪽 {opts.evidence_over}건은 건수 상한"
                           f"({_EVID_ITEMS}건 — DELIB_EVID_ITEMS)을 넘겨 좌석에 주지 않았다.")
@@ -6355,6 +6553,27 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (1R 은 좌석 간엔 이미 병렬 독립이므로, 남은 구조적 레버는 '이전 결론 은닉'이다).
     _has_blind = (any(p.get("origin") == "new" for p in personas) or _anon1r) and bool(opts.continue_summary)
 
+    # 재개 자료(HA-09 S1 — e:pre) — 라운드 전 단계의 산출. 되살릴 때(_pre)는 위 단계를 일지 값으로 채웠고 화두 블록은 같은 인자로 다시 만들었다 —
+    # 끊기기 전의 지문과 견주고 다르거나 판 · 창 · 조회 도구가 바뀌었으면 카드로 알린다(막지 않는다 — A5.3). 근거 계수는 일지 값이다(위 근거
+    # 블록이 다시 센 것을 덮는다). 아니면(잡) 이어할 때 쓸 값을 일지에 적는다. 호출자가 준 근거 본문은 적지 않는다(시작 인자 파일에 있다 —
+    # 지문만). _rk — 되살릴 끝난 라운드 수(라운드 수가 끊기기 전과 다르면 라운드는 되살리지 않는다). _cutd — 끊긴 라운드(S2 — 끊기기 전에 말한
+    # 좌석의 원 출력 · 끝난 조회. 라운드 수가 같을 때만 — 라운드 구조가 같아야 그 라운드가 같은 라운드다).
+    _ids_seen = set(_turn_ids.get() or ())         # 재개 자료가 센 출처 정수 — 라운드마다 새로 배운 것만 적는다(e:gather ids)
+    _rk = len(_rsv.rounds) if (_pre is not None and _pre.get("rounds") == opts.rounds) else 0
+    _cutd = _rsv.cut if (_pre is not None and _pre.get("rounds") == opts.rounds) else None
+    if _pre is not None:
+        ev_count.clear()
+        ev_count.update(_pre["ev_count"])
+        for _c in _resume_notes(_rsv, _rk, _cutd, [p["key"] for p in personas], opts, base, base_blind, free_pool,
+                                g_agent is not None and _rk + 1 != opts.rounds):
+            yield _c
+    elif _jon:
+        delib_resume.write(sk, "e:pre", sync=True, rounds=opts.rounds, ctx=_ctx_tokens(), groups=list(groups or []),
+                           personas=personas, seat_note=seat_note, knowledge=knowledge_by_key, ev_count=ev_count,
+                           sf_inject=sf_inject, stream_head=stream_head, ev_inject=ev_inject, tool_inject=tool_inject,
+                           ao_des=_ao_des, ao_pre=_ao_pre, ids=sorted(_ids_seen), free=sorted(free_pool),
+                           base=delib_resume.digest(base), blind=delib_resume.digest(base_blind))
+
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
     #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.
     N = opts.rounds
@@ -6391,9 +6610,52 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _nv_told = False          # 리스크 앱 읽기 도구의 not_visible 을 알렸나 — 심의에 한 번(라운드마다 같은 말을 되풀이하지 않는다)
     _ao_told = False          # 자유 조회의 기준일 거름 확인 안 됨을 알렸나 — 심의에 한 번(셈은 결정문 머리의 기준일 줄에 다 실린다)
 
+    def _gather_back(rg) -> tuple:
+        """재개 자료 e:gather 한 줄 → 그 라운드의 조회가 바꾼 상태(공용 풀 · 원문 길이 · 자기 조회 · 기준일 셈 · 근거 계수 · 출처 정수)를
+        되돌린다 — 끝난 라운드(HA-09 S1)와 조회가 끝난 끊긴 라운드(S2). 알림 깃발 둘(기준일 · not_visible)을 돌려준다."""
+        gather_pool.extend(tuple(x) for x in rg["pool"])
+        gather_lens.update({tuple(x[:4]): x[4] for x in rg["lens"]})
+        seat_lookups.extend(b for b in rg["gathered"].values() if b)
+        _ao_free.clear()
+        _ao_free.update({k_: list(v_) for k_, v_ in rg["ao_free"].items()})
+        ev_count.clear()
+        ev_count.update(rg["ev_count"])
+        if _turn_ids.get() is not None:
+            _turn_ids.get().update(rg["ids"])
+        return bool(rg["ao_told"]), bool(rg["nv_told"])
+
     for rnd in range(1, N + 1):
         call_trace.tag(round=rnd)      # 이 라운드에서 만드는 좌석 태스크가 물려받는다(마지막 라운드 뒤의 의장·요약 호출에도 남는다)
         kind = _kind(rnd)
+        # 되살리기(HA-09 S1) — 끊기기 전에 끝난 라운드(일지 e:round_end)는 좌석을 부르지 않고 원 출력으로 상태만 되살린다. 턴 사건은 다시 내지
+        # 않는다(제자리 이어하기 — 원장에 이미 있다). 그 라운드의 조회가 바꾼 상태(공용 풀 · 자기 조회 · 기준일 셈 · 알림 깃발 · 근거 계수 ·
+        # 출처 정수)는 e:gather 로 되돌린다 — 다음 라운드의 프롬프트가 그것으로 만들어진다.
+        _rr = _rsv.round(rnd) if (_rsv is not None and rnd <= _rk) else None
+        if _rr is not None:
+            cur = [dict(o) for o in _rr["cur"]]
+            if _rr["gather"] is not None:
+                _ao_told, _nv_told = _gather_back(_rr["gather"])
+                _ids_seen = set(_turn_ids.get() or ())
+            if rnd == 1:
+                r1_by_key = {o["persona"]: o for o in cur}
+            rounds_data.append((cur, "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)))
+            if _rr["lost"]:
+                seat_loss.append({"round": rnd, "lost": list(_rr["lost"])})
+            if out is not None and kind == "converge":
+                # 다단 심의가 다음 단에 넘길 조항(HA-09 S4) — 끊지 않았다면 수렴 라운드의 턴을 낼 때 모았다(아래). 되살린 라운드는 턴을 다시 내지
+                # 않으므로 같은 식 · 같은 차례(원 출력 = 끝난 차례)로 모은다 — 빠지면 1단 체크포인트와 2단 좌석의 조항이 끊지 않은 실행과 다르다.
+                for o in cur:
+                    _nn = _nn_text(o)[:_summary_max() if _wide() else _NN_ITEM_MAX].strip()
+                    if _nn and _nn not in out["non_negotiables"]:
+                        out["non_negotiables"].append(_nn)
+            continue
+        # 끊긴 라운드(HA-09 S2) — 끊기기 전에 말한 좌석(_cback — 원 출력, 끝난 차례)은 다시 부르지 않고, 조회가 끝났으면(_cgat — e:gather) 다시
+        # 하지 않는다. 라운드의 좌석은 서로의 이번 라운드 발언을 보지 않아(병렬) 나머지 좌석의 프롬프트는 끊기지 않았을 때와 같다. 아니면(끊긴
+        # 라운드가 아니거나 재개 상태가 없다) 셋 다 비어 아래는 지금 길 그대로다.
+        _cr = _cutd if (_cutd is not None and _cutd["r"] == rnd) else None
+        _cgat = _cr["gather"] if _cr is not None else None
+        _cback = [dict(o) for o in _cr["raw"]] if _cr is not None else []
+        _cdone = {o["persona"] for o in _cback}
         prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
         prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")
         # 좌석에게 보여 줄 직전 라운드 — prev_t 와 같은 모양이되 직전 라운드 몫(_seat_ctx — 창에서 유도)을 넘으면
@@ -6405,11 +6667,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _sshare:
             yield _sse("status", {"step": f"직전 라운드 {len(prev_t):,}자 — 좌석 프롬프트 상한 "
                                           f"{_sctx:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
-            # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다).
-            yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
-                         text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
-                              f"({_sctx:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
-                              "잘린 것은 긴 발언의 뒷부분이다.")
+            # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다). 끊긴 라운드가 끊기기 전에 조회를 끝냈거나
+            # 좌석이 말했으면(S2) 이 카드는 그때 이미 원장에 실렸다 — 다시 내지 않는다(같은 입력의 같은 카드다).
+            if _cgat is None and not _cback:
+                yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
+                             text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
+                                  f"({_sctx:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
+                                  "잘린 것은 긴 발언의 뒷부분이다.")
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
         for _c in _cred_notice():       # 앞 단계(발굴·지식카드·직전 라운드 조회)에서 자격이 거절됐으면 여기서 알린다
@@ -6454,10 +6718,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         else:  # deepen — 직전 라운드에 반박·심화. 교차심문(cross_exam)·인용계약(rebut_quote)은 직전 라운드 대상.
             prev_keys = [o["persona"] for o in prev_list]
             prev_by_key = {o["persona"]: o for o in prev_list}
-            # 표적 배정은 **라운드당 1회**다 — 좌석마다 다시 부르면 O(N²) 채점을 N 번 돈다.
+            # 표적 배정은 **라운드당 1회**다 — 좌석마다 다시 부르면 O(N²) 채점을 N 번 돈다. 끊긴 라운드가 조회를 끝냈으면(S2) 끊기기 전의
+            # 배정(e:gather cross)을 그대로 쓴다 — 이미 말한 좌석과 나머지 좌석이 한 라운드의 같은 표적으로 말한다.
             _xexam = opts.cross_exam and len(prev_list) >= 2
-            cross_tg = (_cross_targets({k: _ser_kind(prev_by_key[k], prev_kind) for k in prev_keys},
-                                       _CROSS_TARGETS) if _xexam else {})
+            cross_tg = ((_cgat["cross"] if _cgat is not None and _cgat.get("cross") else
+                         _cross_targets({k: _ser_kind(prev_by_key[k], prev_kind) for k in prev_keys}, _CROSS_TARGETS))
+                        if _xexam else {})
             if _xexam:
                 yield _sse("status", {"step": "교차심문 표적 배정 — " + " / ".join(
                     f"{k}→{'·'.join(v)}" for k, v in list(cross_tg.items())[:6])
@@ -6511,8 +6777,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 자유 조회 — 발언 전에 각 전문가가 직접 데이터를 조회한다. 수렴 라운드는 새 조회 없이
         # 기존 논의를 정리하는 단계라 건너뛴다. 병렬 실행하되 완료 순서대로 조회 이력을 흘린다 —
         # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
+        # 끊긴 라운드(S2) — 조회가 끊기기 전에 끝났으면(e:gather) 다시 하지 않고 그 블록 · 풀로 되살린다(아래 몫 셈은 같은 입력에 같은 값이다).
+        # e:gather 없이 원 출력만 있으면 그 라운드는 끊기기 전에도 조회가 없었다(조회가 끝나야 좌석이 말하고, 그 줄이 먼저 적힌다) — 이번에도
+        # 하지 않는다. 둘 다 없으면(조회 도중 · 그 전에 끊겼다) 조회를 처음부터 다시 한다.
         _gathered = {}
-        if g_agent is not None and kind != "converge":
+        if _cgat is not None:
+            _gathered = dict(_cgat["gathered"])
+            _ao_told, _nv_told = _gather_back(_cgat)
+            _ids_seen = set(_turn_ids.get() or ())
+        _look = g_agent is not None and kind != "converge" and _cgat is None and not _cback
+        if _look:
             # 조회 턴의 논의 발췌 — 1라운드는 base 의 앞, 2라운드부터는 직전 전사의 뒤. 상한은 _gather_caps(좁은 창 종전
             # 4,000자). 끊었으면 원문 길이를 적는다 — 종전엔 말없이 끊어 조회 좌석은 무엇이 빠졌는지 몰랐다.
             _gcap, _pcap = _gather_caps()
@@ -6703,6 +6977,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"조회 캐시 — 실제 호출 {_fstats.get('miss', 0)}회 · "
                                               f"공유 {_fstats['hit']}회(같은 도구·같은 인자)",
                                       "tool": None})
+        if _jon and _look:
+            # 재개 자료(HA-09 S1 — e:gather) — 이 라운드의 조회가 바꾼 상태. 끝난 라운드를 되살릴 때 다음 라운드의 프롬프트가 이것으로 만들어진다.
+            # 끊긴 라운드에서 되살린 조회(S2)는 다시 적지 않는다 — 앞 시도의 그 줄이 새 일지에 옮겨 적혔다(delib_resume.parse carry).
+            _ids_now = _turn_ids.get() or set()
+            delib_resume.write(sk, "e:gather", r=rnd, gathered=_gathered, cross=cross_tg if kind == "deepen" else {},
+                               pool=[list(x) for x in gather_pool if x[0] == rnd],
+                               lens=[[*k_, n_] for k_, n_ in gather_lens.items() if k_[0] == rnd],
+                               ao_free=_ao_free, ao_told=_ao_told, nv_told=_nv_told, ev_count=ev_count,
+                               ids=sorted(_ids_now - _ids_seen))
+            _ids_seen = set(_ids_now)
         # 페르소나별 주입 — 지식카드 발췌(결정적 RAG, 매 라운드 기본기)와 자유 조회 결과(모델
         # 재량)를 함께 얹는다. 수렴 라운드는 새 재료 없이 정리만 하므로 지식카드도 생략.
         _kn = knowledge_by_key if kind != "converge" else {}
@@ -6770,9 +7054,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 return out
 
         cur, _fails = [], {}
-        async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
-                                   validator_fn=validator_fn, opts=opts, fails=_fails):
+        # 끊긴 라운드(S2) — 끊기기 전에 말한 좌석은 부르지 않는다(걸러 부르기). 그 원 출력을 먼저 내고(턴을 다시 낸다 — 제자리 이어하기가 그
+        # 라운드의 턴을 원장에서 빼 두었다, delib_jobs._reopen) 나머지 좌석(아직 안 함 · 실패)만 부른다.
+        _seat_gen = _round_live(llm, [p for p in personas if p["key"] not in _cdone] if _cdone else personas, prompt_fn, rnd,
+                                required=required, validator_fn=validator_fn, opts=opts, fails=_fails)
+        async for o in (_then(_cback, _seat_gen) if _cback else _seat_gen):
             cur.append(o)
+            if _jon and o["persona"] not in _cdone:
+                # 재개 자료(HA-09 S1 — e:raw) — 좌석의 원 출력. turn 사건을 내기 **전에** 적는다 — 원장에 턴이 있는 좌석은 일지에 원 출력도 있다.
+                # 되살린 좌석의 것은 다시 적지 않는다 — 앞 시도의 그 줄이 새 일지에 옮겨 적혔다(S2).
+                delib_resume.write(sk, "e:raw", r=rnd, o=o)
             extra = {}
             if render == 1:
                 extra = {"position": _clip_sent(o.get("position_short"), 90)}
@@ -6783,9 +7074,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 # 조항 하나의 길이는 이어하기가 받는 길이와 같다(좁은 창 _NN_ITEM_MAX 1,200자, 넓은 창 _summary_max) —
                 # 종전엔 1백만 토큰 창에서도 1,200자에서 표식 없이 끊겨 이어하기·다단 승계에 갔다. 끊었으면 원래 길이를
                 # 남긴다. 목록으로 오면 항목을 잇는다(종전엔 파이썬 표기 "['…']" 가 그대로 조항이 됐다).
-                _nn_raw = o.get("non_negotiable")
-                _nn_full = ("; ".join(str(x).strip() for x in _nn_raw if str(x).strip())
-                            if isinstance(_nn_raw, list) else str(_nn_raw or ""))
+                _nn_full = _nn_text(o)
                 _nn_cap = _summary_max() if _wide() else _NN_ITEM_MAX
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
                          "stance": _norm_stance(o.get("stance")),
@@ -6862,6 +7151,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("warning", {"code": "seat_lost", "message": _lost_msg, **_loss_kw,
                                    **_ext_cause(*(_fails[_lk] for _lk in _lost_now if _lk in _fails))})
             yield _delib("evidence", source="좌석 유실", included=False, notice=True, text=_lost_msg, **_loss_kw)
+        if _jon:
+            # 재개 자료(HA-09 S1 — e:round_end) — 이 라운드가 끝났다. 이 줄이 있는 라운드만 되살린다(그 라운드의 사건은 모두 이 앞에 적혔다).
+            delib_resume.write(sk, "e:round_end", sync=True, r=rnd, lost=_lost_now, why=_why_t if _lost_now else "")
         # 인간 체크포인트(F7) — 초기 라운드에서 멈추고 사람에게 넘긴다. 결정문을 만들지 않고,
         # 대신 전원 초기 입장을 이어하기의 출발점으로 내려보낸다(프론트의 이어하기 폼이 그대로 쓴다).
         if opts.stop_after_round == 1 and rnd == 1:
@@ -6884,11 +7176,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 마지막 라운드(수렴) 데이터 — 집계·tally 용
     last_list, last_t = rounds_data[-1]
 
+    # 결정문 뒤 되살리기(HA-09 S3) — 끊기기 전에 끝난 단계(일지 e:decision · e:plain · e:report_intent · e:report_saved · e:wiki_sent)는 다시
+    # 하지 않는다 — 의장 · 요약 · 쉬운 설명을 다시 부르지 않고, 저장한 보고서를 다시 저장하지 않고(받은 번호를 쓴다), 위키에 다시 보내지 않는다.
+    # 그 단계의 상태줄 · 카드 · 경고는 그 줄보다 먼저 적혀 원장에 이미 있어 다시 내지 않는다(단계 사건은 낸다 — 원장의 단계가 끊지 않은 실행과
+    # 같게 지나간다). 전 라운드를 되살렸을 때만 있다. 재개 상태가 없으면 다섯 다 None 이라 아래는 지금 길 그대로다.
+    _post = _rsv.post if (_rsv is not None and _rk == N) else {}
+    _rdec, _rpl, _rint, _rsav, _rwik = (_post.get(x) for x in delib_resume.POST)
+
     # 4) 의사결정문 합성
     for _c in _cred_notice():           # 마지막 라운드의 조회에서 거절됐으면 — 아래 근거 프로파일이 읽기 전에
         yield _c
     yield _delib("stage", stage="decide")
-    yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
+    if _rdec is None:
+        yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
     # 출처 태깅(DELIB_CHAIR_CITE) — 절충형 뭉개기(전 의견 나열 병합)를 가시화·감사 가능하게.
     cite_note = ("각 결정사항 항목 끝에 근거가 된 라운드 발언 출처를 [R2·페르소나키] 형식으로 표기하고, "
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
@@ -6944,7 +7244,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 줄인 것이 없다고 봤고, 카드가 나갈 때도 '몇 자 → 몇 자' 의 앞 숫자가 이미 끊은 뒤의 길이였다.
     _rcut = [f"{_dr(i + 1)}R {len(_full_t):,}자 → {len(x):,}자" + (f"(값당 {_vclip:,}자)" if _vclip else "")
              for i, ((_rows, _vclip, _full_t), x) in enumerate(zip(_chair, _rtexts)) if x != _full_t]
-    if _rcut:
+    if _rcut and _rdec is None:         # 결정문을 되살렸으면(S3) 이 카드는 의장을 부르기 전에 이미 원장에 실렸다
         # 줄였으면 화면과 잡 원장에 남긴다. 종전엔 의장만 알았다 — 읽는 사람은 결정문의 '생략된 좌석의
         # 입장은 반영하지 못했다' 한 줄로만 눈치챘고, MCP 호출자는 그마저 결정문을 다 읽어야 보였다.
         # 설정 이름은 화면 글(상태줄·카드)에 넣지 않고 knob 으로 따로 싣는다(사람 의견 카드와 같은 까닭).
@@ -7001,7 +7301,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 결정문 자리에 좌석별 마지막 입장과 실패 사유를 내리고, 아래 보고서 저장까지 간 뒤 error 로 끝낸다
     # (결정문이 없는 것을 done 으로 끝내면 정상 심의와 똑같이 생긴다).
     decision, _chair_failed, _chair_knob, _chair_exc = "", "", "", None
-    for _ctry in range(1 + _CHAIR_RETRIES):
+    for _ctry in range(0 if _rdec is not None else 1 + _CHAIR_RETRIES):
         try:
             decision = await _chair_once()
             _chair_failed = ""
@@ -7019,7 +7319,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 초안은 번호가 대화에 닿지 않는다(HWAXPortal docs/leftovers-1017 triage A24 검토). 의장 호출이 돌아온 바로 뒤에 기다림 없이 낸다 — 그 사이에
     # 취소가 끼어들 자리가 없다. 화면은 이 표지를 받으면 '멈춤' 을 거둔다.
     yield _delib("finishing")
-    if _chair_failed:
+    _chair_cause = _ext_cause(_chair_exc)
+    if _rdec is not None:
+        # 되살림(S3) — 의장을 다시 부르지 않는다. 의장이 못 냈던 것도 그대로다(끊지 않았다면 회의록을 저장하고 chair_failed 로 끝났다).
+        decision, _chair_failed, _chair_knob, _chair_cause = _rdec["text"], _rdec["failed"], _rdec["knob"], _rdec["cause"]
+    elif _chair_failed:
         decision = _chair_fail_text(_chair_failed, 1 + _CHAIR_RETRIES, seat_note,
                                     [(o["persona"], _ser_kind(o, _kind(N))) for o in last_list],
                                     f"{_dr(N)}R {_rtag(N)}")
@@ -7051,7 +7355,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (e:120 의 120, 키 E1-CH-015 의 015)가 '어느 원문에도 없는 수치' 로 올라와 진짜 환각을 묻는다.
     # 의장이 결정문을 못 냈으면 아래 후처리(수치 대조·요약·쉬운 설명·인용 대조)를 돌리지 않는다 — 결정문이 아닌
     # 글을 대조하면 '결정문 수치 N건 전부 확인' 같은 거짓 줄이 나가고, 요약·설명은 같은 LLM 을 또 기다린다.
-    _dec_nums = [] if _chair_failed else [
+    # 결정문을 되살렸으면(S3) 이 대조의 상태줄은 원장에 이미 있다 — 다시 세지 않는다.
+    _dec_nums = [] if (_chair_failed or _rdec is not None) else [
         n for n in dict.fromkeys(_nrm(m.group(0))
                                  for m in _num_re.finditer(_EV_CITE_RE.sub(" ", decision)))
         if not re.fullmatch(r"(19|20)\d{2}", n)]
@@ -7064,13 +7369,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     elif _dec_nums:
         yield _sse("status", {"step": f"근거 대조 — 결정문 수치 {len(_dec_nums)}건 전부 "
                    "근거·발언 원문에서 확인", "tool": None})
+    if _rdec is None and _jon:
+        # 재개 자료(HA-09 S3 — e:decision) — 의장 결정문(못 냈으면 회의록 보존 글)과 실패 표지. 이으면 의장을 다시 부르지 않는다.
+        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause)
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
     _summary = ""
     # 후처리 텍스트 턴이 결정문을 읽는 길이 — 창에서 유도하고 바닥은 종전 값(_text_turn_room). 줄였으면 카드로 알린다.
     _post_cut = []
-    if not _chair_failed:
+    if not _chair_failed and _rpl is None:      # 되살렸으면(S3 e:plain) 요약 · 쉬운 설명을 다시 부르지 않는다 — 아래에서 그 결정문을 쓴다
         yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
         _smax = _text_turn_room(400, 6000, _mt)
         if len(decision) > _smax:
@@ -7104,6 +7412,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _plain = ""
     if not _chair_failed:
         yield _delib("stage", stage="explain")
+    if not _chair_failed and _rpl is None:
         yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
         _pmax = _text_turn_room(600, 7000, _mt)
         if len(decision) > _pmax:
@@ -7130,13 +7439,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="후처리 입력 상한 초과", included=False, notice=True,
                      text=" · ".join(_post_cut) + " 읽고 썼다 — 결정문 뒤쪽은 요약·쉬운 설명에 반영되지 않았을 수 "
                           "있다(결정문 전문은 그대로다). 모델 창이 작아서다.")
+    if _rpl is not None:
+        decision = _rpl["decision"]     # 되살림(S3) — 요약 · 머리 표지 · 쉬운 설명을 붙인 끊기기 전의 결정문(위에서 붙인 표지를 덮는다)
+    elif _jon:
+        # 재개 자료(HA-09 S3 — e:plain) — 쉬운 설명과 그것까지 붙인 결정문. 이으면 요약 · 쉬운 설명을 다시 부르지 않는다.
+        delib_resume.write(sk, "e:plain", sync=True, plain=_plain, decision=decision)
 
     # 아래 두 대조(웹 인용 · 수치)는 **보고서를 저장하기 전에** 한다. 종전엔 저장한 뒤에 경고를 붙여서,
     # 화면의 결정문에는 '이 수치는 확인되지 않았다' 가 있는데 Report Archive 에 남는 보고서에는 없었다 —
     # 나중에 보고서만 읽는 사람은 지어낸 값을 그대로 믿는다(봉인 표식을 저장 전에 찍는 것과 같은 까닭).
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
-    if opts.search_sources and not _chair_failed:
+    # 보고서 단계를 되살렸으면(S3 e:report_intent) 두 대조를 다시 하지 않는다 — 그 줄의 결정문(두 대조를 붙인 것)을 쓴다.
+    if opts.search_sources and not _chair_failed and _rint is None:
         _ok_n, _bad_n, _bad, _unk = await _verify_web_citations(app, groups, decision,
                                                                 user, user_pat)
         _n_cite = len(_WEB_CITE.findall(decision))
@@ -7183,7 +7498,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
         + list(knowledge_by_key.values()) + seat_lookups
         + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
-    _bad_num = [] if _chair_failed else unsourced_numbers(decision, _num_src, limit=0)
+    _bad_num = [] if (_chair_failed or _rint is not None) else unsourced_numbers(decision, _num_src, limit=0)
     if _bad_num:
         # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
         # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
@@ -7201,12 +7516,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _append_to = int(getattr(opts, "append_to_report_id", 0) or 0)
     report_note = ""
     rid = None
+    if _rint is not None:
+        decision = _rint["decision"]    # 되살림(S3) — 저장하려던 결정문(웹 인용 · 수치 대조까지 붙인 것)
     yield _delib("stage", stage="report")
-    yield _sse("status", {"step": ("Report Archive 보고서 저장 중" if _do_save and not _append_to
-                                   else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
-                                   else "보고서 저장 건너뜀(save_report=0)"),
-                          "tool": "create_report_draft" if _do_save else None,
-                          "detail": _ra_report_title(question)})
+    if _rsav is None:
+        yield _sse("status", {"step": ("Report Archive 보고서 저장 중" if _do_save and not _append_to
+                                       else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
+                                       else "보고서 저장 건너뜀(save_report=0)"),
+                              "tool": "create_report_draft" if _do_save else None,
+                              "detail": _ra_report_title(question)})
+    if _rint is not None and _rsav is None and _rint["save"]:
+        # 되살림(S3) — 저장 도중 끊겼다(e:report_intent 만 있다). RA 가 받았는지 알 길이 없다(멱등 열쇠가 없다) — 알리고 새로 저장한다.
+        yield _sse("warning", {"code": "report_maybe_saved", "message": (
+            (f"끊기기 전에 Report Archive 보고서 #{_rint['append_to']} 에 이 회차의 페이지를 붙이던 중이었다 — 끝났는지 알 수 없어 다시 "
+             f"붙인다. #{_rint['append_to']} 에 같은 페이지가 둘이면 하나를 지운다.") if _rint["append_to"] else
+            (f"끊기기 전에 Report Archive 에 보고서 「{_rint['title']}」 를 저장하던 중이었다 — 끝났는지 알 수 없어 새로 저장한다. "
+             "RA 에 같은 제목의 보고서가 둘이면 하나를 지운다."))})
     try:
         # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
         transcript = []
@@ -7241,10 +7566,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                        if n > cap]
             print(f"[deliberation] RA 블록 절단 — {' · '.join(_ra_cut)}")
             # 서버 로그만으로는 보고서만 읽는 사람도 호출자도 모른다 — 잡 원장(evidence_omitted)과 화면에 남긴다.
-            yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
-                         text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
-                              "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
-        if not _do_save:
+            if _rint is None:           # 보고서 단계를 되살렸으면(S3) 이 카드는 e:report_intent 보다 먼저 원장에 실렸다
+                yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
+                             text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
+                                  "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
+        if _rint is None and _jon:
+            # 재개 자료(HA-09 S3 — e:report_intent) — RA 호출 직전. 이 줄만 남고 끊기면 저장됐는지 알 수 없다 — 이을 때 경고하고 새로 저장한다.
+            delib_resume.write(sk, "e:report_intent", sync=True, save=_do_save, append_to=_append_to,
+                               title=_ra_report_title(question), decision=decision)
+        if _rsav is not None:           # 되살림(S3) — 끊기기 전에 이 단계가 끝났다. 다시 저장하지 않고 받은 번호 · 안내를 쓴다(아래)
+            _raw_made = None
+        elif not _do_save:
             _raw_made = None
         elif _append_to:
             # 이어하기 회차를 한 보고서로 묶는다 — 현재 페이지 수를 읽어 그 다음 장에 붙인다.
@@ -7261,11 +7593,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
         # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
-        rid, report_note = _ra_save_outcome(_raw_made, _append_to, _do_save)
+        rid, report_note = ((_rsav["rid"], _rsav["note"]) if _rsav is not None
+                            else _ra_save_outcome(_raw_made, _append_to, _do_save))
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
     for _c in _cred_notice():           # 보고서 저장에서 거절됐으면 — 수 시간 심의의 맨 끝이 가장 걸리기 쉽다
         yield _c
+    if _rsav is None and _jon:
+        # 재개 자료(HA-09 S3 — e:report_saved) — 받은 번호와 결정문 끝의 안내(저장 실패도 그대로 — 끊지 않았다면 그대로 끝났다). 이으면 다시
+        # 저장하지 않는다.
+        delib_resume.write(sk, "e:report_saved", sync=True, rid=rid, note=report_note)
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
     # ⚠ 분모는 **착석 수**다. 예전엔 len(last_list) — 즉 마지막 라운드 **응답자 수** 였고,
@@ -7281,13 +7618,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tally["abstain"] += max(0, _seated - len(last_list))
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
-    wiki_note = ""
-    if getattr(opts, "wiki", 0):
+    # 위키 단계를 되살렸으면(S3 e:wiki_sent) 다시 보내지 않고 그 안내와 꺼짐 상태(off — 다단 심의의 뒤 단이 꺼짐 안내를 또 붙이지 않게,
+    # HA-08)를 쓴다. 보내던 중에 끊겼으면 다시 보낸다 — 제자리 이어하기는 잡 id 가 같아 원천 열쇠(delib:<잡 id>:<틀>)도 같고, 같은 본문이면
+    # MX 백서가 앞의 원천으로 받는다(dedup — 열쇠 · 본문 지문 · 범위).
+    wiki_note = _rwik["note"] if _rwik is not None else ""
+    if _rwik is not None:
+        _wiki_off_back(_rwik.get("off"))
+    if getattr(opts, "wiki", 0) and _rwik is None:
         yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
         wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
                                        stage=opts.chair_template, personas=personas, last_list=last_list, rid=rid,
                                        evidence=opts.evidence, pool=gather_pool)
         yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
+        if _jon:
+            # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내와 그 뒤의 꺼짐 상태. 이으면 다시 보내지 않고 꺼짐도 되돌린다.
+            delib_resume.write(sk, "e:wiki_sent", sync=True, note=wiki_note, off=_wiki_off())
     # 다음 단(시뮬 2·3단)에는 **진짜 결정문만** 넘긴다 — 의장이 못 낸 글을 넘기면 그 위에서 다음 단이 돈다.
     # 못 냈으면 사유를 넘긴다(다단 래퍼가 제 오류에 싣는다).
     if out is not None and not _chair_failed:
@@ -7320,7 +7665,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                          "이어하기로 다시 수렴시키면 결정문을 받는다."),
                              "knob": " · ".join(x for x in (_chair_knob,
                                                            "의장 재호출 DELIB_CHAIR_RETRIES") if x),
-                             **_ext_cause(_chair_exc)})
+                             **_chair_cause})
     yield _sse("done", {})
 
 

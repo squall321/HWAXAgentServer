@@ -6,13 +6,19 @@
     .venv/bin/python tests/fakes/mcp_gateway.py --port 18124
 
 도구 — get_agent_session(좌석 역할 원문 — 지정 좌석의 역할 복원) · recommend_agents(좌석 셋) · agent_search(지식카드 0건).
+--record 를 주면 create_report_draft(받은 차례로 보고서 번호 77, 78, …) · wiki_submit_source(결정문 뒤 멱등 — HA-09 S3)와 사내 자산
+현황 도구 둘(list_tool_apps · database_summary — 해석 설계 2단에 들기 전의 현황 조회, HA-09 S4)도 싣고, 받은 호출을 도구마다(위 셋 포함) 그
+파일에 한 줄씩 적는다. --hold 파일({도구 이름: 초})에 적힌 도구는 적은 뒤 그만큼 기다렸다 답한다 — 그 사이 시험이 에이전트 서버를 내린다.
 9009(떠 있는 에이전트 서버)에는 뜨지 않는다.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
+import itertools
 import json
 import sys
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -20,13 +26,19 @@ from mcp.server.transport_security import TransportSecuritySettings
 SEATS = ("mech-a", "rel-b", "pcb-c")
 
 
-def make_server(port: int) -> FastMCP:
+def make_server(port: int, record: str | None = None, hold: str | None = None) -> FastMCP:
     mcp = FastMCP("fake-gateway", host="127.0.0.1", port=port, stateless_http=True, json_response=True,
                   transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+
+    def _log(row: dict) -> None:
+        if record:
+            with open(record, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     @mcp.tool()
     def get_agent_session(agent_type: str) -> str:
         """좌석 역할 원문 — 정해진 글이다."""
+        _log({"tool": "get_agent_session", "agent_type": agent_type})
         return json.dumps({"data": {"agent_type": agent_type, "name": agent_type,
                                     "description": f"{agent_type} 전문가 — 대본 좌석이다. 자기 도메인 관점에서만 판단한다."}},
                           ensure_ascii=False)
@@ -34,12 +46,53 @@ def make_server(port: int) -> FastMCP:
     @mcp.tool()
     def recommend_agents(q: str) -> str:
         """좌석 발굴 — 늘 같은 좌석 셋."""
+        _log({"tool": "recommend_agents"})
         return json.dumps({"agents": [{"agent_type": k, "name": k, "score": 0.9} for k in SEATS]}, ensure_ascii=False)
 
     @mcp.tool()
     def agent_search(q: str = "", agent_type: str = "") -> str:
         """지식카드 검색 — 늘 0건."""
+        _log({"tool": "agent_search"})
         return json.dumps({"hits": []}, ensure_ascii=False)
+
+    if record:
+        rids = itertools.count(77)
+
+        @mcp.tool()
+        def list_tool_apps(include_tools: bool = False) -> str:
+            """연결된 도구 앱 — 정해진 목록(해석 설계 2단의 사내 자산 현황이 읽는다)."""
+            _log({"tool": "list_tool_apps"})
+            return json.dumps({"apps": [{"app": "fake-cae", "tools": 2}]}, ensure_ascii=False)
+
+        @mcp.tool()
+        def database_summary() -> str:
+            """물성 DB 현황 — 정해진 글."""
+            _log({"tool": "database_summary"})
+            return json.dumps({"materials": 3, "properties": 12}, ensure_ascii=False)
+
+        async def _hold(name: str) -> None:
+            try:
+                s = float(json.loads(Path(hold).read_text(encoding="utf-8")).get(name) or 0) if hold else 0.0
+            except (OSError, ValueError):
+                s = 0.0
+            if s > 0:
+                await asyncio.sleep(s)
+
+        @mcp.tool()
+        async def create_report_draft(template_id: str = "", template_version: int = 1, title: str = "", blocks: dict | None = None,
+                                      tags: list[str] | None = None) -> str:
+            """Report Archive 보고서 저장 — 받은 차례로 번호를 주고 기록 파일에 적은 뒤 답한다."""
+            rid = next(rids)
+            _log({"tool": "create_report_draft", "rid": rid, "title": title})
+            await _hold("create_report_draft")
+            return json.dumps({"report_id": rid}, ensure_ascii=False)
+
+        @mcp.tool()
+        async def wiki_submit_source(envelope: dict, ingest: bool = True) -> str:
+            """MX 백서 위키 원천 받기 — 원천 열쇠를 기록 파일에 적은 뒤 답한다."""
+            _log({"tool": "wiki_submit_source", "ref": (envelope.get("origin") or {}).get("ref")})
+            await _hold("wiki_submit_source")
+            return json.dumps({"id": "src-1", "short": "W-1", "ingest_state": "queued"}, ensure_ascii=False)
 
     return mcp
 
@@ -47,12 +100,14 @@ def make_server(port: int) -> FastMCP:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="진짜 프로세스 심의 시험용 가짜 게이트웨이 MCP 서버")
     ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--record", default=None, help="받은 호출을 한 줄씩 적을 파일 — 주면 보고서 · 위키 · 사내 자산 현황 도구도 싣는다")
+    ap.add_argument("--hold", default=None, help="{도구 이름: 초} JSON 파일 — 그 도구는 적은 뒤 그만큼 기다렸다 답한다")
     args = ap.parse_args(argv)
     if args.port == 9009:
         print("9009 는 떠 있는 에이전트 서버의 포트다 — 빈 포트를 고른다", file=sys.stderr)
         return 2
     print(f"[fake-gateway] http://127.0.0.1:{args.port}/mcp", flush=True)
-    make_server(args.port).run(transport="streamable-http")
+    make_server(args.port, args.record, args.hold).run(transport="streamable-http")
     return 0
 
 

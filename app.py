@@ -9206,11 +9206,14 @@ def _delib_ops_health() -> dict:
         import delib_jobs  # noqa: PLC0415
         pause = _delib_pause_view()
         d = delib_jobs.queue_durability()
+        # 진행 일지 · 재개 자료(HA-09 S0 · S1 A5.5) — 쓰는 판인가 · 한 잡의 상한 · 기동 뒤 쓰다 실패한 수, 이번 기동의 재기동 정리가 일지를 접은 잡 수
         return {"delib_paused": bool(pause.get("on")), "delib_pause": pause, "delib_queue_durable": d["durable"],
-                "delib_requeued": d["requeued"], "delib_seats_running": delib_jobs.seats_running()}
+                "delib_requeued": d["requeued"], "delib_seats_running": delib_jobs.seats_running(),
+                "delib_journal": delib_jobs.journal_health(), "delib_folded": delib_jobs.folded()}
     except Exception as exc:  # noqa: BLE001
         return {"delib_paused": False, "delib_pause": {"on": False, "error": f"{type(exc).__name__}: {exc}"[:200]},
-                "delib_queue_durable": False, "delib_requeued": 0, "delib_seats_running": None}
+                "delib_queue_durable": False, "delib_requeued": 0, "delib_seats_running": None,
+                "delib_journal": {"on": False, "error": f"{type(exc).__name__}"}, "delib_folded": 0}
 
 
 # ── 동시 심의 한도(HWAXPortal docs/delib-ops R4) ─────────────────────────────────
@@ -9453,7 +9456,8 @@ def health() -> dict:
         "delib_as_of": True,
         # 새 심의 멈춤(delib_paused · delib_pause — R1) · 줄이 재기동을 넘기나(delib_queue_durable — 참이면 재기동 판정이 줄 선 수를 막는 수로
         # 세지 않는다, start.sh · 포털 lib/delib-busy.sh) · 이번 기동에 다시 세운 줄(delib_requeued — R2, update-all 이 재기동 뒤 찍는다) ·
-        # 도는 GLM 잡의 좌석 합(delib_seats_running — 좌석 합 상한 limits.max_seats_running 이 본다, 앉기 전은 어림).
+        # 도는 GLM 잡의 좌석 합(delib_seats_running — 좌석 합 상한 limits.max_seats_running 이 본다, 앉기 전은 어림) · 진행 일지(delib_journal
+        # {on, max_mb, errors} — HA-09) · 이번 기동에 일지를 접은 잡 수(delib_folded — update-all 이 재기동 뒤 찍을 수 있다).
         **_delib_ops_health(),
         # 카드 대조는 위 두 수와 **다른 칸**이다(C-25) — 재기동을 막지 않는다(끊기면 앱이 차감 없이 다시 낸다).
         **_review,
