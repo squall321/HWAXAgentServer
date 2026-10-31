@@ -6578,6 +6578,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _cp = (f"[체크포인트 — {_dr(rnd)}라운드(초기입장)에서 멈춤]\n{seat_note}\n\n"
                    f"{ct}\n\n빠진 관점이나 추가 관측이 있으면 의견으로 넣어 이어가라. "
                    "좌석 재심사가 그 방향에 맞는 도메인을 불러온다.")
+            if _as_of:
+                # 기준일 줄은 결정문처럼 코드가 머리에 찍는다 — 웹 이어하기가 이 글 머리에서 앞 회차의 기준일을 읽는다(포털 chatStore.decisionAsOf).
+                # 없으면 체크포인트에서 곧바로 이어 간 회차가 기준일 없이 오늘의 카드로 돌았다(반대 검토 10-31). 셈은 1라운드까지다.
+                _cp = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free, _ao_des)}\n\n{_cp}"
             if out is not None:
                 out["decision"] = _cp
             yield _delib("decision", text=_cp)

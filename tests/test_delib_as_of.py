@@ -681,3 +681,16 @@ def test_health_가_기준일을_받는_판이라고_알린다(monkeypatch):
     막는다(HWAXPortal backend/app/agent/routes.py 가 이 이름을 읽는다)."""
     monkeypatch.setattr(app, "_model_context_tokens", lambda: 128000)       # 모델 서버에 묻지 않는다
     assert app.health()["delib_as_of"] is True
+
+
+# ── 반대 검토 10-31 — 웹 이어하기가 앞 회차의 기준일을 읽는다 ───────────────────────────────────────────────────────────
+def test_체크포인트_글에도_기준일_줄이_머리에_있다(monkeypatch, hubs):
+    """웹 이어하기는 앞 회차의 글 머리('■ 기준일 — YYYY-MM-DD.')에서 기준일을 읽는다(포털 chatStore.decisionAsOf — MCP 는 원장의 _CONT_CARRY).
+    체크포인트(stop_after_round=1)는 결정문 대신 이 글을 내리고 사람이 곧바로 이어 가는 자리인데 기준일 줄이 없어, 이어하기가 기준일 없이
+    오늘의 카드로 돌았다."""
+    events = _delib(monkeypatch, hubs["new"], {"as_of": AS_OF, "stop_after_round": 1}, done=True)
+    cp = _decision(events)
+    assert cp.startswith(f"■ 기준일 — {AS_OF}. ") and "[체크포인트 — " in cp.split("\n\n", 1)[1], cp[:300]
+    assert "사전 검색 2석" in cp.split("\n\n", 1)[0]
+    plain = _decision(_delib(monkeypatch, hubs["new"], {"stop_after_round": 1}, done=True))
+    assert plain.startswith("[체크포인트 — "), "기준일 없는 체크포인트 글이 바뀌었다"
