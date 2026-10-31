@@ -60,7 +60,7 @@ def test_분리_태스크는_누가_띄웠는지에_따라_사람_심의로_센�
 def test_웹_심의는_delib_opts_의_started_by_를_분리_태스크에_넘긴다(monkeypatch):
     seen = []
 
-    def capture(stream, label, started_by="human"):
+    def capture(stream, label, started_by="human", conv="", user=""):    # 진짜와 같은 꼴 — 멈춤의 열쇠(대화 id · 사람)도 받는다(A24)
         seen.append((label, started_by))
 
         async def empty():

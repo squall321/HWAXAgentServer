@@ -54,6 +54,19 @@ ChatDock (portal frontend)
   `GET /drain` is unchanged (the card-review flag only — a contract shared with the risk app and the portal);
   `/health.delib_paused` · `delib_pause` show the pause. A pause that ends by its TTL is noticed by the queue tick
   (every 15 s).
+- `POST /deliberate/cancel {conversation_id, by, user_email?}` — **stop a running web deliberation** (portal
+  `docs/leftovers-1017` triage A24 (나)). Web deliberations (`/심의` · `/시뮬심의` · `/시험계획` through `/chat`) are
+  detached tasks with no job ledger; each one started with a portal conversation id (`ChatRequest.conversation_id`) is
+  recorded under that id in memory (a restart ends web deliberations anyway). The call cancels the task the same way
+  `deliberate_cancel` cancels an MCP job: the engine's `finally` blocks run (in-flight LLM calls are cancelled, nothing
+  more is called), and the stream closes with `event: delib {kind: "cancelled", by, message}` then `done` — no `error`,
+  no decision, no report. Answers: 200 `{status: "cancelling", runs}` · 200 `{status: "cancelling"|"cancelled",
+  already: true}` for a repeat (idempotent) · 409 `already_finished` with `status` (`done` · `error` · `interrupted`)
+  when the latest run ended before the call · 404 `delib_not_found` (no web deliberation of this server in that
+  conversation) · 422 for a bad body (`unknown_fields` like `/drain`). With `user_email` only that person's runs are
+  touched (the `deliberate_cancel` rule — no one folds another person's deliberation); without it (an operator's
+  loopback call) every run in the conversation. Loopback only and no auth, like `/drain` · `/limits`; the portal calls it
+  from its owner-checked `POST /agent/deliberate/cancel` only.
 - **The queue survives a restart** (R2). Every MCP job writes all its start arguments — question, evidence bodies,
   seats, human note, knobs, identity (email, groups as received, affiliation), **never a token** — to
   `<DELIB_JOB_DIR>/args/<id>.json` (0600). At startup queued jobs are put back in their original order (`queued_at`) and
