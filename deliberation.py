@@ -6671,6 +6671,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     if _nn and _nn not in out["non_negotiables"]:
                         out["non_negotiables"].append(_nn)
             continue
+        if _jon:
+            # 재개 자료(HA-09 — e:round_in) — 이 라운드에 든다(라운드 머리 카드보다 먼저). 이 뒤에 원장에 실린 알림(경고 · 좌석에 주지 않은 카드)이
+            # 이 라운드의 것이다 — 이 라운드에서 끊겨 이으면 같은 일을 다시 하며 낸 같은 알림을 원장에 다시 싣지 않는다(delib_resume.Seen). 그
+            # 알림들(라운드 머리 · 조회 · 좌석 · 라운드 끝)은 이 라운드의 재개 자료 줄(e:gather · e:raw · e:round_end)보다 먼저 원장에 닿는다.
+            delib_resume.write(sk, "e:round_in", r=rnd)
         # 끊긴 라운드(HA-09 S2) — 끊기기 전에 말한 좌석(_cback — 원 출력, 끝난 차례)은 다시 부르지 않고, 조회가 끝났으면(_cgat — e:gather) 다시
         # 하지 않는다. 라운드의 좌석은 서로의 이번 라운드 발언을 보지 않아(병렬) 나머지 좌석의 프롬프트는 끊기지 않았을 때와 같다. 아니면(끊긴
         # 라운드가 아니거나 재개 상태가 없다) 셋 다 비어 아래는 지금 길 그대로다.
@@ -7204,6 +7209,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 같게 지나간다). 전 라운드를 되살렸을 때만 있다. 재개 상태가 없으면 다섯 다 None 이라 아래는 지금 길 그대로다.
     _post = _rsv.post if (_rsv is not None and _rk == N) else {}
     _rdec, _rpl, _rint, _rsav, _rwik = (_post.get(x) for x in delib_resume.POST)
+    if _jon:
+        # 재개 자료(HA-09 — e:round_in, 라운드 수 + 1) — 결정문 단계에 든다. 라운드와 같은 까닭이다 — 의장 전사 상한 카드 · 의장 출력 상한 경고 ·
+        # 요약 실패 같은 알림은 그 단계의 줄(e:decision · e:plain …)보다 먼저 원장에 닿아, 그 사이에 끊겨 이으면 같은 알림이 또 실렸다.
+        delib_resume.write(sk, "e:round_in", r=N + 1)
 
     # 4) 의사결정문 합성
     for _c in _cred_notice():           # 마지막 라운드의 조회에서 거절됐으면 — 아래 근거 프로파일이 읽기 전에

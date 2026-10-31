@@ -219,9 +219,9 @@ ChatDock (portal frontend)
   decision event already reached the ledger (cut before the outcome · result events) now resumes in place too instead of
   taking the summary path. The `끊긴 심의 되살림` card (kept steps first), the status line and the in-place note say what
   is kept (`보고서는 끊기기 전에 저장돼(#N) 다시 저장하지 않는다` …). `RESUME_SCHEMA` is 2 — a missing line now means "not
-  done yet", which a journal written before these lines (1) cannot tell, so such a journal takes the summary path. Still
-  open: the `의장 전사 상한 초과` card is emitted before the chair call, so a cut during the chair call (no `e:decision`)
-  calls the chair again and emits that card again.
+  done yet", which a journal written before these lines (1) cannot tell, so such a journal takes the summary path. A
+  cut during the chair call (no `e:decision`) calls the chair again; the `의장 전사 상한 초과` card it emits again before
+  that call is kept once by the notice rule below (10-31 — this was the open item here).
 - **Inside a stage of a multi-stage or test-plan job** (HA-09 S4 — portal design A5.2 last row · A5.3 last bullet ·
   A6 S4, user decision 10-31 A-4 (가)). `sim-plan` · `build-plan` run their stages under the stage keys `sim-1` ·
   `sim-2` · `sim-3` and `test-plan` under `tp` (`delib_resume.STAGES`; the single-stage engine keeps `main`), each with
@@ -251,6 +251,21 @@ ChatDock (portal frontend)
   scratch; multi-stage jobs keep `rounds_done` 0 there (a new job cannot apply one stage's rounds — the checkpoint is the
   summary path's unit). `RESUME_SCHEMA` stays 2: single-stage lines are unchanged and earlier multi-stage · test-plan
   journals hold no engine line at all (no `e:pre` → summary path).
+- **Notices at the cut point only once** (HA-09 leftover, 10-31). A place's notices — warnings and cards not given to
+  seats, the two kinds the ledger keeps — reach the ledger before that place's resume line: a round's head card
+  (`좌석 직전 라운드 상한 초과`) and lookup notices (`as_of_unconfirmed` · `risk_read_not_visible` · image-read misses ·
+  `자기 조회 결과 상한 초과` · `free_gather_failed`) before its `e:gather`, its seat-loss and serialisation-cap notices before its
+  `e:round_end`, and the decision stage's chair transcript card, output-cut warning and summary · explanation notices
+  before `e:decision` · `e:plain`. A cut in between made the resumed run redo that work and put the same notice in the
+  ledger a second time. The engine now writes `e:round_in` (round `r`, or rounds + 1 for the decision stage) when it
+  enters a place it runs (before the round-head card); the notices journaled after it are that place's.
+  `delib_resume.parse` takes the cut place's notices (plus `e:note` lines carried from earlier attempts — public events
+  cannot be carried, the restart sweep would fold them again) and carries them as `e:note`; the relaunched job
+  (`delib_resume.Seen`, set by `_drive`) is on from that place's `e:round_in` to its `e:round_end`, its stage's
+  `decision` event or the next stage marker, and does not apply or journal a notice equal to one of them — each equal
+  notice once, as often as it was there, so a notice that recurs within the place keeps its count and a different one
+  (the redone lookup ended otherwise) is applied. `RESUME_SCHEMA` stays 2: both lines are additive (an earlier journal has
+  no `e:round_in`, resumes as before and keeps such a duplicate; an earlier build ignores the lines).
 
 - `POST /seat-eval` · `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — the seat-choice
   baseline windows (shared secret; see "Seat-choice baseline" below). `/health.seat_eval` `{secret, busy}`,

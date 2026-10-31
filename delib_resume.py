@@ -26,6 +26,12 @@
   e:raw       좌석 하나가 말한 직후, turn 사건을 내기 **전** — 원 출력(JSON 칸 전부). 끊긴 라운드에서 이 줄이 있는 좌석은 다시 부르지
               않는다 — 나머지(아직 안 함 · 실패)만 부른다(S2).
   e:round_end 라운드 r 끝 — 유실 좌석. 이 줄이 있는 라운드만 끝난 라운드로 되살린다(그 라운드의 사건은 모두 이 줄 앞에 적혔다).
+  e:round_in  라운드 r 에 든다(되살리지 않고 도는 라운드마다 — 라운드 머리 카드보다 먼저). r 이 라운드 수 + 1 이면 결정문 단계(의장 · 요약 ·
+              보고서 · 위키)에 든다. 이 줄 뒤에 원장에 실린 알림(경고 · 좌석에 주지 않은 카드)이 그 자리의 알림이다 — 끊긴 자리가 그 라운드
+              (단계)이면 이은 실행이 같은 일을 다시 하며 같은 알림을 내도 원장에 다시 싣지 않는다(Seen). 그 라운드 · 단계의 재개 자료 줄
+              (e:gather · e:raw · e:round_end · e:decision …)은 그 일이 끝나야 적혀, 알림만 원장에 닿고 끊기면 종전엔 알림이 두 번 실렸다.
+  e:note      끊긴 자리의 그 알림(사건 이름 ev · 본문 d) — 일지를 고쳐 쓸 때 공개 사건 대신 옮겨 적는다(공개 사건은 옮기면 재기동 정리가
+              또 접는다). 이은 실행이 같은 자리에서 또 끊겨도 앞 시도들의 알림을 모두 안다.
   결정문 뒤(S3 — 전 라운드가 끝난 뒤에만 적히고, 전 라운드를 되살릴 때만 읽는다. 줄 하나가 그 단계가 끝났다는 표지다 — 그 단계의 사건은 모두
   그 줄 앞에 적혔다. 없으면 그 단계를 아직 하지 않은 것이다).
   e:decision  의장 결정문이 나온 뒤 — 결정문(의장이 못 냈으면 회의록 보존 글) · 의장 실패 표지(failed · knob · cause). 있으면 의장을 다시
@@ -66,6 +72,51 @@ STAGE_IN = {SIM2: {"decision_a": str, "nn_a": list, "personas_a": list, "seats":
 STAGE_LABEL = {SIM1: "1단(메커니즘)", SIM2: "2단(해석 설계)", SIM3: "3단(구축 계획)", TP: "시험 설계"}
 # 결정문 뒤 줄 — 엔진이 적는 차례다(이 차례로 옮겨 적는다).
 POST = ("e:decision", "e:plain", "e:report_intent", "e:report_saved", "e:wiki_sent")
+
+
+def notice_key(ev: str, data) -> str | None:
+    """원장에 알림으로 남는 사건(경고 · 좌석에 주지 않은 카드 — delib_jobs._apply 가 warnings · evidence_omitted 에 싣는 것)이면 견줄 열쇠, 아니면
+    None. 일지는 그 둘을 받은 그대로 적는다(_journal_form) — 일지의 줄과 다시 낸 사건이 같은 열쇠다."""
+    if not isinstance(data, dict):
+        return None
+    if ev == "warning" or (ev == "delib" and data.get("kind") == "evidence" and data.get("included") is False):
+        return json.dumps([ev, data], ensure_ascii=False, sort_keys=True)
+    return None
+
+
+class Seen:
+    """끊긴 자리(라운드 r — 라운드 수 + 1 이면 결정문 단계)에서 끊기기 전에 원장에 실린 알림 — 이은 실행이 그 자리에서 같은 알림을 다시 내면
+    원장 · 일지에 다시 싣지 않는다(delib_jobs._drive). 엔진의 e:round_in(그 단 · 그 자리)에서 켜지고 그 자리가 끝나면(e:round_end · 그 단의 결정문
+    사건 · 다른 단의 표지) 꺼진다. 같은 알림이 그 자리에서 여러 번 났으면 그 수만큼만 거른다 — 끊지 않은 실행의 수와 같아진다. 다른 알림(조회가
+    이번엔 다르게 끝났다)은 그대로 싣는다."""
+
+    def __init__(self, sk: str, r: int, notes: list):
+        self.sk, self.r, self.on = sk, r, False
+        self.left = [x for x in (notice_key(ev, d) for ev, d in notes) if x is not None]
+
+    def _here(self, rec: dict) -> bool:
+        return rec.get("sk") == self.sk and rec.get("r") == self.r
+
+    def gate(self, rec: dict) -> None:
+        """엔진의 재개 자료 한 줄 — 그 자리에 들면 켜고, 그 자리가 끝나면 끈다(다시 켜지지 않는다)."""
+        k = rec.get("k")
+        if k == "e:round_in" and self._here(rec):
+            self.on = True
+        elif self.on and (k in ("e:pre", "e:stage_in") or (k == "e:round_end" and self._here(rec))):
+            self.on, self.left = False, []
+
+    def again(self, ev: str, data) -> bool:
+        """이 사건이 끊기기 전에 원장에 이미 실린 그 자리의 알림인가(참이면 거른다 — 하나를 지운다)."""
+        if not self.on:
+            return False
+        if ev == "delib" and isinstance(data, dict) and data.get("kind") == "decision":
+            self.on, self.left = False, []          # 그 단의 결정문 — 결정문 단계가 끝났다(다단 심의의 다음 단 알림을 거르지 않는다)
+            return False
+        key = notice_key(ev, data)
+        if key is None or key not in self.left:
+            return False
+        self.left.remove(key)
+        return True
 
 
 def _engine_rev() -> str:
@@ -264,10 +315,16 @@ class Resume:
     carry 는 새 일지에 그대로 옮겨 쓸 e:* 줄(되살릴 것만 — 다음 재기동에도 남게), info 는 응답 · 안내에 싣는 것, groups 는 끊기기 전의 그룹이다.
     stages 는 끊긴 단 하나 → StageData, stage_in 은 그 단에 들 때의 e:stage_in 줄(2단 · 3단 · 시험 설계만 — S4)이다."""
 
-    def __init__(self, job_id: str, stages: dict, carry: list, info: dict, groups: list, stage_in: dict | None = None):
+    def __init__(self, job_id: str, stages: dict, carry: list, info: dict, groups: list, stage_in: dict | None = None,
+                 notes: tuple | None = None):
         self.job_id, self.stages, self.carry, self.info, self.groups = job_id, stages, carry, info, groups
         self.stage_in = stage_in or {}
         self.by = ""                       # 이은 사람(시도 기록 attempts 의 by)
+        # 끊긴 자리(단 · 라운드 — 라운드 수 + 1 은 결정문 단계)에서 끊기기 전에 원장에 실린 알림 (sk, r, [(ev, d)]) — 없으면 None. 잡이 Seen 으로 건다
+        self.notes = notes
+
+    def seen(self) -> "Seen | None":
+        return Seen(*self.notes) if self.notes and self.notes[2] else None
 
 
 def _rec(raw: bytes):
@@ -308,6 +365,9 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0,
         return None, f"재개 자료의 꼴이 이 판과 다르다(일지 {head.get('rv')} · 이 판 {RESUME_SCHEMA})"
     sk, entered, sin = None, False, {}
     pre, gather, raws, ended, post = None, {}, {}, {}, {}
+    # 자리마다의 알림 — notes[r] 는 그 단의 e:round_in r 뒤에 원장에 실린 알림(공개 사건)과 옮겨 적힌 앞 시도의 알림(e:note). here 는 지금 든 자리
+    notes: dict = {}
+    here = None
     for ln in lines[1:]:
         rec = _rec(ln)
         if rec is None:
@@ -316,16 +376,19 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0,
         if k == "e:resume_off":
             return None, f"재개 자료를 끝까지 쓰지 못했다({str(rec.get('why') or '까닭 없음')[:200]})"
         if not (isinstance(k, str) and k.startswith("e:")):
+            if here is not None and notice_key(k, rec.get("d")) is not None:
+                notes[here].append([k, rec["d"]])
             continue
         rsk = rec.get("sk")
         if not (isinstance(rsk, str) and rsk in stages):
             return None, _WHY_ODD
         if k == "e:stage_in":             # 그 단에 든다(S4) — 앞 단은 끝났다. 그 단의 e:pre 가 오기 전이면 그 단의 라운드 전 단계다
             sk, entered, sin[rsk] = rsk, True, rec
+            here = None
             continue
         if k == "e:pre":
             sk, entered = rsk, False
-            pre, gather, raws, ended, post = rec, {}, {}, {}, {}
+            pre, gather, raws, ended, post, notes, here = rec, {}, {}, {}, {}, {}, None
             continue
         if pre is None or rsk != sk or entered:
             continue
@@ -336,6 +399,14 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0,
             r = int(rec.get("r"))
         except (TypeError, ValueError):
             return None, "재개 자료에 라운드 번호가 없는 줄이 있다"
+        if k == "e:round_in":             # 그 자리에 든다 — 이 뒤의 알림이 그 자리의 것이다(이 시도의 것 — 앞 시도의 것은 e:note 로 옮겨 적혔다)
+            here = r
+            notes.setdefault(r, [])
+            continue
+        if k == "e:note":
+            if isinstance(rec.get("ev"), str) and notice_key(rec["ev"], rec.get("d")) is not None:
+                notes.setdefault(r, []).append([rec["ev"], rec["d"]])
+            continue
         if k == "e:gather":
             gather[r] = rec
         elif k == "e:raw":
@@ -384,6 +455,10 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0,
     # 단계(저장한 보고서 번호 · 보낸 위키)가 남는다.
     post = post if k == n else {}
     carry += [post[x] for x in POST if x in post]
+    # 끊긴 자리(라운드 cut — 전 라운드가 끝났으면 결정문 단계 n + 1)에서 끊기기 전에 원장에 실린 알림 — 이은 실행이 그 자리를 다시 하며 같은 알림을
+    # 내면 다시 싣지 않는다(Seen). 공개 사건은 옮겨 적지 못하니(재기동 정리가 또 접는다) e:note 로 옮긴다 — 또 끊겨도 앞 시도들의 것을 다 안다.
+    cut_notes = notes.get(cut) or []
+    carry += [{"k": "e:note", "sk": sk, "r": cut, "ev": ev, "d": dd} for ev, dd in cut_notes]
     sav, it = post.get("e:report_saved"), post.get("e:report_intent") or {}
     info = {"sk": sk, "round": cut, "restored": k, "total": n, "spoken": spoken,
             "todo": [s for s in seats if s not in spoken] if k < n else [], "gathered": cut in gather if k < n else False,
@@ -395,4 +470,4 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0,
                      "report_id": sav.get("rid") if sav else None, "append_to": it.get("append_to") or 0,
                      "title": it.get("title") or ""}}
     return Resume(job_id, {sk: StageData(pre, rounds, info, cutd, post)}, carry, info, list(pre["groups"]),
-                  stage_in={sk: sin_rec} if sin_rec is not None else {}), ""
+                  stage_in={sk: sin_rec} if sin_rec is not None else {}, notes=(sk, cut, cut_notes)), ""

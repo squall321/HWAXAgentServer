@@ -468,6 +468,9 @@ class _Journal:
         self.job_id, self.fd, self.size = job_id, None, 0
         self.track = delib_resume.Tracker()
         self.eoff = ""              # 엔진 줄을 멈춘 까닭(e:resume_off) — 비면 적는다
+        # 제자리 이어하기의 끊긴 자리에서 끊기기 전에 원장에 실린 알림(HA-09 — delib_resume.Seen, _drive 가 건다) — 엔진 줄(e:round_in ·
+        # e:round_end …)이 켜고 끄고, _drive 가 같은 알림을 원장 · 일지에 다시 싣지 않는다(again)
+        self.seen: "delib_resume.Seen | None" = None
         head = _journal_head(job_id)
         try:
             _private_dir(JOB_DIR / _JOURNAL_DIR)
@@ -533,6 +536,10 @@ class _Journal:
             return
         self._write(data, sync)
 
+    def again(self, ev: str, data: dict) -> bool:
+        """끊긴 자리에서 끊기기 전에 원장에 이미 실린 알림을 이은 실행이 다시 냈나(참이면 _drive 가 원장 · 일지에 싣지 않는다 — Seen)."""
+        return self.seen is not None and self.seen.again(ev, data)
+
     def event(self, ev: str, data: dict, t: float, turns_before: int) -> None:
         """_drive 가 _apply 한 사건 하나 — 시각은 그 사건을 반영한 때(updated_at)다(접으면 그 값이 된다)."""
         form = _journal_form(ev, data, turns_before)
@@ -542,6 +549,8 @@ class _Journal:
     def engine(self, rec: dict, *, sync: bool = False) -> None:
         """엔진의 재개 자료 한 줄(e:* — delib_resume.write 가 부른다). 일지 상한의 4분의 3에 닿거나 JSON 으로 못 적으면 그 까닭을 한 줄
         (e:resume_off) 적고 엔진 줄만 멈춘다 — 공개 사건은 상한까지 계속 적어 접기는 그대로 되고, 그 잡의 이어하기는 요약으로 간다(A5.1)."""
+        if self.seen is not None:
+            self.seen.gate(rec)         # 적든 못 적든 엔진이 그 자리에 든 · 그 자리를 맺은 것은 같다 — 원장 쪽 거름은 일지 쓰기와 따로 간다
         if self.fd is None or self.eoff:
             return
         try:
@@ -1281,12 +1290,19 @@ async def _drive(job: dict, gen) -> None:
     일지에 재개 자료(e:*)를 덧붙인다 — 일지를 이 태스크의 문맥 변수(delib_resume.journal)에 건다(HA-09 S1). 제자리 이어하기면 되살릴 재개
     자료(delib_resume.restore — start 가 이 태스크의 문맥에만 건다)를 새 일지 머리 뒤에 먼저 옮겨 쓴다."""
     res = delib_resume.restore.get()
-    jr = _Journal(job["id"], carry=res.carry if res is not None and res.job_id == job["id"] else ())
+    mine = res is not None and res.job_id == job["id"]
+    jr = _Journal(job["id"], carry=res.carry if mine else ())
+    jr.seen = res.seen() if mine else None
     _JOURNALS[job["id"]] = jr
     tok = delib_resume.journal.set(jr)
     try:
         async for chunk in gen:
             ev, data = _parse_sse(chunk)
+            if jr.again(ev, data):
+                # 끊긴 자리(라운드 · 결정문 단계)에서 끊기기 전에 원장에 실린 알림을 이은 실행이 같은 일을 다시 하며 또 냈다 — 다시 싣지 않는다(HA-09).
+                # 종전엔 그 자리의 재개 자료 줄(e:gather · e:round_end · e:decision …)보다 먼저 원장에 닿은 알림(기준일 · not_visible · 그림 판독 ·
+                # 조회 상한 · 라운드 머리 · 의장 전사 상한 카드와 경고)이 두 번 실렸다.
+                continue
             turns_before = len(job.get("turns") or [])
             _apply(job, ev, data)
             job["updated_at"] = _now()
