@@ -7400,6 +7400,45 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     yield _sse("done", {})
 
 
+def _seat_q_source(req: ChatRequest, started_by: str) -> tuple[str, str, list] | None:
+    """이 발화가 기준선 H 의 재료인가 → (출처, 질문 글, 사람이 고른 전문가). 갈래 차례는 chat() 과 같다(design-e5 2.2 H 의 출처 넷).
+    사람이 좌석을 고른 심의만 · 빗금으로 부른 '/전문가' 만 · 지목 대화는 앞선 사람 발화가 없을 때만이다. 앱이 띄운 리스크 패널은 사람의 화두가 아니다."""
+    m = req.message or ""
+    if is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
+        o = req.delib_opts if isinstance(req.delib_opts, dict) else {}
+        picked = [k for k in (_delib_engine._seat_key(p) for p in (o.get("personas") or []) if isinstance(p, dict)) if k]
+        if started_by == "app" or not picked:
+            return None
+        q = (strip_sim_trigger(m) if is_sim_deliberation(m) else strip_test_plan_trigger(m) if is_test_plan(m)
+             else strip_trigger(m))
+        return "delib", q, picked
+    if is_report_save(m):
+        return None
+    if m.strip().startswith(_AGENT_SEARCH_TRIGGERS):
+        return "expert_cmd", strip_agent_trigger(m), []
+    if is_agent_search(m, pinned=bool(_persona_keys(req.pinned_agents, req.pinned_agent))) or is_tool_search(m):
+        return None
+    if (is_thinking(m) or req.thinking) and not _confirm_reply(req):
+        return "thinking", strip_thinking_trigger(m), []
+    keys = _persona_keys(req.pinned_agents, req.pinned_agent)
+    if keys and not any(isinstance(h, dict) and h.get("role") == "user" for h in (req.history or [])):
+        return "persona", m, keys
+    return None
+
+
+def _seat_q_note(req: ChatRequest, started_by: str) -> None:
+    """기준선 H 재료를 박스 파일에 — 꺼져 있으면(기본) 아무것도 하지 않는다. 사람 · 대화는 적지 않는다(seat_questions). 실패는 삼킨다."""
+    import seat_questions as _sq  # noqa: PLC0415
+    if not _sq.enabled():
+        return
+    try:
+        got = _seat_q_source(req, started_by)
+        if got:
+            _sq.note(got[0], got[1], user=req.user_email, picked=got[2])
+    except Exception as exc:  # noqa: BLE001 — 모으기가 챗을 막지 않는다
+        print(f"[seat-questions] 발화를 남기지 못했다: {exc!r}"[:300])
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
     # 심의 모드: "/심의 <질문>" → 다중 라운드 전문가 심의 파이프라인(코드가 오케스트레이션, vLLM=GLM 이 추론).
@@ -7424,6 +7463,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         _paused = _delib_pause_info()
         if _paused:
             return StreamingResponse(_paused_stream(_paused), media_type="text/event-stream", headers=SSE_HEADERS)
+    _seat_q_note(req, started_by)      # 전문가 고르기 기준선 H 의 재료(기본 꺼짐 — design-e5 E5-2) — 이 턴의 길은 그대로다
     if is_sim_deliberation(req.message):
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
@@ -8922,6 +8962,66 @@ async def post_limits(request: Request):
     return out
 
 
+# ── 실사용 질문 모으기 · 사람 표시(HWAXPortal docs/request-1029 design-e5 E5-2) ─────────────────────────────────────────────
+# GET /seat-questions · POST /seat-questions/label · POST /seat-questions/ingest — 모으기는 기본 꺼짐이다(seat_questions). 공유 비밀을 요구한다 —
+# 게이트웨이 연결의 Authorization(Bearer <GW_TOKEN>), 포털 GATEWAY_SHARED_TOKEN 과 같은 값이다(게이트웨이 /search-eval 과 같은 꼴, seat_box).
+# /drain · /limits 처럼 루프백만 믿지 않는 까닭 — 질문 원문을 낸다.
+def _seat_auth(request: Request):
+    import seat_box  # noqa: PLC0415
+    st, why = seat_box.authorized(app, request.headers.get("authorization", ""))
+    return JSONResponse({"error": why}, status_code=st) if st else None
+
+
+@app.get("/seat-questions")
+def seat_questions_view(request: Request, src: str = "", by: str = "", limit: int = 100, offset: int = 0):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if src and src not in _sq.SOURCES:
+        return JSONResponse({"error": f"src 는 {list(_sq.SOURCES)} 가운데 하나다"}, status_code=422)
+    return _sq.view(src or None, by or None, limit=limit, offset=offset)
+
+
+@app.post("/seat-questions/label")
+async def seat_questions_label(request: Request):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"error": "본문이 JSON 이 아니다"}, status_code=422)
+    st, out = _sq.label(body)
+    return JSONResponse(out, status_code=st)
+
+
+@app.post("/seat-questions/ingest")
+async def seat_questions_ingest(request: Request):
+    import seat_questions as _sq  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"error": "본문이 JSON 이 아니다"}, status_code=422)
+    if not isinstance(body, dict) or sorted(set(body) - {"items"}):
+        return JSONResponse({"error": "본문은 {items: [...]} 다"}, status_code=422)
+    st, out = _sq.ingest(body.get("items"))
+    return JSONResponse(out, status_code=st)
+
+
+def _seat_questions_health() -> dict:
+    """/health 의 seat_questions — 모으기가 켜졌나 · 창 날 수 · 이번 기동에 적은 수 · 받는 표시자 수(질문 글은 싣지 않는다)."""
+    try:
+        import seat_questions as _sq  # noqa: PLC0415
+        return _sq.health()
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"collect": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _limits_health() -> dict:
     """/health 의 limits — 지금 걸린 동시 한도 셋과 출처(file · env). 모듈을 못 붙였으면 빈 사전(/health 는 늘 답한다)."""
     try:
@@ -8979,6 +9079,8 @@ def health() -> dict:
         "xhub_gate": _xhub_gate_health(),
         # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
         "core_vocab": _core_vocab_health(),
+        # 실사용 질문 모으기(기본 꺼짐) — 켜졌나 · 창 · 적은 수(HWAXPortal docs/request-1029 design-e5 E5-2)
+        "seat_questions": _seat_questions_health(),
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,

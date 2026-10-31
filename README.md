@@ -74,6 +74,10 @@ ChatDock (portal frontend)
   (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A
   graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
 
+- `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — real-use question collection for
+  the seat-choice baseline (shared secret; see "Seat-choice baseline" below). `/health.seat_questions`
+  `{collect, days, written, error, labelers}`.
+
 ## Run (dev)
 
 ```bash
@@ -619,6 +623,34 @@ keeps the draft. The main chat answer has no cap (portal decision D-6).
 the chat window (about 88,000 tokens on a 262,144 window). `CHAT_TOOL_SCHEMA_BUDGET` (estimated tokens) sets it to a fixed
 value instead; empty or 0 keeps the 45%. The default is unchanged on purpose (portal decision D-3) — compare 30,000 and
 40,000 on the box with the same 16 questions first. A smaller bundle means more `search_tools` → `invoke_tool` round trips.
+
+### Seat-choice baseline (portal docs/request-1029 design-e5 — E5-0 · E5-1 · E5-2 · E5-4)
+
+Measures who gets picked — deliberation first seats, thinking candidates and screening, the pinned expert's preferred
+tools — **with the engine's own functions**, before anything about seat choice changes (gate G0; user decision 10-31).
+Nothing here changes a seat, a tool or the "nobody owns this" outcome.
+
+- **Box place** — `SEAT_EVAL_DIR`, default the job ledger's sibling `seat-eval/` (`<realpath(ARTIFACT_DIR)>/../seat-eval`,
+  outside the repo). Sub-folders `sets/` (eval sets), `runs/` (window records), `questions/` (real-use questions and
+  labels), `shadow/` (shadow log). Folders 0700, files 0600. `conftest.py` points it at a temp dir for every test.
+- **Shared secret** for the windows below (`seat_box`): the `Authorization` value of the gateway connection in `MCP_CONFIG`
+  (`Bearer <GW_TOKEN>` — the portal's `GATEWAY_SHARED_TOKEN`, the same form as the gateway's `/search-eval`). No secret →
+  503, wrong → 401. Not loopback-only like `/drain` · `/limits`: they hand out question text or call AIDataHub hundreds of times.
+- **Real-use questions (E5-2, off by default)** — `SEAT_QUESTIONS_COLLECT=1` on the box (the user's permission comes first,
+  like the tool-search query collection) records the first utterance of a pinned-expert chat, thinking questions, the
+  topic of a deliberation whose seats a person picked (web `delib_opts.personas` · MCP `deliberate_start(personas)`) and
+  `/전문가` queries into `questions/q-YYYY-MM-DD.jsonl`: date, source, the text with e-mails · uuids · long hex ids
+  (conversation ids) · phone numbers · the caller's e-mail name parts removed, and the experts the person picked. No time,
+  user or conversation. Day files older than `SEAT_QUESTIONS_DAYS` (60) are deleted. `GET /seat-questions?src=&by=&limit=&offset=`
+  (the labeling screen's feed — never ranks, scores, current seats or the picked experts; short, non-standalone and
+  near-duplicate (3-gram Jaccard ≥ 0.8) questions are only counted; sources interleaved; `mine` is the given labeler's
+  label, others only as a count), `POST /seat-questions/label {qid, by, primary (1–3) | none (core_data · out_of_pool) |
+  unsure, also (0–5), via {key: tree|search}, memo, remove?}` (kept with the question text in `questions/labels.jsonl` —
+  the H set outlives the 60 days), `POST /seat-questions/ingest {items: [{src, text, ts?, picked?}]}` (the portal's
+  backfill of the last 60 days; fields that point at a person or a conversation are refused). Who labels is a human
+  decision — `SEAT_QUESTIONS_LABELERS` (comma list; empty = anyone) names the accepted `by` values.
+
+Tests: `tests/test_seat_questions.py`.
 
 ### Images (portal docs/chat-depth-context T5)
 

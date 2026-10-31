@@ -525,6 +525,14 @@ async def deliberate_start(
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
                            owner_aff=_caller_view(ctx)[1])
+    if personas:
+        # 사람이 좌석을 고른 심의의 화두 — 전문가 고르기 기준선 H 의 재료(기본 꺼짐 · 사람 · 잡은 적지 않는다, HWAXPortal docs/request-1029 design-e5 E5-2)
+        try:
+            import seat_questions  # noqa: PLC0415
+            seat_questions.note("delib", question, user=user,
+                                picked=[k for k in (_engine._seat_key(p) for p in personas) if k])
+        except Exception:  # noqa: BLE001 — 모으기가 심의 시작을 막지 않는다
+            pass
     out = delib_jobs.summary(rec)
     out["caller"] = user or "(서비스 계정 — 게이트웨이가 신원 헤더를 안 보냈다)"
     out["note"] = (_queued_note(out["queue"]) if out.get("queue") else
