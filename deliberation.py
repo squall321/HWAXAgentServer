@@ -3478,6 +3478,29 @@ def envelope_failed(s) -> bool:
     return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
 
+def _envelope_no_evidence(s) -> bool:
+    """웹 리서치 3상태 봉투가 '근거 없음' 을 말하는가 — data.status 가 blocked · empty, 또는 degraded 인데 results 가 0건.
+
+    웹 리서치 앱(WebResearchMCP app/errors.py)은 결과의 상태를 맨 위가 아니라 data 에 싣는다 —
+    `{ok, data:{status, results, note, egress}, errors, warnings}`. 차단 · 빈 결과도 맨 위는 ok:true · errors [] 라
+    envelope_failed 는 이 봉투를 실패로 보지 않는다. 실패가 아니니 맞다(챗에 실패 배지를 달 일이 아니고, 좌석에게는
+    '차단은 없음이 아니다' 는 경고째 간다). 다만 **근거로 세면 안 된다** — 세면 근거 프로파일의 '도구 조회' 가 올라 실측
+    데이터 0건인 심의가 '가설 단계' 표지 없이 측정에 기댄 꼴로 나간다(HWAXPortal docs/web-research P6). 세는 자리(지정 도구 ·
+    챗이 넘긴 근거 · 좌석 자유 조회)가 이 판정으로 거른다.
+    results 가 목록이 아니면 3상태 봉투가 아니다 — 다른 앱의 data.status 는 판정하지 않는다(모르는 꼴은 종전대로 센다)."""
+    if not isinstance(s, str) or not s.strip():
+        return False
+    try:
+        v = json.loads(s)
+    except (ValueError, TypeError):
+        return False
+    data = v.get("data") if isinstance(v, dict) else None
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        return False
+    status = str(data.get("status") or "").lower()
+    return status in ("blocked", "empty") or (status == "degraded" and not data["results"])
+
+
 def _tool_schema_brief(t) -> str:
     """도구 args 스키마를 LLM 인자 구성 프롬프트용 요약으로 — MCP 어댑터의 JSON 스키마 dict 만
     (pydantic 모델이면 빈 문자열 — 설명만으로 구성 시도).
@@ -5249,6 +5272,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         _tool_refused = []                    # 리스크 심사에 지정된 등록부·앞 패널 기록 도구 — 부르지 않는다(D-18)
+        _tool_noev = []                       # 웹 리서치의 차단 · 빈 결과를 돌려준 도구 — 좌석에는 싣되 근거로 세지 않는다
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
@@ -5318,7 +5342,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _head = f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
                 _got.append((_head, _good))
                 _used.append(_tn)
-                ev_count["tool"] += 1
+                # 웹 리서치의 차단 · 빈 결과 — 좌석에는 '차단은 없음이 아니다' 는 경고째 그대로 가되 근거로 세지 않는다(_envelope_no_evidence).
+                if _envelope_no_evidence(_good):
+                    _tool_noev.append(_tn)
+                else:
+                    ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
@@ -5358,8 +5386,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    f"지정 도구 결과 {len(_tcut)}건이 도구 하나의 상한({_tchunk:,}자)을 넘어 "
                                    f"앞 {_tchunk:,}자까지만 좌석에 실었다")
                                   + " — 줄인 것: " + ", ".join(_tcut) + ". 뒷부분의 수치는 좌석이 보지 못했다.")
-            yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
-                                  "tools_used": _used})
+            yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used) - len(_tool_noev)}건"
+                                          + (f" · 웹 리서치 차단 · 빈 결과 {len(_tool_noev)}건({', '.join(_tool_noev)})은 "
+                                             "좌석에 싣되 근거로 세지 않았다" if _tool_noev else ""),
+                                  "tool": None, "tools_used": _used})
 
     # 1) 발굴 — recommend_agents. 이어하기(continue_personas)는 이전 전문가를 유임시키되,
     #    사람 의견이 주제를 옮겼을 수 있으므로 실효 질문으로 재심사해 신규 좌석을 더한다(F10).
@@ -5682,7 +5712,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _cut_lines.append(f"[e:{_ei}{'|' + _e['key'] if _e.get('key') else ''}] {_src}: "
                                   f"원문 {_cut_len:,}자 · {_cut_what}")
             yield _delib("evidence", source=f"챗 정리 · {_src}", text=_shown, included=True)
-            ev_count["tool"] += 1
+            if not _envelope_no_evidence(_res):      # 웹 리서치의 차단 · 빈 결과는 좌석에 싣되 근거로 세지 않는다
+                ev_count["tool"] += 1
         # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
         if _dropped:
             yield _delib("evidence", source="사전 근거 예산 초과",
@@ -6010,7 +6041,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                               "detail": _ap, "ok": _ok,
                                               **({"call": _cid} if _cid else {})})
                         if _ok and _out.strip() not in ("[]", "{}", "null", ""):
-                            ev_count["tool"] += 1
+                            # 웹 리서치의 차단 · 빈 결과 — 카드 · 공용 풀에는 그대로 가되(같은 검색을 되풀이하지 않게) 근거로 세지 않는다.
+                            if not _envelope_no_evidence(_out):
+                                ev_count["tool"] += 1
                             yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:_FREE_EVID_SHOW],
                                          included=True, tool=_tn, args=_ap,
                                          **({"call": _cid} if _cid else {}))
