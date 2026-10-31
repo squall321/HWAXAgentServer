@@ -694,17 +694,23 @@ def _write_list(job: dict, st: os.stat_result) -> None:
     tmp.replace(_list_path(job["id"]))
 
 
+# 이 프로세스가 마지막으로 쓴 원장의 도장(잡 id → (mtime_ns, 크기)) — 끝 쓰기가 그 뒤에 다른 프로세스가 원장을 고쳤는지 본다(_closed_elsewhere).
+_WROTE: dict[str, list] = {}
+
+
 def _persist(job: dict) -> None:
     """재기동 뒤에도 결과를 회수할 수 있게 파일로 남긴다. 실패해도 심의는 계속 간다.
 
-    원장을 쓴 다음 그 원장의 도장을 담아 목록 색인을 쓴다(_list_load)."""
+    원장을 쓴 다음 그 원장의 도장을 담아 목록 색인을 쓴다(_list_load). 그 도장은 이 프로세스가 쓴 판으로 적어 둔다(_WROTE)."""
     try:
         JOB_DIR.mkdir(parents=True, exist_ok=True)
         tmp = _path(job["id"]).with_suffix(".json.tmp")
         tmp.write_text(json.dumps(job, ensure_ascii=False, indent=1), encoding="utf-8")
         _chmod_quiet(tmp, _LEDGER_MODE)
         tmp.replace(_path(job["id"]))
-        _write_list(job, _path(job["id"]).stat())
+        st = _path(job["id"]).stat()
+        _WROTE[job["id"]] = _stamp(st)
+        _write_list(job, st)
     except OSError as exc:
         log.warning("잡 기록 실패 %s: %r", job.get("id"), exc)
 
@@ -717,15 +723,25 @@ def _load(job_id: str) -> dict | None:
 
 
 def _closed_elsewhere(job: dict) -> bool:
-    """도는 잡의 끝 쓰기 전에 본다 — 원장이 더는 이 프로세스가 띄운 running 이 아니면(다른 프로세스의 재기동 정리가 interrupted 로 닫았고 그 위에
+    """도는 잡의 끝 쓰기 전에 본다 — 이 프로세스가 마지막으로 쓴 뒤 다른 프로세스가 원장을 고쳤으면(재기동 정리가 interrupted 로 닫았고 그 위에
     이어하기가 resumed_by 를 적었을 수 있다) 참. 그때 끝 쓰기(_drive · _settle · shutdown)는 원장을 덮지 않고 시작 인자 파일 · 진행 일지도 두며
-    그렇다고 적는다(HA-09 S0 반대 검토 10-31 — 재기동이 겹치면 옛 프로세스의 끝 쓰기가 resumed_by 를 지워 이어하기가 한 번 더 받아졌다). 도는
-    동안 원장은 띄울 때(_launch) 한 번만 쓰므로 이 프로세스만 쓴 원장이면 늘 running 이다. 원장이 없거나 못 읽으면 거짓(종전처럼 쓴다)."""
-    rec = _list_load(_path(job["id"]))
-    if not rec or rec.get("status") == "running":
+    그렇다고 적는다(HA-09 S0 반대 검토 10-31 — 재기동이 겹치면 옛 프로세스의 끝 쓰기가 resumed_by 를 지워 이어하기가 한 번 더 받아졌다). 판정은
+    원장 파일의 도장(mtime_ns · 크기)이 이 프로세스가 쓴 그대로인가다 — 상태로 보면 이 프로세스가 내려가며 먼저 쓴 interrupted(shutdown 의 늦은
+    길) 위에 남이 resumed_by 를 적은 것을 가르지 못한다. 이 프로세스가 쓴 적이 없는 잡(시험이 _drive 를 바로 부른다)은 running 이면 제 것이다.
+    원장이 없거나 못 읽으면 거짓(종전처럼 쓴다)."""
+    p = _path(job["id"])
+    try:
+        st = p.stat()
+    except OSError:
         return False
-    log.warning("[delib-job %s] 원장을 다른 프로세스가 이미 %s 로 닫았다%s — 이 프로세스의 끝(%s)은 원장에 쓰지 않는다(재기동이 겹쳤다)",
-                job["id"], rec.get("status"), f"(이어 돈 잡 {rec['resumed_by']})" if rec.get("resumed_by") else "", job.get("status"))
+    wrote = _WROTE.get(job["id"])
+    if wrote is not None and _stamp(st) == wrote:
+        return False
+    rec = _list_load(p)
+    if not rec or (wrote is None and rec.get("status") == "running"):
+        return False
+    log.warning("[delib-job %s] 원장을 다른 프로세스가 고쳤다(%s%s) — 이 프로세스의 끝(%s)은 원장에 쓰지 않는다(재기동이 겹쳤다)",
+                job["id"], rec.get("status"), f" · 이어 돈 잡 {rec['resumed_by']}" if rec.get("resumed_by") else "", job.get("status"))
     return True
 
 
@@ -1112,10 +1128,11 @@ async def _drive(job: dict, gen) -> None:
         job["updated_at"] = job["finished_at"]
         if job["status"] == "running":
             job["status"] = "error" if job.get("error") else "done"
-        if not _closed_elsewhere(job):      # 다른 프로세스가 이미 닫은 원장(재기동이 겹쳤다)은 덮지 않는다 — 시작 인자 파일 · 진행 일지도 그쪽 것이다
+        if not _closed_elsewhere(job):      # 다른 프로세스가 이미 고친 원장(재기동이 겹쳤다)은 덮지 않는다 — 시작 인자 파일 · 진행 일지도 그쪽 것이다
             _persist(job)
             if job["status"] != "interrupted":
                 _drop_args(job["id"])       # 시작 인자 파일 · 진행 일지 — 원장을 쓴 **다음** 지운다(그 사이에 죽으면 원장이 끝난 잡이라 접지 않는다)
+        _WROTE.pop(job["id"], None)        # 끝 쓰기 뒤에는 이 프로세스가 이 원장을 다시 쓰지 않는다(이어하기 표지는 새 잡의 일이다)
         _TASKS.pop(job["id"], None)
         _prune()
         _pump()      # 자리가 났다 — 끝났든 접혔든 터졌든. 상태를 바꾼 **같은 걸음에서** 넘겨준다

@@ -352,9 +352,13 @@ _OTHER = "default-20261031-000000-이은잡"
 
 
 def _closed_by_other(job: dict) -> None:
-    """다른 프로세스가 쓴 꼴 — 재기동 정리가 끊긴 잡으로 닫고 이어하기가 표지를 적은 원장(같은 자리)."""
-    delib_jobs._persist({**_on_disk(job), "status": "interrupted", "error": delib_jobs.INTERRUPTED_MSG, "resumed_by": _OTHER,
-                         "finished_at": delib_jobs._now()})
+    """다른 프로세스가 쓴 꼴 — 재기동 정리가 끊긴 잡으로 닫고 이어하기가 표지를 적은 원장(같은 자리). 이 프로세스의 _persist 를 거치지 않는다
+    (다른 프로세스의 쓰기는 이 프로세스의 기억에 없다) — 원장과 목록 색인을 그 꼴로 바로 쓴다."""
+    rec = {**_on_disk(job), "status": "interrupted", "error": delib_jobs.INTERRUPTED_MSG, "resumed_by": _OTHER,
+           "finished_at": delib_jobs._now()}
+    f = delib_jobs._path(job["id"])
+    f.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    delib_jobs._write_list(rec, f.stat())
 
 
 def test_다른_프로세스가_닫은_원장은_잡이_끝나도_덮지_않는다(eng, monkeypatch):
@@ -406,6 +410,46 @@ def test_내려갈_때도_다른_프로세스가_닫은_원장은_덮지_않는�
         delib_jobs.closing(False)
     rec = _on_disk(a)
     assert (rec["status"], rec.get("resumed_by")) == ("interrupted", _OTHER), "잡의 finally 가 남의 원장을 덮었다"
+
+
+def test_내려가며_먼저_쓴_원장은_제_것이라_잡의_finally_가_마저_쓴다(eng, monkeypatch, caplog):
+    """겹치지 않은 보통 재기동 — shutdown 의 늦은 길이 먼저 interrupted 를 쓰고, 그 뒤 잡의 finally 가 마지막 메모리 상태를 쓴다. 원장의 상태만
+    보면 그 interrupted 를 남이 닫은 것으로 읽어 마지막 쓰기를 빼고 '다른 프로세스' 경고를 남긴다 — 이 프로세스가 쓴 도장으로 가른다."""
+    _caps(monkeypatch, 2)
+    release = {}
+
+    async def slow_entry(_app, q, groups, opts, user_email, user_pat, _x, **_k):
+        for c in _rounds_script():
+            yield c
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            release["ev"] = asyncio.Event()
+            try:
+                await asyncio.wait_for(release["ev"].wait(), 5)
+            except asyncio.TimeoutError:
+                pass
+            raise
+    monkeypatch.setattr(d, "run_deliberation", slow_entry)
+    seen = {}
+
+    async def scenario():
+        a = _start("가", ME)
+        await _tick()
+        assert await delib_jobs.shutdown(wait_s=0.05) == 1
+        seen["late"] = delib_jobs._path(a["id"]).stat().st_mtime_ns
+        await asyncio.sleep(0.01)
+        release["ev"].set()
+        await _tick()
+        return a
+    try:
+        with caplog.at_level("WARNING", logger=delib_jobs.log.name):
+            a = _play(scenario)
+    finally:
+        delib_jobs.closing(False)
+    assert delib_jobs._path(a["id"]).stat().st_mtime_ns != seen["late"], "잡의 finally 가 제 원장을 마저 쓰지 않았다"
+    assert _on_disk(a)["status"] == "interrupted"
+    assert not [r for r in caplog.records if "다른 프로세스" in r.getMessage()], "제가 쓴 원장을 남의 것으로 읽었다"
 
 
 def test_종료_신호를_받는_그_자리에서_줄을_닫는다(monkeypatch):
