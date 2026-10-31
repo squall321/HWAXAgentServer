@@ -1,4 +1,4 @@
-# 재기동 넘기기(HA-09 S0 · S1 · S2) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 같은 잡을 끊긴 라운드의 이미 말한 좌석 뒤부터 잇는지 본다
+# 재기동 넘기기(HA-09 S0 · S1 · S2 · S3) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데 · 보고서 단계에서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 같은 잡을 끊긴 자리부터 잇는지(이미 말한 좌석 · 저장한 보고서는 다시 하지 않는지) 본다
 #
 # 왜 생겼나. 원장은 잡을 띄울 때와 끝날 때만 썼다. 재기동(TERM)에서는 uvicorn 0.49 가 정상 종료를 마친 뒤 같은 신호를 다시 올려
 # 프로세스가 그 자리에서 끝나므로 잡 태스크의 finally(원장 쓰기)가 돌지 않았고, 열린 SSE 가 하나라도 있으면 그 연결이 닫힐 때까지(상한
@@ -100,8 +100,10 @@ def _stop(proc: subprocess.Popen) -> None:
 class _Stack:
     """가짜 LLM · 가짜 게이트웨이(시험 내내 하나) + 에이전트 서버(시험이 띄우고 내린다)."""
 
-    def __init__(self, tmp: Path):
+    def __init__(self, tmp: Path, ra: bool = False):
         self.tmp, self.procs, self.agents = tmp, [], []
+        # ra — 가짜 게이트웨이에 보고서 · 위키 도구를 싣고 받은 호출을 calls 에 적는다. hold 파일({도구: 초})의 도구는 적은 뒤 붙잡힌다(HA-09 S3)
+        self.calls, self.hold = tmp / "gw-calls.jsonl", tmp / "gw-hold.json"
         self.base_env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
                          "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
         self.pid9009 = _listener_pid(9009)
@@ -109,7 +111,8 @@ class _Stack:
         self.llm = f"http://127.0.0.1:{lp}"
         self._spawn([PY, str(ROOT / "tests" / "fakes" / "llm_server.py"), "--port", str(lp), "--ctx", "262144",
                      "--model", "fake-glm"], tmp / "fake-llm.log", f"{self.llm}/health")
-        gw = self._spawn([PY, str(ROOT / "tests" / "fakes" / "mcp_gateway.py"), "--port", str(gp)], tmp / "fake-gw.log")
+        gw = self._spawn([PY, str(ROOT / "tests" / "fakes" / "mcp_gateway.py"), "--port", str(gp),
+                          *(["--record", str(self.calls), "--hold", str(self.hold)] if ra else [])], tmp / "fake-gw.log")
         self._wait_port(gp, gw, tmp / "fake-gw.log")
         (tmp / "mcp.json").write_text(json.dumps({"gateway": {"url": f"http://127.0.0.1:{gp}/mcp",
                                                               "transport": "streamable_http"}}), encoding="utf-8")
@@ -167,14 +170,24 @@ class _Stack:
             _stop(p)
 
 
-@pytest.fixture
-def stack(tmp_path):
-    s = _Stack(tmp_path)
+def _stack_of(tmp_path, **kw):
+    s = _Stack(tmp_path, **kw)
     try:
         yield s
     finally:
         s.close()
         assert 9009 not in s.ports and _listener_pid(9009) == s.pid9009, "하네스가 떠 있는 에이전트 서버(9009)를 바꿨다"
+
+
+@pytest.fixture
+def stack(tmp_path):
+    yield from _stack_of(tmp_path)
+
+
+@pytest.fixture
+def stack_ra(tmp_path):
+    """보고서 · 위키 도구가 실린 가짜 게이트웨이(받은 호출을 적고, hold 파일의 도구는 붙잡는다)."""
+    yield from _stack_of(tmp_path, ra=True)
 
 
 def _mcp(base: str, tool: str, args: dict, user: str = ME) -> dict:
@@ -451,3 +464,87 @@ def test_내려가는_동안_자리가_나도_줄_선_잡은_띄우지_않고_�
     led = _ledger(jobs, jb)
     assert (led["status"], led.get("requeued")) == ("queued", 1), f"재기동 뒤 같은 차례로 다시 서지 않았다 — {led.get('status')}"
     assert _mcp(base2, "deliberate_status", {"job_id": jb})["status"] == "queued"
+
+
+# ── 결정문 뒤(HA-09 S3) — 보고서를 저장한 뒤 · 저장하던 중에 끊겼으면 ─────────────────────────────────────────
+def _calls(stack: _Stack, tool: str) -> list:
+    try:
+        rows = [json.loads(x) for x in stack.calls.read_text(encoding="utf-8").splitlines() if x]
+    except FileNotFoundError:
+        return []
+    return [r for r in rows if r["tool"] == tool]
+
+
+def _wait_call(stack: _Stack, tool: str, n: int = 1, timeout_s: float = 90.0) -> None:
+    """가짜 게이트웨이가 그 도구 호출을 n 번 받을 때까지 — 받은 호출은 답하기 전에 적힌다(붙잡힌 호출도 적힌다)."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if len(_calls(stack, tool)) >= n:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"{tool} 호출이 {timeout_s:.0f}초 안에 {n}번 오지 않았다")
+
+
+_POST_START = {**START, "save_report": True, "wiki": True}
+
+
+def test_KILL_로_보고서를_저장한_뒤_위키를_보내던_중에_죽어도_이으면_다시_저장하지_않고_같은_번호로_맺는다(stack_ra):
+    """결정문 뒤 멱등(HA-09 S3 — 설계 A6 S3) — 보고서를 저장한 뒤 · 결과 사건 전(위키 호출이 붙잡힌 채)에 KILL. 다시 뜨면 이어하기가 같은 잡을
+    LLM 호출 0 · 보고서 저장 0 으로 맺는다 — 번호는 끊기기 전의 것이고, 위키는 같은 원천 열쇠로 한 번 더 간다(보내던 중이었다 — MX 백서가 앞의
+    원천으로 받는다)."""
+    stack = stack_ra
+    jobs = stack.tmp / "jobs"
+    base, proc, _log = stack.agent(jobs, "a")
+    stack.hold.write_text(json.dumps({"wiki_submit_source": 120}), encoding="utf-8")
+    stack.llm_delay(FAST_S)
+    jid = _mcp(base, "deliberate_start", _POST_START)["job_id"]
+    _wait_call(stack, "wiki_submit_source")
+    assert [c["rid"] for c in _calls(stack, "create_report_draft")] == [77], "시험 전제 — 보고서를 한 번 저장한 뒤 위키에서 붙잡혔다"
+    proc.kill()
+    assert proc.wait(timeout=10) == -signal.SIGKILL
+    stack.hold.unlink()
+    base2, _p2, _log2 = stack.agent(jobs, "b")
+    st = _mcp(base2, "deliberate_status", {"job_id": jid})
+    sr = st["resume"]["seat_resume"]
+    assert (st["status"], st["stage"], sr["ok"], sr["round"], sr["todo"]) == ("interrupted", "report", True, ROUNDS + 1, []), st
+    stack.llm_delay(FAST_S)                      # 호출 수를 0 으로 — 이은 실행이 LLM 을 부르면 센다
+    out = _mcp(base2, "deliberate_continue", {"previous_job_id": jid})
+    assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place", out
+    done = _wait(base2, jid)
+    assert [c["rid"] for c in _calls(stack, "create_report_draft")] == [77], "이미 저장한 보고서를 다시 저장했다"
+    assert (done["status"], done["report_id"], len(done["attempts"])) == ("done", 77, 1), done
+    assert stack.llm_stats()["calls"] == 0, "끝난 의장 · 요약 · 쉬운 설명을 다시 불렀다"
+    assert [c["ref"] for c in _calls(stack, "wiki_submit_source")] == [f"delib:{jid}:default"] * 2, "위키를 다른 열쇠로 보냈다"
+    assert "보고서는 끊기기 전에 저장돼(#77) 다시 저장하지 않는다" in out["note"], out["note"]
+    led = _ledger(jobs, jid)
+    assert "보고서 #77 로 저장됨" in led["decision"] and not [w for w in led.get("warnings") or [] if "끝났는지 알 수 없어" in w]
+    assert not (jobs / "journal" / f"{jid}.jsonl").exists() and not (jobs / "args" / f"{jid}.json").exists()
+
+
+def test_TERM_으로_보고서를_저장하던_중에_내려가면_이을_때_경고_한_번과_함께_새로_저장한다(stack_ra):
+    """보고서 저장 호출이 붙잡힌 채 TERM — 내려가며 잡을 접는다(취소는 저장의 예외 그물에 걸리지 않는다 — 저장을 마쳤다는 줄이 없다). 이으면
+    RA 가 받았는지 알 길이 없어 경고 한 번과 함께 새로 저장한다(새 번호). 의장 · 요약 · 쉬운 설명은 다시 부르지 않는다."""
+    stack = stack_ra
+    jobs = stack.tmp / "jobs"
+    base, proc, _log = stack.agent(jobs, "a")
+    stack.hold.write_text(json.dumps({"create_report_draft": 120}), encoding="utf-8")
+    stack.llm_delay(FAST_S)
+    jid = _mcp(base, "deliberate_start", _POST_START)["job_id"]
+    _wait_call(stack, "create_report_draft")
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=stack.stop_grace) == -signal.SIGTERM
+    disk = _ledger(jobs, jid)
+    assert (disk["status"], disk["stage"], disk["seat_resume"]["round"]) == ("interrupted", "report", ROUNDS + 1), disk.get("error")
+    stack.hold.unlink()
+    base2, _p2, _log2 = stack.agent(jobs, "b")
+    stack.llm_delay(FAST_S)
+    out = _mcp(base2, "deliberate_continue", {"previous_job_id": jid})
+    assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place", out
+    done = _wait(base2, jid)
+    assert stack.llm_stats()["calls"] == 0, "끝난 의장 · 요약 · 쉬운 설명을 다시 불렀다"
+    led = _ledger(jobs, jid)
+    assert len([w for w in led.get("warnings") or [] if "끝났는지 알 수 없어" in w]) == 1, led.get("warnings")
+    assert (done["status"], done["report_id"]) == ("done", 78), done
+    assert [c["rid"] for c in _calls(stack, "create_report_draft")] == [77, 78]
+    assert "이미 저장됐을 수 있다" in out["note"], out["note"]
+    assert "보고서 #78 로 저장됨" in led["decision"] and len(_calls(stack, "wiki_submit_source")) == 1

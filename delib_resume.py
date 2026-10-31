@@ -20,6 +20,16 @@
   e:raw       좌석 하나가 말한 직후, turn 사건을 내기 **전** — 원 출력(JSON 칸 전부). 끊긴 라운드에서 이 줄이 있는 좌석은 다시 부르지
               않는다 — 나머지(아직 안 함 · 실패)만 부른다(S2).
   e:round_end 라운드 r 끝 — 유실 좌석. 이 줄이 있는 라운드만 끝난 라운드로 되살린다(그 라운드의 사건은 모두 이 줄 앞에 적혔다).
+  결정문 뒤(S3 — 전 라운드가 끝난 뒤에만 적히고, 전 라운드를 되살릴 때만 읽는다. 줄 하나가 그 단계가 끝났다는 표지다 — 그 단계의 사건은 모두
+  그 줄 앞에 적혔다. 없으면 그 단계를 아직 하지 않은 것이다).
+  e:decision  의장 결정문이 나온 뒤 — 결정문(의장이 못 냈으면 회의록 보존 글) · 의장 실패 표지(failed · knob · cause). 있으면 의장을 다시
+              부르지 않는다.
+  e:plain     핵심 요약 · 쉬운 설명을 붙인 뒤 — 쉬운 설명 · 그것까지 붙인 결정문. 있으면 요약 · 쉬운 설명을 다시 부르지 않는다.
+  e:report_intent  Report Archive 호출 직전 — 저장하나(save) · 붙일 보고서 번호(append_to) · 제목 · 저장할 결정문(웹 인용 · 수치 대조까지 붙인
+              것). 이 줄만 있으면 저장 도중 끊긴 것이라 이미 저장됐을 수 있다 — 이으면 경고 한 번과 함께 새로 저장한다(RA 에 멱등 열쇠가 없다).
+  e:report_saved   보고서 단계 뒤 — 받은 번호(rid) · 결정문 끝에 붙는 안내(note). 있으면 다시 저장하지 않고 그 번호를 쓴다.
+  e:wiki_sent 위키 단계 뒤(켠 심의만) — 결정문 끝에 붙는 안내(note). 있으면 다시 보내지 않는다. 원천 열쇠는 적지 않는다 — 잡 id 에서
+              정해져(delib:<잡 id>:<틀>) 같은 잡을 잇는 한 늘 같다(보내던 중에 끊겨 다시 보내도 MX 백서가 같은 원천으로 받는다).
   e:resume_off 상한 · 꼴 때문에 엔진 줄을 멈췄다 — 그 잡의 이어하기는 요약으로 간다.
 """
 from __future__ import annotations
@@ -30,8 +40,11 @@ import json
 from pathlib import Path
 
 # 재개 자료의 꼴 번호 — 줄 꼴(위)을 바꾸는 커밋이 올린다. 일지 머리(rv)와 다르면 되살리지 않고 요약으로 잇는다.
-RESUME_SCHEMA = 1
+# 2 — 결정문 뒤 줄(S3). 그 줄이 없으면 '그 단계를 아직 하지 않았다' 로 읽으므로, 그 줄을 쓰지 않던 판(1)의 일지는 그렇게 읽을 수 없다.
+RESUME_SCHEMA = 2
 STAGE = "main"                 # 이 판이 되살리는 단 — 한 단 심의(run_deliberation). 해석 설계 · 구축 계획(sim-*) · 시험 설계(tp)는 S4
+# 결정문 뒤 줄 — 엔진이 적는 차례다(이 차례로 옮겨 적는다).
+POST = ("e:decision", "e:plain", "e:report_intent", "e:report_saved", "e:wiki_sent")
 
 
 def _engine_rev() -> str:
@@ -163,10 +176,11 @@ class Tracker:
 class StageData:
     """한 단을 되살릴 상태 — 엔진 갈고리가 읽는다. pre 는 e:pre 줄 그대로, rounds 는 되살릴 끝난 라운드 r → {cur, gather, lost}.
     cut 은 끊긴 라운드(끝난 라운드 다음 — 라운드 수 안일 때만, 아니면 None) {r, gather, raw} 다(S2). gather 는 그 라운드의 e:gather(조회가
-    끝나기 전에 끊겼으면 None — 조회를 다시 한다), raw 는 끊기기 전에 말한 좌석의 원 출력이다(일지 순서 = 그 라운드에서 끝난 순서)."""
+    끝나기 전에 끊겼으면 None — 조회를 다시 한다), raw 는 끊기기 전에 말한 좌석의 원 출력이다(일지 순서 = 그 라운드에서 끝난 순서).
+    post 는 결정문 뒤의 끝난 단계(S3) — 줄 종류(POST) → 그 줄. 전 라운드를 되살릴 때만 찬다."""
 
-    def __init__(self, pre: dict, rounds: dict, info: dict, cut: dict | None = None):
-        self.pre, self.rounds, self.info, self.cut = pre, rounds, info, cut
+    def __init__(self, pre: dict, rounds: dict, info: dict, cut: dict | None = None, post: dict | None = None):
+        self.pre, self.rounds, self.info, self.cut, self.post = pre, rounds, info, cut, post or {}
 
     def round(self, r: int):
         return self.rounds.get(r)
@@ -203,7 +217,7 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         return None, "진행 일지의 머리가 이 잡 · 이 판의 꼴이 아니다"
     if head.get("rv") != RESUME_SCHEMA:
         return None, f"재개 자료의 꼴이 이 판과 다르다(일지 {head.get('rv')} · 이 판 {RESUME_SCHEMA})"
-    pre, gather, raws, ended = None, {}, {}, {}
+    pre, gather, raws, ended, post = None, {}, {}, {}, {}
     for ln in lines[1:]:
         rec = _rec(ln)
         if rec is None:
@@ -214,9 +228,12 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         if not (isinstance(k, str) and k.startswith("e:")) or rec.get("sk") != STAGE:
             continue
         if k == "e:pre":
-            pre, gather, raws, ended = rec, {}, {}, {}
+            pre, gather, raws, ended, post = rec, {}, {}, {}, {}
             continue
         if pre is None:
+            continue
+        if k in POST:                     # 결정문 뒤 줄(S3) — 라운드 번호가 없다
+            post[k] = rec
             continue
         try:
             r = int(rec.get("r"))
@@ -258,7 +275,18 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         spoken = list(craw)
         cutd = {"r": cut, "gather": gather.get(cut), "raw": [x["o"] for x in craw.values()]}
         carry += ([gather[cut]] if cut in gather else []) + list(craw.values())
+    # 결정문 뒤(S3) — 그 줄은 전 라운드가 끝난 뒤에만 적힌다. 전 라운드를 되살릴 때만 쓰고 새 일지에 옮겨 쓴다 — 이은 실행이 또 끊겨도 끝난
+    # 단계(저장한 보고서 번호 · 보낸 위키)가 남는다.
+    post = post if k == n else {}
+    carry += [post[x] for x in POST if x in post]
+    sav, it = post.get("e:report_saved"), post.get("e:report_intent") or {}
     info = {"sk": STAGE, "round": cut, "restored": k, "total": n, "spoken": spoken,
             "todo": [s for s in seats if s not in spoken] if k < n else [], "gathered": cut in gather if k < n else False,
-            "eng_changed": bool(head.get("eng")) and head.get("eng") != ENGINE, "ctx": pre.get("ctx")}
-    return Resume(job_id, {STAGE: StageData(pre, rounds, info, cutd)}, carry, info, list(pre["groups"])), ""
+            "eng_changed": bool(head.get("eng")) and head.get("eng") != ENGINE, "ctx": pre.get("ctx"),
+            # 응답 안내에 싣는 결정문 뒤 단계 — report 는 saved(저장했다) · intent(저장 도중 끊겼다 — 이미 저장됐을 수 있다) · "" 다
+            "post": {"decision": "e:decision" in post, "chair_failed": bool((post.get("e:decision") or {}).get("failed")),
+                     "plain": "e:plain" in post, "wiki": "e:wiki_sent" in post,
+                     "report": "saved" if sav else "intent" if it.get("save") else "",
+                     "report_id": sav.get("rid") if sav else None, "append_to": it.get("append_to") or 0,
+                     "title": it.get("title") or ""}}
+    return Resume(job_id, {STAGE: StageData(pre, rounds, info, cutd, post)}, carry, info, list(pre["groups"])), ""

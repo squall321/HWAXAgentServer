@@ -5121,16 +5121,31 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
 
 
 def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: str, free_pool: dict, looks: bool) -> list:
-    """되살린 단계의 알림(HA-09 S1 · S2 A5.5) — 상태줄 한 줄과 카드 한 장. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
+    """되살린 단계의 알림(HA-09 S1 · S2 · S3 A5.5) — 상태줄 한 줄과 카드 한 장. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
     조회가 끊기기 전의 것이라는 것, 끊긴 라운드(cutd — 라운드 수가 같을 때만 있다)에서 끊기기 전에 말한 좌석은 다시 부르지 않고 나머지만 부른다는
-    것과 그 라운드의 조회를 다시 하는지(looks — 지금 엔진이 그 라운드에서 자유 조회를 하는가), 그리고 끊기기 전과 다른 것(화두 블록 지문 · 엔진 판 ·
+    것과 그 라운드의 조회를 다시 하는지(looks — 지금 엔진이 그 라운드에서 자유 조회를 하는가), 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 요약 · 쉬운
+    설명 · 보고서 · 위키)를 다시 하지 않는다는 것과 저장 도중 끊긴 보고서는 새로 저장한다는 것, 그리고 끊기기 전과 다른 것(화두 블록 지문 · 엔진 판 ·
     모델 창 · 사라진 조회 도구 · 라운드 수)이 있으면 그것까지 — 막지 않는다(남은 좌석은 지금 것으로 말한다)."""
     pre, info = rsv.pre, rsv.info
     n, ro, n_seats = int(opts.rounds), int(getattr(opts, "rounds_so_far", 0) or 0), len(seats)
     spoken = [o["persona"] for o in cutd["raw"]] if cutd is not None else []
     todo = [s for s in seats if s not in spoken]
     _ks = lambda xs: ", ".join(xs[:4]) + (" …" if len(xs) > 4 else "")     # noqa: E731 — 좌석 이름은 넷까지(원장 카드는 앞 400자만 싣는다)
-    if k >= n:
+    # 결정문 뒤(S3) — 엔진과 같은 조건(전 라운드를 되살렸을 때)에서만 끝난 단계를 말한다
+    post = rsv.post if k >= n else {}
+    sav, it = post.get("e:report_saved"), post.get("e:report_intent")
+    redo = bool(it and it["save"] and not sav)          # 저장 도중 끊겼다 — 새로 저장한다(엔진이 경고 한 번)
+    if post:
+        if sav:
+            step = ("끊기기 전에 보고서 단계까지 끝났다 — 의장 · 보고서를 다시 하지 않고 "
+                    + ("결과만 낸다" if (post.get("e:wiki_sent") or not getattr(opts, "wiki", 0)) else "위키에 남기는 것부터 이어 간다"))
+        elif redo:
+            step = "끊기기 전에 결정문까지 나왔고 보고서를 저장하던 중이었다 — 의장을 다시 부르지 않고 보고서를 새로 저장한다(이미 저장됐을 수 있다)"
+        elif it or post.get("e:plain"):
+            step = "끊기기 전에 결정문까지 나왔다 — 의장 · 요약 · 쉬운 설명을 다시 부르지 않고 보고서 단계부터 이어 간다"
+        else:
+            step = "끊기기 전에 의장 단계가 끝났다 — 의장을 다시 부르지 않고 요약 · 쉬운 설명부터 이어 간다"
+    elif k >= n:
         step = f"끊기기 전에 {n}라운드가 모두 끝났다 — 좌석을 다시 부르지 않고 의장 결정문부터 이어 간다"
     elif spoken:
         step = ((f"끊기기 전에 끝난 {k}라운드와 " if k else "끊기기 전의 좌석 · 근거 · 지식카드와 ")
@@ -5141,7 +5156,16 @@ def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: s
     else:
         step = f"끊기기 전의 좌석 · 근거 · 지식카드를 되살렸다 — {1 + ro}라운드부터 좌석 {n_seats}석을 부른다"
     # 카드는 끊긴 라운드부터 적는다 — 잡 원장은 카드 글을 앞 400자만 싣는다(delib_jobs.OMITTED_TEXT_MAX). 누구를 다시 부르는지가 먼저다.
+    # 결정문 뒤에서 끊겼으면 끝난 단계(다시 하지 않는 것)가 먼저다.
     cut_t = ""
+    if post:
+        cut_t = ((" 의장은 끊기기 전에 결정문을 내지 못했다 — 다시 부르지 않고 그대로 잇는다(끊지 않았다면 그렇게 끝났다 — 결정문은 이어하기로 "
+                  "받는다)." if post["e:decision"]["failed"] else
+                  " 의장 결정문" + (" · 요약 · 쉬운 설명" if post.get("e:plain") else "") + "은 끊기기 전의 것을 쓴다 — 다시 부르지 않았다.")
+                 + ((f" Report Archive 보고서는 끊기기 전에 저장돼(#{sav['rid']}) 다시 저장하지 않는다." if sav["rid"] else
+                     " 보고서 단계는 끊기기 전에 끝나 다시 하지 않는다.") if sav else
+                    " 보고서는 저장하던 중에 끊겨 이미 저장됐을 수 있다 — 새로 저장한다(같은 보고서가 둘이면 하나를 지운다)." if redo else "")
+                 + (" MX 백서 위키 단계도 끊기기 전에 끝나 다시 보내지 않는다." if post.get("e:wiki_sent") else ""))
     if cutd is not None:
         if spoken:
             cut_t = (f" 끊긴 {k + 1 + ro}라운드에서 끊기기 전에 말한 {len(spoken)}석({_ks(spoken)})은 다시 부르지 않고 원 출력으로 되살려 턴만 "
@@ -6788,11 +6812,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 마지막 라운드(수렴) 데이터 — 집계·tally 용
     last_list, last_t = rounds_data[-1]
 
+    # 결정문 뒤 되살리기(HA-09 S3) — 끊기기 전에 끝난 단계(일지 e:decision · e:plain · e:report_intent · e:report_saved · e:wiki_sent)는 다시
+    # 하지 않는다 — 의장 · 요약 · 쉬운 설명을 다시 부르지 않고, 저장한 보고서를 다시 저장하지 않고(받은 번호를 쓴다), 위키에 다시 보내지 않는다.
+    # 그 단계의 상태줄 · 카드 · 경고는 그 줄보다 먼저 적혀 원장에 이미 있어 다시 내지 않는다(단계 사건은 낸다 — 원장의 단계가 끊지 않은 실행과
+    # 같게 지나간다). 전 라운드를 되살렸을 때만 있다. 재개 상태가 없으면 다섯 다 None 이라 아래는 지금 길 그대로다.
+    _post = _rsv.post if (_rsv is not None and _rk == N) else {}
+    _rdec, _rpl, _rint, _rsav, _rwik = (_post.get(x) for x in delib_resume.POST)
+
     # 4) 의사결정문 합성
     for _c in _cred_notice():           # 마지막 라운드의 조회에서 거절됐으면 — 아래 근거 프로파일이 읽기 전에
         yield _c
     yield _delib("stage", stage="decide")
-    yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
+    if _rdec is None:
+        yield _sse("status", {"step": "의사결정문 합성 중", "tool": None})
     # 출처 태깅(DELIB_CHAIR_CITE) — 절충형 뭉개기(전 의견 나열 병합)를 가시화·감사 가능하게.
     cite_note = ("각 결정사항 항목 끝에 근거가 된 라운드 발언 출처를 [R2·페르소나키] 형식으로 표기하고, "
                  "어느 라운드에도 근거가 없는 항목은 [무근거] 로 표기하라. "
@@ -6848,7 +6880,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 줄인 것이 없다고 봤고, 카드가 나갈 때도 '몇 자 → 몇 자' 의 앞 숫자가 이미 끊은 뒤의 길이였다.
     _rcut = [f"{_dr(i + 1)}R {len(_full_t):,}자 → {len(x):,}자" + (f"(값당 {_vclip:,}자)" if _vclip else "")
              for i, ((_rows, _vclip, _full_t), x) in enumerate(zip(_chair, _rtexts)) if x != _full_t]
-    if _rcut:
+    if _rcut and _rdec is None:         # 결정문을 되살렸으면(S3) 이 카드는 의장을 부르기 전에 이미 원장에 실렸다
         # 줄였으면 화면과 잡 원장에 남긴다. 종전엔 의장만 알았다 — 읽는 사람은 결정문의 '생략된 좌석의
         # 입장은 반영하지 못했다' 한 줄로만 눈치챘고, MCP 호출자는 그마저 결정문을 다 읽어야 보였다.
         # 설정 이름은 화면 글(상태줄·카드)에 넣지 않고 knob 으로 따로 싣는다(사람 의견 카드와 같은 까닭).
@@ -6905,7 +6937,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 결정문 자리에 좌석별 마지막 입장과 실패 사유를 내리고, 아래 보고서 저장까지 간 뒤 error 로 끝낸다
     # (결정문이 없는 것을 done 으로 끝내면 정상 심의와 똑같이 생긴다).
     decision, _chair_failed, _chair_knob, _chair_exc = "", "", "", None
-    for _ctry in range(1 + _CHAIR_RETRIES):
+    for _ctry in range(0 if _rdec is not None else 1 + _CHAIR_RETRIES):
         try:
             decision = await _chair_once()
             _chair_failed = ""
@@ -6918,7 +6950,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"⚠ 의장 결정문 합성 실패 — 다시 부른다({_ctry + 1}/"
                                               f"{_CHAIR_RETRIES}): {_chair_failed}", "tool": None,
                                       **({"knob": _chair_knob} if _chair_knob else {})})
-    if _chair_failed:
+    _chair_cause = _ext_cause(_chair_exc)
+    if _rdec is not None:
+        # 되살림(S3) — 의장을 다시 부르지 않는다. 의장이 못 냈던 것도 그대로다(끊지 않았다면 회의록을 저장하고 chair_failed 로 끝났다).
+        decision, _chair_failed, _chair_knob, _chair_cause = _rdec["text"], _rdec["failed"], _rdec["knob"], _rdec["cause"]
+    elif _chair_failed:
         decision = _chair_fail_text(_chair_failed, 1 + _CHAIR_RETRIES, seat_note,
                                     [(o["persona"], _ser_kind(o, _kind(N))) for o in last_list],
                                     f"{_dr(N)}R {_rtag(N)}")
@@ -6950,7 +6986,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # (e:120 의 120, 키 E1-CH-015 의 015)가 '어느 원문에도 없는 수치' 로 올라와 진짜 환각을 묻는다.
     # 의장이 결정문을 못 냈으면 아래 후처리(수치 대조·요약·쉬운 설명·인용 대조)를 돌리지 않는다 — 결정문이 아닌
     # 글을 대조하면 '결정문 수치 N건 전부 확인' 같은 거짓 줄이 나가고, 요약·설명은 같은 LLM 을 또 기다린다.
-    _dec_nums = [] if _chair_failed else [
+    # 결정문을 되살렸으면(S3) 이 대조의 상태줄은 원장에 이미 있다 — 다시 세지 않는다.
+    _dec_nums = [] if (_chair_failed or _rdec is not None) else [
         n for n in dict.fromkeys(_nrm(m.group(0))
                                  for m in _num_re.finditer(_EV_CITE_RE.sub(" ", decision)))
         if not re.fullmatch(r"(19|20)\d{2}", n)]
@@ -6963,13 +7000,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     elif _dec_nums:
         yield _sse("status", {"step": f"근거 대조 — 결정문 수치 {len(_dec_nums)}건 전부 "
                    "근거·발언 원문에서 확인", "tool": None})
+    if _rdec is None and _jon:
+        # 재개 자료(HA-09 S3 — e:decision) — 의장 결정문(못 냈으면 회의록 보존 글)과 실패 표지. 이으면 의장을 다시 부르지 않는다.
+        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause)
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
     _summary = ""
     # 후처리 텍스트 턴이 결정문을 읽는 길이 — 창에서 유도하고 바닥은 종전 값(_text_turn_room). 줄였으면 카드로 알린다.
     _post_cut = []
-    if not _chair_failed:
+    if not _chair_failed and _rpl is None:      # 되살렸으면(S3 e:plain) 요약 · 쉬운 설명을 다시 부르지 않는다 — 아래에서 그 결정문을 쓴다
         yield _sse("status", {"step": "핵심 요약 생성 중", "tool": None})
         _smax = _text_turn_room(400, 6000, _mt)
         if len(decision) > _smax:
@@ -7003,6 +7043,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _plain = ""
     if not _chair_failed:
         yield _delib("stage", stage="explain")
+    if not _chair_failed and _rpl is None:
         yield _sse("status", {"step": "쉬운 설명 — 비전문가용 정리", "tool": None})
         _pmax = _text_turn_room(600, 7000, _mt)
         if len(decision) > _pmax:
@@ -7029,13 +7070,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _delib("evidence", source="후처리 입력 상한 초과", included=False, notice=True,
                      text=" · ".join(_post_cut) + " 읽고 썼다 — 결정문 뒤쪽은 요약·쉬운 설명에 반영되지 않았을 수 "
                           "있다(결정문 전문은 그대로다). 모델 창이 작아서다.")
+    if _rpl is not None:
+        decision = _rpl["decision"]     # 되살림(S3) — 요약 · 머리 표지 · 쉬운 설명을 붙인 끊기기 전의 결정문(위에서 붙인 표지를 덮는다)
+    elif _jon:
+        # 재개 자료(HA-09 S3 — e:plain) — 쉬운 설명과 그것까지 붙인 결정문. 이으면 요약 · 쉬운 설명을 다시 부르지 않는다.
+        delib_resume.write(sk, "e:plain", sync=True, plain=_plain, decision=decision)
 
     # 아래 두 대조(웹 인용 · 수치)는 **보고서를 저장하기 전에** 한다. 종전엔 저장한 뒤에 경고를 붙여서,
     # 화면의 결정문에는 '이 수치는 확인되지 않았다' 가 있는데 Report Archive 에 남는 보고서에는 없었다 —
     # 나중에 보고서만 읽는 사람은 지어낸 값을 그대로 믿는다(봉인 표식을 저장 전에 찍는 것과 같은 까닭).
     # 웹 인용 대조 — 결정문에 [W:doc_id#n] 이 있으면 원장과 맞춰 본다. 날조를 조용히
     # 넘기면 "코드로 검증된 인용"이라는 라벨이 그대로 과신의 근거가 된다.
-    if opts.search_sources and not _chair_failed:
+    # 보고서 단계를 되살렸으면(S3 e:report_intent) 두 대조를 다시 하지 않는다 — 그 줄의 결정문(두 대조를 붙인 것)을 쓴다.
+    if opts.search_sources and not _chair_failed and _rint is None:
         _ok_n, _bad_n, _bad, _unk = await _verify_web_citations(app, groups, decision,
                                                                 user, user_pat)
         _n_cite = len(_WEB_CITE.findall(decision))
@@ -7082,7 +7129,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         + [json.dumps(lst, ensure_ascii=False, default=str) for lst, _t in rounds_data]
         + list(knowledge_by_key.values()) + seat_lookups
         + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
-    _bad_num = [] if _chair_failed else unsourced_numbers(decision, _num_src, limit=0)
+    _bad_num = [] if (_chair_failed or _rint is not None) else unsourced_numbers(decision, _num_src, limit=0)
     if _bad_num:
         # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
         # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
@@ -7100,12 +7147,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _append_to = int(getattr(opts, "append_to_report_id", 0) or 0)
     report_note = ""
     rid = None
+    if _rint is not None:
+        decision = _rint["decision"]    # 되살림(S3) — 저장하려던 결정문(웹 인용 · 수치 대조까지 붙인 것)
     yield _delib("stage", stage="report")
-    yield _sse("status", {"step": ("Report Archive 보고서 저장 중" if _do_save and not _append_to
-                                   else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
-                                   else "보고서 저장 건너뜀(save_report=0)"),
-                          "tool": "create_report_draft" if _do_save else None,
-                          "detail": _ra_report_title(question)})
+    if _rsav is None:
+        yield _sse("status", {"step": ("Report Archive 보고서 저장 중" if _do_save and not _append_to
+                                       else f"Report Archive #{_append_to} 에 페이지 추가 중" if _do_save
+                                       else "보고서 저장 건너뜀(save_report=0)"),
+                              "tool": "create_report_draft" if _do_save else None,
+                              "detail": _ra_report_title(question)})
+    if _rint is not None and _rsav is None and _rint["save"]:
+        # 되살림(S3) — 저장 도중 끊겼다(e:report_intent 만 있다). RA 가 받았는지 알 길이 없다(멱등 열쇠가 없다) — 알리고 새로 저장한다.
+        yield _sse("warning", {"code": "report_maybe_saved", "message": (
+            (f"끊기기 전에 Report Archive 보고서 #{_rint['append_to']} 에 이 회차의 페이지를 붙이던 중이었다 — 끝났는지 알 수 없어 다시 "
+             f"붙인다. #{_rint['append_to']} 에 같은 페이지가 둘이면 하나를 지운다.") if _rint["append_to"] else
+            (f"끊기기 전에 Report Archive 에 보고서 「{_rint['title']}」 를 저장하던 중이었다 — 끝났는지 알 수 없어 새로 저장한다. "
+             "RA 에 같은 제목의 보고서가 둘이면 하나를 지운다."))})
     try:
         # 회의록(대화체) — Claude MCP 경로든 챗 경로든 RA 웹에서 회의가 그대로 읽히게 발언을 싣는다.
         transcript = []
@@ -7140,10 +7197,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                        if n > cap]
             print(f"[deliberation] RA 블록 절단 — {' · '.join(_ra_cut)}")
             # 서버 로그만으로는 보고서만 읽는 사람도 호출자도 모른다 — 잡 원장(evidence_omitted)과 화면에 남긴다.
-            yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
-                         text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
-                              "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
-        if not _do_save:
+            if _rint is None:           # 보고서 단계를 되살렸으면(S3) 이 카드는 e:report_intent 보다 먼저 원장에 실렸다
+                yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
+                             text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
+                                  "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
+        if _rint is None and _jon:
+            # 재개 자료(HA-09 S3 — e:report_intent) — RA 호출 직전. 이 줄만 남고 끊기면 저장됐는지 알 수 없다 — 이을 때 경고하고 새로 저장한다.
+            delib_resume.write(sk, "e:report_intent", sync=True, save=_do_save, append_to=_append_to,
+                               title=_ra_report_title(question), decision=decision)
+        if _rsav is not None:           # 되살림(S3) — 끊기기 전에 이 단계가 끝났다. 다시 저장하지 않고 받은 번호 · 안내를 쓴다(아래)
+            _raw_made = None
+        elif not _do_save:
             _raw_made = None
         elif _append_to:
             # 이어하기 회차를 한 보고서로 묶는다 — 현재 페이지 수를 읽어 그 다음 장에 붙인다.
@@ -7160,11 +7224,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
         # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
-        rid, report_note = _ra_save_outcome(_raw_made, _append_to, _do_save)
+        rid, report_note = ((_rsav["rid"], _rsav["note"]) if _rsav is not None
+                            else _ra_save_outcome(_raw_made, _append_to, _do_save))
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
     for _c in _cred_notice():           # 보고서 저장에서 거절됐으면 — 수 시간 심의의 맨 끝이 가장 걸리기 쉽다
         yield _c
+    if _rsav is None and _jon:
+        # 재개 자료(HA-09 S3 — e:report_saved) — 받은 번호와 결정문 끝의 안내(저장 실패도 그대로 — 끊지 않았다면 그대로 끝났다). 이으면 다시
+        # 저장하지 않는다.
+        delib_resume.write(sk, "e:report_saved", sync=True, rid=rid, note=report_note)
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
     # ⚠ 분모는 **착석 수**다. 예전엔 len(last_list) — 즉 마지막 라운드 **응답자 수** 였고,
@@ -7180,13 +7249,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tally["abstain"] += max(0, _seated - len(last_list))
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
-    wiki_note = ""
-    if getattr(opts, "wiki", 0):
+    # 위키 단계를 되살렸으면(S3 e:wiki_sent) 다시 보내지 않고 그 안내를 쓴다. 보내던 중에 끊겼으면 다시 보낸다 — 제자리 이어하기는 잡 id 가
+    # 같아 원천 열쇠(delib:<잡 id>:<틀>)도 같고, 같은 본문이면 MX 백서가 앞의 원천으로 받는다(dedup — 열쇠 · 본문 지문 · 범위).
+    wiki_note = _rwik["note"] if _rwik is not None else ""
+    if getattr(opts, "wiki", 0) and _rwik is None:
         yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
         wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
                                        stage=opts.chair_template, personas=personas, last_list=last_list, rid=rid,
                                        evidence=opts.evidence, pool=gather_pool)
         yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
+        if _jon:
+            # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내. 이으면 다시 보내지 않는다.
+            delib_resume.write(sk, "e:wiki_sent", sync=True, note=wiki_note)
     # 다음 단(시뮬 2·3단)에는 **진짜 결정문만** 넘긴다 — 의장이 못 낸 글을 넘기면 그 위에서 다음 단이 돈다.
     # 못 냈으면 사유를 넘긴다(다단 래퍼가 제 오류에 싣는다).
     if out is not None and not _chair_failed:
@@ -7219,7 +7293,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                          "이어하기로 다시 수렴시키면 결정문을 받는다."),
                              "knob": " · ".join(x for x in (_chair_knob,
                                                            "의장 재호출 DELIB_CHAIR_RETRIES") if x),
-                             **_ext_cause(_chair_exc)})
+                             **_chair_cause})
     yield _sse("done", {})
 
 

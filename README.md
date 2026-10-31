@@ -136,8 +136,7 @@ ChatDock (portal frontend)
   re-reads the resume data (`_requeue`) or puts the job back to `interrupted` when it cannot. Anyone else (same
   affiliation · admin — HA-06: the journal is never read for them), shrunk permissions, a missing · foreign-format ·
   capped journal, an engine other than `general`, or changed values take the R3 summary path above, with the reason in
-  `resumed.why` and the note (`resumed.mode = "summary"`). Not here yet: idempotent decision · report · wiki after the chair
-  (S3 — a job cut at `report` may already have saved its report; the answer says so), multi-stage and test-plan stages (S4).
+  `resumed.why` and the note (`resumed.mode = "summary"`). Not here yet: multi-stage and test-plan stages (S4).
   The free-lookup result cache is not restored — a resumed round may call a tool the uninterrupted run would have served
   from the cache. `/health.delib_journal {on, max_mb, errors}` (journal write failures since startup) and
   `/health.delib_folded` (jobs whose journal the restart sweep folded at this startup) show the journal side.
@@ -160,7 +159,30 @@ ChatDock (portal frontend)
   ledger). `seat_resume.todo` and `resumed.todo` are the remaining seats, `INTERRUPTED_MSG_EXACT` and the in-place note
   say only those are called, and the `끊긴 심의 되살림` card states the cut-round facts first (the ledger keeps the first 400
   characters of a card). A checkpoint job (`stop_after_round=1`) cut after round 1 ended continues round 1 as the cut
-  round — nobody is called again — and still stops at the checkpoint. `RESUME_SCHEMA` stays 1 — S2 reads the S1 lines.
+  round — nobody is called again — and still stops at the checkpoint. S2 adds no line kind (S3 below raised `RESUME_SCHEMA`).
+- **Decision, report and wiki only once** (HA-09 S3 — portal design A5.3 fourth bullet · A6 S3). After the last round the
+  engine writes five more lines, each when its step has finished (every event of that step is written before it):
+  `e:decision` after the chair (the chair text — the minutes-preserving text when the chair failed — with `failed` ·
+  `knob` · `cause`), `e:plain` after the TL;DR and the plain explanation (the explanation and the decision text with both
+  attached), `e:report_intent` right before the Report Archive call (`save`, `append_to`, the title and the decision text
+  that is saved — web-citation and number checks attached), `e:report_saved` after the report step (`rid` and the note
+  appended to the decision — a failed save too) and `e:wiki_sent` after the wiki step (its note). They are read only when
+  every round is restored and are carried into the rewritten journal, so a second cut keeps them. Resuming in place skips
+  each step whose line is there — no chair · TL;DR · plain-explanation call, no second save (the number and note are
+  reused), no second wiki submission — and does not emit that step's status lines, cards or warnings again (they precede
+  the line); stage events are emitted, so the ledger's stage ends where an uninterrupted run ends. A job cut between
+  `e:report_intent` and `e:report_saved` may or may not have reached Report Archive, which has no idempotency key (portal
+  C Q-R1): the resumed run emits one `report_maybe_saved` warning (`끝났는지 알 수 없어 …`) and saves again with the same
+  blocks (an append job appends its page again); `save_report=0` writes the intent with `save: false` and never warns. A
+  wiki submission cut in flight is sent again under the same source key (`delib:<job id>:<template>` — the job id does not
+  change in place), which MX WhitePaper deduplicates when the body is the same. A failed chair stays failed: the resumed
+  run saves the minutes and ends with the same `chair_failed` error, as the uninterrupted run would have. A job whose
+  decision event already reached the ledger (cut before the outcome · result events) now resumes in place too instead of
+  taking the summary path. The `끊긴 심의 되살림` card (kept steps first), the status line and the in-place note say what
+  is kept (`보고서는 끊기기 전에 저장돼(#N) 다시 저장하지 않는다` …). `RESUME_SCHEMA` is 2 — a missing line now means "not
+  done yet", which a journal written before these lines (1) cannot tell, so such a journal takes the summary path. Still
+  open: the `의장 전사 상한 초과` card is emitted before the chair call, so a cut during the chair call (no `e:decision`)
+  calls the chair again and emits that card again.
 
 - `POST /seat-eval` · `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — the seat-choice
   baseline windows (shared secret; see "Seat-choice baseline" below). `/health.seat_eval` `{secret, busy}`,
