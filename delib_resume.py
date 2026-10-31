@@ -11,7 +11,12 @@
 의 키워드로만 넘기고, start 가 그 잡의 태스크 문맥에만 건다. **요청 손잡이(delib_opts)로는 받지 않는다** — 손잡이로 받으면 호출자가 남의 잡 id 를
 적어 그 사람의 재개 자료를 읽는 길이 생긴다. 시험이 다시 읽지(reload) 않는 작은 모듈에 둔다 — deliberation 을 다시 읽어도 변수가 같다.
 
-**줄 꼴**(머리 줄 rv = RESUME_SCHEMA, 단 열쇠 sk — 이 판은 한 단 심의 main 만 쓰고 되살린다).
+**줄 꼴**(머리 줄 rv = RESUME_SCHEMA, 단 열쇠 sk — 한 단 심의 main, 해석 설계 · 구축 계획 sim-1 · sim-2 · sim-3, 시험 설계 tp. 단마다 같은
+줄을 쓴다 — 다단 심의는 단이 차례로 돌아 뒤 단의 e:pre 가 적혔으면 앞 단은 끝났다. 되살리는 단은 마지막 단 표지(e:stage_in · e:pre)의 단 하나다).
+  e:stage_in  그 단에 들기 직전(2단 · 3단 · 시험 설계 — S4) — 엔진이 단 밖에서 따로 부른 것과 앞 단의 산출. 2단은 1단 결정문 · 양보 불가
+              조항 · 1단 좌석(체크포인트와 같은 값) · 좌석 전환 결과 · 사내 자산 현황 글(2단 사람 의견에 붙는 것), 3단은 2단 결정문 · 좌석,
+              시험 설계는 물성 근거 현황 글. 끊긴 단이 이 단이면 앞 단 · 좌석 전환 · 현황 조회를 다시 하지 않고 이 값으로 그 단에 든다. 이 줄
+              뒤 · 그 단의 e:pre 전에 끊겼으면(그 단의 라운드 전 단계) 되살리지 않는다 — 요약 길이 체크포인트로 끝난 단을 건너뛴다.
   e:pre       라운드 루프 직전 — 좌석 전부(복원된 역할 · origin · lookup_hint) · 지식카드 · 근거 계수 · VOC · 선주입 · 지정 도구 결과 ·
               기준일 셈 · 출처 정수 · 자유 조회 도구 이름 · 그룹 · 창 · 라운드 수 · 화두 블록(base · base_blind)의 지문.
               호출자가 준 근거 본문(evidence)은 적지 않는다 — 시작 인자 파일에 있고, 되살릴 때 같은 인자로 다시 만든 블록을 지문으로 견준다.
@@ -41,8 +46,20 @@ from pathlib import Path
 
 # 재개 자료의 꼴 번호 — 줄 꼴(위)을 바꾸는 커밋이 올린다. 일지 머리(rv)와 다르면 되살리지 않고 요약으로 잇는다.
 # 2 — 결정문 뒤 줄(S3). 그 줄이 없으면 '그 단계를 아직 하지 않았다' 로 읽으므로, 그 줄을 쓰지 않던 판(1)의 일지는 그렇게 읽을 수 없다.
+# S4(다단 · 시험 설계의 단 열쇠와 e:stage_in)는 올리지 않는다 — 한 단 심의의 줄은 그대로고, 그 앞 판의 다단 · 시험 설계 일지에는 재개 자료가
+# 한 줄도 없어(그 엔진은 단 열쇠 없이 돌았다) 잘못 읽을 줄이 없다(e:pre 가 없어 요약으로 잇는다).
 RESUME_SCHEMA = 2
-STAGE = "main"                 # 이 판이 되살리는 단 — 한 단 심의(run_deliberation). 해석 설계 · 구축 계획(sim-*) · 시험 설계(tp)는 S4
+STAGE = "main"                 # 한 단 심의(run_deliberation)의 단 열쇠
+SIM1, SIM2, SIM3 = "sim-1", "sim-2", "sim-3"      # 해석 설계 · 구축 계획(run_sim_deliberation)의 1단(메커니즘) · 2단(해석 설계) · 3단(구축 계획)
+TP = "tp"                      # 시험 설계(run_test_plan)
+# 엔진 종류(delib_jobs.JOBS 의 engine) → 그 잡의 단 열쇠(도는 차례). 일지의 줄이 이 밖의 단이면 되살리지 않는다.
+STAGES = {"general": (STAGE,), "sim": (SIM1, SIM2, SIM3), "test-plan": (TP,)}
+# 단에 들기 전에 엔진이 단 밖에서 부르는 단(좌석 전환 · 사내 자산 현황 · 물성 현황) — 그 단을 되살리려면 e:stage_in 이 있어야 한다. 값은 그
+# 줄에 있어야 할 칸과 꼴이다(글 칸은 문자열, 목록 칸은 목록 — 좌석 목록은 key 가 있는 객체만).
+STAGE_IN = {SIM2: {"decision_a": str, "nn_a": list, "personas_a": list, "seats": list, "note": str},
+            SIM3: {"decision_b": str, "seats": list},
+            TP: {"note": str}}
+STAGE_LABEL = {SIM1: "1단(메커니즘)", SIM2: "2단(해석 설계)", SIM3: "3단(구축 계획)", TP: "시험 설계"}
 # 결정문 뒤 줄 — 엔진이 적는 차례다(이 차례로 옮겨 적는다).
 POST = ("e:decision", "e:plain", "e:report_intent", "e:report_saved", "e:wiki_sent")
 
@@ -71,7 +88,7 @@ def on(sk) -> bool:
 
 
 def write(sk, kind: str, *, sync: bool = False, **data) -> None:
-    """엔진의 재개 자료 한 줄 — 일지가 없거나(웹 심의) 단 열쇠가 없으면(다단 · 시험 설계 — S4) 아무것도 안 한다."""
+    """엔진의 재개 자료 한 줄 — 일지가 없거나(웹 심의) 단 열쇠가 없으면(리스크 패널처럼 단 열쇠 없이 부르는 스트림) 아무것도 안 한다."""
     jr = journal.get()
     if jr is not None and sk:
         jr.engine({"k": kind, "sk": sk, **data}, sync=sync)
@@ -81,6 +98,13 @@ def stage(sk):
     """이 단을 되살릴 상태(StageData) — 제자리 이어하기의 그 단만. 없으면 None(지금과 같은 길)."""
     r = restore.get()
     return r.stages.get(sk) if (r is not None and sk) else None
+
+
+def stage_in(sk):
+    """이 단에 들 때의 재개 자료(e:stage_in 줄 — S4) — 제자리 이어하기의 끊긴 단이 이 단일 때만. 있으면 엔진이 앞 단 · 좌석 전환 · 현황 조회를
+    건너뛰고 이 값으로 그 단에 든다. 없으면 None(지금과 같은 길)."""
+    r = restore.get()
+    return r.stage_in.get(sk) if (r is not None and sk) else None
 
 
 def _restorable(seats: list, rounds: int, ended: dict, spoke: dict, stop_after_round: int = 0) -> int:
@@ -101,14 +125,43 @@ def _seat_list(xs) -> list:
     return list(dict.fromkeys(x for x in xs if isinstance(x, str) and x))
 
 
+# 되살리지 않는 까닭 — 진행 조회의 재개 요약(Tracker)과 이어하기의 일지 읽기(parse)가 같은 글을 쓴다(S1-D13).
+_WHY_PRE = "라운드 전 단계에서 끊겨 되살릴 재개 자료가 없다(좌석 · 근거가 서기 전)"
+_WHY_ODD = "재개 자료의 단이 이 잡의 종류와 다르다"
+
+
+def _why_entered(sk) -> str:
+    """그 단에 들었는데(e:stage_in) 그 단의 라운드 전 단계에서 끊겼다(e:pre 전) — 그 단을 되살릴 것이 없다. 끝난 단은 요약 길이 체크포인트로
+    건너뛴다(2단 · 3단) — 시험 설계는 단이 하나라 처음부터다."""
+    return (f"{STAGE_LABEL.get(sk, sk)}의 라운드 전 단계에서 끊겨 그 단을 되살릴 재개 자료가 없다(좌석 · 근거가 서기 전) — 이으면 "
+            + ("끝난 단은 체크포인트로 건너뛰고 그 단을 같은 인자로 처음부터 돈다" if sk in (SIM2, SIM3) else "같은 인자로 처음부터 돈다"))
+
+
+def _why_no_in(sk) -> str:
+    return f"{STAGE_LABEL.get(sk, sk)}에 들 때의 재개 자료(e:stage_in)가 없다 — 앞 단 · 좌석 전환 · 현황 조회의 값을 되살릴 수 없다"
+
+
+def why_between(sk) -> str:
+    """끊긴 단이 끝났다(원장의 체크포인트가 그 단이다) — 다음 단에 들기 전(좌석 전환 · 현황 조회)에 끊겼다. 되살릴 단 안이 없고, 끝난 단을
+    되살려 다시 맺으면 다음 단 들머리의 카드가 두 번 실릴 수 있다 — 요약 길이 체크포인트로 끝난 단을 건너뛴다(같은 비용, S4)."""
+    return (f"{STAGE_LABEL.get(sk, sk)}은 끝났고 다음 단에 들기 전(좌석 전환 · 현황 조회)에 끊겼다 — 이으면 끝난 단은 체크포인트로 "
+            "건너뛰고 다음 단을 같은 인자로 처음부터 돈다")
+
+
 class Tracker:
     """e:* 줄을 받아 좌석 단위 재개 요약(seat_resume)을 만든다 — 일지가 쓰는 동안(delib_jobs._Journal)과 재기동 정리가 접는 동안(_fold_journal)이
-    같은 것을 써서, 내려가며 쓴 원장과 재기동이 접은 원장이 같은 요약을 싣는다. 원 출력은 들고 있지 않는다(좌석 키만)."""
+    같은 것을 써서, 내려가며 쓴 원장과 재기동이 접은 원장이 같은 요약을 싣는다. 원 출력은 들고 있지 않는다(좌석 키만).
+
+    다단 심의 · 시험 설계(S4)는 마지막 단 표지(e:stage_in · e:pre)의 단을 센다 — 단은 차례로 돌아 뒤 단의 표지가 적혔으면 앞 단은 끝났다."""
 
     def __init__(self):
-        self.pre: dict | None = None      # {"seats": [...], "rounds": N}
-        self.ended: dict = {}             # r → [유실 좌석]
-        self.spoke: dict = {}             # r → [말한 좌석]
+        self.pre: dict | None = None      # 마지막 e:pre 의 {"seats": [...], "rounds": N}
+        self.sk = None                    # 마지막 단 표지의 단 — 끊긴 단
+        self.entered = False              # 마지막 단 표지가 e:stage_in 이다(그 단의 라운드 전 단계에서 끊겼다 — e:pre 전)
+        self.sin: set = set()             # e:stage_in 이 적힌 단
+        self.sks: set = set()             # 일지에 나온 단 열쇠 전부 — 잡의 종류와 견준다(parse 와 같은 규칙)
+        self.ended: dict = {}             # r → [유실 좌석] (끊긴 단의 것)
+        self.spoke: dict = {}             # r → [말한 좌석] (끊긴 단의 것)
         self.off = ""                     # 엔진 줄을 멈춘 까닭(e:resume_off)
         self.rv = None                    # 일지 머리의 재개 자료 꼴 번호 — 없으면 이 판 이전의 일지다
         self.bad = 0                      # 가운데 깨진 줄 수(읽는 쪽이 센다) — 있으면 되살리지 않는다(parse 와 같은 규칙)
@@ -123,13 +176,21 @@ class Tracker:
         if k == "e:resume_off":
             self.off = str(rec.get("why") or "까닭 없음")[:200]
             return
-        if rec.get("sk") != STAGE:
+        sk = rec.get("sk")
+        sk = sk if isinstance(sk, str) else "?"           # 꼴이 다른 단 열쇠 — 어느 잡의 단도 아니다(summary 가 되살리지 않는다)
+        self.sks.add(sk)
+        if k == "e:stage_in":
+            self.sk, self.entered = sk, True
+            self.sin.add(sk)
             return
         if k == "e:pre":
             ps = rec.get("personas")
+            self.sk, self.entered = sk, False
             self.pre = {"seats": _seat_list(p.get("key") for p in ps if isinstance(p, dict)) if isinstance(ps, list) else [],
                         "rounds": rec.get("rounds") if isinstance(rec.get("rounds"), int) else 0}
             self.ended, self.spoke = {}, {}
+            return
+        if sk != self.sk or self.entered:
             return
         try:
             r = int(rec.get("r"))
@@ -143,14 +204,14 @@ class Tracker:
             lost = rec.get("lost")
             self.ended[r] = _seat_list(lost) if isinstance(lost, list) else []
 
-    def summary(self, *, general: bool = True, stop_after_round: int = 0) -> dict:
-        """{ok, sk, round, spoken, todo, why} — round 는 이으면 처음 부를 라운드(전 라운드가 끝났으면 라운드 수 + 1 — 의장부터), spoken 은 그
-        라운드에서 끊기기 전에 말한 좌석(원 출력이 적힌 좌석 — 다시 부르지 않는다), todo 는 그 라운드에서 부를 나머지 좌석이다(아직 말하지
-        않았거나 실패한 좌석 — 앉은 차례대로, S2)."""
+    def summary(self, *, stages: tuple = (STAGE,), stop_after_round: int = 0, done_sk=None) -> dict:
+        """{ok, sk, round, spoken, todo, why} — sk 는 끊긴 단(stages — 그 잡의 단 열쇠, STAGES), round 는 이으면 그 단에서 처음 부를 라운드(전
+        라운드가 끝났으면 라운드 수 + 1 — 의장부터), spoken 은 그 라운드에서 끊기기 전에 말한 좌석(원 출력이 적힌 좌석 — 다시 부르지 않는다),
+        todo 는 그 라운드에서 부를 나머지 좌석이다(아직 말하지 않았거나 실패한 좌석 — 앉은 차례대로, S2). done_sk 는 원장의 체크포인트가 말하는
+        끝난 단이다 — 끊긴 단이 그 단이면 단 사이에서 끊긴 것이라 되살리지 않는다(delib_jobs.resume_load 와 같은 규칙)."""
         out = {"ok": False, "sk": None, "round": None, "spoken": [], "todo": [], "why": ""}
-        if not general:
-            out["why"] = ("다단 심의 · 시험 설계는 끝난 단(체크포인트)까지만 잇는다 — 단 안을 라운드 경계에서 잇는 재개 자료는 아직 쓰지 "
-                          "않는다(HA-09 S4)")
+        if not stages:
+            out["why"] = "알 수 없는 심의 종류다 — 이으면 요약으로 잇는다"
         elif self.rv is None:
             out["why"] = "재개 자료가 없다(좌석 단위 이어하기 이전 판의 일지이거나 진행 일지가 없다) — 이으면 요약으로 잇는다"
         elif self.rv != RESUME_SCHEMA:
@@ -159,8 +220,16 @@ class Tracker:
             out["why"] = f"재개 자료를 끝까지 쓰지 못했다({self.off}) — 이으면 요약으로 잇는다"
         elif self.bad:
             out["why"] = f"진행 일지에 깨진 줄이 {self.bad}개 있다 — 되살린 상태를 믿을 수 없어 이으면 요약으로 잇는다"
+        elif self.sks - set(stages):
+            out["why"] = f"{_WHY_ODD} — 되살린 상태를 믿을 수 없어 이으면 요약으로 잇는다"
+        elif self.entered:
+            out["why"] = _why_entered(self.sk)
         elif self.pre is None:
-            out["why"] = "라운드 전 단계에서 끊겨 되살릴 재개 자료가 없다(좌석 · 근거가 서기 전) — 이으면 같은 인자로 처음부터 돈다"
+            out["why"] = f"{_WHY_PRE} — 이으면 같은 인자로 처음부터 돈다"
+        elif self.sk in STAGE_IN and self.sk not in self.sin:
+            out["why"] = f"{_why_no_in(self.sk)} — 이으면 요약으로 잇는다"
+        elif done_sk is not None and self.sk == done_sk:
+            out["why"] = why_between(self.sk)
         if out["why"]:
             return out
         seats, rounds = self.pre["seats"], int(self.pre["rounds"] or 0)
@@ -169,7 +238,7 @@ class Tracker:
         spoken = _seat_list(self.spoke.get(cut) or ()) if cut <= rounds else []
         if set(spoken) - set(seats):          # parse 와 같은 규칙 — 이어하기가 쓰지 않을 재개 자료를 진행 조회가 된다고 말하지 않는다
             return {**out, "why": "재개 자료에 앉지 않은 좌석의 원 출력이 있다 — 되살린 상태를 믿을 수 없어 이으면 요약으로 잇는다"}
-        return {"ok": True, "sk": STAGE, "round": cut, "spoken": spoken,
+        return {"ok": True, "sk": self.sk, "round": cut, "spoken": spoken,
                 "todo": [s for s in seats if s not in spoken] if cut <= rounds else [], "why": ""}
 
 
@@ -188,10 +257,12 @@ class StageData:
 
 class Resume:
     """제자리 이어하기의 재개 상태 — MCP 입구가 주인의 일지에서 만들어 delib_jobs.start(..., resume=) 로만 넘긴다.
-    carry 는 새 일지에 그대로 옮겨 쓸 e:* 줄(되살릴 것만 — 다음 재기동에도 남게), info 는 응답 · 안내에 싣는 것, groups 는 끊기기 전의 그룹이다."""
+    carry 는 새 일지에 그대로 옮겨 쓸 e:* 줄(되살릴 것만 — 다음 재기동에도 남게), info 는 응답 · 안내에 싣는 것, groups 는 끊기기 전의 그룹이다.
+    stages 는 끊긴 단 하나 → StageData, stage_in 은 그 단에 들 때의 e:stage_in 줄(2단 · 3단 · 시험 설계만 — S4)이다."""
 
-    def __init__(self, job_id: str, stages: dict, carry: list, info: dict, groups: list):
+    def __init__(self, job_id: str, stages: dict, carry: list, info: dict, groups: list, stage_in: dict | None = None):
         self.job_id, self.stages, self.carry, self.info, self.groups = job_id, stages, carry, info, groups
+        self.stage_in = stage_in or {}
         self.by = ""                       # 이은 사람(시도 기록 attempts 의 by)
 
 
@@ -207,9 +278,23 @@ _PRE_KEYS = {"personas": list, "rounds": int, "knowledge": dict, "ev_count": dic
              "ao_pre": dict, "ao_des": dict, "free": list}
 
 
-def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0):
+def _stage_in_ok(sk: str, rec: dict) -> bool:
+    """e:stage_in 줄의 꼴 — 칸마다 꼴이 맞고, 앞 단 결정문은 비지 않았고, 좌석 목록은 key 가 있는 객체만이다."""
+    want = STAGE_IN.get(sk) or {}
+    if any(not isinstance(rec.get(key), typ) for key, typ in want.items()):
+        return False
+    if any(not (isinstance(x, dict) and isinstance(x.get("key"), str) and x["key"]) for x in rec.get("seats") or []):
+        return False
+    return all(str(rec.get(key)).strip() for key in ("decision_a", "decision_b") if key in want)
+
+
+def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0, stages: tuple = (STAGE,)):
     """진행 일지 바이트 → (Resume, "") 또는 (None, 못 쓰는 까닭). 반쯤 쓴 마지막 줄은 버린다. 깨진 줄 · 꼴이 다른 머리 · 멈춘 엔진 줄이 있으면 쓰지 않는다
-    — 되살린 상태가 끊기기 전과 같다는 보장이 없으면 요약으로 잇는 것이 낫다."""
+    — 되살린 상태가 끊기기 전과 같다는 보장이 없으면 요약으로 잇는 것이 낫다.
+
+    stages 는 그 잡의 단 열쇠(STAGES — 엔진 종류로 정해진다)다. 되살리는 단은 마지막 단 표지(e:stage_in · e:pre)의 단 하나다(S4) — 단은 차례로
+    돌아 뒤 단의 표지가 적혔으면 앞 단은 끝났고, 그 산출은 그 단의 e:stage_in 에 있다. 마지막 표지가 e:stage_in 이면 그 단의 라운드 전 단계에서
+    끊긴 것이라 되살릴 것이 없다(요약 길 — 체크포인트로 끝난 단을 건너뛴다). 이 잡의 단이 아닌 줄이 있으면 쓰지 않는다."""
     lines = raw.split(b"\n")
     lines.pop()
     head = _rec(lines[0]) if lines else None
@@ -217,6 +302,7 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         return None, "진행 일지의 머리가 이 잡 · 이 판의 꼴이 아니다"
     if head.get("rv") != RESUME_SCHEMA:
         return None, f"재개 자료의 꼴이 이 판과 다르다(일지 {head.get('rv')} · 이 판 {RESUME_SCHEMA})"
+    sk, entered, sin = None, False, {}
     pre, gather, raws, ended, post = None, {}, {}, {}, {}
     for ln in lines[1:]:
         rec = _rec(ln)
@@ -225,12 +311,19 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         k = rec.get("k")
         if k == "e:resume_off":
             return None, f"재개 자료를 끝까지 쓰지 못했다({str(rec.get('why') or '까닭 없음')[:200]})"
-        if not (isinstance(k, str) and k.startswith("e:")) or rec.get("sk") != STAGE:
+        if not (isinstance(k, str) and k.startswith("e:")):
+            continue
+        rsk = rec.get("sk")
+        if not (isinstance(rsk, str) and rsk in stages):
+            return None, _WHY_ODD
+        if k == "e:stage_in":             # 그 단에 든다(S4) — 앞 단은 끝났다. 그 단의 e:pre 가 오기 전이면 그 단의 라운드 전 단계다
+            sk, entered, sin[rsk] = rsk, True, rec
             continue
         if k == "e:pre":
+            sk, entered = rsk, False
             pre, gather, raws, ended, post = rec, {}, {}, {}, {}
             continue
-        if pre is None:
+        if pre is None or rsk != sk or entered:
             continue
         if k in POST:                     # 결정문 뒤 줄(S3) — 라운드 번호가 없다
             post[k] = rec
@@ -248,8 +341,15 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
             raws.setdefault(r, {}).setdefault(o["persona"], rec)          # 같은 좌석이 두 번이면 먼저 적힌 것(한 일지에서는 없다)
         elif k == "e:round_end":
             ended[r] = rec
+    if entered:
+        return None, _why_entered(sk)
     if pre is None:
-        return None, "라운드 전 단계에서 끊겨 되살릴 재개 자료가 없다(좌석 · 근거가 서기 전)"
+        return None, _WHY_PRE
+    sin_rec = sin.get(sk)
+    if sk in STAGE_IN and sin_rec is None:
+        return None, _why_no_in(sk)
+    if sk in STAGE_IN and not _stage_in_ok(sk, sin_rec):
+        return None, "재개 자료(e:stage_in)의 꼴이 이 판과 다르다"
     if any(not isinstance(pre.get(key), typ) or isinstance(pre.get(key), bool) for key, typ in _PRE_KEYS.items()):
         return None, "재개 자료(e:pre)의 꼴이 이 판과 다르다"
     seats = _seat_list(p.get("key") for p in pre["personas"] if isinstance(p, dict))
@@ -258,7 +358,8 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
     n = pre["rounds"]
     k = _restorable(seats, n, {r: e.get("lost") or [] for r, e in ended.items()},
                     {r: list(x) for r, x in raws.items()}, stop_after_round)
-    rounds, carry = {}, [pre]
+    # 옮겨 쓸 줄 — 그 단에 들 때의 줄(S4)이 e:pre 보다 먼저다(일지에 적힌 차례 — 다음 재기동의 읽기가 같은 단을 끊긴 단으로 본다)
+    rounds, carry = {}, ([sin_rec] if sin_rec is not None else []) + [pre]
     for r in range(1, k + 1):
         cur = [x["o"] for x in raws.get(r, {}).values()]
         lost = _seat_list(ended[r].get("lost") or [])
@@ -280,7 +381,7 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
     post = post if k == n else {}
     carry += [post[x] for x in POST if x in post]
     sav, it = post.get("e:report_saved"), post.get("e:report_intent") or {}
-    info = {"sk": STAGE, "round": cut, "restored": k, "total": n, "spoken": spoken,
+    info = {"sk": sk, "round": cut, "restored": k, "total": n, "spoken": spoken,
             "todo": [s for s in seats if s not in spoken] if k < n else [], "gathered": cut in gather if k < n else False,
             "eng_changed": bool(head.get("eng")) and head.get("eng") != ENGINE, "ctx": pre.get("ctx"),
             # 응답 안내에 싣는 결정문 뒤 단계 — report 는 saved(저장했다) · intent(저장 도중 끊겼다 — 이미 저장됐을 수 있다) · "" 다
@@ -289,4 +390,5 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
                      "report": "saved" if sav else "intent" if it.get("save") else "",
                      "report_id": sav.get("rid") if sav else None, "append_to": it.get("append_to") or 0,
                      "title": it.get("title") or ""}}
-    return Resume(job_id, {STAGE: StageData(pre, rounds, info, cutd, post)}, carry, info, list(pre["groups"])), ""
+    return Resume(job_id, {sk: StageData(pre, rounds, info, cutd, post)}, carry, info, list(pre["groups"]),
+                  stage_in={sk: sin_rec} if sin_rec is not None else {}), ""

@@ -131,12 +131,14 @@ _JOURNAL_ERRORS = 0           # 기동 뒤 진행 일지 · 재개 자료를 쓰
 _JOURNALS: dict = {}          # 도는 잡의 진행 일지(잡 id → _Journal) — 내려갈 때 늦게 접히는 잡의 재개 요약을 여기서 읽는다(shutdown)
 INTERRUPTED_MSG = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 끝난 라운드 뒤부터 남은 라운드만 이어 돈다"
                    "(사람 의견은 비워도 된다 · 처음 인자를 그대로 쓴다). 처음부터 다시 시작하려면 deliberate_start")
-# 재개 자료(일지의 e:* 줄 — HA-09 S1 · S2 · S3)가 있는 잡의 안내 — 주인이 바꾼 값 없이 이으면 같은 잡이 끊긴 라운드의 이미 말한 좌석 뒤부터
-# 그대로 돌고, 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 보고서 · 위키)를 다시 하지 않는다(A5.4 · A5.3 넷째).
+# 재개 자료(일지의 e:* 줄 — HA-09 S1 · S2 · S3 · S4)가 있는 잡의 안내 — 주인이 바꾼 값 없이 이으면 같은 잡이 끊긴 라운드의 이미 말한 좌석 뒤부터
+# 그대로 돌고, 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 보고서 · 위키)를 다시 하지 않는다(A5.4 · A5.3 넷째). 다단 심의 · 시험 설계는 끊긴 단 안에서
+# 잇는다(A5.3 끝).
 INTERRUPTED_MSG_EXACT = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 같은 잡에서 이어 돈다 — 끊기기 전에 끝난 "
                          "라운드는 좌석 · 근거 · 지식카드 · 발언을 다시 부르지 않고 되살리고, 끊긴 라운드는 이미 말한 좌석을 다시 부르지 않고 "
                          "나머지 좌석만 불러 원래 라운드 구조(심화 · 수렴) 그대로 잇는다. 의장 결정문 · 보고서 · 위키도 끊기기 전에 끝난 것은 다시 "
-                         "하지 않는다(저장 도중 끊긴 보고서만 경고와 함께 새로 저장한다). 주인이 사람 의견 · 손잡이를 바꾸지 않고 이을 때다 — 아니면 "
+                         "하지 않는다(저장 도중 끊긴 보고서만 경고와 함께 새로 저장한다). 다단 심의 · 시험 설계는 끝난 단과 단 밖의 조회(좌석 전환 · "
+                         "사내 자산 · 물성 근거 현황)도 다시 하지 않고 끊긴 단 안에서 잇는다. 주인이 사람 의견 · 손잡이를 바꾸지 않고 이을 때다 — 아니면 "
                          "끝난 라운드 뒤부터 요약으로 잇는다. 처음부터 다시 시작하려면 deliberate_start")
 # 외부 응답자 심의(delib_opts.llm=external)의 자리 — 판단 호출이 전부 잡 주인의 Claude Code 워크플로로 가서 이 서버의 LLM 을 물지
 # 않는다. 사람 속도의 워커를 기다리는 그 잡이 전역 자리(MAX_RUNNING)를 쥐면 남의 GLM 심의가 그 몇 시간 동안 줄에 묶였다(X-D6).
@@ -637,12 +639,19 @@ def _journal_track(job_id: str) -> "delib_resume.Tracker":
     return t
 
 
-def _general(job: dict) -> bool:
-    """한 단 심의(엔진 general)인가 — 끝난 라운드 · 좌석 단위로 잇는 것은 이 엔진뿐이다(다단 · 시험 설계는 단 경계까지 — HA-09 S4 전)."""
+def _stages(job: dict) -> tuple:
+    """그 잡의 단 열쇠(delib_resume.STAGES — 엔진 종류로 정해진다): 한 단 심의 (main), 해석 설계 · 구축 계획 (sim-1, sim-2, sim-3), 시험 설계 (tp).
+    모르는 종류면 빈 것이다(되살리지 않는다). 재개 자료는 단 열쇠로 적고 읽는다(HA-09 S4 — 종전엔 한 단 심의만 라운드 · 좌석 단위로 이었다)."""
     try:
-        return JOBS[resolve_job(str(job.get("job") or job.get("kind") or "default"))]["engine"] == "general"
+        return delib_resume.STAGES.get(JOBS[resolve_job(str(job.get("job") or job.get("kind") or "default"))]["engine"], ())
     except (KeyError, ValueError):
-        return False
+        return ()
+
+
+def _done_sk(job: dict):
+    """원장의 체크포인트가 말하는 끝난 단(다단 심의 — sim-1 · sim-2). 끊긴 단이 그 단이면 단 사이에서 끊긴 것이다(HA-09 S4)."""
+    ck = job.get("checkpoint")
+    return ck.get("stage") if isinstance(ck, dict) and isinstance(ck.get("stage"), str) else None
 
 
 def _stop_after(job: dict) -> int:
@@ -657,7 +666,7 @@ def _mark_interrupted(job: dict, track=None) -> None:
     e:* 줄의 셈이다(없으면 일지 파일을 읽는다). 재개 자료가 있으면 안내가 '같은 잡에서 끊긴 라운드부터' 를 말한다."""
     if track is None:
         track = _journal_track(job["id"])
-    sr = track.summary(general=_general(job), stop_after_round=_stop_after(job))
+    sr = track.summary(stages=_stages(job), stop_after_round=_stop_after(job), done_sk=_done_sk(job))
     job["status"], job["seat_resume"] = "interrupted", sr
     job["error"] = INTERRUPTED_MSG_EXACT if sr["ok"] else INTERRUPTED_MSG
 
@@ -1140,6 +1149,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "personas":
             job["seats"] = data.get("personas") or []
             job["total_rounds"] = data.get("totalRounds")
+            # 이 단의 턴이 시작되는 자리(HA-09 S4) — 다단 심의는 단마다 라운드를 1부터 센다. 제자리 이어하기(_reopen)가 끊긴 단의 턴만 뺀다.
+            job["turns_from"] = len(job.get("turns") or [])
         elif kind == "decision":
             job["decision"] = data.get("text") or job.get("decision")
         elif kind == "outcome":
@@ -1485,7 +1496,7 @@ def _rewrite_journal(job_id: str, carry: list) -> None:
 def _reopen(res: "delib_resume.Resume") -> dict:
     """제자리 이어하기(HA-09 S1 A5.4 · 사용자 결정 10-31 A-2 (가)) — 끊긴 그 잡을 다시 줄에 세울 꼴로 바꾼다. start 안에서 동기로 돈다 — 상태를
     보고 바꾸는 사이에 await 가 없어 같은 잡을 두 번 이을 수 없다(두 번째는 interrupted 가 아니라 거절된다). 시도마다 attempts 에 한 줄(끊긴
-    시각 · 이은 시각 · 이은 사람 · 처음 부를 라운드 · 끊긴 단계)을 더한다. 끊긴 라운드에서 끊기기 전에 말한 턴은 원장에서 뺀다 — 엔진이 그
+    시각 · 이은 시각 · 이은 사람 · 처음 부를 라운드 · 끊긴 단계 · 끊긴 단 sk)을 더한다. 끊긴 라운드에서 끊기기 전에 말한 턴은 원장에서 뺀다 — 엔진이 그
     좌석을 다시 부르지 않고 일지의 원 출력에서 그 턴을 다시 내고(S2) 나머지 좌석만 부르므로 전사에 좌석마다 한 번이다(원 출력은 적혔는데 턴은
     원장에 닿기 전에 죽은 좌석도 한 번 — 원 출력이 턴보다 먼저 적힌다). 그 라운드의 카드 · 경고는 남는다. 결정문 뒤에서 끊긴 잡은 뺄 턴이 없다
     — 엔진이 끝난 단계를 다시 하지 않고 결정문 · 결과를 끊기기 전의 것으로 다시 낸다(S3). 일지를 먼저 고쳐 쓴다 — 못 쓰면 잡은 그대로다."""
@@ -1500,8 +1511,13 @@ def _reopen(res: "delib_resume.Resume") -> dict:
     _rewrite_journal(jid, res.carry)
     k, now = int(res.info.get("restored") or 0), _now()
     job["attempts"] = [*(job.get("attempts") or []), {"cut_at": job.get("finished_at"), "resumed_at": now, "by": res.by or "",
-                                                      "round": k + 1, "stage": job.get("stage")}]
-    job["turns"] = [t for t in (job.get("turns") or []) if not (isinstance(t.get("round"), int) and t["round"] > k)]
+                                                      "round": k + 1, "stage": job.get("stage"), "sk": res.info.get("sk")}]
+    # 끊긴 단의 턴만 본다(HA-09 S4) — 다단 심의는 단마다 라운드를 1부터 세어, 앞 단의 턴을 라운드 번호로 거르면 앞 단의 뒤 라운드가 빠진다. 끊긴
+    # 단의 턴은 그 단의 personas 사건 뒤에 쌓였다(turns_from — 되살린 단도 그 사건을 다시 낸다). 그 앞의 턴은 앞 단 것이거나 이 단의 되살린
+    # 라운드(k 이하) 것이라 한 단 심의는 종전과 같다.
+    t, tf = job.get("turns") or [], job.get("turns_from")
+    tf = tf if isinstance(tf, int) and not isinstance(tf, bool) and 0 <= tf <= len(t) else 0
+    job["turns"] = t[:tf] + [x for x in t[tf:] if not (isinstance(x.get("round"), int) and x["round"] > k)]
     job.update(status="queued", stage="queued", error=None, finished_at=None, round=k, updated_at=now)
     job.pop("seat_resume", None)
     return job
@@ -1513,9 +1529,6 @@ def resume_load(job: dict, *, groups: list | None) -> tuple:
     **남의 이어하기에서는 부르지 않는다**(HA-06 — mcp_server._resume 이 먼저 가른다). groups 를 주면 지금 그룹이 끊기기 전 그룹(e:pre)을 다
     가졌는지 본다 — 줄었으면 쓰지 않는다(사용자 결정 10-31 A-5 (가) — 그때 본 근거 · 지식카드 · 조회가 지금은 못 볼 것일 수 있다). 재기동
     정리가 줄에 다시 세울 때(_requeue)는 None 이다(이을 때 봤다). 시작 인자 파일이 없으면 끊기기 전 인자를 그대로 쓸 수 없어 쓰지 않는다."""
-    if not _general(job):
-        return None, ("다단 심의 · 시험 설계는 끝난 단(체크포인트)까지만 잇는다 — 단 안을 라운드 경계에서 잇는 재개 자료는 아직 쓰지 "
-                      "않는다(HA-09 S4)")
     if _read_args(job["id"]) is None:
         return None, "시작 인자 파일이 없다 — 끊기기 전 인자를 그대로 쓸 수 없다"
     try:
@@ -1524,9 +1537,12 @@ def resume_load(job: dict, *, groups: list | None) -> tuple:
         return None, "진행 일지가 없다"
     except OSError as exc:
         return None, f"진행 일지를 읽지 못했다({type(exc).__name__})"
-    res, why = delib_resume.parse(raw, job["id"], journal_v=JOURNAL_V, stop_after_round=_stop_after(job))
+    res, why = delib_resume.parse(raw, job["id"], journal_v=JOURNAL_V, stop_after_round=_stop_after(job), stages=_stages(job))
     if res is None:
         return None, why
+    if res.info.get("sk") == _done_sk(job):
+        # 끊긴 단이 이미 끝났다(원장의 체크포인트) — 다음 단에 들기 전에 끊겼다. 요약 길이 체크포인트로 건너뛴다(S4 — 진행 조회와 같은 규칙)
+        return None, delib_resume.why_between(res.info["sk"])
     if groups is not None and not set(groups) >= set(res.groups):
         return None, ("끊긴 뒤 권한이 줄었다(지금 그룹이 끊기기 전 그룹을 다 갖지 않는다) — 그때 본 근거 · 지식카드 · 조회를 되살리지 "
                       "않는다")
@@ -1730,16 +1746,19 @@ def resume_info(job: dict) -> dict | None:
     """재기동으로 끊긴(interrupted) 잡을 이어 돌릴 재료 — {rounds_done, total_rounds, rounds_left, args, resumed_by}. 아니면 None.
 
     끝난 라운드는 단계로 센다 — 라운드 N 에 들어서면(stage rN) 앞의 N-1 이 끝난 것이고, 의장 결정 이후 단계(decide · explain · report)면 전부다.
-    단계 rN 에서 끊긴 라운드는 일부 좌석만 말했을 수 있어 세지 않는다. 다단 심의(sim · test-plan)는 단 사이 승계가 엔진 안에 있어 끝난
-    라운드로 잇지 않는다(rounds_done 0 — 같은 인자로 처음부터). rounds_left 는 이어 돌 라운드 수다 — 엔진의 하한이 2 라, 마지막 라운드나
-    결정문에서 끊긴 잡도 2라운드(앞 입장을 이어받은 입장 · 수렴)를 돈다."""
+    단계 rN 에서 끊긴 라운드는 일부 좌석만 말했을 수 있어 세지 않는다. 라운드를 세는 것은 단이 하나인 잡(단 열쇠 main · tp — 한 단 심의 · 시험
+    설계)이다(HA-09 S4 — 종전엔 엔진 general 만 셌다). 다단 심의(sim-plan · build-plan)는 단 사이 승계가 엔진 안에 있어 요약 길(새 잡)이 끝난
+    라운드로 잇지 않는다(rounds_done 0 — 체크포인트로 끝난 단을 건너뛰고 끊긴 단을 처음부터). 그 단 안을 잇는 것은 제자리 이어하기(seat_resume 의
+    sk 가 그 단)다. rounds_left 는 이어 돌 라운드 수다 — 엔진의 하한이 2 라, 마지막 라운드나 결정문에서 끊긴 잡도 2라운드(앞 입장을 이어받은
+    입장 · 수렴)를 돈다."""
     if job.get("status") != "interrupted":
         return None
-    general = _general(job)
+    stages = _stages(job)
+    one = len(stages) == 1                          # 라운드가 한 단의 것인 잡 — 원장의 단계 · 라운드가 그 단의 것이다
     total = int(job.get("total_rounds") or 0)       # 엔진이 좌석을 앉힐 때 적는다 — 그 전에 끊겼으면 끝난 라운드가 없다(목록 색인에도 이 칸뿐이다)
     stage = str(job.get("stage") or "")
     done = 0
-    if general and total:
+    if one and total:
         if stage.startswith("r") and stage[1:].isdigit():
             done = max(0, min(total, int(stage[1:]) - 1))
         elif stage in ("decide", "explain", "report"):
@@ -1747,8 +1766,9 @@ def resume_info(job: dict) -> dict | None:
     # 좌석 단위 재개 요약(HA-09 S1) — 끊기는 자리에서 적는다(_mark_interrupted). 없으면(이 판 이전에 끊긴 잡) 재개 자료가 없다고 답한다.
     # 끝난 라운드는 일지가 더 정확히 안다 — 라운드 끝 줄(e:round_end)은 그 라운드의 턴이 모두 원장에 접힌 뒤에 적히는데, 단계는 다음 라운드에
     # 들어서야 바뀐다(그 사이에 끊기면 단계로는 한 라운드 덜 센다). 제자리 이어하기로 다시 뜬 잡이 단계에 들기 전에 끊기면 단계는 start 다.
-    sr = job.get("seat_resume") if isinstance(job.get("seat_resume"), dict) else delib_resume.Tracker().summary(general=general)
-    if general and total and sr.get("ok") and isinstance(sr.get("round"), int):
+    sr = (job.get("seat_resume") if isinstance(job.get("seat_resume"), dict)
+          else delib_resume.Tracker().summary(stages=stages, done_sk=_done_sk(job)))
+    if one and total and sr.get("ok") and isinstance(sr.get("round"), int):
         done = max(done, min(total, sr["round"] - 1))
     ck = job.get("checkpoint")
     return {"rounds_done": done, "total_rounds": total or None,

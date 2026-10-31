@@ -26,6 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 import delib_jobs
+import delib_resume
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
 import external_llm
 import mcp_pages
@@ -301,7 +302,8 @@ _STATE_DESC = (
     "라운드 뒤부터 남은 라운드만 이어 돈다. 사람 의견은 비워도 된다 · resume 에 끝난 라운드 수가 있다. resume.seat_resume.ok 면 "
     "시작한 사람이 바꾼 값 없이 이을 때 **같은 job_id** 가 seat_resume.round 라운드부터 다시 돌고 — 그 라운드에서 이미 말한 좌석(spoken)은 "
     "다시 부르지 않고 todo 좌석만 부른다. 결정문 뒤에서 끊겼으면(round 가 라운드 수 + 1) 끝난 의장 결정문 · 보고서 · 위키도 다시 하지 "
-    "않는다 — 시도마다 attempts 가 는다). 줄 선 잡(queued)은 서버 "
+    "않는다. 다단 심의 · 시험 설계는 seat_resume.sk 가 끊긴 단(sim-1 · sim-2 · sim-3 · tp)이고 그 단 안에서 잇는다(끝난 단과 단 밖의 "
+    "조회 — 좌석 전환 · 사내 자산 · 물성 근거 현황은 다시 하지 않는다). 시도마다 attempts 가 는다). 줄 선 잡(queued)은 서버 "
     "재기동을 넘겨 같은 차례로 다시 선다. 운영이 새 심의를 잠시 멈춘 서버는 시작 · 이어하기를 '점검 중 — 약 N분 뒤 다시"
     "(retry_after_s)' 오류로 거절한다(도는 잡 · 줄 선 잡은 그대로다 — 그때 다시 부른다). "
     + (f"줄은 {delib_jobs.queue_max()}건까지 선다(DELIB_JOB_QUEUE_MAX — 운영이 재기동 없이 바꿀 수 있어 지금 값은 deliberate_jobs 의 "
@@ -761,8 +763,13 @@ def _resume_in_place(prev: dict, res, *, user: str) -> dict:
                + " 중에 끊겨 이미 저장됐을 수 있다 — 새로 저장하니 RA 에서 같은 보고서가 둘인지 확인하라")
     else:
         nxt = f"{chair}. " + ("보고서 단계" if post.get("plain") else "요약 · 쉬운 설명") + "부터 이어 간다"
+    # 다단 심의 · 시험 설계(HA-09 S4) — 끊긴 단 안에서 잇는다. 끝난 단과 단 밖의 조회(좌석 전환 · 사내 자산 · 물성 근거 현황)는 다시 하지 않는다
+    stage = {delib_resume.SIM1: "1단(메커니즘) 안에서 ",
+             delib_resume.SIM2: "끝난 1단(메커니즘)과 단 사이의 좌석 전환 · 사내 자산 현황은 다시 하지 않고 2단(해석 설계) 안에서 ",
+             delib_resume.SIM3: "끝난 1 · 2단은 다시 돌지 않고 3단(구축 계획) 안에서 ",
+             delib_resume.TP: "물성 근거 현황은 다시 조회하지 않고 "}.get(info.get("sk"), "")
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + [
-        "끊긴 심의를 같은 잡(같은 job_id)에서 잇는다 — "
+        "끊긴 심의를 같은 잡(같은 job_id)에서 잇는다 — " + stage
         + (f"끝난 {k}라운드는 좌석 · 근거 · 지식카드 · 발언을 다시 부르지 않고 되살리고 " if k else
            "끊기기 전의 좌석 · 근거 · 지식카드를 되살리고 ")
         + (f"{rn}라운드부터 돈다" if k < n else nxt)
@@ -794,7 +801,8 @@ _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 adva
                  "이 도구 한 번으로 잇는다 — 시작한 사람이 바꾼 값 없이 이으면 **같은 job_id** 가 끊긴 라운드부터 다시 돈다(끝난 "
                  "라운드 · 좌석 · 근거 · 지식카드를 다시 부르지 않고 되살리고, 끊긴 라운드에서 이미 말한 좌석도 다시 부르지 않고 나머지 "
                  "좌석만 부른다. 결정문 뒤에서 끊겼으면 끝난 의장 결정문 · 보고서 · 위키를 다시 하지 않는다 — 저장 도중 끊긴 보고서만 "
-                 "경고와 함께 새로 저장한다. 응답 resumed.mode=in_place, 어디서부터인지는 진행 조회의 "
+                 "경고와 함께 새로 저장한다. 다단 심의 · 시험 설계는 끝난 단과 단 밖의 조회(좌석 전환 · 사내 자산 · 물성 근거 현황)를 다시 하지 "
+                 "않고 끊긴 단 안에서 잇는다(resumed.sk). 응답 resumed.mode=in_place, 어디서부터인지는 진행 조회의 "
                  "resume.seat_resume). 그 밖(남 · 재개 자료 없음 · 권한 줄어듦 · 바꾼 값)은 새 잡에서 끝난 라운드 뒤부터 남은 라운드만 "
                  "돈다 — 끝난 라운드의 좌석별 마지막 입장을 요약으로 싣는다(resumed.mode=summary · why). 어느 쪽이든 "
                  "처음 인자(근거 본문 · 지정 좌석 · 사람 의견 · 손잡이)를 그대로 쓴다(그 잡에는 화두 · 종류를 바꿀 수 없다). "

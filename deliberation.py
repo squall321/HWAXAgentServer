@@ -2926,6 +2926,13 @@ def _quote_validator(ctx: str, where: str = "위 라운드 텍스트"):
 
     return check
 
+def _nn_text(o: dict) -> str:
+    """좌석 원 출력의 양보 불가 조항 전문 — 목록으로 오면 항목을 잇는다(종전엔 파이썬 표기 "['…']" 가 그대로 조항이 됐다). 수렴 라운드의 턴과
+    다단 심의가 다음 단에 넘기는 조항(out["non_negotiables"] — 되살린 수렴 라운드도, HA-09 S4)이 같은 식을 쓴다."""
+    raw = o.get("non_negotiable")
+    return "; ".join(str(x).strip() for x in raw if str(x).strip()) if isinstance(raw, list) else str(raw or "")
+
+
 def _rebut_items(o: dict) -> list:
     """발언의 반박을 **구조 그대로** 꺼낸다 — {target, quote, counter, basis}.
 
@@ -4978,9 +4985,27 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     ckpt = req_opts.pop("resume_checkpoint", None)
     ckpt = ckpt if (isinstance(ckpt, dict) and ckpt.get("stage") in ("sim-1", "sim-2") and str(ckpt.get("decision_a") or "").strip()
                     and (ckpt["stage"] == "sim-1" or (str(ckpt.get("decision_b") or "").strip() and ckpt.get("sim_seats")))) else None
+    # 단 안에서 잇기(HA-09 S4) — 제자리 이어하기의 끊긴 단이 2단 · 3단이면 그 단에 들 때 적은 재개 자료(e:stage_in — 앞 단 결정문 · 조항 · 좌석 ·
+    # 좌석 전환 결과 · 사내 자산 현황 글)로 앞 단 · 좌석 전환 · 현황 조회를 다시 하지 않고 그 단에 든다. 그 단 안은 단 열쇠의 재개 상태로
+    # 되살린다(_deliberation_stream). 둘 다 없으면(끊긴 단이 1단 · 재개 상태 없음) 아래는 지금 길 그대로다.
+    _in2, _in3 = delib_resume.stage_in(delib_resume.SIM2), delib_resume.stage_in(delib_resume.SIM3)
 
     try:
-        if ckpt:
+        if _in3 is not None:
+            # ── 1 · 2단 — 끊기기 전에 끝났다(3단 안에서 끊겼다) ─────────────────────
+            yield _sse("status", {"step": "1 · 2단은 끊기기 전에 끝났다 — 2단 결정문과 좌석을 되살려 3단(구축 계획) 안에서 잇는다"
+                                          "(다시 돌지 않는다)", "tool": None})
+            async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, str(_in3["decision_b"]),
+                                           [dict(x) for x in _in3["seats"]]):
+                yield chunk
+            return
+        if _in2 is not None:
+            # ── 1단 — 끊기기 전에 끝났다(2단 안에서 끊겼다 — 체크포인트와 같은 값) ─────────
+            decision_a, nn_a = str(_in2["decision_a"]), [str(x) for x in _in2["nn_a"]]
+            personas_a = [dict(x) for x in _in2["personas_a"] if isinstance(x, dict)]
+            yield _sse("status", {"step": "1단(메커니즘)은 끊기기 전에 끝났다 — 그 결정문 · 2단 좌석 · 사내 자산 현황을 되살려 2단(해석 설계) "
+                                          "안에서 잇는다(다시 부르지 않는다)", "tool": None})
+        elif ckpt:
             # ── 1단 — 끊기기 전에 끝났다(체크포인트) ─────────────────────────────
             decision_a = str(ckpt["decision_a"])
             personas_a = [x for x in (ckpt.get("personas_a") or []) if isinstance(x, dict) and x.get("key")]
@@ -4992,7 +5017,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             opts_a = _resolve_opts(req_opts)
             opts_a.chair_template = "mechanism"
             async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
-                                                    history, out=out_a):
+                                                    history, out=out_a, sk=delib_resume.SIM1):
                 yield chunk
             decision_a = out_a.get("decision") or ""
             personas_a = out_a.get("personas") or []
@@ -5010,7 +5035,7 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                                  **({"knob": _knob_a} if _knob_a else {})})
             yield _sse("done", {}); return
 
-        if ckpt and ckpt["stage"] == "sim-2":
+        if ckpt and ckpt["stage"] == "sim-2" and _in2 is None:
             # ── 2단 — 끊기기 전에 끝났다(체크포인트) — 3단(구축 계획)부터 ──────────────
             sim_seats = [x for x in ckpt["sim_seats"] if isinstance(x, dict) and x.get("key")]
             decision_b = str(ckpt["decision_b"])
@@ -5018,29 +5043,33 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
             async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, decision_b, sim_seats):
                 yield chunk
             return
-        # ── 좌석 전환 ────────────────────────────────────────────────────────
-        yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
-        tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-        sim_seats, seen = [], set()
+        if _in2 is not None:
+            # 좌석 전환 — 끊기기 전의 결과(S4). 발굴 · 역할 복원을 다시 부르지 않는다
+            sim_seats = [dict(x) for x in _in2["seats"]]
+        else:
+            # ── 좌석 전환 ────────────────────────────────────────────────────────
+            yield _sse("status", {"step": "좌석 전환 — CAE 전문가 발굴", "tool": "recommend_agents"})
+            tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+            sim_seats, seen = [], set()
 
-        async def _add(key, origin):
-            if not key or key in seen:
-                return
-            seen.add(key)
-            sim_seats.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
+            async def _add(key, origin):
+                if not key or key in seen:
+                    return
+                seen.add(key)
+                sim_seats.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
 
-        for k in _SIM_FIXED_CAE:
-            await _add(k, "new")
-        # 1단 결론의 물리 축으로 발굴 — 현상 어휘가 아니라 계산의 성격으로 찾아야 CAE 가 잡힌다.
-        for cand in await _discover(tools, f"{question}\n\n{decision_a[:1500]}\n\n수치해석 시뮬레이션 모델링",
-                                    3, exclude=seen, origin="new"):
-            await _add(cand["key"], "new")
-        # 물리 유임 — 없으면 해석이 물리에서 떠난다. 1단 좌석 앞에서 강제로 채운다.
-        for pa in personas_a[:max(1, _SIM_CARRY)]:
-            await _add(pa["key"], "carry")
-        n_carry = sum(1 for x in sim_seats if x["origin"] == "carry")
-        yield _sse("status", {"step": f"2단 좌석 {len(sim_seats)}인 (CAE {len(sim_seats) - n_carry} · 물리 유임 {n_carry})",
-                              "tool": None, "personas": [x["key"] for x in sim_seats]})
+            for k in _SIM_FIXED_CAE:
+                await _add(k, "new")
+            # 1단 결론의 물리 축으로 발굴 — 현상 어휘가 아니라 계산의 성격으로 찾아야 CAE 가 잡힌다.
+            for cand in await _discover(tools, f"{question}\n\n{decision_a[:1500]}\n\n수치해석 시뮬레이션 모델링",
+                                        3, exclude=seen, origin="new"):
+                await _add(cand["key"], "new")
+            # 물리 유임 — 없으면 해석이 물리에서 떠난다. 1단 좌석 앞에서 강제로 채운다.
+            for pa in personas_a[:max(1, _SIM_CARRY)]:
+                await _add(pa["key"], "carry")
+            n_carry = sum(1 for x in sim_seats if x["origin"] == "carry")
+            yield _sse("status", {"step": f"2단 좌석 {len(sim_seats)}인 (CAE {len(sim_seats) - n_carry} · 물리 유임 {n_carry})",
+                                  "tool": None, "personas": [x["key"] for x in sim_seats]})
 
         # ── 2단 — 해석 설계 심의 ─────────────────────────────────────────────
         yield _sse("status", {"step": "2단 — 해석 설계 심의", "tool": None})
@@ -5055,8 +5084,9 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         _smax = _summary_max()
         opts_b.continue_summary = decision_a[:_smax]
         opts_b.continue_non_negotiables = nn_a[:_NN_MAX]
-        for _c in _carry_cut_cards("1단 결정문", decision_a, _smax, "2단", nn_a):
-            yield _c
+        if _in2 is None:        # 되살렸으면(S4) 이 카드는 끊기기 전에 이미 원장에 실렸다 — 다시 내지 않는다
+            for _c in _carry_cut_cards("1단 결정문", decision_a, _smax, "2단", nn_a):
+                yield _c
         opts_b.continue_personas = sim_seats
         # 호출자의 사람 의견·지정 좌석은 **1단의 입력**이다(hwax-sim-deliberate.js 의 humanNote 도 '1단에 주입할
         # 사람 의견' 이다). 여기서는 이어 붙이지 않는다 — 1단 좌석 전원이 그 의견을 받았고, 그 방향은 1단
@@ -5066,16 +5096,25 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
         # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
         # 실제 보유 목록과 어긋난다 — 계획서가 없는 도구를 쓰자고 하거나, 있는 물성을 새로
         # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
-        try:
-            yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
-            _tools_b = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-            _snap = await _asset_snapshot(_tools_b, question)
-            opts_b.human_note += "\n\n" + _snap
-        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
-            print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
+        if _in2 is not None:
+            opts_b.human_note += _in2["note"]       # 끊기기 전에 붙인 현황 글 그대로(S4) — 다시 조회하지 않는다
+        else:
+            _snap_add = ""          # 사람 의견에 붙인 글 — 2단에 들 때의 재개 자료(e:stage_in)에 그대로 적는다
+            try:
+                yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
+                _tools_b = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+                _snap_add = "\n\n" + await _asset_snapshot(_tools_b, question)
+            except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+                print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
+            opts_b.human_note += _snap_add
+            # 재개 자료(HA-09 S4 — e:stage_in) — 2단에 들 때의 값. 2단 안에서 끊겨 이으면 1단 · 좌석 전환 · 현황 조회를 다시 하지 않고 이 값으로
+            # 든다. 앞 단 산출은 체크포인트와 같은 값이다(요약 길은 원장의 체크포인트를, 제자리 이어하기는 이 줄을 읽는다).
+            delib_resume.write(delib_resume.SIM2, "e:stage_in", sync=True, decision_a=decision_a, nn_a=list(nn_a),
+                               personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
+                               seats=sim_seats, note=_snap_add)
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat,
-                                                history, out=out_b):
+                                                history, out=out_b, sk=delib_resume.SIM2):
             yield chunk
         decision_b = out_b.get("decision") or ""
         if opts.build_plan and decision_b:
@@ -5098,6 +5137,9 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     build_plan 이 꺼져 있으면 종전 2단 동작 그대로(아무것도 내지 않는다). 2단 체크포인트로 이어 돌 때도 이 길이다(HA-09)."""
     if not (opts.build_plan and decision_b):
         return
+    # 3단 안에서 잇는다(HA-09 S4) — 들 때의 값(decision_b · sim_seats)은 부르는 쪽이 재개 자료(e:stage_in)에서 넘겼다. 아래 카드는 끊기기 전에 이미
+    # 원장에 실렸고 그 줄은 새 일지에 옮겨 적혔다 — 다시 내지도 적지도 않는다.
+    _in3 = delib_resume.stage_in(delib_resume.SIM3)
     yield _sse("status", {"step": "3단 — 구축 계획 심의", "tool": None})
     opts_c = _resolve_opts(req_opts)
     opts_c.req_cut = {}
@@ -5108,26 +5150,33 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     # 2단 결정문(sim_spec 포함) — 종전 20,000자가 바닥이고 넓은 창은 이어하기 요약 몫까지(_summary_max).
     _smax_c = max(20000, _summary_max())
     opts_c.continue_summary = decision_b[:_smax_c]
-    for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
-        yield _c
+    if _in3 is None:
+        for _c in _carry_cut_cards("2단 결정문", decision_b, _smax_c, "3단"):
+            yield _c
     opts_c.continue_personas = [{"key": s["key"], "role": s.get("role", ""), "origin": "carry"}
                                 for s in sim_seats]
     opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
                          "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
     build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
-    async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history):
+    if _in3 is None:
+        # 재개 자료(HA-09 S4 — e:stage_in) — 3단에 들 때의 값. 3단 안에서 끊겨 이으면 1 · 2단을 다시 돌지 않고 이 값으로 든다.
+        delib_resume.write(delib_resume.SIM3, "e:stage_in", sync=True, decision_b=decision_b,
+                           seats=[{"key": s["key"], "role": s.get("role", ""), "origin": s.get("origin")} for s in sim_seats])
+    async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history, sk=delib_resume.SIM3):
         yield chunk
 
 
 def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: str, free_pool: dict, looks: bool) -> list:
-    """되살린 단계의 알림(HA-09 S1 · S2 · S3 A5.5) — 상태줄 한 줄과 카드 한 장. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
+    """되살린 단계의 알림(HA-09 S1 · S2 · S3 · S4 A5.5) — 상태줄 한 줄과 카드 한 장. 다단 심의 · 시험 설계면 끊긴 단(상태줄 머리)과 다시 하지 않은
+    앞 단 · 단 밖 조회(카드)를 함께 말한다. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
     조회가 끊기기 전의 것이라는 것, 끊긴 라운드(cutd — 라운드 수가 같을 때만 있다)에서 끊기기 전에 말한 좌석은 다시 부르지 않고 나머지만 부른다는
     것과 그 라운드의 조회를 다시 하는지(looks — 지금 엔진이 그 라운드에서 자유 조회를 하는가), 결정문 뒤에서 끊겼으면 끝난 단계(의장 · 요약 · 쉬운
     설명 · 보고서 · 위키)를 다시 하지 않는다는 것과 저장 도중 끊긴 보고서는 새로 저장한다는 것, 그리고 끊기기 전과 다른 것(화두 블록 지문 · 엔진 판 ·
     모델 창 · 사라진 조회 도구 · 라운드 수)이 있으면 그것까지 — 막지 않는다(남은 좌석은 지금 것으로 말한다)."""
     pre, info = rsv.pre, rsv.info
     n, ro, n_seats = int(opts.rounds), int(getattr(opts, "rounds_so_far", 0) or 0), len(seats)
+    sk = info.get("sk")         # 끊긴 단(S4) — 다단 심의 · 시험 설계는 그 앞에 끝난 단 · 단 밖의 조회도 되살렸다
     spoken = [o["persona"] for o in cutd["raw"]] if cutd is not None else []
     todo = [s for s in seats if s not in spoken]
     _ks = lambda xs: ", ".join(xs[:4]) + (" …" if len(xs) > 4 else "")     # noqa: E731 — 좌석 이름은 넷까지(원장 카드는 앞 400자만 싣는다)
@@ -5155,6 +5204,11 @@ def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: s
         step = f"끊기기 전에 끝난 {k}라운드를 되살렸다 — {k + 1 + ro}라운드부터 좌석 {n_seats}석을 다시 부른다"
     else:
         step = f"끊기기 전의 좌석 · 근거 · 지식카드를 되살렸다 — {1 + ro}라운드부터 좌석 {n_seats}석을 부른다"
+    if sk in (delib_resume.SIM1, delib_resume.SIM2, delib_resume.SIM3):
+        step = f"{delib_resume.STAGE_LABEL[sk]} — {step}"
+    stage_t = {delib_resume.SIM2: " 앞 단(1단 메커니즘 심의)과 단 사이의 좌석 전환 · 사내 자산 현황도 끊기기 전의 것을 되살렸다 — 다시 부르지 않았다.",
+               delib_resume.SIM3: " 앞 단(1 · 2단)도 끊기기 전의 것을 되살렸다 — 다시 돌지 않았다.",
+               delib_resume.TP: " 물성 근거 현황도 끊기기 전의 것을 되살렸다 — 다시 조회하지 않았다."}.get(sk, "")
     # 카드는 끊긴 라운드부터 적는다 — 잡 원장은 카드 글을 앞 400자만 싣는다(delib_jobs.OMITTED_TEXT_MAX). 누구를 다시 부르는지가 먼저다.
     # 결정문 뒤에서 끊겼으면 끝난 단계(다시 하지 않는 것)가 먼저다.
     cut_t = ""
@@ -5189,7 +5243,7 @@ def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: s
     gone = sorted(set(x for x in (pre.get("free") or []) if isinstance(x, str)) - set(free_pool or ()))
     if gone:
         diff.append(f"끊기기 전에 있던 자유 조회 도구 {len(gone)}개가 지금은 없다 — {', '.join(gone[:8])}{' …' if len(gone) > 8 else ''}")
-    text = ("끊긴 심의를 같은 잡에서 잇는다(시도 기록은 attempts)." + cut_t
+    text = ("끊긴 심의를 같은 잡에서 잇는다(시도 기록은 attempts)." + cut_t + stage_t
             + " 라운드 전 단계(VOC · 정량 근거 선주입 · 지정 도구 · 좌석 발굴 · 역할 복원 · 지식카드)" + (f"와 끝난 {k}라운드" if k else "")
             + "는 다시 부르지 않고 끊기기 전의 것을 되살렸다 — 근거 · 지식카드 · 조회 결과 · 발언은 끊기기 전의 것이고 다시 조회하지 않았다."
             + "".join(f" {x}." for x in diff))
@@ -5265,17 +5319,28 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     # 재심사 질의(앞 1,000자)가 보는 창 밖으로 밀려난다.
     if _caller_note:
         opts.human_note += "\n\n[호출자가 넣은 사람 의견]\n" + _caller_note
+    # 단 안에서 잇기(HA-09 S4) — 제자리 이어하기면 끊기기 전에 붙인 물성 근거 현황 글(e:stage_in)을 그대로 붙이고 다시 조회하지 않는다. 심의 안은
+    # 단 열쇠(tp)의 재개 상태로 되살린다. 없으면 아래는 지금 길 그대로다.
+    _in = delib_resume.stage_in(delib_resume.TP)
     try:
-        # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
-        try:
-            yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
-            _tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-            opts.human_note += "\n\n" + await _material_evidence_snapshot(_tools, question)
-        except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
-            print(f"[test-plan] snapshot failed: {exc!r}")
+        if _in is not None:
+            yield _sse("status", {"step": "물성 근거 현황은 끊기기 전의 것을 되살렸다 — 다시 조회하지 않는다", "tool": None})
+            opts.human_note += _in["note"]
+        else:
+            # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
+            _snap_add = ""          # 사람 의견에 붙인 글 — 시험 설계에 들 때의 재개 자료(e:stage_in)에 그대로 적는다
+            try:
+                yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
+                _tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
+                _snap_add = "\n\n" + await _material_evidence_snapshot(_tools, question)
+            except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
+                print(f"[test-plan] snapshot failed: {exc!r}")
+            opts.human_note += _snap_add
+            # 재개 자료(HA-09 S4 — e:stage_in) — 이 단에 들 때 붙인 현황 글. 심의 안에서 끊겨 이으면 다시 조회하지 않고 이 글을 붙인다.
+            delib_resume.write(delib_resume.TP, "e:stage_in", sync=True, note=_snap_add)
         q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
              f"목적: {question}")
-        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history):
+        async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history, sk=delib_resume.TP):
             yield chunk
     except Exception as exc:  # noqa: BLE001
         print(f"[test-plan] fatal: {exc!r}")
@@ -6290,6 +6355,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             rounds_data.append((cur, "\n".join(f"• {o['persona']}: {_ser_kind(o, kind)}" for o in cur)))
             if _rr["lost"]:
                 seat_loss.append({"round": rnd, "lost": list(_rr["lost"])})
+            if out is not None and kind == "converge":
+                # 다단 심의가 다음 단에 넘길 조항(HA-09 S4) — 끊지 않았다면 수렴 라운드의 턴을 낼 때 모았다(아래). 되살린 라운드는 턴을 다시 내지
+                # 않으므로 같은 식 · 같은 차례(원 출력 = 끝난 차례)로 모은다 — 빠지면 1단 체크포인트와 2단 좌석의 조항이 끊지 않은 실행과 다르다.
+                for o in cur:
+                    _nn = _nn_text(o)[:_summary_max() if _wide() else _NN_ITEM_MAX].strip()
+                    if _nn and _nn not in out["non_negotiables"]:
+                        out["non_negotiables"].append(_nn)
             continue
         # 끊긴 라운드(HA-09 S2) — 끊기기 전에 말한 좌석(_cback — 원 출력, 끝난 차례)은 다시 부르지 않고, 조회가 끝났으면(_cgat — e:gather) 다시
         # 하지 않는다. 라운드의 좌석은 서로의 이번 라운드 발언을 보지 않아(병렬) 나머지 좌석의 프롬프트는 끊기지 않았을 때와 같다. 아니면(끊긴
@@ -6708,9 +6780,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 # 조항 하나의 길이는 이어하기가 받는 길이와 같다(좁은 창 _NN_ITEM_MAX 1,200자, 넓은 창 _summary_max) —
                 # 종전엔 1백만 토큰 창에서도 1,200자에서 표식 없이 끊겨 이어하기·다단 승계에 갔다. 끊었으면 원래 길이를
                 # 남긴다. 목록으로 오면 항목을 잇는다(종전엔 파이썬 표기 "['…']" 가 그대로 조항이 됐다).
-                _nn_raw = o.get("non_negotiable")
-                _nn_full = ("; ".join(str(x).strip() for x in _nn_raw if str(x).strip())
-                            if isinstance(_nn_raw, list) else str(_nn_raw or ""))
+                _nn_full = _nn_text(o)
                 _nn_cap = _summary_max() if _wide() else _NN_ITEM_MAX
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
                          "stance": _norm_stance(o.get("stance")),

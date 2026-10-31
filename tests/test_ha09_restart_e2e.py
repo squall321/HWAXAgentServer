@@ -548,3 +548,85 @@ def test_TERM_으로_보고서를_저장하던_중에_내려가면_이을_때_�
     assert [c["rid"] for c in _calls(stack, "create_report_draft")] == [77, 78]
     assert "이미 저장됐을 수 있다" in out["note"], out["note"]
     assert "보고서 #78 로 저장됨" in led["decision"] and len(_calls(stack, "wiki_submit_source")) == 1
+
+
+# ── 다단 심의(HA-09 S4) — 해석 설계 2단 한가운데서 KILL ─────────────────────────────────────────────
+_SIM_START = {**START, "job": "sim-plan"}
+_SEAT_SWITCH = ("recommend_agents", "get_agent_session", "list_tool_apps", "database_summary")
+
+
+def _all_calls(stack: _Stack) -> list:
+    try:
+        return [json.loads(x) for x in stack.calls.read_text(encoding="utf-8").splitlines() if x]
+    except FileNotFoundError:
+        return []
+
+
+def _wait_sim2(base: str, jid: str, stage: str, timeout_s: float = 120.0) -> dict:
+    """2단(1단 체크포인트 뒤)의 그 단계에 들 때까지 — 1단의 같은 이름 단계는 넘긴다. 2단에서 그 단계를 건너뛰었으면 곧바로 실패다."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        st = _mcp(base, "deliberate_status", {"job_id": jid})
+        if st.get("checkpoint") and st.get("stage") == stage:
+            return st
+        if st.get("checkpoint") and re.fullmatch(r"r\d+", str(st.get("stage"))) and int(st["stage"][1:]) > int(stage[1:]):
+            pytest.fail(f"2단 {stage} 를 진행 조회가 놓쳤다(이미 {st['stage']}) — 가짜 LLM 이 너무 빠르다(STEP_S)")
+        if st.get("status") not in ("running", "queued"):
+            pytest.fail(f"2단 {stage} 에 들기 전에 끝났다 — {st.get('status')} · {st.get('error')}")
+        time.sleep(0.05)
+    pytest.fail(f"{jid} 가 {timeout_s:.0f}초 안에 2단 {stage} 에 닿지 않았다")
+
+
+def test_KILL_로_해석_설계_2단_한가운데서_죽어도_이으면_1단_좌석_전환_자산_현황을_다시_하지_않고_2단_안에서_잇는다(stack_ra):
+    """다단 심의(HA-09 S4 — 설계 A6 S4) — 해석 설계 2단 3라운드의 좌석 호출이 붙잡힌 채 KILL. 다시 뜨면 재개 요약이 끊긴 단(sim-2)과 라운드를
+    싣고, 이으면 같은 잡이 2단 3라운드부터 돈다 — 가짜 LLM 이 받은 호출은 2단 3 · 4라운드 좌석과 2단 의장 · 요약 · 쉬운 설명뿐이고(1단 호출 0),
+    가짜 게이트웨이는 좌석 전환(발굴 · 역할 복원)과 사내 자산 현황 호출을 받지 않는다. 전사는 끊지 않은 실행의 칸을 단마다 좌석마다 한 번
+    채우고 1단의 턴은 그대로다(단마다 라운드를 1부터 센다 — 앞 단의 턴을 라운드 번호로 빼지 않는다)."""
+    stack = stack_ra
+    stack.base_env = {**stack.base_env, "DELIB_SIM_SPINE": "0"}          # 2단 고정 CAE 좌석을 둘로(시험 시간 — 좌석 수는 이 시험이 보지 않는다)
+    jobs = stack.tmp / "jobs"
+    base, proc, _log = stack.agent(jobs, "a")
+    stack.llm_delay(FAST_S)
+    jo = _mcp(base, "deliberate_start", _SIM_START)["job_id"]
+    assert _wait(base, jo, timeout_s=180)["status"] == "done"
+    oracle = _turns(base, jo)
+    assert {c["tool"] for c in _all_calls(stack)} >= set(_SEAT_SWITCH), "시험 전제 — 끊지 않은 실행이 좌석 전환 · 사내 자산 현황을 불렀다"
+    stack.llm_delay(STEP_S)
+    jid = _mcp(base, "deliberate_start", _SIM_START)["job_id"]
+    _wait_sim2(base, jid, "r2")
+    stack.llm_delay(HOLD_S)                        # 2단 2라운드 호출은 이미 나갔다 — 그 뒤 3라운드 호출이 붙잡힌다
+    _wait_sim2(base, jid, "r3")
+    pre = _turns(base, jid)
+    n1 = len(SEATS) * ROUNDS
+    proc.kill()
+    assert proc.wait(timeout=10) == -signal.SIGKILL
+    seen = len(_all_calls(stack))
+    base2, _p2, _log2 = stack.agent(jobs, "b")
+    st = _mcp(base2, "deliberate_status", {"job_id": jid})
+    sr = st["resume"]["seat_resume"]
+    seats2 = st["seats"]
+    assert len(pre) == n1 + 2 * len(seats2), f"시험 전제 — 1단 전부와 2단 1 · 2라운드의 턴: {len(pre)}"
+    assert (st["status"], sr["ok"], sr["sk"], sr["round"], sr["spoken"], sr["todo"]) == ("interrupted", True, "sim-2", 3, [], seats2), st
+    assert (st["resume"]["rounds_done"], st["resume"]["checkpoint"]) == (0, "sim-1"), st["resume"]
+    assert _turns(base2, jid) == pre, "접은 원장의 전사가 죽기 직전과 다르다"
+    stack.llm_delay(FAST_S)                        # 호출 수를 0 으로 — 이은 실행의 LLM 호출만 센다
+    out = _mcp(base2, "deliberate_continue", {"previous_job_id": jid})
+    r = out["resumed"]
+    assert out["job_id"] == jid and (r["mode"], r["sk"], r["round"], r["todo"]) == ("in_place", "sim-2", 3, seats2), out
+    assert "2단(해석 설계) 안에서" in out["note"], out["note"]
+    done = _wait(base2, jid, timeout_s=180)
+    assert done["status"] == "done" and len(done["attempts"]) == 1 and done["attempts"][0]["sk"] == "sim-2", done
+    stats = stack.llm_stats()
+    assert stats["calls"] == 2 * len(seats2) + 3, f"이은 실행의 LLM 호출이 2단 3 · 4라운드 좌석 + 의장 · 요약 · 쉬운 설명이 아니다: {stats['calls']}"
+    recent = list(zip(stats["systems"], stats["humans"]))[-stats["calls"]:]
+    who = lambda mark: sorted(re.search(r"당신은 '([^']+)' 전문가", sy).group(1) for sy, hu in recent  # noqa: E731
+                              if "전문가입니다" in sy and mark in hu)
+    assert who("수용(concede)") == sorted(seats2) and who("최종 입장(final_position") == sorted(seats2), "2단 3 · 4라운드 좌석이 아니다"
+    assert not who("당신의 관점(lens"), "1라운드(1단이든 2단이든)를 다시 불렀다"
+    later = [c["tool"] for c in _all_calls(stack)[seen:]]
+    assert not [t for t in later if t in _SEAT_SWITCH], f"좌석 전환 · 사내 자산 현황을 다시 불렀다 — {later}"
+    turns = _turns(base2, jid)
+    key = lambda ts: sorted((t["display_round"], t["persona"]) for t in ts)  # noqa: E731
+    assert key(turns) == key(oracle) and len(turns) == len(oracle), "끊긴 잡이 끊지 않은 실행의 칸을 단마다 좌석마다 한 번 채우지 않았다"
+    assert turns[:len(pre)] == pre, "끊기기 전의 턴(1단 전부 · 2단 1 · 2라운드)이 바뀌었거나 빠졌다"
+    assert not (jobs / "journal" / f"{jid}.jsonl").exists() and not (jobs / "args" / f"{jid}.json").exists()
