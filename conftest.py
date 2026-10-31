@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 두 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -60,6 +60,11 @@ os.environ["CHAT_CONFIRM_GATE"] = "0"
 # 켠 채(기본) 둔다 — 허브를 건너는 호출만 막아 남의 턴 시험의 호출 수 · 글이 바뀌지 않는다. 켠 꼴 · 끈 꼴은 그 행 시험이 app._XHUB_GATE 로 고정한다
 # (tests/test_request_1030_ha30.py · HWAXPortal docs/request-1030 design-integration C-5).
 for _k in ("CHAT_XHUB_ID_GATE", "CHAT_STATUS_WAIT_POLL_S", "CHAT_STATUS_TOOLS"):
+    os.environ.pop(_k, None)
+
+# 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES — ui_panels 가 import 때 한 번 읽는다)도 지운다 — 박스 우회 값(=0)을 내보낸 셸에서 돌리면
+# 기본 꼴(표지를 따른다 · 256 KiB)을 보는 시험이 흔들린다. 끈 꼴은 그 시험이 ui_panels.ON 으로 고정한다(HWAXPortal docs/request-1027 HA-20).
+for _k in ("CHAT_UI_HOST", "UI_RESOURCE_MAX_BYTES"):
     os.environ.pop(_k, None)
 
 

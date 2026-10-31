@@ -109,6 +109,7 @@ import sc_gate as _sc_gate   # 자기검증 관문 — 바꿀 곳을 이번 턴 
 import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 — 이름으로 가져오면 엔진을 다시 읽은 뒤(시험의 reload) 다른 문맥 변수를 쥔다
 import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
+import ui_panels as _ui   # 포털 챗의 MCP Apps 패널 — 표지가 있는 턴만 패널 도구를 묶고 ui_resource 를 낸다(HWAXPortal docs/request-1027 HA-20)
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -1142,6 +1143,9 @@ class ChatRequest(BaseModel):
     # 분석 루틴(HWAXPortal docs/analysis-routines R3) — {id, version?, inputs}(새 실행) 또는 {run_id}(이어서 · 다시 붙기). delib_opts 처럼 원 사전으로
     # 받고 실행기(routine.py)가 검사한다. 포털 ChatRequest 에도 같은 칸이 있어야 한다 — 어느 한쪽이라도 빠지면 조용히 버려져 일반 챗이 돈다.
     routine: dict | None = None
+    # MCP Apps 패널을 그릴 수 있다는 표지(HWAXPortal docs/request-1027 HA-20) — 포털이 박스 손잡이(MCP_APPS_HOST) · feat:panels · 화면의 표지가
+    # 다 있을 때만 "mcp-apps/1" 을 싣는다. 그 턴만 패널 도구를 묶고 ui_resource 를 낸다(_ui_host). 비거나 다른 값이면 HA-05 그대로다.
+    ui_host: str = ""
 
 
 # 기능 권한 이름(사람용) — 포털 access.yaml 의 label 과 같다.
@@ -2206,8 +2210,15 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         if getattr(tool, "name", "") == "invoke_tool":
             for _args in (kw, *(x for x in a if isinstance(x, dict))):
                 _inner = _args.get("name") if isinstance(_args, dict) else None
-                if isinstance(_inner, str) and _agent_denied(_inner):
-                    if _chat_panel_tool(_inner):
+                if isinstance(_inner, str) and (_agent_denied(_inner) or _ui.known(_inner)):
+                    if _chat_panel_tool(_inner) or _ui.known(_inner):
+                        # 패널 도구는 invoke_tool 로는 늘 막는다 — 사건(ui_resource)이 도구 목록의 `_meta` 를 봐야 해서다(HA-20). 패널을 그리는
+                        # 턴이면 직접 묶여 있으니 그 이름으로 부르라고 말한다.
+                        if _ui.TURN.get() is not None:
+                            print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 패널 도구는 이름으로 직접 부른다(경유로는 패널이 안 뜬다)")
+                            msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 패널 도구는 invoke_tool 로 부르면 패널이 뜨지 않는다 — "
+                                   "이 대화에 직접 묶인 그 이름으로 부른다(묶여 있지 않으면 이 턴에는 쓸 수 없다). 인자 문제가 아니다")
+                            return _refuse(tool, msg)
                         print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 패널 전용 도구(이 대화는 패널을 그리지 못한다)")
                         msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 패널을 그리는 클라이언트 전용 도구라 이 대화에서는 "
                                "쓰지 않는다(패널이 그려지지 않는다). 같은 일을 하는 일반 도구(예: 실행 준비 prepare_run · 업로드 도구)로 한다. "
@@ -2282,6 +2293,11 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
             elif _inner_def and (_ia is None or isinstance(_ia, dict)):
                 kw["arguments"] = {**_inner_def, **(_ia or {})}
         # ── C 호출 — 예외면 ✖ 글로 끝난다(아래 R 걸음을 타지 않는다)
+        # 패널 도구이고 패널을 그리는 턴이면(HA-20) 원 결과 그릇을 건다 — 인터셉터(ui_panels.capture)가 structuredContent · 결과 `_meta` 를 적는다.
+        # 모델에 가는 결과(out)는 바꾸지 않는다.
+        _ui_turn = _ui.TURN.get()
+        _ui_uri = _ui.resource_uri(tool) if _ui_turn is not None else None
+        _ui_tok, _ui_slot = _ui.begin() if _ui_uri else (None, None)
         try:
             out = await orig(*a, **kw)
         except Exception as exc:  # noqa: BLE001 — 인자 검증 실패는 코루틴 안에서 raise 된다(실측).
@@ -2331,6 +2347,15 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                         "같은 도구를 인자만 바꿔 다시 호출하지 말고, 다른 방법으로 답하거나 "
                         "사용자에게 해당 백엔드가 일시적으로 불가하다고 알려라.")
             return _refuse(tool, msg)
+        finally:
+            if _ui_tok is not None:
+                _ui.end(_ui_tok)
+        # ── R0 패널(HA-20) — 성공한 패널 도구 호출이면 ui_resource 사건을 턴 그릇에 둔다(스트림이 그 도구의 끝 사건에서 낸다). 실패 · 막은 호출은
+        # 위에서 끝났다. 결과 `_meta` 는 이 사건에만 실리고 모델 · 근거 블록 · 다음 턴 이력 · 자기검증에는 가지 않는다(B-6 (가)).
+        if _ui_slot is not None and _ui_slot.get("seen"):
+            _tname = getattr(tool, "name", "")
+            _ui_turn.add(_ui.event(tool=_tname, app=(_TOOLS_MAP_CACHE.get("map") or {}).get(_tname, ""), uri=_ui_uri,
+                                   args=kw, slot=_ui_slot))
         # ── R1 접기 · 앱 머리 · 되풀이 꼬리는 경유(invoke_tool)면 안쪽 도구 이름으로 본다
         _eff = getattr(tool, "name", "")
         if _eff == "invoke_tool" and isinstance(kw.get("name"), str):
@@ -3235,6 +3260,24 @@ def _agent_denied(name: str) -> bool:
             or n in _ROUTINE_TOOLS)
 
 
+def _ui_host(req: "ChatRequest") -> bool:
+    """이번 챗 턴이 MCP Apps 패널을 그리는 화면의 턴인가(HA-20) — 포털이 실은 표지가 맞고 박스 손잡이(CHAT_UI_HOST)가 켜져 있을 때만."""
+    return _ui.ON and str(req.ui_host or "").strip() == _ui.HOST_TOKEN
+
+
+def _bindable(tool, allow_panels: bool = False) -> bool:
+    """게이트웨이 도구 목록에서 묶을 수 있는 도구인가. 외부 응답자 과제 · 루틴 도구는 늘 뺀다. 패널 도구(HA-05 이름 집합 · `_meta.ui.resourceUri`)는
+    표지가 있는 턴(allow_panels)에 resourceUri 가 있을 때만 남긴다 — 이름 집합이라도 주소가 없으면 부를 패널이 없다(HA-20). `_meta.ui.visibility`
+    에 "model" 이 없는 도구(패널 전용)는 표지 턴에 모델에 묶지 않는다(표지 없는 턴은 지금 그대로 — HA-05 밖은 바꾸지 않는다)."""
+    n = str(getattr(tool, "name", "") or "").strip().lower()
+    if any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or n in _ROUTINE_TOOLS:
+        return False
+    uri = _ui.resource_uri(tool)
+    if uri or _chat_panel_tool(n):
+        return bool(allow_panels and uri and not _ui.model_hidden(tool))
+    return not (allow_panels and _ui.model_hidden(tool))
+
+
 # 이 서버의 에이전트가 외부 응답자 칸을 실어 부르지 못하는 심의 도구 — 이름 규칙은 _agent_denied 와 같다(게이트웨이 별칭 포함).
 # 게이트웨이는 이 호출을 사용자 신원으로 중계하므로, 지식카드에 숨은 지시를 받은 GLM 턴이 advanced.llm=external 과
 # consent_external: true 를 스스로 달면 외부 심의가 서고 원장에 거짓 동의가 남는다(X-D6). 사람의 동의는 사람의 클라이언트에서만 온다.
@@ -4129,16 +4172,22 @@ def _confirm_health() -> dict:
             "pending": pending, "counts": counts}
 
 
-async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5):
+async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 0.5, allow_panels: bool = False):
     """게이트웨이에서 도구 목록을 받되, **일시적** 실패는 지수 백오프로 재시도한다(간헐 도구
     0개 해소). 게이트웨이 재기동·재연결은 보통 1~2초 내에 끝나므로, 그 창에 걸린 요청이
     도구 없이 응답하던 것을 흡수한다(cae00 '될 때도 안 될 때도' 실증). 401/403 인증 실패는
-    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다. 이 서버의 에이전트가 묶지 않는 도구(_AGENT_DENY_TOOLS)는 여기서 뺀다."""
+    재시도해도 같아서 즉시 던진다 — 지연만 늘 뿐이다. 이 서버의 에이전트가 묶지 않는 도구(_AGENT_DENY_TOOLS)는 여기서 뺀다.
+    allow_panels 는 표지가 있는 챗 턴만 준다(HA-20) — 그때만 패널 도구를 남기고 원 결과를 붙잡는 인터셉터를 단다. 심의 · 카탈로그 · 루틴은
+    주지 않아 패널 도구를 보지 못한다(_bindable). 주지 않으면 클라이언트를 종전 꼴 그대로 만든다."""
     import asyncio as _aio
     last = None
     for i in range(max(1, tries)):
         try:
-            got = [t for t in await MultiServerMCPClient(scoped).get_tools() if not _agent_denied(getattr(t, "name", ""))]
+            client = (MultiServerMCPClient(scoped, tool_interceptors=[_ui.capture]) if allow_panels
+                      else MultiServerMCPClient(scoped))
+            listed = await client.get_tools()
+            _ui.learn(listed)          # 패널 도구 이름 — 어느 길의 목록이든 배운다(invoke_tool 안쪽 이름 막이가 읽는다)
+            got = [t for t in listed if _bindable(t, allow_panels)]
             # 빈 목록도 실패로 본다 — 게이트웨이가 부팅 직후 tools=0 인 과도 상태를 완결로
             # 받으면 도구 없는 에이전트가 만들어진다. 마지막 시도가 아니면 재시도.
             if not got and i < tries - 1:
@@ -4159,7 +4208,8 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
                      query: str = "", sources: list[str] | None = None, user: str = "",
                      user_pat: str = "", first: list[str] | None = None,
-                     core_names: tuple | None = None, prefer: list[str] | None = None):
+                     core_names: tuple | None = None, prefer: list[str] | None = None,
+                     allow_panels: bool = False):
     """ReAct agent whose tools are the gateway's group-filtered set for this caller.
     Cached by group-set; the tools carry the groups header so tool *calls* are scoped too.
     pinned·first·core_names·prefer 는 TOOL_MAX 캡 환경에서만 바인딩 구성을 바꾸므로 그때만
@@ -4184,10 +4234,14 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # ⚠ 자격증명도 키에 있어야 한다. 도구는 만들 때의 Authorization 헤더를 물고 있어서,
     # PAT 가 갱신돼도 캐시된 에이전트는 옛 토큰으로 계속 돌다가 만료되는 순간 도구가 조용히
     # 죽는다. 포털이 30분 창에 맞춰 같은 토큰을 주므로 캐시 적중은 그대로다.
+    # ⚠ 패널 표지(allow_panels)도 키에 있어야 한다 — 표지 턴의 에이전트(패널 도구 · 인터셉터를 묶은)를 표지 없는 턴이 재사용하면 HA-05 가 풀린다.
+    #   자격증명 해시 **앞에** 둔다 — 강등 저장(key[:-1] + 빈 해시)이 마지막 칸을 갈아 끼운다.
     key = (frozenset(groups), pin_key, q_key,
            tuple(sorted(sources)) if sources is not None else None,
            (user or "").strip().lower(),
+           bool(allow_panels),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
+    _snap_key = (frozenset(groups), (user or "").strip().lower(), bool(allow_panels))   # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다
     cache = app.state.agent_cache
     hit = cache.get(key)
     if hit is not None and AGENT_CACHE_TTL_S > 0 and time.time() - getattr(hit, "_hwax_at", time.time()) > AGENT_CACHE_TTL_S:
@@ -4224,7 +4278,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 scoped = _with_groups(connections, sorted(groups), user, user_pat)
                 import asyncio as _aio
                 try:
-                    _got = await _get_tools_retry(scoped)
+                    _got = await _get_tools_retry(scoped, allow_panels=allow_panels)
                 except Exception as _pe:
                     # ⚠ 사용자 PAT 로 붙는 데 실패하면 서비스 계정으로 한 번 되돌아간다.
                     # 챗의 도구 연결은 게이트웨이 하나뿐이라(mcp_servers.json), 이 한 번의
@@ -4241,12 +4295,12 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                     degraded = repr(_pe)[:200]
                     print(f"[agent] tool load: 사용자 PAT 실패 — 서비스 계정으로 재시도 ({degraded})")
                     scoped = _with_groups(connections, sorted(groups), user, "")
-                    _got = await _get_tools_retry(scoped)
+                    _got = await _get_tools_retry(scoped, allow_panels=allow_panels)
                 _raw = [_prep_tool(t, arg_defaults=_CHAT_ARG_DEFAULTS, chat=True) for t in _got]
                 # 성공분을 스냅샷에 보관(source 게이트·select 전 순수 목록) — 다음 불통 때
                 # 폴백 재료다. 사용자 신원 키라 남에게 재사용되지 않는다.
                 if _raw:
-                    app.state.tool_snapshot[(frozenset(groups), (user or "").strip().lower())] = (
+                    app.state.tool_snapshot[_snap_key] = (
                         _raw, time.time())
                 _raw = gate_sources(_raw, sources)
                 raw_pool = tuple(_raw)
@@ -4282,7 +4336,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
                 print(f"[agent] tool load FAILED groups={sorted(groups)} {detail} ({exc!r})")
                 # ── 스냅샷 폴백 — 게이트웨이가 죽어도 직전 성공 도구로 응답한다(강건성 최상단).
                 #    401(인증) 실패면 스냅샷 도구도 같은 토큰을 물어 무의미하니 폴백하지 않는다.
-                snap = app.state.tool_snapshot.get((frozenset(groups), (user or "").strip().lower()))
+                snap = app.state.tool_snapshot.get(_snap_key)
                 if snap and _st != 401:
                     _snap_raw, _snap_ts = snap
                     _age = int(time.time() - _snap_ts)
@@ -6420,6 +6474,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _turn_status_wait.set(_status_wait_mod.new_turn() if _status_wait_mod.on() else None)       # HA-28
     _turn_confirm.set(_confirm_ctx(req) if CHAT_CONFIRM_GATE else None)   # HA-29 — 주문 판정은 원문을 본다 · 앞 카드의 승인 · 거절도 여기서 가린다
     _turn_sc_raw.set(_sc_raw_box() if box is not None else None)       # HA-27 — 자기검증 감싸개가 준 턴만(원문 그릇)
+    _ui_turn = _ui.Turn() if _ui_host(req) else None                    # HA-20 — 패널을 그리는 화면의 턴만(패널 사건 그릇)
+    _ui.TURN.set(_ui_turn)
     _cctx = _turn_confirm.get() or _ConfirmCtx()     # 관문이 꺼져 있으면 빈 맥락(막지도 보내지도 않는다)
     for _c in _cctx.approved.values():
         _seed_ids |= _int_tokens(_c["args"])          # 승인된 인자의 정수는 사람이 카드에서 본 값이다 — 유령 ID 관문의 출처로
@@ -6527,7 +6583,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                  # 빠져 핵심 38개가 예산 밖에서 덧붙고, dev 16K 에서 16,385
                                  # 토큰으로 400 이 났다(실측: PCB 전문가 + 라미네이트 운영자).
                                  _GUIDE_TOOLS if (operator or op_apps) else None,
-                                 prefer)
+                                 prefer,
+                                 # 패널 표지 턴만 싣는다(HA-20) — 표지 없는 턴은 종전 호출 꼴 그대로다
+                                 **({"allow_panels": True} if _ui_turn is not None else {}))
         # ⚠ 상태줄은 **바인딩된 뒤에** 낸다. 앞에 내면 (a) 조기 반환·예산 절단으로 실제로는
         #   안 붙었을 수 있고 (b) prefer 는 그룹 필터 전 목록이라 그 사용자에게 없는 도구
         #   이름을 "우선 바인딩" 칩으로 그려 준다. 실제로 묶인 것만 말한다.
@@ -6922,6 +6980,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                       **({"call": str(event["run_id"])} if event.get("run_id") else {}),
                                       **({"result_preview": out} if out else {}),
                                       **({"result_full": _hand} if len(_hand) > len(out) else {})})
+                if _ui_turn is not None:
+                    # 패널(HA-20) — 그 도구가 둔 ui_resource 를 이 끝 사건의 call(상태줄과 같은 id)로 낸다
+                    for _uev in _ui_turn.take(str(event.get("name") or ""), _cid2):
+                        yield _sse(_ui.EVENT, _uev)
             elif kind == "on_tool_error":
                 # ⚠ LangChain 은 도구가 **터지면** on_tool_end 대신 이것을 낸다. 아무도
                 # 안 받는 동안 그 호출은 완료 이벤트가 아예 안 나갔다 — 화면에는 인자만
@@ -6957,6 +7019,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), confirm=_cctx.card)
             else:
                 yield _sse("token", {"delta": _cctx.card})
+            for _uev in (_ui_turn.rest() if _ui_turn is not None else ()):    # 패널(HA-20) — 이 길에서도 남은 사건을 버리지 않는다
+                yield _sse(_ui.EVENT, _uev)
             yield _sse("result", {"type": "text", "content": text})
             yield _sse("done", {})
             return
@@ -7391,6 +7455,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 yield _sse("token", {"delta": _ev})
         except Exception as exc:  # noqa: BLE001 — 근거 표기 실패가 답변을 못 죽인다
             print(f"[agent] evidence block failed: {exc!r}")
+    if _ui_turn is not None:
+        # 패널(HA-20) — 끝 사건이 없던 길(재시도의 ainvoke)의 ui_resource 를 call 없이 낸다. 결과 · 끝 앞이다(자기검증 감싸개는 그대로 넘긴다)
+        for _uev in _ui_turn.rest():
+            yield _sse(_ui.EVENT, _uev)
     if _turn_models:
         # 답한 모델 · 생각 설정 — 화면이 메시지 아래에 보인다(C3). 챗 서버가 아닌 모델이 섞였으면 넘김이 일어났다.
         _ci = getattr(app.state, "chat_llm_info", None) or {}
