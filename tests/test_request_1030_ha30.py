@@ -101,17 +101,18 @@ def _cache(monkeypatch, mapping, labels):
     monkeypatch.setattr(a, "_gw_apps", lambda: apps)
 
 
-def _rec(name, result, log, *, mcp=False):
+def _rec(name, result, log, *, mcp=False, prep=True):
     """기록하는 도구 — 받은 인자 · 그때 턴 상태가 아는 id(상태가 없으면 None)를 적고 정해 둔 글(또는 인자로 고른 글)을 돌려준다. 사전 스키마라
-    넘긴 인자가 그대로 간다. mcp 면 운영 꼴(content_and_artifact — 내용 블록 목록과 아티팩트)로 돌려준다."""
+    넘긴 인자가 그대로 간다. mcp 면 운영 꼴(content_and_artifact — 내용 블록 목록과 아티팩트)로 돌려준다. prep 이 거짓이면 래퍼로 싸지 않은
+    도구다 — 실제 턴(_agent_for)이 운영처럼 한 겹만 싼다."""
     async def call(**kw):
         st = a._turn_hub_ids.get()
         log.append((name, dict(kw), None if st is None else set(st)))
         text = result(kw) if callable(result) else result
         return ([{"type": "text", "text": text}], None) if mcp else text
-    return a._prep_tool(StructuredTool(name=name, description="d", coroutine=call, args_schema={"type": "object", "properties": {}},
-                                       **({"response_format": "content_and_artifact"} if mcp else {})),
-                        arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True)
+    tool = StructuredTool(name=name, description="d", coroutine=call, args_schema={"type": "object", "properties": {}},
+                          **({"response_format": "content_and_artifact"} if mcp else {}))
+    return a._prep_tool(tool, arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True) if prep else tool
 
 
 def _call(tool, args):
@@ -688,5 +689,157 @@ def test_rv2_실제_턴_사람이_친_id_를_먼저_다른_허브에_물어도_�
         return [c async for c in a._agent_stream(a.app, req)]
     asyncio.run(run())
     assert _names(log) == [tool, "rootdesigndatahub_graph_neighbors"], "정본 그래프 호출이 닿았다"
+    last = [m for m in llm.seen[2] if isinstance(m, ToolMessage)][-1].content
+    assert a._XHUB_ID_MARK not in last and U_PART in last, last[:300]
+
+
+# ── 반대 검토 10-31(R9 ②) — search 결과의 게시판 글(posts[] 의 title · snippet)에만 나온 UUID 는 그 허브 것으로 배우지 않는다 ──────────────
+# 0.4.66(418af00)부터 search 는 게시판 글을 posts 로 싣는다(search/schemas.py SearchPostOut — id · title · author_name · created_at ·
+# comment_count · snippet). 사람이 쓴 글이라 다른 허브 객체의 UUID 를 적을 수 있고, q 로 실어 보낸 id 가 아니면 메아리 예외에도 들지 않는다. 종전엔
+# 그 UUID 를 FailureTrace 것으로 배워 진짜 주인 허브(정본)의 그래프 · 검색 호출이 그 턴 내내 막히고, 'key 를 모르는 id 는 앞 허브의 결과에서 찾는다'
+# 는 거짓 안내를 받았다(글에는 key 가 없다). 발췌는 board/services.py snippet 의 셈 그대로다(q 앞뒤 40자). HWAXPortal docs/request-1030
+# design-ha30 R9 — 사용자 결정 10-31 갈래 ②.
+Q_POST = "솔더 크랙"
+SNIP_RD = f"… {U_RD} 의 솔더 크랙 재현 기록이다. PCB 쪽에서 먼저 보였고 두 번째 낙하에서 커졌다. …"
+FT_HIT = {"id": U_FT, "type_slug": "failure_mode", "type_label": "고장모드", "icon": "", "label": "솔더 접합 불량", "key": "JNT-SLD-01",
+          "matched": "label", "matched_text": "솔더 접합 불량"}
+MAP_R9 = {**MAP_RV2, "rootdesigndatahub_search": "rootdesigndatahub"}
+
+
+def _ft_search(title="솔더 크랙 재현 메모", snippet=SNIP_RD, items=(), indent=None) -> str:
+    """FailureTrace search 의 답(StandardPlatform main 778db2f SearchOut 꼴) — q 는 '솔더 크랙', 글 하나(U_POST)를 싣는다."""
+    types_ = [{"type_slug": "failure_mode", "type_label": "고장모드", "icon": "", "count": len(items), "usage": "axis"}] if items else []
+    post = {"id": U_POST, "title": title, "author_name": "작성자 A", "created_at": "2026-10-29T08:00:00Z", "comment_count": 1,
+            "snippet": snippet}
+    return json.dumps({"q": Q_POST, "total": len(items), "types": types_, "records": 0, "items": list(items), "limit": 20, "offset": 0,
+                       "min_query": 2, "posts": [post], "posts_total": 1}, ensure_ascii=False, indent=indent)
+
+
+def _ask_ft(log, form):
+    """FailureTrace 에 q='솔더 크랙' 을 묻는다 — form 은 정본 UUID 가 든 자리(snippet · title)나 부르는 길(invoke_tool 경유 · 운영 꼴 mcp —
+    내용 블록 목록에 FastMCP 처럼 들여 쓴 JSON)."""
+    body = (_ft_search(title=f"{U_RD} 솔더 크랙 재현 메모", snippet="제목에만 걸린 글의 본문 앞머리다. …") if form == "title"
+            else _ft_search(indent=2) if form == "mcp" else _ft_search())
+    if form == "invoke_tool":
+        return _call(_rec("invoke_tool", body, log), {"name": "failuretrace_search", "arguments": {"q": Q_POST}})
+    return _call(_rec("failuretrace_search", body, log, mcp=form == "mcp"), {"q": Q_POST})
+
+
+R9_OWNER = {"graph": ("rootdesigndatahub_graph_neighbors", {"object_id": U_RD}, RD_GRAPH),
+            "search": ("rootdesigndatahub_search", {"q": U_RD}, json.dumps({**_SEARCH_NONE, "posts": [], "posts_total": 0}))}
+
+
+@pytest.mark.parametrize("owner", list(R9_OWNER))
+@pytest.mark.parametrize("form", ["snippet", "title", "invoke_tool", "mcp"])
+def test_r9_검색_결과의_글에만_나온_다른_허브_id_로_주인_허브를_부르면_보낸다(monkeypatch, turn, form, owner):
+    """FailureTrace search 의 게시판 글(snippet · title)에만 정본의 UUID 가 있다 — 그 id 로 정본을 부르면 막지 않고 보낸다(거짓 안내도 없다)."""
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    _ask_ft(log, form)
+    name, args, body = R9_OWNER[owner]
+    out = _call(_rec(name, body, log), args)
+    assert log[-1][:2] == (name, args) and a._XHUB_ID_MARK not in out, "정본 호출이 막혔다 — " + out
+    assert "앞 허브의 결과에서" not in out and out.endswith(body), out[:300]
+    assert a._xhub_gate_health()["blocked"] == 0
+    assert U_RD not in log[-1][2], "글에만 나온 UUID 는 FailureTrace 것으로 배우지 않았다(정본을 부를 때의 턴 상태)"
+    assert U_RD not in turn or turn[U_RD]["apps"] == {"rootdesigndatahub"}, "정본 그래프의 결과로는 정본 것으로 배운다"
+    assert turn[U_POST]["apps"] == {"failuretrace"}, "글 id 는 그대로 배운다"
+
+
+def test_r9_글_id_와_글_밖에도_나온_id_는_종전처럼_배운다(monkeypatch, turn):
+    """객체 행(items[] — 이름표가 있는 id 자리)의 id 는 글 snippet 에 함께 나와도 종전처럼 이름표째 배우고, 글 id(posts[].id)도 배운다 — 글에만
+    나온 정본 id 만 뺀다."""
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    _call(_rec("failuretrace_search", _ft_search(snippet=f"… {U_FT} · {U_RD} 의 솔더 크랙 재현 기록이다 …", items=[FT_HIT]), log),
+          {"q": Q_POST})
+    assert turn[U_FT] == {"apps": {"failuretrace"}, "hub": "failuretrace", "tool": "failuretrace_search", "key": "JNT-SLD-01",
+                          "type": "failure_mode", "label": "솔더 접합 불량"}, turn
+    assert turn[U_POST] == {"apps": {"failuretrace"}, "hub": "failuretrace", "tool": "failuretrace_search", "key": "", "type": "",
+                            "label": ""}, turn
+    assert U_RD not in turn, turn
+    out = _call(_rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log), {"object_id": U_FT})
+    assert _names(log) == ["failuretrace_search"] and a._XHUB_ID_MARK in out, "FailureTrace 의 객체 행 id 를 정본에 실으면 종전처럼 막는다"
+    assert 'rootdesigndatahub_object_resolve(type_slug="failure_mode", name="JNT-SLD-01")' in out, out
+
+
+@pytest.mark.parametrize("post_first", [True, False])
+def test_r9_글에만_나온_id_는_공유_id_를_만들지_않아_OT07_꼴이_막힌다(monkeypatch, turn, post_first):
+    """정본에서 푼 id 가 FailureTrace 글에도 적혀 있다 — 종전엔 그 글로 FailureTrace 도 '본 허브' 가 되어(공유 id) OT-07 꼴이 지났다."""
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    steps = [(_rec("failuretrace_search", _ft_search(), log), {"q": Q_POST}),
+             (_rec("rootdesigndatahub_object_resolve", RD_RESOLVE, log), RESOLVE_ARGS)]
+    for t, args in steps[::(1 if post_first else -1)]:
+        _call(t, args)
+    assert turn[U_RD]["apps"] == {"rootdesigndatahub"}, turn[U_RD]
+    out = _call(_rec("failuretrace_graph_neighbors", FT_GRAPH, log), {"object_id": U_RD})
+    assert "failuretrace_graph_neighbors" not in _names(log) and out == WANT_OT07, out
+
+
+R9_FALLBACK = {
+    "posts_renamed": ("failuretrace_search", {"q": Q_POST},
+                      lambda d: {**{k: v for k, v in d.items() if k != "posts"}, "board_posts": d["posts"]}),
+    "snippet_renamed": ("failuretrace_search", {"q": Q_POST},
+                        lambda d: {**d, "posts": [{**{k: v for k, v in p.items() if k != "snippet"}, "excerpt": p["snippet"]}
+                                                  for p in d["posts"]]}),
+    "not_search": ("failuretrace_objects_list", {"type_slug": "pd_defect"}, lambda d: d),
+}
+
+
+@pytest.mark.parametrize("form", list(R9_FALLBACK))
+def test_r9_칸_이름이_바뀌거나_search_가_아니면_종전처럼_배운다(monkeypatch, turn, form):
+    """배포판 꼴(search 의 posts[] · title · snippet)에 묶인 예외라 꼴이 다르면 지금 동작으로 돌아갈 뿐이다 — 글의 UUID 도 그 허브 것으로 배워
+    정본 호출이 막힌다(R9 ① 의 동작)."""
+    _cache(monkeypatch, MAP_R9, LABELS)
+    tool, args, reshape = R9_FALLBACK[form]
+    log = []
+    _call(_rec(tool, json.dumps(reshape(json.loads(_ft_search())), ensure_ascii=False), log), args)
+    assert turn[U_RD]["apps"] == {"failuretrace"} and turn[U_RD]["tool"] == tool, turn
+    out = _call(_rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log), {"object_id": U_RD})
+    assert _names(log) == [tool] and a._XHUB_ID_MARK in out, out[:300]
+
+
+@pytest.mark.parametrize("name, body, want", [
+    pytest.param("failuretrace_search", _ft_search(), {U_RD}, id="snippet"),
+    pytest.param("search", _ft_search(), {U_RD}, id="bare_name"),                                       # 허브 하나 박스의 맨 이름
+    pytest.param(" failuretrace_search ", _ft_search(), {U_RD}, id="spaced_name"),                      # 경유의 안쪽 이름은 strip 전이다
+    pytest.param("failuretrace_search", _ft_search(title=f"{U_RD} 솔더 크랙 재현 메모", snippet="제목에만 걸린 글의 본문 앞머리다. …"),
+                 {U_RD}, id="title"),
+    pytest.param("failuretrace_search", _ft_search(snippet=f"… {U_POST} 에 이어 쓴다 — 솔더 크랙 …"), set(),
+                 id="post_id_in_snippet"),                                                             # 글 id 는 글 안에 다시 나와도 글 id 다
+    pytest.param("failuretrace_search", _ft_search(items=[{**FT_HIT, "label": f"솔더 접합 불량 — 정본{U_RD} 의 사본"}]), set(),
+                 id="also_outside_after_hangul"),                                                      # 글 밖(한글 바로 뒤)에도 있다
+    pytest.param("failuretrace_objects_list", _ft_search(), set(), id="not_search"),
+    pytest.param("failuretrace_search", _ft_search()[:-1], set(), id="cut_text"),                       # 상한에서 잘린 글 — JSON 이 아니면 종전대로
+])
+def test_r9_글에만_나온_UUID_를_가른다(name, body, want):
+    assert a._hub_post_only_ids(name, body) == want
+
+
+def test_r9_실제_턴_FailureTrace_글에서_본_정본_id_로_정본_그래프를_부른다(monkeypatch):
+    """한 턴 — FailureTrace 검색이 실은 글에서 정본 id 를 읽은 모델이 정본 그래프를 부른다. 도구는 운영처럼 _agent_for 가 한 겹만 싸고(prep=False)
+    운영 꼴(내용 블록 목록 · 들여 쓴 JSON)로 돌려준다."""
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    tools = (_rec("failuretrace_search", _ft_search(indent=2), log, mcp=True, prep=False),
+             _rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log, mcp=True, prep=False))
+    llm = _HubLLM(script=[("failuretrace_search", {"q": Q_POST}), ("rootdesigndatahub_graph_neighbors", {"object_id": U_RD}), "답 글."])
+    agent = _agent(monkeypatch, llm, tools=tools)
+
+    async def _built(*_a, **_k):
+        return agent
+    monkeypatch.setattr(a, "_agent_for", _built)
+    req = a.ChatRequest(message="FailureTrace 게시판에서 솔더 크랙 글을 찾고, 글에 적힌 정본 고장모드가 무엇과 이어져 있는지 알려줘",
+                        groups=["portal-admin"], history=[])
+
+    async def run():
+        return [c async for c in a._agent_stream(a.app, req)]
+    asyncio.run(run())
+    assert _names(log) == ["failuretrace_search", "rootdesigndatahub_graph_neighbors"], "정본 그래프 호출이 닿았다"
+    assert [kw for n, kw, _ in log if n == "rootdesigndatahub_graph_neighbors"] == [{"object_id": U_RD}]
+    seen = [m for m in llm.seen[1] if isinstance(m, ToolMessage)][-1].content
+    assert U_RD in seen, "전제 — 모델이 받은 검색 결과의 글에 정본 id 가 있다"
     last = [m for m in llm.seen[2] if isinstance(m, ToolMessage)][-1].content
     assert a._XHUB_ID_MARK not in last and U_PART in last, last[:300]
