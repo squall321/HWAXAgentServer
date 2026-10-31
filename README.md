@@ -96,8 +96,10 @@ ChatDock (portal frontend)
   requeue). A job's end write leaves the ledger alone when another process has already closed it (a restart sweep,
   maybe with `resumed_by` on it), so an overlapping old process cannot reopen a resumed job for a second resume. The
   journal follows the args-file rules: removed when the job ends or is resumed
-  by its owner, kept 7 days for an interrupted job. Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line
-  and stops — the fold is then the state up to that line, with a warning. Exact resume is the next bullet (S1).
+  by its owner, kept 7 days for an interrupted job. A temp file left by a process killed while it rewrote the args
+  file or a journal (`args/` · `journal/.<id>.<pid>.tmp`) is removed at startup unless its writer is still alive.
+  Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line and stops — the fold is then the state up to that
+  line, with a warning. Exact resume is the next bullet (S1).
 - **Resume in place at the round boundary** (HA-09 S1 — portal `docs/request-1027/design-ha09-ha20.md` A5.2 – A5.5,
   user decisions 10-31 A-2 · A-3 · A-4 · A-5 · A-6 (가)). An MCP job (single-stage engine `general` under the stage key
   `main`; the multi-stage and test-plan engines under their own stage keys since S4 below) also appends the engine's
@@ -124,15 +126,18 @@ ChatDock (portal frontend)
   caller's current groups still contain the groups of `e:pre` (A-5), then `delib_jobs.start(..., resume=…)` — a keyword
   only the MCP entry passes, never a request option — reopens the job synchronously (`interrupted → queued`, one more
   `attempts {cut_at, resumed_at, by, round, stage}`, turns of the cut round dropped so every seat appears once per round,
-  the journal rewritten atomically to its head plus the carried resume data) and sets `delib_resume.restore` on that job
-  task's context only. The engine then skips the pre-round calls (VOC, prepass, designated tools, discovery, role restore,
-  counter seats, knowledge), rebuilds the topic blocks from the same args and compares their digests, re-emits
+  the journal rewritten atomically to its head plus the carried resume data — the relaunched task does the same
+  temp-file-and-rename rewrite when it opens the journal and appends to it, never truncating it) and sets
+  `delib_resume.restore` on that job task's context only. The engine then skips the pre-round calls (VOC, prepass,
+  designated tools, discovery, role restore, counter seats, knowledge), rebuilds the topic blocks from the same args and
+  compares their digests, re-emits
   `personas`, restores finished rounds (raw outputs, pool, own lookups, as-of counts, flags, evidence counts, learned
   integers, round-1 anchors, lost seats) without calling a seat or re-emitting turns, and runs from the cut round with the
   same prompts the uninterrupted run would have used (same window and engine — a changed window, engine digest, round
   count or vanished free tool is announced on the `끊긴 심의 되살림` card, never blocked). Restored notices are not
-  re-emitted, so `evidence_omitted` holds each card once plus that card. A checkpoint job (`stop_after_round=1`) never
-  restores round 1 as a finished round, so the checkpoint still stops it (S2 continues that round seat by seat). The
+  re-emitted (the free-lookup preparation's cards and warnings included — the tools are fetched again), so
+  `evidence_omitted` holds each card once plus that card. A checkpoint job (`stop_after_round=1`) never restores round 1
+  as a finished round, so the checkpoint still stops it (S2 continues that round seat by seat). The
   answer keeps the job id with `resumed {mode: "in_place", sk, round, spoken, todo, rounds_done, attempt}`; a second
   continue while it runs is refused, and a restart while it waits in the queue
   re-reads the resume data (`_requeue`) or puts the job back to `interrupted` when it cannot. Anyone else (same
@@ -145,7 +150,9 @@ ChatDock (portal frontend)
 - **Resume inside the cut round, seat by seat** (HA-09 S2 — portal design A5.3 third bullet · A6 S2). The cut round (the
   first round without `e:round_end`) is continued, not re-run: seats whose `e:raw` was written before the cut are not
   called again — the engine re-emits their turns from the raw output (the ledger dropped that round's turns at the reopen,
-  so a seat whose raw output was written but whose turn never reached the ledger also appears once) and passes only the
+  so a seat whose raw output was written but whose turn never reached the ledger also appears once; when the transcript
+  cap `DELIB_JOB_TURN_MAX` was reached inside that round, its note row and warning go too, so the re-emitted turns fill
+  the cap where the uninterrupted run did) and passes only the
   remaining seats to `_round_live` (`deliberation._then` puts the restored outputs first). A round's seats never see each
   other's output of that round, so the remaining seats get the prompts the uninterrupted run would have given them. A
   seat that failed before the cut has no raw output and is called again — had the job not been cut it would have been
@@ -168,7 +175,8 @@ ChatDock (portal frontend)
   `knob` · `cause`), `e:plain` after the TL;DR and the plain explanation (the explanation and the decision text with both
   attached), `e:report_intent` right before the Report Archive call (`save`, `append_to`, the title and the decision text
   that is saved — web-citation and number checks attached), `e:report_saved` after the report step (`rid` and the note
-  appended to the decision — a failed save too) and `e:wiki_sent` after the wiki step (its note). They are read only when
+  appended to the decision — a failed save too) and `e:wiki_sent` after the wiki step (its note and `off`, whether the
+  wiki is known to be off). They are read only when
   every round is restored and are carried into the rewritten journal, so a second cut keeps them. Resuming in place skips
   each step whose line is there — no chair · TL;DR · plain-explanation call, no second save (the number and note are
   reused), no second wiki submission — and does not emit that step's status lines, cards or warnings again (they precede
@@ -192,8 +200,11 @@ ChatDock (portal frontend)
   what it fetched outside the stage and what the earlier stage produced: stage 2 — stage 1's decision · clauses · seats
   (the checkpoint values), the seat switch result (`sim_seats` after discovery and role restore) and the in-house asset
   snapshot text appended to stage 2's human note; stage 3 — stage 2's decision and the seats; test plan — the material
-  status text appended to its note. The cut stage is the stage of the **last stage marker** (`e:stage_in` · `e:pre`):
-  stages run in order, so a later marker means the earlier stages finished. Resuming in place enters the cut stage from
+  status text appended to its note. Stages 2 and 3 also record `wiki_off` (an earlier stage already reported the wiki
+  as off — HA-08 reports it once per job); a stage entered from `e:stage_in`, like a restored wiki step (`e:wiki_sent`
+  `off`), restores that state, so a later stage does not append the off note again. The cut stage is the stage of the
+  **last stage marker** (`e:stage_in` · `e:pre`): stages run in order, so a later marker means the earlier stages
+  finished. Resuming in place enters the cut stage from
   its `e:stage_in` — no stage-1 or stage-2 calls, no seat switch (`recommend_agents` · `get_agent_session`), no asset or
   material snapshot calls, and the carry-cut card `다단 승계 상한 초과` is not emitted again — and inside the stage
   S1 – S3 apply unchanged. Nothing is restored, and the summary path skips the finished stages by the ledger checkpoint

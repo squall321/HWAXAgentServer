@@ -286,7 +286,8 @@ def test_이은_실행이_또_끊겨도_앞_시도의_결정문_뒤_단계가_�
     one = _result(w3, {"id": jid})
     w3.reset()
     assert len(one["reports"]) == 1 and one["led"]["report_id"] == 78
-    lines = [rec for rec, _d in again]
+    # 새 일지의 줄 — 이은 실행이 마지막 줄을 적은 때의 일지 파일(머리와 옮겨 쓴 재개 자료는 바꿔 넣기로 들어가 _write 를 지나지 않는다)
+    lines = [json.loads(x) for x in again[-1][1][f"journal/{jid}.jsonl"].splitlines()]
     assert [x["k"] for x in lines if x["k"] in _POST] == list(_POST), "결정문 뒤 줄을 옮겨 적지 않았거나 두 번 적었다"
     _out, res, wiki = _resume_at(w3, monkeypatch, tmp_path, "b", _cut(again, _eng("e:report_saved")))
     a = res["led"]

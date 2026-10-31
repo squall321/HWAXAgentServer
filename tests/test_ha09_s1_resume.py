@@ -329,6 +329,7 @@ def _check_resumed(o: dict, res: dict, first_round: int, *, spoken=(), gathered:
     assert (a["status"], a["decision"], a["result_text"], a["report_id"]) == (b["status"], b["decision"], b["result_text"], b["report_id"])
     assert _turn_rows(a) == _turn_rows(b), "전사가 끊지 않은 실행과 다르다(좌석마다 한 번이 아니다)"
     assert [c for c in a["evidence_omitted"] if c["source"] != "끊긴 심의 되살림"] == b["evidence_omitted"], "알림 카드가 두 번 실렸다"
+    assert (a.get("warnings"), a.get("warnings_total")) == (b.get("warnings"), b.get("warnings_total")), "경고가 두 번 실렸다"
     assert [c["source"] for c in b["evidence_omitted"]].count("요청 값 해석 불가") == 1, "시험 전제 — 라운드 전 단계의 알림 카드가 있다"
 
 
@@ -362,6 +363,37 @@ def test_끊긴_자리에서_같은_잡을_이으면_남은_좌석_프롬프트�
     notes = [c for c in a["evidence_omitted"] if c["source"] == "끊긴 심의 되살림"]
     assert len(notes) == 1 and "다시 조회하지 않았다" in notes[0]["text"], notes
     assert ("끊기기 전에 말한 2석(" in notes[0]["text"]) is (where == "mid2"), notes[0]["text"]
+
+
+@pytest.mark.parametrize("case", ["지정 앱", "조회 도구 없음", "준비 실패"])
+@pytest.mark.parametrize("where, first", [("r2", 3), ("mid2", 2)])
+def test_자유_조회_준비의_알림_카드와_경고는_되살릴_때_다시_내지_않는다(world, monkeypatch, tmp_path, case, where, first):
+    """좌석 자유 조회를 준비할 때의 알림 — 지정한 앱의 조회 도구를 찾지 못해 좁히지 못했다(카드 '지정 앱 범위 제한 불가') · 쓸 조회 도구가
+    하나도 없다(경고 free_tools_unavailable · 카드 '자유 조회 불가') · 준비하다 예외가 났다(경고 free_tools_failed) — 은 라운드 전 단계의 것이라
+    끊기기 전에 이미 원장에 있다. 이으면 게이트웨이 도구는 다시 받지만 그 알림은 다시 내지 않는다(다른 라운드 전 알림과 같다 — 원장에 카드 ·
+    경고가 끊지 않은 실행처럼 한 번, 검토 10-31). 원 실행도 이은 실행도 같은 조건이다(도구-앱 매핑이 비었다 · 허용 접두에 걸리는 도구가 없다 ·
+    준비가 터진다)."""
+    opts = copy.deepcopy(OPTS)
+    if case == "지정 앱":
+        opts["apps"] = ["no-such-app"]
+    elif case == "조회 도구 없음":
+        monkeypatch.setattr(d, "_free_tool_ok", lambda _n: False)
+    else:
+        def boom(_budget):
+            raise RuntimeError("자유 조회 준비 실패")
+        monkeypatch.setattr(d, "_free_result_chars", boom)
+    snaps: list = []
+    o = _oracle(world, monkeypatch, snaps, opts=opts)
+    card, warn = {"지정 앱": ("지정 앱 범위 제한 불가", None), "조회 도구 없음": ("자유 조회 불가", "쓸 수 있는 조회 도구가"),
+                  "준비 실패": (None, "준비하지 못했습니다")}[case]
+    srcs, warns = [c["source"] for c in o["led"]["evidence_omitted"]], o["led"].get("warnings") or []
+    assert (card is None or srcs.count(card) == 1) and (warn is None or len([w for w in warns if warn in w]) == 1), \
+        f"시험 전제 — 끊지 않은 실행이 그 알림을 한 번 냈다: {srcs} {warns}"
+    snap = _cut(snaps, _turn_line(2), nth=2) if where == "mid2" else _cut(snaps, _eng("e:round_end", 2))
+    jid = _restart(monkeypatch, tmp_path, where, snap)
+    out = _continue(jid)
+    assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place", out["resumed"]
+    _check_resumed(o, _result(world, {"id": jid}), first, spoken=SEATS[:2] if where == "mid2" else (), gathered=where == "mid2")
 
 
 def test_정상_종료로_끊겨도_같은_잡이_끊긴_라운드부터_끊지_않은_실행과_같게_돈다(world, monkeypatch, tmp_path):
@@ -428,6 +460,82 @@ def test_제자리로_줄_섰다가_재기동해도_재개_자료로_다시_선�
         delib_jobs._pump()
         await _settle_all()
     asyncio.run(go())
+    _check_resumed(o, _result(world, {"id": jid}), 3)
+
+
+class _OsSnap:
+    """delib_jobs 가 부르는 os — 파일을 바꾸는 호출(open · write · replace · ftruncate)이 끝날 때마다 디스크를 뜬다(on 일 때만). 프로세스가 그 호출
+    뒤에 죽은 꼴이다(KILL · 메모리 고갈 — 커널이 쥔 쓰기는 남는다). 나머지는 진짜 os 그대로다."""
+
+    def __init__(self, real, out: list):
+        self._real, self._out, self.on = real, out, False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def _snap(self):
+        if self.on:
+            self._out.append(_disk())
+
+    def open(self, *a, **k):
+        fd = self._real.open(*a, **k)
+        self._snap()
+        return fd
+
+    def write(self, *a, **k):
+        n = self._real.write(*a, **k)
+        self._snap()
+        return n
+
+    def replace(self, *a, **k):
+        self._real.replace(*a, **k)
+        self._snap()
+
+    def ftruncate(self, *a, **k):
+        self._real.ftruncate(*a, **k)
+        self._snap()
+
+
+def test_제자리로_다시_뜬_잡이_일지를_여는_동안_어디서_죽어도_재개_자료가_남아_같은_라운드에서_잇는다(world, monkeypatch, tmp_path):
+    """제자리 이어하기는 끊긴 잡의 일지를 머리와 재개 자료로 원자적으로 고쳐 쓴다(_reopen). 그 잡이 뜨며 일지를 다시 열 때(_drive 의 _Journal) 그
+    파일이 끝난 라운드 재개 자료의 유일한 사본이다 — 비우고(O_TRUNC) 다시 적으면 그 사이에 죽을 때(KILL · 메모리 고갈 · 전원) 그것이 디스크에서
+    사라져, 다시 뜬 뒤 재개 요약이 '라운드 전 단계에서 끊겼다' 가 되고 다음 이어하기가 요약 길로 처음부터 돌았다(검토 10-31). 일지를 여는 동안과
+    그 뒤 첫 줄까지 파일을 바꾸는 호출마다 디스크를 떠 — 어느 자리에서 다시 떠도 재개 요약이 같은 라운드 · 좌석이고, 그중 첫 자리에서 이으면 끊지
+    않은 실행과 같다."""
+    snaps: list = []
+    o = _oracle(world, monkeypatch, snaps)
+    jid = _restart(monkeypatch, tmp_path, "a", _cut(snaps, _eng("e:round_end", 2)))
+    assert (_on_disk({"id": jid})["seat_resume"]["ok"], _on_disk({"id": jid})["seat_resume"]["round"]) == (True, 3)
+    cuts: list = []
+    spy = _OsSnap(delib_jobs.os, cuts)
+    monkeypatch.setattr(delib_jobs, "os", spy)
+    real_init, real_write = delib_jobs._Journal.__init__, delib_jobs._Journal._write
+
+    def init(self, job_id, carry=()):
+        spy.on = bool(carry) and not cuts          # 다시 뜬 잡이 재개 자료를 옮겨 쓰며 여는 동안부터
+        real_init(self, job_id, carry)
+
+    def write(self, data, sync):
+        real_write(self, data, sync)
+        spy.on = False                              # 연 뒤 첫 줄까지
+    monkeypatch.setattr(delib_jobs._Journal, "__init__", init)
+    monkeypatch.setattr(delib_jobs._Journal, "_write", write)
+    out = _continue(jid)
+    monkeypatch.setattr(delib_jobs, "os", spy._real)
+    monkeypatch.setattr(delib_jobs._Journal, "__init__", real_init)
+    monkeypatch.setattr(delib_jobs._Journal, "_write", real_write)
+    assert out["resumed"]["mode"] == "in_place" and len(cuts) >= 2, f"시험 전제 — 다시 뜬 잡이 일지를 열었다({len(cuts)}자리)"
+    for i, disk in enumerate(cuts):
+        world.reset()
+        jid2 = _restart(monkeypatch, tmp_path, f"k{i}", disk)
+        led = _on_disk({"id": jid2})
+        sr = led["seat_resume"]
+        assert (jid2, led["status"], sr["ok"], sr["round"], sr["spoken"], sr["todo"]) == (jid, "interrupted", True, 3, [], list(SEATS)), \
+            f"다시 뜬 잡이 일지를 연 {i}번째 호출 뒤에 죽으면 재개 자료를 잃는다 — {sr}"
+    world.reset()
+    _restart(monkeypatch, tmp_path, "first", cuts[0])
+    again = _continue(jid)
+    assert again["job_id"] == jid and again["resumed"]["mode"] == "in_place" and again["resumed"]["attempt"] == 2, again["resumed"]
     _check_resumed(o, _result(world, {"id": jid}), 3)
 
 

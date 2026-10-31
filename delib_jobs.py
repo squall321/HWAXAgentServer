@@ -456,23 +456,31 @@ class _Journal:
         self.job_id, self.fd, self.size = job_id, None, 0
         self.track = delib_resume.Tracker()
         self.eoff = ""              # 엔진 줄을 멈춘 까닭(e:resume_off) — 비면 적는다
+        head = _journal_head(job_id)
         try:
             _private_dir(JOB_DIR / _JOURNAL_DIR)
-            # 잡 하나에 일지 하나 — 남은 파일은 앞의 것이 아니라 비운다(두 번 접히지 않게). 제자리 이어하기(같은 잡 id 가 다시 뜬다)의 앞 시도
-            # 공개 사건은 이미 원장에 접혔다 — 그 재개 자료만 carry 로 다시 적는다.
-            self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
+            if carry:
+                # 제자리 이어하기(같은 잡 id 가 다시 뜬다) — 앞 시도의 공개 사건은 이미 원장에 접혔고 재개 자료만 carry 로 옮겨 쓴다. 이 파일이 그
+                # 재개 자료의 유일한 사본이라 비우지(O_TRUNC) 않는다 — 머리와 carry 를 임시 파일에 다 쓰고 fsync 한 뒤 바꿔 넣고(_rewrite_journal —
+                # _reopen 과 같다) 그 파일에 덧붙인다. 비우고 다시 적던 동안 죽으면(KILL · 메모리 고갈 · 전원) 끝난 라운드가 디스크에서 사라졌다
+                # (검토 10-31 — 다음 이어하기가 처음부터 돌았다). 어느 때 죽어도 디스크에는 옛 파일이나 새 파일 하나가 통째로 있다.
+                _rewrite_journal(job_id, carry)
+                self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_APPEND)
+                self.size = os.fstat(self.fd).st_size
+            else:
+                # 잡 하나에 일지 하나 — 남은 파일은 앞의 것이 아니라 비운다(두 번 접히지 않게).
+                self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
             os.fchmod(self.fd, 0o600)
         except OSError as exc:
             self._fail(exc)
             return
-        head = _journal_head(job_id)
-        self._line(head, sync=not carry)
+        if carry:
+            for rec in (head, *carry):
+                self.track.feed(rec)
+            return
+        self._line(head, sync=True)
         if self.fd is not None:
             self.track.feed(head)
-        for rec in carry:
-            self.engine(rec)
-        if carry and self.fd is not None:
-            self._sync()
 
     def _fail(self, exc) -> None:
         global _JOURNAL_ERRORS  # noqa: PLW0603 — 기동 뒤 실패 수(/health)
@@ -1134,6 +1142,30 @@ def _event_label(event: str, data: dict) -> str:
     return ""
 
 
+# 전사 상한(TURN_MAX)에 닿을 때 전사에 넣는 줄과 같이 내는 경고의 꼬리 — 머리는 '전사 상한 {n}턴 초과'. _apply 가 내고, 제자리 이어하기(_reopen)가
+# 끊긴 라운드의 턴을 뺄 때 같은 머리의 경고를 찾아 걷는다.
+_CAP_NOTE_TAIL = " — 이후 발언은 기록하지 않는다"
+_CAP_WARN_TAIL = (" — 이후 좌석 발언은 원장(deliberate_transcript)에 기록하지 않는다(결정문·보고서 회의록에는 실린다) "
+                  "(설정 DELIB_JOB_TURN_MAX)")
+
+
+def _turn_cap_row(x) -> bool:
+    """전사의 상한 줄인가(_apply 가 넣는 note — 좌석이 없다). 전사에 좌석 없이 드는 줄은 이것뿐이다."""
+    return isinstance(x, dict) and "persona" not in x and "note" in x
+
+
+def _drop_turn_cap_warning(job: dict, note: str) -> None:
+    """상한 줄(note)과 같이 낸 경고 하나를 걷는다(같은 머리 — 마지막 것부터). 경고 창(최근 10건)에서 밀려났어도 전체 수(warnings_total)는 하나
+    줄인다 — 줄과 경고는 늘 같이 났다."""
+    if note.endswith(_CAP_NOTE_TAIL):
+        want, ws = note[:-len(_CAP_NOTE_TAIL)] + _CAP_WARN_TAIL, job.get("warnings") or []
+        for i in range(len(ws) - 1, -1, -1):
+            if ws[i] == want:
+                del ws[i]
+                break
+    job["warnings_total"] = max(0, int(job.get("warnings_total") or 0) - 1)
+
+
 def _apply(job: dict, event: str, data: dict) -> None:
     """SSE 이벤트 하나를 잡 상태에 반영. deliberation.py 의 이벤트 계약을 읽기만 한다."""
     # 마지막으로 일어난 일 — 상태줄뿐 아니라 좌석 발언·근거·단계 전환도 적는다. 상태줄(step)은 라운드가 도는
@@ -1167,11 +1199,9 @@ def _apply(job: dict, event: str, data: dict) -> None:
             if len(t) < TURN_MAX:
                 t.append({k: v for k, v in data.items() if k != "kind"})
             elif len(t) == TURN_MAX:
-                t.append({"note": f"전사 상한 {TURN_MAX}턴 초과 — 이후 발언은 기록하지 않는다"})
+                t.append({"note": f"전사 상한 {TURN_MAX}턴 초과{_CAP_NOTE_TAIL}"})
                 # 전사 안의 note 한 줄로는 deliberate_status 를 보는 호출자가 모른다 — 경고로도 한 번 알린다.
-                job["warnings"] = (job.get("warnings") or [])[-9:] + [
-                    f"전사 상한 {TURN_MAX}턴 초과 — 이후 좌석 발언은 원장(deliberate_transcript)에 기록하지 않는다"
-                    "(결정문·보고서 회의록에는 실린다) (설정 DELIB_JOB_TURN_MAX)"]
+                job["warnings"] = (job.get("warnings") or [])[-9:] + [f"전사 상한 {TURN_MAX}턴 초과{_CAP_WARN_TAIL}"]
                 job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
         elif kind == "checkpoint":
             job["checkpoint"] = {k: v for k, v in data.items() if k != "kind"}
@@ -1517,7 +1547,15 @@ def _reopen(res: "delib_resume.Resume") -> dict:
     # 라운드(k 이하) 것이라 한 단 심의는 종전과 같다.
     t, tf = job.get("turns") or [], job.get("turns_from")
     tf = tf if isinstance(tf, int) and not isinstance(tf, bool) and 0 <= tf <= len(t) else 0
-    job["turns"] = t[:tf] + [x for x in t[tf:] if not (isinstance(x.get("round"), int) and x["round"] > k)]
+    keep = [x for x in t[tf:] if not (isinstance(x.get("round"), int) and x["round"] > k)]
+    if len(keep) < len(t) - tf:
+        # 뺀 턴이 있으면 전사 상한(TURN_MAX)이 끊긴 라운드 안에서 찼을 수 있다 — 그 줄(round 없는 note — 상한에 닿은 뒤에는 턴이 붙지 않아 뺀
+        # 턴보다 뒤다)과 같이 낸 경고도 걷는다. 남기면 다시 내는 턴이 상한을 또 채워 줄 · 경고가 둘이 되고, 남은 줄이 한 칸을 먹어 끊지 않은
+        # 실행이 적은 턴 하나가 빠진다(검토 10-31). 걷으면 다시 내는 턴이 끊지 않은 실행과 같은 자리에서 상한을 채운다.
+        for x in [x for x in keep if _turn_cap_row(x)]:
+            keep.remove(x)
+            _drop_turn_cap_warning(job, str(x["note"]))
+    job["turns"] = t[:tf] + keep
     job.update(status="queued", stage="queued", error=None, finished_at=None, round=k, updated_at=now)
     job.pop("seat_resume", None)
     return job
@@ -1722,7 +1760,7 @@ def _requeue(app, job: dict, args: dict) -> bool:
 def _sweep_args() -> None:
     """남은 시작 인자 파일 · 진행 일지를 치운다 — 원장이 없거나 끝난 잡(끝남과 지우기 사이에 죽었다)의 것, 끊긴 잡이라도 이어 돌렸거나
     ARGS_KEEP_S 가 지난 것. 근거 본문 · 발언이 원장 옆에 오래 남지 않게 한다. 둘은 잡마다 같은 규칙이다(_drop_args 가 함께 지운다) — 시작
-    인자 파일을 못 쓴 잡(durable 거짓)의 일지도 여기서 본다."""
+    인자 파일을 못 쓴 잡(durable 거짓)의 일지도 여기서 본다. 고쳐 쓰다 남은 임시 파일은 잡 규칙과 따로 늘 치운다(_sweep_tmp)."""
     files = []
     for sub, pat in ((_ARGS_DIR, "*.json"), (_JOURNAL_DIR, "*.jsonl")):
         try:
@@ -1740,6 +1778,42 @@ def _sweep_args() -> None:
         if status == "interrupted" and not rec.get("resumed_by") and now - float(rec.get("finished_at") or now) < ARGS_KEEP_S:
             continue
         _drop_args(jid)
+    _sweep_tmp()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:             # 남의 프로세스(PermissionError) — 살아 있다
+        return True
+    return True
+
+
+def _sweep_tmp() -> None:
+    """고쳐 쓰다 남은 임시 파일(.<잡 id>.<pid>.tmp — 시작 인자 파일 _write_args · 일지 _rewrite_journal)을 치운다. 기동 때 남은 것은 쓰던
+    프로세스가 바꿔 넣기(os.replace) 전에 죽은 것이다(KILL · 메모리 고갈) — 읽는 곳이 없고(진짜 파일은 그대로다) 근거 본문 · 지식카드 · 원
+    출력이 든다. 그 잡의 진짜 파일과 달리 끝나도 7일이 지나도 지우는 길이 없어 남았다(검토 10-31). 쓰던 프로세스가 아직 살아 있으면(재기동이
+    겹쳤다) 둔다 — 그 프로세스가 곧 바꿔 넣거나 스스로 지운다. 이 프로세스의 것은 지운다(기동 정리는 쓰기와 같은 동기 구간에 겹치지 않는다)."""
+    me = os.getpid()
+    for sub in (_ARGS_DIR, _JOURNAL_DIR):
+        try:
+            tmps = list((JOB_DIR / sub).glob(".*.tmp"))
+        except OSError:
+            continue
+        for p in tmps:
+            pid = p.name[:-len(".tmp")].rsplit(".", 1)[-1]
+            if pid.isdigit() and int(pid) != me and _pid_alive(int(pid)):
+                continue
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("고쳐 쓰다 남은 임시 파일 %s/%s 를 못 지웠다: %r", sub, p.name, exc)
 
 
 def resume_info(job: dict) -> dict | None:

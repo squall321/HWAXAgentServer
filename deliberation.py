@@ -3654,6 +3654,21 @@ async def _wiki_submit(tools: dict, *, user: str, chair_failed, **env_kw) -> str
     return note
 
 
+def _wiki_off() -> bool:
+    """이 심의가 위키 꺼짐을 이미 알렸나(HA-08 — 다단 심의는 한 번만 알린다). 재개 자료(e:wiki_sent · e:stage_in — HA-09)에 적는 값이다."""
+    st = _WIKI_STATE.get()
+    return bool(st is not None and st.get("off"))
+
+
+def _wiki_off_back(off) -> None:
+    """되살릴 때(HA-09) — 끊기기 전에 이 심의가 위키 꺼짐을 알렸으면(재개 자료의 off · wiki_off) 그 상태를 되돌린다. 알린 단계(위키 단계 ·
+    앞 단)를 다시 돌지 않으므로, 되돌리지 않으면 뒤 단이 꺼짐을 처음 아는 것처럼 결정문 끝에 한 줄을 또 붙인다(끊지 않은 실행에는 없는 줄 —
+    검토 10-31). 그 칸이 없는 줄(이 고침 앞에 적힌 일지)은 종전 읽기 그대로다(꺼지지 않은 것으로 읽는다)."""
+    st = _WIKI_STATE.get()
+    if off is True and st is not None:
+        st["off"] = True
+
+
 def _tool_text_ok(s) -> bool:
     """도구 반환이 실제 내용인지 — 에러 문구(SQL 덤프 등)가 환기/프롬프트에 유입되지 않게 거른다."""
     if not isinstance(s, str) or not s.strip():
@@ -4989,6 +5004,8 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
     # 좌석 전환 결과 · 사내 자산 현황 글)로 앞 단 · 좌석 전환 · 현황 조회를 다시 하지 않고 그 단에 든다. 그 단 안은 단 열쇠의 재개 상태로
     # 되살린다(_deliberation_stream). 둘 다 없으면(끊긴 단이 1단 · 재개 상태 없음) 아래는 지금 길 그대로다.
     _in2, _in3 = delib_resume.stage_in(delib_resume.SIM2), delib_resume.stage_in(delib_resume.SIM3)
+    # 앞 단이 위키 꺼짐을 이미 알렸으면(그 단에 들 때의 wiki_off) 그 상태도 되돌린다 — 이 단은 끊지 않은 실행처럼 조용히 건너뛴다(HA-08)
+    _wiki_off_back((_in3 or _in2 or {}).get("wiki_off"))
 
     try:
         if _in3 is not None:
@@ -5108,10 +5125,11 @@ async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, 
                 print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
             opts_b.human_note += _snap_add
             # 재개 자료(HA-09 S4 — e:stage_in) — 2단에 들 때의 값. 2단 안에서 끊겨 이으면 1단 · 좌석 전환 · 현황 조회를 다시 하지 않고 이 값으로
-            # 든다. 앞 단 산출은 체크포인트와 같은 값이다(요약 길은 원장의 체크포인트를, 제자리 이어하기는 이 줄을 읽는다).
+            # 든다. 앞 단 산출은 체크포인트와 같은 값이다(요약 길은 원장의 체크포인트를, 제자리 이어하기는 이 줄을 읽는다). wiki_off — 1단이 위키
+            # 꺼짐을 알렸나(되살릴 때 2단이 그 안내를 또 붙이지 않게).
             delib_resume.write(delib_resume.SIM2, "e:stage_in", sync=True, decision_a=decision_a, nn_a=list(nn_a),
                                personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
-                               seats=sim_seats, note=_snap_add)
+                               seats=sim_seats, note=_snap_add, wiki_off=_wiki_off())
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat,
                                                 history, out=out_b, sk=delib_resume.SIM2):
@@ -5160,9 +5178,11 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
     if _in3 is None:
-        # 재개 자료(HA-09 S4 — e:stage_in) — 3단에 들 때의 값. 3단 안에서 끊겨 이으면 1 · 2단을 다시 돌지 않고 이 값으로 든다.
+        # 재개 자료(HA-09 S4 — e:stage_in) — 3단에 들 때의 값. 3단 안에서 끊겨 이으면 1 · 2단을 다시 돌지 않고 이 값으로 든다. wiki_off 는
+        # 2단 줄과 같다(1 · 2단이 위키 꺼짐을 알렸나).
         delib_resume.write(delib_resume.SIM3, "e:stage_in", sync=True, decision_b=decision_b,
-                           seats=[{"key": s["key"], "role": s.get("role", ""), "origin": s.get("origin")} for s in sim_seats])
+                           seats=[{"key": s["key"], "role": s.get("role", ""), "origin": s.get("origin")} for s in sim_seats],
+                           wiki_off=_wiki_off())
     async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history, sk=delib_resume.SIM3):
         yield chunk
 
@@ -5583,10 +5603,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                           "tool": None})
                     # 상태줄 한 줄로는 잡 원장의 최근 30줄 창 밖으로 밀려난다(좌석마다 조회 줄이 찍힌다) — 그러면
                     # MCP 호출자에게 남는 것은 지정한 앱이 그대로 적힌 잡 기록뿐이라 좁혀진 줄 안다. 카드로도
-                    # 남긴다(좌석에 안 준 근거가 아니라 알림이다 — notice).
-                    yield _delib("evidence", source="지정 앱 범위 제한 불가", included=False, notice=True,
-                                 text=f"지정한 앱({', '.join(opts.delib_apps)})의 조회 도구를 찾지 못해 좌석 자유 "
-                                      f"조회를 좁히지 못했다 — 전체 범위({len(_g)}종)로 돈다.")
+                    # 남긴다(좌석에 안 준 근거가 아니라 알림이다 — notice). 되살릴 때(_pre)는 내지 않는다 — 이 자유 조회 준비의
+                    # 카드 · 경고는 끊기기 전에 이미 원장에 있다(다른 라운드 전 알림과 같다. 도구는 다시 받고, 끊기기 전에 있던
+                    # 도구가 사라졌으면 되살림 카드가 말한다 — _resume_notes).
+                    if _pre is None:
+                        yield _delib("evidence", source="지정 앱 범위 제한 불가", included=False, notice=True,
+                                     text=f"지정한 앱({', '.join(opts.delib_apps)})의 조회 도구를 찾지 못해 좌석 자유 "
+                                          f"조회를 좁히지 못했다 — 전체 범위({len(_g)}종)로 돈다.")
             # ⚠ 스키마 예산 — 챗 경로엔 TOOL_SCHEMA_BUDGET 이 있는데 **여기엔 없었다.**
             # 174종을 통째로 바인딩하면 좌석 프롬프트가 16K 모델에서 그대로 400 이 나고,
             # 실패는 print 한 줄로만 남아 심의는 정상처럼 끝난다(실측: 7명 전원 400).
@@ -5603,10 +5626,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                               f"{opts.tool_budget}회 · 결과 {_rmax:,}자까지"
                                               + (" · 외부 응답자는 부를 도구를 글(CALL 줄)로 적고 엔진이 실행한다" if _ext else ""),
                                       "tool": None})
-            else:
+            elif _pre is None:
                 # ⚠ 조용히 넘어가면 안 된다. 자유 조회를 켜 놓고 도구가 하나도 안 붙으면 심의는
                 # **자유 조회가 원래 없던 것처럼** 끝나고, 화면은 정상 심의와 구별되지 않는다.
-                # 좌석이 '도구로 확인했다' 고 믿게 만드는 자리라 특히 위험하다.
+                # 좌석이 '도구로 확인했다' 고 믿게 만드는 자리라 특히 위험하다. 되살릴 때(_pre)는 위 카드와 같은 까닭으로 내지 않는다.
                 yield _sse("warning", {"code": "free_tools_unavailable",
                                        "message": "전문가 자유 조회를 켰지만 **쓸 수 있는 조회 도구가 "
                                                   "하나도 없습니다** — 좌석이 도구로 확인하지 않고 "
@@ -5616,10 +5639,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                              text="읽기 전용 도구가 바인딩되지 않아 좌석이 직접 조회하지 못했습니다.")
         except Exception as exc:  # noqa: BLE001 — 자유 조회 불가여도 심의는 종전대로 진행
             print(f"[deliberation] free-tool 준비 실패: {exc!r}")
-            # print 만 하면 사용자는 왜 조회가 없었는지 영원히 모른다.
-            yield _sse("warning", {"code": "free_tools_failed",
-                                   "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
-                                              "좌석이 도구 없이 논의합니다."})
+            # print 만 하면 사용자는 왜 조회가 없었는지 영원히 모른다. 되살릴 때(_pre)는 위 카드와 같은 까닭으로 내지 않는다.
+            if _pre is None:
+                yield _sse("warning", {"code": "free_tools_failed",
+                                       "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
+                                                  "좌석이 도구 없이 논의합니다."})
 
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = _pre["stream_head"] if _pre is not None else ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
@@ -7319,9 +7343,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     tally["abstain"] += max(0, _seated - len(last_list))
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
-    # 위키 단계를 되살렸으면(S3 e:wiki_sent) 다시 보내지 않고 그 안내를 쓴다. 보내던 중에 끊겼으면 다시 보낸다 — 제자리 이어하기는 잡 id 가
-    # 같아 원천 열쇠(delib:<잡 id>:<틀>)도 같고, 같은 본문이면 MX 백서가 앞의 원천으로 받는다(dedup — 열쇠 · 본문 지문 · 범위).
+    # 위키 단계를 되살렸으면(S3 e:wiki_sent) 다시 보내지 않고 그 안내와 꺼짐 상태(off — 다단 심의의 뒤 단이 꺼짐 안내를 또 붙이지 않게,
+    # HA-08)를 쓴다. 보내던 중에 끊겼으면 다시 보낸다 — 제자리 이어하기는 잡 id 가 같아 원천 열쇠(delib:<잡 id>:<틀>)도 같고, 같은 본문이면
+    # MX 백서가 앞의 원천으로 받는다(dedup — 열쇠 · 본문 지문 · 범위).
     wiki_note = _rwik["note"] if _rwik is not None else ""
+    if _rwik is not None:
+        _wiki_off_back(_rwik.get("off"))
     if getattr(opts, "wiki", 0) and _rwik is None:
         yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
         wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
@@ -7329,8 +7356,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                        evidence=opts.evidence, pool=gather_pool)
         yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
         if _jon:
-            # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내. 이으면 다시 보내지 않는다.
-            delib_resume.write(sk, "e:wiki_sent", sync=True, note=wiki_note)
+            # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내와 그 뒤의 꺼짐 상태. 이으면 다시 보내지 않고 꺼짐도 되돌린다.
+            delib_resume.write(sk, "e:wiki_sent", sync=True, note=wiki_note, off=_wiki_off())
     # 다음 단(시뮬 2·3단)에는 **진짜 결정문만** 넘긴다 — 의장이 못 낸 글을 넘기면 그 위에서 다음 단이 돈다.
     # 못 냈으면 사유를 넘긴다(다단 래퍼가 제 오류에 싣는다).
     if out is not None and not _chair_failed:

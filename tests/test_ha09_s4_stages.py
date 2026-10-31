@@ -294,6 +294,35 @@ def test_단_사이_승계를_줄인_카드는_되살릴_때_다시_내지_않�
     _check(o, _res(w4, jid), "build-plan", sk, r, spoken=seats[:k], gathered=r < ROUNDS)
 
 
+# ── 위키가 꺼진 박스 — 꺼짐 안내는 잡에 한 번(HA-08)이다. 단 안에서 이어도 뒤 단이 다시 붙이지 않는다 ─────────────────────────────
+@pytest.mark.parametrize("job, sk, at", [("sim-plan", "sim-2", "r2"), ("sim-plan", "sim-1", "e:wiki_sent"),
+                                         ("build-plan", "sim-3", "r2"), ("build-plan", "sim-2", "e:wiki_sent")])
+def test_위키가_꺼진_박스에서_단_안에서_이어도_꺼짐_안내는_잡에_한_번이다(w4, monkeypatch, tmp_path, job, sk, at):
+    """위키를 켠 다단 심의(wiki=1)가 위키 도구가 없는 박스(꺼졌거나 MX 백서 권한이 없다)에서 돈다 — 1단 결정문 끝에 꺼짐 안내가 한 줄 붙고 뒤 단은
+    조용히 건너뛴다(HA-08 — 한 번만). 그 알림이 든 앞 단 · 위키 단계를 이은 실행은 다시 돌지 않으므로, 앞 단이 알렸다는 것을 2단 · 3단 안에서
+    끊겼으면 그 단에 든 줄(e:stage_in wiki_off)에서, 위키 단계 뒤에서 끊겼으면 그 줄(e:wiki_sent off)에서 되돌린다 — 이은 실행의 뒤 단 결정문
+    끝에 끊지 않은 실행에는 없는 꺼짐 안내가 붙지 않는다(검토 10-31 — 종전엔 뒤 단이 꺼짐을 처음 아는 것처럼 한 줄을 또 붙였다)."""
+    lines: list = []
+    o, got = _run(w4, monkeypatch, job, {**OPTS, "wiki": 1},
+                  cuts={"cut": _turn_at(sk, 2, 2) if at == "r2" else _eng_at("e:wiki_sent", sk)}, lines=lines)
+    note = d._WIKI_OFF_NOTE.strip()
+    sent = [(r["sk"], r["note"].strip()) for r, _b in lines if r.get("k") == "e:wiki_sent"]
+    stages = ["sim-1", "sim-2", "sim-3"][:3 if job == "build-plan" else 2]
+    assert sent == [(s, note if s == "sim-1" else "") for s in stages], f"시험 전제 — 1단만 꺼짐을 알렸다: {sent}"
+    assert note not in o["led"]["decision"], "시험 전제 — 마지막 단 결정문에는 꺼짐 안내가 없다"
+    jid = _restart(monkeypatch, tmp_path, f"wiki-{job}-{sk}-{at}", got["cut"])
+    seats = _seated(jid)
+    out = _continue(jid)
+    assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place" and out["resumed"]["sk"] == sk, out["resumed"]
+    res = _res(w4, jid)
+    assert note not in res["led"]["decision"] and note not in (res["led"]["result_text"] or ""), \
+        "이은 실행의 뒤 단 결정문에 꺼짐 안내가 또 붙었다"
+    if at == "r2":
+        _check(o, res, job, sk, 2, spoken=seats[:2], gathered=True)
+    else:
+        _check(o, res, job, sk, ROUNDS + 1, post=(), ra=False)
+
+
 # ── 1단 안 · 1단 결정문 뒤에서 끊기면 1단을 되살려 맺고 단 사이부터는 끊지 않은 실행 그대로 돈다 ─────────────────────────────────
 @pytest.mark.parametrize("at", ["r3", "e:decision", "e:report_saved"])
 def test_1단_안에서_끊기면_1단을_되살려_맺고_좌석_전환부터_끊지_않은_실행과_같게_돈다(w4, monkeypatch, tmp_path, at):

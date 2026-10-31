@@ -172,7 +172,8 @@ def test_이은_실행이_같은_라운드에서_또_끊겨도_앞_시도에서_
     assert first["resumed"]["todo"] == list(SEATS[1:])
     one = _result(world, {"id": jid})
     assert sorted(s for rr, s in one["seat"] if rr == 3) == sorted(SEATS[1:]), "첫 이음이 3라운드의 나머지만 부르지 않았다"
-    lines2 = [rec for rec, _d in again]
+    # 새 일지의 줄 — 이은 실행이 마지막 줄을 적은 때의 일지 파일(머리와 옮겨 쓴 재개 자료는 바꿔 넣기로 들어가 _write 를 지나지 않는다)
+    lines2 = [json.loads(x) for x in again[-1][1][f"journal/{jid}.jsonl"].splitlines()]
     assert [x["k"] for x in lines2][:2] == ["j:head", "e:pre"] and [x for x in lines2 if x["k"] == "e:gather" and x["r"] == 3], \
         "끊긴 라운드의 조회를 새 일지에 옮겨 적지 않았다"
     raws = [(x["r"], x["o"]["persona"]) for x in lines2 if x["k"] == "e:raw"]
@@ -285,3 +286,27 @@ def test_되살린_좌석의_턴은_나머지_좌석보다_먼저_한_번씩_다
     assert [t["persona"] for t in led["turns"] if t["round"] == 2] == list(SEATS), "끊긴 라운드의 전사 차례가 끝난 차례가 아니다"
     assert _turn_rows(led) == _turn_rows(o["led"])
     assert [(t["round"], t["persona"]) for t in led["turns"]] == [(t["round"], t["persona"]) for t in o["led"]["turns"]]
+
+
+# ── 전사 상한이 끊긴 라운드 안에서 찼어도 상한 줄 · 경고는 끊지 않은 실행처럼 한 번이다 ─────────────────────────────────
+@pytest.mark.parametrize("r, k, at", [(3, 4, "raw"), (3, 5, "raw"), (3, 5, "turn"), (4, 2, "raw")])
+def test_전사_상한이_끊긴_라운드_안에서_찼어도_상한_줄과_경고는_끊지_않은_실행처럼_한_번이다(world, monkeypatch, tmp_path, r, k, at):
+    """원장 전사 상한(TURN_MAX — 이 시험은 13턴이라 5석 × 2라운드 뒤 3라운드의 셋째 턴에서 찬다)에 닿으면 그 뒤 턴 자리에 상한 줄(round 없는
+    note)이 붙고 경고가 한 번 난다. 제자리 이어하기는 끊긴 라운드의 턴을 원장에서 뺀다 — 상한 줄과 그 경고도 같이 걷어야 다시 내는 턴이 끊지
+    않은 실행과 같은 자리에서 상한을 채운다(검토 10-31 — 종전엔 상한 줄이 가운데 남아 한 칸을 먹어 턴 하나가 빠지고 줄 · 경고가 둘이었다).
+    상한 줄이 생기기 전(3라운드 넷째 원 출력 뒤)과 상한 뒤 라운드(4라운드 — 뺄 턴이 없다)에서 끊겨도 같다."""
+    monkeypatch.setattr(delib_jobs, "TURN_MAX", 13)
+    snaps: list = []
+    o = _oracle(world, monkeypatch, snaps)
+
+    def rows(led):
+        return [(t["round"], t["persona"]) if t.get("persona") else ("note", t.get("note")) for t in led["turns"]]
+    cap = [w for w in o["led"]["warnings"] if w.startswith("전사 상한 13턴 초과")]
+    assert rows(o["led"])[10:] == [(3, s) for s in SEATS[:3]] + [("note", "전사 상한 13턴 초과 — 이후 발언은 기록하지 않는다")] and len(cap) == 1, \
+        "시험 전제 — 3라운드 셋째 턴에서 상한이 찼다"
+    jid = _restart(monkeypatch, tmp_path, f"cap{r}{k}{at}", _cut(snaps, _turn_line(r) if at == "turn" else _eng("e:raw", r), nth=k))
+    out = _continue(jid)
+    assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place" and out["resumed"]["round"] == r, out["resumed"]
+    res = _result(world, {"id": jid})
+    assert rows(res["led"]) == rows(o["led"]), "전사(상한 줄의 자리까지)가 끊지 않은 실행과 다르다"
+    _check_resumed(o, res, r, spoken=SEATS[:k], gathered=r < ROUNDS)
