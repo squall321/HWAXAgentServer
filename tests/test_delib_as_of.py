@@ -673,3 +673,11 @@ def test_지정_도구로_고른_agent_search_도_기준일_셈에_들고_옛_�
         assert [s["as_of"] for s in SEEN["new"]] == [AS_OF] and not warn and not miss, (SEEN["new"], warn, miss)
         assert f"지정 도구 agent_search 1건 — 결과에 {d._AS_OF_UNDATED} 1장" in head, head
 
+
+# ── 반대 검토 10-31 — 포털이 이 판인지 본다 ───────────────────────────────────────────────────────────────────────────
+def test_health_가_기준일을_받는_판이라고_알린다(monkeypatch):
+    """포털이 기준일 심의를 넘기기 전에 이 표지를 본다 — 옛 엔진은 delib_opts.as_of 를 말없이 버려(_resolve_opts 에 칸이 없다) 기준일을 준 소급
+    검증이 오늘의 카드로 돌았다(반대 검토 10-31 — 포털을 먼저 올리고 에이전트 서버 재기동이 미뤄진 창). 이름을 바꾸면 포털이 모든 기준일 심의를
+    막는다(HWAXPortal backend/app/agent/routes.py 가 이 이름을 읽는다)."""
+    monkeypatch.setattr(app, "_model_context_tokens", lambda: 128000)       # 모델 서버에 묻지 않는다
+    assert app.health()["delib_as_of"] is True

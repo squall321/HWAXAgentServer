@@ -8952,6 +8952,9 @@ def health() -> dict:
         **_routine_health(),
         # 동시 심의 한도 셋과 출처 — 박스 덮개(POST /limits)가 env 위에 덮인다(HWAXPortal docs/delib-ops R4).
         "limits": _limits_health(),
+        # 심의 기준일(delib_opts.as_of — HWAXPortal docs/request-1027 HA-11)을 받는 판이다. 포털은 기준일 심의를 넘기기 전에 이 표지를 본다 —
+        # 옛 판은 그 칸을 말없이 버려 기준일을 준 소급 검증이 오늘의 카드로 돌았다(포털을 먼저 올리고 이 서버의 재기동이 미뤄진 창).
+        "delib_as_of": True,
         # 새 심의 멈춤(delib_paused · delib_pause — R1) · 줄이 재기동을 넘기나(delib_queue_durable — 참이면 재기동 판정이 줄 선 수를 막는 수로
         # 세지 않는다, start.sh · 포털 lib/delib-busy.sh) · 이번 기동에 다시 세운 줄(delib_requeued — R2, update-all 이 재기동 뒤 찍는다) ·
         # 도는 GLM 잡의 좌석 합(delib_seats_running — 좌석 합 상한 limits.max_seats_running 이 본다, 앉기 전은 어림).
