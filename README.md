@@ -689,15 +689,20 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
   is measured on cae00 (C-31).
 - **Real-use questions (E5-2, off by default)** — `SEAT_QUESTIONS_COLLECT=1` on the box (the user's permission comes first,
   like the tool-search query collection) records the first utterance of a pinned-expert chat, thinking questions, the
-  topic of a deliberation whose seats a person picked (web `delib_opts.personas` · MCP `deliberate_start(personas)`) and
-  `/전문가` queries into `questions/q-YYYY-MM-DD.jsonl`: date, source, the text with e-mails · uuids · long hex ids
-  (conversation ids) · phone numbers · the caller's e-mail name parts removed, and the experts the person picked. No time,
-  user or conversation. Day files older than `SEAT_QUESTIONS_DAYS` (60) are deleted. `GET /seat-questions?src=&by=&limit=&offset=`
+  topic of a deliberation opened with given seats (web `delib_opts.personas` · MCP `deliberate_start(personas)`; not a
+  continuation; the seats are not kept — the web picker pre-selects the top recommendations, so they may not be a
+  person's pick) and `/전문가` queries into `questions/q-YYYY-MM-DD.jsonl`: date, source, the text with e-mails · JWTs ·
+  `Bearer` tokens · uuids · job ids · long hex ids (conversation ids — also when a Korean particle follows) · phone numbers ·
+  the caller's e-mail name parts removed, and, for a pinned-expert chat, the experts the person pinned. No time, user or
+  conversation. Other people's names are only removed by the portal when it shows the text (the ledger is there).
+  Day files older than `SEAT_QUESTIONS_DAYS` (60) are deleted — also with collection off, on the read paths (view ·
+  `/health` · label · ingest, once a day). `GET /seat-questions?src=&by=&limit=&offset=`
   (the labeling screen's feed — never ranks, scores, current seats or the picked experts; short, non-standalone and
   near-duplicate (3-gram Jaccard ≥ 0.8) questions are only counted; sources interleaved; `mine` is the given labeler's
   label, others only as a count), `POST /seat-questions/label {qid, by, primary (1–3) | none (core_data · out_of_pool) |
   unsure, also (0–5), via {key: tree|search}, memo, remove?}` (kept with the question text in `questions/labels.jsonl` —
-  the H set outlives the 60 days), `POST /seat-questions/ingest {items: [{src, text, ts?, picked?}]}` (the portal's
+  the H set outlives the 60 days; when the last label of a question is removed, its text is taken out of `labels.jsonl`
+  and it is no longer offered), `POST /seat-questions/ingest {items: [{src, text, ts?, picked?}]}` (the portal's
   backfill of the last 60 days; fields that point at a person or a conversation are refused). Who labels is a human
   decision — `SEAT_QUESTIONS_LABELERS` (comma list; empty = anyone) names the accepted `by` values.
 - **Persona links (E5-4)** — the core vocabulary's `personas` field (`domains` · `experts` · `data_types` · `no_tools`) is
@@ -705,12 +710,15 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
   types against the vocabulary's `types`, areas and apps against the gateway tool map already fetched; operators (`he`)
   are refused. A bad line is dropped alone; `/health` `core_vocab.personas` shows the counts, the dropped lines with
   reasons, the tables it could not check, org-chart domains with no line, and the shadow log. Shadow log
-  (`shadow/s-YYYY-MM-DD.jsonl`, 30 days, `PERSONA_SHADOW_LOG=0` turns it off): for a pinned expert's chat turn, the
-  current preferred tools next to what the links would pick; for deliberation first seats and thinking candidates, the
-  detected core types, the domains that own them, the domains the seats miss, short seats, and whether all types are
-  data types. Only a hash of the question is written. Every failure is swallowed — selection is untouched.
+  (`shadow/s-YYYY-MM-DD.jsonl`, 30 days) is real-use data, so it follows the collection rule — **off by default**,
+  `PERSONA_SHADOW_LOG=1` on a box that has the user's permission: for a pinned expert's chat turn, the current preferred
+  tools next to what the links would pick; for deliberation first seats and thinking candidates, the detected core types,
+  the domains that own them, the domains the seats miss, short seats, and whether all types are data types. No question
+  text, time or question hash (the date is the file name). Old files are also removed when `/health` is read. Every
+  failure is swallowed — selection is untouched.
 
-Tests: `tests/test_seat_evalset.py`, `tests/test_seat_eval_window.py`, `tests/test_seat_questions.py`, `tests/test_persona_links.py`.
+Tests: `tests/test_seat_evalset.py`, `tests/test_seat_eval_window.py`, `tests/test_seat_questions.py`, `tests/test_persona_links.py`
+(`HWAX_PORTAL_ROOT` · `HWAX_GATEWAY_ROOT` point the sibling-file check at unmerged work trees).
 
 ### Images (portal docs/chat-depth-context T5)
 

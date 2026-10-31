@@ -526,11 +526,11 @@ async def deliberate_start(
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
                            owner_aff=_caller_view(ctx)[1])
     if personas:
-        # 사람이 좌석을 고른 심의의 화두 — 전문가 고르기 기준선 H 의 재료(기본 꺼짐 · 사람 · 잡은 적지 않는다, HWAXPortal docs/request-1029 design-e5 E5-2)
+        # 좌석을 지정해 연 심의의 화두 — 전문가 고르기 기준선 H 의 재료(기본 꺼짐 · 사람 · 잡은 적지 않는다, HWAXPortal docs/request-1029 design-e5 E5-2).
+        # 지정 좌석은 적지 않는다 — 사람이 고른 것인지 부르는 쪽(개인 Claude)이 고른 것인지 모른다(L6).
         try:
             import seat_questions  # noqa: PLC0415
-            seat_questions.note("delib", question, user=user,
-                                picked=[k for k in (_engine._seat_key(p) for p in personas) if k])
+            seat_questions.note("delib", question, user=user)
         except Exception:  # noqa: BLE001 — 모으기가 심의 시작을 막지 않는다
             pass
     out = delib_jobs.summary(rec)

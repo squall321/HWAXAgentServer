@@ -472,14 +472,14 @@ def _persona_links_health() -> dict:
         return {"present": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
-def _persona_shadow_tools(key: str, persona: dict, sel_q: str, message: str, names: list, prefer: list) -> None:
+def _persona_shadow_tools(key: str, persona: dict, sel_q: str, names: list, prefer: list) -> None:
     """챗 지목 전문가 — 연결 표가 골랐을 우선 도구를 지금 고른 것(prefer)과 나란히 적기만 한다. prefer 는 그대로 쓰인다. 실패는 삼킨다."""
     try:
         v = _persona_links()
         if not v or not v.get("present") or not key or persona.get("operator"):
             return
         import persona_links as _pl  # noqa: PLC0415
-        _pl.shadow_tools(v, site="chat", key=key, question=sel_q, qkey=message, names=names, prefer_now=prefer,
+        _pl.shadow_tools(v, site="chat", key=key, question=sel_q, names=names, prefer_now=prefer,
                          tool_app=(_TOOLS_MAP_CACHE.get("map") or {}).get, tool_area=lambda n: _area_of(n)[0])
     except Exception as exc:  # noqa: BLE001 — 그림자가 챗을 막지 않는다
         print(f"[persona-links] 그림자(챗 도구)를 적지 못했다: {exc!r}"[:300])
@@ -6578,7 +6578,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             if _names:
                 prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
                 # 연결 표(personas)가 골랐을 것을 적기만 한다 — prefer 는 그대로다(design-e5 E5-4 그림자)
-                _persona_shadow_tools(agent_key, persona, _sel_q, req.message, _names, prefer)
+                _persona_shadow_tools(agent_key, persona, _sel_q, _names, prefer)
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
                                  # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.
@@ -7462,16 +7462,17 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
 
 def _seat_q_source(req: ChatRequest, started_by: str) -> tuple[str, str, list] | None:
     """이 발화가 기준선 H 의 재료인가 → (출처, 질문 글, 사람이 고른 전문가). 갈래 차례는 chat() 과 같다(design-e5 2.2 H 의 출처 넷).
-    사람이 좌석을 고른 심의만 · 빗금으로 부른 '/전문가' 만 · 지목 대화는 앞선 사람 발화가 없을 때만이다. 앱이 띄운 리스크 패널은 사람의 화두가 아니다."""
+    좌석을 지정해 연 심의의 화두만(이어하기는 앞 회차 화두라 빼고, 지정 좌석은 싣지 않는다 — 웹 심의 화면은 추천 상위를 기본으로 골라 두어 사람이
+    고친 것인지 모른다, L6) · 빗금으로 부른 '/전문가' 만 · 지목 대화는 앞선 사람 발화가 없을 때만이다. 앱이 띄운 리스크 패널은 사람의 화두가 아니다."""
     m = req.message or ""
     if is_sim_deliberation(m) or is_test_plan(m) or is_deliberation(m):
         o = req.delib_opts if isinstance(req.delib_opts, dict) else {}
-        picked = [k for k in (_delib_engine._seat_key(p) for p in (o.get("personas") or []) if isinstance(p, dict)) if k]
-        if started_by == "app" or not picked:
+        seats = [k for k in (_delib_engine._seat_key(p) for p in (o.get("personas") or []) if isinstance(p, dict)) if k]
+        if started_by == "app" or not seats or o.get("continue_summary"):
             return None
         q = (strip_sim_trigger(m) if is_sim_deliberation(m) else strip_test_plan_trigger(m) if is_test_plan(m)
              else strip_trigger(m))
-        return "delib", q, picked
+        return "delib", q, []
     if is_report_save(m):
         return None
     if m.strip().startswith(_AGENT_SEARCH_TRIGGERS):

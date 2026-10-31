@@ -29,7 +29,7 @@ LEAK_KEYS = {"rank", "score", "scores", "desc_match", "low_confidence", "seats",
 def box(monkeypatch, tmp_path):
     monkeypatch.setenv("SEAT_EVAL_DIR", str(tmp_path / "seat-eval"))
     monkeypatch.setattr(a.app.state, "connections", {"gateway": {"url": "x", "headers": {"Authorization": SECRET}}}, raising=False)
-    sq._STATE.update(day=None, written=0, error=None)
+    sq._STATE.update(day=None, written=0, error=None, swept=None)
     sq._VIEW_CACHE.update(key=None, rows=None, filtered=None)
     return tmp_path / "seat-eval" / "questions"
 
@@ -89,8 +89,8 @@ def test_챗_턴의_출처_가름은_chat_의_갈래와_같다():
     assert src(R(message="/띵킹 낙하 크랙 원인"), "human") == ("thinking", "낙하 크랙 원인", [])
     assert src(R(message="낙하 크랙 원인", thinking=True), "human") == ("thinking", "낙하 크랙 원인", [])
     opts = {"personas": [{"key": "mech-drop", "role": "낙하"}, {"agent_type": "rel-drop"}]}
-    assert src(R(message="/심의 보스 보강할까?", delib_opts=opts), "human") == ("delib", "보스 보강할까?", ["mech-drop", "rel-drop"])
-    assert src(R(message="/심의 보스 보강할까?"), "human") is None, "서버가 고른 좌석의 심의는 아니다"
+    assert src(R(message="/심의 보스 보강할까?", delib_opts=opts), "human") == ("delib", "보스 보강할까?", []), "지정 좌석은 싣지 않는다"
+    assert src(R(message="/심의 보스 보강할까?"), "human") is None, "좌석을 지정하지 않은 심의는 아니다"
     assert src(R(message="/심의 보스 보강할까?", delib_opts=opts), "app") is None, "앱이 띄운 리스크 패널은 아니다"
     assert src(R(message="/전문가 낙하 해석"), "human") == ("expert_cmd", "낙하 해석", [])
     assert src(R(message="낙하 해석 전문가 추천해 줘"), "human") is None, "자연어 전문가 찾기는 '/전문가' 질의가 아니다"
@@ -114,7 +114,7 @@ def test_챗_턴과_MCP_심의_시작이_적는다(box, monkeypatch):
     asyncio.run(m.deliberate_start("보스 보강 여부를 정하자", personas=[{"key": "mech-drop", "role": "낙하"}]))
     asyncio.run(m.deliberate_start("좌석을 서버에 맡긴 화두입니다"))
     got = sorted((x["src"], x["text"], tuple(x.get("picked") or ())) for x in _rows(box))
-    assert got == [("delib", "보스 보강 여부를 정하자", ("mech-drop",)), ("thinking", "힌지 낙하 크랙 원인이 뭔가", ())]
+    assert got == [("delib", "보스 보강 여부를 정하자", ()), ("thinking", "힌지 낙하 크랙 원인이 뭔가", ())]
 
 
 def test_화면_응답에는_순위_점수_좌석_고른_전문가가_없다(box, monkeypatch):
@@ -205,3 +205,113 @@ def test_날짜_파일은_굴러가는_창으로_지운다(box, monkeypatch):
     assert sq.note("thinking", "새 질문 하나 둘 셋") is True
     assert not (box / "q-2000-01-01.jsonl").exists()
     assert os.environ.get("SEAT_QUESTIONS_COLLECT") == "1"
+
+
+# ── 반대 검토(10-31) — 짚인 것마다 하나씩(HWAXPortal docs/request-1029 context-notes C-48) ─────────────────────────────
+# 아래 id · 토큰은 모두 지어낸 것이다(무작위 16진 · 서명 없는 JWT 꼴).
+_CID = "eafd6a99440942329ef50006a43e3769"
+_UUID = "123e4567-e89b-42d3-a456-426614174000"
+_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0QGV4YW1wbGUuY29tIn0.c2lnbmF0dXJlLXBhcnQ"
+
+
+def test_R14_id_뒤에_조사가_붙어도_지우고_잡_id_JWT_Bearer_도_지운다():
+    cases = {f"대화 {_CID}에서 본 낙하 해석 결과 다시 봐줘": _CID,
+             f"{_UUID}의 결과를 비교해 줘": _UUID,
+             f"대화 {_CID.upper()}를 이어서": _CID.upper(),
+             "default-20261030-101500-a1b2c3 심의 결과를 정리해 줘": "default-20261030-101500-a1b2c3",
+             "risk-review-20261029-235959-0f9e8d 잡이 멈췄다": "20261029-235959-0f9e8d",
+             f"토큰 {_JWT} 를 넣었더니 401 이 난다": _JWT,
+             "헤더에 Authorization: Bearer hwaxgw_abcDEF123456 을 실었다": "hwaxgw_abcDEF123456"}
+    for text, secret in cases.items():
+        out = sq.strip(text)
+        assert secret not in out, (text, out)
+        assert "[id]" in out or "[토큰]" in out, out
+    assert sq.strip("PCB 휨 0.15 mm 기준 2026-10-30 시험") == "PCB 휨 0.15 mm 기준 2026-10-30 시험", "날짜 · 수치는 그대로"
+    assert sq.strip("deadbeef 는 짧은 16진이라 둔다") == "deadbeef 는 짧은 16진이라 둔다"
+
+
+def test_R15_심의_화두는_고른_좌석을_싣지_않고_이어하기는_적지_않는다(box, monkeypatch):
+    src = a._seat_q_source
+    R = a.ChatRequest
+    opts = {"personas": [{"key": "mech-drop", "role": "낙하"}, {"agent_type": "rel-drop"}]}
+    assert src(R(message="/심의 보스 보강할까?", delib_opts=opts), "human") == ("delib", "보스 보강할까?", []), \
+        "웹 심의 화면은 추천 상위를 기본으로 골라 둔다 — 좌석이 사람이 고른 것인지 모른다(L6 · design-e5 2.4 는 지목 출처만)"
+    assert src(R(message="/심의 보스 보강할까?", delib_opts={**opts, "continue_summary": "앞 회차 결정문"}), "human") is None, \
+        "이어하기는 앞 회차 화두를 다시 적지 않는다"
+    monkeypatch.setenv("SEAT_QUESTIONS_COLLECT", "1")
+    import delib_jobs  # noqa: PLC0415
+    import mcp_server as m  # noqa: PLC0415
+    monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace()))
+    monkeypatch.setattr(delib_jobs, "start", lambda *a_, **k: {"job_id": "j1"})
+    monkeypatch.setattr(delib_jobs, "summary", lambda rec: {"job_id": "j1", "question": "q", "status": "running"})
+    asyncio.run(m.deliberate_start("커넥터 보강 여부를 정하자", personas=[{"key": "mech-drop", "role": "낙하"}]))
+    rows = _rows(box)
+    assert [(r["src"], r.get("picked")) for r in rows] == [("delib", None)], rows
+
+
+def test_R12_모으기를_꺼도_지난_날짜_파일은_읽는_길에서_지운다(box, monkeypatch):
+    monkeypatch.setenv("SEAT_QUESTIONS_COLLECT", "1")
+    assert sq.note("thinking", "열충격 수명 예측은 어디서 하나요")
+    monkeypatch.delenv("SEAT_QUESTIONS_COLLECT")
+    f = next(box.glob("q-*.jsonl"))
+    old = box / "q-2000-01-01.jsonl"
+    f.rename(old)
+    sq._STATE.update(day=None)
+    sq._VIEW_CACHE.update(key=None)
+    v = sq.view()
+    assert v["collect"] is False and v["total"] == 0
+    assert not old.exists(), "모으기를 꺼도 창 밖 날짜 파일은 읽는 길(보기 · /health)에서 지운다"
+    old.write_text('{"qid":"H-aaaaaaaaaaaa","d":"2000-01-01","src":"thinking","text":"옛 질문 하나 둘"}\n', encoding="utf-8")
+    sq._STATE.update(swept=None)
+    sq.health()
+    assert not old.exists()
+
+
+def test_R12_지운_표시의_글은_다시_싣지_않고_남은_표시가_없으면_표시_기록에서도_걷는다(box, monkeypatch):
+    monkeypatch.setenv("SEAT_QUESTIONS_COLLECT", "1")
+    text = "카메라 모듈 낙하 손상 기준을 알려 주세요"
+    assert sq.note("persona", text, picked=["cam-module-reliability"])
+    qid = sq.qid_of(text)
+    assert sq.label({"qid": qid, "by": "a", "primary": ["cam-module-reliability"]})[0] == 200
+    for f in box.glob("q-*.jsonl"):
+        f.unlink()                                       # 9.4 '모은 질문' — 날짜 파일을 지운다
+    sq._VIEW_CACHE.update(key=None)
+    assert sq.view()["total"] == 1, "표시가 살아 있는 동안은 표시 기록의 글이 후보로 남는다"
+    assert sq.label({"qid": qid, "by": "a", "remove": True})[0] == 200
+    sq._VIEW_CACHE.update(key=None)
+    v = sq.view()
+    assert v["total"] == 0 and v["items"] == [], "지운 표시의 글을 후보로 되살리지 않는다"
+    body = (box / "labels.jsonl").read_text(encoding="utf-8")
+    assert text not in body, "남은 표시가 없는 질문의 글은 표시 기록에서도 걷는다"
+    assert oct((box / "labels.jsonl").stat().st_mode & 0o777) == "0o600"
+    assert sq.export() == []
+
+
+def test_R12_다른_사람의_표시가_남아_있으면_글을_둔다(box, monkeypatch):
+    monkeypatch.setenv("SEAT_QUESTIONS_COLLECT", "1")
+    text = "보드 휨 기준을 어떻게 잡아야 하나요"
+    assert sq.note("persona", text)
+    qid = sq.qid_of(text)
+    sq.label({"qid": qid, "by": "a", "primary": ["pcb-warp"]})
+    sq.label({"qid": qid, "by": "b", "primary": ["pcb-warp"]})
+    sq.label({"qid": qid, "by": "a", "remove": True})
+    assert text in (box / "labels.jsonl").read_text(encoding="utf-8")
+    assert [r["q"] for r in sq.export(by="b")] == [text]
+
+
+def test_R12_글_걷기가_실패해도_지운_표시의_글을_후보로_되살리지_않는다(box, monkeypatch):
+    monkeypatch.setenv("SEAT_QUESTIONS_COLLECT", "1")
+    text = "힌지 보스 크랙 기준을 알려 주세요"
+    assert sq.note("persona", text)
+    qid = sq.qid_of(text)
+    sq.label({"qid": qid, "by": "a", "primary": ["mech-hinge"]})
+    for f in box.glob("q-*.jsonl"):
+        f.unlink()
+
+    def boom(_qid):
+        raise OSError("디스크가 찼다")
+    monkeypatch.setattr(sq, "_drop_text", boom)
+    assert sq.label({"qid": qid, "by": "a", "remove": True})[0] == 200, "지운 표시는 적힌다"
+    assert "디스크가 찼다" in sq.health()["error"]
+    sq._VIEW_CACHE.update(key=None)
+    assert sq.view()["total"] == 0, "표시 기록에 글이 남아도 살아 있는 표시가 없으면 후보가 아니다"

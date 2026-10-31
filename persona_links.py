@@ -14,8 +14,10 @@
 운영자의 앱은 포털 infra/personas/he-team.json 이 맡는다.
 
 그림자 — 챗 지목 전문가의 우선 도구(U1)와 심의 첫 좌석 · 띵킹 소집의 도메인 덮음(U2 · U3), 코어 데이터 질문 표지(U4 ①의 타입 쪽)를 박스 자리
-(seat_box.box_dir()/shadow)에 날짜 파일로 적는다. 질문 글 · 사람은 적지 않는다(qh — 맞대기 꼴의 sha256 앞 12자만). 끄기 PERSONA_SHADOW_LOG=0.
-적기는 어떤 실패도 삼킨다 — 고르기에 닿지 않는다.
+(seat_box.box_dir()/shadow)에 날짜 파일로 적는다. 실사용에서 나온 기록이라 모으기와 같은 규칙이다 — 기본 꺼짐, 박스마다 PERSONA_SHADOW_LOG=1 로
+켠다(사용자 허락이 전제다 — 결정 D-E5-2). 질문 글 · 사람 · 시각 · 질문 지문은 적지 않는다 — 날짜는 파일 이름뿐이다(초 단위 시각과 질문 지문 —
+H qid 와 같은 해시였다 — 을 포털 대화 저장소와 맞대면 그 사람 · 대화가 나왔다, 반대 검토 10-31). 창(SHADOW_DAYS) 밖 파일은 /health 를 읽을 때도
+지운다(끈 뒤에도). 적기는 어떤 실패도 삼킨다 — 고르기에 닿지 않는다.
 """
 from __future__ import annotations
 
@@ -23,7 +25,6 @@ import json
 import os
 import re
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -41,12 +42,25 @@ _SHADOW_FILE = re.compile(r"^s-(\d{4}-\d{2}-\d{2})\.jsonl$")
 # 어느 좌석에나 필요한 입구 — 연결 후보 안에서 먼저 세운다(deliberation._trim_free_tools 의 entry 와 같은 낱말)
 _ENTRY = ("search", "list", "find", "guide", "describe", "get_guide", "discover")
 _ORG = {"mtime": None, "domains": None}
-_SHADOW = {"day": None, "written": 0, "error": None}
+_SHADOW = {"day": None, "written": 0, "error": None, "swept": None}
 _LOCK = threading.Lock()
 
 
 def shadow_on() -> bool:
-    return os.environ.get("PERSONA_SHADOW_LOG", "1").strip() != "0"
+    """그림자 기록 — 기본 꺼짐, 박스마다 PERSONA_SHADOW_LOG=1 로 켠다(실사용 질문 모으기 SEAT_QUESTIONS_COLLECT 와 같은 규칙)."""
+    return os.environ.get("PERSONA_SHADOW_LOG", "0").strip() == "1"
+
+
+def _sweep_shadow() -> None:
+    """창 밖 그림자 파일을 지운다 — 하루 한 번, 꺼져 있어도(새로 적을 때만 지우면 끈 뒤에 남는다). 실패는 삼킨다."""
+    today = datetime.now(seat_box.KST).date()
+    if _SHADOW.get("swept") == today:
+        return
+    _SHADOW["swept"] = today
+    try:
+        seat_box.drop_old(seat_box.box_dir() / "shadow", _SHADOW_FILE, SHADOW_DAYS, today)
+    except Exception as exc:  # noqa: BLE001 — 지우기가 /health 를 막지 않는다
+        _SHADOW["error"] = f"{type(exc).__name__}: {exc}"[:200]
 
 
 def _dom(key: str) -> str:
@@ -191,6 +205,7 @@ def validate(raw, *, types_map: dict, domains_known=None, areas_known=None, apps
 
 def health(v: dict | None) -> dict:
     """/health core_vocab.personas — 수 · 버린 줄(까닭) · 대조 못 한 표 · 줄이 없는 조직도 도메인 · 그림자 기록."""
+    _sweep_shadow()
     if not v or not v.get("present"):
         out = {"present": False}
         if v and v.get("dropped"):
@@ -272,25 +287,24 @@ def _write(rec: dict) -> None:
                 _SHADOW["day"] = now.date()
                 seat_box.private_dir(d)
                 seat_box.drop_old(d, _SHADOW_FILE, SHADOW_DAYS, now.date())
-            seat_box.append_jsonl(d / f"s-{now.date().isoformat()}.jsonl", {"t": int(time.time()), **rec})
+            seat_box.append_jsonl(d / f"s-{now.date().isoformat()}.jsonl", rec)        # 날짜는 파일 이름뿐 — 시각은 적지 않는다
             _SHADOW["written"] += 1
     except Exception as exc:  # noqa: BLE001 — 그림자가 고르기를 막지 않는다
         _SHADOW["error"] = f"{type(exc).__name__}: {exc}"[:200]
 
 
-def shadow_tools(v: dict, *, site: str, key: str, question: str, qkey: str, names, prefer_now, tool_app, tool_area) -> dict:
+def shadow_tools(v: dict, *, site: str, key: str, question: str, names, prefer_now, tool_app, tool_area) -> dict:
     """챗 지목 전문가 — 지금 고른 우선 도구(prefer_now)와 연결이 골랐을 것을 나란히 적는다. 돌려준 값은 시험만 본다."""
     n = len(prefer_now or []) or 12
     got = link_tools(v, key=key, names=names, question=question, n=n, tool_app=tool_app, tool_area=tool_area)
     now = list(prefer_now or [])
     rec = {"site": site, "key": key, "dom": _dom(key), "link": got["link"], "now": now, "link_top": got["top"],
-           "same": len(set(now) & set(got["top"])), "n_cand": got["n_cand"], "qh": seat_box.qhash(qkey)}
+           "same": len(set(now) & set(got["top"])), "n_cand": got["n_cand"]}
     _write(rec)
     return rec
 
 
 def shadow_seats(v: dict, *, site: str, question: str, seats: list, want: int) -> dict:
-    rec = {"site": site, **seat_cover(v, question=question, seats=seats, want=want), "n": len(seats),
-           "qh": seat_box.qhash(question)}
+    rec = {"site": site, **seat_cover(v, question=question, seats=seats, want=want), "n": len(seats)}
     _write(rec)
     return rec

@@ -1,13 +1,17 @@
 # 코어 어휘표 personas 칸(persona_links)이 줄마다 검증되어 /health 에 실리고, 그림자 기록만 남기며 고르기는 바꾸지 않는지(HWAXPortal docs/request-1029 design-e5 E5-4)
 """형제 리포 실파일 대조 — 포털 어휘표에 personas 칸이 있으면 그 줄이 조직도 라벨(orgTaxonomy) · 어휘표 types · 게이트웨이 tool_areas.json 과
-어긋나지 않는지 본다(칸이 아직 없으면 건너뛴다). 지문 — personas 칸도 표의 일부라 지문에 든다(게이트웨이와 같은 셈).
-동작 변화 0 — personas 가 있든 없든 띵킹 소집 · 예심 · 본심의 결과 글이 같다. 그림자는 박스 자리에만, 질문 글 없이.
+어긋나지 않는지 본다(칸이 아직 없으면 건너뛴다). 도메인 줄을 쓰기 시작하면(domains · no_tools 가 비지 않으면) 지식 도메인마다 줄이 있거나 no_tools
+에 있어야 한다 — 첫 판은 도메인 줄이 비었다(L7 — A-dev 와 도메인 검토로 쓴다)라 빠진 수만 센다. 합치기 전의 작업 트리는 HWAX_PORTAL_ROOT ·
+HWAX_GATEWAY_ROOT 로 준다(포털 시험의 HWAX_AGENT_SERVER_ROOT 와 같은 꼴). 지문 — personas 칸도 표의 일부라 지문에 든다(게이트웨이와 같은 셈).
+동작 변화 0 — personas 가 있든 없든 띵킹 소집 · 예심 · 본심의 결과 글이 같다. 그림자는 박스마다 켜고(기본 꺼짐), 박스 자리에만, 질문 글 · 시각 ·
+질문 지문 없이.
 
   실행:  .venv/bin/python -m pytest tests/test_persona_links.py -q
 """
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +26,8 @@ import deliberation  # noqa: E402
 import persona_links as pl  # noqa: E402
 import thinking as t  # noqa: E402
 
-PORTAL = ROOT.parent / "HWAXPortal"
-GATEWAY = ROOT.parent / "HWAXMcpGateway"
+PORTAL = Path(os.environ.get("HWAX_PORTAL_ROOT") or ROOT.parent / "HWAXPortal")
+GATEWAY = Path(os.environ.get("HWAX_GATEWAY_ROOT") or ROOT.parent / "HWAXMcpGateway")
 TYPES = {"고장모드": "failure_mode", "시험항목": "test_item", "PLM 과제": "plm_task", "개발모델": "plm_model", "물성": "material_property",
          "관리 기준": "criterion"}
 PERSONAS = {
@@ -134,7 +138,7 @@ def test_health_와_덧씌우기와_지문(links_env, monkeypatch):
     h = a._core_vocab_health()
     ph = h["personas"]
     assert (ph["present"], ph["domains"], ph["no_tools"], ph["dropped_n"], ph["unchecked"]) == (True, 1, 1, 0, [])
-    assert ph["missing"] == ["cam", "mech", "pcb", "sim", "xd"] and ph["shadow"]["on"] is True
+    assert ph["missing"] == ["cam", "mech", "pcb", "sim", "xd"] and ph["shadow"]["on"] is False, "그림자는 기본 꺼짐"
     merged = {**base, **ov}
     want = hashlib.sha256(json.dumps({k: v for k, v in merged.items() if k != "_doc"}, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()[:12]
@@ -151,9 +155,10 @@ def test_health_와_덧씌우기와_지문(links_env, monkeypatch):
 def test_그림자는_박스에만_질문_글_없이_고르기는_그대로(links_env, monkeypatch):
     p, loc, _b = _vocab(links_env, personas=PERSONAS)
     _use(monkeypatch, p, loc)
+    monkeypatch.setenv("PERSONA_SHADOW_LOG", "1")          # 박스마다 켠다(기본 꺼짐)
     prefer = ["search_records", "stepforge_section"]
     before = list(prefer)
-    assert a._persona_shadow_tools("mech-drop", {"key": "mech-drop"}, "힌지 단면 비밀질문", "힌지 단면 비밀질문",
+    assert a._persona_shadow_tools("mech-drop", {"key": "mech-drop"}, "힌지 단면 비밀질문",
                                    ["stepforge_section", "search_records", "thermal_predict"], prefer) is None
     assert prefer == before, "지금 고른 우선 도구는 그대로"
     deliberation._persona_shadow("delib", "고장모드 비밀질문 시험항목", ["mech-drop", "pcb-warp"], 5)
@@ -168,14 +173,14 @@ def test_그림자는_박스에만_질문_글_없이_고르기는_그대로(link
     monkeypatch.setenv("PERSONA_SHADOW_LOG", "0")
     deliberation._persona_shadow("delib", "고장모드", ["mech-drop"], 5)
     assert len(files[0].read_text(encoding="utf-8").splitlines()) == 2, "끄면 적지 않는다"
-    monkeypatch.delenv("PERSONA_SHADOW_LOG")
+    monkeypatch.setenv("PERSONA_SHADOW_LOG", "1")
 
     def boom(*_a, **_k):
         raise OSError("디스크가 찼다")
     import seat_box  # noqa: PLC0415
     monkeypatch.setattr(seat_box, "append_jsonl", boom)
     deliberation._persona_shadow("delib", "고장모드", ["mech-drop"], 5)       # 삼킨다
-    a._persona_shadow_tools("mech-drop", {"key": "mech-drop"}, "q", "q", ["search_records"], ["search_records"])
+    a._persona_shadow_tools("mech-drop", {"key": "mech-drop"}, "q", ["search_records"], ["search_records"])
     assert "디스크가 찼다" in pl._SHADOW["error"]
 
 
@@ -215,6 +220,7 @@ def _think_run(monkeypatch):
 
 def test_띵킹은_personas_가_있든_없든_같은_결과다(links_env, monkeypatch):
     monkeypatch.setattr(a, "_ctx_cache", {"n": 1_048_576, "src": "server"})
+    monkeypatch.setenv("PERSONA_SHADOW_LOG", "1")
     off = _think_run(monkeypatch)
     p, loc, _b = _vocab(links_env, personas=PERSONAS)
     _use(monkeypatch, p, loc)
@@ -224,8 +230,21 @@ def test_띵킹은_personas_가_있든_없든_같은_결과다(links_env, monkey
     assert [r["site"] for r in recs] == ["think"] and recs[0]["seated"] == ["mech", "rel"] and recs[0]["types"] == ["failure_mode"]
 
 
+def _sibling_check(personas, types_map, org, areas, apps, knowledge) -> dict:
+    """형제 리포 대조의 몸 — 한 줄도 버리지 않는다. 도메인 줄(또는 no_tools)을 쓰기 시작했으면 지식 도메인마다 줄이 있거나 no_tools 에 있다
+    (design-e5 3.1). 첫 판(domains · no_tools 가 비었다 — L7: 도메인 줄은 A-dev 와 도메인 검토로 쓴다)은 빠진 도메인을 셈만 한다(/health
+    core_vocab.personas.missing 과 같다). 도메인 줄은 한 판에 빠짐없이 쓴다 — 반쯤 쓴 판은 여기서 걸린다."""
+    v = pl.validate(personas, types_map=types_map, domains_known=org, areas_known=areas, apps_known=apps)
+    assert v["dropped"] == [], v["dropped"]
+    missing = sorted(set(knowledge) - set(v["domains"]) - set(v["no_tools"]))
+    if v["domains"] or v["no_tools"]:
+        assert not missing, f"지식 도메인마다 줄이 있거나 no_tools 에 있다 — 빠짐 {missing}"
+    return {**v, "missing": missing}
+
+
 def test_형제_리포_실파일_대조():
-    """포털 어휘표의 personas 줄이 조직도 · types · 게이트웨이 표와 어긋나지 않고, 조직도 도메인마다 줄이 있거나 no_tools 에 있다(design-e5 3.1)."""
+    """포털 어휘표의 personas 줄이 조직도 · types · 게이트웨이 표와 어긋나지 않고, 도메인 줄을 썼으면 지식 도메인마다 줄이 있거나 no_tools 에
+    있다(design-e5 3.1). 합치기 전에는 HWAX_PORTAL_ROOT · HWAX_GATEWAY_ROOT 로 작업 트리를 준다."""
     vf = PORTAL / "backend" / "config" / "core_vocab.json"
     org = PORTAL / "frontend" / "src" / "components" / "chat" / "orgTaxonomy.json"
     ta = GATEWAY / "tool_areas.json"
@@ -237,7 +256,39 @@ def test_형제_리포_실파일_대조():
     tad = json.loads(ta.read_text(encoding="utf-8"))
     o = json.loads(org.read_text(encoding="utf-8"))
     knowledge = {d for c in o["categories"] if c.get("root") == "knowledge" for d in c.get("domains") or []} | {"sw"}
-    v = pl.validate(vocab["personas"], types_map=vocab.get("types") or {}, domains_known=frozenset(o["domain_label"]),
-                    areas_known=frozenset(x["key"] for x in tad["areas"]), apps_known=frozenset(tad["apps"]))
-    assert v["dropped"] == [], v["dropped"]
-    assert not (knowledge - set(v["domains"]) - set(v["no_tools"])), "지식 도메인마다 줄이 있거나 no_tools 에 있다"
+    v = _sibling_check(vocab["personas"], vocab.get("types") or {}, frozenset(o["domain_label"]),
+                       frozenset(x["key"] for x in tad["areas"]), frozenset(tad["apps"]), knowledge)
+    print(f"[형제 리포 대조] 줄 없는 지식 도메인 {len(v['missing'])}개 — 도메인 줄을 쓰기 전이면 정상(첫 판)")
+
+
+# ── 반대 검토(10-31) — 짚인 것마다 하나씩(HWAXPortal docs/request-1029 context-notes C-48) ─────────────────────────────
+def test_R10_그림자는_기본으로_꺼져_있고_켜도_날짜만_질문_지문은_적지_않는다(links_env, monkeypatch):
+    p, loc, _b = _vocab(links_env, personas=PERSONAS)
+    _use(monkeypatch, p, loc)
+    monkeypatch.delenv("PERSONA_SHADOW_LOG", raising=False)
+    deliberation._persona_shadow("delib", "고장모드 비밀질문 시험항목", ["mech-drop"], 5)
+    assert not (links_env / "seat-eval" / "shadow").exists(), "모으기와 같은 규칙 — 박스마다 켠다(기본 꺼짐)"
+    assert a._core_vocab_health()["personas"]["shadow"]["on"] is False
+    monkeypatch.setenv("PERSONA_SHADOW_LOG", "1")
+    deliberation._persona_shadow("delib", "고장모드 비밀질문 시험항목", ["mech-drop"], 5)
+    a._persona_shadow_tools("mech-drop", {"key": "mech-drop"}, "힌지 단면", ["stepforge_section"], ["stepforge_section"])
+    [f] = list((links_env / "seat-eval" / "shadow").glob("s-*.jsonl"))
+    recs = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()]
+    assert len(recs) == 2 and not any({"t", "qh"} & set(r) for r in recs), \
+        "초 단위 시각 · 질문 지문(H qid 와 같은 해시)은 적지 않는다 — 날짜는 파일 이름이다"
+
+
+def test_R2_형제_리포_대조는_도메인_줄을_쓰기_전엔_줄이_없어도_통과하고_쓴_뒤엔_빠짐이_없어야_한다():
+    org = frozenset({"rel", "mech", "sw", "he"})
+    knowledge = {"rel", "mech", "sw"}
+    first = {"domains": {}, "experts": {"rel-x": {"apps": ["ai-data-hub"]}}, "data_types": [], "no_tools": []}
+    v = _sibling_check(first, {}, org, frozenset({"knowledge"}), frozenset({"ai-data-hub"}), knowledge)
+    assert v["missing"] == ["mech", "rel", "sw"], "첫 판(도메인 줄 없음 — L7)은 빠진 도메인을 셈만 한다"
+    half = {**first, "domains": {"rel": {"core_types": [], "areas": ["knowledge"], "apps": []}}}
+    with pytest.raises(AssertionError, match="지식 도메인마다"):
+        _sibling_check(half, {}, org, frozenset({"knowledge"}), frozenset({"ai-data-hub"}), knowledge)
+    full = {**half, "domains": {**half["domains"], "mech": {"core_types": [], "areas": [], "apps": []}}, "no_tools": ["sw"]}
+    assert _sibling_check(full, {}, org, frozenset({"knowledge"}), frozenset({"ai-data-hub"}), knowledge)["missing"] == []
+    bad = {**first, "experts": {"rel-x": {"apps": ["no-such-app"]}}}
+    with pytest.raises(AssertionError):
+        _sibling_check(bad, {}, org, frozenset({"knowledge"}), frozenset({"ai-data-hub"}), knowledge)

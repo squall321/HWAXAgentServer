@@ -2,14 +2,17 @@
 """모으는 것 — 넷이다(design-e5 2.2 H).
   persona     전문가를 지목한 대화의 첫 발화(그 대화에 앞선 사람 발화가 없다)
   thinking    띵킹 질문
-  delib       사람이 좌석을 고른 심의의 화두(웹 /심의 · /시뮬심의 · /시험계획 의 delib_opts.personas, MCP deliberate_start 의 personas)
+  delib       좌석을 지정해 연 심의의 화두(웹 /심의 · /시뮬심의 · /시험계획 의 delib_opts.personas, MCP deliberate_start 의 personas). 이어하기는
+              앞 회차 화두라 적지 않는다. 지정 좌석은 적지 않는다 — 웹 심의 화면은 추천 상위를 기본으로 골라 두어 사람이 고친 것인지 모른다(L6)
   expert_cmd  '/전문가' 질의(빗금 트리거 넷 — /전문가 · /에이전트 · /agents · /agent)
 
 모으기는 박스마다 켠다 — SEAT_QUESTIONS_COLLECT=1(기본 꺼짐 · 사용자 허락이 전제다 — 도구 검색 질의 모으기와 같은 꼴, docs/followups-1017 결정 21).
-꺼져 있으면 아무것도 적지 않고, 포털이 지난 60일을 밀어 넣는 창구(ingest)도 거절한다. 적는 것은 날짜(KST — 시각은 적지 않는다) · 출처 · 질문 글(메일 · 대화 id 꼴 ·
-전화 · 그 사람 메일의 이름 조각을 지운 것) · 사람이 고른 전문가(지목 · 지정 좌석 — 화면에는 내지 않는다, 표시 뒤 맞대기에만)다. 누가 · 어느 대화인지는
-적지 않는다. 날짜 파일은 SEAT_QUESTIONS_DAYS(기본 60)일 뒤 지워진다. 사람 표시(labels.jsonl)는 지우지 않는다 — 기준선 H 그 자체라 표시한 질문 글을
-함께 둔다.
+꺼져 있으면 아무것도 적지 않고, 포털이 지난 60일을 밀어 넣는 창구(ingest)도 거절한다. 적는 것은 날짜(KST — 시각은 적지 않는다) · 출처 · 질문 글(메일 ·
+uuid · 대화 id · 잡 id · JWT · Bearer 토큰 · 전화 · 그 사람 메일의 이름 조각을 지운 것) · 지목 전문가 챗에서 사람이 고른 전문가(화면에는 내지 않는다,
+표시 뒤 맞대기에만)다. 누가 · 어느 대화인지는 적지 않는다. 사람 이름은 그 사람 메일의 조각만 지운다 — 원장이 포털에 있어 다른 사람 이름은 포털이 화면에
+낼 때 지운다(박스 파일에는 남는다 — 0600). 날짜 파일은 SEAT_QUESTIONS_DAYS(기본 60)일이 지나면 지운다 — 모으기를 꺼도 읽는 길(보기 · /health ·
+표시 · 밀어 넣기)에서 하루 한 번 지운다. 사람 표시(labels.jsonl)는 기준선 H 그 자체라 표시가 살아 있는 동안 질문 글을 함께 둔다 — 표시를 모두 지우면
+그 질문의 글도 표시 기록에서 걷는다(후보로 되살리지 않는다).
 
 화면 쪽(view) — 순위 · 점수 · 지금 좌석 · 사람이 고른 전문가를 싣지 않는다(누설 규칙 L6). 8자 아래 · 홀로 서지 않는 발화('그럼 그건?') · 3글자 조각
 자카드 0.8 이상의 겹침은 뺀 수만 알린다. 출처를 번갈아 늘어놓는다(출처마다 몫을 고르게 — 2.2). 다는 사람은 사람이 정한다 —
@@ -18,6 +21,7 @@ SEAT_QUESTIONS_LABELERS(쉼표, 비면 누구나)가 받을 표시자 이름이�
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -38,14 +42,19 @@ _BY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,39}$")
 _LABEL_FIELDS = ("qid", "by", "primary", "also", "none", "unsure", "via", "memo", "remove")
 _ITEM_FIELDS = ("src", "text", "ts", "picked")
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-_HEXID = re.compile(r"\b[0-9a-fA-F]{16,}\b")          # 대화 id(uuid4 hex 32자) · 잡 id 꼴
+# 경계는 ASCII 로 본다 — 파이썬 \b 는 유니코드라 한글이 \w 다. 'eafd…3769에서' 처럼 조사가 붙으면 \b 가 서지 않아 id 가 그대로 남았다.
+_A0, _A1 = r"(?<![0-9A-Za-z])", r"(?![0-9A-Za-z])"
+_JWT = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+")     # 포털 PAT(RS256 JWT — payload 에 sub=메일)
+_BEARER = re.compile(r"(?i)" + _A0 + r"(bearer)\s+\S+")
+_UUID = re.compile(_A0 + r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" + _A1)
+_JOBID = re.compile(_A0 + r"(?:[A-Za-z][A-Za-z0-9_-]*-)?\d{8}-\d{6}-[0-9a-f]{6}" + _A1)   # 심의 잡 id <잡>-YYYYMMDD-HHMMSS-<6hex> — 초 단위 시각이 원장의 주인과 잇는다
+_HEXID = re.compile(_A0 + r"[0-9a-fA-F]{16,}" + _A1)          # 대화 id(uuid4 hex 32자) 꼴
 _PHONE = re.compile(r"(?<!\d)(?:\+?82[- ]?)?0\d{1,2}[- ]?\d{3,4}[- ]?\d{4}(?!\d)")
 # 홀로 서지 않는 발화의 머리 — 짧을 때만 뺀다('다시 말해 PCB 휨 …' 처럼 긴 글은 남는다)
 _OPENERS = ("그럼", "그건", "그거", "그것", "그게", "이건", "이거", "이게", "저건", "저거", "아까", "위에", "위의", "방금", "그래서",
             "그러면", "그리고", "또 ", "다시", "이어서", "계속", "네 ", "응 ", "ㅇㅇ", "ok", "okay")
 _LOCK = threading.Lock()
-_STATE = {"day": None, "written": 0, "error": None}
+_STATE = {"day": None, "written": 0, "error": None, "swept": None}
 _VIEW_CACHE: dict = {"key": None, "rows": None, "filtered": None}
 
 
@@ -69,16 +78,33 @@ def qdir():
 
 
 def health() -> dict:
+    _sweep()
     return {"collect": enabled(), "days": days(), "written": _STATE["written"], "error": _STATE["error"],
             "labelers": len(labelers())}
 
 
+def _sweep() -> None:
+    """창 밖 날짜 파일을 지운다 — 하루 한 번, 모으기가 꺼져 있어도(새로 적을 때만 지우면 끈 뒤엔 날짜 파일이 창을 넘겨 남는다). 실패는 삼킨다."""
+    today = datetime.now(seat_box.KST).date()
+    if _STATE.get("swept") == today:
+        return
+    _STATE["swept"] = today
+    try:
+        seat_box.drop_old(qdir(), _DAY_FILE, days(), today)
+    except Exception as exc:  # noqa: BLE001 — 지우기가 보기 · /health 를 막지 않는다
+        _STATE["error"] = f"{type(exc).__name__}: {exc}"[:200]
+
+
 # ── 지우기 · 모으기 ────────────────────────────────────────────────────────────
 def strip(text: str, user: str = "") -> str:
-    """질문 글에서 메일 · uuid · 긴 16진 id(대화 id 꼴) · 전화 · 그 사람 메일의 이름 조각을 지운다. 공백은 하나로, 앞 MAX_CHARS 자."""
+    """질문 글에서 메일 · JWT · Bearer 토큰 · uuid · 잡 id · 긴 16진 id(대화 id 꼴) · 전화 · 그 사람 메일의 이름 조각을 지운다. id 뒤에 조사가
+    붙어도 지운다. 공백은 하나로, 앞 MAX_CHARS 자."""
     s = str(text or "")
     s = _EMAIL.sub("[메일]", s)
+    s = _JWT.sub("[토큰]", s)
+    s = _BEARER.sub(r"\1 [토큰]", s)
     s = _UUID.sub("[id]", s)
+    s = _JOBID.sub("[id]", s)
     s = _HEXID.sub("[id]", s)
     s = _PHONE.sub("[번호]", s)
     local = str(user or "").split("@", 1)[0].strip()
@@ -174,6 +200,7 @@ def ingest(items) -> tuple[int, dict]:
 
 # ── 읽기 ─────────────────────────────────────────────────────────────────────
 def _files():
+    _sweep()
     d = qdir()
     try:
         return sorted(f for f in d.iterdir() if _DAY_FILE.match(f.name))
@@ -214,8 +241,9 @@ def _filtered() -> tuple[list[dict], dict]:
     if _VIEW_CACHE["key"] == key:
         return _VIEW_CACHE["rows"], _VIEW_CACHE["filtered"]
     rows = sorted(_rows_raw(), key=lambda r: (str(r.get("d") or ""), r.get("qid") or ""))
-    # 표시된 질문은 날짜 파일이 지워진 뒤에도 후보로 남는다(표시를 다시 볼 수 있게) — 글은 표시 기록에 있다
-    for lb in labels_all():
+    # 표시가 살아 있는 질문은 날짜 파일이 지워진 뒤에도 후보로 남는다(표시를 다시 볼 수 있게) — 글은 표시 기록에 있다. 지운 표시의 글은
+    # 되살리지 않는다(표시를 모두 지운 질문은 날짜 파일과 함께 사라진다)
+    for lb in labels_effective().values():
         if lb.get("text"):
             rows.append({"qid": lb["qid"], "d": lb.get("d"), "src": lb.get("src"), "text": lb["text"]})
     seen, kept, index = set(), [], {}
@@ -367,7 +395,42 @@ def label(body) -> tuple[int, dict]:
             full["picked"] = src["picked"]
     with _LOCK:
         seat_box.append_jsonl(qdir() / "labels.jsonl", full)
+        if rec.get("remove") and not any(q == rec["qid"] for (q, _b) in labels_effective()):
+            try:
+                _drop_text(rec["qid"])
+            except OSError as exc:      # 지운 표시는 이미 적혔다 — 글 걷기 실패는 /health seat_questions.error 로 알린다
+                _STATE["error"] = f"표시 기록에서 글을 걷지 못했다 — {type(exc).__name__}: {exc}"[:200]
     return 200, {"ok": True, "qid": rec["qid"], "by": rec["by"], "removed": bool(rec.get("remove"))}
+
+
+def _drop_text(qid: str) -> None:
+    """표시가 하나도 남지 않은 질문의 글을 표시 기록에서 걷는다 — 그 qid 의 줄을 글 없이 다시 쓴다(0600, 바꿔 끼우기). _LOCK 안에서 부른다."""
+    path = qdir() / "labels.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    out, changed = [], False
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            out.append(ln)
+            continue
+        if isinstance(rec, dict) and rec.get("qid") == qid and "text" in rec:
+            rec.pop("text")
+            changed = True
+            out.append(json.dumps(rec, ensure_ascii=False))
+        else:
+            out.append(ln)
+    if not changed:
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("".join(x + "\n" for x in out))
+    os.replace(tmp, path)
 
 
 def export(by: str | None = None) -> list[dict]:
