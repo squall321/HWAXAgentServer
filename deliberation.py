@@ -3353,24 +3353,31 @@ def _as_of_seat(meta: dict, as_of: str) -> dict:
     return {"state": "ok", "later": _n("as_of_excluded_later"), "kept": _n("as_of_undated_kept"), "undated_in": 0}
 
 
-def _as_of_line(as_of: str, pre: dict, free: dict) -> str:
+def _as_of_line(as_of: str, pre: dict, free: dict, des: dict | None = None) -> str:
     """결정문 머리의 기준일 줄 — 코드가 찍는다(봉인 표지와 같은 까닭 — 결정문은 RA 보고서에 남는 내구 기록이다).
     pre — 사전 검색 셈 {asked: 물은 좌석 수, lines: 실은 줄, undated: 그 가운데 날짜 미확인, later: 그 날 뒤라 뺀 카드(좌석마다 센 합),
-    unconfirmed: [좌석]}. free — 자유 조회 셈 {좌석: [agent_search 부른 수, 결과의 날짜 미확인 수, 메아리가 없어 버린 수]}."""
-    out = [f"{as_of}. 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 좌석 자유 조회)에 이 날을 박아(호출자가 준 날이다 — 질문에서 "
+    unconfirmed: [좌석]}. free — 자유 조회 셈 {좌석: [agent_search 부른 수, 결과의 날짜 미확인 수, 메아리가 없어 버린 수]}. des — 지정 도구로 고른
+    agent_search 셈 {calls: 부른 수, undated: 실은 결과의 날짜 미확인 수, dropped: 메아리가 없어 버린 수}. '거름이 걸린 조회가 없었다' 는 세 길이
+    모두 0 일 때만 적는다(종전엔 지정 도구를 세지 않아, 거른 결과를 전 좌석에 싣고도 없었다고 적었다 — 반대 검토 10-31)."""
+    des = des or {}
+    out = [f"{as_of}. 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 지정 도구 · 좌석 자유 조회)에 이 날을 박아(호출자가 준 날이다 — 질문에서 "
            f"짐작하지 않았다) 지식 허브가 그 거름을 확인해 준 카드만 실었다. 날짜 없는 카드는 남기고 '{_AS_OF_UNDATED}' 으로 표시했다 — "
            "그 날 뒤에 쓰였을 수 있다."]
     if pre.get("asked"):
         out.append(f"사전 검색 {pre['asked']}석 — 실은 카드 {pre['lines']}줄 가운데 {_AS_OF_UNDATED} {pre['undated']}줄 · 그 날 뒤라 뺀 카드 "
                    f"{pre['later']}장(좌석마다 센 합).")
+    if des.get("calls"):
+        out.append(f"지정 도구 agent_search {des['calls']}건 — 결과에 {_AS_OF_UNDATED} {des.get('undated', 0)}장"
+                   + (f" · 지식 허브가 거름을 확인해 주지 않아(메아리 없음) {des['dropped']}건의 결과를 싣지 않았다" if des.get("dropped") else "")
+                   + ".")
     if free:
         out.append(f"자유 조회의 agent_search {sum(v[0] for v in free.values())}건 — 결과에 {_AS_OF_UNDATED} "
                    f"{sum(v[1] for v in free.values())}장.")
     unc = sorted(set(pre.get("unconfirmed") or ()) | {k for k, v in free.items() if v[2]})
     if unc:
         out.append(f"지식 허브가 거름을 확인해 주지 않아(메아리 applied_config.as_of 없음) 카드를 싣지 않은 좌석: {', '.join(unc)}.")
-    if not pre.get("asked") and not pre.get("unconfirmed") and not free:
-        out.append("이 심의에는 이 거름이 걸린 조회가 없었다(좌석 지식카드 · 자유 조회의 agent_search 를 부르지 않았다).")
+    if not pre.get("asked") and not pre.get("unconfirmed") and not free and not des.get("calls"):
+        out.append("이 심의에는 이 거름이 걸린 조회가 없었다(좌석 지식카드 · 지정 도구 · 자유 조회의 agent_search 를 부르지 않았다).")
     return " ".join(out) + f" {_AS_OF_OPEN}."
 
 
@@ -5471,9 +5478,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     #      선정 패널에서 직접 고른 도구를 주제 기반 인자로 실제 호출해 정량 근거로 주입한다.
     #      인자는 LLM 이 도구 스키마를 보고 구성(불가하면 skip) — 도구별 실패는 비치명.
     tool_inject = ""
+    # 기준일 셈 — 지정 도구로 고른 agent_search {calls: 부른 수, undated: 실은 결과의 날짜 미확인 수, dropped: 메아리가 없어 버린 수}. 결정문 머리의
+    # 기준일 줄이 읽는다(_as_of_line — 종전엔 이 길을 세지 않아, 거른 결과를 전 좌석에 싣고도 '거름이 걸린 조회가 없었다' 고 적었다).
+    _ao_des = {"calls": 0, "undated": 0, "dropped": 0}
     if opts.delib_tools:
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
+        _tool_unconf = []                     # 기준일 거름을 확인하지 못해(메아리 없음) 결과를 버린 도구 — 인자 문제가 아니라 다시 시키지 않는다
         _tool_refused = []                    # 리스크 심사에 지정된 등록부·앞 패널 기록 도구 — 부르지 않는다(D-18)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
@@ -5534,8 +5545,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _out = await _call(tools, _tn, _argd)
                 if not isinstance(_out, str):
                     _out = json.dumps(_out, ensure_ascii=False, default=str) if _out is not None else ""
+                if _as_of and _tn == "agent_search":
+                    _ao_des["calls"] += 1
+                    if _as_of_dropped(_out):
+                        # 옛 지식 허브가 기준일을 버렸다(_as_of_guard 가 카드를 버린 답) — 인자를 고쳐 다시 불러도 같다. 일반 실패로 보면 계획자에게
+                        # 다시 시키고(허브를 두 번 부른다) 까닭 없이 '호출 실패' 로 남았다.
+                        _ao_des["dropped"] += 1
+                        _tool_unconf.append(_tn)
+                        break
                 if _out and _delib_tool_result_ok(_out):
                     _good = _out
+                    if _as_of and _tn == "agent_search":
+                        _ao_des["undated"] += _out.count(_AS_OF_UNDATED_MARK)
                     break
                 # 재시도 계획자에게 주는 오류 — 좁은 창은 종전 앞 500자(원문 길이 표식), 넓은 창은 전부(교정 단서가 뒤에 있다).
                 _err_note = _cut_mark(_out or "(빈 응답)", _narrow_cap(500))
@@ -5546,18 +5567,29 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _used.append(_tn)
                 ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
+            elif _tn in _tool_unconf:
+                yield _sse("status", {"step": f"지정 도구 결과를 싣지 않음: {_tn} — 기준일 {_as_of} 거름을 지식 허브가 확인해 주지 "
+                                              "않았다(메아리 없음)", "tool": _tn})
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
                 _tool_fail.append(_tn)
         # 돌지 않은 지정 도구 — 상태줄은 원장의 창 밖으로 밀려나고, 잡 기록에는 지정한 도구가 걸린 것처럼
         # 적혀 있다. 도구마다 한 장씩 내지 않는다(원장은 30건까지다) — 한 장에 모은다.
-        if _tool_miss or _tool_fail or _tool_refused:
+        if _tool_unconf:
+            # 사전 검색 · 자유 조회와 같은 경고 — 닫힌 쪽으로 버렸다는 것을 말한다(말없이 빼면 '지정 도구가 실패했다' 와 같아 보인다).
+            yield _sse("warning", {"code": "as_of_unconfirmed",
+                                   "message": f"기준일 {_as_of} 거름이 걸렸다는 확인(메아리)이 지식 허브 응답에 없어 지정 도구 "
+                                              f"{', '.join(_tool_unconf)} 의 결과를 싣지 않았습니다. 옛 AIDataHub 는 기준일을 말없이 버려 그 날 "
+                                              "뒤의 카드가 섞였을 수 있습니다."})
+        if _tool_miss or _tool_fail or _tool_refused or _tool_unconf:
             yield _delib("evidence", source="지정 도구 미실행", included=False,
                          text=f"지정 도구 {len(_ordered)}개 중 "
-                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused)}개는 결과를 좌석에 주지 못했다 — "
+                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused) + len(_tool_unconf)}개는 결과를 좌석에 주지 못했다 — "
                               + " · ".join(x for x in (
                                   f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
                                   f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
+                                  (f"기준일 {_as_of} 거름을 지식 허브가 확인해 주지 않아(메아리 applied_config.as_of 없음 — 옛 AIDataHub 는 "
+                                   f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
                                   (f"리스크 심사라 부르지 않은 등록부·앞 패널 기록 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 "
                                    "판정을 좌석이 보지 않는다 — D-18)") if _tool_refused else "",
                               ) if x) + ".")
@@ -6758,7 +6790,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 기준일 줄도 코드가 찍는다(아래 봉인 표지와 같은 까닭) — 봉인 줄 아래에 온다. 셈은 사전 검색 · 자유 조회에서 모은 것이다.
     if _as_of:
-        decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free)}\n\n{decision}"
+        decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free, _ao_des)}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
     # 똑같이 생긴다. 결정문은 이 심의의 내구 기록(RA 보고서)이라 저장 전에, 맨 위에 찍는다.
     if opts.sealed:

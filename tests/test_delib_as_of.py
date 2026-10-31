@@ -634,3 +634,42 @@ def test_심의의_로드는_좌석에_기준일_칸을_보이지_않고_넣어�
     assert {"as_of", "as_of_undated"} <= set(props), "심의 밖의 로드 스키마가 바뀌었다"
     assert (SEEN["new"][-1]["as_of"], SEEN["new"][-1]["as_of_undated"]) == ("2024-01-01", "exclude"), "심의 밖의 로드가 바뀌었다"
 
+
+# ── 반대 검토 10-31 — 지정 도구로 고른 agent_search 도 기준일 셈에 든다 ───────────────────────────────────────────────────
+@pytest.mark.parametrize("which", ["old", "new"])
+def test_지정_도구로_고른_agent_search_도_기준일_셈에_들고_옛_허브면_다시_시키지_않는다(monkeypatch, hubs, which):
+    async def _llm(_o, system, human, *_img):
+        if "도구 호출 계획자" in system:
+            return '{"agent_type": "mech-a", "q": "힌지"}'
+        return _SEAT_JSON if "전문가입니다" in system else "결정문 본문"
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None, connections=hubs[which]))
+    opts = {"personas": _SEATS, "free_tools": 0, "voc": "off", "rescreen": 0, "rounds": 2, "save_report": 0,
+            "rebut_quote": 0, "persona_knowledge": 0, "tools": ["agent_search"], "as_of": AS_OF}
+
+    async def go():
+        out, gen = [], d.run_deliberation(stub, "힌지 크랙 원인", [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                out.append((ev, data))
+                if ev == "done":
+                    break
+        finally:
+            await gen.aclose()
+        return out
+    events = asyncio.run(go())
+    head = _decision(events).split("\n\n", 1)[0]
+    assert "이 거름이 걸린 조회가 없었다" not in head, f"지정 도구로 부른 조회가 있는데 없었다고 적었다 — {head}"
+    warn = [x for ev, x in events if ev == "warning" and x.get("code") == "as_of_unconfirmed"]
+    miss = [c["text"] for c in _cards(events, included=False) if c["source"] == "지정 도구 미실행"]
+    if which == "old":
+        assert len(SEEN["old"]) == 1, f"메아리가 없어 버린 답을 일반 실패처럼 다시 시켰다 — {SEEN['old']}"
+        assert len(warn) == 1 and "지정 도구" in warn[0]["message"], warn
+        assert miss and "기준일" in miss[0] and "호출 실패·인자를 못 정해 건너뜀" not in miss[0], miss
+        assert "지정 도구 agent_search 1건" in head and "싣지 않았다" in head, head
+    else:
+        assert [s["as_of"] for s in SEEN["new"]] == [AS_OF] and not warn and not miss, (SEEN["new"], warn, miss)
+        assert f"지정 도구 agent_search 1건 — 결과에 {d._AS_OF_UNDATED} 1장" in head, head
+
