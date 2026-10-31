@@ -3710,6 +3710,60 @@ def envelope_failed(s) -> bool:
     return isinstance(code, int) and not isinstance(code, bool) and code != 0
 
 
+# 챗 도구 결과의 앱 머리(app._chat_result_note — '[이 결과는 ○○ 앱의 도구 이다]'). 포털 '심의로 넘기기' 가 넘기는 근거(delib_opts.evidence)는
+# 챗이 모델에 준 결과 그대로라 이 머리를 달고 공백이 한 칸으로 접혀(app._handoff_text) 온다. 봉투 뒤에는 되풀이 꼬리
+# ('[이 턴에 … 번째 불렀다 …]')가 붙을 수 있다.
+_CHAT_HEAD_RE = re.compile(r"\[이 결과는 [^\]\n]* 앱의 [^\]\s]+ 이다\]\s*")
+# 3상태 봉투의 앞머리 — 맨 위 ok 다음에 data 가, data 안에서는 status 다음에 results 가 온다(WebResearchMCP app/errors.py 의 envelope ·
+# search_data 차례). 챗 활동의 220자 미리보기(포털은 날것 result_full 을 저장 예산에서 떨어뜨리면 이것을 넘긴다 — chatStore
+# keepHandoffBudget)처럼 잘린 글에서도 상태와 빈 결과가 보이는 자리다.
+_WEB_NOEV_HEAD_RE = re.compile(r'\{\s*"ok"\s*:\s*true\s*,\s*"data"\s*:\s*\{\s*"status"\s*:\s*"(?:blocked|empty|degraded)"\s*,'
+                               r'\s*"results"\s*:\s*\[\s*\]', re.IGNORECASE)
+
+
+def _envelope_no_evidence(s) -> bool:
+    """웹 리서치 3상태 봉투가 '근거 없음' 을 말하는가 — data.status 가 blocked · empty, 또는 degraded 인데 results 가 0건.
+
+    웹 리서치 앱(WebResearchMCP app/errors.py)은 결과의 상태를 맨 위가 아니라 data 에 싣는다 —
+    `{ok, data:{status, results, note, egress}, errors, warnings}`. 차단 · 빈 결과도 맨 위는 ok:true · errors [] 라
+    envelope_failed 는 이 봉투를 실패로 보지 않는다. 실패가 아니니 맞다(챗에 실패 배지를 달 일이 아니고, 좌석에게는
+    '차단은 없음이 아니다' 는 경고째 간다). 다만 **근거로 세면 안 된다** — 세면 근거 프로파일의 '도구 조회' 가 올라 실측
+    데이터 0건인 심의가 '가설 단계' 표지 없이 측정에 기댄 꼴로 나간다(HWAXPortal docs/web-research P6). 세는 자리(지정 도구 ·
+    챗이 넘긴 근거 · 좌석 자유 조회)가 이 판정으로 거른다.
+    results 가 목록이 아니면 3상태 봉투가 아니다 — 다른 앱의 data.status 는 판정하지 않는다(모르는 꼴은 종전대로 센다).
+
+    챗이 넘긴 근거는 앱 머리(_CHAT_HEAD_RE)를 단 채 온다 — 머리 바로 뒤의 봉투를 읽고(raw_decode — 봉투 뒤의 되풀이 꼬리는 읽지 않는다),
+    잘려서 끝까지 못 읽으면 앞머리(_WEB_NOEV_HEAD_RE)로 본다. 종전엔 글 전체를 JSON 으로만 읽어 머리 단 챗 결과는 늘 근거로 셌다 —
+    챗에서 차단된 검색을 '심의로 넘기기' 한 심의에 가설 단계 표지가 빠졌다(반대 검토 10-31). 머리 없는 글은 종전대로 통째로 JSON 일
+    때만 판정한다 — 머리는 그 글이 도구 결과 하나라는 표지라, 다른 글과 섞인 봉투는 판정하지 않는다."""
+    if not isinstance(s, str) or not s.strip():
+        return False
+    t = s.strip()
+    head = _CHAT_HEAD_RE.match(t)
+    try:
+        v = json.JSONDecoder().raw_decode(t, head.end())[0] if head else json.loads(t)
+    except (ValueError, TypeError):
+        return bool(head and _WEB_NOEV_HEAD_RE.match(t, head.end()))
+    data = v.get("data") if isinstance(v, dict) else None
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        return False
+    status = str(data.get("status") or "").lower()
+    return status in ("blocked", "empty") or (status == "degraded" and not data["results"])
+
+
+# 웹 리서치 앱의 상태 · 기록 도구 — 그 서버가 지금 무엇을 할 수 있는지(describe_search_status)와 무엇을 내보냈는지(list_egress_log)를
+# 말할 뿐 주제의 근거가 아니다. 성공 봉투이고 3상태가 없어 _envelope_no_evidence 로는 가려지지 않는다 — 세면 '결과가 왜 비는지' 를 보려
+# 상태 도구를 부르고 차단된 검색만 받은 심의가 도구 조회 1건 이상으로 읽혀 가설 단계 표지가 빠진다(HWAXPortal docs/web-research P6).
+_WEB_META_TOOLS = ("describe_search_status", "list_egress_log")
+
+
+def _web_meta_tool(name) -> bool:
+    """웹 리서치의 상태 · 기록 도구인가 — 이름 그대로이거나 게이트웨이 별칭 · 충돌 접두(<앱키>_<도구>)를 단 꼴(app._agent_denied 와 같은 규칙).
+    세는 자리 셋이 이 도구의 결과를 좌석에는 그대로 싣되 근거로 세지 않는다."""
+    n = str(name or "").strip().lower()
+    return any(n == t or n.endswith("_" + t) for t in _WEB_META_TOOLS)
+
+
 def _tool_schema_brief(t) -> str:
     """도구 args 스키마를 LLM 인자 구성 프롬프트용 요약으로 — MCP 어댑터의 JSON 스키마 dict 만
     (pydantic 모델이면 빈 문자열 — 설명만으로 구성 시도).
@@ -5505,6 +5559,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         _tool_unconf = []                     # 기준일 거름을 확인하지 못해(메아리 없음) 결과를 버린 도구 — 인자 문제가 아니라 다시 시키지 않는다
         _tool_refused = []                    # 리스크 심사에 지정된 등록부·앞 패널 기록 도구 — 부르지 않는다(D-18)
+        _tool_noev = []                       # 웹 리서치의 차단 · 빈 결과를 돌려준 도구 — 좌석에는 싣되 근거로 세지 않는다
+        _tool_meta = []                       # 웹 리서치의 상태 · 기록 도구(_web_meta_tool) — 같다(서버를 말할 뿐 주제의 근거가 아니다)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
@@ -5584,7 +5640,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _head = f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
                 _got.append((_head, _good))
                 _used.append(_tn)
-                ev_count["tool"] += 1
+                # 웹 리서치의 차단 · 빈 결과 — 좌석에는 '차단은 없음이 아니다' 는 경고째 그대로 가되 근거로 세지 않는다(_envelope_no_evidence).
+                # 상태 · 기록 도구의 결과도 같다(_web_meta_tool).
+                if _web_meta_tool(_tn):
+                    _tool_meta.append(_tn)
+                elif _envelope_no_evidence(_good):
+                    _tool_noev.append(_tn)
+                else:
+                    ev_count["tool"] += 1
                 yield _delib("evidence", source=f"지정 도구 {_tn}", text=_good[:1500], included=True)
             elif _tn in _tool_unconf:
                 yield _sse("status", {"step": f"지정 도구 결과를 싣지 않음: {_tn} — 기준일 {_as_of} 거름을 지식 허브가 확인해 주지 "
@@ -5635,8 +5698,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    f"지정 도구 결과 {len(_tcut)}건이 도구 하나의 상한({_tchunk:,}자)을 넘어 "
                                    f"앞 {_tchunk:,}자까지만 좌석에 실었다")
                                   + " — 줄인 것: " + ", ".join(_tcut) + ". 뒷부분의 수치는 좌석이 보지 못했다.")
-            yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used)}건", "tool": None,
-                                  "tools_used": _used})
+            _noev = " · ".join(f"{_what} {len(_ns)}건({', '.join(_ns)})" for _what, _ns in
+                               (("웹 리서치 차단 · 빈 결과", _tool_noev), ("웹 리서치 상태 · 기록 조회", _tool_meta)) if _ns)
+            yield _sse("status", {"step": f"지정 도구 근거 확보 — {len(_used) - len(_tool_noev) - len(_tool_meta)}건"
+                                          + (f" · {_noev}은 좌석에 싣되 근거로 세지 않았다" if _noev else ""),
+                                  "tool": None, "tools_used": _used})
 
     # 1) 발굴 — recommend_agents. 이어하기(continue_personas)는 이전 전문가를 유임시키되,
     #    사람 의견이 주제를 옮겼을 수 있으므로 실효 질문으로 재심사해 신규 좌석을 더한다(F10).
@@ -6009,7 +6075,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _cut_lines.append(f"[e:{_ei}{'|' + _e['key'] if _e.get('key') else ''}] {_src}: "
                                   f"원문 {_cut_len:,}자 · {_cut_what}")
             yield _delib("evidence", source=f"챗 정리 · {_src}", text=_shown, included=True)
-            ev_count["tool"] += 1
+            # 웹 리서치의 차단 · 빈 결과 · 상태 · 기록 조회는 좌석에 싣되 근거로 세지 않는다(챗이 넘긴 것은 앱 머리째 온다 — _CHAT_HEAD_RE).
+            if not (_web_meta_tool(_e.get("tool")) or _envelope_no_evidence(_res)):
+                ev_count["tool"] += 1
         # 드롭을 조용히 넘기면 좌석은 전부 봤다고 믿는다. 무엇이 빠졌는지 화면에 남긴다.
         if _dropped:
             yield _delib("evidence", source="사전 근거 예산 초과",
@@ -6259,6 +6327,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                          f"…[{len(prev_t):,}자 중 뒤 {_gcap:,}자]\n" + prev_t[-_gcap:])
             else:
                 _gctx = _cut_mark(base, _gcap)
+            # 1라운드 조회 턴도 발언 턴(prompt_fn)이 가리는 좌석을 똑같이 가린다(F12) — 신규 좌석(anon1r 면 전원)은 이전 결론 없이
+            # 조회한다. 조회 턴에 이전 결론이 실리면 무엇을 찾을지부터 그 결론에 끌려가고, 조회 요약이 그대로 1라운드 발언에 들어간다
+            # (Claude 길 hwax-deliberate.js 는 1라운드 조회와 발언이 한 턴이라 BASE_BLIND 하나로 가린다).
+            _gctx_blind = _cut_mark(base_blind, _gcap) if rnd == 1 and _has_blind else _gctx
             # 좌석마다 **자기 분야 도구**로 에이전트를 만든다. 전원에게 같은 목록을 주면
             # 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은 못 고르고 큰 모델도
             # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
@@ -6308,7 +6380,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _img_acc = {"read": 0, "fail": 0, "no_model": 0, "over": 0, "err": 0}
             _gt = [asyncio.ensure_future(
                 _gather_with_img_acc(_img_acc, _seat_agents.get(p["key"]) or g_agent, p, question,
-                                     _gctx, opts.tool_budget, _prior)) for p in personas]
+                                     _gctx_blind if (_anon1r or p.get("origin") == "new") else _gctx,
+                                     opts.tool_budget, _prior)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
             # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
             # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,
@@ -6339,7 +6412,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                               "detail": _ap, "ok": _ok,
                                               **({"call": _cid} if _cid else {})})
                         if _ok and _out.strip() not in ("[]", "{}", "null", ""):
-                            ev_count["tool"] += 1
+                            # 웹 리서치의 차단 · 빈 결과 · 상태 · 기록 조회 — 카드 · 공용 풀에는 그대로 가되(같은 검색을 되풀이하지 않게)
+                            # 근거로 세지 않는다.
+                            if not (_web_meta_tool(_tn) or _envelope_no_evidence(_out)):
+                                ev_count["tool"] += 1
                             yield _delib("evidence", source=f"{_k} · {_tn}", text=_out[:_FREE_EVID_SHOW],
                                          included=True, tool=_tn, args=_ap,
                                          **({"call": _cid} if _cid else {}))
