@@ -18,7 +18,12 @@ ChatDock (portal frontend)
 - `POST /chat` — body `{message, system_id?, groups?}`. `groups` (the caller's JWT
   groups, handed off by the portal) are forwarded to the MCP Gateway, which returns only
   the tools those groups may use. Streams the portal's §5 SSE contract:
-  `status` → `token`×N → `result` → `done` (or `error`).
+  `status` → `token`×N → `result` → `done` (or `error`). A multi-stage deliberation (`/시뮬심의` — two stages, three with
+  the build plan) also sends `done` once, at the very end: each stage's engine stream ends with `done`, and
+  `run_sim_deliberation` drops those (`_one_done`) — the stage boundary is the `delib {kind: "checkpoint"}` event. Before
+  10-31 every stage sent its own `done`, and the web chat, which ends the turn at the first one, lost the stop button and
+  unlocked the composer from stage 2 on. An early end (refused start, no stage-1 decision, an exception) is `error` then
+  that one `done`.
 - `GET /health` — `{status, delib_active, delib_queued, model, vllm, mcp, tool_scoping, …}`.
   `delib_active` / `delib_queued` count running and queued deliberations (web and MCP jobs);
   `start.sh` reads them before it replaces a running instance, and any unattended restart

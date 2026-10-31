@@ -5192,17 +5192,39 @@ def _carry_cut_cards(what: str, text: str, cap: int, to: str, nn: list | None = 
                         "앞 단의 결과에 그대로 있다).")]
 
 
+_DONE_HEAD = b"event: done\n"
+
+
+async def _one_done(gen):
+    """다단 심의의 스트림 — 단마다 엔진 스트림(_deliberation_stream)이 끝에 내는 done 을 걷고 맨 끝에 하나만 낸다. 다른 사건(단 경계 표지
+    checkpoint 포함)은 그대로 흘린다. 웹 챗은 첫 done 을 턴의 끝으로 읽어, 단마다 done 이 나가면 2단부터 멈춤(■)이 사라지고 입력창이 풀리고 마지막
+    done 은 버려졌다(포털 헤드리스 하네스 확인 10-31). 앞에서 끝나는 길(거절 · 1단 결정문 없음 · 예외)도 오류 뒤 done 하나로 맺는다. 닫히면(구독이
+    끊겨 접힌다) 아무것도 더 내지 않는다. 잡 길(delib_jobs._drive)은 done 을 원장 · 일지에 싣지 않아 그대로다."""
+    async for chunk in gen:
+        if not (isinstance(chunk, bytes) and chunk.startswith(_DONE_HEAD)):
+            yield chunk
+    yield _sse("done", {})
+
+
 async def run_sim_deliberation(app, question: str, groups: list, req_opts=None, user: str = "",
                                user_pat: str = "", history: list | None = None, *, owner: str = "", job_id: str = "",
                                affiliation: str = ""):
-    """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의.
+    """시뮬레이션 심의 — 메커니즘을 좁힌 뒤 CAE 가 해석을 설계하는 2단 심의(구축 계획이면 3단).
 
     라운드 루프를 건드리지 않고 기존 스트림을 두 번 돌린다. 리팩터링하면 회귀 위험이 크고,
-    래퍼는 기존 계약(SSE 이벤트·저장 경로)을 그대로 쓴다.
+    래퍼는 기존 계약(SSE 이벤트·저장 경로)을 그대로 쓴다. 단 스트림마다 끝에 오는 done 은 걷고 맨 끝에 하나만 낸다(_one_done).
 
     좌석 설계가 핵심이다 — CAE 전문가만 모으면 틀린 물리를 아름답게 계산한다. 그래서 2단은
     고정 CAE 좌석 + 1단 결론으로 발굴한 CAE 좌석 + 물리 유임 좌석으로 구성한다. 유임자는
     해석이 물리에서 떠나는 것을 막는 감시자다."""
+    async for chunk in _one_done(_sim_stages(app, question, groups, req_opts, user, user_pat, history, owner=owner,
+                                             job_id=job_id, affiliation=affiliation)):
+        yield chunk
+
+
+async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str = "", user_pat: str = "",
+                      history: list | None = None, *, owner: str = "", job_id: str = "", affiliation: str = ""):
+    """run_sim_deliberation 의 본체 — 단 스트림을 차례로 흘린다(단마다의 done 은 바깥 _one_done 이 걷는다)."""
     call_trace.tag(kind="sim-delib")
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
