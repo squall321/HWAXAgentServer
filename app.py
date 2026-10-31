@@ -1721,15 +1721,30 @@ def _hub_tool(hub: str, base: str) -> str:
     return base if m.get(base) == hub else pre
 
 
-def _hub_id_meta(text: str) -> dict:
-    """허브 결과 글의 이름표 — {uuid: {"key", "type", "label"}}. JSON 으로 읽힐 때만 얻는다(접기 머리 줄은 떼고 읽는다). 두 꼴만 본다 — {id,
-    key|label, type_slug}(resolve · 목록 · 검색 · 그래프 노드)와 {object_id, object_key|object_label, object_type_slug}(object_get 의 관련 객체).
-    처음 본 것을 남긴다. 못 읽으면(상한에서 잘린 글 · JSON 이 아닌 글) 빈 사전이고 id 는 이름표 없이 적힌다. 글에 실을 값이라 공백을 한 칸으로
-    줄이고 '"' 를 "'" 로 바꾸고 _HUB_TAG_CHARS 자로 자른다."""
-    s = text.split("\n", 1)[1] if text.startswith("[포털 챗이 허브 응답을 접었다") and "\n" in text else text
+_JSON_HEAD = json.JSONDecoder()
+
+
+def _json_head(text: str):
+    """허브 결과 글 맨 앞의 JSON 값 하나와 그 뒤의 꼬리 — (값, 꼬리). 못 읽으면 (None, 글). 래퍼는 성공한 결과 뒤에도 '[인자 스키마 — …]' 를
+    붙인다(_maybe_repair_hint — 머리 600자에 인자 검증 낱말이 있으면. search 의 q · 객체 이름표에 그 낱말이 든 성공한 답에도 붙는다). 글 전체를
+    json.loads 로 읽으면 그 꼬리 하나로 이름표(_hub_id_meta)와 글에만 나온 UUID(_hub_post_only_ids)를 둘 다 잃었다(반대 검토 10-31 R9 2차). 상한에서
+    잘린 글은 맨 앞 값도 끝나지 않아 종전처럼 못 읽는다."""
+    s = text.lstrip()
     try:
-        data = json.loads(s)
+        data, end = _JSON_HEAD.raw_decode(s)
     except ValueError:
+        return None, text
+    return data, s[end:]
+
+
+def _hub_id_meta(text: str) -> dict:
+    """허브 결과 글의 이름표 — {uuid: {"key", "type", "label"}}. JSON 으로 읽힐 때만 얻는다(접기 머리 줄은 떼고 · 뒤에 붙은 인자 힌트는 두고 맨 앞
+    값만 읽는다 — _json_head). 두 꼴만 본다 — {id, key|label, type_slug}(resolve · 목록 · 검색 · 그래프 노드)와 {object_id, object_key|object_label,
+    object_type_slug}(object_get 의 관련 객체). 처음 본 것을 남긴다. 못 읽으면(상한에서 잘린 글 · JSON 이 아닌 글) 빈 사전이고 id 는 이름표 없이
+    적힌다. 글에 실을 값이라 공백을 한 칸으로 줄이고 '"' 를 "'" 로 바꾸고 _HUB_TAG_CHARS 자로 자른다."""
+    s = text.split("\n", 1)[1] if text.startswith("[포털 챗이 허브 응답을 접었다") and "\n" in text else text
+    data, _tail = _json_head(s)
+    if data is None:
         return {}
     out: dict = {}
 
@@ -1766,10 +1781,7 @@ def _hub_post_only_ids(name, text: str) -> set:
     n = str(name or "").strip().lower()
     if not (n == "search" or n.endswith("_search")):
         return set()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return set()
+    data, tail = _json_head(text)        # 뒤에 붙은 인자 힌트는 두고 맨 앞 값만 읽는다 — 꼬리는 '글 밖' 으로 센다
     posts = data.get("posts") if isinstance(data, dict) else None
     if not isinstance(posts, list):
         return set()
@@ -1781,11 +1793,11 @@ def _hub_post_only_ids(name, text: str) -> set:
                 inside.update(_uuids(v))
     if not inside:
         return inside
-    # 글 밖에도 나온 UUID 는 빼지 않는다 — title · snippet 글만 걷은 사본에서 다시 찾는다. ensure_ascii 를 끄는 까닭은 \uXXXX 의 끝 자리(16진)가
-    # 바로 뒤의 UUID 를 가려서다.
+    # 글 밖에도 나온 UUID 는 빼지 않는다 — title · snippet 글만 걷은 사본과 맨 앞 값 뒤의 꼬리에서 다시 찾는다. ensure_ascii 를 끄는 까닭은
+    # \uXXXX 의 끝 자리(16진)가 바로 뒤의 UUID 를 가려서다.
     rest = {**data, "posts": [{k: v for k, v in p.items() if not (k in _HUB_POST_TEXT and isinstance(v, str))} if isinstance(p, dict) else p
                               for p in posts]}
-    return inside - set(_uuids(json.dumps(rest, ensure_ascii=False)))
+    return inside - set(_uuids(json.dumps(rest, ensure_ascii=False) + "\n" + tail))
 
 
 def _learn_hub_ids(name, text, carried=()) -> None:

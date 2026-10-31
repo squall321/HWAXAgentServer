@@ -101,16 +101,17 @@ def _cache(monkeypatch, mapping, labels):
     monkeypatch.setattr(a, "_gw_apps", lambda: apps)
 
 
-def _rec(name, result, log, *, mcp=False, prep=True):
+def _rec(name, result, log, *, mcp=False, prep=True, schema=None):
     """기록하는 도구 — 받은 인자 · 그때 턴 상태가 아는 id(상태가 없으면 None)를 적고 정해 둔 글(또는 인자로 고른 글)을 돌려준다. 사전 스키마라
     넘긴 인자가 그대로 간다. mcp 면 운영 꼴(content_and_artifact — 내용 블록 목록과 아티팩트)로 돌려준다. prep 이 거짓이면 래퍼로 싸지 않은
-    도구다 — 실제 턴(_agent_for)이 운영처럼 한 겹만 싼다."""
+    도구다 — 실제 턴(_agent_for)이 운영처럼 한 겹만 싼다. schema 를 주면 그 인자 스키마다 — 빈 스키마는 인자 힌트(_arg_hint)가 비어 래퍼가
+    결과 뒤에 '[인자 스키마 …]' 를 붙이는 길을 못 본다(운영의 MCP 도구는 늘 칸이 있는 스키마다)."""
     async def call(**kw):
         st = a._turn_hub_ids.get()
         log.append((name, dict(kw), None if st is None else set(st)))
         text = result(kw) if callable(result) else result
         return ([{"type": "text", "text": text}], None) if mcp else text
-    tool = StructuredTool(name=name, description="d", coroutine=call, args_schema={"type": "object", "properties": {}},
+    tool = StructuredTool(name=name, description="d", coroutine=call, args_schema=schema or {"type": "object", "properties": {}},
                           **({"response_format": "content_and_artifact"} if mcp else {}))
     return a._prep_tool(tool, arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True) if prep else tool
 
@@ -843,3 +844,99 @@ def test_r9_실제_턴_FailureTrace_글에서_본_정본_id_로_정본_그래프
     assert U_RD in seen, "전제 — 모델이 받은 검색 결과의 글에 정본 id 가 있다"
     last = [m for m in llm.seen[2] if isinstance(m, ToolMessage)][-1].content
     assert a._XHUB_ID_MARK not in last and U_PART in last, last[:300]
+
+
+# ── 반대 검토 10-31(R9 ② 2차) — 성공한 search 결과 뒤에 래퍼가 인자 힌트를 붙여도 글에만 나온 UUID 를 배우지 않는다 ────────────────────────────
+# 래퍼(_prep_tool)는 결과 머리 600자에 인자 검증 낱말(validation error · field required · unexpected keyword · invalid arguments …)이 있으면 성공한 결과
+# 뒤에도 '[인자 스키마 — …]' 를 붙인다(_maybe_repair_hint). 운영의 MCP 도구는 늘 칸이 있는 스키마라 힌트가 붙는다. 종전엔 그 꼬리 때문에 글 전체를
+# JSON 으로 못 읽어 _hub_post_only_ids 가 빈 집합이 되고(글에만 나온 정본 id 를 FailureTrace 것으로 배워 정본 호출이 막혔다) _hub_id_meta 도 비었다
+# (FailureTrace 의 객체 행이 key · 이름표 없이 적혔다). 위 시험들의 도구는 빈 스키마라 힌트가 붙지 않아 이 길을 못 봤다.
+SP_SEARCH_SCHEMA = {"properties": {"q": {"title": "Q", "type": "string"},
+                                   "type_slug": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "title": "Type Slug"},
+                                   "limit": {"default": 20, "title": "Limit", "type": "integer"},
+                                   "offset": {"default": 0, "title": "Offset", "type": "integer"}},
+                    "required": ["q"], "title": "failuretrace_searchArguments", "type": "object"}   # FastMCP 가 search(q, type_slug, limit, offset)에 짓는 꼴
+HINT_WORDS = ["validation error", "Field required", "unexpected keyword", "invalid arguments"]
+FT_HIT_VE = {**FT_HIT, "label": "부팅 시 Validation Error 반복", "matched_text": "부팅 시 Validation Error 반복"}   # 첫 객체 행 이름표 — 머리 600자 안이다
+
+
+def _ft_search_q(q: str, items=(), indent=None) -> str:
+    """같은 FailureTrace search 답에 q 만 바꾼다(글 snippet 에는 그대로 정본 id 가 있다)."""
+    return json.dumps({**json.loads(_ft_search(items=items)), "q": q}, ensure_ascii=False, indent=indent)
+
+
+@pytest.mark.parametrize("q, items", [*((w, ()) for w in HINT_WORDS), ("부팅", (FT_HIT_VE,))],
+                         ids=[*HINT_WORDS, "item_label"])
+def test_r9_인자_힌트가_붙은_검색_결과에서도_글에만_나온_id_는_배우지_않고_주인_허브를_부른다(monkeypatch, turn, q, items):
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    got = _call(_rec("failuretrace_search", _ft_search_q(q, items), log, schema=SP_SEARCH_SCHEMA), {"q": q})
+    assert "[인자 스키마 — 이 형식으로 교정해 다시 호출하세요]" in got and got.rstrip().endswith("offset:integer"), \
+        "전제 — 래퍼가 성공한 검색 결과 뒤에 인자 힌트를 붙인다"
+    assert U_RD not in turn, "글에만 나온 정본 id 를 FailureTrace 것으로 배웠다(힌트 꼬리 때문에 글을 JSON 으로 못 읽었다)"
+    assert turn[U_POST]["apps"] == {"failuretrace"}, "글 id 는 그대로 배운다"
+    out = _call(_rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log), {"object_id": U_RD})
+    assert _names(log) == ["failuretrace_search", "rootdesigndatahub_graph_neighbors"] and a._XHUB_ID_MARK not in out, out[:300]
+    assert "앞 허브의 결과에서" not in out
+
+
+def test_r9_인자_힌트가_붙어도_객체_행의_이름표를_읽어_막은_글에_key_를_싣는다(monkeypatch, turn):
+    """같은 꼬리가 _hub_id_meta 도 비웠다 — FailureTrace 의 객체 행(U_FT)이 key · 이름표 없이 적혀, 그 id 를 정본에 실었을 때 막은 글이 'key 를 결과에서
+    읽지 못했다' 로 key 로 다시 푸는 길을 주지 못했다."""
+    _cache(monkeypatch, MAP_R9, LABELS)
+    log = []
+    _call(_rec("failuretrace_search", _ft_search_q("부팅", (FT_HIT_VE,)), log, schema=SP_SEARCH_SCHEMA), {"q": "부팅"})
+    assert turn[U_FT] == {"apps": {"failuretrace"}, "hub": "failuretrace", "tool": "failuretrace_search", "key": "JNT-SLD-01",
+                          "type": "failure_mode", "label": "부팅 시 Validation Error 반복"}, turn.get(U_FT)
+    out = _call(_rec("rootdesigndatahub_graph_neighbors", RD_GRAPH, log), {"object_id": U_FT})
+    assert _names(log) == ["failuretrace_search"] and a._XHUB_ID_MARK in out
+    assert 'rootdesigndatahub_object_resolve(type_slug="failure_mode", name="JNT-SLD-01")' in out, out
+
+
+@pytest.mark.parametrize("tail, want", [
+    pytest.param("\n[인자 스키마 — 이 형식으로 교정해 다시 호출하세요]\nq*:string | limit:integer", {U_RD}, id="hint_tail"),
+    pytest.param(f"\n[다음 쪽 — {U_RD} 로 이어 본다]", set(), id="id_also_in_tail"),     # 꼬리에도 나온 id 는 글 밖에도 나온 id 다
+])
+def test_r9_머리_JSON_뒤의_꼬리를_가른다(tail, want):
+    assert a._hub_post_only_ids("failuretrace_search", _ft_search() + tail) == want
+
+
+def test_r9_진짜_MCP_사슬에서_인자_힌트가_붙어도_주인_허브를_부른다(monkeypatch):
+    """FastMCP 서버 · 메모리 세션 · 어댑터(load_mcp_tools) · _prep_tool(chat) — 운영과 같은 사슬이다(스키마는 FastMCP 가 짓는다)."""
+    from langchain_mcp_adapters.tools import load_mcp_tools
+    from mcp.server.fastmcp import FastMCP
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    _cache(monkeypatch, MAP_R9, LABELS)
+    srv = FastMCP("hub-fake")
+    reached = []
+
+    @srv.tool(name="failuretrace_search")
+    def failuretrace_search(q: str, type_slug: str | None = None, limit: int = 20, offset: int = 0) -> dict:
+        reached.append(("failuretrace_search", q))
+        return json.loads(_ft_search_q(q))
+
+    @srv.tool(name="rootdesigndatahub_graph_neighbors")
+    def rootdesigndatahub_graph_neighbors(object_id: str, depth: int = 1) -> dict:
+        reached.append(("rootdesigndatahub_graph_neighbors", object_id))
+        return json.loads(RD_GRAPH)
+
+    async def go():
+        st: dict = {}
+        tok = a._turn_hub_ids.set(st)
+        try:
+            async with create_connected_server_and_client_session(srv) as s:
+                tools = {t.name: a._prep_tool(t, arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True) for t in await load_mcp_tools(s)}
+                r1 = await tools["failuretrace_search"].ainvoke({"q": "validation error"})
+                learned = {u: set(e["apps"]) for u, e in st.items()}
+                r2 = await tools["rootdesigndatahub_graph_neighbors"].ainvoke({"object_id": U_RD})
+                return r1, r2, learned
+        finally:
+            a._turn_hub_ids.reset(tok)
+
+    r1, r2, learned = asyncio.run(go())
+    t1, t2 = (r if isinstance(r, str) else r[0] if isinstance(r, tuple) else str(r) for r in (r1, r2))
+    assert "[인자 스키마" in t1, "전제 — 진짜 사슬에서도 성공한 결과 뒤에 인자 힌트가 붙는다"
+    assert U_RD not in learned and reached == [("failuretrace_search", "validation error"), ("rootdesigndatahub_graph_neighbors", U_RD)], \
+        (learned, reached)
+    assert a._XHUB_ID_MARK not in t2 and U_PART in t2, t2[:300]
