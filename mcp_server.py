@@ -76,6 +76,9 @@ def bind(app) -> None:
     except Exception:  # noqa: BLE001
         log.exception("잡 원장 정리 실패 — 계속")
     delib_jobs.start_ticker()       # 줄을 주기로 다시 본다 — 멈춤이 풀리거나 한도 덮개를 손으로 고친 것을 따라간다
+    # 종료 신호를 받는 그 자리에서 줄을 닫는다 — uvicorn 은 열린 연결을 AGENT_GRACEFUL_S 까지 기다린 뒤에야 lifespan 종료(unbind)를 돌아, 그 사이
+    # 자리가 나면 내려가는 프로세스가 줄 선 잡을 띄웠다(HA-09 S0 반대 검토 10-31 — R2 의 '같은 차례로 다시 선다' 가 깨졌다)
+    delib_jobs.hook_exit_signals()
 
 
 async def unbind() -> None:

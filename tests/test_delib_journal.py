@@ -341,3 +341,97 @@ def test_다른_루프의_잡은_건드리지_않는다(eng, monkeypatch):
         assert asyncio.run(delib_jobs.shutdown()) == 0
     finally:
         delib_jobs.closing(False)
+
+
+# ── 재기동이 겹쳐도 남이 닫은 원장을 덮지 않는다 · 내려가기 시작하면 줄을 닫는다(HA-09 S0 반대 검토 10-31) ──────────────────────────────
+# 옛 프로세스가 정상 종료를 기다리는 동안 새 프로세스가 같은 원장 자리에 떠서(종전 start.sh — 리스너만 보고 띄웠다) 재기동 정리가 도는 잡을
+# interrupted 로 닫고, 그 위에 이어하기가 resumed_by 를 적었다. 옛 프로세스의 잡은 그 뒤에 끝나며 메모리 사본으로 원장을 덮어 표지를 지웠다 —
+# 이어하기가 한 번 더 받아져 같은 잡이 두 번 이어졌다. start.sh 는 이제 옛 프로세스가 끝난 뒤에 띄우지만, 다른 길(손 기동 · 감시 크론)로 겹쳐도
+# 끝 쓰기가 남이 닫은 원장을 덮지 않는다.
+_OTHER = "default-20261031-000000-이은잡"
+
+
+def _closed_by_other(job: dict) -> None:
+    """다른 프로세스가 쓴 꼴 — 재기동 정리가 끊긴 잡으로 닫고 이어하기가 표지를 적은 원장(같은 자리)."""
+    delib_jobs._persist({**_on_disk(job), "status": "interrupted", "error": delib_jobs.INTERRUPTED_MSG, "resumed_by": _OTHER,
+                         "finished_at": delib_jobs._now()})
+
+
+def test_다른_프로세스가_닫은_원장은_잡이_끝나도_덮지_않는다(eng, monkeypatch):
+    _caps(monkeypatch, 2)
+
+    async def scenario():
+        a = _start("가", ME)
+        await _tick()
+        _closed_by_other(a)
+        await _end(eng, a)
+        assert a["status"] == "done", "시험 전제 — 이 프로세스에서는 잡이 끝까지 갔다"
+        return a
+    a = _play(scenario)
+    rec = _on_disk(a)
+    assert (rec["status"], rec.get("resumed_by")) == ("interrupted", _OTHER), f"남이 닫은 원장을 덮었다 — {rec['status']} · {rec.get('resumed_by')}"
+
+
+def test_내려갈_때도_다른_프로세스가_닫은_원장은_덮지_않는다(eng, monkeypatch):
+    """내려가는 길의 두 쓰기 — 상한 안에 접히지 않은 잡을 메모리 상태로 쓰는 것(shutdown)과 그 뒤 잡의 finally."""
+    _caps(monkeypatch, 2)
+    release = {}
+
+    async def slow_entry(_app, q, groups, opts, user_email, user_pat, _x, **_k):
+        for c in _rounds_script():
+            yield c
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            release["ev"] = asyncio.Event()
+            try:
+                await asyncio.wait_for(release["ev"].wait(), 5)
+            except asyncio.TimeoutError:
+                pass
+            raise
+    monkeypatch.setattr(d, "run_deliberation", slow_entry)
+
+    async def scenario():
+        a = _start("가", ME)
+        await _tick()
+        _closed_by_other(a)
+        assert await delib_jobs.shutdown(wait_s=0.05) == 1
+        assert (_on_disk(a)["status"], _on_disk(a).get("resumed_by")) == ("interrupted", _OTHER), "상한 뒤 쓰기가 남의 원장을 덮었다"
+        release["ev"].set()
+        await _tick()
+        return a
+    try:
+        a = _play(scenario)
+    finally:
+        delib_jobs.closing(False)
+    rec = _on_disk(a)
+    assert (rec["status"], rec.get("resumed_by")) == ("interrupted", _OTHER), "잡의 finally 가 남의 원장을 덮었다"
+
+
+def test_종료_신호를_받는_그_자리에서_줄을_닫는다(monkeypatch):
+    """uvicorn 은 TERM 을 받으면 리스너를 닫고 열린 연결을 AGENT_GRACEFUL_S 까지 기다린 뒤에야 lifespan 종료(unbind — 줄 닫기)를 돈다. 그 사이 자리가
+    나면(도는 잡이 끝나거나 주기 펌프) 내려가는 프로세스가 줄 선 잡을 띄웠고, 그 잡은 곧 interrupted 로 접혀 재기동 뒤 같은 차례로 다시 서지 못했다
+    (R2). 기동 때 uvicorn 의 종료 처리기 앞에 줄 닫기를 끼운다 — 다른 처리기는 건드리지 않는다. 신호는 보내지 않고 처리기를 직접 부른다."""
+    import signal
+
+    seen = []
+
+    class _Server:                      # uvicorn.Server 의 꼴 — 처리기는 바운드 메서드 handle_exit 이다
+        def handle_exit(self, sig, frame):
+            seen.append((sig, delib_jobs._CLOSING))
+
+    srv = _Server()
+    saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    monkeypatch.setattr(delib_jobs, "_CLOSING", False)
+    try:
+        signal.signal(signal.SIGTERM, srv.handle_exit)
+        signal.signal(signal.SIGINT, signal.default_int_handler)     # uvicorn 의 것이 아니다 — 끼우지 않는다
+        assert delib_jobs.hook_exit_signals() is True
+        assert delib_jobs.hook_exit_signals() is False, "두 번 끼웠다"
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        assert seen == [(signal.SIGTERM, True)], f"줄을 닫기 전에 uvicorn 처리기로 갔거나 넘기지 않았다 — {seen}"
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+        delib_jobs.closing(False)

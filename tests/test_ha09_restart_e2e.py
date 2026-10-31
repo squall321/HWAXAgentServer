@@ -1,10 +1,11 @@
 # 재기동 넘기기(HA-09 S0) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 끊긴 라운드부터 잇는지 본다
 #
 # 왜 생겼나. 원장은 잡을 띄울 때와 끝날 때만 썼다. 재기동(TERM)에서는 uvicorn 0.49 가 정상 종료를 마친 뒤 같은 신호를 다시 올려
-# 프로세스가 그 자리에서 끝나므로 잡 태스크의 finally(원장 쓰기)가 돌지 않았고, 열린 SSE 가 하나라도 있으면 lifespan 종료에 닿기도
-# 전에 start.sh 의 kill -9 를 맞았다. 그래서 끊긴 잡의 원장은 늘 띄울 때 모양(stage start · 턴 0)이었고, 끝난 라운드 뒤부터 잇는 길(R3)이
-# 실제 재기동에서는 한 번도 걸리지 않고 처음부터 돌았다. 시험의 가짜(_crash)는 메모리 상태를 원장에 쓴 뒤 죽은 꼴이라 이것을 못 봤다
-# (HWAXPortal docs/request-1027/design-ha09-ha20.md A2.3 · A5.1).
+# 프로세스가 그 자리에서 끝나므로 잡 태스크의 finally(원장 쓰기)가 돌지 않았고, 열린 SSE 가 하나라도 있으면 그 연결이 닫힐 때까지(상한
+# 없음) lifespan 종료에 닿지 않은 채 옛 프로세스가 남았다 — 그동안 start.sh 는 리스너만 보고 새 프로세스를 같은 원장 자리에 띄웠다(반대 검토
+# 10-31 이 바로잡았다 — 설계서 A2.3 은 '2초 뒤 kill -9' 로 적었다). 그래서 끊긴 잡의 원장은 늘 띄울 때 모양(stage start · 턴 0)이었고, 끝난
+# 라운드 뒤부터 잇는 길(R3)이 실제 재기동에서는 한 번도 걸리지 않고 처음부터 돌았다. 시험의 가짜(_crash)는 메모리 상태를 원장에 쓴 뒤
+# 죽은 꼴이라 이것을 못 봤다(HWAXPortal docs/request-1027/design-ha09-ha20.md A2.3 · A5.1).
 #
 # 여기서는 가짜가 엔진 바깥에만 있다 — LLM(tests/fakes/llm_server.py)과 게이트웨이(tests/fakes/mcp_gateway.py)는 따로 뜬 가짜 서버이고,
 # 에이전트 서버는 리포의 app:app 을 start.sh 와 같은 uvicorn 인자로 띄운다. 오라클은 둘이다 — 죽기 직전에 진행 조회로 읽은 메모리 상태
@@ -289,7 +290,7 @@ def test_TERM_은_열린_SSE_가_있어도_유예_안에_내려가며_원장에_
     base, proc, log = stack.agent(jobs, "a")
     oracle = _oracle(stack, base)
     jid, _st, pre = _mid_round(stack, base)
-    # 열린 SSE — 포털 챗의 웹 심의 구독 하나를 읽는 채로 둔다(종전엔 이것이 닫히기를 상한 없이 기다리다 start.sh 의 kill -9 를 맞았다).
+    # 열린 SSE — 포털 챗의 웹 심의 구독 하나를 읽는 채로 둔다(종전엔 이것이 닫히기를 상한 없이 기다려 lifespan 종료에 닿지 않았다).
     # ⚠ 줄 읽개(iter_lines)를 붙잡아 둔다 — 버리면 httpx 가 그 응답의 연결을 닫아 '열린 SSE' 가 없어진다(시험 전제가 조용히 사라진다).
     got, ended = [], []
 
@@ -316,8 +317,8 @@ def test_TERM_은_열린_SSE_가_있어도_유예_안에_내려가며_원장에_
             try:
                 rc = proc.wait(timeout=stack.stop_grace)
             except subprocess.TimeoutExpired:
-                pytest.fail(f"TERM 뒤 {stack.stop_grace:.0f}초(start.sh 의 KILL 유예) 안에 내려가지 않았다 — start.sh 라면 여기서 kill -9"
-                            f" 다(열린 SSE 를 기다린다). 로그 끝:\n{log.read_text()[-1500:]}")
+                pytest.fail(f"TERM 뒤 {stack.stop_grace:.0f}초(start.sh 의 KILL 유예) 안에 내려가지 않았다 — start.sh 는 여기서 옛 PID 를"
+                            f" kill -9 한다(열린 SSE 를 기다린다). 로그 끝:\n{log.read_text()[-1500:]}")
             took = time.monotonic() - t0
             reader.join(timeout=5)
     assert ended and ended[0] - t0 < stack.stop_grace, "구독이 서버가 내려간 뒤에도 열려 있다"
@@ -330,3 +331,55 @@ def test_TERM_은_열린_SSE_가_있어도_유예_안에_내려가며_원장에_
     base2, _p2, _log2 = stack.agent(jobs, "b")
     _check_folded(base2, jid, pre)
     _continue_and_finish(stack, base2, jobs, jid, pre, oracle)
+
+
+def test_내려가는_동안_자리가_나도_줄_선_잡은_띄우지_않고_다시_뜨면_같은_차례로_다시_선다(stack):
+    """R2 — 줄 선 잡은 재기동 뒤 같은 차례로 다시 선다. uvicorn 은 TERM 뒤 열린 연결을 AGENT_GRACEFUL_S 까지 기다린 **뒤에야** lifespan 종료(줄
+    닫기)를 돈다 — 그 사이 도는 잡이 끝나 자리가 나면 내려가는 프로세스가 줄 선 잡을 띄웠고, 그 잡은 곧 interrupted 로 접혀 다시 서지 못했다
+    (HA-09 S0 반대 검토 10-31 — 운영이 웹 구독을 더 기다리려고 상한을 올린 꼴). 신호를 받는 그 자리에서 줄을 닫는다(delib_jobs.hook_exit_signals)."""
+    jobs = stack.tmp / "jobs"
+    grace = 8
+    stack.base_env = {**stack.base_env, "DELIB_JOB_MAX_RUNNING": "1"}
+    stack.uvicorn_extra = ["--timeout-graceful-shutdown", str(grace)]
+    base, proc, log = stack.agent(jobs, "a")
+    stack.llm_delay(STEP_S)
+    ja = _mcp(base, "deliberate_start", {**START, "question": Q + " — 가", "rounds": 2})["job_id"]
+    rb = _mcp(base, "deliberate_start", {**START, "question": Q + " — 나", "rounds": 2})
+    jb = rb["job_id"]
+    assert rb["status"] == "queued", rb
+    _wait(base, ja, stage="r1")
+    got = []
+
+    def _read(it):
+        try:
+            for ln in it:
+                got.append(ln)
+        except httpx.HTTPError:
+            pass
+
+    with httpx.Client(timeout=httpx.Timeout(30, read=None), trust_env=False) as sse:
+        with sse.stream("POST", f"{base}/chat", json={"message": f"/심의 {Q} — 다", "delib_opts": {
+                "personas": SEATS, "rounds": 6, "voc": "off", "free_tools": 0, "persona_knowledge": 0, "rescreen": 0,
+                "save_report": 0}}) as r:
+            assert r.status_code == 200
+            it = r.iter_lines()                  # ⚠ 줄 읽개를 붙잡아 둔다 — 버리면 열린 연결이 없어진다(시험 전제)
+            assert next(it).startswith("event: ")
+            reader = threading.Thread(target=_read, args=(it,), daemon=True)
+            reader.start()
+            time.sleep(0.3)
+            proc.send_signal(signal.SIGTERM)
+            stack.llm_delay(FAST_S)               # 내려가는 동안 도는 잡(가)이 끝나 자리가 난다
+            t0 = time.monotonic()
+            while _ledger(jobs, ja)["status"] == "running" and time.monotonic() - t0 < grace - 1:
+                time.sleep(0.1)
+            assert _ledger(jobs, ja)["status"] == "done" and proc.poll() is None, \
+                "시험 전제 — 정상 종료를 기다리는 동안 도는 잡이 끝나 자리가 났다"
+            assert proc.wait(timeout=grace + 15) == -signal.SIGTERM
+            reader.join(timeout=5)
+    led = _ledger(jobs, jb)
+    assert (led["status"], led.get("started_at")) == ("queued", None), \
+        f"내려가는 프로세스가 줄 선 잡을 띄웠다 — {(led['status'], led.get('started_at'), led.get('error'))}"
+    base2, _p2, _log2 = stack.agent(jobs, "b")
+    led = _ledger(jobs, jb)
+    assert (led["status"], led.get("requeued")) == ("queued", 1), f"재기동 뒤 같은 차례로 다시 서지 않았다 — {led.get('status')}"
+    assert _mcp(base2, "deliberate_status", {"job_id": jb})["status"] == "queued"

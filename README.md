@@ -75,8 +75,9 @@ ChatDock (portal frontend)
   graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
 - **Progress survives a restart** (HA-09 S0 — portal `docs/request-1027/design-ha09-ha20.md` A5.1). The ledger is
   written when a job starts and when it ends; a restart used to skip the end: on TERM uvicorn 0.49 re-raises the signal
-  after its graceful shutdown, so the process ends before any job task's `finally` runs, an open SSE kept it from even
-  reaching the lifespan shutdown until `start.sh`'s KILL, and KILL / OOM run nothing. Every interrupted ledger was
+  after its graceful shutdown, so the process ends before any job task's `finally` runs; an open connection kept the old
+  process (no limit) short of the lifespan shutdown while `start.sh`, which watched only the listener uvicorn closes at
+  once, started the new instance next to it on the same ledger; and KILL / OOM run nothing. Every interrupted ledger was
   therefore still in its launch shape (`stage: start`, 0 turns) and R3 always started over. Now `_drive` appends every
   event it applies to `<DELIB_JOB_DIR>/journal/<id>.jsonl` (folder 0700, file 0600, no credentials; streamed token
   chunks, pings, `done` and the bodies of evidence given to seats are not written; each line goes to the kernel at once,
@@ -85,7 +86,12 @@ ChatDock (portal frontend)
   rounds, seats, turns, checkpoint, result; `finished_at` = the last event's time); a half-written last line is
   dropped, a journal with another head (`v` / id) is not folded. On shutdown the lifespan cancels running jobs and waits
   up to 1 s (`delib_jobs.SHUTDOWN_WAIT_S`) so they write the ledger themselves, and `start.sh` bounds uvicorn's
-  graceful wait (`AGENT_GRACEFUL_S`). The journal follows the args-file rules: removed when the job ends or is resumed
+  graceful wait (`AGENT_GRACEFUL_S`) and waits for the old process itself, not its listener, before it starts the new
+  one. The queue closes at the exit signal, not at the lifespan shutdown — a slot freed during the graceful wait no
+  longer launches a queued job in the process that is going away (that job used to end `interrupted` and lose its R2
+  requeue). A job's end write leaves the ledger alone when another process has already closed it (a restart sweep,
+  maybe with `resumed_by` on it), so an overlapping old process cannot reopen a resumed job for a second resume. The
+  journal follows the args-file rules: removed when the job ends or is resumed
   by its owner, kept 7 days for an interrupted job. Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line
   and stops — the fold is then the state up to that line, with a warning. Seat-level resume (S1 · S2) is not here.
 

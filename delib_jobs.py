@@ -22,6 +22,8 @@ import json
 import logging
 import math
 import os
+import signal
+import threading
 import time
 import uuid
 from urllib.parse import unquote
@@ -244,6 +246,32 @@ def closing(on: bool = True) -> None:
     """서버가 내려간다(on) / 다시 받는다(off) — app 의 기동·종료 절차가 mcp_server 를 거쳐 부른다."""
     global _CLOSING  # noqa: PLW0603 — 프로세스에 하나뿐인 원장의 상태다
     _CLOSING = on
+
+
+def hook_exit_signals() -> bool:
+    """내려가기 시작하는 그 자리에서 줄을 닫는다 — uvicorn 이 받는 종료 신호(TERM · INT)의 처리기 앞에 closing(True) 를 끼운다(기동 때 한 번 —
+    mcp_server.bind). 끼웠으면 참.
+
+    줄 닫기는 lifespan 종료(mcp_server.unbind)에서 했다. uvicorn 은 신호를 받으면 리스너를 닫고 열린 연결(웹 챗 답 · 웹 심의 구독)을
+    AGENT_GRACEFUL_S 까지 기다린 **뒤에야** lifespan 종료를 돈다 — 그 사이 자리가 나면(도는 잡이 끝나거나 주기 펌프) 내려가는 프로세스가 줄 선
+    잡을 띄웠고, 그 잡은 곧 interrupted 로 접혀 재기동 뒤 같은 차례로 다시 서지 못했다(R2 — HA-09 S0 반대 검토 10-31). uvicorn 의 처리기
+    (Server.handle_exit — 바운드 메서드)일 때만 끼운다 — 다른 처리기(시험 · 기본 처리기)는 건드리지 않는다. 메인 스레드가 아니면(시험의
+    TestClient) 아무것도 안 한다 — 신호 처리기는 메인 스레드에서만 건다. 도는 잡은 여기서 접지 않는다(lifespan 종료의 shutdown 이 접는다)."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    hooked = False
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        prev = signal.getsignal(sig)
+        if not callable(prev) or getattr(prev, "_delib_closing", False) or getattr(prev, "__name__", "") != "handle_exit":
+            continue
+
+        def _on_exit(signum, frame, _prev=prev):
+            closing(True)
+            _prev(signum, frame)
+        _on_exit._delib_closing = True      # type: ignore[attr-defined] — 두 번 끼우지 않게
+        signal.signal(sig, _on_exit)
+        hooked = True
+    return hooked
 
 
 def _now() -> float:
@@ -688,6 +716,19 @@ def _load(job_id: str) -> dict | None:
         return None
 
 
+def _closed_elsewhere(job: dict) -> bool:
+    """도는 잡의 끝 쓰기 전에 본다 — 원장이 더는 이 프로세스가 띄운 running 이 아니면(다른 프로세스의 재기동 정리가 interrupted 로 닫았고 그 위에
+    이어하기가 resumed_by 를 적었을 수 있다) 참. 그때 끝 쓰기(_drive · _settle · shutdown)는 원장을 덮지 않고 시작 인자 파일 · 진행 일지도 두며
+    그렇다고 적는다(HA-09 S0 반대 검토 10-31 — 재기동이 겹치면 옛 프로세스의 끝 쓰기가 resumed_by 를 지워 이어하기가 한 번 더 받아졌다). 도는
+    동안 원장은 띄울 때(_launch) 한 번만 쓰므로 이 프로세스만 쓴 원장이면 늘 running 이다. 원장이 없거나 못 읽으면 거짓(종전처럼 쓴다)."""
+    rec = _list_load(_path(job["id"]))
+    if not rec or rec.get("status") == "running":
+        return False
+    log.warning("[delib-job %s] 원장을 다른 프로세스가 이미 %s 로 닫았다%s — 이 프로세스의 끝(%s)은 원장에 쓰지 않는다(재기동이 겹쳤다)",
+                job["id"], rec.get("status"), f"(이어 돈 잡 {rec['resumed_by']})" if rec.get("resumed_by") else "", job.get("status"))
+    return True
+
+
 def _list_load(f: Path) -> dict | None:
     """목록·재기동 정리가 읽는 잡 — 색인의 도장이 지금 원장 파일과 같으면 색인을, 아니면 원장 전부를 읽고 색인을 다시
     쓴다(색인 이전의 옛 원장은 처음 한 번만 통째로 읽는다). 행은 summary() 로 만든다 — 색인에 없는 칸은 쓰지 않는다."""
@@ -850,13 +891,16 @@ def _settle(job: dict, task: asyncio.Task) -> None:
     손에 있어, 띄운 바로 그 틈에 deliberate_cancel 이 들어올 수 있다."""
     if job["status"] != "running":
         return      # _drive 가 제 손으로 끝냈다 — 자리도 거기서 넘겼다
+    mine = not _closed_elsewhere(job)
     if _CLOSING:    # 서버가 내려가며 접혔다 — 사람이 접은 것이 아니다(_drive 와 같다)
         job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
     else:
         job["status"], job["error"] = "cancelled", "취소됨"
-        _drop_args(job["id"])
+        if mine:
+            _drop_args(job["id"])
     job["finished_at"] = job["updated_at"] = _now()
-    _persist(job)
+    if mine:
+        _persist(job)
     if _TASKS.get(job["id"]) is task:
         del _TASKS[job["id"]]
     _pump()
@@ -1068,9 +1112,10 @@ async def _drive(job: dict, gen) -> None:
         job["updated_at"] = job["finished_at"]
         if job["status"] == "running":
             job["status"] = "error" if job.get("error") else "done"
-        _persist(job)
-        if job["status"] != "interrupted":
-            _drop_args(job["id"])       # 시작 인자 파일 · 진행 일지 — 원장을 쓴 **다음** 지운다(그 사이에 죽으면 원장이 끝난 잡이라 접지 않는다)
+        if not _closed_elsewhere(job):      # 다른 프로세스가 이미 닫은 원장(재기동이 겹쳤다)은 덮지 않는다 — 시작 인자 파일 · 진행 일지도 그쪽 것이다
+            _persist(job)
+            if job["status"] != "interrupted":
+                _drop_args(job["id"])       # 시작 인자 파일 · 진행 일지 — 원장을 쓴 **다음** 지운다(그 사이에 죽으면 원장이 끝난 잡이라 접지 않는다)
         _TASKS.pop(job["id"], None)
         _prune()
         _pump()      # 자리가 났다 — 끝났든 접혔든 터졌든. 상태를 바꾼 **같은 걸음에서** 넘겨준다
@@ -1511,9 +1556,11 @@ async def shutdown(wait_s: float | None = None) -> int:
     for jid in live:
         job = _JOBS.get(jid)
         if job is not None and job.get("status") == "running":      # finally 가 아직이다 — 메모리 상태 그대로 남긴다
+            mine = not _closed_elsewhere(job)                       # 다른 프로세스가 이미 닫은 원장은 덮지 않는다(재기동이 겹쳤다)
             job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
             job["finished_at"] = job["updated_at"] = _now()
-            _persist(job)
+            if mine:
+                _persist(job)
             late.append(jid)
     if live:
         log.info("내려가는 중 — 도는 심의 잡 %d건을 interrupted 로 접어 원장에 남겼다%s", len(live),
