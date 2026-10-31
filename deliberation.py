@@ -17,6 +17,7 @@ from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤
 import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
+import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
 from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -810,10 +811,12 @@ def _chat_context_note(history) -> str:
     hist = [m for m in (history or [])]
     keep = _CHAT_ITEMS_MAX_WIDE if wide else _CHAT_ITEMS_MAX
     older = max(0, len(hist) - keep)
+    # RA 게시 확인 토큰은 가린다(publish_token — 좌석 · 결정문 · 보고서에 남는다). 찾은 값은 이 대화 전부에서 가린다
+    _tok = publish_token.found(*(str(m.get("content") or "") for m in hist if isinstance(m, dict)))
     for m in hist[older:]:
         if not isinstance(m, dict):
             continue
-        text = str(m.get("content") or "").strip()
+        text = publish_token.mask(str(m.get("content") or "").strip(), _tok)
         if not text:
             continue
         # 트리거 발화(/심의 …)는 question 으로 이미 들어가 있다 — 두 번 넣지 않는다.
@@ -1765,6 +1768,11 @@ def _resolve_opts(req_opts):
         ev = req_opts.get("evidence")
         if isinstance(ev, list):
             o.evidence = []
+            # RA 게시 확인 토큰(publish_token) — 챗이 넘긴 근거(게시 미리보기 결과 · 게시 인자)에 있으면 가린다. 좌석 · 의장 · 결정문 · 보고서 · 위키
+            # 근거 발췌가 이 근거를 보고 끝난 뒤에도 남는다 — 진짜 값이 쓰일 데가 없다(챗 다음 턴의 게시는 대화 저장소의 이력에서 읽는다). 찾은 값은
+            # 근거 전부에서 가린다(한 항목의 칸에서 찾은 값이 다른 항목에 되비쳐도 — 글이 아닌 칸은 JSON 으로 읽어 찾는다)
+            _tok = publish_token.found(*(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
+                                         for x in ev if isinstance(x, dict) for v in x.values()))
             _bad_keys: list = []      # 형식 밖이라 버린 근거 키 — 표지에 못 찍는다(호출자가 제 원장과 못 맞춘다)
             # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
             # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
@@ -1777,6 +1785,7 @@ def _resolve_opts(req_opts):
                     o.evidence_over += 1
                     continue
                 _used, res = _cands[0]
+                res = publish_token.mask(res, _tok)
                 if len(_cands) > 1:     # 건수 상한을 통과한 뒤에 적는다 — 번호가 그 항목의 [e:N] 과 같게
                     o.evidence_shadowed.append((len(o.evidence) + 1, _used, len(res),
                                                 [(k, len(b)) for k, b in _cands[1:]]))
@@ -1790,7 +1799,7 @@ def _resolve_opts(req_opts):
                     # 곁 필드는 상한에서 끊되 원문 길이를 남긴다 — 종전엔 말없이 끊었다(근거 줄·카드에 그대로 보인다).
                     "source": _cut_mark(str(it.get("source") or it.get("source_app") or "챗"), 200),
                     "tool": _cut_mark(str(it.get("tool") or ""), 80),
-                    "args": _cut_mark(str(it.get("args") or ""), _EVID_ARGS_MAX),
+                    "args": _cut_mark(publish_token.mask(str(it.get("args") or ""), _tok), _EVID_ARGS_MAX),
                     # 앞에서 자르지 않는다 — 발표자료·보고서는 결론이 뒤에 있다.
                     # 낱장 표지가 있으면 경계에서 가운데를 덜어내고 무엇이 빠졌는지 밝힌다.
                     # cut — 줄였으면 (원문 길이, 무엇을 뺐는지). 항목에 달아 둔다(스트림이 **실린** 항목만 알린다).
@@ -7809,6 +7818,12 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     # 두 갈래를 둔 이유: 원문 보존은 기록이고 정리본은 판단 자료다. 하나로 합치면 둘 다 어정쩡해진다.
     # 정리본은 LLM 왕복이라 실패할 수 있고, 그때 원문형으로 조용히 대체하지 않는다 —
     # 정리를 기대한 사람에게 회의록을 주면 '정리가 안 됐다'로 보이지 '실패했다'로 보이지 않는다.
+    # RA 게시 확인 토큰은 가린다(publish_token — 사용자 결정 10-31). 이 보고서는 Report Archive 에 남고 진짜 값이 쓰일 데가 없다 — 챗의 다음 턴
+    # 게시는 대화 저장소의 이력에서 읽으므로 그쪽은 그대로다. 정리본(LLM 재구성)도 가린 이력을 읽는다. 찾은 값은 이 대화 전부에서 가린다.
+    _tok = publish_token.found(note, *(str(m.get("content") or "") for m in history if isinstance(m, dict)))
+    history = [{**m, "content": publish_token.mask(m["content"], _tok)} if isinstance(m, dict) and isinstance(m.get("content"), str) else m
+               for m in history]
+    note = publish_token.mask(note, _tok)
     _tidy = False
     _n = (note or "").strip()
     for _kw in ("정리", "tidy", "summary"):

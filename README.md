@@ -931,6 +931,20 @@ Nothing is probed at startup. Tests: `tests/test_chat_vision.py`, `tests/test_vi
 vision model on vLLM 0.23 (Qwen2.5-VL-3B — upload, an earlier turn's image, a tool's image, deliberation transcripts; portal
 `docs/chat-depth-context` CD-D13).
 
+### Report Archive publish token (user decision 10-31 '내보내는 곳만 가린다')
+
+RA's `preview_publish` returns a `confirm_token` (`<expiry>.<43-char signature>`, valid 600 s) and the next chat turn's
+`publish_report` reads it from the stored conversation, so the conversation store and the chat's history evidence keep
+it. `publish_token.py` masks it where it outlives the turn and the real value is never needed — the portal procedures
+rule (`runner._mask_publish_token` · `from_chat.TOKEN_ECHO_MIN`): the JSON field `"confirm_token": "<value>"` (also
+inside an escaped JSON string) becomes `[가림:confirm_token]`, and a value found that way of 20+ characters is replaced
+verbatim elsewhere in the text (or in the related texts the caller passes). Applied to the HA-29 confirm card (card text
+in the reply and the `confirm` event's `args`; the held call keeps the real value and approval sends it), to what a
+deliberation takes in from the chat (`delib_opts.evidence` args and bodies, the chat context of `history` — so seats,
+the decision, the Report Archive report and the wiki evidence excerpts see the masked form) and to `/보고서` (minutes,
+results and the `/보고서 정리` LLM input). Not here: the portal's `wiki_send` (it builds its excerpts from the stored
+turn — a portal change). Tests: `tests/test_publish_token_mask.py`.
+
 ## Status
 
 - **Now**: LangGraph ReAct agent over vLLM, tools from the MCP Gateway. Per request the

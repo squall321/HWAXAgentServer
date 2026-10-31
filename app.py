@@ -111,6 +111,7 @@ import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 �
 import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
 import ui_panels as _ui   # 포털 챗의 MCP Apps 패널 — 표지가 있는 턴만 패널 도구를 묶고 ui_resource 를 낸다(HWAXPortal docs/request-1027 HA-20)
+import publish_token as _publish_token   # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(확인 카드 — 사용자 결정 10-31 '내보내는 곳만 가린다')
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -4219,7 +4220,10 @@ async def _confirm_card(app_, req, ctx):
         # 승인 때 같은 앱인지 견줄 열쇠 — 승인 실행은 노출 이름을 그때 다시 풀어, 이름이 겹치던 앱 하나가 30분 안에 빠지거나 붙으면 사람이 승인하지 않은
         # 앱으로 갔다(반대 검토 2차 — submit_job 의 ste(24대) · stcx(356대)). 맵이 모르면 비운다(견주지 않는다).
         c["app_key"] = (_TOOLS_MAP_CACHE.get("map") or {}).get(c["name"], "")
-        c["args_text"] = _confirm_args_text(c["args"])
+        # 카드 글(답 본문 — 대화에 저장된다) · 카드 사건의 인자는 RA 게시 확인 토큰을 가린 꼴이다(publish_token — 사용자 결정 10-31). 맡아 둔 호출
+        # (args · canon)은 진짜 값 그대로다 — 승인하면 서버가 그것을 보낸다(_confirm_send). 사람은 토큰 값을 보고 고를 것이 없다.
+        c["args_shown"] = _publish_token.mask(c["canon"])
+        c["args_text"] = _confirm_args_text(c["args_shown"])
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
@@ -4231,7 +4235,7 @@ async def _confirm_card(app_, req, ctx):
     print(f"[confirm] 카드 {cid} — " + ", ".join(f"{c['name']}({c['kind']})" for c in calls)[:300], flush=True)
     yield _sse("confirm", {"id": cid, "expires_at": int(exp * 1000),
                            "calls": [{"tool": c["name"], **({"app": c["app"]} if c.get("app") else {}), "kind": c["kind"],
-                                      "args_text": c["args_text"], **_confirm_sse_args(c["canon"]),
+                                      "args_text": c["args_text"], **_confirm_sse_args(c["args_shown"]),
                                       **({"workload": c["workload"]} if c.get("workload") else {}),
                                       "again": bool(c.get("again"))} for c in calls],
                            "approve_text": f"실행 — 확인 번호 {cid}", "decline_text": f"취소 — 확인 번호 {cid} 는 실행하지 않음"})
