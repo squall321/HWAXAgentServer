@@ -10,6 +10,7 @@
 #   실행:  .venv/bin/python -m pytest tests/test_delib_as_of.py -q
 import asyncio
 import json
+import re
 import socket
 import sys
 import threading
@@ -453,3 +454,144 @@ def test_MCP_안내에_있고_이어하기가_이어받는다(monkeypatch, tmp_p
     assert c.job["decision"].startswith(f"■ 기준일 — {AS_OF}. ")
     c2 = _continue(r, advanced={"as_of": "2024-12-31"})
     assert c2.job["opts"]["as_of"] == "2024-12-31", "이번 회차에 다시 건 값이 이기지 않았다"
+
+
+# ── 반대 검토 10-31 — '날짜 미확인' 표지가 잘리지 않는다 ────────────────────────────────────────────────────────────────
+# 실측 좌석 카드 절 길이(dev 읽기 — 중앙값 1,858자 · p90 2,309자)의 카드 10장을 좌석이 두 번 조회한다. 창 200,000(cae00 GLM)이면 발언 턴의 조회
+# 블록 3,500자 · 공용 항목 840자 · 근거 카드 2,000자라 결과의 앞부분만 실린다. 종전엔 '날짜 미확인' 표지를 히트 맨 끝에 달아 제목은 보이고
+# 표지만 잘려 나갔는데 결정문 머리는 '표시했다' 고 적었다.
+_LONG = 1_900
+_UNDATED_TITLE = re.compile(r'"title": "(UNDATED-[a-z]+-\d+)"')
+
+
+@pytest.fixture
+def _cae00_window():
+    app._ctx_cache["n"] = 200_000         # _pin_context(128,000) 뒤에 덮는다 — cae00 GLM 의 창
+    d._evid_cache.clear()
+    yield
+    d._evid_cache.clear()
+
+
+@pytest.fixture(scope="module")
+def long_hub():
+    """새 판 허브 — 히트 10장(짝수 번째가 날짜 없는 카드), 절 본문 _LONG 자. 받은 인자를 SEEN['long'] 에 적는다."""
+    SEEN["long"] = []
+    hub = FastMCP("hwax-as-of-long", stateless_http=True, streamable_http_path="/")
+
+    @hub.tool()
+    async def agent_search(agent_type: str, q: str, mode: str = "semantic", top_k: int | None = None,
+                           as_of: str = "", as_of_undated: Literal["keep", "exclude"] = "keep") -> dict:
+        """agent-scoped search(새 판 · 긴 절)."""
+        SEEN["long"].append({"agent_type": agent_type, "q": q, "as_of": as_of, "as_of_undated": as_of_undated})
+        hits = []
+        for i in range(10):
+            und = i % 2 == 0
+            h = {"record_id": f"{agent_type}-{q}-{i}", "section_id": "s1", "title": f"{'UNDATED' if und else 'DATED'}-{q}-{i}",
+                 "section_title": "본문", "data_type": "DOC", "snippet": "가" * _LONG, "score": 0.9 - i / 100, "tags": [],
+                 "causal_status": "validated"}
+            if as_of:
+                h["valid_from"] = None if und else "2025-03-01"
+            hits.append(h)
+        cfg = {"top_k": 10, "as_of": as_of, "as_of_excluded_later": 4, "as_of_undated_kept": 5} if as_of else {"top_k": 10}
+        return {"agent_type": agent_type, "query": q, "mode": mode, "hits": hits, "hit_count": 10, "refused": False,
+                "applied_config": cfg}
+
+    srv, th, conns = _serve(hub)
+    yield conns
+    srv.should_exit = True
+    th.join(timeout=10)
+
+
+def _unmarked(text: str) -> tuple[list, list]:
+    """글에 보이는 날짜 없는 카드 제목 — (표지와 함께 보이는 것, 표지 없이 보이는 것). 표지는 그 히트 객체 안, 제목보다 앞에 있어야 한다
+    (본문 snippet 에는 중괄호가 없어 제목 앞의 가장 가까운 '{' 가 그 히트의 머리다)."""
+    ok, bad = [], []
+    for m in _UNDATED_TITLE.finditer(text):
+        head = text.rfind("{", 0, m.start())
+        (ok if head >= 0 and text.startswith('{"date_note": "' + d._AS_OF_UNDATED + '"', head) else bad).append(m.group(1))
+    return ok, bad
+
+
+class _LookupAgent:
+    """좌석 자유 조회 대역 — 받은 도구(엔진의 로드 길에서 온 진짜 MCP 도구)로 agent_search 를 차례로 부른다. calls 는 [(q, 넣은 인자 더)]."""
+
+    def __init__(self, tools, calls):
+        self.tools, self.calls = {t.name: t for t in tools}, calls
+
+    async def astream(self, inp, config=None, stream_mode="values"):
+        from langchain_core.messages import AIMessage, ToolMessage
+        key = "mech-a" if "'mech-a'" in inp["messages"][0][1] else "rel-b"
+        msgs = []
+        for j, (q, extra) in enumerate(self.calls):
+            call = {"name": "agent_search", "args": {"agent_type": key, "q": q, **extra}, "id": f"c-{key}-{j}", "type": "tool_call"}
+            msgs.append(AIMessage(content="", tool_calls=[call]))
+            out = await self.tools["agent_search"].ainvoke(call)
+            msgs.append(out if isinstance(out, ToolMessage) else ToolMessage(str(out), name="agent_search", tool_call_id=call["id"]))
+            yield {"messages": list(msgs)}
+        msgs.append(AIMessage(content="조회 요약"))
+        yield {"messages": list(msgs)}
+
+
+def _seat_run(monkeypatch, conns, req_opts, calls, *, planner=None):
+    """run_deliberation 을 끝까지 — 도구는 시험 허브에서 엔진의 로드 길로 받고, 좌석 자유 조회는 _LookupAgent 가 calls 대로 부른다.
+    (이벤트, 1라운드 좌석 발언 프롬프트들)."""
+    import langgraph.prebuilt
+    prompts = []
+
+    async def _llm(_o, system, human, *_img):
+        if "도구 호출 계획자" in system:
+            return planner or '{"skip": true}'
+        if "전문가입니다" in system:
+            prompts.append(human)
+            return _SEAT_JSON
+        return "결정문 본문"
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {})
+    monkeypatch.setattr(app, "_area_of", lambda _n: ("", ""))
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda _llm, tools, **_k: _LookupAgent(tools, calls))
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None, connections=conns))
+    opts = {"personas": _SEATS, "free_tools": 1, "voc": "off", "rescreen": 0, "rounds": 2, "save_report": 0,
+            "rebut_quote": 0, "persona_knowledge": 0, **req_opts}
+
+    async def go():
+        out, gen = [], d.run_deliberation(stub, "힌지 크랙 원인", [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                out.append((ev, data))
+                if ev == "done":
+                    break
+        finally:
+            await gen.aclose()
+        return out
+    events = asyncio.run(go())
+    assert not [x for ev, x in events if ev == "error"], events
+    return events, prompts
+
+
+def test_긴_카드를_두_번_조회해도_제목이_보이는_자리마다_날짜_미확인_표지가_보인다(monkeypatch, long_hub, _cae00_window):
+    events, prompts = _seat_run(monkeypatch, long_hub, {"as_of": AS_OF}, [("qa", {}), ("qb", {})])
+    r1 = prompts[:2]
+    assert len(r1) == 2
+    for p in r1:
+        ok, bad = _unmarked(p)
+        assert ok or bad, "시험 전제 — 1라운드 발언 프롬프트에 날짜 없는 카드의 제목이 보인다"
+        assert not bad, f"발언 턴에 표지 없이 보이는 날짜 없는 카드: {bad}"
+    cards = [c for c in _cards(events, included=True) if c.get("tool") == "agent_search"]
+    assert len(cards) == 4, [c["source"] for c in cards]
+    for c in cards:
+        ok, bad = _unmarked(c["text"])
+        assert (ok or bad) and not bad, (c["source"], ok, bad)
+    head = _decision(events).split("\n\n", 1)[0]
+    assert f"자유 조회의 agent_search 4건 — 결과에 {d._AS_OF_UNDATED} 20장" in head, head
+
+
+def test_지정_도구로_실은_긴_카드도_제목_앞에_표지가_있다(monkeypatch, long_hub, _cae00_window):
+    events, prompts = _seat_run(monkeypatch, long_hub, {"as_of": AS_OF, "tools": ["agent_search"], "free_tools": 0}, [],
+                                planner='{"agent_type": "mech-a", "q": "qd"}')
+    blk = prompts[0][prompts[0].index("[사용자 지정 도구 정량 결과"):]
+    ok, bad = _unmarked(blk)
+    assert (ok or bad) and not bad, (ok, bad)
+

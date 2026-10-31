@@ -1263,9 +1263,11 @@ def _as_of_guard(tool, as_of: str):
 def _as_of_check(out, as_of: str, asked=None):
     """agent_search 응답 → 기준일을 확인한 응답. 꼴은 받은 그대로다((content, artifact) 면 그 꼴로).
 
-    메아리(applied_config.as_of)가 보낸 날과 같으면 날짜 없는 히트(valid_from null)마다 date_note '날짜 미확인' 을 달고 맨 앞에 as_of_note 를
-    단다. 검색 결과 꼴(hits 칸)인데 메아리가 없거나 다르면 히트를 버리고 _AS_OF_UNCONFIRMED 칸을 맨 앞에 둔 거절로 바꾼다 — 구조화 사본
-    (artifact)도 버린다. 검색 결과 꼴이 아닌 응답(오류 글 따위)은 실린 카드가 없어 그대로 둔다. asked — 부른 쪽이 넣었던 as_of(덮어쓴 값)."""
+    메아리(applied_config.as_of)가 보낸 날과 같으면 날짜 없는 히트(valid_from null)마다 date_note '날짜 미확인' 을 **히트의 맨 앞 칸으로** 달고
+    맨 앞에 as_of_note 를 단다. 히트는 절 전문(snippet — 실측 중앙값 1,858자)을 싣고 valid_from 은 그 뒤에 온다. 표지를 끝에 달면 좌석 발언 턴 ·
+    공용 풀 · 근거 카드 · 지정 도구 주입이 앞부분만 실을 때 제목은 남고 표지만 잘려 나갔다(반대 검토 10-31). 검색 결과 꼴(hits 칸)인데 메아리가
+    없거나 다르면 히트를 버리고 _AS_OF_UNCONFIRMED 칸을 맨 앞에 둔 거절로 바꾼다 — 구조화 사본(artifact)도 버린다. 검색 결과 꼴이 아닌
+    응답(오류 글 따위)은 실린 카드가 없어 그대로 둔다. asked — 부른 쪽이 넣었던 as_of(덮어쓴 값)."""
     pair = isinstance(out, tuple) and len(out) == 2
     try:
         d = json.loads(_as_text(out[0] if pair else out))
@@ -1285,10 +1287,14 @@ def _as_of_check(out, as_of: str, asked=None):
                            "hits": [], "hit_count": 0, "refused": True}, ensure_ascii=False)
         return (body, None) if pair else body
     undated = 0
-    for h in hits:
-        if isinstance(h, dict) and h.get("valid_from") is None:
-            h["date_note"] = _AS_OF_UNDATED
-            undated += 1
+    if isinstance(d["hits"], list):
+        marked = []
+        for h in hits:
+            if isinstance(h, dict) and h.get("valid_from") is None:
+                h = {"date_note": _AS_OF_UNDATED, **{k: v for k, v in h.items() if k != "date_note"}}
+                undated += 1
+            marked.append(h)
+        d["hits"] = marked
     ignored = f" — 좌석이 넣은 as_of({_delib_preview(asked, 30)})는 쓰지 않았다" if asked not in (None, "", as_of) else ""
     note = (f"기준일 {as_of} 까지의 카드만 찾았다(이 심의의 기준일을 엔진이 박았다{ignored}). 날짜 없는 카드 {undated}장은 남기고 "
             f"date_note '{_AS_OF_UNDATED}' 을 달았다 — 그 날 뒤에 쓰였을 수 있다.")
