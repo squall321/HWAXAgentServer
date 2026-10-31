@@ -5962,6 +5962,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                          f"…[{len(prev_t):,}자 중 뒤 {_gcap:,}자]\n" + prev_t[-_gcap:])
             else:
                 _gctx = _cut_mark(base, _gcap)
+            # 1라운드 조회 턴도 발언 턴(prompt_fn)이 가리는 좌석을 똑같이 가린다(F12) — 신규 좌석(anon1r 면 전원)은 이전 결론 없이
+            # 조회한다. 조회 턴에 이전 결론이 실리면 무엇을 찾을지부터 그 결론에 끌려가고, 조회 요약이 그대로 1라운드 발언에 들어간다
+            # (Claude 길 hwax-deliberate.js 는 1라운드 조회와 발언이 한 턴이라 BASE_BLIND 하나로 가린다).
+            _gctx_blind = _cut_mark(base_blind, _gcap) if rnd == 1 and _has_blind else _gctx
             # 좌석마다 **자기 분야 도구**로 에이전트를 만든다. 전원에게 같은 목록을 주면
             # 물성 전문가도 적층 전문가도 똑같은 걸 받아, 작은 모델은 못 고르고 큰 모델도
             # 엉뚱한 데를 뒤진다(사용자 제안). create_react_agent 는 망 호출이 없어 싸다.
@@ -6010,7 +6014,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _img_acc = {"read": 0, "fail": 0, "no_model": 0, "over": 0, "err": 0}
             _gt = [asyncio.ensure_future(
                 _gather_with_img_acc(_img_acc, _seat_agents.get(p["key"]) or g_agent, p, question,
-                                     _gctx, opts.tool_budget, _prior)) for p in personas]
+                                     _gctx_blind if (_anon1r or p.get("origin") == "new") else _gctx,
+                                     opts.tool_budget, _prior)) for p in personas]
             # ⚠ try/finally 로 감싼다. 같은 파일 _round_live 는 "클라이언트 중단 시 잔여 LLM
             # 호출 정리"라며 이미 이렇게 하는데 여기만 빠져 있었다. 이 루프는 yield 를 하므로
             # 브라우저가 심의 창을 닫으면 제너레이터가 그 yield 에서 GeneratorExit 로 끊기고,

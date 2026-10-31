@@ -18,11 +18,13 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest  # noqa: E402
+
 import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
 import mcp_server as m  # noqa: E402
 
-from test_delib_silent_drops import _pin_context  # noqa: E402, F401
+from test_delib_silent_drops import _pin_context, _Tool  # noqa: E402, F401
 
 _TAIL = "[끝] 수치 없는 주장은 기각을 요구하라."
 _ROLE = "[앞] 힌지 접착 계면 전문. " + "가" * 700 + _TAIL            # 호출자가 지어 준 좌석의 역할
@@ -294,3 +296,56 @@ def test_원_이어하기_꼴_재심사는_유임_전원에_착석하지_않은_
     assert (r.job.get("decision") or "").startswith("[체크포인트"), "1라운드 체크포인트로 끝나야 한다(보고서 저장 없음)"
     assert {k for k, _kind in r.prompts} == {k for k, _o in seated}, "새 좌석이 1라운드에 발언하지 않았다"
 
+
+@pytest.mark.parametrize("modifiers", [[], ["anon1r"]], ids=["new-only", "anon1r"])
+def test_1라운드_조회_턴도_발언_턴과_같이_이전_결론을_가린다(monkeypatch, modifiers):
+    """자유 조회(기본 켬)는 1라운드 발언 앞에 좌석마다 조회 턴을 따로 돈다. 그 턴의 논의 발췌에 이전 결론이 실리면 신규 좌석은
+    무엇을 찾을지부터 그 결론에 끌려가고, 조회 요약이 그대로 1라운드 발언에 들어간다 — 발언 프롬프트만 가린 F12 가 새는 길이다
+    (Claude 길 hwax-deliberate.js 는 1라운드 조회와 발언이 한 턴이라 BASE_BLIND 하나로 가린다). anon1r 면 유임 좌석도 가린다."""
+    import langgraph.prebuilt
+
+    import app as agent_app
+
+    ctx_by_seat, prompts = {}, {}
+
+    async def _tools(*_a, **_k):
+        return {"search_records": _Tool("search_records")}
+
+    async def _llm(_obj, system, human, *_a):
+        seat = re.match(r"당신은 '([^']+)' 전문가입니다\.", system)
+        if seat:
+            prompts.setdefault(seat.group(1), human)
+        return json.dumps(_R1_CARRY, ensure_ascii=False)
+
+    async def _gather(_agent, persona, _question, ctx, *_a, **_k):
+        ctx_by_seat[persona["key"]] = ctx
+        return persona["key"], [], "", ""
+
+    monkeypatch.setattr(d, "_tools_by_name", _tools)
+    monkeypatch.setattr(d, "_llm_text", _llm)
+    monkeypatch.setattr(d, "_free_gather_one", _gather)
+    monkeypatch.setattr(d, "_tools_for_seat", lambda *_a, **_k: {})
+    monkeypatch.setattr(agent_app, "_area_of", lambda _n: ("", ""))
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", lambda *_a, **_k: object())
+    seats = [{**p, "origin": "carry"} for p in _CARRY] + [{"key": _NEW, "role": "", "origin": "new"}]
+    opts = {"personas": seats, "continue_summary": _PREV, "human_note": _NOTE, "modifiers": modifiers,
+            "rescreen": 0, "free_tools": 1, "voc": "off", "persona_knowledge": 0, "stop_after_round": 1,
+            "save_report": 0}
+    stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
+
+    async def go():
+        return [delib_jobs._parse_sse(c) async for c in _REAL_RUN(stub, "힌지 크랙 원인", [], opts)]
+
+    events = asyncio.run(go())
+    assert not [x for ev, x in events if ev == "error"], events[-3:]
+    assert set(ctx_by_seat) == {p["key"] for p in seats}, f"시험 전제 — 전원이 1라운드 조회 턴을 돌았다: {sorted(ctx_by_seat)}"
+    blind = {p["key"] for p in seats if "anon1r" in modifiers or p["origin"] == "new"}
+    for key, ctx in ctx_by_seat.items():
+        said = prompts[key]
+        if key in blind:
+            assert _CONT_MARK not in ctx and _PREV not in ctx, f"{key} 의 1라운드 조회 턴에 이전 결론이 실렸다 — 발언만 가렸다"
+            assert _NOTE in ctx, "가린 것은 이전 결론뿐이다 — 사람 의견은 조회 턴에도 간다"
+            assert _CONT_MARK not in said and _PREV not in said, "시험 전제 — 발언 프롬프트는 이미 가린다"
+        else:
+            assert _CONT_MARK in ctx and _PREV in ctx, f"유임 {key} 의 조회 턴에서 이전 결론이 빠졌다"
+            assert _CONT_MARK in said and _PREV in said
