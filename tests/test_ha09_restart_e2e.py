@@ -1,4 +1,4 @@
-# 재기동 넘기기(HA-09 S0 · S1) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 같은 잡을 끊긴 라운드부터 잇는지 본다
+# 재기동 넘기기(HA-09 S0 · S1 · S2) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 같은 잡을 끊긴 라운드의 이미 말한 좌석 뒤부터 잇는지 본다
 #
 # 왜 생겼나. 원장은 잡을 띄울 때와 끝날 때만 썼다. 재기동(TERM)에서는 uvicorn 0.49 가 정상 종료를 마친 뒤 같은 신호를 다시 올려
 # 프로세스가 그 자리에서 끝나므로 잡 태스크의 finally(원장 쓰기)가 돌지 않았고, 열린 SSE 가 하나라도 있으면 그 연결이 닫힐 때까지(상한
@@ -150,8 +150,17 @@ class _Stack:
         return url, p, log
 
     def llm_delay(self, s: float) -> None:
+        self.llm_script([s])
+
+    def llm_script(self, delays: list) -> None:
+        """가짜 LLM 의 대본 — 호출 차례마다 기다림(초). 다 떨어지면 마지막 것을 되풀이한다. 호출 수(calls)를 0 으로 돌린다(최근 요청 기록
+        systems · humans 는 요청마다 굴러가는 최근 20건이라 그대로다)."""
         with httpx.Client(timeout=10, trust_env=False) as c:
-            assert c.post(f"{self.llm}/_script", json={"script": [{"behavior": "oracle", "delay": s}]}).status_code == 200
+            assert c.post(f"{self.llm}/_script", json={"script": [{"behavior": "oracle", "delay": s} for s in delays]}).status_code == 200
+
+    def llm_stats(self) -> dict:
+        with httpx.Client(timeout=10, trust_env=False) as c:
+            return c.get(f"{self.llm}/_stats").json()
 
     def close(self):
         for p in reversed(self.procs):
@@ -334,6 +343,62 @@ def test_TERM_은_열린_SSE_가_있어도_유예_안에_내려가며_원장에_
     base2, _p2, _log2 = stack.agent(jobs, "b")
     _check_folded(base2, jid, pre)
     _continue_and_finish(stack, base2, jobs, jid, pre, oracle)
+
+
+def _wait_turns(base: str, jid: str, n: int, timeout_s: float = 60.0) -> dict:
+    """원장의 턴이 n 개가 될 때까지 진행 조회를 되풀이한다(넘기거나 끝나면 곧바로 실패 — 시험 전제가 깨졌다)."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        st = _mcp(base, "deliberate_status", {"job_id": jid})
+        if st.get("turn_count") == n:
+            return st
+        assert st.get("status") == "running" and (st.get("turn_count") or 0) < n, f"턴 {n}개 자리를 놓쳤다 — {st.get('status')} · {st.get('turn_count')}"
+        time.sleep(0.05)
+    pytest.fail(f"{jid} 의 턴이 {timeout_s:.0f}초 안에 {n}개가 되지 않았다")
+
+
+def test_KILL_로_3라운드에서_한_석이_말한_뒤_죽어도_이으면_그_좌석은_다시_부르지_않고_나머지_두_석만_부른다(stack):
+    """좌석 단위(HA-09 S2) — 3라운드에서 한 석이 말하고 두 석의 호출이 붙잡힌 채 KILL. 다시 뜨면 재개 요약이 말한 한 석과 부를 두 석을 싣고,
+    이으면 같은 잡이 그 한 석을 다시 부르지 않고(가짜 LLM 이 받은 3라운드 좌석 호출이 정확히 나머지 두 석이다) 그 턴은 끊기기 전과 같게 다시
+    낸다 — 전사는 끊지 않은 실행의 칸을 좌석마다 한 번 채운다."""
+    jobs = stack.tmp / "jobs"
+    base, proc, _log = stack.agent(jobs, "a")
+    oracle = _oracle(stack, base)
+    stack.llm_delay(STEP_S)
+    jid = _mcp(base, "deliberate_start", START)["job_id"]
+    _wait(base, jid, stage="r2")
+    time.sleep(0.3)                  # 2라운드 좌석 호출은 이미 가짜 LLM 에 닿아 STEP_S 를 받았다 — 다음 호출(3라운드)부터 새 대본이다
+    stack.llm_script([FAST_S, HOLD_S])                  # 3라운드의 첫 호출만 곧바로, 나머지는 붙잡힌다
+    _wait_turns(base, jid, 2 * len(SEATS) + 1)
+    pre = _turns(base, jid)
+    spoke = [t["persona"] for t in pre if t["display_round"] == 3]
+    assert len(spoke) == 1 and _grid(pre) == {(r, s["key"]) for r in (1, 2) for s in SEATS} | {(3, spoke[0])}, _grid(pre)
+    proc.kill()
+    assert proc.wait(timeout=10) == -signal.SIGKILL
+    base2, _p2, _log2 = stack.agent(jobs, "b")
+    st = _mcp(base2, "deliberate_status", {"job_id": jid})
+    sr = st["resume"]["seat_resume"]
+    todo = [s["key"] for s in SEATS if s["key"] != spoke[0]]
+    assert (st["status"], sr["ok"], sr["round"], sr["spoken"], sr["todo"]) == ("interrupted", True, 3, spoke, todo), sr
+    assert _turns(base2, jid) == pre, "접은 원장의 전사가 죽기 직전과 다르다"
+    stack.llm_delay(FAST_S)
+    out = _mcp(base2, "deliberate_continue", {"previous_job_id": jid})
+    r = out["resumed"]
+    assert out["job_id"] == jid and (r["mode"], r["round"], r["spoken"], r["todo"]) == ("in_place", 3, spoke, todo), out
+    assert "이미 말한 1석은 다시 부르지 않고 남은 2석만 부른다" in out["note"], out["note"]
+    done = _wait(base2, jid)
+    assert done["status"] == "done" and len(done["attempts"]) == 1, done
+    stats = stack.llm_stats()
+    assert 0 < stats["calls"] <= 20, stats["calls"]           # 최근 요청 기록(20건) 안에 이은 실행의 호출이 다 있다
+    recent = list(zip(stats["systems"], stats["humans"]))[-stats["calls"]:]
+    called = sorted(re.search(r"당신은 '([^']+)' 전문가", sy).group(1) for sy, hu in recent if "전문가입니다" in sy and "수용(concede)" in hu)
+    assert called == sorted(todo), f"3라운드에서 부른 좌석이 정확히 나머지 두 석이 아니다 — {called}"
+    turns = _turns(base2, jid)
+    assert _grid(turns) == _grid(oracle) and len(turns) == len(oracle), "끊긴 잡이 이어 돌아 끊지 않은 실행의 칸을 좌석마다 한 번 채우지 않았다"
+    assert [t for t in turns if t["display_round"] <= 2] == [t for t in pre if t["display_round"] <= 2], "끝난 라운드의 턴이 바뀌었다"
+    assert [t for t in turns if (t["display_round"], t["persona"]) == (3, spoke[0])] == [t for t in pre if t["display_round"] == 3], \
+        "끊기기 전에 말한 좌석의 턴이 원 출력과 다르게 다시 났다"
+    assert not (jobs / "journal" / f"{jid}.jsonl").exists() and not (jobs / "args" / f"{jid}.json").exists()
 
 
 def test_내려가는_동안_자리가_나도_줄_선_잡은_띄우지_않고_다시_뜨면_같은_차례로_다시_선다(stack):

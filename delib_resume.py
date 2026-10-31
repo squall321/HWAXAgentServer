@@ -16,9 +16,10 @@
               기준일 셈 · 출처 정수 · 자유 조회 도구 이름 · 그룹 · 창 · 라운드 수 · 화두 블록(base · base_blind)의 지문.
               호출자가 준 근거 본문(evidence)은 적지 않는다 — 시작 인자 파일에 있고, 되살릴 때 같은 인자로 다시 만든 블록을 지문으로 견준다.
   e:gather    라운드 r 의 자유 조회가 끝난 뒤 · 발언 전 — 좌석별 조회 블록 · 이번에 풀에 더한 항목과 원문 길이 · 기준일 셈 · 알림 깃발 ·
-              근거 계수 · 새로 배운 출처 정수 · 교차심문 표적.
-  e:raw       좌석 하나가 말한 직후, turn 사건을 내기 **전** — 원 출력(JSON 칸 전부).
-  e:round_end 라운드 r 끝 — 유실 좌석. 이 줄이 있는 라운드만 되살린다(그 라운드의 사건은 모두 이 줄 앞에 적혔다).
+              근거 계수 · 새로 배운 출처 정수 · 교차심문 표적. 끊긴 라운드에 이 줄이 있으면 조회를 다시 하지 않는다(S2).
+  e:raw       좌석 하나가 말한 직후, turn 사건을 내기 **전** — 원 출력(JSON 칸 전부). 끊긴 라운드에서 이 줄이 있는 좌석은 다시 부르지
+              않는다 — 나머지(아직 안 함 · 실패)만 부른다(S2).
+  e:round_end 라운드 r 끝 — 유실 좌석. 이 줄이 있는 라운드만 끝난 라운드로 되살린다(그 라운드의 사건은 모두 이 줄 앞에 적혔다).
   e:resume_off 상한 · 꼴 때문에 엔진 줄을 멈췄다 — 그 잡의 이어하기는 요약으로 간다.
 """
 from __future__ import annotations
@@ -131,8 +132,8 @@ class Tracker:
 
     def summary(self, *, general: bool = True, stop_after_round: int = 0) -> dict:
         """{ok, sk, round, spoken, todo, why} — round 는 이으면 처음 부를 라운드(전 라운드가 끝났으면 라운드 수 + 1 — 의장부터), spoken 은 그
-        라운드에서 끊기기 전에 말한 좌석, todo 는 그 라운드에서 부를 좌석이다. 이 판(S1)은 끊긴 라운드를 처음부터 다시 돌아 todo 가 그 라운드의
-        전 좌석이다 — 이미 말한 좌석도 다시 부른다(좌석 단위로 거르는 것은 S2)."""
+        라운드에서 끊기기 전에 말한 좌석(원 출력이 적힌 좌석 — 다시 부르지 않는다), todo 는 그 라운드에서 부를 나머지 좌석이다(아직 말하지
+        않았거나 실패한 좌석 — 앉은 차례대로, S2)."""
         out = {"ok": False, "sk": None, "round": None, "spoken": [], "todo": [], "why": ""}
         if not general:
             out["why"] = ("다단 심의 · 시험 설계는 끝난 단(체크포인트)까지만 잇는다 — 단 안을 라운드 경계에서 잇는 재개 자료는 아직 쓰지 "
@@ -152,16 +153,20 @@ class Tracker:
         seats, rounds = self.pre["seats"], int(self.pre["rounds"] or 0)
         k = _restorable(seats, rounds, self.ended, self.spoke, stop_after_round)
         cut = k + 1
-        return {"ok": True, "sk": STAGE, "round": cut,
-                "spoken": _seat_list(self.spoke.get(cut) or ()) if cut <= rounds else [],
-                "todo": list(seats) if cut <= rounds else [], "why": ""}
+        spoken = _seat_list(self.spoke.get(cut) or ()) if cut <= rounds else []
+        if set(spoken) - set(seats):          # parse 와 같은 규칙 — 이어하기가 쓰지 않을 재개 자료를 진행 조회가 된다고 말하지 않는다
+            return {**out, "why": "재개 자료에 앉지 않은 좌석의 원 출력이 있다 — 되살린 상태를 믿을 수 없어 이으면 요약으로 잇는다"}
+        return {"ok": True, "sk": STAGE, "round": cut, "spoken": spoken,
+                "todo": [s for s in seats if s not in spoken] if cut <= rounds else [], "why": ""}
 
 
 class StageData:
-    """한 단을 되살릴 상태 — 엔진 갈고리가 읽는다. pre 는 e:pre 줄 그대로, rounds 는 되살릴 끝난 라운드 r → {cur, gather, lost}."""
+    """한 단을 되살릴 상태 — 엔진 갈고리가 읽는다. pre 는 e:pre 줄 그대로, rounds 는 되살릴 끝난 라운드 r → {cur, gather, lost}.
+    cut 은 끊긴 라운드(끝난 라운드 다음 — 라운드 수 안일 때만, 아니면 None) {r, gather, raw} 다(S2). gather 는 그 라운드의 e:gather(조회가
+    끝나기 전에 끊겼으면 None — 조회를 다시 한다), raw 는 끊기기 전에 말한 좌석의 원 출력이다(일지 순서 = 그 라운드에서 끝난 순서)."""
 
-    def __init__(self, pre: dict, rounds: dict, info: dict):
-        self.pre, self.rounds, self.info = pre, rounds, info
+    def __init__(self, pre: dict, rounds: dict, info: dict, cut: dict | None = None):
+        self.pre, self.rounds, self.info, self.cut = pre, rounds, info, cut
 
     def round(self, r: int):
         return self.rounds.get(r)
@@ -242,8 +247,18 @@ def parse(raw: bytes, job_id: str, *, journal_v: int, stop_after_round: int = 0)
         lost = _seat_list(ended[r].get("lost") or [])
         rounds[r] = {"cur": cur, "gather": gather.get(r), "lost": lost}
         carry += ([gather[r]] if r in gather else []) + list(raws.get(r, {}).values()) + [ended[r]]
-    cut = k + 1
-    info = {"sk": STAGE, "round": cut, "restored": k, "total": n,
-            "spoken": list(raws.get(cut, {})) if cut <= n else [], "todo": list(seats) if cut <= n else [],
+    cut, cutd, spoken = k + 1, None, []
+    if k < n:
+        # 끊긴 라운드(S2) — 끊기기 전에 말한 좌석(e:raw)은 다시 부르지 않고 원 출력으로 되살리고, 조회가 끝났으면(e:gather) 다시 하지 않는다.
+        # 그 줄도 새 일지에 옮겨 쓴다 — 이은 실행이 그 라운드에서 또 끊겨도 앞 시도에서 말한 좌석 · 조회가 남는다(라운드 끝 줄은 옮기지 않는다 —
+        # 그 라운드는 이은 실행이 맺는다).
+        craw = raws.get(cut, {})
+        if set(craw) - set(seats):
+            return None, "재개 자료에 앉지 않은 좌석의 원 출력이 있다"
+        spoken = list(craw)
+        cutd = {"r": cut, "gather": gather.get(cut), "raw": [x["o"] for x in craw.values()]}
+        carry += ([gather[cut]] if cut in gather else []) + list(craw.values())
+    info = {"sk": STAGE, "round": cut, "restored": k, "total": n, "spoken": spoken,
+            "todo": [s for s in seats if s not in spoken] if k < n else [], "gathered": cut in gather if k < n else False,
             "eng_changed": bool(head.get("eng")) and head.get("eng") != ENGINE, "ctx": pre.get("ctx")}
-    return Resume(job_id, {STAGE: StageData(pre, rounds, info)}, carry, info, list(pre["groups"])), ""
+    return Resume(job_id, {STAGE: StageData(pre, rounds, info, cutd)}, carry, info, list(pre["groups"])), ""

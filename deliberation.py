@@ -3168,6 +3168,19 @@ async def _round_live(llm, personas: list, prompt_fn, rnd: int, required: tuple 
                 t.cancel()
 
 
+async def _then(first: list, gen):
+    """first 를 먼저 내고 gen 을 잇는다 — 끊긴 라운드를 이을 때 끊기기 전에 말한 좌석의 원 출력 뒤에 나머지 좌석의 발언(_round_live)을 낸다
+    (HA-09 S2). 그 라운드의 전사 차례는 끝난 차례다 — 끊기기 전에 끝난 좌석이 먼저다. 이것이 닫히면 gen 도 곧바로 닫는다(남은 좌석 호출을
+    접는 _round_live 의 finally 가 한 겹 더 늦지 않게)."""
+    try:
+        for x in first:
+            yield x
+        async for x in gen:
+            yield x
+    finally:
+        await gen.aclose()
+
+
 # 유령 ID 게이트(app._cap_tool)가 '실행하지 않았다'는 뜻으로 돌려주는 표지. 챗과 심의 양쪽에서
 # 판정에 쓰이므로 하위 모듈인 여기에 두고 app 이 import 한다(app→deliberation 단방향 유지).
 def _delib_preview(v, n: int = 140) -> str:
@@ -5107,19 +5120,38 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
         yield chunk
 
 
-def _resume_notes(rsv, k: int, n_seats: int, opts, base: str, base_blind: str, free_pool: dict) -> list:
-    """되살린 단계의 알림(HA-09 S1 A5.5) — 상태줄 한 줄과 카드 한 장. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
-    조회가 끊기기 전의 것이라는 것, 끊긴 라운드는 처음부터 다시 돈다는 것(이 판은 라운드 경계까지 — 좌석 단위로 거르는 것은 S2), 그리고 끊기기
-    전과 다른 것(화두 블록 지문 · 엔진 판 · 모델 창 · 사라진 조회 도구 · 라운드 수)이 있으면 그것까지 — 막지 않는다(남은 좌석은 지금 것으로 말한다)."""
+def _resume_notes(rsv, k: int, cutd, seats: list, opts, base: str, base_blind: str, free_pool: dict, looks: bool) -> list:
+    """되살린 단계의 알림(HA-09 S1 · S2 A5.5) — 상태줄 한 줄과 카드 한 장. 라운드 전 단계 · 끝난 라운드를 다시 부르지 않았다는 것, 근거 · 지식카드 ·
+    조회가 끊기기 전의 것이라는 것, 끊긴 라운드(cutd — 라운드 수가 같을 때만 있다)에서 끊기기 전에 말한 좌석은 다시 부르지 않고 나머지만 부른다는
+    것과 그 라운드의 조회를 다시 하는지(looks — 지금 엔진이 그 라운드에서 자유 조회를 하는가), 그리고 끊기기 전과 다른 것(화두 블록 지문 · 엔진 판 ·
+    모델 창 · 사라진 조회 도구 · 라운드 수)이 있으면 그것까지 — 막지 않는다(남은 좌석은 지금 것으로 말한다)."""
     pre, info = rsv.pre, rsv.info
-    n, ro = int(opts.rounds), int(getattr(opts, "rounds_so_far", 0) or 0)
-    spoken = [x for x in (info.get("spoken") or []) if isinstance(x, str)] if k < n else []
+    n, ro, n_seats = int(opts.rounds), int(getattr(opts, "rounds_so_far", 0) or 0), len(seats)
+    spoken = [o["persona"] for o in cutd["raw"]] if cutd is not None else []
+    todo = [s for s in seats if s not in spoken]
+    _ks = lambda xs: ", ".join(xs[:4]) + (" …" if len(xs) > 4 else "")     # noqa: E731 — 좌석 이름은 넷까지(원장 카드는 앞 400자만 싣는다)
     if k >= n:
         step = f"끊기기 전에 {n}라운드가 모두 끝났다 — 좌석을 다시 부르지 않고 의장 결정문부터 이어 간다"
+    elif spoken:
+        step = ((f"끊기기 전에 끝난 {k}라운드와 " if k else "끊기기 전의 좌석 · 근거 · 지식카드와 ")
+                + f"{k + 1 + ro}라운드의 {len(spoken)}/{n_seats}석을 되살렸다 — "
+                + (f"남은 {len(todo)}석만 부른다" if todo else "그 라운드의 좌석은 모두 말해 아무도 다시 부르지 않는다"))
     elif k:
         step = f"끊기기 전에 끝난 {k}라운드를 되살렸다 — {k + 1 + ro}라운드부터 좌석 {n_seats}석을 다시 부른다"
     else:
         step = f"끊기기 전의 좌석 · 근거 · 지식카드를 되살렸다 — {1 + ro}라운드부터 좌석 {n_seats}석을 부른다"
+    # 카드는 끊긴 라운드부터 적는다 — 잡 원장은 카드 글을 앞 400자만 싣는다(delib_jobs.OMITTED_TEXT_MAX). 누구를 다시 부르는지가 먼저다.
+    cut_t = ""
+    if cutd is not None:
+        if spoken:
+            cut_t = (f" 끊긴 {k + 1 + ro}라운드에서 끊기기 전에 말한 {len(spoken)}석({_ks(spoken)})은 다시 부르지 않고 원 출력으로 되살려 턴만 "
+                     "다시 낸다 — "
+                     + (f"나머지 {len(todo)}석({_ks(todo)})만 같은 프롬프트로 부른다(아직 답하지 않았거나 실패한 좌석 — 실패한 좌석은 "
+                        "끊기지 않았다면 유실이었다)." if todo else "좌석이 모두 말해 아무도 다시 부르지 않는다."))
+        if cutd["gather"] is not None:
+            cut_t += f" {k + 1 + ro}라운드의 자유 조회는 끊기기 전에 끝나 다시 하지 않았다."
+        elif looks and not spoken:
+            cut_t += f" {k + 1 + ro}라운드의 자유 조회는 끊기기 전에 끝나지 않아 처음부터 다시 한다."
     diff = []
     if pre.get("rounds") != n:
         diff.append(f"라운드 수가 끊기기 전({pre.get('rounds')})과 달라 끝난 라운드는 되살리지 않았다")
@@ -5133,11 +5165,9 @@ def _resume_notes(rsv, k: int, n_seats: int, opts, base: str, base_blind: str, f
     gone = sorted(set(x for x in (pre.get("free") or []) if isinstance(x, str)) - set(free_pool or ()))
     if gone:
         diff.append(f"끊기기 전에 있던 자유 조회 도구 {len(gone)}개가 지금은 없다 — {', '.join(gone[:8])}{' …' if len(gone) > 8 else ''}")
-    text = ("끊긴 심의를 같은 잡에서 잇는다(시도 기록은 attempts). 라운드 전 단계(VOC · 정량 근거 선주입 · 지정 도구 · 좌석 발굴 · 역할 복원 · "
-            "지식카드)를 다시 부르지 않고 끊기기 전의 것을 되살렸다 — 근거 · 지식카드 · 조회 결과는 끊기기 전의 것이고 다시 조회하지 않았다."
-            + (f" 끝난 {k}라운드의 발언은 원 출력 그대로 다음 라운드와 의장에게 간다." if k else "")
-            + (f" 끊긴 {k + 1 + ro}라운드는 처음부터 다시 돈다 — 그 라운드에서 끊기기 전에 말한 {len(spoken)}석({', '.join(spoken[:6])}"
-               f"{' …' if len(spoken) > 6 else ''})도 다시 부른다." if spoken else "")
+    text = ("끊긴 심의를 같은 잡에서 잇는다(시도 기록은 attempts)." + cut_t
+            + " 라운드 전 단계(VOC · 정량 근거 선주입 · 지정 도구 · 좌석 발굴 · 역할 복원 · 지식카드)" + (f"와 끝난 {k}라운드" if k else "")
+            + "는 다시 부르지 않고 끊기기 전의 것을 되살렸다 — 근거 · 지식카드 · 조회 결과 · 발언은 끊기기 전의 것이고 다시 조회하지 않았다."
             + "".join(f" {x}." for x in diff))
     return [_sse("status", {"step": step, "tool": None}),
             _delib("evidence", source="끊긴 심의 되살림", included=False, notice=True, text=text)]
@@ -6151,13 +6181,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 재개 자료(HA-09 S1 — e:pre) — 라운드 전 단계의 산출. 되살릴 때(_pre)는 위 단계를 일지 값으로 채웠고 화두 블록은 같은 인자로 다시 만들었다 —
     # 끊기기 전의 지문과 견주고 다르거나 판 · 창 · 조회 도구가 바뀌었으면 카드로 알린다(막지 않는다 — A5.3). 근거 계수는 일지 값이다(위 근거
     # 블록이 다시 센 것을 덮는다). 아니면(잡) 이어할 때 쓸 값을 일지에 적는다. 호출자가 준 근거 본문은 적지 않는다(시작 인자 파일에 있다 —
-    # 지문만). _rk — 되살릴 끝난 라운드 수(라운드 수가 끊기기 전과 다르면 라운드는 되살리지 않는다).
+    # 지문만). _rk — 되살릴 끝난 라운드 수(라운드 수가 끊기기 전과 다르면 라운드는 되살리지 않는다). _cutd — 끊긴 라운드(S2 — 끊기기 전에 말한
+    # 좌석의 원 출력 · 끝난 조회. 라운드 수가 같을 때만 — 라운드 구조가 같아야 그 라운드가 같은 라운드다).
     _ids_seen = set(_turn_ids.get() or ())         # 재개 자료가 센 출처 정수 — 라운드마다 새로 배운 것만 적는다(e:gather ids)
     _rk = len(_rsv.rounds) if (_pre is not None and _pre.get("rounds") == opts.rounds) else 0
+    _cutd = _rsv.cut if (_pre is not None and _pre.get("rounds") == opts.rounds) else None
     if _pre is not None:
         ev_count.clear()
         ev_count.update(_pre["ev_count"])
-        for _c in _resume_notes(_rsv, _rk, len(personas), opts, base, base_blind, free_pool):
+        for _c in _resume_notes(_rsv, _rk, _cutd, [p["key"] for p in personas], opts, base, base_blind, free_pool,
+                                g_agent is not None and _rk + 1 != opts.rounds):
             yield _c
     elif _jon:
         delib_resume.write(sk, "e:pre", sync=True, rounds=opts.rounds, ctx=_ctx_tokens(), groups=list(groups or []),
@@ -6202,6 +6235,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _nv_told = False          # 리스크 앱 읽기 도구의 not_visible 을 알렸나 — 심의에 한 번(라운드마다 같은 말을 되풀이하지 않는다)
     _ao_told = False          # 자유 조회의 기준일 거름 확인 안 됨을 알렸나 — 심의에 한 번(셈은 결정문 머리의 기준일 줄에 다 실린다)
 
+    def _gather_back(rg) -> tuple:
+        """재개 자료 e:gather 한 줄 → 그 라운드의 조회가 바꾼 상태(공용 풀 · 원문 길이 · 자기 조회 · 기준일 셈 · 근거 계수 · 출처 정수)를
+        되돌린다 — 끝난 라운드(HA-09 S1)와 조회가 끝난 끊긴 라운드(S2). 알림 깃발 둘(기준일 · not_visible)을 돌려준다."""
+        gather_pool.extend(tuple(x) for x in rg["pool"])
+        gather_lens.update({tuple(x[:4]): x[4] for x in rg["lens"]})
+        seat_lookups.extend(b for b in rg["gathered"].values() if b)
+        _ao_free.clear()
+        _ao_free.update({k_: list(v_) for k_, v_ in rg["ao_free"].items()})
+        ev_count.clear()
+        ev_count.update(rg["ev_count"])
+        if _turn_ids.get() is not None:
+            _turn_ids.get().update(rg["ids"])
+        return bool(rg["ao_told"]), bool(rg["nv_told"])
+
     for rnd in range(1, N + 1):
         call_trace.tag(round=rnd)      # 이 라운드에서 만드는 좌석 태스크가 물려받는다(마지막 라운드 뒤의 의장·요약 호출에도 남는다)
         kind = _kind(rnd)
@@ -6211,18 +6258,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _rr = _rsv.round(rnd) if (_rsv is not None and rnd <= _rk) else None
         if _rr is not None:
             cur = [dict(o) for o in _rr["cur"]]
-            _rg = _rr["gather"]
-            if _rg is not None:
-                gather_pool.extend(tuple(x) for x in _rg["pool"])
-                gather_lens.update({tuple(x[:4]): x[4] for x in _rg["lens"]})
-                seat_lookups.extend(b for b in _rg["gathered"].values() if b)
-                _ao_free.clear()
-                _ao_free.update({k_: list(v_) for k_, v_ in _rg["ao_free"].items()})
-                _ao_told, _nv_told = bool(_rg["ao_told"]), bool(_rg["nv_told"])
-                ev_count.clear()
-                ev_count.update(_rg["ev_count"])
-                if _turn_ids.get() is not None:
-                    _turn_ids.get().update(_rg["ids"])
+            if _rr["gather"] is not None:
+                _ao_told, _nv_told = _gather_back(_rr["gather"])
                 _ids_seen = set(_turn_ids.get() or ())
             if rnd == 1:
                 r1_by_key = {o["persona"]: o for o in cur}
@@ -6230,6 +6267,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if _rr["lost"]:
                 seat_loss.append({"round": rnd, "lost": list(_rr["lost"])})
             continue
+        # 끊긴 라운드(HA-09 S2) — 끊기기 전에 말한 좌석(_cback — 원 출력, 끝난 차례)은 다시 부르지 않고, 조회가 끝났으면(_cgat — e:gather) 다시
+        # 하지 않는다. 라운드의 좌석은 서로의 이번 라운드 발언을 보지 않아(병렬) 나머지 좌석의 프롬프트는 끊기지 않았을 때와 같다. 아니면(끊긴
+        # 라운드가 아니거나 재개 상태가 없다) 셋 다 비어 아래는 지금 길 그대로다.
+        _cr = _cutd if (_cutd is not None and _cutd["r"] == rnd) else None
+        _cgat = _cr["gather"] if _cr is not None else None
+        _cback = [dict(o) for o in _cr["raw"]] if _cr is not None else []
+        _cdone = {o["persona"] for o in _cback}
         prev_list, prev_t = rounds_data[-1] if rounds_data else ([], "")
         prev_no, prev_kind = rnd - 1, (_kind(rnd - 1) if rnd > 1 else "")
         # 좌석에게 보여 줄 직전 라운드 — prev_t 와 같은 모양이되 직전 라운드 몫(_seat_ctx — 창에서 유도)을 넘으면
@@ -6241,11 +6285,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if _sshare:
             yield _sse("status", {"step": f"직전 라운드 {len(prev_t):,}자 — 좌석 프롬프트 상한 "
                                           f"{_sctx:,}자라 좌석당 {_sshare:,}자로 줄여 싣는다", "tool": None})
-            # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다).
-            yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
-                         text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
-                              f"({_sctx:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
-                              "잘린 것은 긴 발언의 뒷부분이다.")
+            # 의장 전사 상한과 같은 길로 — 카드로도 남겨 잡 원장에 싣는다(상태줄은 창 밖으로 밀려난다). 끊긴 라운드가 끊기기 전에 조회를 끝냈거나
+            # 좌석이 말했으면(S2) 이 카드는 그때 이미 원장에 실렸다 — 다시 내지 않는다(같은 입력의 같은 카드다).
+            if _cgat is None and not _cback:
+                yield _delib("evidence", source="좌석 직전 라운드 상한 초과", included=False, knob="DELIB_SEAT_CTX",
+                             text=f"{_dr(rnd)}라운드 좌석에게 준 직전 라운드({len(prev_t):,}자)를 좌석 프롬프트 상한"
+                                  f"({_sctx:,}자)에 맞춰 좌석당 앞 {_sshare:,}자까지만 실었다 — 빠진 좌석은 없고, "
+                                  "잘린 것은 긴 발언의 뒷부분이다.")
         rlabel = ("도메인별 초기 입장" if kind == "initial"
                   else "수렴·최종 입장" if kind == "converge" else "상호 반박·수치 심화")
         for _c in _cred_notice():       # 앞 단계(발굴·지식카드·직전 라운드 조회)에서 자격이 거절됐으면 여기서 알린다
@@ -6290,10 +6336,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         else:  # deepen — 직전 라운드에 반박·심화. 교차심문(cross_exam)·인용계약(rebut_quote)은 직전 라운드 대상.
             prev_keys = [o["persona"] for o in prev_list]
             prev_by_key = {o["persona"]: o for o in prev_list}
-            # 표적 배정은 **라운드당 1회**다 — 좌석마다 다시 부르면 O(N²) 채점을 N 번 돈다.
+            # 표적 배정은 **라운드당 1회**다 — 좌석마다 다시 부르면 O(N²) 채점을 N 번 돈다. 끊긴 라운드가 조회를 끝냈으면(S2) 끊기기 전의
+            # 배정(e:gather cross)을 그대로 쓴다 — 이미 말한 좌석과 나머지 좌석이 한 라운드의 같은 표적으로 말한다.
             _xexam = opts.cross_exam and len(prev_list) >= 2
-            cross_tg = (_cross_targets({k: _ser_kind(prev_by_key[k], prev_kind) for k in prev_keys},
-                                       _CROSS_TARGETS) if _xexam else {})
+            cross_tg = ((_cgat["cross"] if _cgat is not None and _cgat.get("cross") else
+                         _cross_targets({k: _ser_kind(prev_by_key[k], prev_kind) for k in prev_keys}, _CROSS_TARGETS))
+                        if _xexam else {})
             if _xexam:
                 yield _sse("status", {"step": "교차심문 표적 배정 — " + " / ".join(
                     f"{k}→{'·'.join(v)}" for k, v in list(cross_tg.items())[:6])
@@ -6347,8 +6395,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 자유 조회 — 발언 전에 각 전문가가 직접 데이터를 조회한다. 수렴 라운드는 새 조회 없이
         # 기존 논의를 정리하는 단계라 건너뛴다. 병렬 실행하되 완료 순서대로 조회 이력을 흘린다 —
         # "수치는 기억이 아니라 조회 기록" 계약이 근거 패널에 그대로 남는다.
+        # 끊긴 라운드(S2) — 조회가 끊기기 전에 끝났으면(e:gather) 다시 하지 않고 그 블록 · 풀로 되살린다(아래 몫 셈은 같은 입력에 같은 값이다).
+        # e:gather 없이 원 출력만 있으면 그 라운드는 끊기기 전에도 조회가 없었다(조회가 끝나야 좌석이 말하고, 그 줄이 먼저 적힌다) — 이번에도
+        # 하지 않는다. 둘 다 없으면(조회 도중 · 그 전에 끊겼다) 조회를 처음부터 다시 한다.
         _gathered = {}
-        if g_agent is not None and kind != "converge":
+        if _cgat is not None:
+            _gathered = dict(_cgat["gathered"])
+            _ao_told, _nv_told = _gather_back(_cgat)
+            _ids_seen = set(_turn_ids.get() or ())
+        _look = g_agent is not None and kind != "converge" and _cgat is None and not _cback
+        if _look:
             # 조회 턴의 논의 발췌 — 1라운드는 base 의 앞, 2라운드부터는 직전 전사의 뒤. 상한은 _gather_caps(좁은 창 종전
             # 4,000자). 끊었으면 원문 길이를 적는다 — 종전엔 말없이 끊어 조회 좌석은 무엇이 빠졌는지 몰랐다.
             _gcap, _pcap = _gather_caps()
@@ -6531,8 +6587,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"조회 캐시 — 실제 호출 {_fstats.get('miss', 0)}회 · "
                                               f"공유 {_fstats['hit']}회(같은 도구·같은 인자)",
                                       "tool": None})
-        if _jon and g_agent is not None and kind != "converge":
+        if _jon and _look:
             # 재개 자료(HA-09 S1 — e:gather) — 이 라운드의 조회가 바꾼 상태. 끝난 라운드를 되살릴 때 다음 라운드의 프롬프트가 이것으로 만들어진다.
+            # 끊긴 라운드에서 되살린 조회(S2)는 다시 적지 않는다 — 앞 시도의 그 줄이 새 일지에 옮겨 적혔다(delib_resume.parse carry).
             _ids_now = _turn_ids.get() or set()
             delib_resume.write(sk, "e:gather", r=rnd, gathered=_gathered, cross=cross_tg if kind == "deepen" else {},
                                pool=[list(x) for x in gather_pool if x[0] == rnd],
@@ -6607,11 +6664,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 return out
 
         cur, _fails = [], {}
-        async for o in _round_live(llm, personas, prompt_fn, rnd, required=required,
-                                   validator_fn=validator_fn, opts=opts, fails=_fails):
+        # 끊긴 라운드(S2) — 끊기기 전에 말한 좌석은 부르지 않는다(걸러 부르기). 그 원 출력을 먼저 내고(턴을 다시 낸다 — 제자리 이어하기가 그
+        # 라운드의 턴을 원장에서 빼 두었다, delib_jobs._reopen) 나머지 좌석(아직 안 함 · 실패)만 부른다.
+        _seat_gen = _round_live(llm, [p for p in personas if p["key"] not in _cdone] if _cdone else personas, prompt_fn, rnd,
+                                required=required, validator_fn=validator_fn, opts=opts, fails=_fails)
+        async for o in (_then(_cback, _seat_gen) if _cback else _seat_gen):
             cur.append(o)
-            if _jon:
+            if _jon and o["persona"] not in _cdone:
                 # 재개 자료(HA-09 S1 — e:raw) — 좌석의 원 출력. turn 사건을 내기 **전에** 적는다 — 원장에 턴이 있는 좌석은 일지에 원 출력도 있다.
+                # 되살린 좌석의 것은 다시 적지 않는다 — 앞 시도의 그 줄이 새 일지에 옮겨 적혔다(S2).
                 delib_resume.write(sk, "e:raw", r=rnd, o=o)
             extra = {}
             if render == 1:

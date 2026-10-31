@@ -299,7 +299,8 @@ _STATE_DESC = (
     "error·cancelled·interrupted 는 결정문 "
     "없이 끝난 것이고 까닭은 error 에 있다(interrupted 는 서버 재기동 — deliberate_continue(previous_job_id) 한 번으로 끝난 "
     "라운드 뒤부터 남은 라운드만 이어 돈다. 사람 의견은 비워도 된다 · resume 에 끝난 라운드 수가 있다. resume.seat_resume.ok 면 "
-    "시작한 사람이 바꾼 값 없이 이을 때 **같은 job_id** 가 seat_resume.round 라운드부터 다시 돌고 시도마다 attempts 가 는다). 줄 선 잡(queued)은 서버 "
+    "시작한 사람이 바꾼 값 없이 이을 때 **같은 job_id** 가 seat_resume.round 라운드부터 다시 돌고 — 그 라운드에서 이미 말한 좌석(spoken)은 "
+    "다시 부르지 않고 todo 좌석만 부른다 — 시도마다 attempts 가 는다). 줄 선 잡(queued)은 서버 "
     "재기동을 넘겨 같은 차례로 다시 선다. 운영이 새 심의를 잠시 멈춘 서버는 시작 · 이어하기를 '점검 중 — 약 N분 뒤 다시"
     "(retry_after_s)' 오류로 거절한다(도는 잡 · 줄 선 잡은 그대로다 — 그때 다시 부른다). "
     + (f"줄은 {delib_jobs.queue_max()}건까지 선다(DELIB_JOB_QUEUE_MAX — 운영이 재기동 없이 바꿀 수 있어 지금 값은 deliberate_jobs 의 "
@@ -720,9 +721,10 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
 
 
 def _resume_in_place(prev: dict, res, *, user: str) -> dict:
-    """제자리 이어하기(HA-09 S1 A5.4) — 끊긴 그 잡을 같은 job_id 로 다시 줄에 세운다. 인자는 시작 인자 파일 그대로(처음 그룹 · 신원 · 손잡이 —
-    이을 때 지금 그룹이 그것을 다 가졌는지 봤다), 재개 상태는 delib_jobs.start 의 키워드로만 넘긴다. 같은 잡을 두 번 잇지 못한다(start 가 같은
-    동기 구간에서 상태를 보고 바꾼다). 응답은 같은 job_id 와 resumed{mode: in_place, sk, round, spoken, todo, rounds_done, attempt}."""
+    """제자리 이어하기(HA-09 S1 · S2 A5.4) — 끊긴 그 잡을 같은 job_id 로 다시 줄에 세운다. 인자는 시작 인자 파일 그대로(처음 그룹 · 신원 ·
+    손잡이 — 이을 때 지금 그룹이 그것을 다 가졌는지 봤다), 재개 상태는 delib_jobs.start 의 키워드로만 넘긴다. 같은 잡을 두 번 잇지 못한다(start
+    가 같은 동기 구간에서 상태를 보고 바꾼다). 응답은 같은 job_id 와 resumed{mode: in_place, sk, round, spoken, todo, rounds_done, attempt} —
+    spoken 은 끊긴 라운드에서 이미 말해 다시 부르지 않는 좌석, todo 는 그 라운드에서 부를 나머지 좌석이다."""
     pid = prev["id"]
     args = delib_jobs._read_args(pid) or {}
     res.by = user or ""
@@ -737,13 +739,17 @@ def _resume_in_place(prev: dict, res, *, user: str) -> dict:
     out["resumed"] = {"mode": "in_place", "sk": info.get("sk"), "round": info.get("round"), "spoken": list(info.get("spoken") or []),
                       "todo": list(info.get("todo") or []), "rounds_done": k, "attempt": len(rec.get("attempts") or []),
                       "foreign": False, "args": True, "why": ""}
-    spoken = list(info.get("spoken") or [])
+    spoken, todo, rn = list(info.get("spoken") or []), list(info.get("todo") or []), k + 1 + ro
+    # 끊긴 라운드(HA-09 S2) — 이미 말한 좌석은 다시 부르지 않고 나머지만 부른다 · 끝난 조회는 다시 하지 않는다
+    cut = ([f"끊긴 {rn}라운드에서 이미 말한 {len(spoken)}석은 다시 부르지 않고 남은 {len(todo)}석만 부른다" if todo else
+            f"끊긴 {rn}라운드의 좌석은 끊기기 전에 모두 말해 아무도 다시 부르지 않는다"] if spoken else []) + (
+        [("그 라운드" if spoken else f"끊긴 {rn}라운드") + "의 조회는 끊기기 전에 끝나 다시 하지 않는다"] if info.get("gathered") else [])
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + [
         "끊긴 심의를 같은 잡(같은 job_id)에서 잇는다 — "
         + (f"끝난 {k}라운드는 좌석 · 근거 · 지식카드 · 발언을 다시 부르지 않고 되살리고 " if k else
            "끊기기 전의 좌석 · 근거 · 지식카드를 되살리고 ")
-        + (f"{k + 1 + ro}라운드부터 돈다" if k < n else "의장 결정문부터 이어 간다")
-        + (f"(끊긴 라운드는 처음부터 다시 돈다 — 그 라운드에서 이미 말한 {len(spoken)}석도 다시 부른다)" if spoken else "")
+        + (f"{rn}라운드부터 돈다" if k < n else "의장 결정문부터 이어 간다")
+        + ("(" + " — ".join(cut) + ")" if cut and k < n else "")
         + ". 진행은 같은 job_id 의 deliberate_status 로 본다(시도 기록은 attempts)."]
     if str(prev.get("stage") or "") == "report":
         notes.append("보고서 단계에서 끊긴 잡이다 — 끊기기 전에 Report Archive 보고서가 이미 저장됐을 수 있다(같은 제목을 확인하라). "
@@ -772,7 +778,8 @@ _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 adva
     title="심의 이어하기",
     description=("끝난 HWAX 심의에 사람 의견을 넣어 이어서 돌린다. **재기동으로 끊긴(interrupted) 심의**는 사람 의견 없이 "
                  "이 도구 한 번으로 잇는다 — 시작한 사람이 바꾼 값 없이 이으면 **같은 job_id** 가 끊긴 라운드부터 다시 돈다(끝난 "
-                 "라운드 · 좌석 · 근거 · 지식카드를 다시 부르지 않고 되살린다 — 응답 resumed.mode=in_place, 어디서부터인지는 진행 조회의 "
+                 "라운드 · 좌석 · 근거 · 지식카드를 다시 부르지 않고 되살리고, 끊긴 라운드에서 이미 말한 좌석도 다시 부르지 않고 나머지 "
+                 "좌석만 부른다 — 응답 resumed.mode=in_place, 어디서부터인지는 진행 조회의 "
                  "resume.seat_resume). 그 밖(남 · 재개 자료 없음 · 권한 줄어듦 · 바꾼 값)은 새 잡에서 끝난 라운드 뒤부터 남은 라운드만 "
                  "돈다 — 끝난 라운드의 좌석별 마지막 입장을 요약으로 싣는다(resumed.mode=summary · why). 어느 쪽이든 "
                  "처음 인자(근거 본문 · 지정 좌석 · 사람 의견 · 손잡이)를 그대로 쓴다(그 잡에는 화두 · 종류를 바꿀 수 없다). "

@@ -90,6 +90,8 @@ class _World:
         self.reset()
         self.hold = None            # (라운드, 좌석) — 그 좌석의 발언 호출을 붙잡아 둔다(정상 종료 꼴)
         self.held = None
+        self.slow = None            # (라운드, 좌석) — 그 좌석이 그 라운드에서 맨 나중에 끝난다(나머지는 앉은 차례대로 곧바로 끝난다)
+        self.fail = set()           # {(라운드, 좌석)} — 그 좌석의 발언 호출이 예외로 실패한다(프롬프트는 적는다)
 
     def reset(self):
         self.llm, self.tools, self.lookups, self.reports, self.restore_seen = [], [], [], [], []
@@ -104,6 +106,11 @@ class _World:
             if self.hold == (tg.get("round"), seat):
                 self.held.set()
                 await asyncio.Event().wait()        # 취소될 때까지 붙잡는다
+            if (tg.get("round"), seat) in self.fail:
+                raise RuntimeError(f"가짜 LLM 실패 — {seat}")
+            if self.slow == (tg.get("round"), seat):
+                for _ in range(5):                  # 나머지 좌석은 첫 걸음에 끝난다 — 몇 바퀴 늦게 끝내 그 라운드의 맨 끝이 된다
+                    await asyncio.sleep(0)
             return json.dumps({
                 "lens": f"{seat} 관점 {h[:10]} — 보스 뿌리 응력이 낙하 각도에 따라 달라진다", "reads": [f"(경험칙) {seat} 해석 {h[10:16]}"],
                 "recommendation": f"{seat} 권장 {h[16:24]}", "concerns": [f"우려 {h[24:28]}", f"우려 {h[28:32]}"],
@@ -301,10 +308,11 @@ def _turn_rows(led: dict) -> list:
     return sorted((t["round"], t.get("display_round"), t["persona"], t["say"]) for t in led["turns"] if t.get("persona"))
 
 
-def _check_resumed(o: dict, res: dict, first_round: int) -> None:
+def _check_resumed(o: dict, res: dict, first_round: int, *, spoken=(), gathered: bool = False) -> None:
     """이어 돈 실행이 끊지 않은 실행과 같은가 — 남은 라운드의 좌석 프롬프트(지문) · 라운드 성격 · 라운드 전 단계 호출 0 · 조회 · 의장 · 보고서 ·
-    결정문 · 전사(좌석마다 한 번)."""
-    want = {key: v for key, v in o["seat"].items() if key[0] >= first_round}
+    결정문 · 전사(좌석마다 한 번). 끊긴 라운드(first_round)에서 끊기기 전에 말한 좌석(spoken)은 부르지 않았어야 하고, 그 라운드의 조회가
+    끊기기 전에 끝났으면(gathered) 그 조회를 다시 하지 않았어야 한다(S2)."""
+    want = {key: v for key, v in o["seat"].items() if key[0] > first_round or (key[0] == first_round and key[1] not in spoken)}
     assert {key: h for key, (h, _x) in res["seat"].items()} == {key: h for key, (h, _x) in want.items()}, (
         "남은 라운드의 좌석 프롬프트가 끊지 않은 실행과 다르다 — 다른 칸: "
         + str(sorted(set(res["seat"]) ^ set(want)) or [k for k in want if res["seat"].get(k, ("",))[0] != want[k][0]]))
@@ -312,7 +320,8 @@ def _check_resumed(o: dict, res: dict, first_round: int) -> None:
         assert _KIND_MARK[r] in human, f"{r}라운드 프롬프트가 그 라운드 성격(심화 · 수렴)이 아니다"
     assert [x for x in res["llm"] if x[0] in PRE_KINDS] == [], "라운드 전 단계의 LLM 을 다시 불렀다"
     assert [t for t, _r in res["tools"] if t in PRE_TOOLS] == [], f"라운드 전 단계의 도구를 다시 불렀다: {res['tools']}"
-    assert res["lookups"] == [x for x in o["lookups"] if x[0] >= first_round], "끝난 라운드의 조회를 다시 했거나 남은 라운드의 조회가 다르다"
+    assert res["lookups"] == [x for x in o["lookups"] if x[0] > first_round or (x[0] == first_round and not gathered)], \
+        "끝난 조회를 다시 했거나 남은 라운드의 조회가 다르다"
     assert all(res["restore_seen"]) and not any(o["restore_seen"]), "엔진이 재개 상태를 보지 못했다(또는 오라클이 봤다)"
     assert res["chair"] == o["chair"], "의장 · 요약 · 쉬운 설명 프롬프트가 다르다(되살린 근거 계수 · 좌석 · 라운드 전사)"
     assert res["reports"] == o["reports"], "보고서 블록이 다르다(되살린 VOC · 선주입 · 라운드 전사)"
@@ -331,21 +340,22 @@ def test_끊긴_자리에서_같은_잡을_이으면_남은_좌석_프롬프트�
     if where == "pre":
         snap = _cut(snaps, _eng("e:pre"))
     elif where == "mid2":
-        snap = _cut(snaps, _turn_line(2), nth=2)            # 2라운드에서 두 석이 말한 뒤 — S1 은 그 라운드를 처음부터 다시 돈다
+        snap = _cut(snaps, _turn_line(2), nth=2)            # 2라운드에서 두 석이 말한 뒤 — 그 두 석은 다시 부르지 않고 나머지 세 석만 부른다(S2)
     else:
         snap = _cut(snaps, _eng("e:round_end", int(where[1:])))
     jid = _restart(monkeypatch, tmp_path, where, snap)
     led = _on_disk({"id": jid})
     sr = led["seat_resume"]
+    spoken = list(SEATS[:2]) if where == "mid2" else []    # 가짜는 같은 라운드의 좌석을 앉은 차례대로 끝낸다
     assert led["status"] == "interrupted" and led["error"] == delib_jobs.INTERRUPTED_MSG_EXACT
-    assert (sr["ok"], sr["sk"], sr["round"], sr["todo"]) == (True, "main", first, list(SEATS) if first <= ROUNDS else []), sr
-    if where == "mid2":
-        assert len(sr["spoken"]) == 2 and set(sr["spoken"]) <= set(SEATS), sr
+    assert (sr["ok"], sr["sk"], sr["round"], sr["spoken"], sr["todo"]) == (
+        True, "main", first, spoken, [s for s in SEATS if s not in spoken] if first <= ROUNDS else []), sr
     out = _continue(jid)
     assert out["job_id"] == jid and out["resumed"]["mode"] == "in_place", out["resumed"]
     assert (out["resumed"]["round"], out["resumed"]["rounds_done"], out["resumed"]["attempt"]) == (first, first - 1, 1)
+    assert (out["resumed"]["spoken"], out["resumed"]["todo"]) == (sr["spoken"], sr["todo"]), out["resumed"]
     res = _result(world, {"id": jid})
-    _check_resumed(o, res, first)
+    _check_resumed(o, res, first, spoken=spoken, gathered=where == "mid2")
     a = res["led"]
     assert len(a["attempts"]) == 1 and a["attempts"][0]["by"] == ME and a["attempts"][0]["round"] == first and not a.get("resumed_by")
     assert not delib_jobs._journal_path(jid).exists() and not delib_jobs._args_path(jid).exists(), "끝난 잡의 일지 · 시작 인자 파일이 남았다"
@@ -356,8 +366,10 @@ def test_끊긴_자리에서_같은_잡을_이으면_남은_좌석_프롬프트�
 
 def test_정상_종료로_끊겨도_같은_잡이_끊긴_라운드부터_끊지_않은_실행과_같게_돈다(world, monkeypatch, tmp_path):
     """TERM 꼴 — 3라운드의 한 좌석 호출을 붙잡아 둔 채 내려가면(shutdown) 잡의 finally 가 원장에 진행과 재개 요약을 쓴다(일지가 센 것). 다시 뜨면
-    재기동 정리는 끊긴 잡을 건드리지 않고, 주인의 이어하기가 3라운드부터 같은 잡을 돌린다 — 끊기기 전에 3라운드에서 말한 좌석의 턴은 빠지고 다시
-    말한다(전사에 좌석마다 한 번)."""
+    재기동 정리는 끊긴 잡을 건드리지 않고, 주인의 이어하기가 3라운드부터 같은 잡을 돌린다 — 끊기기 전에 3라운드에서 말한 좌석은 다시 부르지 않고
+    붙잡혔던 좌석만 부른다(S2 — 전사에 좌석마다 한 번). 오라클은 그 좌석이 3라운드에서 맨 나중에 끝난 끊지 않은 실행이다(라운드 전사는 끝난
+    차례다 — 끊긴 실행에서도 그 좌석이 맨 나중에 끝났다)."""
+    world.slow = (3, "rel-drop")
     o = _oracle(world, monkeypatch)
     world.hold, world.held = (3, "rel-drop"), None
 
@@ -383,9 +395,10 @@ def test_정상_종료로_끊겨도_같은_잡이_끊긴_라운드부터_끊지_
     _fresh(monkeypatch, root)                             # 같은 디스크로 다시 뜬다
     m.bind(STUB)
     assert delib_jobs.folded() == 0, "내려가며 쓴 원장을 다시 접었다"
+    assert sr["todo"] == ["rel-drop"] and sr["spoken"] == [s for s in SEATS if s != "rel-drop"], sr
     out = _continue(job["id"])
-    assert out["resumed"]["mode"] == "in_place" and out["resumed"]["round"] == 3
-    _check_resumed(o, _result(world, job), 3)
+    assert out["resumed"]["mode"] == "in_place" and out["resumed"]["round"] == 3 and out["resumed"]["todo"] == ["rel-drop"]
+    _check_resumed(o, _result(world, job), 3, spoken=sr["spoken"], gathered=True)
 
 
 def test_제자리로_줄_섰다가_재기동해도_재개_자료로_다시_선다(world, monkeypatch, tmp_path):
@@ -447,6 +460,7 @@ def test_일지의_어느_줄에서_끊겨도_재개_요약이_접은_원장과_
         turned = {x["persona"] for x in led["turns"] if x.get("round") == sr["round"]}
         assert turned <= set(sr["spoken"]), f"{i}번째 줄 뒤 — 원장에 턴이 있는 좌석 {turned - set(sr['spoken'])} 의 원 출력이 일지에 없다"
         assert len(sr["spoken"]) - len(turned) <= 1, "원 출력은 turn 바로 앞에만 먼저 적힌다"
+        assert sr["todo"] == ([s for s in SEATS if s not in sr["spoken"]] if sr["round"] <= ROUNDS else []), (i, sr)   # 나머지만 부른다(S2)
     p.unlink()
 
 
@@ -562,7 +576,8 @@ def test_상태_목록_health_가_재개_요약과_시도와_접은_수를_싣�
     jid = _restart(monkeypatch, tmp_path, "h", _cut(snaps, _turn_line(3), nth=3))
     st = asyncio.run(m.deliberate_status(jid, ctx=_ctx(ME, AFF)))
     sr = st["resume"]["seat_resume"]
-    assert st["resume"]["rounds_done"] == 2 and (sr["ok"], sr["round"], len(sr["spoken"]), sr["todo"]) == (True, 3, 3, list(SEATS)), sr
+    assert st["resume"]["rounds_done"] == 2 and (sr["ok"], sr["round"], sr["spoken"], sr["todo"]) == (
+        True, 3, list(SEATS[:3]), list(SEATS[3:])), sr
     assert st["error"] == delib_jobs.INTERRUPTED_MSG_EXACT
     row = next(x for x in asyncio.run(m.deliberate_list(ctx=_ctx(ME, AFF)))["jobs"] if x["job_id"] == jid)
     assert row["resume"]["seat_resume"] == sr, "목록 행이 재개 요약을 싣지 않았다(목록 색인)"
@@ -575,19 +590,21 @@ def test_상태_목록_health_가_재개_요약과_시도와_접은_수를_싣�
     assert st["attempts"][0]["round"] == 3 and st["attempts"][0]["stage"] == "r3"
 
 
-def test_체크포인트_심의는_1라운드를_되살리지_않고_다시_돌아_체크포인트에서_멈춘다(world, monkeypatch, tmp_path):
-    """stop_after_round=1 — 1라운드가 끝난 줄(e:round_end) 뒤 · 체크포인트 결정문 전에 끊기면, 1라운드를 되살리면 루프가 체크포인트를 지나쳐
-    2라운드를 돈다. 1라운드는 처음부터 다시 돈다(라운드 전 단계는 되살린다)."""
+def test_체크포인트_심의는_1라운드를_끝난_라운드로_건너뛰지_않고_끊긴_라운드로_이어_체크포인트에서_멈춘다(world, monkeypatch, tmp_path):
+    """stop_after_round=1 — 1라운드가 끝난 줄(e:round_end) 뒤 · 체크포인트 결정문 전에 끊기면, 1라운드를 끝난 라운드로 되살려 건너뛰면 루프가
+    체크포인트를 지나쳐 2라운드를 돈다. 1라운드는 끊긴 라운드로 잇는다 — 좌석은 모두 말했으니 아무도 다시 부르지 않고(S2) 그 라운드를 맺어
+    체크포인트에서 멈춘다(라운드 전 단계 · 1라운드 조회도 되살린다)."""
     ck = {**OPTS, "stop_after_round": 1}
     snaps: list = []
     o = _oracle(world, monkeypatch, snaps, opts=ck)
     assert o["led"]["decision"].startswith("[체크포인트") and {r for r, _s in o["seat"]} == {1}
     jid = _restart(monkeypatch, tmp_path, "ck", _cut(snaps, _eng("e:round_end", 1)))
-    assert _on_disk({"id": jid})["seat_resume"]["round"] == 1
+    sr = _on_disk({"id": jid})["seat_resume"]
+    assert (sr["round"], sr["spoken"], sr["todo"]) == (1, list(SEATS), []), sr
     out = _continue(jid)
-    assert out["resumed"]["mode"] == "in_place" and out["resumed"]["round"] == 1
+    assert out["resumed"]["mode"] == "in_place" and out["resumed"]["round"] == 1 and out["resumed"]["todo"] == []
     res = _result(world, {"id": jid})
-    assert {k: h for k, (h, _x) in res["seat"].items()} == {k: h for k, (h, _x) in o["seat"].items()}
+    assert res["seat"] == {} and res["lookups"] == [], "1라운드에서 이미 말한 좌석을 다시 불렀거나 끝난 조회를 다시 했다"
     assert [x for x in res["llm"] if x[0] in PRE_KINDS] == [] and res["led"]["decision"] == o["led"]["decision"]
     assert _turn_rows(res["led"]) == _turn_rows(o["led"])
 
