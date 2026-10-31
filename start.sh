@@ -97,13 +97,16 @@ secs_or() {   # secs_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는�
     *) printf '%s' "$2" ;;
   esac
 }
-# TERM 뒤 KILL 까지(AGENT_STOP_GRACE_S)는 아래 정상 종료 상한(AGENT_GRACEFUL_S) + 도는 심의를 접는 1초(delib_jobs.SHUTDOWN_WAIT_S) + 여유보다
-# 커야 내려가는 서버가 원장에 진행을 남긴다(HWAXPortal docs/request-1027/design-ha09-ha20.md HA-09 S0 — 그래서 기본 2 → 4). 짧아도 진행 일지가
-# 남아 다음 기동이 접는다 — 이 유예는 덤이다.
+# TERM 뒤 KILL 까지(AGENT_STOP_GRACE_S)는 옛 프로세스가 **끝나기를** 기다리는 상한이다 — 먼저 끝나면 거기서 새 것을 띄운다. 아래 정상 종료
+# 상한(AGENT_GRACEFUL_S) + 도는 심의를 접는 1초(delib_jobs.SHUTDOWN_WAIT_S) + 분석 루틴을 접는 2초(routine.shutdown)보다 짧으면 옛 것이 잡의
+# 진행을 원장에 쓰기 전에 KILL 을 맞는다 — 그 합으로 올리고 그렇다고 말한다(HWAXPortal docs/request-1027/design-ha09-ha20.md HA-09 S0 — 기본
+# 2 → 4). KILL 을 맞아도 진행 일지가 남아 다음 기동이 접는다.
 STOP_GRACE_S="$(secs_or AGENT_STOP_GRACE_S "${AGENT_STOP_GRACE_S:-4}" 4)"
 HEALTH_PROBE_S="$(secs_or AGENT_HEALTH_PROBE_S "${AGENT_HEALTH_PROBE_S:-3}" 3)"
-# uvicorn 정상 종료의 상한(초) — 열린 연결(웹 챗 · 웹 심의의 SSE 구독)이 닫히기를 이만큼만 기다리고 끊는다. 종전엔 상한이 없어(uvicorn 기본)
-# 열린 SSE 하나가 lifespan 종료(도는 심의 접기)를 막은 채 위 유예 뒤 kill -9 를 맞았다. uvicorn 은 정수만 받는다 — 아니면 경고하고 기본값이다.
+# uvicorn 정상 종료의 상한(초) — 열린 연결(웹 챗 답 · 웹 심의의 SSE 구독)이 닫히기를 이만큼만 기다리고 끊은 뒤 lifespan 종료(도는 심의 접기)를
+# 돈다. 종전엔 상한이 없어(uvicorn 기본) 열린 연결이 다 닫힐 때까지 옛 프로세스가 남았고, 위 유예 뒤 리스너만 보던 이 스크립트는 그것을 내리지
+# 않은 채 새 것을 띄웠다(웹 챗 답은 옛 것에서 끝까지 갔다 — 대신 두 프로세스가 같은 원장을 함께 썼다). 이 값에서 도는 웹 챗 답 · 웹 심의
+# 구독이 끊긴다(기본 1초 — 길게 잡으면 그만큼 새 서버가 늦게 뜬다). uvicorn 은 정수만 받는다 — 아니면 경고하고 기본값이다.
 int_or() {   # int_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는다
   case "$2" in
     ''|*[!0-9]*)
@@ -113,6 +116,33 @@ int_or() {   # int_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는다
   esac
 }
 GRACEFUL_S="$(int_or AGENT_GRACEFUL_S "${AGENT_GRACEFUL_S:-1}" 1)"
+STOP_FLOOR_S=$((GRACEFUL_S + 3))
+if awk -v s="$STOP_GRACE_S" -v f="$STOP_FLOOR_S" 'BEGIN { exit !(s < f) }'; then
+  echo "  ⚠ AGENT_STOP_GRACE_S=${STOP_GRACE_S} 가 정상 종료 상한 AGENT_GRACEFUL_S=${GRACEFUL_S} + 접기 3초보다 짧다 — ${STOP_FLOOR_S}초로 올린다" \
+       "(옛 프로세스가 도는 잡의 진행을 원장에 쓰기 전에 KILL 을 맞지 않게)" >&2
+  STOP_GRACE_S="$STOP_FLOOR_S"
+fi
+# 옛 PID 가운데 아직 끝나지 않은 것만 찍는다. 좀비(부모가 아직 거두지 않았다)는 끝난 것이다 — kill -0 만 보면 좀비를 산 것으로 읽는다.
+alive_pids() {   # alive_pids "<pid...>"
+  local p s
+  for p in $1; do
+    s="$(ps -o stat= -p "$p" 2>/dev/null || true)"
+    case "${s// /}" in ''|Z*) ;; *) echo "$p" ;; esac
+  done
+}
+# 옛 PID 가 다 끝나기를 0.1초 간격으로 기다린다 — 그 안에 끝나면 빈 글, 아니면 남은 PID 를 찍는다. 횟수로 끝난다(sleep 이 실패해도 끝없이 돌지 않는다).
+wait_gone() {   # wait_gone <초> "<pid...>"
+  local ticks i=0 left
+  ticks="$(awk -v s="$1" 'BEGIN { t = s * 10; printf "%d", (t == int(t)) ? t : int(t) + 1 }' 2>/dev/null || true)"
+  case "$ticks" in ''|*[!0-9]*) i="${1%%.*}"; ticks=$((10#${i:-0} * 10 + 10)); i=0 ;; esac    # awk 를 못 쓰면 초 단위로 올린다
+  left="$(alive_pids "$2")"
+  while [ -n "$left" ] && [ "$i" -lt "$ticks" ]; do
+    sleep 0.1 || true
+    i=$((i + 1))
+    left="$(alive_pids "$left")"
+  done
+  printf '%s' "$left"
+}
 # /health 본문은 한 번만 묻는다(아래 둘이 같은 본문을 읽는다) — 답이 없으면 빈 글이다.
 health_body() {
   local probe="$HOST"
@@ -188,13 +218,22 @@ if [ -n "$OLD_PIDS" ]; then
   else
     echo "==> 진행 중 심의 수를 확인하지 못했다(/health 무응답 또는 그 수를 안 주는 옛 빌드) — 그대로 재기동한다"
   fi
-  echo "==> stopping previous instance (${OLD_PIDS//$'\n'/ })"
+  echo "==> stopping previous instance (${OLD_PIDS//$'\n'/ }) — 내려가기를 최대 ${STOP_GRACE_S}초 기다린다"
   kill $OLD_PIDS 2>/dev/null || true
-  # TERM 뒤 KILL 까지의 유예(초). 긴 심의를 기다리는 값이 아니다 — 프로세스가 스스로 내려갈 짧은 틈이다.
-  # `|| true` — 옛 서버를 이미 내린 자리다. 여기서 sleep 이 무슨 까닭으로든 실패해 스크립트가 끝나면 아무것도 안 뜬다.
-  sleep "$STOP_GRACE_S" || true
+  # TERM 뒤 KILL 까지의 유예(초) — **옛 프로세스가 끝나기를** 기다린다(리스너가 닫히는 것이 아니다). 긴 심의를 기다리는 값이 아니다 — 프로세스가
+  # 스스로 내려갈 짧은 틈이다. uvicorn 은 TERM 을 받자마자 리스너를 닫고 열린 연결을 AGENT_GRACEFUL_S 까지 기다린 뒤 lifespan 종료를 돈다 — 종전엔
+  # 고정 sleep 뒤 리스너로 남은 것만 kill -9 해, 옛 것이 살아 있는 채 새 것이 떴다. 같은 원장을 둘이 함께 써 옛 것이 끊긴 잡을 계속 돌렸고, 내려가며
+  # 새 것이 적은 이어하기 표지를 지워 같은 잡을 두 번 이을 수 있었다(HA-09 S0 반대 검토 10-31). 남은 PID 는 kill -9 로 내리고 다 끝난 뒤에 띄운다.
+  # 기다리는 sleep 이 무슨 까닭으로든 실패해도 스크립트가 끝나지 않는다(wait_gone — 옛 서버를 이미 내린 자리다, 끝나면 아무것도 안 뜬다).
+  LEFT="$(wait_gone "$STOP_GRACE_S" "$OLD_PIDS")"
+  if [ -n "$LEFT" ]; then
+    echo "==> ⚠ ${STOP_GRACE_S}초 안에 내려가지 않았다 — 강제로 내린다(pid ${LEFT//$'\n'/ })"
+    kill -9 $LEFT 2>/dev/null || true
+    LEFT="$(wait_gone 5 "$LEFT")"
+    if [ -n "$LEFT" ]; then echo "==> ⚠ kill -9 뒤에도 남았다(pid ${LEFT//$'\n'/ }) — 그대로 새 서버를 띄운다" >&2; fi
+  fi
   STILL="$(port_pids || true)"
-  if [ -n "$STILL" ]; then kill -9 $STILL 2>/dev/null || true; sleep 1; fi   # 안 죽었으면 강제
+  if [ -n "$STILL" ]; then kill -9 $STILL 2>/dev/null || true; sleep 1 || true; fi   # 옛 PID 밖에서 포트를 잡은 것 — 종전대로 강제
 fi
 
 echo "==> Agent Server on :${PORT}  (vLLM=${VLLM_BASE_URL}, model=${VLLM_MODEL})"
