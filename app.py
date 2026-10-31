@@ -353,7 +353,10 @@ def _core_vocab() -> dict | None:
                 # 허브 키 → 라벨 — 정본과 role sibling(다른 허브 id 막이 _hub_apps, HWAXPortal docs/request-1030 HA-30). /health 에는 싣지 않는다.
                 "hubs": {d["canonical"]["app"]: d["canonical"].get("label") or d["canonical"]["app"],
                          **{k: (a or {}).get("label") or k for k, a in (d.get("apps") or {}).items()
-                            if (a or {}).get("role") == "sibling"}}}
+                            if (a or {}).get("role") == "sibling"}},
+                # 페르소나 연결(personas — HWAXPortal docs/request-1029 design-e5 E5-4)은 줄마다 검증한다(_persona_links). 틀린 줄이 표 전체를
+                # 버리지 않게 여기서는 원본과 타입 대응만 들고 간다. /health 에는 검증한 수만 싣는다.
+                "personas_raw": d.get("personas"), "types_map": dict(d.get("types") or {})}
     if (mt, lmt) != _CORE_VOCAB["mtime"]:
         try:
             raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
@@ -433,7 +436,61 @@ def _core_vocab_health() -> dict:
     return {"loaded": True, "version": d["version"], "rule_words": d["rule_words"], "canonical": d["canonical"],
             # 덧씌운 표 · 기본 표의 지문과 박스 덧씌우기 — 게이트웨이 /health core_vocab 과 같아야 한다(E-7 ③)
             "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
-            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False})}
+            "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False}),
+            # 페르소나 연결 — 줄 수 · 버린 줄과 까닭 · 대조 못 한 표 · 줄 없는 조직도 도메인 · 그림자 기록(design-e5 E5-4, 고르기는 바꾸지 않는다)
+            "personas": _persona_links_health()}
+
+
+# ── 페르소나 연결(코어 어휘표 personas — HWAXPortal docs/request-1029 design-e5 E5-4) ─────────────────────────────────────
+# 지금은 읽기 · 검증 · /health · 그림자 기록뿐이다 — 좌석 · 도구 · '맡은 사람이 없다' 고르기는 그대로다(관문 G0 전 — 사용자 결정 10-31).
+# 대조 표 셋(어휘표 types · 조직도 domain_label · 게이트웨이 도구 지도)이 바뀌면 다시 셈한다. 도구 지도는 받아 둔 것만 본다(/health 가 게이트웨이를
+# 두드리지 않는다) — 아직 못 받았으면 영역 · 앱 대조를 건너뛰고 unchecked 에 적는다.
+_PERSONA_LINKS: dict = {"key": None, "v": None}
+
+
+def _persona_links() -> dict | None:
+    """검증한 페르소나 연결 — 어휘표가 없으면 None. 칸이 없으면 present 거짓."""
+    d = _core_vocab()
+    if d is None:
+        return None
+    import persona_links as _pl  # noqa: PLC0415
+    areas = frozenset(_TOOLS_MAP_CACHE.get("area_meta") or ()) or None
+    apps = frozenset(set((_TOOLS_MAP_CACHE.get("map") or {}).values()) | set(_APPS_CACHE.get("apps") or {})) or None
+    key = (d.get("fingerprint"), areas, apps, _pl.org_mtime())
+    if _PERSONA_LINKS["key"] != key:
+        _PERSONA_LINKS.update(key=key, v=_pl.validate(d.get("personas_raw"), types_map=d.get("types_map") or {},
+                                                      domains_known=_pl.org_domains(), areas_known=areas, apps_known=apps))
+    return _PERSONA_LINKS["v"]
+
+
+def _persona_links_health() -> dict:
+    try:
+        import persona_links as _pl  # noqa: PLC0415
+        return _pl.health(_persona_links())
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"present": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _persona_shadow_tools(key: str, persona: dict, sel_q: str, message: str, names: list, prefer: list) -> None:
+    """챗 지목 전문가 — 연결 표가 골랐을 우선 도구를 지금 고른 것(prefer)과 나란히 적기만 한다. prefer 는 그대로 쓰인다. 실패는 삼킨다."""
+    try:
+        v = _persona_links()
+        if not v or not v.get("present") or not key or persona.get("operator"):
+            return
+        import persona_links as _pl  # noqa: PLC0415
+        _pl.shadow_tools(v, site="chat", key=key, question=sel_q, qkey=message, names=names, prefer_now=prefer,
+                         tool_app=(_TOOLS_MAP_CACHE.get("map") or {}).get, tool_area=lambda n: _area_of(n)[0])
+    except Exception as exc:  # noqa: BLE001 — 그림자가 챗을 막지 않는다
+        print(f"[persona-links] 그림자(챗 도구)를 적지 못했다: {exc!r}"[:300])
+
+
+def _persona_shadow_seats(site: str, question: str, keys: list, want: int) -> None:
+    """심의 첫 좌석 · 띵킹 소집 — 연결 표가 덮었을 도메인을 적기만 한다(deliberation._persona_shadow 가 부른다). 좌석은 그대로다."""
+    v = _persona_links()
+    if not v or not v.get("present"):
+        return
+    import persona_links as _pl  # noqa: PLC0415
+    _pl.shadow_seats(v, site=site, question=question, seats=list(keys), want=want)
 
 
 def _parse_servers(spec: str) -> dict:
@@ -6519,6 +6576,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             _names = list(await asyncio.to_thread(_tools_map))
             if _names:
                 prefer = _seat_tool_prefer(_names, persona, _sel_q, _PERSONA_PREFER_N)
+                # 연결 표(personas)가 골랐을 것을 적기만 한다 — prefer 는 그대로다(design-e5 E5-4 그림자)
+                _persona_shadow_tools(agent_key, persona, _sel_q, req.message, _names, prefer)
         agent = await _agent_for(app, req.groups, pinned, _sel_q, req.search_sources,
                                  req.user_email, req.user_pat, first,
                                  # 앱 하나를 통째로 핀한 턴이면 상시 예약을 안내대 4개로 줄인다.

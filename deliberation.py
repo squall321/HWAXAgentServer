@@ -4369,6 +4369,16 @@ async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
     return out
 
 
+def _persona_shadow(site: str, question: str, keys: list, want: int) -> None:
+    """페르소나 연결의 그림자(HWAXPortal docs/request-1029 design-e5 E5-4) — 코어 어휘표 personas 가 덮었을 도메인 · 모자란 좌석 수를 박스 자리에
+    적기만 한다. 좌석 · 순서는 그대로고, 어떤 실패도 삼킨다(관문 G0 전에는 고르기를 바꾸지 않는다 — 사용자 결정 10-31)."""
+    try:
+        from app import _persona_shadow_seats  # noqa: PLC0415 — 순환 방지용 늦은 import(_restore_role 과 같은 방식)
+        _persona_shadow_seats(site, question, keys, want)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: int) -> list:
     """착석 좌석이 보지 못하는 원인 축을 명명하게 하고, 그 축의 짧은 질의로 좌석을 발굴한다.
 
@@ -5435,6 +5445,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                       "tool": "recommend_agents"})
     else:
         personas = await _discover(tools, question, N_PERSONAS, origin="primary")
+        _persona_shadow("delib", question, [p["key"] for p in personas], N_PERSONAS)   # 적기만 한다 — 좌석은 그대로다
         # 반대 도메인 좌석(F1) — 질문의 어휘가 도메인을 고정하면 그 밖의 가설은 발생 경로가 없다.
         # 착석 좌석이 못 보는 원인 축을 명명하게 하고 그 축으로 발굴한다(_counter_seats 주석에
         # 실측 근거). DELIB_COUNTER_SEATS=0 으로 종전 동작 복귀.

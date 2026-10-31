@@ -76,7 +76,7 @@ ChatDock (portal frontend)
 
 - `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — real-use question collection for
   the seat-choice baseline (shared secret; see "Seat-choice baseline" below). `/health.seat_questions`
-  `{collect, days, written, error, labelers}`.
+  `{collect, days, written, error, labelers}`, `/health.core_vocab.personas`.
 
 ## Run (dev)
 
@@ -649,8 +649,17 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
   the H set outlives the 60 days), `POST /seat-questions/ingest {items: [{src, text, ts?, picked?}]}` (the portal's
   backfill of the last 60 days; fields that point at a person or a conversation are refused). Who labels is a human
   decision — `SEAT_QUESTIONS_LABELERS` (comma list; empty = anyone) names the accepted `by` values.
+- **Persona links (E5-4)** — the core vocabulary's `personas` field (`domains` · `experts` · `data_types` · `no_tools`) is
+  validated line by line: domains against the org chart labels (`../HWAXPortal/frontend/src/components/chat/orgTaxonomy.json`),
+  types against the vocabulary's `types`, areas and apps against the gateway tool map already fetched; operators (`he`)
+  are refused. A bad line is dropped alone; `/health` `core_vocab.personas` shows the counts, the dropped lines with
+  reasons, the tables it could not check, org-chart domains with no line, and the shadow log. Shadow log
+  (`shadow/s-YYYY-MM-DD.jsonl`, 30 days, `PERSONA_SHADOW_LOG=0` turns it off): for a pinned expert's chat turn, the
+  current preferred tools next to what the links would pick; for deliberation first seats and thinking candidates, the
+  detected core types, the domains that own them, the domains the seats miss, short seats, and whether all types are
+  data types. Only a hash of the question is written. Every failure is swallowed — selection is untouched.
 
-Tests: `tests/test_seat_questions.py`.
+Tests: `tests/test_seat_questions.py`, `tests/test_persona_links.py`.
 
 ### Images (portal docs/chat-depth-context T5)
 
