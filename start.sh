@@ -97,8 +97,22 @@ secs_or() {   # secs_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는�
     *) printf '%s' "$2" ;;
   esac
 }
-STOP_GRACE_S="$(secs_or AGENT_STOP_GRACE_S "${AGENT_STOP_GRACE_S:-2}" 2)"
+# TERM 뒤 KILL 까지(AGENT_STOP_GRACE_S)는 아래 정상 종료 상한(AGENT_GRACEFUL_S) + 도는 심의를 접는 1초(delib_jobs.SHUTDOWN_WAIT_S) + 여유보다
+# 커야 내려가는 서버가 원장에 진행을 남긴다(HWAXPortal docs/request-1027/design-ha09-ha20.md HA-09 S0 — 그래서 기본 2 → 4). 짧아도 진행 일지가
+# 남아 다음 기동이 접는다 — 이 유예는 덤이다.
+STOP_GRACE_S="$(secs_or AGENT_STOP_GRACE_S "${AGENT_STOP_GRACE_S:-4}" 4)"
 HEALTH_PROBE_S="$(secs_or AGENT_HEALTH_PROBE_S "${AGENT_HEALTH_PROBE_S:-3}" 3)"
+# uvicorn 정상 종료의 상한(초) — 열린 연결(웹 챗 · 웹 심의의 SSE 구독)이 닫히기를 이만큼만 기다리고 끊는다. 종전엔 상한이 없어(uvicorn 기본)
+# 열린 SSE 하나가 lifespan 종료(도는 심의 접기)를 막은 채 위 유예 뒤 kill -9 를 맞았다. uvicorn 은 정수만 받는다 — 아니면 경고하고 기본값이다.
+int_or() {   # int_or <이름> <읽은 값> <기본값> — 쓸 값을 찍는다
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "  ⚠ $1='$(printf '%.40s' "$2")' 를 정수 초로 읽지 못했다 — 기본값 ${3}초로 돈다(.env 의 값 줄 끝에 설명·공백·단위·소수를 두지 않는다)" >&2
+      printf '%s' "$3" ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+GRACEFUL_S="$(int_or AGENT_GRACEFUL_S "${AGENT_GRACEFUL_S:-1}" 1)"
 # /health 본문은 한 번만 묻는다(아래 둘이 같은 본문을 읽는다) — 답이 없으면 빈 글이다.
 health_body() {
   local probe="$HOST"
@@ -188,7 +202,7 @@ echo "==> Agent Server on :${PORT}  (vLLM=${VLLM_BASE_URL}, model=${VLLM_MODEL})
 # (SSH 끊겨도 유지). 로그는 AGENT_LOG(기본 ./agent-server.log).
 if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--daemon" ]; then
   LOG="${AGENT_LOG:-$(pwd)/agent-server.log}"
-  nohup .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT" >"$LOG" 2>&1 &
+  nohup .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT" --timeout-graceful-shutdown "$GRACEFUL_S" >"$LOG" 2>&1 &
   NEWPID=$!
   # 기동 자체 검증 — 포트가 타 유저 프로세스에 잡혀 bind 실패하면 nohup 이 조용히 죽는다.
   # '떴다'고 오인하지 않게(전에 stale 서버가 계속 응답하던 그 부류) 실제 리슨을 확인한다.
@@ -207,5 +221,5 @@ if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--daemon" ]; then
     exit 1
   fi
 else
-  exec .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT"
+  exec .venv/bin/uvicorn app:app --host "$HOST" --port "$PORT" --timeout-graceful-shutdown "$GRACEFUL_S"
 fi

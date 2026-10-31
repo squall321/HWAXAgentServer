@@ -180,10 +180,11 @@ def test_health_는_루프백으로_프록시_없이_짧게_묻는다(box):
 
 
 # ── 유예 ─────────────────────────────────────────────────────────────────────
-def test_TERM_뒤_유예는_기본_2초이고_설정으로_바꾼다(box):
+def test_TERM_뒤_유예는_기본_4초이고_설정으로_바꾼다(box):
+    """정상 종료 상한(AGENT_GRACEFUL_S 1) + 도는 심의 접기(1초) + 여유 — 그 안에 내려가야 원장에 진행이 남는다(HA-09 S0, 종전 기본 2)."""
     box.health('{"status":"ok","delib_active":0,"delib_queued":0}')
     box.run()
-    assert box.read("sleep.args")[0] == "2", box.read("sleep.args")
+    assert box.read("sleep.args")[0] == "4", box.read("sleep.args")
 
 
 def test_유예를_설정으로_바꾼다(box):
@@ -222,8 +223,8 @@ def test_유예를_숫자로_못_읽어도_옛_서버만_내리고_끝나지_않
     rc, out = box.run()
     assert rc == 0 and not box.old_alive(), (rc, out)
     assert box.started(), f"옛 서버를 내리고 새 서버를 띄우지 않았다 — {out}"
-    assert box.read("sleep.args")[0] == "2", box.read("sleep.args")
-    assert "AGENT_STOP_GRACE_S" in out and "기본값 2초" in out, out
+    assert box.read("sleep.args")[0] == "4", box.read("sleep.args")
+    assert "AGENT_STOP_GRACE_S" in out and "기본값 4초" in out, out
 
 
 @pytest.mark.parametrize("bad", _BAD_PROBE)
@@ -255,6 +256,43 @@ def test_숫자로_읽히는_값에는_경고가_없다(box):
     assert rc == 0 and box.started(), (rc, out)
     assert box.read("sleep.args")[0] == "0.5" and "--max-time 10 " in box.read("curl.args")[0]
     assert "기본값" not in out, out
+
+
+# ── uvicorn 정상 종료 상한(HA-09 S0) ────────────────────────────────────────────
+def _graceful(box) -> str:
+    args = box.read("uvicorn.args")[0].split()
+    assert args.count("--timeout-graceful-shutdown") == 1, args
+    return args[args.index("--timeout-graceful-shutdown") + 1]
+
+
+def test_uvicorn_에_정상_종료_상한을_기본_1초로_주고_설정으로_바꾼다(box):
+    """상한이 없으면(uvicorn 기본) 열린 SSE 하나가 닫히기를 끝없이 기다려 lifespan 종료(도는 심의 접기)에 닿기 전에 KILL 을 맞았다."""
+    box.close()
+    box.run()
+    assert _graceful(box) == "1"
+    box.run(AGENT_GRACEFUL_S="3")
+    assert _graceful(box) == "3"
+    (box.dir / ".env").write_text("AGENT_GRACEFUL_S=0\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and _graceful(box) == "0" and "기본값" not in out, out
+
+
+@pytest.mark.parametrize("bad", ["1.5", "2s", "abc", "1 # 설명", "-1"])
+def test_정상_종료_상한을_정수로_못_읽으면_경고하고_기본값이다(box, bad):
+    """uvicorn 은 --timeout-graceful-shutdown 에 정수만 받는다 — 그대로 넘기면 새 서버가 뜨지 않는다(옛 서버는 이미 내렸다)."""
+    box.close()
+    (box.dir / ".env").write_text(f"AGENT_GRACEFUL_S={bad}\n", encoding="utf-8")
+    rc, out = box.run()
+    assert rc == 0 and box.started() and _graceful(box) == "1", (rc, out)
+    assert "AGENT_GRACEFUL_S" in out and "기본값 1초" in out, out
+
+
+def test_백그라운드_기동도_같은_상한을_준다():
+    """-d(nohup) 갈래와 포그라운드(exec) 갈래가 같은 인자로 뜬다 — 한쪽만 고치면 다른 길로 뜬 서버(손으로 ./start.sh -d · 서비스 매니페스트의
+    ./start.sh)는 종전대로 상한 없이 뜬다."""
+    src = (ROOT / "start.sh").read_text(encoding="utf-8")
+    lines = [ln for ln in src.splitlines() if ".venv/bin/uvicorn app:app" in ln and not ln.lstrip().startswith("#")]
+    assert len(lines) == 2 and all('--timeout-graceful-shutdown "$GRACEFUL_S"' in ln for ln in lines), lines
 
 
 # ── 서버에 넘기는 환경 ───────────────────────────────────────────────────────

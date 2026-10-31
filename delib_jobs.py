@@ -107,6 +107,21 @@ _TICKER = None
 # 지운다(끊긴 잡만 남긴다 — 이어 돌리면 지운다). 끊긴 잡의 것도 ARGS_KEEP_S 가 지나면 재기동 정리가 지운다(근거 본문이 남지 않게).
 _ARGS_DIR = "args"
 ARGS_KEEP_S = 7 * 86400
+# 진행 일지(HWAXPortal docs/request-1027/design-ha09-ha20.md HA-09 S0) — 도는 잡의 사건을 <잡 원장>/journal/<id>.jsonl(폴더 0700 · 파일 0600)에
+# 한 줄씩 덧붙인다. 원장은 띄울 때와 끝날 때만 쓰는데, 재기동(TERM)은 uvicorn 0.49 가 정상 종료를 마친 뒤 같은 신호를 다시 올려 잡 태스크의
+# finally(원장 쓰기)가 돌 틈이 없고 KILL · 메모리 고갈은 아무것도 돌지 않는다 — 끊긴 잡의 원장은 늘 띄울 때 모양(stage start · 턴 0)이었고,
+# 끝난 라운드 뒤부터 잇는 길(R3)과 끝난 단 건너뛰기(체크포인트)가 실제 재기동에서는 걸리지 않고 처음부터 돌았다. 줄은 os.write 로 곧바로
+# 커널에 넘긴다(프로세스가 죽어도 남는다 — 전원이 나갈 때만 마지막 묶음을 잃는다). 재기동 정리(reap_orphans)가 원장 위에 같은 _apply 를
+# 다시 돌려 접는다 — 접은 원장은 죽기 직전의 메모리와 같다. 토큰은 없다(사건에 토큰이 실리지 않는다 — 시작 인자 파일과 같은 규칙). 끝(done ·
+# error · cancelled)이면 원장을 쓴 다음 지우고, 끊긴 잡의 것은 시작 인자 파일과 같이 이어 돌릴 때까지 · ARGS_KEEP_S 동안 둔다(_drop_args).
+_JOURNAL_DIR = "journal"
+JOURNAL_V = 1                 # 일지 꼴 번호 — 머리 줄과 다르면 접지 않는다
+JOURNAL_MAX_BYTES = max(1, _env_int("DELIB_JOURNAL_MAX_MB", 64)) * 1024 * 1024
+_JOURNAL_EVENTS = ("status", "delib", "warning", "error", "result")       # _apply 가 읽는 사건 — 토큰 조각 · ping · done 은 적지 않는다
+_JOURNAL_SYNC = ("stage", "personas", "checkpoint", "decision", "outcome")  # 이 delib 사건 뒤에는 fsync — 라운드 · 단 · 결정문 · 보고서 경계
+# 내려갈 때(lifespan 종료 — mcp_server.unbind) 도는 잡이 접히기를 기다리는 상한(초). 취소된 잡의 finally 가 interrupted 와 원장을 쓴다.
+# start.sh 의 uvicorn 정상 종료 상한(AGENT_GRACEFUL_S) 뒤에 오므로 둘의 합이 TERM 뒤 KILL 까지(AGENT_STOP_GRACE_S)보다 작아야 한다.
+SHUTDOWN_WAIT_S = 1.0
 _REQUEUED = 0                 # 이번 기동에서 다시 세운 줄 선 잡 수(/health.delib_requeued — update-all 이 재기동 뒤 찍는다, O2)
 INTERRUPTED_MSG = ("서버 재기동으로 중단됨 — deliberate_continue(previous_job_id=이 잡) 한 번으로 끝난 라운드 뒤부터 남은 라운드만 이어 돈다"
                    "(사람 의견은 비워도 된다 · 처음 인자를 그대로 쓴다). 처음부터 다시 시작하려면 deliberate_start")
@@ -353,12 +368,151 @@ def _read_args(job_id: str) -> dict | None:
 
 
 def _drop_args(job_id: str) -> None:
+    """시작 인자 파일과 진행 일지를 지운다 — 둘은 같은 규칙이다(끊긴 잡의 것만 이어 돌릴 때까지 남긴다 · 근거 본문 · 발언이 든다)."""
+    for p, what in ((_args_path(job_id), "시작 인자 파일을"), (_journal_path(job_id), "진행 일지를")):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("[delib-job %s] %s 못 지웠다: %r", job_id, what, exc)
+
+
+def _journal_path(job_id: str) -> Path:
+    return JOB_DIR / _JOURNAL_DIR / f"{job_id}.jsonl"
+
+
+def _journal_form(ev: str, data: dict, turns_before: int) -> dict | None:
+    """일지에 적을 꼴 — _apply 가 읽는 것 그대로라 접으면 메모리와 같다. 적지 않는 것(None) — _apply 가 안 읽는 사건(토큰 조각 · ping · done ·
+    모르는 이름). 줄여 적는 것 둘은 _apply 가 상태에 넣지 않고 마지막 일(last_step)만 고치는 사건이다 — 좌석에 준 근거 카드(included 가 거짓이
+    아닌 것 — 원장도 본문을 싣지 않는다)는 이름만, 전사 상한(TURN_MAX)을 넘은 턴은 좌석과 라운드만 적는다."""
+    if ev not in _JOURNAL_EVENTS:
+        return None
+    if ev == "delib":
+        kind = data.get("kind")
+        if kind == "evidence" and data.get("included") is not False:
+            return {"kind": "evidence", "source": str(data.get("source") or "")[:80]}
+        if kind == "turn" and turns_before >= TURN_MAX:
+            return {k: data[k] for k in ("kind", "persona", "round", "display_round") if k in data}
+    return data
+
+
+class _Journal:
+    """잡 하나의 진행 일지 — 덧붙이기만 한다(_drive 가 열고 닫는다). 줄마다 os.write 로 커널에 넘기고(사용자 공간 버퍼가 없다 — 프로세스가
+    죽어도 쓴 줄은 남는다) 경계 사건(_JOURNAL_SYNC) 뒤에만 fsync 한다. 쓰기가 한 번이라도 실패하면 그 잡은 더 쓰지 않는다 — 경고 한 번이고,
+    재기동하면 거기까지 접힌다(일지가 없던 때보다 나빠지지 않는다). 상한(JOURNAL_MAX_BYTES)에 닿으면 그 사실을 한 줄 적고 멈춘다 — 접은 원장이
+    그 줄까지의 메모리와 같게(앞부분만 — 단계 · 턴 · 체크포인트가 서로 어긋나지 않는다)."""
+
+    def __init__(self, job_id: str):
+        self.job_id, self.fd, self.size = job_id, None, 0
+        try:
+            _private_dir(JOB_DIR / _JOURNAL_DIR)
+            # 같은 잡 id 는 한 번만 뜬다(이어하기는 새 잡이다) — 남은 파일이 있으면 앞의 것이 아니라 비운다(두 번 접히지 않게)
+            self.fd = os.open(_journal_path(job_id), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o600)
+            os.fchmod(self.fd, 0o600)
+        except OSError as exc:
+            self._fail(exc)
+            return
+        self._line({"k": "j:head", "v": JOURNAL_V, "id": job_id}, sync=True)
+
+    def _fail(self, exc) -> None:
+        log.warning("[delib-job %s] 진행 일지를 쓰지 못했다 — 재기동하면 여기까지만 원장에 접힌다: %r", self.job_id, exc)
+        self.close()
+
+    def _line(self, rec: dict, *, sync: bool = False) -> None:
+        if self.fd is None:
+            return
+        try:
+            data = (json.dumps({"t": _now(), **rec}, ensure_ascii=False) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            self._fail(exc)
+            return
+        if self.size + len(data) > JOURNAL_MAX_BYTES and rec.get("k") != "j:cap":
+            log.warning("[delib-job %s] 진행 일지가 상한 %dMB 에 닿았다 — 그 뒤 진행은 재기동을 넘기지 못한다(설정 DELIB_JOURNAL_MAX_MB)",
+                        self.job_id, JOURNAL_MAX_BYTES // (1024 * 1024))
+            self._line({"k": "j:cap", "max_mb": JOURNAL_MAX_BYTES // (1024 * 1024)}, sync=True)
+            self.close()
+            return
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(self.fd, view):]
+            self.size += len(data)
+            if sync:
+                os.fsync(self.fd)
+        except OSError as exc:
+            self._fail(exc)
+
+    def event(self, ev: str, data: dict, t: float, turns_before: int) -> None:
+        """_drive 가 _apply 한 사건 하나 — 시각은 그 사건을 반영한 때(updated_at)다(접으면 그 값이 된다)."""
+        form = _journal_form(ev, data, turns_before)
+        if form is not None:
+            self._line({"t": t, "k": ev, "d": form}, sync=ev == "delib" and data.get("kind") in _JOURNAL_SYNC)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def _journal_rec(raw: bytes):
     try:
-        _args_path(job_id).unlink()
+        rec = json.loads(raw)
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _fold_journal(job: dict) -> int:
+    """재기동 정리 — 끊긴 잡의 진행 일지를 원장에 접는다. 접은 사건 수를 돌려준다.
+
+    원장은 도는 동안 띄울 때 모양 그대로다(_launch 뒤로는 끝날 때까지 쓰지 않는다). 그 위에 일지의 사건을 같은 _apply 로 다시 돌리면 죽기
+    직전의 메모리와 같아진다 — 단계 · 라운드 · 좌석 · 턴(상한 TURN_MAX 그대로) · 체크포인트 · 결과. 마지막 시각(updated_at)은 마지막 사건의
+    시각이다(_close_orphan 이 끝난 시각으로 쓴다 — 종전엔 띄운 시각이 끝난 시각으로 남았다). 반쯤 쓴 마지막 줄(쓰는 도중에 죽었다)은 버린다.
+    머리가 없거나 꼴 번호 · 잡 id 가 다른 일지는 접지 않는다(원장 그대로 — 종전과 같다)."""
+    try:
+        raw = _journal_path(job["id"]).read_bytes()
     except FileNotFoundError:
-        pass
+        return 0
     except OSError as exc:
-        log.warning("[delib-job %s] 시작 인자 파일을 못 지웠다: %r", job_id, exc)
+        log.warning("[delib-job %s] 진행 일지를 읽지 못했다 — 접지 않는다: %r", job["id"], exc)
+        return 0
+    lines = raw.split(b"\n")
+    lines.pop()                   # 마지막 조각 — 줄바꿈으로 끝났으면 빈 것이고, 아니면 반쯤 쓴 줄이다
+    head = _journal_rec(lines[0]) if lines else None
+    if not (head and head.get("k") == "j:head" and head.get("v") == JOURNAL_V and head.get("id") == job["id"]):
+        if lines:
+            log.warning("[delib-job %s] 진행 일지의 머리가 이 판의 꼴이 아니다 — 접지 않는다", job["id"])
+        return 0
+    n = bad = 0
+    capped, last = False, None
+    for ln in lines[1:]:
+        rec = _journal_rec(ln)
+        if rec is None:
+            bad += 1
+            continue
+        k, d, t = rec.get("k"), rec.get("d"), rec.get("t")
+        if k in _JOURNAL_EVENTS and isinstance(d, dict):
+            _apply(job, k, d)
+            n += 1
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                last = float(t)
+        elif k == "j:cap":
+            capped = True
+    if last is not None:
+        job["updated_at"] = last
+    notes = ([f"진행 일지가 상한 {JOURNAL_MAX_BYTES // (1024 * 1024)}MB 에 닿아 그 뒤 진행은 원장에 없다 — 이어 돌면 그 앞까지의 끝난 라운드 "
+              "뒤부터다(설정 DELIB_JOURNAL_MAX_MB)"] if capped else []) + (
+        [f"진행 일지의 깨진 줄 {bad}개를 건너뛰고 접었다"] if bad else [])
+    for msg in notes:
+        job["warnings"] = (job.get("warnings") or [])[-9:] + [msg]
+        job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
+    log.info("[delib-job %s] 재기동 정리 — 진행 일지 %d건을 원장에 접었다(단계 %s · 턴 %d)", job["id"], n, job.get("stage"),
+             len(job.get("turns") or []))
+    return n
 
 
 def _limit_value(k: str, v) -> int:
@@ -883,12 +1037,17 @@ def _apply(job: dict, event: str, data: dict) -> None:
 
 
 async def _drive(job: dict, gen) -> None:
-    """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다."""
+    """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다.
+
+    반영한 사건은 진행 일지에도 한 줄씩 적는다(HA-09 S0) — 원장은 끝날 때 쓰는데, 프로세스가 죽으면 그 finally 가 돌지 않는다."""
+    jr = _Journal(job["id"])
     try:
         async for chunk in gen:
             ev, data = _parse_sse(chunk)
+            turns_before = len(job.get("turns") or [])
             _apply(job, ev, data)
             job["updated_at"] = _now()
+            jr.event(ev, data, job["updated_at"], turns_before)
             if ev == "delib" and data.get("kind") == "personas" and _PENDING:
                 _pump()     # 좌석이 앉았다 — 어림보다 적으면 줄 선 잡이 들 자리가 났다(좌석 합 상한)
     except asyncio.CancelledError:
@@ -904,13 +1063,14 @@ async def _drive(job: dict, gen) -> None:
         log.exception("[delib-job %s] 심의 태스크 오류", job["id"])
         job["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        jr.close()
         job["finished_at"] = _now()
         job["updated_at"] = job["finished_at"]
         if job["status"] == "running":
             job["status"] = "error" if job.get("error") else "done"
         _persist(job)
         if job["status"] != "interrupted":
-            _drop_args(job["id"])
+            _drop_args(job["id"])       # 시작 인자 파일 · 진행 일지 — 원장을 쓴 **다음** 지운다(그 사이에 죽으면 원장이 끝난 잡이라 접지 않는다)
         _TASKS.pop(job["id"], None)
         _prune()
         _pump()      # 자리가 났다 — 끝났든 접혔든 터졌든. 상태를 바꾼 **같은 걸음에서** 넘겨준다
@@ -1155,11 +1315,11 @@ def cancel(job_id: str, *, by: str = "") -> dict:
 
 def _tighten_existing() -> None:
     """기동 때 한 번 — 이 판 전에 넓게 만들어진 하위 폴더 · 원장 · 색인을 좁힌다(HA-10). 이미 좁으면 건드리지 않는다."""
-    for sub in (_ARGS_DIR, _LIST_DIR, "state"):
+    for sub in (_ARGS_DIR, _LIST_DIR, "state", _JOURNAL_DIR):
         if (JOB_DIR / sub).is_dir():
             _private_dir(JOB_DIR / sub)
     for pat, mode in ((JOB_DIR.glob("*.json"), _LEDGER_MODE), ((JOB_DIR / _LIST_DIR).glob("*.json"), _LEDGER_MODE),
-                      ((JOB_DIR / "state").glob("*.json"), _STATE_MODE)):
+                      ((JOB_DIR / "state").glob("*.json"), _STATE_MODE), ((JOB_DIR / _JOURNAL_DIR).glob("*.jsonl"), _STATE_MODE)):
         try:
             for f in pat:
                 try:
@@ -1195,6 +1355,8 @@ def reap_orphans(app=None) -> int:
             if args is not None:
                 back.append((j, args))
                 continue
+            if j["status"] == "running":
+                _fold_journal(j)        # 끊기기 전의 진행 — 원장은 띄울 때 모양이다(HA-09 S0). 닫기 전에 접어야 끝난 시각이 마지막 사건의 시각이다
             _close_orphan(j)
             n += 1
     except OSError:
@@ -1245,16 +1407,17 @@ def _requeue(app, job: dict, args: dict) -> None:
 
 
 def _sweep_args() -> None:
-    """남은 시작 인자 파일을 치운다 — 원장이 없거나 끝난 잡(끝남과 지우기 사이에 죽었다)의 것, 끊긴 잡이라도 이어 돌렸거나 ARGS_KEEP_S 가
-    지난 것. 근거 본문이 원장 옆에 오래 남지 않게 한다."""
-    d = JOB_DIR / _ARGS_DIR
-    try:
-        files = list(d.glob("*.json"))
-    except OSError:
-        return
+    """남은 시작 인자 파일 · 진행 일지를 치운다 — 원장이 없거나 끝난 잡(끝남과 지우기 사이에 죽었다)의 것, 끊긴 잡이라도 이어 돌렸거나
+    ARGS_KEEP_S 가 지난 것. 근거 본문 · 발언이 원장 옆에 오래 남지 않게 한다. 둘은 잡마다 같은 규칙이다(_drop_args 가 함께 지운다) — 시작
+    인자 파일을 못 쓴 잡(durable 거짓)의 일지도 여기서 본다."""
+    files = []
+    for sub, pat in ((_ARGS_DIR, "*.json"), (_JOURNAL_DIR, "*.jsonl")):
+        try:
+            files += list((JOB_DIR / sub).glob(pat))
+        except OSError:
+            pass
     now = _now()
-    for f in files:
-        jid = f.stem
+    for jid in dict.fromkeys(f.stem for f in files):
         if jid in _JOBS:
             continue
         rec = _list_load(JOB_DIR / f"{jid}.json")
@@ -1327,6 +1490,35 @@ def stop_ticker() -> None:
     if _TICKER is not None:
         _TICKER.cancel()
         _TICKER = None
+
+
+async def shutdown(wait_s: float | None = None) -> int:
+    """서버가 내려간다(lifespan 종료 — mcp_server.unbind) — 도는 잡 태스크를 취소하고 wait_s(기본 SHUTDOWN_WAIT_S)까지 기다린다. 접은 잡 수를
+    돌려준다(HA-09 S0).
+
+    취소된 잡은 _drive 가 interrupted 로 적고 그 자리에서 원장에 진행을 쓴다(DO-D7 — 사람이 접은 것과 가른다). 종전엔 아무도 취소하지 않았다 —
+    uvicorn 은 정상 종료를 마친 뒤 받은 신호를 다시 올려 프로세스가 그 자리에서 끝나므로, 루프가 남은 태스크를 취소하는 정리도 finally 도 오지
+    않았다. 상한 안에 접히지 않은 잡(엔진이 취소를 늦게 받는다)은 메모리 상태 그대로 interrupted 로 쓴다. 쓰기가 끝내 안 돼도 진행 일지가 있다 —
+    다음 기동이 접는다. 이 이벤트 루프의 태스크만 본다(시험이 남긴 다른 루프의 잡은 건드리지 않는다)."""
+    closing(True)
+    loop = asyncio.get_running_loop()
+    live = {jid: t for jid, t in list(_TASKS.items()) if not t.done() and t.get_loop() is loop}
+    for t in live.values():
+        t.cancel()
+    if live:
+        await asyncio.wait(list(live.values()), timeout=SHUTDOWN_WAIT_S if wait_s is None else wait_s)
+    late = []
+    for jid in live:
+        job = _JOBS.get(jid)
+        if job is not None and job.get("status") == "running":      # finally 가 아직이다 — 메모리 상태 그대로 남긴다
+            job["status"], job["error"] = "interrupted", INTERRUPTED_MSG
+            job["finished_at"] = job["updated_at"] = _now()
+            _persist(job)
+            late.append(jid)
+    if live:
+        log.info("내려가는 중 — 도는 심의 잡 %d건을 interrupted 로 접어 원장에 남겼다%s", len(live),
+                 f"(그 가운데 {len(late)}건은 상한 {SHUTDOWN_WAIT_S if wait_s is None else wait_s}초 안에 접히지 않아 메모리 상태 그대로)" if late else "")
+    return len(live)
 
 
 def summary(job: dict, *, full: bool = False) -> dict:

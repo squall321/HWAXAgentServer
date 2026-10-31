@@ -231,23 +231,35 @@ def test_시작_인자를_못_쓰면_그_잡은_durable_거짓(eng, monkeypatch)
     _play(scenario)
 
 
-def _crash(eng, monkeypatch, states: dict, queued_at: dict | None = None):
-    """잡 셋을 띄워 두고 프로세스가 죽은 꼴을 만든다 — 원장과 시작 인자 파일만 남고 메모리는 빈다. (화두 → 잡)을 돌려준다."""
+def _crash(eng, monkeypatch, states: dict, queued_at: dict | None = None, kind: str = "default"):
+    """잡 셋을 띄워 두고 프로세스가 죽은 꼴을 만든다 — 메모리는 비고 디스크에 있던 것만 남는다. (화두 → 잡)을 돌려준다.
+
+    **도는 잡(running)은 죽을 때 디스크에 있던 바이트 그대로다** — 띄울 때 쓴 원장(stage start · 턴 0)과 그 색인, 시작 인자 파일, 진행 일지.
+    도는 동안의 진행은 원장에 가지 않는다(HWAXPortal docs/request-1027/design-ha09-ha20.md A2.3). 종전엔 시나리오가 끝난 **메모리 상태를
+    원장에 쓴 뒤** 죽은 꼴을 만들어, 진짜 재기동에서는 원장에 진행이 없다는 것을 시험이 못 봤다(가짜가 진짜 꼴과 달랐다). 실제로 돈 적 없는
+    잡을 다른 상태로 청하면(줄 선 · 끝난 · 끊긴 잡 — 그 상태의 원장은 그 상태를 정한 자리에서 쓰인다) 종전대로 그 상태로 적는다."""
     _caps(monkeypatch, 1)
-    saved = {}
+    saved, live = {}, {}
 
     async def scenario():
-        jobs = {q: _start(q, ME, delib_opts={"human_note": f"{q} 의견"}) for q in states}
+        jobs = {q: delib_jobs.start(object(), kind, q, user_email=ME, delib_opts={"human_note": f"{q} 의견"}) for q in states}
         await _tick()
-        for j in jobs.values():
+        for q, j in jobs.items():
             saved[j["id"]] = delib_jobs._args_path(j["id"]).read_bytes()
+            if j["status"] == "running" and states[q] == "running":      # 그 잡의 파일 전부(원장 · 색인 · 시작 인자 · 진행 일지 — 무엇이든)
+                live[j["id"]] = {p: p.read_bytes() for p in delib_jobs.JOB_DIR.rglob("*") if p.is_file() and p.stem == j["id"]}
         return jobs
     jobs = _play(scenario)                        # 뒷정리가 잡을 접고 파일을 지운다 — 아래에서 죽기 전 꼴로 되돌린다
     for q, j in jobs.items():
-        j["status"] = states[q]
-        if queued_at and q in queued_at:
-            j["queued_at"] = queued_at[q]
-        delib_jobs._persist(j)
+        if j["id"] in live:
+            for p, b in live[j["id"]].items():
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b)
+        else:
+            j["status"] = states[q]
+            if queued_at and q in queued_at:
+                j["queued_at"] = queued_at[q]
+            delib_jobs._persist(j)
         delib_jobs._args_path(j["id"]).write_bytes(saved[j["id"]])
     for store in (delib_jobs._JOBS, delib_jobs._TASKS, delib_jobs._PENDING):
         store.clear()
@@ -300,6 +312,61 @@ def test_시작_인자_파일이_없거나_깨진_줄_선_잡은_종전처럼_�
         assert rec["status"] == "interrupted" and "시작하지 못했다" in rec["error"], rec["error"]
     assert list(delib_jobs._PENDING) == [jobs["다"]["id"]]
     assert not delib_jobs._args_path(jobs["나"]["id"]).exists(), "닫은 잡의 깨진 파일이 남았다"
+
+
+def _rounds_script(seats=("기구", "열"), done=2, total=4, partial=1) -> list:
+    """엔진이 내는 꼴 — 좌석이 앉고 done 라운드를 마친 뒤 다음 라운드에서 partial 석이 말했다."""
+    out = [d._delib("personas", totalRounds=total, personas=[{"key": k, "role": f"{k} 역할", "origin": "primary"} for k in seats])]
+    for r in range(1, done + 2):
+        out.append(d._delib("stage", stage=f"r{r}", n=len(seats)))
+        for k in (seats if r <= done else seats[:partial]):
+            out.append(d._delib("turn", round=r, display_round=r, persona=k, say=f"{k} {r}R 줄임", say_full=f"{k} {r}R 입장 전문"))
+    return out
+
+
+def test_실제로_죽은_꼴에서도_끝난_라운드_뒤부터_잇는다(eng, monkeypatch):
+    """HWAXPortal docs/request-1027 HA-09 S0 — 죽을 때 디스크에 있는 것은 띄울 때 원장과 진행 일지뿐이다(_crash 의 진짜 꼴). 재기동 정리가 일지를
+    접어 끝난 라운드를 원장에 싣고, 이어하기는 그 뒤부터 돈다. 일지가 없던 판에서는 원장이 띄울 때 모양이라 끝난 라운드 0 · 처음부터였다
+    (이 시험이 붉었다 — 결함의 오라클)."""
+    eng.script["가"] = _rounds_script()
+    jobs = _crash(eng, monkeypatch, {"가": "running"})
+    jid = jobs["가"]["id"]
+    disk = _on_disk(jobs["가"])
+    assert (disk["status"], disk["stage"], disk["turns"]) == ("running", "start", []), "시험 전제 — 도는 동안 원장은 띄울 때 모양이다"
+    m.bind(object())                              # 다음 기동 — 재기동 정리
+    rec = _on_disk(jobs["가"])
+    assert (rec["status"], rec["stage"], rec["total_rounds"], len(rec["turns"])) == ("interrupted", "r3", 4, 5), \
+        f"재기동 뒤 원장이 끊기기 전 진행을 싣지 않았다: {(rec['status'], rec['stage'], rec['total_rounds'], len(rec['turns']))}"
+    assert [s["key"] for s in rec["seats"]] == ["기구", "열"]
+    last_t = json.loads(delib_jobs._journal_path(jid).read_text(encoding="utf-8").splitlines()[-1])["t"]
+    assert rec["finished_at"] == rec["updated_at"] == last_t, "끝난 시각이 마지막 사건의 시각이 아니다(띄운 시각이 남았다)"
+    st = asyncio.run(m.deliberate_status(jid))
+    assert st["resume"] == {"rounds_done": 2, "total_rounds": 4, "rounds_left": 2, "args": True, "resumed_by": None,
+                            "checkpoint": None}, st["resume"]
+    out = _resume(eng, jid)
+    o = eng.seen["가"].opts
+    assert (o["rounds"], o["rounds_so_far"]) == (2, 2) and out["resumed"]["rounds_start_at"] == 3, "끝난 라운드 뒤부터가 아니라 처음부터 돌았다"
+    assert "끝난 2라운드" in o["continue_summary"] and "기구 2R 입장 전문" in o["continue_summary"] and "3R" not in o["continue_summary"]
+    assert o["human_note"] == "가 의견", "처음 인자(시작 인자 파일)를 잇지 못했다"
+    assert not delib_jobs._journal_path(jid).exists(), "이어 돌린 잡의 진행 일지(발언)가 남았다"
+
+
+def test_다단_심의도_실제로_죽은_꼴에서_끝난_단의_체크포인트가_남아_그_단부터_잇는다(eng, monkeypatch):
+    """HA-09 S0 — 끝난 단 건너뛰기(체크포인트, 4c67229)도 실제 재기동에서 걸린다. 체크포인트는 사건이라 원장에는 끝날 때만 갔다 — 일지가 없던
+    판에서는 죽은 꼴의 원장에 체크포인트가 없어 1단부터 다시 돌았다."""
+    monkeypatch.setattr(d, "run_sim_deliberation", eng.entry)
+    eng.script["나"] = [d._delib("checkpoint", stage="sim-1", decision_a="1단 결정문", nn_a=["조항"],
+                                 personas_a=[{"key": "phys-a", "role": "물리"}]), *_rounds_script(done=1, total=3)]
+    jobs = _crash(eng, monkeypatch, {"나": "running"}, kind="sim-plan")
+    jid = jobs["나"]["id"]
+    assert _on_disk(jobs["나"])["checkpoint"] is None, "시험 전제 — 도는 동안 원장에는 체크포인트가 없다"
+    m.bind(object())
+    st = asyncio.run(m.deliberate_status(jid))
+    assert st["checkpoint"] is True and st["resume"]["checkpoint"] == "sim-1", st.get("resume")
+    out = _resume(eng, jid)
+    o = eng.seen["나"].opts
+    assert o["resume_checkpoint"]["decision_a"] == "1단 결정문" and o["resume_checkpoint"]["nn_a"] == ["조항"]
+    assert out["resumed"]["checkpoint"] == "sim-1" and "2단부터" in out["note"], out["note"]
 
 
 def test_재기동_정리는_끝난_잡과_오래된_끊긴_잡의_시작_인자를_치운다(eng, monkeypatch):
@@ -496,15 +563,15 @@ async def go2(job):
 
 
 def test_정상_종료로_접힌_도는_잡은_cancelled_가_아니라_interrupted_다(eng, monkeypatch):
-    """사람이 접은 것(cancelled)과 서버가 내려가며 접힌 것을 가른다 — 내려갈 때 루프가 남은 태스크를 취소한다."""
+    """사람이 접은 것(cancelled)과 서버가 내려가며 접힌 것을 가른다. 내려가는 길(lifespan 종료 — mcp_server.unbind)이 부르는 그대로
+    delib_jobs.shutdown 이 닫고 취소한다 — 종전 시험은 closing(True) 와 cancel() 을 손으로 불렀는데 진짜 종료는 둘 다 하지 않았다(HA-09 S0 —
+    uvicorn 은 정상 종료 뒤 신호를 다시 올려 루프가 남은 태스크를 취소하지 않는다)."""
     _caps(monkeypatch, 1)
 
     async def scenario():
         a = _start("가")
         await _tick()
-        delib_jobs.closing(True)
-        delib_jobs._TASKS[a["id"]].cancel()
-        await _tick()
+        assert await delib_jobs.shutdown() == 1
         return a
     try:
         a = _play(scenario)

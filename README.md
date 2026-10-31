@@ -73,6 +73,21 @@ ChatDock (portal frontend)
   args file (a given human note is appended to the original one). Same question and kind only; a job resumes once
   (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A
   graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
+- **Progress survives a restart** (HA-09 S0 — portal `docs/request-1027/design-ha09-ha20.md` A5.1). The ledger is
+  written when a job starts and when it ends; a restart used to skip the end: on TERM uvicorn 0.49 re-raises the signal
+  after its graceful shutdown, so the process ends before any job task's `finally` runs, an open SSE kept it from even
+  reaching the lifespan shutdown until `start.sh`'s KILL, and KILL / OOM run nothing. Every interrupted ledger was
+  therefore still in its launch shape (`stage: start`, 0 turns) and R3 always started over. Now `_drive` appends every
+  event it applies to `<DELIB_JOB_DIR>/journal/<id>.jsonl` (folder 0700, file 0600, no credentials; streamed token
+  chunks, pings, `done` and the bodies of evidence given to seats are not written; each line goes to the kernel at once,
+  `fsync` at stage · seating · checkpoint · decision · report boundaries). The restart sweep replays it onto the ledger
+  with the same `_apply` before it closes the job — the folded ledger equals the memory just before death (stage,
+  rounds, seats, turns, checkpoint, result; `finished_at` = the last event's time); a half-written last line is
+  dropped, a journal with another head (`v` / id) is not folded. On shutdown the lifespan cancels running jobs and waits
+  up to 1 s (`delib_jobs.SHUTDOWN_WAIT_S`) so they write the ledger themselves, and `start.sh` bounds uvicorn's
+  graceful wait (`AGENT_GRACEFUL_S`). The journal follows the args-file rules: removed when the job ends or is resumed
+  by its owner, kept 7 days for an interrupted job. Over `DELIB_JOURNAL_MAX_MB` (default 64) it writes one `j:cap` line
+  and stops — the fold is then the state up to that line, with a warning. Seat-level resume (S1 · S2) is not here.
 
 ## Run (dev)
 
@@ -96,6 +111,7 @@ vLLM itself: see `HWAXPortal/docs/dev-vllm-setup.md` (apptainer `:latest` +
 | `LLM_CONTEXT_SAMPLES` | `3` | `/v1/models` asks per lookup; the smallest answer wins (a pool answers from a different server each time). `/health.context` shows `tokens`, `source`, the last `server` answer and its `samples`, `env_cap`, `wider`, `reask_s` and `asked_s_ago` |
 | `MCP_CONFIG` | _(unset)_ | path to a gitignored JSON file holding the gateway entry + token (takes precedence) |
 | `MCP_SERVERS` | _(empty)_ | fallback `name=url` pairs when `MCP_CONFIG` is unset (no auth headers) |
+| `DELIB_JOURNAL_MAX_MB` | `64` | Size cap of one job's progress journal (`<DELIB_JOB_DIR>/journal/<id>.jsonl`). Past it the journal writes one `j:cap` line and stops; a restart then folds the progress up to that line. |
 
 ### Time limits
 
@@ -137,7 +153,8 @@ Nothing is cut on this value. It matters to the outer idle limits only when the 
 | `KNOWLEDGE_TIMEOUT_S` | `180` | One seat's knowledge-card lookup (`agent_search`) before the round starts; on expiry it asks once more in `KNOWLEDGE_FALLBACK_MODE` and the seat's status line says so. Intentionally **shorter** than the gateway limit — it is the switch to the fallback, not a wrapping layer. Must stay above AIDataHub's `DB_POOL_TIMEOUT` (60) + `AIDH_SEARCH_STATEMENT_TIMEOUT_S` (90). |
 | `DELIB_HEARTBEAT_S` | `15` | While a deliberation stream has nothing to send, emit `event: ping` / `data: {"idle_s", "ts"}` at this interval so proxies and idle read timeouts see a live stream. `0` turns it off — then every outer idle limit (portal `AGENT_STREAM_IDLE_TIMEOUT_S`, nginx `NGINX_AGENT_READ_TIMEOUT`, risk app `HWAXRISK_ENGINE_READ_TIMEOUT_S`) must exceed the silence of one seat turn, (1 + parse retries)×((1+`DELIB_LLM_MAX_RETRIES`)×`DELIB_TIMEOUT_S`+8) = 10824 s by default — not one logical call (the startup log prints the figure for the box). Consumers must ignore unknown event names. |
 | `AGENT_RESTART_FORCE` | `0` | `start.sh` will not stop a running instance that reports running or queued deliberations — a restart cuts all of them. It prints the counts and exits `3` (skipped), leaving the instance up. When the instance reports `delib_queue_durable: true` (the queue survives a restart), queued jobs no longer block — only running ones do. `1` restarts anyway. If the counts cannot be read (no answer, older build) it says so and restarts. |
-| `AGENT_STOP_GRACE_S` | `2` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. A value that is not a plain number (trailing comment or space, a unit) is read as the default, with a warning. |
+| `AGENT_STOP_GRACE_S` | `4` | Seconds `start.sh` waits between TERM and KILL when it replaces a running instance. Not a wait for deliberations to finish. It must exceed `AGENT_GRACEFUL_S` + 1 s (running jobs folding into the ledger) for the old instance to leave its jobs' progress itself; shorter only loses that bonus — the progress journal survives KILL (was `2`). A value that is not a plain number (trailing comment or space, a unit) is read as the default, with a warning. |
+| `AGENT_GRACEFUL_S` | `1` | `start.sh` passes it as uvicorn's `--timeout-graceful-shutdown`: on TERM, open connections (web chat · web deliberation SSE) get this long to close, then they are cut and the lifespan shutdown (which folds running jobs) runs. Unset upstream means no limit — one open SSE used to hold the shutdown until KILL. Whole seconds only (uvicorn takes an integer); anything else is read as the default, with a warning. |
 | `AGENT_HEALTH_PROBE_S` | `3` | How long `start.sh` waits for `/health` when it asks the running instance for those counts. A value that is not a plain number is read as the default, with a warning — it no longer turns the guard off. |
 | `EXTERNAL_LLM_WAIT_S` | `300` | External responder only (`EXTERNAL_LLM_ENABLED=1`): how long a task waits while the owner's workflow shows no sign of life, then `external_worker_absent`. Full meaning under External responder. |
 | `EXTERNAL_LLM_ANSWER_S` | `1200` | External responder only: how long a claimed task may take to its final submit; requeued once, the second miss is `external_answer_timeout`. 2×this + 2×`EXTERNAL_LLM_WAIT_S` must stay below one logical deliberation call (3608 by default) or the path stays closed. |

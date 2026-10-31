@@ -1035,9 +1035,9 @@ async def lifespan(app: FastAPI):
                 try:
                     yield
                 finally:
-                    # 내려가는 중 — 곧 도는 심의가 전부 취소되며 자리가 난다. 그 자리에 줄 선 심의를
-                    # 띄우지 않게 먼저 닫는다(띄우면 뜨자마자 죽고 결정문 없는 done 으로 남는다).
-                    _delib_mcp_module.unbind()
+                    # 내려가는 중 — 줄 선 심의를 띄우지 않게 먼저 닫고(띄우면 뜨자마자 죽고 결정문 없는 done 으로 남는다), 도는
+                    # 심의를 취소해 원장에 진행을 남긴다(HA-09 S0 — uvicorn 은 이 절차 뒤 신호를 다시 올려 곧바로 끝난다).
+                    await _delib_mcp_module.unbind()
                     await _stop_routines()
             return
         except Exception:  # noqa: BLE001
