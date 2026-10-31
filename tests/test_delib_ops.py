@@ -341,8 +341,11 @@ def test_실제로_죽은_꼴에서도_끝난_라운드_뒤부터_잇는다(eng,
     last_t = json.loads(delib_jobs._journal_path(jid).read_text(encoding="utf-8").splitlines()[-1])["t"]
     assert rec["finished_at"] == rec["updated_at"] == last_t, "끝난 시각이 마지막 사건의 시각이 아니다(띄운 시각이 남았다)"
     st = asyncio.run(m.deliberate_status(jid))
+    sr = st["resume"].pop("seat_resume")
     assert st["resume"] == {"rounds_done": 2, "total_rounds": 4, "rounds_left": 2, "args": True, "resumed_by": None,
                             "checkpoint": None}, st["resume"]
+    # 가짜 엔진은 재개 자료(e:* — HA-09 S1)를 쓰지 않는다 — 라운드 경계로 그대로 잇지 못하고 요약으로 잇는다고 말한다
+    assert sr["ok"] is False and "라운드 전 단계" in sr["why"], sr
     out = _resume(eng, jid)
     o = eng.seen["가"].opts
     assert (o["rounds"], o["rounds_so_far"]) == (2, 2) and out["resumed"]["rounds_start_at"] == 3, "끝난 라운드 뒤부터가 아니라 처음부터 돌았다"
@@ -416,8 +419,10 @@ def _resume(eng, job_id, **kw):
 def test_끊긴_잡은_끝난_라운드_수를_싣는다(eng, monkeypatch):
     job = _interrupted(args_opts=_ORIG)
     st = asyncio.run(m.deliberate_status(job["id"]))
+    sr = st["resume"].pop("seat_resume")
     assert st["resume"] == {"rounds_done": 2, "total_rounds": 4, "rounds_left": 2, "args": True, "resumed_by": None,
                             "checkpoint": None}
+    assert sr["ok"] is False and "이전 판" in sr["why"], sr       # 좌석 단위 재개 요약 없이 끊긴 옛 잡(HA-09 S1 전)
     assert "deliberate_continue" in st["error"]
 
 
@@ -432,8 +437,9 @@ def test_이어하기는_사람_의견_없이_남은_라운드만_처음_인자�
     assert "3R" not in cs.replace("2R", ""), "끝나지 않은 3라운드 발언을 요약에 실었다"
     assert o["human_note"] == "현장 의견" and o["evidence"] == _ORIG["evidence"] and o["timeout_s"] == 3600, "처음 인자를 잇지 못했다"
     assert [p["key"] for p in o["personas"]] == ["mech-hinge", "thermal"] and o["personas"][0]["role"] == "기구 역할 전문"
-    assert out["resumed"] == {"rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3, "foreign": False,
-                              "checkpoint": None}
+    assert out["resumed"] == {"mode": "summary", "rounds_done": 2, "rounds": 2, "args": True, "rounds_start_at": 3, "foreign": False,
+                              "checkpoint": None, "why": "진행 일지가 없다"}, out["resumed"]
+    assert "새 잡에서 잇는다 — 진행 일지가 없다" in out["note"], out["note"]   # 같은 잡에서 잇지 못한 까닭을 말한다(HA-09 S1)
     assert out["continued_from"] == job["id"]
     prev = _on_disk(job)
     assert prev["resumed_by"] == out["job_id"] and not delib_jobs._args_path(job["id"]).exists()

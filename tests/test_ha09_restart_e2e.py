@@ -1,4 +1,4 @@
-# 재기동 넘기기(HA-09 S0) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 끊긴 라운드부터 잇는지 본다
+# 재기동 넘기기(HA-09 S0 · S1) — 진짜 에이전트 서버를 빈 포트에 띄워 MCP 심의 잡을 돌리다 3라운드 한가운데서 KILL · TERM 으로 내리고 다시 띄워, 원장이 끊기기 전 진행을 싣고 deliberate_continue 가 같은 잡을 끊긴 라운드부터 잇는지 본다
 #
 # 왜 생겼나. 원장은 잡을 띄울 때와 끝날 때만 썼다. 재기동(TERM)에서는 uvicorn 0.49 가 정상 종료를 마친 뒤 같은 신호를 다시 올려
 # 프로세스가 그 자리에서 끝나므로 잡 태스크의 finally(원장 쓰기)가 돌지 않았고, 열린 SSE 가 하나라도 있으면 그 연결이 닫힐 때까지(상한
@@ -244,27 +244,30 @@ def _check_folded(base: str, jid: str, pre_turns: list) -> None:
     assert (st["stage"], st["turn_count"], st["total_rounds"]) == ("r3", 2 * len(SEATS), ROUNDS), \
         f"원장이 끊기기 전 진행을 싣지 않았다 — 띄울 때 모양이면 결함 그대로다: {(st['stage'], st['turn_count'], st['total_rounds'])}"
     assert st["seats"] == [s["key"] for s in SEATS]
+    sr = st["resume"].pop("seat_resume")
     assert st["resume"] == {"rounds_done": 2, "total_rounds": ROUNDS, "rounds_left": 2, "args": True, "resumed_by": None,
                             "checkpoint": None}, st["resume"]
+    # 재개 자료(HA-09 S1) — 3라운드의 좌석 호출은 붙잡혀 아무도 말하지 않았다. 이으면 같은 잡이 3라운드부터 세 좌석을 부른다
+    assert (sr["ok"], sr["sk"], sr["round"], sr["spoken"], sr["todo"]) == (True, "main", 3, [], [s["key"] for s in SEATS]), sr
+    assert "같은 잡에서 이어 돈다" in st["error"], st["error"]
     assert _turns(base, jid) == pre_turns, "접은 원장의 전사가 죽기 직전의 메모리(진행 조회로 읽은 것)와 다르다"
 
 
 def _continue_and_finish(stack: _Stack, base: str, jobs: Path, jid: str, pre_turns: list, oracle: list) -> None:
-    """이어하기 한 번 — 끊긴 3라운드부터 돌아, 끊긴 잡의 끝난 라운드와 합쳐 끊지 않은 실행과 같은 칸을 채운다."""
+    """이어하기 한 번 — 같은 잡(제자리 — HA-09 S1 · 사용자 결정 10-31 A-2 (가))이 끊긴 3라운드부터 돌아, 끊기기 전에 끝난 라운드와 합쳐 끊지 않은
+    실행과 같은 칸을 좌석마다 한 번 채운다. 끝난 라운드의 턴은 그대로다(다시 부르지 않았다)."""
     stack.llm_delay(FAST_S)
     out = _mcp(base, "deliberate_continue", {"previous_job_id": jid})
-    assert out["resumed"]["rounds_done"] == 2 and out["resumed"]["rounds_start_at"] == 3 and out["resumed"]["args"] is True, out
-    assert "끝난 2라운드 뒤부터" in out["note"], out["note"]
-    new = out["job_id"]
-    done = _wait(base, new)
-    assert done["status"] == "done", done
-    new_turns = _turns(base, new)
-    assert {t["display_round"] for t in new_turns} == {3, 4}, "끊긴 라운드부터가 아니라 처음부터 돌았다"
-    assert _grid(pre_turns) | _grid(new_turns) == _grid(oracle), "끊긴 잡 + 이어 돈 잡이 끊지 않은 실행의 칸을 채우지 않았다"
-    assert not _grid(pre_turns) & _grid(new_turns), "끝난 라운드의 좌석을 다시 불렀다"
-    cs = _mcp(base, "deliberate_result", {"job_id": new})["applied_opts"]["continue_summary"]
-    assert "끝난 2라운드까지 좌석 3석" in cs, cs
-    assert _ledger(jobs, jid)["resumed_by"] == new
+    r = out["resumed"]
+    assert out["job_id"] == jid and r["mode"] == "in_place" and (r["round"], r["rounds_done"], r["attempt"]) == (3, 2, 1), out
+    assert "같은 잡(같은 job_id)에서 잇는다" in out["note"] and "3라운드부터" in out["note"], out["note"]
+    done = _wait(base, jid)
+    assert done["status"] == "done" and len(done["attempts"]) == 1 and done["attempts"][0]["round"] == 3, done
+    turns = _turns(base, jid)
+    assert _grid(turns) == _grid(oracle) and len(turns) == len(oracle), "끊긴 잡이 이어 돌아 끊지 않은 실행의 칸을 좌석마다 한 번 채우지 않았다"
+    assert [t for t in turns if t["display_round"] <= 2] == pre_turns, "끝난 라운드의 턴이 바뀌었다(좌석을 다시 불렀다)"
+    led = _ledger(jobs, jid)
+    assert not led.get("resumed_by") and "continue_summary" not in led["opts"], "요약 길(새 잡)로 이었다"
     assert not (jobs / "journal" / f"{jid}.jsonl").exists() and not (jobs / "args" / f"{jid}.json").exists(), \
         "이어 돌린 잡의 일지 · 시작 인자 파일(근거 본문)이 남았다"
 

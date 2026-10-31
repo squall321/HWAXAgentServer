@@ -298,7 +298,8 @@ _STATE_DESC = (
     "시작하지 마라 — 그만두려면 deliberate_cancel) · done(끝났다 — deliberate_result 로 결정문을 받는다). "
     "error·cancelled·interrupted 는 결정문 "
     "없이 끝난 것이고 까닭은 error 에 있다(interrupted 는 서버 재기동 — deliberate_continue(previous_job_id) 한 번으로 끝난 "
-    "라운드 뒤부터 남은 라운드만 이어 돈다. 사람 의견은 비워도 된다 · resume 에 끝난 라운드 수가 있다). 줄 선 잡(queued)은 서버 "
+    "라운드 뒤부터 남은 라운드만 이어 돈다. 사람 의견은 비워도 된다 · resume 에 끝난 라운드 수가 있다. resume.seat_resume.ok 면 "
+    "시작한 사람이 바꾼 값 없이 이을 때 **같은 job_id** 가 seat_resume.round 라운드부터 다시 돌고 시도마다 attempts 가 는다). 줄 선 잡(queued)은 서버 "
     "재기동을 넘겨 같은 차례로 다시 선다. 운영이 새 심의를 잠시 멈춘 서버는 시작 · 이어하기를 '점검 중 — 약 N분 뒤 다시"
     "(retry_after_s)' 오류로 거절한다(도는 잡 · 줄 선 잡은 그대로다 — 그때 다시 부른다). "
     + (f"줄은 {delib_jobs.queue_max()}건까지 선다(DELIB_JOB_QUEUE_MAX — 운영이 재기동 없이 바꿀 수 있어 지금 값은 deliberate_jobs 의 "
@@ -447,7 +448,8 @@ _A_TR_LIMIT = "한 묶음의 턴 수 — 1~200 으로 죈다(기본 40)."
 _A_TR_FULL = "참이면 화면용으로 줄이지 않은 발언을 준다(리스크 원장에 제출할 때). 기본 거짓 — 줄인 글과 say_clipped 표식."
 _A_PREV_JOB = "이어갈 심의의 job_id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
 _A_CONT_NOTE = ("넣을 사람 의견 — 이어하기의 핵심이다(패널이 갖지 못한 관측). 재기동으로 끊긴(interrupted) 심의는 비워도 된다 — "
-                "처음의 사람 의견을 그대로 쓰고, 적으면 그 뒤에 덧붙인다. " + _A_NOTE_CAP)
+                "처음의 사람 의견을 그대로 쓰고, 적으면 그 뒤에 덧붙인다(그때는 같은 잡에서 끊긴 자리부터가 아니라 새 잡에서 요약으로 잇는다). "
+                + _A_NOTE_CAP)
 _A_CONT_QUESTION = "화두를 바꿀 때만 적는다. 비우면 이전 화두 그대로다."
 _A_CONT_JOB = ("심의 종류를 바꿀 때만 적는다(비우면 이전과 같다 — 값은 deliberate_start 의 job). 봉인으로 돈 심의는 무엇을 적어도 "
                "봉인으로 이어지고, 다단 심의(sim-plan · test-plan · build-plan)를 적으면 거절한다.")
@@ -603,7 +605,11 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
 
     **남(같은 소속 · 관리자)이 이으면** 시작 인자 파일을 쓰지 않는다 — 원장에는 수만 남은 근거 본문 · 지정 좌석 역할 전문 · 사람 의견이
     그 사람의 새 잡에 실렸고, 원 주인의 한 번뿐인 이어하기도 소진됐다(HWAXPortal docs/request-1027 HA-06). 남에게는 원장의 남은
-    손잡이와 좌석만 넘기고, 원 주인의 이어하기(잇기 표지 · 시작 인자 파일)는 그대로 둔다."""
+    손잡이와 좌석만 넘기고, 원 주인의 이어하기(잇기 표지 · 시작 인자 파일)는 그대로 둔다.
+
+    **주인이 바꾼 값 없이 이으면 같은 잡을 제자리에서 잇는다**(HA-09 S1 — 사용자 결정 10-31 A-2 (가)). 진행 일지의 재개 자료(e:*)를 읽어
+    끊기기 전에 끝난 라운드를 그대로 되살리고 끊긴 라운드부터 돈다(_resume_in_place). 재개 자료를 못 쓰면(남 · 일지 없음 · 꼴 다름 · 권한
+    줄어듦 · 상한 넘김 · 바꾼 값) 아래 요약 길이고, 그 까닭을 응답 note 와 resumed.why 에 싣는다. 남의 이어하기는 일지를 읽지도 않는다."""
     pid = prev["id"]
     if prev.get("resumed_by"):
         raise ValueError(f"{pid} 는 이미 이어 돌렸다 → {prev['resumed_by']} — 그 잡을 deliberate_status 로 본다")
@@ -613,6 +619,20 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     done = int(info.get("rounds_done") or 0)
     user, groups = _caller(ctx)
     foreign = delib_jobs._foreign(prev, user)
+    # 제자리 이어하기를 못 하는 까닭 — 일지를 읽지 않고 가를 수 있는 것부터(남에게는 일지를 읽지 않는다 — HA-06)
+    changed = [k for k, v in (("human_note", bool(human_note and human_note.strip())), ("rounds", bool(rounds)),
+                              ("non_negotiables", bool(non_negotiables)), ("evidence", bool(evidence)),
+                              ("advanced", isinstance(advanced, dict) and any(x is not None for x in advanced.values()))) if v]
+    why = ("남의 심의다 — 재개 자료(그 사람이 본 근거 · 지식카드 · 발언)는 주인의 이어하기만 쓴다" if foreign else
+           f"이어 돌리며 바꾼 값이 있다({' · '.join(changed)}) — 끊긴 자리에서 그대로 잇는 길은 처음 인자 그대로만 돈다" if changed else
+           "결정문이 이미 나왔다 — 이어하기는 그 위의 새 회차다" if prev.get("decision") else "")
+    if not why:
+        res, why = delib_jobs.resume_load(prev, groups=groups)
+        if res is not None:
+            try:
+                return _resume_in_place(prev, res, user=user)
+            except OSError as exc:      # 일지를 고쳐 쓰지 못했다 — 잡은 그대로다(_reopen 이 바꾸기 전에 쓴다). 요약으로 잇는다
+                why = f"진행 일지를 고쳐 쓰지 못했다({type(exc).__name__})"
     args = None if foreign else delib_jobs._read_args(pid)
     prev_opts = prev.get("opts") or {}
     if args is not None:
@@ -682,18 +702,52 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         delib_jobs._drop_args(pid)
     out = delib_jobs.summary(rec)
     out["continued_from"] = pid
-    out["resumed"] = {"rounds_done": done, "rounds": o.get("rounds"), "args": args is not None,
+    out["resumed"] = {"mode": "summary", "rounds_done": done, "rounds": o.get("rounds"), "args": args is not None,
                       "rounds_start_at": (int(o.get("rounds_so_far") or 0) + 1) if done else None, "foreign": foreign,
-                      "checkpoint": ck}
+                      "checkpoint": ck, "why": why}
     _ck_say = {"sim-1": "끝난 1단(메커니즘)은 건너뛰고 그 결정문을 이어받아 2단부터 돈다.",
                "sim-2": "끝난 1 · 2단은 건너뛰고 2단 결정문을 이어받아 3단(구축 계획)부터 돈다."}
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + (
         [f"끊긴 심의를 이어 돈다 — 끝난 {done}라운드 뒤부터 {o.get('rounds')}라운드." if done else
          _ck_say.get(ck) or "끊긴 심의에 끝난 라운드가 없어 같은 인자로 처음부터 돈다."]) + (
+        [f"같은 잡에서 끊긴 자리부터 잇지 못하고 새 잡에서 잇는다 — {why}."] if why else []) + (
         ["남의 심의를 이어 돈다 — 원 주인의 시작 인자(근거 본문 · 지정 좌석 역할 전문 · 사람 의견)는 싣지 않고 남은 손잡이와 좌석만 넘겼다. "
          "원 주인의 이어하기는 그대로 남는다 — 다시 봐야 할 근거는 evidence 로 싣는다."] if foreign else
         [] if args is not None else ["시작 인자 파일이 없는 잡이라(이 판 이전) 처음 근거 본문 · 지정 좌석 역할 전문은 잇지 못했다 — "
                                      "다시 봐야 하면 evidence 로 싣는다."])
+    out["note"] = " ".join(notes)
+    return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
+
+
+def _resume_in_place(prev: dict, res, *, user: str) -> dict:
+    """제자리 이어하기(HA-09 S1 A5.4) — 끊긴 그 잡을 같은 job_id 로 다시 줄에 세운다. 인자는 시작 인자 파일 그대로(처음 그룹 · 신원 · 손잡이 —
+    이을 때 지금 그룹이 그것을 다 가졌는지 봤다), 재개 상태는 delib_jobs.start 의 키워드로만 넘긴다. 같은 잡을 두 번 잇지 못한다(start 가 같은
+    동기 구간에서 상태를 보고 바꾼다). 응답은 같은 job_id 와 resumed{mode: in_place, sk, round, spoken, todo, rounds_done, attempt}."""
+    pid = prev["id"]
+    args = delib_jobs._read_args(pid) or {}
+    res.by = user or ""
+    rec = delib_jobs.start(_need_app(), prev.get("job") or "default", prev["question"], groups=list(args.get("groups") or []),
+                           delib_opts=dict(args.get("opts") or {}), user_email=str(args.get("user_email") or ""),
+                           owner=str(args.get("owner") or ""), owner_aff=str(args.get("owner_aff") or ""), resume=res)
+    info = res.info
+    k, n = int(info.get("restored") or 0), int(info.get("total") or 0)
+    ro = int((rec.get("opts") or {}).get("rounds_so_far") or 0)
+    out = delib_jobs.summary(rec)
+    out["continued_from"] = pid
+    out["resumed"] = {"mode": "in_place", "sk": info.get("sk"), "round": info.get("round"), "spoken": list(info.get("spoken") or []),
+                      "todo": list(info.get("todo") or []), "rounds_done": k, "attempt": len(rec.get("attempts") or []),
+                      "foreign": False, "args": True, "why": ""}
+    spoken = list(info.get("spoken") or [])
+    notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + [
+        "끊긴 심의를 같은 잡(같은 job_id)에서 잇는다 — "
+        + (f"끝난 {k}라운드는 좌석 · 근거 · 지식카드 · 발언을 다시 부르지 않고 되살리고 " if k else
+           "끊기기 전의 좌석 · 근거 · 지식카드를 되살리고 ")
+        + (f"{k + 1 + ro}라운드부터 돈다" if k < n else "의장 결정문부터 이어 간다")
+        + (f"(끊긴 라운드는 처음부터 다시 돈다 — 그 라운드에서 이미 말한 {len(spoken)}석도 다시 부른다)" if spoken else "")
+        + ". 진행은 같은 job_id 의 deliberate_status 로 본다(시도 기록은 attempts)."]
+    if str(prev.get("stage") or "") == "report":
+        notes.append("보고서 단계에서 끊긴 잡이다 — 끊기기 전에 Report Archive 보고서가 이미 저장됐을 수 있다(같은 제목을 확인하라). "
+                     "결정문 뒤 단계의 멱등은 아직이다.")
     out["note"] = " ".join(notes)
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
@@ -717,7 +771,10 @@ _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 adva
 @mcp.tool(
     title="심의 이어하기",
     description=("끝난 HWAX 심의에 사람 의견을 넣어 이어서 돌린다. **재기동으로 끊긴(interrupted) 심의**는 사람 의견 없이 "
-                 "이 도구 한 번으로 끝난 라운드 뒤부터 남은 라운드만 이어 돈다 — 끝난 라운드의 좌석별 마지막 입장을 요약으로 싣고 "
+                 "이 도구 한 번으로 잇는다 — 시작한 사람이 바꾼 값 없이 이으면 **같은 job_id** 가 끊긴 라운드부터 다시 돈다(끝난 "
+                 "라운드 · 좌석 · 근거 · 지식카드를 다시 부르지 않고 되살린다 — 응답 resumed.mode=in_place, 어디서부터인지는 진행 조회의 "
+                 "resume.seat_resume). 그 밖(남 · 재개 자료 없음 · 권한 줄어듦 · 바꾼 값)은 새 잡에서 끝난 라운드 뒤부터 남은 라운드만 "
+                 "돈다 — 끝난 라운드의 좌석별 마지막 입장을 요약으로 싣는다(resumed.mode=summary · why). 어느 쪽이든 "
                  "처음 인자(근거 본문 · 지정 좌석 · 사람 의견 · 손잡이)를 그대로 쓴다(그 잡에는 화두 · 종류를 바꿀 수 없다). "
                  "이전 좌석과 양보 불가 조항을 "
                  "승계하므로 처음부터 다시 돌리는 것보다 싸고 결론이 되돌아가지 않는다. 동시 실행 상한이 "
@@ -776,6 +833,10 @@ async def deliberate_continue(
         raise ValueError(f"그런 심의 잡이 없다: {previous_job_id} — deliberate_list 로 확인하라")
     # 이어하기는 이전 결정문을 내 잡으로 옮긴다 — 볼 수 없는 심의를 이어 가면 그것이 읽기 우회로가 된다(결정 6 조사).
     _need_read(prev, ctx)
+    if prev.get("attempts") and prev.get("status") in ("queued", "running"):
+        # 제자리 이어하기로 이미 다시 도는 잡(HA-09 S1) — 같은 잡을 두 번 잇지 않는다(그 잡이 끝난 뒤의 이어하기는 아래 보통 길이다)
+        raise ValueError(f"{previous_job_id} 는 이미 같은 잡에서 이어 돌고 있다(시도 {len(prev['attempts'])}번째 · {prev['status']}) — "
+                         "다시 잇지 않는다. 진행은 deliberate_status 로 본다")
     if prev.get("status") == "interrupted":
         return _resume(prev, human_note=human_note, question=question, job=job, rounds=rounds,
                        non_negotiables=non_negotiables, advanced=advanced, evidence=evidence, ctx=ctx)
