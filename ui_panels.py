@@ -12,7 +12,7 @@
     `_meta` 를 문맥 변수 그릇에 적고 결과는 손대지 않고 넘긴다 — 모델에 가는 결과는 지금과 같다(B-6 (가) — `_meta` 는 패널에만).
   · 사건 — 턴 그릇(Turn)에 쌓고 챗 스트림이 그 도구의 on_tool_end 에서 SSE ui_resource 로 낸다. 사용자 사건(adispatch_custom_event)은
     LangGraph 의 Send 노드 실행으로 매겨져 상태줄의 call(도구 실행 id)과 이어지지 않았다(10-31 실측) — 그래서 끝 사건에서 짝짓는다. 끝 사건이
-    없는 길(재시도의 ainvoke)은 턴 끝에서 call 없이 낸다.
+    없는 길(ainvoke — 정상 길의 강제 재시도 · 구제, 예외 길의 자동 재시도)은 그 길의 결과 · 오류 · 끝 앞에서 call 없이 낸다.
   · 상한 — 사건 한 건의 JSON 이 UI_RESOURCE_MAX_BYTES(기본 256 KiB)를 넘으면 result 를 빼고 cut(원래 바이트)을 싣는다(패널이 도구를 다시
     불러 받는다). 그래도 넘으면 input 도 뺀다.
 

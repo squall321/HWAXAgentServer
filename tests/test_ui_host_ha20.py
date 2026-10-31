@@ -4,7 +4,7 @@
   · 표지(ui_host="mcp-apps/1")가 있는 턴만 패널 도구가 묶이고, 부르면 ui_resource 사건이 정확히 하나(주소 · 입력 · structuredContent · 결과 _meta).
   · 표지가 없거나 손잡이 CHAT_UI_HOST=0 이면 HA-20 전 그대로다(HA-05) — 이름 집합만 빼고, 집합 밖의 resourceUri 도구는 종전처럼 묶이고
     invoke_tool 로도 간다(반대 검토 10-31 — 넓힌 규칙이 손잡이로 되돌릴 수 없는 길을 닫았다). 심의 · 루틴 · 카탈로그도 같다.
-  · invoke_tool 경유는 표지 턴에서만 배운 패널 이름까지 막는다(직접 부르라고 한다).
+  · invoke_tool 경유는 표지 턴에서만 배운 패널 이름까지 막는다(직접 부르라고 한다). 자동 재시도(ainvoke) 안에서 부른 패널 도구의 사건도 결과 앞에 낸다.
   · 사건이 상한을 넘으면 result 를 빼고 cut. 자기검증을 켜도 사건은 턴 도중에 나간다. 모델에 가는 결과는 그대로다(결과 _meta 는 모델 ·
     자기검증 · 다음 턴에 가지 않는다).
 
@@ -90,6 +90,12 @@ def panel_gw():
         """일반 조회."""
         calls.append(("plain_lookup", q))
         return f"조회 결과 {q}"
+
+    @mcp.tool()
+    async def run_job(project_id: str = "") -> str:
+        """잡 넣기 — 확인 관문 바닥 목록(_CONFIRM_JOB_TOOLS)의 이름이다(재시도 안에서 막히는 갈래를 본다)."""
+        calls.append(("run_job", project_id))
+        return f"job J-1 for {project_id}"
 
     @mcp.tool()
     async def invoke_tool(name: str, arguments: dict | None = None) -> str:
@@ -361,6 +367,75 @@ def test_P1_자기검증을_켜도_사건은_턴_도중에_나가고_검토자�
     assert rv.calls and SECRET not in json.dumps([[getattr(m, "content", m) for m in c] for c in rv.calls], ensure_ascii=False, default=str)
     meta = [dd for ev, dd in evs if ev == "meta"][-1]
     assert meta["self_check"]["status"] in ("ok", "skipped"), meta
+
+
+class _FailFirstStream(_Script):
+    """스트리밍(astream_events)의 첫 모델 호출이 글 한 자 없이 상류 오류로 터진다 — 자동 재시도(ainvoke)는 대본대로 간다. fail_last 면 재시도의
+    마지막 모델 호출(도구 결과를 받은 뒤)도 터진다."""
+
+    failed: int = 0
+    fail_last: bool = False
+
+    def _stream(self, messages, stop=None, run_manager=None, **kw):
+        if self.failed == 0:
+            self.failed += 1
+            raise RuntimeError("upstream 502 Bad Gateway — 일시 장애")
+        yield from super()._stream(messages, stop, run_manager, **kw)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        if self.fail_last and len(self.seen) >= 1:
+            self.seen.append(list(messages))
+            raise RuntimeError("upstream 502 Bad Gateway — 재시도도 끝에서 끊겼다")
+        return super()._generate(messages, stop, run_manager, **kw)
+
+
+@pytest.mark.parametrize("self_check", [False, True])
+def test_P1_자동_재시도_안에서_부른_패널_도구의_사건도_결과_앞에_나간다(panel_gw, monkeypatch, self_check):
+    """첫 스트리밍 호출이 글 없이 터지면 자동 재시도(agent.ainvoke)가 그래프를 다시 돈다 — 끝 사건(on_tool_end)이 없는 길이라 사건은 턴 그릇에
+    남는다. 도구는 실행됐으니 사건이 결과 · 끝 앞에 하나 나가야 한다(반대 검토 10-31 — 예외 갈래가 그릇을 비우지 않고 끝나 패널이 조용히 사라졌다)."""
+    conns, calls = panel_gw
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+    monkeypatch.setenv("CHAT_SELF_CHECK", "1" if self_check else "0")
+    monkeypatch.setattr(a.app.state, "chat_llm", _Reviewer(), raising=False)
+    before = len(calls)
+    llm = _FailFirstStream(steps=[[("open_fake_panel", {"case": "R"})], "패널을 열었습니다."])
+    _wire(monkeypatch, llm, conns)
+    evs = _turn(_req(ui_host="mcp-apps/1"))
+    names = [ev for ev, _ in evs]
+    ui_evs = [dd for ev, dd in evs if ev == "ui_resource"]
+    assert calls[before:].count(("open_fake_panel", "R")) == 1 and len(ui_evs) == 1, names
+    assert ui_evs[0]["call"] == "" and ui_evs[0]["result"]["structuredContent"]["case"] == "R" and ui_evs[0]["uri"] == URI
+    assert names.index("ui_resource") < names.index("result") < names.index("done") and "error" not in names, names
+    assert not any(SECRET in json.dumps(dd, ensure_ascii=False) for ev, dd in evs if ev != "ui_resource"), "_meta 는 패널 사건에만"
+
+
+def test_P1_자동_재시도_안에서_확인_관문이_막아도_패널_사건은_카드_결과_앞에_나간다(panel_gw, monkeypatch):
+    """재시도 안에서 확인 관문(HA-29)이 잡을 막으면 그 턴은 카드로 끝난다 — 같은 걸음에서 부른 패널 도구의 사건도 카드 · 결과 앞에 나간다."""
+    conns, calls = panel_gw
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+    monkeypatch.setattr(a, "CHAT_CONFIRM_GATE", True)
+    monkeypatch.setattr(a, "_CONFIRM_STAT", a.Counter())
+    before = len(calls)
+    llm = _FailFirstStream(steps=[[("open_fake_panel", {"case": "G"}), ("run_job", {"project_id": "P1"})], "패널을 열고 잡을 걸었습니다."])
+    _wire(monkeypatch, llm, conns)
+    evs = _turn(_req(ui_host="mcp-apps/1", user_email="u@x.com", conversation_id="c-ha20"))
+    names = [ev for ev, _ in evs]
+    assert ("open_fake_panel", "G") in calls[before:] and ("run_job", "P1") not in calls[before:], calls[before:]
+    assert names.count("confirm") == 1 and names.count("ui_resource") == 1, names
+    assert names.index("ui_resource") < names.index("result") < names.index("done"), names
+
+
+def test_P1_자동_재시도가_도구를_부른_뒤_끝내_실패해도_패널_사건은_오류_앞에_나간다(panel_gw, monkeypatch):
+    """재시도가 패널 도구를 실행한 뒤 마지막 모델 호출에서 터지면 턴은 오류로 끝난다 — 도구는 실행됐으니 사건을 버리지 않는다(오류 · 끝 앞)."""
+    conns, calls = panel_gw
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "1")
+    before = len(calls)
+    llm = _FailFirstStream(steps=[[("open_fake_panel", {"case": "E"})], "닿지 않는 답"], fail_last=True)
+    _wire(monkeypatch, llm, conns)
+    evs = _turn(_req(ui_host="mcp-apps/1"))
+    names = [ev for ev, _ in evs]
+    assert ("open_fake_panel", "E") in calls[before:] and "result" not in names, names
+    assert names.count("ui_resource") == 1 and names.index("ui_resource") < names.index("error") < names.index("done"), names
 
 
 # ── 단위 — 그릇 · 꼴 ───────────────────────────────────────────────────────────────────────────────────────────

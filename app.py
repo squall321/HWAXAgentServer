@@ -7110,6 +7110,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 except Exception as exc2:  # noqa: BLE001
                     print(f"[agent] auto-retry {_attempt}/{_tries} failed: {exc2!r}")
                     exc = exc2          # 마지막 실패 원인으로 메시지를 만든다
+            # 패널(HA-20) — 재시도(ainvoke) 안에서 부른 패널 도구는 끝 사건이 없어 사건이 그릇에 남는다. 도구는 실행됐으니 어느 갈래(카드 · 건진 답 ·
+            # 오류)로 끝나든 그 앞에 낸다 — 종전엔 그릇을 비우지 않고 끝나 패널이 조용히 사라졌다(반대 검토 10-31).
+            for _uev in (_ui_turn.rest() if _ui_turn is not None else ()):
+                yield _sse(_ui.EVENT, _uev)
             if _cctx.pending:
                 # 재시도(agent.ainvoke) 안에서 확인 관문(HA-29)이 막았다 — 건진 글(있으면)과 카드로 끝낸다. 종전엔 재시도가 건진 글을 그대로 내고
                 # 끝나 카드 사건 · 본문 카드 글 · 저장분이 모두 없었다(모델은 '확인 카드를 띄웠다' 고 답하는데 승인할 길이 없었다 — 반대 검토 2차).
