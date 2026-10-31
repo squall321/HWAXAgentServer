@@ -1235,26 +1235,43 @@ def _as_of_refusal(req_opts) -> dict | None:
                        "아니거나 달력에 없는 날이다. 이 심의는 시작하지 않았다(기준일을 못 읽은 채 거르지 않고 돌지 않는다)."}
 
 
-def _as_of_guard(tool, as_of: str):
-    """agent_search 도구에 기준일을 박는다 — _tools_by_name 이 결과 상한(_prep_tool) **앞에서** 감싼다. 상한을 지난 글은 끝의
-    applied_config 가 잘려 메아리를 볼 수 없다. as_of 가 비었거나 agent_search 가 아니면 그대로 돌려준다.
+# 엔진이 정하는 agent_search 의 두 칸 — 심의의 좌석 · 계획자는 고르지 않는다(_as_of_guard).
+_AS_OF_ARGS = ("as_of", "as_of_undated")
 
-    부를 때마다 as_of · as_of_undated='keep' 을 덮어 싣는다 — 모델이 빼도, 다른 날이나 'exclude' 를 넣어도 이 심의의 값으로 간다.
-    응답은 _as_of_check 가 메아리로 확인한다."""
+
+def _as_of_guard(tool, as_of: str | None):
+    """agent_search 도구의 기준일 두 칸을 엔진이 정한다 — _tools_by_name 이 결과 상한(_prep_tool) **앞에서** 감싼다. 상한을 지난 글은 끝의
+    applied_config 가 잘려 메아리를 볼 수 없다. as_of 가 None(심의 밖의 로드 — 챗 · 띵킹 · 카드 대조 따위)이거나 agent_search 가 아니면
+    그대로 돌려준다.
+
+    심의의 로드(엔진의 사전 검색 · 지정 도구 · 좌석 자유 조회)는 늘 감싼다. 기준일이 있으면 부를 때마다 as_of · as_of_undated='keep' 을 덮어
+    싣고(모델이 빼도, 다른 날이나 'exclude' 를 넣어도 이 심의의 값으로 간다) 응답은 _as_of_check 가 메아리로 확인한다. 기준일이 없으면(as_of
+    '') 모델이 넣은 두 칸을 걷어 보낸다 — A-keep 은 심의가 날을 댈 때만 거른다. 종전엔 그냥 두어, 좌석이 화두의 날짜를 보고 스스로 as_of ·
+    'exclude' 를 넣으면 허브가 날짜 없는 카드까지 빼고 걸렀는데 엔진은 아무것도 세지 않아 결정문에 흔적이 없었다(반대 검토 10-31). 좌석 ·
+    계획자에게 묶는 스키마에서도 두 칸을 지운다 — 엔진이 정하는 값이라 고를 칸이 아니다."""
     orig = getattr(tool, "coroutine", None)
-    if not as_of or orig is None or getattr(tool, "name", "") != "agent_search":
+    if as_of is None or orig is None or getattr(tool, "name", "") != "agent_search":
         return tool
-    pin = {"as_of": as_of, "as_of_undated": "keep"}
+    sc = getattr(tool, "args_schema", None)
+    if isinstance(sc, dict) and isinstance(sc.get("properties"), dict):
+        tool.args_schema = {**sc, "properties": {k: v for k, v in sc["properties"].items() if k not in _AS_OF_ARGS},
+                            **({"required": [r for r in sc["required"] if r not in _AS_OF_ARGS]}
+                               if isinstance(sc.get("required"), list) else {})}
+    pin = {"as_of": as_of, "as_of_undated": "keep"} if as_of else {}
 
     async def dated(*a, **kw):
-        # 어댑터에 따라 인자가 kw 로도, a 의 사전 하나로도 온다(app._cap_tool 과 같은 가정) — 온 자리에 덮는다.
-        if a and isinstance(a[0], dict):
-            asked = a[0].get("as_of")
-            a = ({**a[0], **pin}, *a[1:])
+        # 어댑터에 따라 인자가 kw 로도, a 의 사전 하나로도 온다(app._cap_tool 과 같은 가정) — 온 자리에서 걷고 덮는다.
+        src = a[0] if a and isinstance(a[0], dict) else kw
+        asked = {k: src[k] for k in _AS_OF_ARGS if src.get(k) not in (None, "")}
+        put = {**{k: v for k, v in src.items() if k not in _AS_OF_ARGS}, **pin}
+        if src is kw:
+            kw = put
         else:
-            asked = kw.get("as_of")
-            kw = {**kw, **pin}
-        return _as_of_check(await orig(*a, **kw), as_of, asked)
+            a = (put, *a[1:])
+        out = await orig(*a, **kw)
+        if as_of:
+            return _as_of_check(out, as_of, asked.get("as_of"))
+        return _as_of_unasked(out, asked) if asked else out
 
     tool.coroutine = dated
     return tool
@@ -1298,6 +1315,23 @@ def _as_of_check(out, as_of: str, asked=None):
     ignored = f" — 좌석이 넣은 as_of({_delib_preview(asked, 30)})는 쓰지 않았다" if asked not in (None, "", as_of) else ""
     note = (f"기준일 {as_of} 까지의 카드만 찾았다(이 심의의 기준일을 엔진이 박았다{ignored}). 날짜 없는 카드 {undated}장은 남기고 "
             f"date_note '{_AS_OF_UNDATED}' 을 달았다 — 그 날 뒤에 쓰였을 수 있다.")
+    body = json.dumps({"as_of_note": note, **d}, ensure_ascii=False)
+    return (body, out[1]) if pair else body
+
+
+def _as_of_unasked(out, asked: dict):
+    """기준일 없는 심의에서 좌석이 넣은 기준일 칸을 걷고 보낸 답 — 맨 앞에 그렇다는 안내를 단다(좌석이 '그 날까지의 카드' 로 읽지 않게).
+    JSON 사전이 아닌 답은 그대로다. 꼴은 받은 그대로다((content, artifact) 면 그 꼴로)."""
+    pair = isinstance(out, tuple) and len(out) == 2
+    try:
+        d = json.loads(_as_text(out[0] if pair else out))
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(d, dict):
+        return out
+    put = " · ".join(f"{k}({_delib_preview(v, 30)})" for k, v in asked.items())
+    note = (f"이 심의에는 기준일이 없다 — 좌석이 넣은 {put}는 보내지 않았다(기준일은 심의를 열 때 정한다). 날짜로 거르지 않은 지금의 "
+            "카드다.")
     body = json.dumps({"as_of_note": note, **d}, ensure_ascii=False)
     return (body, out[1]) if pair else body
 
@@ -1969,13 +2003,14 @@ async def _load_tools(scoped: dict) -> list:
 
 
 async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user: str = "",
-                         user_pat: str = "", svc_fallback: bool = True, as_of: str = "") -> dict:
+                         user_pat: str = "", svc_fallback: bool = True, as_of: str | None = None) -> dict:
     """result_max: 도구 결과 절단 한도. None 이면 LLM 프롬프트 보호용 기본(TOOL_RESULT_MAX).
     결과를 코드가 JSON 으로 파싱하는 결정적 경로는 CATALOG_RESULT_MAX 를 넘겨 절단을 사실상 끈다.
     svc_fallback=False 면 사용자 토큰이 거절돼도(로드 때·호출 때 모두) 서비스 계정으로 넘어가지 않는다 — 로드 때는 예외를
     그대로 올리고, 호출 때는 자격 거절 문구(_AUTH_REJECT_MARK)를 그대로 돌려준다. 자격이 만료되면 멈추고 알려야 하는 길
     (카드 대조의 팩 조회 — 리스크 재설계 D-26)이 쓴다. 기본값(True)은 종전 동작이다.
-    as_of 를 주면(기준일 심의) agent_search 를 결과 상한 **앞에서** _as_of_guard 로 감싼다 — 서비스 계정 폴백 도구도 같다. 비면 종전 그대로다."""
+    as_of 는 심의의 로드만 준다(기준일 'YYYY-MM-DD' · 없으면 '') — agent_search 를 결과 상한 **앞에서** _as_of_guard 로 감싸 기준일 두 칸을 엔진이
+    정한다(있으면 박고, 없으면 모델이 넣은 것을 걷는다). 서비스 계정 폴백 도구도 같다. 안 주면(None — 심의 밖의 로드) 종전 그대로다."""
     conns = app.state.connections
     if not conns:
         return {}

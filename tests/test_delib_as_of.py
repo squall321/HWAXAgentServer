@@ -595,3 +595,42 @@ def test_지정_도구로_실은_긴_카드도_제목_앞에_표지가_있다(mo
     ok, bad = _unmarked(blk)
     assert (ok or bad) and not bad, (ok, bad)
 
+
+# ── 반대 검토 10-31 — 기준일 없는 심의의 좌석은 날로 거르지 못한다(A-keep — 심의가 날을 댈 때만 거른다) ──────────────────────────────
+def test_기준일_없는_심의에서는_좌석이_넣은_as_of_가_허브에_닿지_않는다(monkeypatch, long_hub):
+    """A-keep — 심의가 날을 댈 때만 거른다. 좌석이 화두의 날짜를 보고 스스로 as_of · 'exclude' 를 넣으면 허브가 그대로 걸렀고(날짜 없는 카드까지
+    뺀다) 엔진은 아무것도 세지 않아 결정문에 흔적이 없었다."""
+    SEEN["long"].clear()
+    events, _p = _seat_run(monkeypatch, long_hub, {}, [("qa", {"as_of": "2024-01-01", "as_of_undated": "exclude"})])
+    seat_calls = [s for s in SEEN["long"] if s["q"] == "qa"]
+    assert seat_calls and all((s["as_of"], s["as_of_undated"]) == ("", "keep") for s in seat_calls), seat_calls
+    cards = [c for c in _cards(events, included=True) if c.get("tool") == "agent_search"]
+    assert cards and all("좌석이 넣은 as_of(2024-01-01)" in c["text"] and "보내지 않았다" in c["text"] for c in cards), \
+        [c["text"][:200] for c in cards]
+    assert not _decision(events).startswith("■ 기준일"), "기준일을 주지 않은 심의에 기준일 줄을 찍었다"
+
+
+def test_심의의_로드는_좌석에_기준일_칸을_보이지_않고_넣어도_걷는다(hubs):
+    """도구 하나로 본다 — 심의의 로드(as_of 를 '' 로 준다)는 스키마에서 두 칸을 지우고 넣은 값을 걷는다. 심의 밖의 로드(as_of 를 안 준다 — 챗 ·
+    띵킹 · 카드 대조)는 종전 그대로다."""
+    stub = SimpleNamespace(state=SimpleNamespace(connections=hubs["new"]))
+
+    async def go(**kw):
+        tools = await d._tools_by_name(stub, ["g"], 2_000, **kw)
+        t = tools["agent_search"]
+        props = sorted((t.args_schema or {}).get("properties", {}))
+        out = await d._call(tools, "agent_search", {"agent_type": "mech-a", "q": "힌지", "as_of": "2024-01-01",
+                                                     "as_of_undated": "exclude"})
+        return props, out
+    props, out = asyncio.run(go(as_of=""))
+    assert "as_of" not in props and "as_of_undated" not in props and {"agent_type", "q"} <= set(props), props
+    assert SEEN["new"][-1]["as_of"] == "" and SEEN["new"][-1]["as_of_undated"] == "keep", SEEN["new"]
+    got = json.loads(out)
+    assert next(iter(got)) == "as_of_note" and "as_of" not in got["applied_config"], got
+    props, _out = asyncio.run(go(as_of=AS_OF))
+    assert "as_of" not in props and "as_of_undated" not in props, "기준일 심의도 엔진이 박는 칸이다 — 좌석이 고를 칸이 아니다"
+    assert (SEEN["new"][-1]["as_of"], SEEN["new"][-1]["as_of_undated"]) == (AS_OF, "keep")
+    props, _out = asyncio.run(go())
+    assert {"as_of", "as_of_undated"} <= set(props), "심의 밖의 로드 스키마가 바뀌었다"
+    assert (SEEN["new"][-1]["as_of"], SEEN["new"][-1]["as_of_undated"]) == ("2024-01-01", "exclude"), "심의 밖의 로드가 바뀌었다"
+
