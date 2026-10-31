@@ -6820,6 +6820,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"⚠ 의장 결정문 합성 실패 — 다시 부른다({_ctry + 1}/"
                                               f"{_CHAIR_RETRIES}): {_chair_failed}", "tool": None,
                                       **({"knob": _chair_knob} if _chair_knob else {})})
+    # 마무리 표지 — 이 단의 결정문(의장이 끝내 못 냈으면 아래의 좌석별 마지막 입장)이 여기서 생겼다. 웹 심의 멈춤 창구(app._web_cancel)는 이
+    # 표지부터 이 단의 결정문 사건까지 접지 않는다 — 요약 · 쉬운 설명 · 대조 · Report Archive 저장을 접으면 다 만든 결정문이 버려지고 RA 에 들어간
+    # 초안은 번호가 대화에 닿지 않는다(HWAXPortal docs/leftovers-1017 triage A24 검토). 의장 호출이 돌아온 바로 뒤에 기다림 없이 낸다 — 그 사이에
+    # 취소가 끼어들 자리가 없다. 화면은 이 표지를 받으면 '멈춤' 을 거둔다.
+    yield _delib("finishing")
     if _chair_failed:
         decision = _chair_fail_text(_chair_failed, 1 + _CHAIR_RETRIES, seat_note,
                                     [(o["persona"], _ser_kind(o, _kind(N))) for o in last_list],

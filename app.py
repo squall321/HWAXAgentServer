@@ -1145,7 +1145,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 class ChatRequest(BaseModel):
     message: str
-    # 서버 대화 id(포털이 싣는다 — 없으면 빈 값). 챗 LLM 호출의 대화 머리(W-1)에만 쓴다.
+    # 서버 대화 id(포털이 싣는다 — 없으면 빈 값). 챗 LLM 호출의 대화 머리(W-1)와 웹 심의 멈춤의 열쇠(_WEB_RUNS — POST /deliberate/cancel)다.
     conversation_id: str = ""
     system_id: str | None = None  # sub-page context → tool scope (portal Phase 2; accepted, not yet used)
     groups: list[str] = []
@@ -1286,25 +1286,132 @@ _DETACHED_BY: dict = {}
 # 2×DELIB_TIMEOUT_S)가 아니라 그것의 (1 + 파싱 재시도)배다(기본 3×3,608초. 기동 경고가 그 박스의 수를 적는다).
 DELIB_HEARTBEAT_S = _env_float("DELIB_HEARTBEAT_S", 15.0)
 
+# ── 웹 심의 멈춤(HWAXPortal docs/leftovers-1017 triage A24 (나) — 사용자 결정 10-31) ───────────────────────────
+# 웹 심의(포털 화면 · 리스크 패널의 /심의 · /시뮬심의 · /시험계획)는 잡 원장에 없는 분리 태스크라, 구독이 끊긴 뒤 서버에서 도는 것을 멈출 길이
+# 없었다(HWAXPortal docs/change-request-8-10/server-setup §6). 포털이 싣는 서버 대화 id(ChatRequest.conversation_id)로 그 대화의 태스크를 적어
+# 두고 POST /deliberate/cancel 이 접는다. 접기는 MCP 잡의 deliberate_cancel 과 같은 태스크 취소다 — 엔진의 finally(남은 LLM 호출 접기)가 그대로
+# 돌고, 분리 스트림은 멈춤 사건(delib cancelled)과 done 을 내고 닫힌다(오류로 내지 않는다 — 실패가 아니다). 대화 id 가 없는 심의는 적지 않는다.
+# 기록은 이 프로세스의 메모리다 — 재기동은 분리 태스크를 함께 접으므로 넘길 것이 없다.
+#   · 실행 id — 심의마다 하나다. 스트림의 첫 심의 사건(delib)과 멈춤 사건에 run_id 로 싣는다. 사람(포털)의 멈춤은 이 id 로 그 심의 하나만 접는다 —
+#     대화 id 만으로 접으면 끊긴 채 남은 낡은 화면의 '멈춤' 이 같은 대화에서 다른 기기가 띄운 새 심의를 접었다(A24 검토). 대화 전체를 접는 것은
+#     신원 없이 부르는 운영의 루프백 호출만이다.
+#   · 마무리 — 엔진은 의장 호출이 돌아온 바로 뒤에 finishing 표지(delib kind=finishing)를 낸다. 그때부터 그 단의 결정문(delib kind=decision)까지는
+#     접지 않고 409 finishing 으로 답한다 — 요약 · 쉬운 설명 · 대조 · Report Archive 저장(실측 3시간 심의에 1시간 반)이 도는 자리라, 접으면 다 만든
+#     결정문이 버려지고 RA 에 들어간 초안은 번호가 대화에 닿지 않는다(A24 검토). 다단 심의(/시뮬심의)는 앞 단의 결정문에서 막음이 풀려 다음 단을
+#     다시 멈출 수 있다.
+_WEB_RUNS: dict[str, list[dict]] = {}     # 대화 id → 그 대화의 웹 심의 기록(시작 순) — 도는 것과 끝난 것('이미 끝났다' 를 말할 재료)
+_WEB_RUNS_KEEP = 512                      # 끝난 기록만 남은 대화 수의 상한 — 넘으면 가장 오래전에 끝난 대화부터 버린다
+_WEB_RUNS_PER_CONV = 8                    # 한 대화에 남기는 끝난 기록 수(이어하기가 같은 대화에 심의를 잇는다)
+# 멈춤 사건의 글 — 이 단의 결정문 · 보고서는 없다(마무리에는 멈추지 않는다). 다단 심의의 앞 단 · 이어하기의 앞 회차가 낸 결정문과 Report Archive
+# 초안은 그대로 있다 — '보고서는 만들지 않았다' 고 단정하지 않는다(A24 검토).
+_WEB_CANCEL_MSG = ("사람이 멈췄다 — 의장이 결정문을 내기 전에 멈춰 이 단의 결정문 · 보고서는 없다. 여기까지의 발언은 남고, 앞 단 · 앞 회차에서 "
+                   "이미 낸 결정문과 Report Archive 에 저장된 초안은 그대로 있다")
+_DELIB_HEAD = b"event: delib\ndata: "
+_DELIB_KIND = re.compile(rb'event: delib\ndata: \{"kind": "([a-z_]+)"')   # _delib(kind, …) 의 꼴 — kind 가 늘 첫 칸이다
 
-def _detach_stream(gen, label: str, started_by: str = "human"):
+
+def _web_run_open(conv: str, user: str, label: str) -> dict | None:
+    """분리 심의 하나를 대화 id 아래 적는다. 대화 id 가 없으면 None(멈출 열쇠가 없다 — 종전 그대로 돈다)."""
+    cid = str(conv or "").strip()
+    if not cid:
+        return None
+    run = {"id": secrets.token_hex(8), "task": None, "label": label, "user": str(user or "").strip().lower(),
+           "state": "running", "finishing": False, "started_at": time.time(), "finished_at": None, "by": "", "error": False}
+    _WEB_RUNS.setdefault(cid, []).append(run)
+    return run
+
+
+def _with_run_id(chunk: bytes, rid: str) -> bytes | None:
+    """심의 사건 한 프레임에 실행 id 를 싣는다. 한 프레임이 아니거나 풀리지 않으면 None(다음 심의 사건에 싣는다)."""
+    if not chunk.endswith(b"\n\n") or chunk.count(b"\n\n") != 1:
+        return None
+    try:
+        data = json.loads(chunk[len(_DELIB_HEAD):].decode("utf-8"))
+    except ValueError:
+        return None
+    return _sse("delib", {**data, "run_id": rid}) if isinstance(data, dict) else None
+
+
+def _web_run_close(run: dict, task) -> None:
+    """분리 태스크가 끝났다(태스크 끝 콜백) — 기록을 닫는다. 두 번 불려도 한 번만 일한다(멈춤 창구가 콜백보다 먼저 볼 수 있다)."""
+    if run["finished_at"] is not None:
+        return
+    run["finished_at"] = time.time()
+    if run["state"] == "cancelling":
+        run["state"] = "cancelled"
+    elif task.cancelled():
+        run["state"] = "interrupted"        # 서버가 내려가며 접혔다 — 사람이 멈춘 것이 아니다
+    else:
+        run["state"] = "error" if run["error"] else "done"
+    run["task"] = None
+    _web_runs_prune()
+
+
+def _web_runs_prune() -> None:
+    """끝난 기록을 대화마다 _WEB_RUNS_PER_CONV 건, 끝난 기록만 남은 대화를 _WEB_RUNS_KEEP 개까지 둔다. 도는 기록은 버리지 않는다."""
+    for cid, runs in list(_WEB_RUNS.items()):
+        ended = [r for r in runs if r["finished_at"] is not None]
+        if len(ended) > _WEB_RUNS_PER_CONV:
+            drop = {id(r) for r in ended[:len(ended) - _WEB_RUNS_PER_CONV]}
+            _WEB_RUNS[cid] = [r for r in runs if id(r) not in drop]
+    idle = sorted((max(r["finished_at"] for r in runs), cid) for cid, runs in _WEB_RUNS.items()
+                  if all(r["finished_at"] is not None for r in runs))
+    for _at, cid in idle[:max(0, len(idle) - _WEB_RUNS_KEEP)]:
+        del _WEB_RUNS[cid]
+
+
+def _detach_stream(gen, label: str, started_by: str = "human", conv: str = "", user: str = ""):
     q: asyncio.Queue = asyncio.Queue()   # 무제한 — 소비자가 없어도 생산이 막히지 않는다
+    # 대화 id 가 있으면 멈춤 창구(POST /deliberate/cancel)가 찾게 적는다. user 는 띄운 사람(포털이 채운 이메일)이다.
+    run = _web_run_open(conv, user, label)
 
     async def _drive():
+        tagged = run is None             # 실행 id 를 실은 첫 심의 사건을 냈나(멈출 열쇠가 없는 심의는 싣지 않는다)
         try:
             async for chunk in gen:
+                if run is not None and isinstance(chunk, bytes):
+                    if chunk.startswith(b"event: error"):
+                        run["error"] = True
+                    elif chunk.startswith(_DELIB_HEAD):
+                        m = _DELIB_KIND.match(chunk)
+                        kind = m.group(1) if m else b""
+                        # 마무리(위 머리글) — 표지부터 그 단의 결정문까지. 둘 다 이 걸음 안에서 바뀐다(엔진은 의장 호출이 돌아온 바로 뒤
+                        # 기다림 없이 표지를 내고, 결정문 뒤 끝까지도 기다림이 없다) — 그 사이에 멈춤 창구가 끼어들지 못한다.
+                        if kind == b"finishing":
+                            run["finishing"] = True
+                        elif kind == b"decision":
+                            run["finishing"] = False
+                        if not tagged:
+                            got = _with_run_id(chunk, run["id"])
+                            if got is not None:
+                                chunk, tagged = got, True
                 q.put_nowait(chunk)
         except Exception as exc:  # noqa: BLE001 — 태스크 안 예외는 아무도 await 안 하면 무음이다
+            if run is not None:
+                run["error"] = True
             logging.getLogger("agent").exception("[detach:%s] 심의 태스크 오류", label)
             q.put_nowait(_sse("error", {"message": f"심의 오류: {exc}"}))
-        finally:
-            q.put_nowait(None)
+
+    def _done(t) -> None:
+        # 끝 표지(None)는 태스크 끝 콜백이 낸다 — 첫 걸음 전에 취소가 닿은 태스크는 _drive 의 finally 조차 돌지 않아, 거기에 두면 구독자가
+        # 끝없이 기다린다. 사람이 멈췄으면(멈춤 창구) 멈춤 사건과 done 을 먼저 낸다 — 오류(error)로 내지 않는다. 엔진의 finally(남은 LLM 호출
+        # 접기)는 취소가 생성기를 닫으며 이미 돌았다. 서버가 내려가며 접힌 것은 종전처럼 끝 표지만 낸다.
+        if run is not None:
+            if run["state"] in ("cancelling", "cancelled"):
+                q.put_nowait(_sse("delib", {"kind": "cancelled", "by": run["by"], "message": _WEB_CANCEL_MSG,
+                                            "run_id": run["id"]}))
+                q.put_nowait(_sse("done", {}))
+            _web_run_close(run, t)
+        q.put_nowait(None)
 
     task = asyncio.create_task(_drive(), name=f"delib-{label}")
     _DETACHED_TASKS.add(task)
     _DETACHED_BY[task] = started_by
     task.add_done_callback(_DETACHED_TASKS.discard)
     task.add_done_callback(lambda t: _DETACHED_BY.pop(t, None))
+    if run is not None:
+        run["task"] = task
+    task.add_done_callback(_done)
 
     async def _subscribe():
         # ⚠ q.get() 을 wait_for 로 감싸지 않는다. wait_for 는 만료 때마다 안쪽 get 을 **취소**하고, 취소와
@@ -7659,19 +7766,21 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         _q = strip_sim_trigger(req.message)
         stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_sim_deliberation(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "sim", started_by)
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "sim", started_by,
+            conv=req.conversation_id, user=req.user_email)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
         _q = strip_test_plan_trigger(req.message)
         stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_test_plan(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "test-plan", started_by)
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "test-plan", started_by,
+            conv=req.conversation_id, user=req.user_email)
     elif is_deliberation(req.message):
         # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
         # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
         # (종전엔 빈 문자열로 그대로 심의가 돌았다 — 가드가 없었다).
         # 그때만 대화에서 뽑고, **무엇을 화두로 삼았는지 화면에 밝힌다.**
-        stream = _detach_stream(_delib_with_topic(req), "delib", started_by)
+        stream = _detach_stream(_delib_with_topic(req), "delib", started_by, conv=req.conversation_id, user=req.user_email)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
@@ -9238,6 +9347,84 @@ def _limits_health() -> dict:
         return delib_jobs.limits()
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+# ── 웹 심의 멈춤 창구(HWAXPortal docs/leftovers-1017 triage A24 (나)) ─────────────────────────────────────────
+# POST /deliberate/cancel {conversation_id, by, run_id?, user_email?} — 그 대화에서 도는 웹 심의(분리 태스크 — 위 _WEB_RUNS)를 접는다. 인증은
+# 없다 — /drain · /limits 와 같은 신뢰다(서버는 루프백에만 묶이고 /chat 도 같은 신뢰 수준이다). 포털은 대화 주인을 확인한 뒤 이 창구 하나만
+# 부른다(포털 POST /agent/deliberate/cancel). by 는 누가 멈추나(기록 · 로그 · 멈춤 사건), run_id 는 스트림의 첫 심의 사건이 실은 실행 id 다.
+#   · user_email 을 주면(사람 — 포털) run_id 가 있어야 하고 그 사람이 띄운 그 심의 하나만 접는다(없으면 422 run_id_required). 대화 id 만으로
+#     접으면 낡은 화면의 '멈춤' 이 같은 대화의 다른(새) 심의를 접는다(A24 검토). 남의 심의는 접지 못한다 — MCP deliberate_cancel 과 같은 규칙.
+#   · user_email 이 없으면(운영의 루프백 호출) run_id 를 주면 그 심의, 없으면 그 대화의 웹 심의 전부다.
+#   · 마무리(finishing 표지부터 그 단의 결정문까지 — 위 머리글)에 있는 심의는 접지 않는다.
+# 답 — 200 {status: cancelling, runs}(접기를 요청했다 — 스트림이 delib cancelled 와 done 으로 닫힌다) · 200 {status: cancelling|cancelled,
+# already}(이미 멈췄다 — 같은 요청을 거듭 보내도 같다) · 409 finishing(의장이 결정문을 이미 냈다 — 마무리 중이라 멈추지 않는다) · 409
+# already_finished(멈추기 전에 끝났다) · 404 delib_not_found(이 대화에 그 웹 심의가 없다 — 다시 떴거나 오래전에 끝났다) · 422(본문). 실행을
+# 짚은 답에는 run_id 를 싣는다. 모르는 칸은 422.
+_CANCEL_FIELDS = ("conversation_id", "by", "run_id", "user_email")
+_RUN_ID_MAX = 64
+
+
+@app.post("/deliberate/cancel")
+async def post_delib_cancel(request: Request):
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return JSONResponse({"code": "bad_request", "message": "본문이 JSON 이 아니다"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"code": "bad_request", "message": "본문은 JSON 객체여야 한다"}, status_code=422)
+    extra = sorted(set(body) - set(_CANCEL_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 "
+                             "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
+    cid, by, who, rid = body.get("conversation_id"), body.get("by"), body.get("user_email", ""), body.get("run_id", "")
+    if not isinstance(cid, str) or not cid.strip() or len(cid) > 128:
+        return JSONResponse({"code": "bad_request", "message": "conversation_id 는 1~128자 글이다"}, status_code=422)
+    if not isinstance(by, str) or not by.strip() or len(by) > 200:
+        return JSONResponse({"code": "bad_request", "message": "by(누가 멈추나)는 1~200자 글이다"}, status_code=422)
+    if not isinstance(who, str) or len(who) > 320:
+        return JSONResponse({"code": "bad_request", "message": "user_email 은 320자 안의 글이다"}, status_code=422)
+    if not isinstance(rid, str) or len(rid) > _RUN_ID_MAX:
+        return JSONResponse({"code": "bad_request", "message": f"run_id 는 {_RUN_ID_MAX}자 안의 글이다"}, status_code=422)
+    if who.strip() and not rid.strip():
+        return JSONResponse({"code": "run_id_required", "message": "사람(user_email)을 실은 멈춤은 run_id(스트림의 첫 심의 사건이 실은 "
+                             "실행 id)로 그 심의 하나를 짚어야 한다 — 대화 전체를 접는 것은 운영의 루프백 호출(신원 없음)만이다"},
+                            status_code=422)
+    return _web_cancel(cid.strip(), by.strip(), who.strip().lower(), rid.strip())
+
+
+def _web_cancel(cid: str, by: str, who: str, rid: str = ""):
+    runs = [r for r in _WEB_RUNS.get(cid, ())
+            if (not who or not r["user"] or r["user"] == who) and (not rid or r["id"] == rid)]
+    for r in runs:              # 끝났는데 끝 콜백이 아직 돌지 않은 태스크 — 지금 닫는다(아래 판정이 '도는 중' 으로 읽지 않게)
+        if r["task"] is not None and r["task"].done():
+            _web_run_close(r, r["task"])
+    named = {"run_id": rid} if rid else {}
+    if not runs:
+        return JSONResponse({"code": "delib_not_found", "conversation_id": cid, **named,
+                             "message": "이 대화에서 도는 그 웹 심의가 없다 — 이 서버가 띄운 적이 없거나(다시 떴으면 웹 심의는 함께 "
+                                        "접혔다) 오래전에 끝났다"}, status_code=404)
+    live = [r for r in runs if r["state"] == "running"]
+    stop = [r for r in live if not r["finishing"]]
+    if stop:
+        for r in stop:
+            r["state"], r["by"] = "cancelling", by
+            r["task"].cancel()
+        print(f"[delib-cancel] 대화 {_echo(cid)} 웹 심의 {len(stop)}건 멈춤 요청 — by {_echo(by)}"
+              + (f" (마무리 중 {len(live) - len(stop)}건은 두었다)" if len(live) > len(stop) else ""))
+        return {"conversation_id": cid, **named, "status": "cancelling", "runs": len(stop),
+                "message": "멈춤을 요청했다 — 스트림이 멈춤 사건(delib cancelled)과 done 으로 닫힌다. 지금까지의 발언은 남는다"}
+    if live:                    # 도는 것이 전부 마무리 중이다 — 다 만든 결정문을 버리지 않는다
+        return JSONResponse({"code": "finishing", "conversation_id": cid, **named, "status": "running",
+                             "message": "의장이 결정문을 이미 냈다 — 요약 · 쉬운 설명 · Report Archive 저장으로 마무리하는 중이라 멈추지 "
+                                        "않는다(곧 결정문과 보고서 번호가 나온다)"}, status_code=409)
+    last = runs[-1]             # 도는 것이 없다 — 가장 늦게 띄운(짚은) 심의가 어떻게 끝났나
+    if last["state"] in ("cancelling", "cancelled"):
+        return {"conversation_id": cid, **named, "status": last["state"], "runs": 0, "already": True,
+                "message": "이미 멈춘 심의다 — 다시 멈출 것이 없다"}
+    return JSONResponse({"code": "already_finished", "conversation_id": cid, **named, "status": last["state"],
+                         "message": "이미 끝난 심의다 — 멈출 것이 없다(결과는 대화와 Report Archive 에서 본다)"}, status_code=409)
 
 
 @app.get("/health")
