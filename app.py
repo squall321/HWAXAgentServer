@@ -37,6 +37,7 @@ import logging   # _detach_stream 의 오류 로깅이 쓰는데 임포트가 �
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -9081,6 +9082,25 @@ def _seat_questions_health() -> dict:
         return {"collect": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
+# ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
+# POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
+# AIDataHub 를 수백 번 부른다.
+@app.post("/seat-eval")
+async def seat_eval(request: Request):
+    import seat_probe  # noqa: PLC0415
+    st, body = await seat_probe.handle(app, sys.modules[__name__], request.headers, await request.body())
+    return JSONResponse(body, status_code=st)
+
+
+def _seat_eval_health() -> dict:
+    """/health 의 seat_eval — 창구 비밀이 있나 · 평가가 도나."""
+    try:
+        import seat_probe  # noqa: PLC0415
+        return seat_probe.health(app)
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _limits_health() -> dict:
     """/health 의 limits — 지금 걸린 동시 한도 셋과 출처(file · env). 모듈을 못 붙였으면 빈 사전(/health 는 늘 답한다)."""
     try:
@@ -9170,4 +9190,6 @@ def health() -> dict:
         # 비어 있으면 최근 로드가 전부 성공. 값이 있으면 401/타임아웃 등 실사유가 찍힌다.
         "tool_load_errors": {" ".join(sorted(g)) or "(none)": v
                              for g, v in (getattr(app.state, "tool_load_error", None) or {}).items()},
+        # 전문가 고르기 기준선 창구 — 비밀이 있나 · 평가가 도나(HWAXPortal docs/request-1029 design-e5 E5-1)
+        "seat_eval": _seat_eval_health(),
     }

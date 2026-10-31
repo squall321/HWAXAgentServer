@@ -74,9 +74,9 @@ ChatDock (portal frontend)
   (`resumed_by` / `resumed_from`); multi-stage jobs and jobs cut in round 1 start over with the same arguments. A
   graceful shutdown now leaves running jobs `interrupted` (not `cancelled`), so they can be resumed.
 
-- `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — real-use question collection for
-  the seat-choice baseline (shared secret; see "Seat-choice baseline" below). `/health.seat_questions`
-  `{collect, days, written, error, labelers}`, `/health.core_vocab.personas`.
+- `POST /seat-eval` · `GET /seat-questions` · `POST /seat-questions/label` · `POST /seat-questions/ingest` — the seat-choice
+  baseline windows (shared secret; see "Seat-choice baseline" below). `/health.seat_eval` `{secret, busy}`,
+  `/health.seat_questions` `{collect, days, written, error, labelers}`, `/health.core_vocab.personas`.
 
 ## Run (dev)
 
@@ -636,6 +636,38 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
 - **Shared secret** for the windows below (`seat_box`): the `Authorization` value of the gateway connection in `MCP_CONFIG`
   (`Bearer <GW_TOKEN>` — the portal's `GATEWAY_SHARED_TOKEN`, the same form as the gateway's `/search-eval`). No secret →
   503, wrong → 401. Not loopback-only like `/drain` · `/limits`: they hand out question text or call AIDataHub hundreds of times.
+- `POST /seat-eval {items: [{qid, q, expert?}] (1–50), layers?, run?, concurrency? (1–4), summon_k?}` — per query, the
+  layers `rec` (`recommend_agents(q, top_k=40)` as returned: operators included and marked `op`, `score` · `desc_match` ·
+  `matched_*` · `low_confidence`), `discover` (`deliberation._discover(tools, q, N_PERSONAS)` — default top_k, so the
+  first seats can come short after operators are dropped), `summon` (`thinking._summon(tools, q, THINK_CANDIDATES)`, or
+  `summon_k` — 3 for the referral hop), `screen` (`thinking._screen_one` per candidate; `asked` = the first
+  `THINK_MAX_ANSWERS` that passed), `tools` (the chat's `_persona_meta` → `_seat_tool_prefer(…, CHAT_PERSONA_PREFER_N)`
+  for `expert`, plus what the persona links would pick, when present). LLM layers — `judge` (thinking self-judgement on
+  the asked seats), `counter` (`_counter_seats`), `axes` (`_seat_axes` on the one question) — are refused (409) while a
+  deliberation runs. The engine functions get a tool dict that holds read tools only (`recommend_agents` ·
+  `get_agent_session` · `agent_search` · `list_agents` · `list_agent_domains`); every call is counted in `calls`, and
+  `read_only` must be true. One run at a time (409). Each answer carries a version fingerprint — agent and AIDataHub
+  commits, AIDataHub version · build · embedder slot, field-terms sha, pool fingerprint (keys · updated_at), core-vocab
+  fingerprint, tool-map sha, the selection knobs. With `run`, every item is appended to `runs/<run>.jsonl` without the
+  question text.
+- **Eval sets** — `python -m tools.seat_evalset build [--experts ../ExpertAgents] [--c-queries <AIDataHub ko-search
+  queries.jsonl>] [--pool-file <keys>] [--seed 20261031]` writes `A.jsonl` (600 authored confusions from
+  `routing.anti_examples` `# → target` comments, filters L1 · L2 · generic/unknown/self targets, quotas HW 12×30 · xd 60 ·
+  std/oss/misc all · sw 120 with the rest to HW, then xd, then sw; ≤ 2 per answer expert, ≤ 1 per (answer, author);
+  dev/test split by answer expert), `A-name.jsonl` (the name bundle), `P.jsonl` (300 referral phrases from
+  `expertise.out_of_scope`), `C.jsonl` (card-derived queries, title copies removed), `rels.jsonl` (key pairs and relation
+  names only), `manifest.json` and `SEAL.txt` (`A-test sha256=…` over the sorted test qids). Same seed → same qids. No
+  sibling ExpertAgents → skipped (exit 0). It refuses to write inside this repo — the sets travel by Drive (decision
+  D-E5-8), never into a public repo or AIDataHub. `seal <dir>` re-checks the seal.
+- **Runner** — `python -m tools.seat_eval run --sets <dir> [--only A,P,C,H,N,T] [--layers …] [--run <id>]` sends the sets
+  in batches (the secret is read from `MCP_CONFIG`), keeps `<set>.results.jsonl` / `<set>.version.json` (no question text)
+  under `runs/<id>/` and prints numbers only: acc@1 · acc@3 · MRR@10 (strict · lenient), discover hit@5 · short seats ·
+  domain cover, summon recall · screening · asked-seat hit, confusion (confuser above the answer), "nobody" precision ·
+  recall · F0.5 per signal, N3 (answer domain and relation experts removed), labeler agreement (κ) and picked-vs-label,
+  guards (operators · unknown keys) and thinking latency p50 · p95 — per branch (hw · sw · xd · other), lexical band
+  (answer `desc_match` ≥ 0.40), split and H source. `compare <off> <on>` pairs two runs per qid (McNemar — exact below 25
+  discordant pairs, else χ² with continuity correction) and names any fingerprint field that differs (same day, same pool —
+  L8). dev is a smoke; the verdict is measured on cae00 (C-31).
 - **Real-use questions (E5-2, off by default)** — `SEAT_QUESTIONS_COLLECT=1` on the box (the user's permission comes first,
   like the tool-search query collection) records the first utterance of a pinned-expert chat, thinking questions, the
   topic of a deliberation whose seats a person picked (web `delib_opts.personas` · MCP `deliberate_start(personas)`) and
@@ -659,7 +691,7 @@ Nothing here changes a seat, a tool or the "nobody owns this" outcome.
   detected core types, the domains that own them, the domains the seats miss, short seats, and whether all types are
   data types. Only a hash of the question is written. Every failure is swallowed — selection is untouched.
 
-Tests: `tests/test_seat_questions.py`, `tests/test_persona_links.py`.
+Tests: `tests/test_seat_evalset.py`, `tests/test_seat_eval_window.py`, `tests/test_seat_questions.py`, `tests/test_persona_links.py`.
 
 ### Images (portal docs/chat-depth-context T5)
 
