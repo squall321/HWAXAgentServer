@@ -369,7 +369,6 @@ class DelibPaused(RuntimeError):
 class DelibFinishing(RuntimeError):
     """마무리 중인 잡의 접기를 거절한다(cancel) — 웹 멈춤 창구의 409 finishing 과 같은 뜻이다. MCP deliberate_cancel 은 이 글을 도구 오류로 낸다
     (루틴 · 게이트웨이의 접기도 오류를 '접지 못했다' 로 읽는다)."""
-    code = "finishing"
 
     def __init__(self, job_id: str):
         super().__init__(f"{job_id} 는 접지 않는다(finishing — 마무리 중) — 의장이 결정문을 이미 냈다(끊기기 전에 낸 것도 같다). 남은 것은 "
