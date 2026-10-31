@@ -10,7 +10,7 @@
 #
 # 챗이 넘긴 근거는 두 꼴로 본다 — MCP 호출자가 실은 날 봉투(evidence)와, 포털 '심의로 넘기기' 가 보내는 챗 도구 결과(chat — 챗 턴의
 # 길로 만든다: 앱 머리 '[이 결과는 ○○ 앱의 도구 이다]' · 공백 접기 · 되풀이 꼬리 · 220자 미리보기). 앞엣것만 보던 동안 판정은 날 JSON 만
-# 읽어 머리 단 챗 결과를 세었다(반대 검토 10-31).
+# 읽어 머리 단 챗 결과를 세었다(반대 검토 10-31). 웹 리서치의 상태 · 기록 도구(describe_search_status · list_egress_log)도 근거가 아니다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_web_envelope_evidence.py -q
 import asyncio
@@ -52,6 +52,19 @@ def _env(status: str, n: int = 0, **data) -> str:
                        "server": {"name": "web-research", "version": "0"}}, ensure_ascii=False)
 
 
+# 웹 리서치의 상태 · 기록 도구 결과(WebResearchMCP describe_search_status · list_egress_log 의 꼴을 줄인 것) — 성공 봉투지만 data 에
+# 3상태(status · results)가 없다. 서버가 무엇을 할 수 있는지 · 무엇을 내보냈는지를 말할 뿐 주제의 근거가 아니다.
+_STATUS_ENV = json.dumps({"ok": True, "data": {"mode": "offline", "network": {"proxy_configured": False},
+                                               "sources": {"scholar": {"enabled": False, "tool": "search_scholar", "usable": False,
+                                                                       "reason": "전역 모드가 offline 입니다."}},
+                                               "ledger": {"documents": 0}},
+                          "errors": [], "warnings": ["외부 검색이 전역으로 꺼져 있습니다(SEARCH_MODE=offline)."],
+                          "server": {"name": "web-research-mcp", "version": "0"}}, ensure_ascii=False)
+_LOG_ENV = json.dumps({"ok": True, "data": {"count": 1, "entries": [{"occurred": False, "destination": "example.org",
+                                                                     "purpose": "scholar", "queries_sent": ["x"],
+                                                                     "result": "blocked_by_policy"}]},
+                       "errors": [], "warnings": [], "server": {"name": "web-research-mcp", "version": "0"}}, ensure_ascii=False)
+_META = (("describe_search_status", _STATUS_ENV), ("list_egress_log", _LOG_ENV))
 _WEB_APP = "heax-web_research_mcp"           # 게이트웨이 /tools-map 이 웹 리서치 도구에 주는 앱 키
 
 
@@ -144,19 +157,34 @@ def test_챗_머리_뒤의_봉투만_읽고_다른_글은_판정하지_않는다
     assert not d._envelope_no_evidence(s)
 
 
+@pytest.mark.parametrize("name, out", [*_META, ("heaxweb_research_mcp_list_egress_log", _LOG_ENV)],   # 마지막은 게이트웨이 별칭
+                         ids=["status", "egress-log", "alias"])
+def test_웹_리서치의_상태_기록_도구는_근거가_아니다(name, out):
+    assert d._web_meta_tool(name) and d._web_meta_tool(name.upper())
+    # 시험 전제 — 봉투로는 가려지지 않는다(성공 봉투이고 3상태가 없다). 그래서 이름으로 본다.
+    assert not d._envelope_no_evidence(out) and d._delib_tool_result_ok(out)
+
+
+@pytest.mark.parametrize("name", ["search_scholar", "get_page", "get_quote", "describe_status", "list_egress", "", None])
+def test_그_밖의_도구는_상태_기록_도구가_아니다(name):
+    assert not d._web_meta_tool(name)
+
+
 # ── 실제 엔진 ────────────────────────────────────────────────────────────────
-def _chair_prompt(monkeypatch, path: str, out: str) -> tuple[str, list]:
-    """세는 자리 하나(path)로만 웹 리서치 봉투 out 을 흘려 실제 엔진을 의장 단계까지 돌리고 (의장이 받은 프롬프트, 이벤트) 를 돌려준다.
+def _chair_prompt(monkeypatch, path: str, out: str, extra=()) -> tuple[str, list]:
+    """세는 자리 하나(path)로만 웹 리서치 봉투 out(search_scholar 의 결과)과 extra[(도구, 결과) …]를 흘려 실제 엔진을 의장 단계까지
+    돌리고 (의장이 받은 프롬프트, 이벤트) 를 돌려준다.
 
     좌석은 지정으로 주고(발굴 생략) VOC · 지식카드 · 재심사 · 보고서 저장을 끈다 — 망을 타는 단계다. 자유 조회는 그 자리를
-    볼 때만 켜고, 좌석의 조회 턴(_free_gather_one)은 그 봉투를 받은 호출 하나로 갈음한다. chat 은 evidence 와 같은 자리이되 항목을
+    볼 때만 켜고, 좌석의 조회 턴(_free_gather_one)은 그 결과들을 받은 호출로 갈음한다. chat 은 evidence 와 같은 자리이되 항목을
     챗 턴의 길(_chat_item)로 만든다 — 포털 '심의로 넘기기' 가 보내는 꼴이다."""
     import langgraph.prebuilt
 
-    scholar, seen, gathered = _Tool("search_scholar", answer=out), [], []
+    calls = (("search_scholar", out), *extra)
+    tools, seen, gathered = {n: _Tool(n, answer=o) for n, o in calls}, [], []
 
     async def _fake_tools(*_a, **_k):
-        return {"search_scholar": scholar}
+        return tools
 
     async def _fake_llm(_llm, system, human, *_a):
         seen.append((system, human))
@@ -168,7 +196,7 @@ def _chair_prompt(monkeypatch, path: str, out: str) -> tuple[str, list]:
 
     async def _fake_gather(_agent, persona, *_a, **_k):
         gathered.append(persona["key"])
-        return persona["key"], [("search_scholar", '{"query": "x"}', out, f"call-{persona['key']}")], "", ""
+        return persona["key"], [(n, '{"query": "x"}', o, f"call-{persona['key']}-{n}") for n, o in calls], "", ""
 
     monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
     monkeypatch.setattr(d, "_llm_text", _fake_llm)
@@ -179,10 +207,10 @@ def _chair_prompt(monkeypatch, path: str, out: str) -> tuple[str, list]:
     opts = {"personas": _SEATS, "rounds": 2, "voc": "off", "rescreen": 0, "persona_knowledge": 0,
             "evidence_prepass": 0, "save_report": 0, "free_tools": int(path == "free")}
     if path == "tools":
-        opts["tools"] = ["search_scholar"]
+        opts["tools"] = [n for n, _o in calls]
     if path in ("evidence", "chat"):
-        opts["evidence"] = [{"source": "챗", "tool": "search_scholar", "args": '{"query": "x"}',
-                             "result": _chat_item(monkeypatch, "search_scholar", out)[0] if path == "chat" else out}]
+        opts["evidence"] = [{"source": "챗", "tool": n, "args": '{"query": "x"}',
+                             "result": _chat_item(monkeypatch, n, o)[0] if path == "chat" else o} for n, o in calls]
     stub = SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None))
 
     async def go():
@@ -191,9 +219,12 @@ def _chair_prompt(monkeypatch, path: str, out: str) -> tuple[str, list]:
     events = asyncio.run(go())
     errs = [x for ev, x in events if ev == "error"]
     assert not errs, f"스트림이 오류로 끝났다 — {errs}"
-    # 시험 전제 — 그 자리가 실제로 돌았다. 안 돌았으면 '0건' 은 판정이 아니라 하네스가 눈이 먼 것이다.
-    _card = any(ev == "delib" and x.get("source") == "챗 정리 · 챗" for ev, x in events)
-    assert {"tools": bool(scholar.calls), "free": bool(gathered), "evidence": _card, "chat": _card}[path], \
+    # 시험 전제 — 그 자리가 결과 전부로 실제로 돌았다. 안 돌았으면 '0건' 은 판정이 아니라 하네스가 눈이 먼 것이다.
+    cards = sum(ev == "delib" and x.get("source") == "챗 정리 · 챗" for ev, x in events)
+    seat_calls = sum(ev == "status" and str(x.get("step", "")).startswith(tuple(f"{s['key']} 조회: " for s in _SEATS))
+                     for ev, x in events)
+    assert {"tools": all(t.calls for t in tools.values()), "free": seat_calls == len(_SEATS) * len(calls),
+            "evidence": cards == len(calls), "chat": cards == len(calls)}[path], \
         f"{path} 자리가 돌지 않았다 — 하네스가 낡았다"
     chair = [h for s, h in seen if "엔지니어링 톤" in s]
     assert chair, "의장 단계까지 가지 못했다"
@@ -228,3 +259,22 @@ def test_결과가_있는_봉투는_근거로_센다(monkeypatch, path, out):
     assert f"도구 조회 {n}건" in chair and _HYPO_NOTE not in chair and _HYPO_ASK not in chair, chair[:600]
     if path == "tools":
         assert _secured(events) == "지정 도구 근거 확보 — 1건", _secured(events)
+
+
+@pytest.mark.parametrize("out, n_seat", [(_env("blocked"), 0), (_env("ok", 2), 1)], ids=["with-blocked", "with-results"])
+@pytest.mark.parametrize("path", _PATHS)
+def test_웹_리서치_상태_기록_조회는_어느_자리에서도_근거로_세지_않는다(monkeypatch, path, out, n_seat):
+    """'결과가 왜 비는지' 를 보려 상태 도구를 부르고 차단된 검색만 받은 심의도 실측 데이터 0건이다 — 상태 · 기록 도구는 서버를 말할 뿐이다.
+    결과가 있는 검색과 함께면 그 검색만 센다(자유 조회는 좌석마다 한 건)."""
+    chair, events = _chair_prompt(monkeypatch, path, out, extra=_META)
+    n = n_seat * (len(_SEATS) if path == "free" else 1)
+    assert f"도구 조회 {n}건" in chair, f"{path} 자리에서 웹 리서치 상태 · 기록 조회를 근거로 셌다 — {chair[chair.find('근거 프로파일'):][:80]}"
+    assert (_HYPO_NOTE in chair and _HYPO_ASK in chair) == (n == 0), chair[:600]
+    if path == "tools":
+        # 상태줄도 결정문과 같은 셈 — 상태 · 기록 도구는 차단 · 빈 결과와 따로 밝힌다(좌석에는 그대로 실린다).
+        assert _secured(events) == (
+            f"지정 도구 근거 확보 — {n}건"
+            + (" · 웹 리서치 차단 · 빈 결과 1건(search_scholar)" if n == 0 else "")
+            + " · 웹 리서치 상태 · 기록 조회 2건(list_egress_log, describe_search_status)은 좌석에 싣되 근거로 세지 않았다"), \
+            _secured(events)
+        assert '"mode": "offline"' in chair and '"count": 1' in chair
