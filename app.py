@@ -7821,6 +7821,7 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
     failed = 0
     empty_notes: list[tuple[str, list[str]]] = []      # 0건 검색어와 그 notes — 글은 note 를 지을 때 짓는다(주의 줄로 실린 글을 뺀다)
     cautions: dict[str, list[str]] = {}      # 행이 있는 검색어가 받은 주의 줄 → 그 검색어들(처음 받은 차례)
+    caution_ids: dict[str, set] = {}         # 그 주의 줄 → 그 검색어들이 돌려준 행 id(화면의 검색어 표지를 맞춘다)
     for kw in kws:
         raw = await _call(tools, "search_voc", {"keyword": kw, "limit": 10})
         if isinstance(raw, str) and raw.strip() and not _tool_text_ok(raw):
@@ -7853,6 +7854,7 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
                     ks = cautions.setdefault(n, [])
                     if kw not in ks:
                         ks.append(kw)
+                    caution_ids.setdefault(n, set()).update(r["id"] for r in rows if r["text"])
         elif not any(r["text"] for r in rows) and isinstance(raw, str) and raw.strip() not in ("", "[]"):
             # 펼칠 것이 없고 읽을 글도 없는데 결과 글은 왔다(모르는 꼴 · 실패 문구 · 옛 꼴의 본문 없는 행) — 0건으로 두면 '정말 없음' 과
             # 같아 보이니 실패로 센다. '[]' 는 옛 꼴의 0건이다(내용 블록 0개를 도구 래퍼 _cap 이 그 글로 만든다).
@@ -7869,14 +7871,23 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
                 items.append(rows[i])
     total = len(items)
     items = items[:_VOC_PREVIEW_MAX]
-    # 주의 줄이 맨 앞이다 — 보이는 행이 어느 제품의 것인지에 대한 말이다. 검색어를 앞에 달아 어느 행에 걸리는지 화면의 검색어 표지로 맞춘다.
-    # 0건 줄은 종전 글 그대로이되 주의 줄로 이미 실린 글은 뺀다 — 같은 주의가 안내 한 줄에 두 번 나왔다(반대 검토 10-31). 0건 검색어를 주의 줄의
-    # 검색어 표지에 달지는 않는다(보이는 행이 없다).
+
+    def _caution_head(c: str, ks: list[str]) -> str:
+        """주의 줄의 머리 — 그 주의를 받은 검색어. 화면은 행마다 그 행을 먼저 돌려준 검색어를 표지로 단다(위 번갈아 뽑기가 행 id 로 겹침을
+        뺀다). 그래서 그 검색어들이 돌려준 보이는 행에 다른 표지가 있으면 그 표지를 덧붙이고, 상한에 잘려 하나도 안 보이면 그렇다고 적는다 —
+        검색어만 적으면 사람은 보이는 행에는 주의가 걸리지 않는다고 읽었다(반대 검토 10-31)."""
+        own = " · ".join(f"'{k}'" for k in ks)
+        tags = list(dict.fromkeys(r["keyword"] for r in items if r["id"] in caution_ids.get(c, ())))
+        if not tags:
+            return f"{own}(보이는 행 없음)"
+        return own if set(tags) <= set(ks) else own + "(보이는 행 표지 " + " · ".join(f"'{t}'" for t in tags) + ")"
+    # 주의 줄이 맨 앞이다 — 보이는 행이 어느 제품의 것인지에 대한 말이다. 0건 줄은 종전 글 그대로이되 주의 줄로 이미 실린 글은 뺀다 — 같은
+    # 주의가 안내 한 줄에 두 번 나왔다(반대 검토 10-31). 0건 검색어를 주의 줄의 검색어 표지에 달지는 않는다(보이는 행이 없다).
     zero = []
     for zkw, ns in empty_notes:
         rest = [n for n in ns if n not in cautions]
         zero.append(f"'{zkw}' 0건" + (" — " + " · ".join(rest) if rest else ""))
-    note = ([" · ".join(f"'{k}'" for k in ks) + f" {c}" for c, ks in cautions.items()]
+    note = ([f"{_caution_head(c, ks)} {c}" for c, ks in cautions.items()]
             + ([f"{total}건 중 {len(items)}건만 보입니다 — 검색어를 좁혀 보세요."] if total > len(items) else []) + zero)
     return {"keywords": kws, "items": items, "total": total,
             "degraded": failed == len(kws),

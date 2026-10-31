@@ -257,3 +257,28 @@ def test_SG04_0건_검색어의_글은_종전_그대로고_주의_줄로_실린_
 
     out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["px1 hinge", "px1 none"]})
     assert out["note"] == f"'px1 hinge' {C_PX1} / 'px1 none' 0건", out.get("note")
+
+
+def test_SG04_주의를_받은_검색어의_행이_다른_표지로_보이면_그_표지를_단다(monkeypatch):
+    """화면은 행마다 그 행을 먼저 돌려준 검색어를 표지로 단다(번갈아 뽑기가 행 id 로 겹침을 뺀다). 주의를 받은 검색어의 행이 모두 다른 검색어
+    표지로 보이면 '그 검색어' 만 적힌 주의는 보이는 행에 걸리지 않는 말로 읽혔다(반대 검토 10-31) — 그 주의가 걸리는 보이는 행의 표지를 덧붙이고,
+    상한에 잘려 하나도 안 보이면 그렇다고 적는다. 행이 모두 제 검색어 표지로 보이면 종전 그대로다(위 시험들)."""
+    async def call(tools, name, args):
+        return data[args["keyword"]]
+
+    rows = [_voc(1, "x"), _voc(2, "x")]
+    data = {"hinge": _envelope(rows, [_MODEL_NOTE]), "px1 hinge": _envelope(rows, [C_PX1])}
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["hinge", "px1 hinge"]})
+    assert [(x["id"], x["keyword"]) for x in out["items"]] == [(1, "hinge"), (2, "hinge")]
+    assert out["note"] == f"'px1 hinge'(보이는 행 표지 'hinge') {C_PX1}", out.get("note")
+
+    data = {"hinge": _envelope([_voc(1, "hinge")]), "px1 hinge": _envelope([_voc(1, "x"), _voc(2, "px1 hinge")], [C_PX1])}
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["hinge", "px1 hinge"]})
+    assert [(x["id"], x["keyword"]) for x in out["items"]] == [(1, "hinge"), (2, "px1 hinge")]
+    assert out["note"] == f"'px1 hinge'(보이는 행 표지 'hinge' · 'px1 hinge') {C_PX1}", out.get("note")
+
+    monkeypatch.setattr(a, "_VOC_PREVIEW_MAX", 1)
+    data = {"hinge": _envelope([_voc(1, "hinge"), _voc(2, "hinge")]), "px1 hinge": _envelope([_voc(3, "px1 hinge")], [C_PX1])}
+    out = _run(monkeypatch, {"search_voc": object()}, call, {"message": "x", "keywords": ["hinge", "px1 hinge"]})
+    assert [x["id"] for x in out["items"]] == [1]
+    assert out["note"] == f"'px1 hinge'(보이는 행 없음) {C_PX1} / 3건 중 1건만 보입니다 — 검색어를 좁혀 보세요.", out.get("note")
