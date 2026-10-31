@@ -1,4 +1,4 @@
-# 이어하기의 좌석 — 지어 준 좌석의 역할을 줄어든 사본으로 앉히지 않는지, 재심사 신규 좌석이 1라운드에 이전 결론 없이 앉고 2라운드 교차심문에 걸리는지 — 좌석이 받은 프롬프트로 본다
+# 이어하기의 좌석 — 지어 준 좌석의 역할을 줄어든 사본으로 앉히지 않는지, 재심사가 사람 의견의 짧은 축으로 새 도메인을 찾는지, 재심사 신규 좌석이 1라운드에 이전 결론 없이 앉고 2라운드 교차심문에 걸리는지 — 좌석이 받은 프롬프트로 본다
 #
 # 이어하기는 이전 잡의 좌석(seats)을 그대로 넘긴다. 그 좌석 목록은 엔진의 personas 이벤트에서 온 것이고,
 # 그 이벤트의 역할은 소개 카드용으로 앞 280자만 실린다. 레지스트리에 있는 좌석은 엔진이 원본을 다시 읽어
@@ -130,9 +130,10 @@ def test_좌석_목록의_모양과_화면용_역할은_그대로다(monkeypatch
 
 
 # ── 재심사로 새로 앉은 좌석(HWAXPortal docs/deliberation-quality F10 · F12) ─────────────────────────────────
-# 이어하기는 유임 좌석 전원에 재심사 신규 좌석을 더한다(F10 — '원 질문 + 이전 결론 + 사람 의견' 으로 recommend_agents 를 다시
-# 불러, 이미 앉은 도메인은 빼고 DELIB_RESCREEN_SEATS 명까지). 신규 좌석은 1라운드에 이전 결론을 받지 않는다(F12 — 앵커링
-# 차단, 2라운드부터 받는다). 그 독립 판단이 이전 결론과 어긋나면 이어하기의 소득인데, 2라운드 교차심문에서 아무도 그 좌석을
+# 이어하기는 유임 좌석 전원에 재심사 신규 좌석을 더한다(F10 — 사람 의견(과 원 질문)에서 뽑은 짧은 축마다 recommend_agents 를
+# 깊게(top_k) 불러 후보를 합치고, 앉은 좌석 · 앉은 도메인(넓은 접두는 둘째 마디까지)은 빼고 DELIB_RESCREEN_SEATS 명까지).
+# 신규 좌석은 1라운드에 이전 결론을 받지 않는다(F12 — 앵커링 차단, 2라운드부터 받는다). 그 독립 판단이 이전 결론과
+# 어긋나면 이어하기의 소득인데, 2라운드 교차심문에서 아무도 그 좌석을
 # 겨냥하지 않으면 무사통과한다 — 관련도(용어 겹침)로 표적을 고르면 홀로 다른 말을 하는 신규 좌석이 거기 걸리기 쉬워
 # _cross_targets 가 끝에서 보정한다. 이어하기 한 번을 실제 코드로 돌려 좌석이 받은 프롬프트로 본다.
 
@@ -160,25 +161,45 @@ def _kind_of(prompt: str) -> str:
     return "initial" if "당신의 관점(lens" in prompt else "?"
 
 
-def _continue_once(monkeypatch, tmp_path, carry, recs, *, rounds=3, stop_round=2, advanced=None):
-    """시작(1라운드 뒤 결정문 _PREV 로 닫는다) → 이어하기 한 번(재심사 켬, 사람 의견 _NOTE). recs 는 recommend_agents 가 돌려줄
-    좌석 키다. 이어하기는 stop_round 라운드의 전원 발언까지 실제로 돌고 닫는다(None 이면 엔진이 스스로 끝낼 때까지 — 체크포인트).
+def _continue_once(monkeypatch, tmp_path, carry, recs, *, rounds=3, stop_round=2, advanced=None, note=_NOTE,
+                   axes="산화피막 부식", domains=None):
+    """시작(1라운드 뒤 결정문 _PREV 로 닫는다) → 이어하기 한 번(재심사 켬, 사람 의견 note). 이어하기는 stop_round 라운드의 전원
+    발언까지 실제로 돌고 닫는다(None 이면 엔진이 스스로 끝낼 때까지 — 체크포인트).
+
+    recs — recommend_agents 가 돌려줄 좌석 키(목록이면 질의와 상관없이 그대로, 함수면 받은 인자로 지은 목록 — AIDataHub 응답 꼴
+    {agents: [...]} 로 싸서 준다). axes — 재심사 검색 축을 묻는 LLM 의 답(예외를 주면 그 예외를 올린다). domains — 주면
+    list_agent_domains 가 그 행들을 돌려준다(MCP 가 목록 원소마다 글을 따로 실어 이어 붙인 꼴 그대로).
 
     반환 SimpleNamespace(prompts={(좌석, 라운드 성격): 이어하기에서 그 좌석이 받은 첫 발언 프롬프트},
-                          queries=recommend_agents 가 받은 질의들, job=이어하기 잡 원장, events=이어하기 사건들)."""
-    runs, queries = [], []
+                          queries=recommend_agents 가 받은 질의들, calls=그 인자들, axis_prompts=검색 축을 물은 프롬프트들,
+                          job=이어하기 잡 원장, events=이어하기 사건들)."""
+    runs, queries, calls, axis_prompts = [], [], [], []
 
     class _Rec:
         name, coroutine = "recommend_agents", None
 
         async def ainvoke(self, args):
             queries.append(str(args.get("q") or ""))
-            return json.dumps([{"agent_type": k} for k in recs])
+            calls.append(dict(args))
+            keys = recs(args) if callable(recs) else recs
+            return json.dumps({"agents": [{"agent_type": k} for k in keys]})
+
+    class _Domains:
+        name, coroutine = "list_agent_domains", None
+
+        async def ainvoke(self, _args):
+            return "".join(json.dumps(r) for r in domains)
 
     async def _tools(*_a, **_k):
-        return {"get_agent_session": _Session(), "recommend_agents": _Rec()}
+        return {"get_agent_session": _Session(), "recommend_agents": _Rec(),
+                **({"list_agent_domains": _Domains()} if domains is not None else {})}
 
     async def _llm(_obj, system, human, *_a):
+        if system.startswith("당신은 심의체 좌석 구성을 검토하는 조정자"):      # 재심사 검색 축(_rescreen_axes)
+            axis_prompts.append(human)
+            if isinstance(axes, BaseException):
+                raise axes
+            return axes
         seat = re.match(r"당신은 '([^']+)' 전문가입니다\.", system)
         if not seat:
             return "결정문"
@@ -227,7 +248,7 @@ def _continue_once(monkeypatch, tmp_path, carry, recs, *, rounds=3, stop_round=2
         await delib_jobs._TASKS[first["job_id"]]
         assert delib_jobs.get(first["job_id"])["decision"] == _PREV, "시험 전제 — 첫 회차 결정문이 이전 결론이다"
         delib_jobs._JOBS.clear()       # 재기동 뒤처럼 — 메모리에 없으면 원장 파일에서 읽는다
-        second = await m.deliberate_continue(first["job_id"], _NOTE, rounds=rounds,
+        second = await m.deliberate_continue(first["job_id"], note, rounds=rounds,
                                              advanced={"rescreen": 1, **(advanced or {})})
         await delib_jobs._TASKS[second["job_id"]]
         return delib_jobs.get(second["job_id"])
@@ -235,7 +256,8 @@ def _continue_once(monkeypatch, tmp_path, carry, recs, *, rounds=3, stop_round=2
     job = asyncio.run(go())
     assert job["status"] == "done", job.get("error")
     assert len(runs) == 2, len(runs)
-    return SimpleNamespace(prompts=runs[1]["prompts"], queries=queries, job=job, events=runs[1]["events"])
+    return SimpleNamespace(prompts=runs[1]["prompts"], queries=queries, calls=calls, axis_prompts=axis_prompts, job=job,
+                           events=runs[1]["events"])
 
 
 def _target_block(prompt: str) -> str:
@@ -277,24 +299,95 @@ def test_재심사_신규_좌석의_1라운드_입장이_2라운드_교차심문
         assert any(f"— {key} —" in blk for k2, blk in blocks.items() if k2 != key), f"{key} 를 겨냥한 좌석이 없다"
 
 
-def test_원_이어하기_꼴_재심사는_유임_전원에_착석하지_않은_도메인_둘까지만_더한다(monkeypatch, tmp_path):
+# 원 이어하기(deliberation-quality 42)의 꼴 — 한 도메인 넷(disp) · 넓은 접두(sw) 둘, 사람 의견이 지금 좌석 밖(필드 · 서비스)을 다루라 한다.
+_B17_CARRY = [{"key": k, "role": ""} for k in ("disp-a", "disp-b", "disp-c", "disp-d", "sw-lum-ctl", "sw-tone-mgr")]
+_B17_NOTE = "열화를 필드에서 추적하는 체계와 서비스 교체 기준을 정하라"
+
+
+def _rescreen_once(monkeypatch, tmp_path, carry, recs, **kw):
+    """이어하기 한 번을 1라운드 체크포인트까지(보고서 저장 없음) — 아래 재심사 시험들이 쓴다."""
+    return _continue_once(monkeypatch, tmp_path, carry, recs, stop_round=None,
+                          advanced={"stop_after_round": 1, "save_report": 0}, **kw)
+
+
+def _new_seats(r) -> list:
+    return [s["key"] for s in r.job["seats"] if s["origin"] == "new"]
+
+
+def _steps(r) -> list:
+    return [x.get("step", "") for ev, x in r.events if ev == "status"]
+
+
+def test_원_이어하기_꼴_재심사는_유임_전원에_사람_의견의_축으로_새_도메인_둘까지만_더한다(monkeypatch, tmp_path):
     """원 이어하기(6석 · 두 도메인 · 사람 의견 · 1라운드 체크포인트)와 같은 꼴(deliberation-quality 42 의 회귀 시험) — 유임 전원이
-    그대로 앉고, 추천 가운데 이미 앉은 좌석 · 앉은 도메인은 빠지며, 새 좌석은 DELIB_RESCREEN_SEATS(2)까지다."""
-    carry = [{"key": k, "role": ""} for k in ("disp-a", "disp-b", "disp-c", "disp-d", "sw-a", "sw-b")]
-    recs = ["disp-a", "disp-x", "sw-x", "svc-ops", "field-data", "rel-chem"]
+    그대로 앉고, 사람 의견에서 뽑은 짧은 축마다 깊게 물어 합친 후보 가운데 앉은 좌석 · 앉은 도메인(sw 는 둘째 마디까지)은 빠지며,
+    새 좌석은 축마다 깊이 차례로 DELIB_RESCREEN_SEATS(2)까지다."""
+    axes = ["필드 열화 추적", "서비스 교체 판정", "보상 테이블 배포"]
+    lists = {axes[0]: ["disp-x", "sw-field-mon", "sw-field-rel", "xd-field-tri"],
+             axes[1]: ["disp-y", "xd-svc-ops", "sw-lum-x"],
+             axes[2]: ["sw-tone-y", "cam-tune", "disp-z"]}         # 둘째 깊이에서 셋이 다 새 도메인 — 상한이 셋째를 막는다
     assert d._RESCREEN_SEATS == 2, "시험 전제 — 재심사 신규 좌석 상한의 기본값"
-    r = _continue_once(monkeypatch, tmp_path, carry, recs, stop_round=None,
-                       advanced={"stop_after_round": 1, "save_report": 0})
+    r = _rescreen_once(monkeypatch, tmp_path, _B17_CARRY, lambda a: lists.get(a["q"], ["disp-x", "cam-tune"]),
+                       note=_B17_NOTE, axes="\n".join(axes))
     seated = [(s["key"], s["origin"]) for s in r.job["seats"]]
-    assert seated == [(p["key"], "carry") for p in carry] + [("svc-ops", "new"), ("field-data", "new")], seated
-    assert len(r.queries) == 1, r.queries
-    q = r.queries[0]
-    assert q.startswith("힌지 크랙 원인") and f"[이전 결론]\n{_PREV}" in q and f"[사람 의견]\n{_NOTE}" in q, (
-        "재심사 질의는 '원 질문 + 이전 결론 + 사람 의견' 이다")
-    steps = [x.get("step", "") for ev, x in r.events if ev == "status"]
-    assert "이어하기 재심사 — 신규 좌석 svc-ops, field-data" in steps, steps
+    assert seated == [(p["key"], "carry") for p in _B17_CARRY] + [("sw-field-mon", "new"), ("xd-svc-ops", "new")], seated
+    assert sorted(r.queries) == sorted(axes), f"재심사 질의는 검색 축 셋이다(한 덩이 질의가 아니다): {r.queries}"
+    assert all(c.get("top_k") == d._RESCREEN_TOP_K for c in r.calls), r.calls
+    assert len(r.axis_prompts) == 1 and _B17_NOTE in r.axis_prompts[0] and _PREV not in r.axis_prompts[0], (
+        "검색 축은 사람 의견(과 원 질문)에서 짓는다 — 이전 결론은 싣지 않는다")
+    assert "이어하기 재심사 — 신규 좌석 sw-field-mon(필드 열화 추적), xd-svc-ops(서비스 교체 판정)" in _steps(r), _steps(r)
     assert (r.job.get("decision") or "").startswith("[체크포인트"), "1라운드 체크포인트로 끝나야 한다(보고서 저장 없음)"
     assert {k for k, _kind in r.prompts} == {k for k, _o in seated}, "새 좌석이 1라운드에 발언하지 않았다"
+
+
+def test_재심사는_추천을_도구_기본_다섯명보다_깊게_받는다(monkeypatch, tmp_path):
+    """① recommend_agents 는 top_k 를 안 주면 5명만 준다(AIDataHub mcp_runtime.recommend_agents) — 앉은 도메인이 그 다섯을
+    채우면 새 도메인이 보이지 않았다(10-31 dev 재실행 — 다섯 중 넷이 앉은 도메인)."""
+    ranked = ["disp-p", "sw-lum-p", "disp-q", "sw-tone-p", "disp-r", "rel-field-q", "cam-q"]
+    r = _rescreen_once(monkeypatch, tmp_path, _B17_CARRY, lambda a: ranked[:int(a.get("top_k") or 5)],
+                       note=_B17_NOTE, axes="필드 열화 추적")
+    assert _new_seats(r) == ["rel-field-q", "cam-q"], f"다섯 뒤의 새 도메인을 보지 못했다: {_new_seats(r)}"
+    assert [c.get("top_k") for c in r.calls] == [d._RESCREEN_TOP_K] and 20 <= d._RESCREEN_TOP_K <= 40, r.calls
+
+
+def test_재심사는_사람_의견에서_뽑은_짧은_축으로_묻고_이전_결론은_싣지_않는다(monkeypatch, tmp_path):
+    """② '원 질문 + 이전 결론 + 사람 의견' 한 덩이는 임베딩이 원 어휘(지금 좌석) 쪽으로 평균된다 — 사람 의견이 연 방향(필드)의
+    좌석은 짧은 축 질의에서만 위로 온다. 가짜 추천은 그 성질 그대로다."""
+    def rec(a):
+        q = a["q"]
+        if _PREV in q or len(q) > 200:                    # 한 덩이 질의 — 지금 좌석의 이웃만 돌아온다
+            return ["disp-x", "sw-lum-x", "cam-near"]
+        return ["xd-field-tri", "disp-x"] if "필드" in q else ["cam-near"]
+
+    r = _rescreen_once(monkeypatch, tmp_path, _B17_CARRY, rec, note=_B17_NOTE, axes="필드 열화 추적\n교체 판정 기준")
+    assert _new_seats(r) == ["xd-field-tri", "cam-near"], f"사람 의견이 연 방향의 좌석이 앉지 않았다: {_new_seats(r)}"
+    assert r.queries == ["필드 열화 추적", "교체 판정 기준"], r.queries
+    assert not any(_PREV in q or "[이전 결론]" in q for q in r.queries), "재심사 질의에 이전 결론이 실렸다"
+    assert "힌지 크랙 원인" in r.axis_prompts[0], "원 질문은 축을 짓는 맥락으로 간다"
+
+
+@pytest.mark.parametrize("axes,why", [(RuntimeError("LLM 연결 실패"), "RuntimeError"), ("  \n", "빈 답")],
+                         ids=["llm-error", "empty"])
+def test_재심사_축을_못_지으면_한_덩이로_묻지_않고_유임_전원으로_가며_그렇다고_알린다(monkeypatch, tmp_path, axes, why):
+    """축을 묻는 LLM 이 실패하거나 빈 답이면 재심사는 신규 좌석 없이 끝난다 — 사람 의견 · 이전 결론을 한 덩이로 묻는 길로 돌아가지
+    않는다(그 길이 고친 결함이다). 유임 좌석은 그대로 앉고, 왜 신규 좌석이 없는지 상태줄에 남는다."""
+    r = _rescreen_once(monkeypatch, tmp_path, _B17_CARRY, ["disp-x", "xd-field-tri"], note=_B17_NOTE, axes=axes)
+    assert r.queries == [], f"축 없이 추천을 물었다 — 한 덩이 질의로 돌아갔다: {r.queries}"
+    assert [(s["key"], s["origin"]) for s in r.job["seats"]] == [(p["key"], "carry") for p in _B17_CARRY]
+    assert f"이어하기 재심사 — 검색 축을 짓지 못해({why}) 신규 좌석 없이 유임 전원으로 간다" in _steps(r), _steps(r)
+
+
+def test_재심사는_넓은_접두를_둘째_마디까지_앉은_도메인으로_본다(monkeypatch, tmp_path):
+    """③ 첫 마디 접두로 거르면 sw(수백 명) 좌석 하나가 sw-field-* · sw-voc-* 를 다 막는다. 넓은 접두(sw · xd 와 지금 풀에서 접두
+    하나에 많이 모인 것 — list_agent_domains)는 둘째 마디까지 견주고, 좁은 접두(disp)는 종전대로 첫 마디다. 신규 좌석끼리도
+    단위가 겹치지 않는다."""
+    carry = [{"key": k, "role": ""} for k in ("disp-a", "sw-lum-ctl", "big-core-a")]
+    domains = [{"domain": "sw", "agent_count": 408}, {"domain": "big", "agent_count": 60},
+               {"domain": "disp", "agent_count": 19}]
+    recs = ["sw-lum-x", "disp-new", "sw-field-mon", "sw-field-rel", "big-edge-b", "rel-x"]
+    r = _rescreen_once(monkeypatch, tmp_path, carry, recs, note=_B17_NOTE, axes="필드 열화 추적", domains=domains)
+    assert _new_seats(r) == ["sw-field-mon", "big-edge-b"], (
+        f"앉은 sw · big 좌석이 다른 마디의 좌석까지 막았거나, 같은 단위가 둘 앉았다: {_new_seats(r)}")
 
 
 @pytest.mark.parametrize("modifiers", [[], ["anon1r"]], ids=["new-only", "anon1r"])

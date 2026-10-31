@@ -707,6 +707,16 @@ _SIM_CARRY = _env_int("DELIB_SIM_CARRY", 2)           # 2단에 남길 물리 �
 _COUNTER_SEATS = _env_int("DELIB_COUNTER_SEATS", 2)   # 반대 도메인 좌석 수(0=끔, 종전 동작)
 _RESCREEN = _env_int("DELIB_RESCREEN", 1)             # 이어하기 좌석 재심사(0=끔, 종전 동작)
 _RESCREEN_SEATS = _env_int("DELIB_RESCREEN_SEATS", 2)  # 재심사로 더할 신규 좌석 상한
+# 재심사 축 질의마다 받는 추천 깊이(recommend_agents 의 top_k — 안 주면 도구 기본 5명이다). 앉은 도메인 하나가 창을 통째로 채워도
+# 그 뒤를 볼 만큼 깊어야 한다 — dev 풀(10-31, 796명)에서 가장 큰 단위가 33명(sw-app)이고 넓은 접두 밖의 가장 큰 도메인이 22명이다.
+# 40 은 그보다 깊고 심의 전 전문가 미리보기(EXPERT_CANDIDATE_TOP_K)와 같은 깊이다 — 사람이 고르는 후보와 같은 데까지 본다.
+# 깊이를 늘려도 AIDataHub 의 셈은 같다(후보 섹션 수는 따로 정해진다) — 응답이 길어질 뿐이다(40명 ≈ 53KB).
+_RESCREEN_TOP_K = _env_int("DELIB_RESCREEN_TOP_K", 40)
+# 넓은 접두 — 접두 하나에 이만큼 넘게 모인 계열은 접두가 도메인이 아니다(sw 408명 · xd 122명 — 그다음이 22명). 재심사는 그런
+# 접두의 좌석을 둘째 마디까지(sw-field-monitoring → sw-field) 한 도메인으로 본다. 풀 분류를 못 받아도 sw · xd 는 넓게 본다.
+_RESCREEN_WIDE_MIN = _env_int("DELIB_RESCREEN_WIDE_MIN", 50)
+_RESCREEN_WIDE = frozenset({"sw", "xd"})
+_RESCREEN_AXES = 3                                     # 재심사 검색 축 수(반대 도메인 좌석 _counter_seats 와 같다)
 
 # 얹을 층(2층 Modifier) — chairTemplate(무엇을 산출) 과 직교하는 "어떻게 굴리나" 오버레이.
 # 각 값은 심의 BASE 에 덧붙는 지시 블록. hwax-deliberate.js MODIFIERS 와 키·취지 정합.
@@ -4626,15 +4636,11 @@ async def _restore_role(tools: dict, key: str, fallback: str = "", why: dict | N
     return fallback
 
 
-async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
-                    origin: str = "primary") -> list:
-    """recommend_agents 로 좌석을 발굴해 [{key, role, origin}] 로 돌려준다.
-
-    반대 도메인 좌석(F1)·이어하기 재심사(F10)가 같은 코드를 쓴다 — 질의문만 다르다.
-    도구 실패·빈 결과는 비치명적으로 빈 목록을 돌려준다. 좌석이 없어도 심의는 진행하고,
-    그 사실은 origin 표시가 없는 것으로 결정문에 남는다."""
+async def _rank_keys(tools: dict, q: str, top_k: int | None = None) -> list:
+    """recommend_agents 의 순위 그대로 좌석 키만 — 도구 운영자(he)와 겹친 키는 뺀다. 도구 실패·빈 결과는 빈 목록이다.
+    top_k 를 주면 그만큼 받는다(안 주면 도구 기본 5명 — AIDataHub mcp_runtime.recommend_agents)."""
     try:
-        recd = _parse_json(await _call(tools, "recommend_agents", {"q": q}))
+        recd = _parse_json(await _call(tools, "recommend_agents", {"q": q} if top_k is None else {"q": q, "top_k": top_k}))
     except Exception:  # noqa: BLE001
         return []
     if isinstance(recd, list):
@@ -4645,11 +4651,25 @@ async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
         items = []
     out = []
     for it in (items if isinstance(items, list) else []):
-        if len(out) >= limit:
-            break
         it = _first_dict(it)
         key = it.get("agent_type") or it.get("id")
-        if not key or key in exclude or is_operator(key) or any(p["key"] == key for p in out):
+        if key and not is_operator(key) and key not in out:
+            out.append(key)
+    return out
+
+
+async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
+                    origin: str = "primary") -> list:
+    """recommend_agents 로 좌석을 발굴해 [{key, role, origin}] 로 돌려준다.
+
+    첫 좌석·반대 도메인 좌석(F1)이 같은 코드를 쓴다 — 질의문만 다르다(이어하기 재심사는 _rescreen_seats).
+    도구 실패·빈 결과는 비치명적으로 빈 목록을 돌려준다. 좌석이 없어도 심의는 진행하고,
+    그 사실은 origin 표시가 없는 것으로 결정문에 남는다."""
+    out = []
+    for key in await _rank_keys(tools, q):
+        if len(out) >= limit:
+            break
+        if key in exclude:
             continue
         out.append({"key": key, "role": await _restore_role(tools, key), "origin": origin})
     return out
@@ -4706,6 +4726,96 @@ async def _counter_seats(tools: dict, llm, question: str, seated: list, limit: i
             seated_keys.add(c["key"])
             break                 # 축당 1명 — 축 다양성이 인원수보다 중요하다
     return out[:limit]
+
+
+def _seat_unit(key: str, wide: frozenset = frozenset()) -> str:
+    """이어하기 재심사가 '앉은 도메인' 으로 견주는 단위 — 보통은 첫 마디(_dom_of)이고, 넓은 접두(wide)는 둘째 마디까지다
+    (sw-field-monitoring → sw-field). 첫 마디로만 견주면 sw 좌석 하나가 sw-field-* · sw-voc-* 를 모두 막는다."""
+    head, _, rest = str(key or "").partition("-")
+    if head in wide and rest:
+        return f"{head}-{rest.split('-', 1)[0]}"
+    return _dom_of(key)
+
+
+async def _wide_prefixes(tools: dict) -> frozenset:
+    """넓은 접두 — 기본 둘(_RESCREEN_WIDE)에 지금 풀(list_agent_domains)에서 _RESCREEN_WIDE_MIN 명 넘게 모인 접두를 더한다.
+    분류를 못 받으면 기본 둘만이다."""
+    out = set(_RESCREEN_WIDE)
+    try:
+        rows = _parse_json_multi(await _call(tools, "list_agent_domains", {}))
+    except Exception:  # noqa: BLE001 — 분류 조회 실패는 비치명적
+        rows = []
+    for r in rows:
+        r = _first_dict(r)
+        try:
+            n = int(r.get("agent_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        dom = str(r.get("domain") or "").strip()
+        if dom and n >= _RESCREEN_WIDE_MIN:
+            out.add(dom)
+    return frozenset(out)
+
+
+async def _rescreen_axes(llm, question: str, note: str, seated_keys: set) -> tuple[list, str]:
+    """이어하기 재심사의 검색 축 — 사람 의견(없으면 원 질문)이 다루라는 것 가운데 앉은 좌석의 담당 범위 밖인 것을 짧은 명사구로
+    받는다(_counter_seats 와 같은 방식). 반환 (축들, 못 지은 까닭 — 지었으면 "").
+
+    이전 결론은 주지 않는다 — 축은 사람이 옮긴 방향에서 나와야 하고, 이전 결론은 지금 좌석의 어휘다."""
+    head = (f"[사람 의견 — 이번 회차에 다루라는 것]\n{_cut_mark(note, _narrow_cap(1500))}\n\n" if note else "")
+    ask = "사람 의견이 다루라는 것" if note else "질문이 요구하는 것"
+    try:
+        raw = await _llm_text(
+            llm,
+            "당신은 심의체 좌석 구성을 검토하는 조정자입니다. 짧고 건조하게 답하세요.",
+            f"[질문]\n{_cut_mark(question, _narrow_cap(1500))}\n\n{head}[이미 착석한 전문가]\n{', '.join(sorted(seated_keys))}\n\n"
+            f"{ask} 가운데 이 전문가들의 담당 범위로는 다루기 어려운 검토 축을 중요한 순서로 최대 {_RESCREEN_AXES}개 제시하라. "
+            "각 축을 전문가 검색에 쓸 짧은 명사구 한 줄로만 쓰고(8단어 이내), 설명·번호·기호 없이 줄바꿈으로 구분하라. "
+            "이미 착석한 분야를 다시 쓰지 마라.")
+    except Exception as exc:  # noqa: BLE001 — 축 명명 실패는 비치명적. 재심사 신규 좌석 없이 유임 전원으로 간다(호출부가 알린다)
+        return [], type(exc).__name__
+    axes = []
+    for ln in str(raw or "").splitlines():
+        ln = re.sub(r"^\s*(?:[-*•·]+|\d+[.)])\s*", "", ln).strip(" *`\t")[:60]     # 번호 · 글머리 · 굵게(**) 표지를 뗀다
+        if ln and not ln.startswith("…[") and ln not in axes:     # …[ — 출력 상한 절단 표지(_OUT_CUT_MARK)
+            axes.append(ln)
+        if len(axes) >= _RESCREEN_AXES:
+            break
+    return axes, ("" if axes else "빈 답")
+
+
+async def _rescreen_seats(tools: dict, llm, question: str, note: str, seated: list) -> tuple[list, dict]:
+    """이어하기 좌석 재심사(F10) — 유임 좌석 위에 더할 신규 좌석을 _RESCREEN_SEATS 명까지 고른다.
+    반환 (신규 좌석 [{key, role, origin: new, axis}], {queries: 물은 질의들, why: 축을 못 지은 까닭 — 지었으면 "", candidates: 후보 수}).
+
+    세 가지를 지킨다(HWAXPortal docs/deliberation-quality 42 — 10-31 dev 재실행에서 서비스 운영 · 필드 데이터 신규 좌석이 0 이던 까닭).
+    ① 깊이 — 축 질의마다 top_k 를 준다(_RESCREEN_TOP_K). 안 주면 5명뿐이라 앉은 도메인이 그 다섯을 채우면 새 도메인이 안 보인다.
+    ② 짧은 축 질의 — '원 질문 + 이전 결론 + 사람 의견' 한 덩이는 임베딩이 원 어휘 쪽으로 평균된다(_counter_seats 의 실측과 같은 까닭).
+       사람 의견(과 원 질문)에서 축을 받아 축마다 따로 묻고 후보를 합친다. 축을 못 지으면(LLM 실패 · 빈 답) 신규 좌석 없이 돌아간다 —
+       사람 의견을 통째로 한 질의로 물어도 같은 평균이 된다(dev 10-31 — 사람 의견 한 덩이로 물으면 앞의 새 도메인 둘이 필드 · 서비스
+       계열이 아니었다).
+    ③ 도메인 단위 — 넓은 접두는 둘째 마디까지 견준다(_seat_unit). 신규 좌석끼리도 단위가 겹치지 않는다.
+    고르는 차례는 깊이 우선이다 — 축마다 1위, 그다음 축마다 2위 … 라 한 축이 자리를 독식하지 않는다. 유임 좌석은 건드리지 않는다."""
+    seated_keys = {p["key"] for p in seated}
+    queries, why = await _rescreen_axes(llm, question, note, seated_keys)
+    if not queries:
+        return [], {"queries": [], "why": why, "candidates": 0}
+    wide, *ranked = await asyncio.gather(_wide_prefixes(tools),
+                                         *(_rank_keys(tools, q, _RESCREEN_TOP_K) for q in queries))
+    taken = {_seat_unit(k, wide) for k in seated_keys}
+    picks = []
+    for depth in range(max((len(r) for r in ranked), default=0)):
+        for q, keys in zip(queries, ranked):
+            unit = _seat_unit(keys[depth], wide) if depth < len(keys) else None
+            if unit is not None and unit not in taken and len(picks) < _RESCREEN_SEATS:
+                taken.add(unit)
+                picks.append({"key": keys[depth], "axis": q})
+        if len(picks) >= _RESCREEN_SEATS:
+            break
+    for p in picks:
+        p["role"] = await _restore_role(tools, p["key"])
+        p["origin"] = "new"
+    return picks, {"queries": queries, "why": why, "candidates": len({k for r in ranked for k in r})}
 
 
 def _fit_carry(nn: list, options: list) -> tuple[list, list, str]:
@@ -5760,22 +5870,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         if getattr(opts, "seats_clamped", None):
             yield _sse("status", {"step": f"⚠ 좌석 상한 {MAX_REQ_SEATS}석 초과 — 제외: "
                                           + ", ".join(opts.seats_clamped), "tool": None})
-        # 이어하기 좌석 재심사(F10) — 이어하기의 실효 질문은 원 질문이 아니라
-        # '원 질문 + 이전 결론 + 사람 의견'이다. 좌석을 그 위에서 다시 뽑아 새 도메인을 연다.
+        # 이어하기 좌석 재심사(F10) — 사람 의견이 주제를 옮겼을 수 있다. 그 의견(과 원 질문)에서 뽑은 짧은 축마다
+        # 좌석을 다시 찾아 새 도메인을 연다(_rescreen_seats — 축 질의 · 깊이 · 도메인 단위).
         # 유임은 전원 유지하고 신규만 더한다(정원 확대) — 좌석을 빼면 그 도메인의 이전 발언에
         # 대한 책임 주체가 사라지기 때문. DELIB_RESCREEN=0 으로 종전 동작(재심사 없음) 복귀.
         if opts.rescreen and (opts.continue_summary or opts.human_note):
-            eff_q = (f"{question}\n\n[이전 결론]\n{(opts.continue_summary or '')[:2000]}"
-                     f"\n\n[사람 의견]\n{(opts.human_note or '')[:1000]}")
-            _seated_dom = {_dom_of(p["key"]) for p in personas}
-            added = [c for c in await _discover(tools, eff_q, _RESCREEN_SEATS * 3,
-                                                exclude={p["key"] for p in personas}, origin="new")
-                     if _dom_of(c["key"]) not in _seated_dom][:_RESCREEN_SEATS]
-            if added:
-                personas.extend(added)
-                yield _sse("status", {"step": "이어하기 재심사 — 신규 좌석 " +
-                                              ", ".join(p["key"] for p in added),
-                                      "tool": "recommend_agents"})
+            yield _sse("status", {"step": "이어하기 재심사 — " + ("사람 의견" if opts.human_note else "원 질문")
+                                          + "에서 검색 축을 짓고 축마다 좌석을 찾는다", "tool": "recommend_agents"})
+            added, _rs = await _rescreen_seats(tools, llm, question, opts.human_note or "", personas)
+            personas.extend(added)
+            yield _sse("status", {"step": (
+                f"이어하기 재심사 — 검색 축을 짓지 못해({_rs['why']}) 신규 좌석 없이 유임 전원으로 간다" if _rs["why"] else
+                "이어하기 재심사 — 신규 좌석 " + ", ".join(f"{p['key']}({p['axis']})" for p in added) if added else
+                f"이어하기 재심사 — 신규 좌석 없음(축 {len(_rs['queries'])}개의 후보 {_rs['candidates']}명이 모두 앉은 좌석 · "
+                "앉은 도메인이거나 추천이 비었다)"), "tool": "recommend_agents"})
     else:
         personas = await _discover(tools, question, N_PERSONAS, origin="primary")
         _persona_shadow("delib", question, [p["key"] for p in personas], N_PERSONAS)   # 적기만 한다 — 좌석은 그대로다
