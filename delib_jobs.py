@@ -366,6 +366,18 @@ class DelibPaused(RuntimeError):
         super().__init__(pause_message(info))
 
 
+class DelibFinishing(RuntimeError):
+    """마무리 중인 잡의 접기를 거절한다(cancel) — 웹 멈춤 창구의 409 finishing 과 같은 뜻이다. MCP deliberate_cancel 은 이 글을 도구 오류로 낸다
+    (루틴 · 게이트웨이의 접기도 오류를 '접지 못했다' 로 읽는다)."""
+    code = "finishing"
+
+    def __init__(self, job_id: str):
+        super().__init__(f"{job_id} 는 접지 않는다(finishing — 마무리 중) — 의장이 결정문을 이미 냈다(끊기기 전에 낸 것도 같다). 남은 것은 "
+                         "요약 · 쉬운 설명 · Report Archive 저장이라 접으면 다 만든 결정문이 버려지고 RA 에 들어간 초안은 번호를 잃는다. 곧 "
+                         "끝난다 — deliberate_status 로 보고 deliberate_result 로 결정문을 받는다. 다단 심의는 그 단의 결정문 뒤 다음 단에서 "
+                         "다시 접을 수 있다")
+
+
 def _paused() -> bool:
     try:
         return pause_info() is not None
@@ -676,6 +688,7 @@ def _mark_interrupted(job: dict, track=None) -> None:
         track = _journal_track(job["id"])
     sr = track.summary(stages=_stages(job), stop_after_round=_stop_after(job), done_sk=_done_sk(job))
     job["status"], job["seat_resume"] = "interrupted", sr
+    job.pop("finishing", None)      # 끊긴 잡에는 접기 막음이 없다 — 다시 이으면 _reopen 이 재개 자료로 다시 정한다
     job["error"] = INTERRUPTED_MSG_EXACT if sr["ok"] else INTERRUPTED_MSG
 
 
@@ -1183,8 +1196,13 @@ def _apply(job: dict, event: str, data: dict) -> None:
             job["total_rounds"] = data.get("totalRounds")
             # 이 단의 턴이 시작되는 자리(HA-09 S4) — 다단 심의는 단마다 라운드를 1부터 센다. 제자리 이어하기(_reopen)가 끊긴 단의 턴만 뺀다.
             job["turns_from"] = len(job.get("turns") or [])
+        elif kind == "finishing":
+            # 마무리 표지 — 엔진은 의장 호출이 돌아온 바로 뒤에 낸다. 그 단의 결정문 사건까지 접기(cancel)를 거절한다(웹 멈춤의 409 finishing 과
+            # 같다 — 요약 · 쉬운 설명 · Report Archive 저장 중에 접으면 다 만든 결정문이 버려진다). 다단 심의는 그 단의 결정문에서 풀린다.
+            job["finishing"] = True
         elif kind == "decision":
             job["decision"] = data.get("text") or job.get("decision")
+            job["finishing"] = False
         elif kind == "outcome":
             job["report_id"] = data.get("report_id")
             job["title"] = data.get("title") or job.get("title")
@@ -1293,6 +1311,7 @@ async def _drive(job: dict, gen) -> None:
         _JOURNALS.pop(job["id"], None)
         job["finished_at"] = _now()
         job["updated_at"] = job["finished_at"]
+        job.pop("finishing", None)          # 끝난 잡에는 접기 막음이 없다(원장에 남기지 않는다)
         if job["status"] == "running":
             job["status"] = "error" if job.get("error") else "done"
         if not _closed_elsewhere(job):      # 다른 프로세스가 이미 고친 원장(재기동이 겹쳤다)은 덮지 않는다 — 시작 인자 파일 · 진행 일지도 그쪽 것이다
@@ -1558,7 +1577,15 @@ def _reopen(res: "delib_resume.Resume") -> dict:
     job["turns"] = t[:tf] + keep
     job.update(status="queued", stage="queued", error=None, finished_at=None, round=k, updated_at=now)
     job.pop("seat_resume", None)
+    # 끊긴 단의 결정문이 끊기기 전에 나왔으면(e:decision) 다시 선 잡은 처음부터 마무리 중이다 — 엔진이 그 단의 finishing 표지를 다시 내기 전(줄 ·
+    # 도구 로드 · 되살림)에 접으면 결정문 · 일지(재개 자료)가 함께 버려진다. 그 단의 결정문 사건이 막음을 푼다(_apply). 그 전에 끊겼으면 막지 않는다.
+    job["finishing"] = _finishing_of(res)
     return job
+
+
+def _finishing_of(res: "delib_resume.Resume") -> bool:
+    """제자리로 다시 서는 잡이 처음부터 마무리 중인가 — 끊긴 단의 결정문 뒤 줄(e:decision)이 일지에 있다."""
+    return bool(((res.info or {}).get("post") or {}).get("decision"))
 
 
 def resume_load(job: dict, *, groups: list | None) -> tuple:
@@ -1622,6 +1649,11 @@ def cancel(job_id: str, *, by: str = "") -> dict:
     if _foreign(job, by):
         # 누구 것인지는 말하지 않는다 — 주인의 계정도 남의 정보다.
         raise PermissionError(f"내가 시작한 심의가 아니다: {job_id} — 접을 수 있는 것은 제 것뿐이다")
+    if job["status"] in ("running", "queued") and job.get("finishing"):
+        # 마무리 중(엔진의 finishing 표지부터 그 단의 결정문 사건까지 — _apply · 제자리로 다시 선 잡은 끊기기 전에 낸 결정문 e:decision — _reopen)
+        # 이다. 웹 멈춤(app._web_cancel)의 409 finishing 과 같은 뜻으로 거절하고 잡은 끝까지 간다. 종전엔 접혀 결정문이 버려지고 RA 에 들어간 초안은
+        # 번호가 잡에 닿지 않았다 — 제자리 이어하기의 일지(재개 자료)까지 지워졌다(A24 고침 단계 보고).
+        raise DelibFinishing(job_id)
     if job_id in _PENDING:      # 줄 선 잡 — 태스크가 없다. 줄에서 빼면 끝이고, 도는 자리는 바뀌지 않는다
         del _PENDING[job_id]
         job["status"], job["error"] = "cancelled", "취소됨 — 줄을 선 채로 접었다(시작하지 않았다)"
@@ -1748,6 +1780,7 @@ def _requeue(app, job: dict, args: dict) -> bool:
             return False
         res.by = str(job["attempts"][-1].get("by") or "") if isinstance(job["attempts"][-1], dict) else ""
         ctx.run(delib_resume.restore.set, res)
+        job["finishing"] = _finishing_of(res)       # _reopen 과 같다 — 원장의 값이 아니라 다시 읽은 재개 자료로 정한다
     spawn = _make_spawn(app, job, _entry(spec), args["question"], list(args.get("groups") or []), dict(args.get("opts") or {}),
                         str(args.get("user_email") or ""), "", ext_kw, ctx)
     job.update(status="queued", stage="queued", durable=True, requeued=int(job.get("requeued") or 0) + 1, requeued_at=_now())

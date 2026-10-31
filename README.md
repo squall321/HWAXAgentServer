@@ -74,7 +74,12 @@ ChatDock (portal frontend)
   a newer deliberation in the same conversation; without it (an operator's loopback call) `run_id` picks one run, or every
   run in the conversation when absent. **The finishing tail is not cancelled**: the engine sends `event: delib {kind:
   "finishing"}` right after the chair call returns, and from there to that stage's `decision` frame (summary, plain
-  explanation, checks, Report Archive save) the call answers 409 `finishing` — the decision is kept. Answers: 200
+  explanation, checks, Report Archive save) the call answers 409 `finishing` — the decision is kept. MCP
+  `deliberate_cancel` follows the same rule (10-31): the job ledger marks the job finishing from that marker to that
+  stage's `decision` event, and the cancel is refused with a tool error (`delib_jobs.DelibFinishing`, `finishing — 마무리 중`)
+  while the job runs to its decision and report number; a job resumed in place whose cut stage already wrote `e:decision`
+  (HA-09 S3) is finishing from the reopen on, queued or running (before, the cancel discarded the decision and the
+  journal); a later stage of a multi-stage job can be cancelled again. Answers: 200
   `{status: "cancelling", runs}` · 200 `{status: "cancelling"|"cancelled", already: true}` for a repeat (idempotent) ·
   409 `finishing` · 409 `already_finished` with `status` (`done` · `error` · `interrupted`) when the run ended before
   the call · 404 `delib_not_found` (no such web deliberation of this server in that conversation) · 422 for a bad body

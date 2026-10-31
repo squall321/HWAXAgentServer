@@ -1015,9 +1015,13 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
 @mcp.tool(title="심의 취소",
           description="진행 중이거나 대기 중(queued)인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 "
                       "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다. 접을 수 있는 것은 내가 "
-                      "시작한 심의뿐이다.")
+                      "시작한 심의뿐이다. 의장이 결정문을 낸 뒤의 마무리(요약 · 쉬운 설명 · 보고서 저장) 중에는 접지 않고 "
+                      "오류(finishing)로 답한다 — 다 만든 결정문을 버리지 않는다. 다단 심의는 그 단의 결정문 뒤 다음 단에서 "
+                      "다시 접을 수 있다.")
 async def deliberate_cancel(job_id: Annotated[str, Field(description=_A_CANCEL_JOB_ID)], ctx: Context | None = None) -> dict:
-    """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다."""
+    """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다. 마무리 중(엔진의 finishing 표지부터 그 단의
+    결정문까지 — 제자리로 다시 선 잡은 끊기기 전에 결정문이 나왔으면 처음부터)이면 delib_jobs.DelibFinishing 으로 거절한다(웹 멈춤의 409
+    finishing 과 같은 뜻)."""
     user, _groups = _caller(ctx)
     return delib_jobs.cancel(job_id, by=user)
 
