@@ -1211,9 +1211,26 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "decision":
             job["decision"] = data.get("text") or job.get("decision")
             job["finishing"] = False
+            # 결정문 수치 대조(엔진의 numcheck — evidence.unsourced_numbers) — deliberate_result(view="summary") 가 옮긴다(HWAXPortal docs/token-saving
+            # P4a). 사건에 없으면 걷는다 — 다단 심의는 마지막 단의 것이고, 대조하지 않은 결정문(체크포인트 · 의장 실패)에 앞 단의 대조가 남지 않게.
+            if isinstance(data.get("numcheck"), dict):
+                job["numcheck"] = data["numcheck"]
+            else:
+                job.pop("numcheck", None)
         elif kind == "outcome":
             job["report_id"] = data.get("report_id")
             job["title"] = data.get("title") or job.get("title")
+            # 표결(집계 tally · 만장일치 · 좌석별 votes)과 RA 가 준 보고서 주소(url) — 웹 화면에만 가고 원장은 버리던 칸이다. 요약(view="summary")이
+            # 옮긴다. 사건에 없으면 걷는다(다단 심의는 마지막 단의 것).
+            for k in ("tally", "unanimous", "votes"):
+                if k in data:
+                    job[k] = data[k]
+                else:
+                    job.pop(k, None)
+            if data.get("url"):
+                job["report_url"] = data["url"]
+            else:
+                job.pop("report_url", None)
         elif kind == "plain":
             job["plain"] = data.get("text") or data.get("content")
         elif kind == "turn":

@@ -18,7 +18,7 @@ import call_trace                                       # 호출 추적(CALL_TRA
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
-from evidence import fit_document, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
+from evidence import fit_document, sig_numbers, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
 # _tools_by_name 이 세우고, _evidence_note(결정문 헤더)와 스트림(라이브 배너)이 읽는다.
@@ -7551,6 +7551,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         + list(knowledge_by_key.values()) + seat_lookups
         + [f"{_t}({_a}): {_o}" for _r, _s, _t, _a, _o in gather_pool])
     _bad_num = [] if (_chair_failed or _rint is not None) else unsourced_numbers(decision, _num_src, limit=0)
+    # 같은 판정을 칸으로도 남긴다 — 결정문 사건의 numcheck(잡 원장 → deliberate_result(view="summary"), HWAXPortal docs/token-saving P4a). 출처 없는
+    # 수치 전부 · 그 수 · 대조한 수치 수(경고 줄을 붙이기 **전** 결정문의 것). 대조하지 않은 결정문(의장 실패)에는 없다 — 빈 목록이면 '출처 없는
+    # 수치 0' 으로 읽힌다. 보고서 단계를 되살렸으면(S3) 대조를 다시 하지 않으니 끊기기 전 줄(e:report_intent)에 적어 둔 것을 쓴다(옛 일지는 없다).
+    _numcheck = (_rint.get("numcheck") if _rint is not None else None if _chair_failed else
+                 {"unsourced": list(_bad_num), "unsourced_count": len(_bad_num),
+                  "checked": len({n for _r, n in sig_numbers(decision)})})
     if _bad_num:
         # 보이는 것은 6건까지다(경고가 결정문을 덮지 않게). 대신 **총 건수**를 적는다 — 종전엔 6건에서
         # 끊고 나머지가 있다는 것도 감춰서, 몇 건이 지어낸 값인지 결정문만 봐서는 알 수 없었다.
@@ -7625,8 +7631,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                   "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
         if _rint is None and _jon:
             # 재개 자료(HA-09 S3 — e:report_intent) — RA 호출 직전. 이 줄만 남고 끊기면 저장됐는지 알 수 없다 — 이을 때 경고하고 새로 저장한다.
+            # 수치 대조 칸(numcheck)도 싣는다 — 이은 실행은 대조를 다시 하지 않는다(위).
             delib_resume.write(sk, "e:report_intent", sync=True, save=_do_save, append_to=_append_to,
-                               title=_ra_report_title(question), decision=decision)
+                               title=_ra_report_title(question), decision=decision, numcheck=_numcheck)
         if _rsav is not None:           # 되살림(S3) — 끊기기 전에 이 단계가 끝났다. 다시 저장하지 않고 받은 번호 · 안내를 쓴다(아래)
             _raw_made = None
         elif not _do_save:
@@ -7678,6 +7685,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         tally[_KEY[_norm_stance(o.get("stance"))]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
+    # 좌석별 표 — 집계와 같은 좌석 · 같은 정규화(착석 전원, 응답 못 한 좌석은 미표명 · responded 거짓). 결과 사건에 싣는다(잡 원장 →
+    # deliberate_result(view="summary") 의 표결 · 소수 의견, HWAXPortal docs/token-saving P4a — 원장의 전사로 다시 셈하면 전사 상한에 걸린 좌석을
+    # '응답 못 함' 으로 잘못 센다).
+    _last_by = {o.get("persona"): o for o in last_list}
+    votes = [{"seat": p["key"], "stance": _norm_stance(_last_by[p["key"]].get("stance")) if p["key"] in _last_by else "미표명",
+              "responded": p["key"] in _last_by} for p in personas]
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
     # 위키 단계를 되살렸으면(S3 e:wiki_sent) 다시 보내지 않고 그 안내와 꺼짐 상태(off — 다단 심의의 뒤 단이 꺼짐 안내를 또 붙이지 않게,
@@ -7701,14 +7714,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         out["decision"] = decision
     elif out is not None:
         out["chair_failed"] = (_chair_failed, _chair_knob)
-    yield _delib("decision", text=decision + report_note + wiki_note, **({"chair_failed": True} if _chair_failed else {}))
+    yield _delib("decision", text=decision + report_note + wiki_note, **({"chair_failed": True} if _chair_failed else {}),
+                 **({"numcheck": _numcheck} if isinstance(_numcheck, dict) else {}))
     yield _delib("outcome", report_id=rid, **({"url": rurl} if rurl else {}), title=_ra_report_title(question),
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
                  # 그대로 좌석 유실까지 막는다(응답 못 한 좌석은 abstain 으로 들어간다).
                  tally=tally, unanimous=(tally["total"] > 0
                                          and tally["agree"] == tally["total"]
-                                         and tally["abstain"] == 0))
+                                         and tally["abstain"] == 0), votes=votes)
 
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.
