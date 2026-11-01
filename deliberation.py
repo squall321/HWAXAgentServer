@@ -7911,5 +7911,6 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     else:
         text = "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요."
     yield _sse("token", {"delta": text})
-    yield _sse("result", {"type": "text", "content": text})
+    # 저장한 보고서를 구조로도 — 포털이 이 답 옆에 '발표자료로' 단추를 세운다(포털 docs/wda-deck WD-D12). 글을 파싱하지 않게, 성공일 때만.
+    yield _sse("result", {"type": "text", "content": text, **({"ra_report": {"id": rid, "title": title}} if rid else {})})
     yield _sse("done", {})
