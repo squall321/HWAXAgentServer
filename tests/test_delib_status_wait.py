@@ -156,7 +156,7 @@ def test_범위_밖의_기다림은_상한_안으로_죄고_그렇다고_말한�
     async def go():
         job = await _running(remote)
         t0 = time.monotonic()
-        out = await m.deliberate_status(job["id"], wait_s=asked)
+        out = await asyncio.wait_for(m.deliberate_status(job["id"], wait_s=asked), used + 2)    # 죄지 않으면 붙잡히지 않고 붉게 끝난다
         return out, time.monotonic() - t0
 
     out, took = _play(go)
@@ -212,6 +212,24 @@ def test_기다리는_사이_새_심의를_멈추면_돌아오고_이미_멈춘_
     first, second, took = _play(go)
     assert first["wait"]["woke"] == "paused" and first["wait"]["waited_s"] < 0.4, first["wait"]
     assert second["wait"]["woke"] == "timeout" and took >= 0.4, (second["wait"], took)
+
+
+def test_멈춤이_풀렸다가_기다리는_사이_다시_서도_돌아온다(remote, monkeypatch):
+    """깨는 것은 꺼짐 → 켜짐이다 — 부를 때 서 있던 멈춤이 풀린 뒤 다시 서면(다음 update-all) 그것도 재기동 앞이다."""
+    async def go():
+        job = await _running(remote)
+        st = delib_jobs.pause_state()
+        st.set_on(scope="delib", by="update-all", ttl_s=60)
+        call = asyncio.ensure_future(m.deliberate_status(job["id"], wait_s=4))
+        await asyncio.sleep(0.15)
+        held = not call.done()
+        st.set_off(by="update-all")
+        await asyncio.sleep(0.15)
+        st.set_on(scope="delib", by="update-all", ttl_s=60)
+        return held, await asyncio.wait_for(call, 3)
+
+    held, out = _play(go)
+    assert held and out["wait"]["woke"] == "paused", out["wait"]
 
 
 def test_이_서버가_돌리지_않는_잡은_기다리지_않는다(remote):

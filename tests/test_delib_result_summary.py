@@ -70,13 +70,14 @@ _GONE = object()          # _led(칸=_GONE) — 그 칸을 원장에서 뺀다(�
 
 
 def _led(**kw) -> dict:
-    """끝난 잡의 원장 — 마지막 라운드(3R) 좌석 다섯: a 동의 · b 반대(줄인 발언) · c 조건부 동의 · d 응답 못 함 · e 반대(전사에 발언이 없다)."""
+    """끝난 잡의 원장 — 마지막 라운드(3R) 좌석 다섯: a 동의 · b 반대(줄인 발언) · c 조건부 동의 · d 응답 못 함 · e 반대(이 단의 전사에 발언이
+    없다 — 앞 단(turns_from 앞)의 3R 발언은 이 단의 것이 아니다)."""
     now = delib_jobs._now()
     job = {"id": "default-20261102-030303-cccccc", "job": "default", "kind": "default", "label": "자유 심의", "status": "done",
            "question": "화두", "chair_template": None, "opts": {"sealed": None}, "stage": "report", "step": "", "round": 3,
            "total_rounds": 3, "turns_from": 2,
            "seats": [{"key": k} for k in "abcde"],
-           "turns": [{"persona": "a", "round": 3, "say": "앞 단의 3R — 세지 않는다", "stance": "반대"},       # 앞 단(turns_from 앞)
+           "turns": [{"persona": "e", "round": 3, "say": "앞 단의 e 3R — 이 단의 발언이 아니다", "stance": "반대"},  # 앞 단(turns_from 앞)
                      {"persona": "b", "round": 1, "say": "b 의 1라운드"},
                      {"persona": "a", "round": 3, "say": "a 최종 — 동의", "stance": "동의"},
                      {"persona": "b", "round": 3, "say": "b 최종(화면용)", "say_full": "b 최종(화면용) — 전문 " * 40,

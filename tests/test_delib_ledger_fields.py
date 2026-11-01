@@ -22,7 +22,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 import pytest  # noqa: E402
 
+import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
+from evidence import sig_numbers  # noqa: E402
 from test_delib_silent_drops import _pin_context  # noqa: E402, F401 — 모델 창 고정(자동 픽스처)
 from test_ha09_s1_resume import ROUNDS, TAGS, _cut, _eng, _kind, _oracle, world  # noqa: E402, F401 — world 는 픽스처
 from test_ha09_s3_post_idempotent import OPTS3, _resume_at, w3  # noqa: E402, F401 — w3 는 픽스처
@@ -33,16 +35,18 @@ _RA_URL = "/w/team-a/reports/77"
 
 @pytest.fixture
 def wd(world, monkeypatch):
-    """S1 가짜 위에 — 한 좌석(rel-drop)이 마지막 라운드에 반대하고, 의장 결정문에 근거에 없는 수치가 하나 있고, RA 가 보고서 주소를 준다."""
+    """S1 가짜 위에 — 한 좌석(rel-drop)이 마지막 라운드에 반대하고('동의하지 않습니다' — 정규화하면 반대다), 의장 결정문에 근거에 없는 수치와
+    있는 수치가 하나씩 있고, RA 가 보고서 주소를 준다."""
     real_llm, real_answer = d._llm_text, world.answer
 
     async def llm_text(llm, system, human, *img):
         out = await real_llm(llm, system, human, *img)
         tg = TAGS.get() or {}
         if _kind(system) == "seat" and tg.get("seat") == _DISSENT and tg.get("round") == ROUNDS:
-            return out.replace('"stance": "동의"', '"stance": "반대"')
+            return out.replace('"stance": "동의"', '"stance": "동의하지 않습니다"')
         if _kind(system) == "chair":
-            return out + "\n- 보스 두께를 13.75 mm 로 바꾼다"
+            # 근거에 없는 수치 하나(13.75)와 있는 수치 하나(700 — 좌석 지식카드 「시험 700」) — 대조한 수 checked 가 출처 없는 수와 갈린다
+            return out + "\n- 보스 두께를 13.75 mm 로 바꾼다\n- 낙하 시험은 700 회 기준이다"
         return out
 
     def answer(name, args):
@@ -69,11 +73,43 @@ def test_엔진은_좌석별_표와_수치_대조와_보고서_주소를_원장�
     assert (t["oppose"], t["agree"], t["total"]) == (1, len(votes) - 1, len(votes)) and led["unanimous"] is False, t
     assert led["report_url"] == _RA_URL
     nc = led["numcheck"]
-    assert "13.75" in nc["unsourced"] and nc["unsourced_count"] == len(nc["unsourced"]) and nc["checked"] >= nc["unsourced_count"], nc
-    # 칸은 결정문 끝의 경고 줄과 같은 판정이다(보이는 것은 6건까지 · 총 건수)
-    line = next(ln for ln in led["decision"].splitlines() if ln.startswith("> ⚠ 다음 수치는"))
+    assert "13.75" in nc["unsourced"] and nc["unsourced_count"] == len(nc["unsourced"]), nc
+    # 칸은 결정문 끝의 경고 줄과 같은 판정이다(보이는 것은 6건까지 · 총 건수) — 대조한 글은 경고 줄을 붙이기 전의 결정문이다
+    checked_text, warn = led["decision"].split("\n\n> ⚠ 다음 수치는")
+    line = warn.splitlines()[0]
     assert re.findall(r"`([^`]+)`", line) == nc["unsourced"][:6], line
     assert re.search(rf"(?:총 )?{nc['unsourced_count']}건\)", line), line
+    assert nc["checked"] == len({n for _r, n in sig_numbers(checked_text)}) > nc["unsourced_count"], nc
+    assert "700" not in nc["unsourced"], "시험 전제 — 지식카드에 있는 수치는 출처가 있다"
+
+
+def test_마지막_라운드에_응답하지_못한_좌석은_표에서_미표명이고_응답하지_않았다고_적힌다(wd, monkeypatch):
+    """집계는 응답 못 한 좌석을 미표명(abstain)으로 센다 — 좌석별 표도 같다. 원장의 전사로 다시 셈하면 전사 상한에 걸린 좌석과 갈리지 않는다."""
+    wd.fail = {(ROUNDS, "pcb-warp")}
+    led = _oracle(wd, monkeypatch)["led"]
+    votes = {v["seat"]: v for v in led["votes"]}
+    assert votes["pcb-warp"] == {"seat": "pcb-warp", "stance": "미표명", "responded": False}, votes["pcb-warp"]
+    t = led["tally"]
+    assert (t["abstain"], t["responded"], t["total"]) == (1, len(votes) - 1, len(votes)), t
+
+
+def test_원장은_사건에_없는_칸을_걷는다():
+    """다단 심의는 단마다 결정문 · 결과 사건이 온다 — 원장은 마지막 단의 것이다. 대조하지 않은 결정문(체크포인트 · 의장 실패) · 칸이 없는 결과
+    사건 뒤에 앞 단의 대조 · 표결 · 주소가 남으면 요약이 앞 단의 것을 이 결정문의 것처럼 보인다."""
+    job = {"id": "j", "status": "running", "question": "q"}
+
+    def feed(kind, **kw):
+        delib_jobs._apply(job, *delib_jobs._parse_sse(d._delib(kind, **kw)))
+
+    nc = {"unsourced": ["1.5"], "unsourced_count": 1, "checked": 2}
+    tally = {"agree": 1, "conditional": 0, "oppose": 0, "abstain": 0, "responded": 1, "total": 1}
+    votes = [{"seat": "a", "stance": "동의", "responded": True}]
+    feed("decision", text="1단 결정문", numcheck=nc)
+    feed("outcome", report_id=1, url="/w/a/reports/1", title="t", tally=tally, unanimous=True, votes=votes)
+    assert (job["numcheck"], job["tally"], job["unanimous"], job["votes"], job["report_url"]) == (nc, tally, True, votes, "/w/a/reports/1")
+    feed("decision", text="2단 — 의장이 결정문을 내지 못했다")
+    feed("outcome", report_id=None, title="t")
+    assert not [k for k in ("numcheck", "tally", "unanimous", "votes", "report_url") if k in job], job
 
 
 def test_수치가_다_근거에_있으면_수치_대조는_0건이고_경고_줄이_없다(world, monkeypatch):
