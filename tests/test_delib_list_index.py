@@ -111,6 +111,24 @@ def test_색인으로_만든_목록_행은_원장으로_만든_행과_같다(mon
     assert {r["turn_count"] for r in delib_jobs.list_jobs(100)} == {0, len(job["turns"])}
 
 
+def test_마무리_중인_잡도_색인으로_만든_행이_원장으로_만든_행과_같다(monkeypatch, tmp_path):
+    """목록 행의 finishing(11-01 — 접기가 거절될 동안만 붙는다). 이 프로세스 밖에서 도는 잡은 목록이 색인에서 읽는다 — 색인이 그 칸을 잃으면 같은
+    잡이 원장으로는 마무리 중, 목록으로는 아니게 보인다. 시계를 박는다 — 도는 · 줄 선 잡의 경과가 두 읽기에서 같게."""
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    monkeypatch.setattr(delib_jobs, "_PENDING", {})
+    monkeypatch.setattr(delib_jobs, "_now", lambda: 1_000_060.0)
+    base = {"id": "default-20261101-000000-fin00", "job": "default", "status": "running", "question": "q", "turns": [],
+            "started_at": 1_000_000.0 - 10, "updated_at": 1_000_030.0, "user": ME, "opts": {}}
+    for k, v in enumerate(({"finishing": True}, {"finishing": False},
+                           {"status": "queued", "started_at": None, "queued_at": 999_000.0, "finishing": True},
+                           {"status": "done", "finished_at": 1_000_050.0, "finishing": True})):    # 끝난 잡의 남은 칸은 보이지 않는다
+        delib_jobs._persist({**base, **v, "id": f"{base['id']}{k}"})
+    got = delib_jobs.list_jobs(10, viewer=ME)
+    assert got == _rows_from_ledger(ME), "색인으로 만든 행이 원장으로 만든 행과 다르다"
+    assert {r["job_id"][-1]: r.get("finishing") for r in got} == {"0": True, "1": None, "2": True, "3": None}, got
+
+
 def test_색인이_원장보다_오래됐으면_원장을_읽고_색인을_다시_쓴다(monkeypatch, tmp_path):
     """색인 쓰기가 실패했거나 색인 없는 판이 원장만 고쳐 썼으면 색인은 원장과 어긋난다 — 그대로 믿으면 옛 상태가 목록에 뜬다.
     원장의 mtime 을 앞당겨 둔다(다른 박스에서 옮겨 온 원장처럼) — 시각을 견주면 다시 쓴 색인도 영영 '오래됐다' 로 읽힌다."""

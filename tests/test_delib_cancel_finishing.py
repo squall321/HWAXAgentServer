@@ -1,4 +1,4 @@
-# MCP deliberate_cancel 의 마무리 막음 — 의장이 결정문을 낸 뒤(엔진의 finishing 표지부터 그 단의 결정문 사건까지) 접기를 거절하고 잡이 결정문 · 보고서 번호까지 가는지, 그 전 · 다단 심의의 다음 단에서는 종전대로 접히는지, 제자리로 다시 선 잡(끊기기 전에 결정문이 나왔다)은 처음부터 막히는지 본다
+# MCP deliberate_cancel 의 마무리 막음 — 의장이 결정문을 낸 뒤(엔진의 finishing 표지부터 그 단의 결정문 사건까지) 접기를 거절하고 잡이 결정문 · 보고서 번호까지 가는지, 그 전 · 다단 심의의 다음 단에서는 종전대로 접히는지, 제자리로 다시 선 잡(끊기기 전에 결정문이 나왔다)은 처음부터 막히는지, 진행 조회 · 목록이 그동안만 finishing 을 보이는지 본다
 #
 # 왜 생겼나. 웹 멈춤(app._web_cancel — A24 (나) 0e1d635 · bf8cc55)은 finishing 표지부터 그 단의 결정문까지 409 finishing 으로 접지 않는다 —
 # 요약 · 쉬운 설명 · 대조 · Report Archive 저장(실측 3시간 심의에 1시간 반) 중에 접으면 다 만든 결정문이 버려지고 RA 에 들어간 초안은 번호가 남지
@@ -261,3 +261,64 @@ def test_결정문_뒤에서_끊겨_줄에_다시_선_채로_재기동해도_원
     assert how == "refused" and "finishing" in what, (how, what)
     led = _on_disk({"id": jid})
     assert led["status"] == "done" and led["decision"] and led["report_id"], (led["status"], led.get("error"))
+
+
+# ── 진행 조회 · 목록 — 접기가 거절될 동안만 finishing 이 붙는다(11-01) ─────────────────────────────────────────
+# 종전엔 진행 조회에 마무리 표지가 없어 부르는 쪽(루틴 · 게이트웨이 · Claude)은 접어 보고서야(DelibFinishing) 거절될 것을 알았다. 판정은 접기의 거절과
+# 같은 것이다(delib_jobs._finishing).
+def _row(rows: list, jid: str) -> dict:
+    return next(r for r in rows if r["job_id"] == jid)
+
+
+def test_진행_조회와_목록은_결정문_뒤_마무리_중에만_finishing_을_보이고_그때_접기가_거절된다(world, gate):
+    async def go():
+        gate.arm("load")                              # 결정문 전 — 도구를 받는 자리
+        job = _start()
+        await asyncio.wait_for(gate.hit.wait(), 20)
+        before = await m.deliberate_status(job["id"])
+        loaded = gate.open
+        gate.arm("create_report_draft")               # 결정문 뒤 — 보고서 저장(마무리)
+        loaded.set()
+        await asyncio.wait_for(gate.hit.wait(), 20)
+        during = await m.deliberate_status(job["id"])
+        row = _row((await m.deliberate_list(ctx=_ctx(ME, AFF)))["jobs"], job["id"])
+        got = await _cancel(job["id"])
+        gate.open.set()
+        await _settle_all()
+        return before, during, row, got, await m.deliberate_status(job["id"])
+    before, during, row, (how, what), after = asyncio.run(go())
+    assert before["status"] == "running" and "finishing" not in before, before
+    assert during["status"] == "running" and during.get("finishing") is True, during
+    assert row["status"] == "running" and row.get("finishing") is True, row
+    assert how == "refused" and "finishing" in what, (how, what)
+    assert after["status"] == "done" and "finishing" not in after, after
+
+
+@pytest.mark.parametrize("line,finishing", [("e:report_intent", True), ("e:round_end", False)])
+def test_끊겨_줄에_다시_선_잡은_결정문_뒤에서_끊겼을_때만_줄에서부터_finishing_을_보인다(world, monkeypatch, tmp_path, line, finishing):
+    jid = _cut_after(world, monkeypatch, tmp_path, line, f"st-{line}")
+
+    async def go():
+        delib_jobs.closing(True)                      # 자리가 있어도 띄우지 않는다 — 줄에 선 채로 둔다
+        out = await m.deliberate_continue(previous_job_id=jid, ctx=_ctx(ME, AFF, ",".join(GROUPS)))
+        st = await m.deliberate_status(jid)
+        row = _row((await m.deliberate_list(ctx=_ctx(ME, AFF)))["jobs"], jid)
+        delib_jobs.closing(False)
+        delib_jobs._pump()
+        await _settle_all()
+        return out, st, row, await m.deliberate_status(jid)
+    try:
+        out, st, row, after = asyncio.run(go())
+    finally:
+        delib_jobs.closing(False)
+    assert out["resumed"]["mode"] == "in_place", out
+    assert st["status"] == "queued" and row["status"] == "queued", (st, row)
+    assert st.get("finishing") is (True if finishing else None) and row.get("finishing") is st.get("finishing"), (st, row)
+    assert after["status"] == "done" and "finishing" not in after, after
+
+
+def test_진행_조회_도구_설명이_finishing_이_무엇인지_말한다():
+    """칸만 있고 뜻이 없으면 부르는 쪽(LLM)은 그것을 접기 거절과 잇지 못한다 — tools/list 가 내주는 글(_STATE_DESC)에 적는다."""
+    desc = next(t.description for t in asyncio.run(m.mcp.list_tools()) if t.name == "deliberate_status")
+    for want in ("finishing 이 true 면", "deliberate_cancel 은 거절되고", "결정문 · 보고서까지 끝난다"):
+        assert want in desc, want

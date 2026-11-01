@@ -809,7 +809,7 @@ def _path(job_id: str) -> Path:
 _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts")
+              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts", "finishing")
 
 
 def _list_path(job_id: str) -> Path:
@@ -1603,6 +1603,12 @@ def _finishing_of(res: "delib_resume.Resume") -> bool:
     return bool(((res.info or {}).get("post") or {}).get("decision"))
 
 
+def _finishing(job: dict) -> bool:
+    """접기(cancel)를 거절하는 마무리 중인가 — 도는 잡 · 줄 선 잡에 막음 칸이 섰다(_apply · _reopen · _requeue). 진행 조회 · 목록의 finishing
+    (summary)이 같은 판정을 보인다 — 부르는 쪽이 접기를 청하기 전에 거절될 것을 안다."""
+    return job.get("status") in ("running", "queued") and bool(job.get("finishing"))
+
+
 def resume_load(job: dict, *, groups: list | None) -> tuple:
     """주인의 이어하기 — 끊긴 잡의 진행 일지에서 되살릴 재개 자료를 읽는다(HA-09 S1). (delib_resume.Resume, "") 또는 (None, 못 쓰는 까닭).
 
@@ -1664,7 +1670,7 @@ def cancel(job_id: str, *, by: str = "") -> dict:
     if _foreign(job, by):
         # 누구 것인지는 말하지 않는다 — 주인의 계정도 남의 정보다.
         raise PermissionError(f"내가 시작한 심의가 아니다: {job_id} — 접을 수 있는 것은 제 것뿐이다")
-    if job["status"] in ("running", "queued") and job.get("finishing"):
+    if _finishing(job):
         # 마무리 중(엔진의 finishing 표지부터 그 단의 결정문 사건까지 — _apply · 제자리로 다시 선 잡은 끊기기 전에 낸 결정문 e:decision — _reopen)
         # 이다. 웹 멈춤(app._web_cancel)의 409 finishing 과 같은 뜻으로 거절하고 잡은 끝까지 간다. 종전엔 접혀 결정문이 버려지고 RA 에 들어간 초안은
         # 번호가 잡에 닿지 않았다 — 제자리 이어하기의 일지(재개 자료)까지 지워졌다(A24 고침 단계 보고).
@@ -2017,6 +2023,10 @@ def summary(job: dict, *, full: bool = False) -> dict:
         # ⚠ 이 값으로 잡을 끊지 않는다. 시간으로 죽은 것을 판정하면 긴 심의를 죽은 것으로 읽는다.
         out["idle_s"] = round(max(0.0, _now() - (job.get("updated_at") or _now())), 1)
         out["last_step"] = job.get("last_step") or job.get("step")
+    if _finishing(job):
+        # 마무리 중이다(엔진의 finishing 표지부터 그 단의 결정문까지 · 결정문 뒤에서 끊겨 같은 job_id 로 다시 선 잡은 줄에서부터) — 접기
+        # (deliberate_cancel)는 거절되고(DelibFinishing) 잡은 결정문 · 보고서까지 간다. 종전엔 진행 조회에 그 표지가 없어 접어 보고서야 알았다.
+        out["finishing"] = True
     q = queue_info(job)
     if q:
         out["queue"] = q

@@ -79,7 +79,9 @@ ChatDock (portal frontend)
   stage's `decision` event, and the cancel is refused with a tool error (`delib_jobs.DelibFinishing`, `finishing — 마무리 중`)
   while the job runs to its decision and report number; a job resumed in place whose cut stage already wrote `e:decision`
   (HA-09 S3) is finishing from the reopen on, queued or running (before, the cancel discarded the decision and the
-  journal); a later stage of a multi-stage job can be cancelled again. Answers: 200
+  journal); a later stage of a multi-stage job can be cancelled again. `deliberate_status` and the `deliberate_list` rows
+  carry `finishing: true` exactly while that cancel would be refused (11-01 — before, a caller learned it only from the
+  refusal). Answers: 200
   `{status: "cancelling", runs}` · 200 `{status: "cancelling"|"cancelled", already: true}` for a repeat (idempotent) ·
   409 `finishing` · 409 `already_finished` with `status` (`done` · `error` · `interrupted`) when the run ended before
   the call · 404 `delib_not_found` (no such web deliberation of this server in that conversation) · 422 for a bad body
