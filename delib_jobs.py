@@ -1211,9 +1211,26 @@ def _apply(job: dict, event: str, data: dict) -> None:
         elif kind == "decision":
             job["decision"] = data.get("text") or job.get("decision")
             job["finishing"] = False
+            # 결정문 수치 대조(엔진의 numcheck — evidence.unsourced_numbers) — deliberate_result(view="summary") 가 옮긴다(HWAXPortal docs/token-saving
+            # P4a). 사건에 없으면 걷는다 — 다단 심의는 마지막 단의 것이고, 대조하지 않은 결정문(체크포인트 · 의장 실패)에 앞 단의 대조가 남지 않게.
+            if isinstance(data.get("numcheck"), dict):
+                job["numcheck"] = data["numcheck"]
+            else:
+                job.pop("numcheck", None)
         elif kind == "outcome":
             job["report_id"] = data.get("report_id")
             job["title"] = data.get("title") or job.get("title")
+            # 표결(집계 tally · 만장일치 · 좌석별 votes)과 RA 가 준 보고서 주소(url) — 웹 화면에만 가고 원장은 버리던 칸이다. 요약(view="summary")이
+            # 옮긴다. 사건에 없으면 걷는다(다단 심의는 마지막 단의 것).
+            for k in ("tally", "unanimous", "votes"):
+                if k in data:
+                    job[k] = data[k]
+                else:
+                    job.pop(k, None)
+            if data.get("url"):
+                job["report_url"] = data["url"]
+            else:
+                job.pop("report_url", None)
         elif kind == "plain":
             job["plain"] = data.get("text") or data.get("content")
         elif kind == "turn":
@@ -2044,6 +2061,75 @@ def summary(job: dict, *, full: bool = False) -> dict:
         out["applied_opts"] = _opts_view(job.get("opts") or {})
         if job.get("checkpoint"):
             out["checkpoint_payload"] = job["checkpoint"]
+    return out
+
+
+def decision_summary(job: dict) -> dict:
+    """deliberate_result(view="summary") 의 칸 — 결정에 필요한 것만, **원장에 있는 것만** 옮긴다(글을 짓지 않는다 — HWAXPortal docs/token-saving
+    P4a · TS-5). 없는 칸은 null 이고 까닭을 missing 에 적는다(빈 값으로 말없이 두지 않는다).
+    · decision — 결정문(full 의 decision 과 같은 글)
+    · votes — 결과 사건의 집계(tally) · 만장일치 · 좌석별 표(seats — 마지막 라운드 입장, 응답 못 한 좌석은 미표명 · responded 거짓)
+    · minority — 표가 '동의' 가 아닌 좌석(표 차례)의 마지막 라운드 발언(_minority)
+    · numcheck — 결정문 수치 대조(엔진의 evidence.unsourced_numbers — 출처 없는 수치 전부 · 그 수 · 대조한 수치 수)
+    · report_id · report_url — Report Archive 보고서 번호와 RA 가 준 주소"""
+    st = job.get("status")
+    missing: dict = {}
+
+    def gone(k: str, why: str) -> None:
+        missing[k] = f"아직 끝나지 않았다(status {st})" if st in ("queued", "running") else why
+
+    decision = job.get("decision") or job.get("result_text") or None
+    if decision is None:
+        err = str(job.get("error") or "").strip()
+        gone("decision", f"원장에 결정문이 없다(status {st}" + (f" — {err[:200]}" if err else "") + ")")
+    votes = minority = None
+    if isinstance(job.get("tally"), dict) and isinstance(job.get("votes"), list):
+        votes = {"tally": job["tally"], "unanimous": job.get("unanimous"), "seats": job["votes"]}
+        minority = _minority(job, job["votes"])
+    else:
+        gone("votes", "원장에 표결이 없다 — 결정문 단계까지 가지 못했거나(체크포인트 · 오류 · 취소) 이 판 이전에 돈 잡이다")
+        gone("minority", "표결(votes)이 없어 소수 의견을 가를 수 없다")
+    numcheck = job["numcheck"] if isinstance(job.get("numcheck"), dict) else None
+    if numcheck is None:
+        gone("numcheck", "원장에 결정문 수치 대조가 없다 — 의장 결정문이 없었거나(체크포인트 · 의장 실패 · 오류 · 취소) 이 판 이전에 돈 잡이다")
+    rid, url = job.get("report_id"), job.get("report_url") or None
+    if rid is None:
+        gone("report_id", "보고서를 남기지 않는 심의다(save_report=0)" if (job.get("opts") or {}).get("save_report") == 0 else
+             "원장에 보고서 번호가 없다 — 저장에 실패했거나 보고서 단계 전에 끝났다(결정문 끝의 안내를 본다)")
+    if url is None:
+        gone("report_url", "보고서 번호가 없다(report_id)" if rid is None else
+             "RA 가 보고서 주소를 주지 않았다(또는 이 판 이전에 돈 잡) — 번호로 연다")
+    return {"report_id": rid, "report_url": url, "votes": votes, "minority": minority, "numcheck": numcheck,
+            "missing": missing, "decision": decision}
+
+
+def _minority(job: dict, votes: list) -> list:
+    """표가 '동의' 가 아닌 좌석의 마지막 라운드 발언 — 그 단(turns_from 뒤)의 마지막 라운드(total_rounds) 턴을 원장 전사에서 찾아 화면용 글을
+    옮긴다(transcript 의 기본과 같은 꼴 — 줄였으면 say_clipped · say_full_chars, 전문은 deliberate_transcript(full=true)). 원장에 그 턴이
+    없으면 say 는 null 이고 까닭을 단다 — 응답하지 못한 좌석(표의 responded 거짓) · 전사 상한(TURN_MAX)에 걸려 적히지 않은 발언."""
+    t = job.get("turns") or []
+    tf = job.get("turns_from")
+    tf = tf if isinstance(tf, int) and not isinstance(tf, bool) and 0 <= tf <= len(t) else 0
+    n = job.get("total_rounds")
+    last = {x.get("persona"): x for x in t[tf:] if isinstance(x, dict) and x.get("persona") and x.get("round") == n}
+    out = []
+    for v in votes:
+        if not isinstance(v, dict) or v.get("stance") == "동의":
+            continue
+        row = {"seat": v.get("seat"), "stance": v.get("stance")}
+        turn = last.get(v.get("seat"))
+        if turn is None:
+            row["say"] = None
+            row["missing"] = ("마지막 라운드에 응답하지 못했다" if v.get("responded") is False else
+                              f"원장 전사에 이 좌석의 마지막 라운드 발언이 없다(전사 상한 DELIB_JOB_TURN_MAX {TURN_MAX}턴을 넘었을 수 있다)")
+        else:
+            tv = _turn_view(turn, False)
+            row["say"] = tv.get("say")
+            if tv.get("say_clipped"):
+                row["say_clipped"] = True
+                if tv.get("say_full_chars") is not None:
+                    row["say_full_chars"] = tv["say_full_chars"]
+        out.append(row)
     return out
 
 

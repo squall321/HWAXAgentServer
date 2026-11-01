@@ -362,6 +362,39 @@ written next to every ledger write) instead of the full ledger, which grows to M
 index carries the ledger's mtime and size; a stale or missing index is rebuilt from the ledger on the next
 read, so the `list/` folder is derived data and may be deleted.
 
+### Waiting status and short views
+
+`deliberate_status(job_id, part, wait_s=0, brief=False)` and `deliberate_result(job_id, part, view="full")` take optional
+token-saving arguments (portal `docs/token-saving` P3 · P4a, user decision 11-02). Without them the answers are byte-for-byte
+the old ones — the routine executor (`routine._job_status` · `_delib_step`, which reads every page of the full result), the
+portal and the gateway call with the defaults.
+
+- `wait_s` — the server waits instead of the caller polling in a loop. It re-reads the in-memory job ledger every 0.5 s (no LLM
+  call) and answers once `status`, `stage` or `round` differs from the call start, or the job is over. The answer carries
+  `wait{wait_s, waited_s, woke, changed?, clamped?}`; `woke` is `ended` · `changed` · `timeout` · `closing` (this server got its
+  stop signal — answered inside uvicorn's graceful window) · `paused` (the new-deliberation pause came on during the wait; a
+  pause already on at call start does not wake it, or the caller would spin through the whole pause) · `untracked` (only a
+  ledger file says running — nothing in this process changes it). Out-of-range or non-numeric values are clamped and
+  `clamped` says so. `page.next` keeps `brief` and drops `wait_s` (later pages come at once).
+- Time layers (dev, 11-02): gateway per-call limit 600 s (backend read 660) · nginx 3600 · SSE ping every 15 s keeps the
+  connection alive · mcp-remote has no per-request limit · Claude Code's `MCP_TOOL_TIMEOUT` default is very large. The cap stays
+  below the smallest of them. A gateway restart waits only `GATEWAY_DRAIN_TIMEOUT` (30 s) for calls in flight, so a waiting
+  call may be cut then — the client simply calls again.
+- `brief` — the large fields repeated on every call become heads and counts: `question` → `question_head` (80 chars) and
+  `question_chars`, `seats` → `seat_count`, `warnings` → `warnings_total` (already there), `evidence_omitted` →
+  `evidence_omitted_total`. Every other field stays as it was.
+- `view="summary"` — only what a decision needs, copied from the ledger (never written): `decision`, `votes{tally, unanimous,
+  seats[{seat, stance, responded}]}`, `minority` (each non-agreeing seat's last-round turn as shown on screen, with
+  `say_clipped` · `say_full_chars` when shortened), `numcheck{unsourced, unsourced_count, checked}` (the engine's
+  `evidence.unsourced_numbers` on the decision), `report_id`, `report_url`, and `full_parts` (pages of the full view). A field
+  the ledger lacks is `null` with the reason in `missing`. The engine puts `numcheck` on the `decision` event and `votes` on
+  `outcome`; the ledger keeps them with `tally`, `unanimous` and the RA `url` (`report_url`). Jobs from before this build lack
+  them, and the summary says so.
+
+| var | default | meaning |
+|---|---|---|
+| `DELIB_STATUS_WAIT_MAX_S` | `240` | Longest `deliberate_status` wait. Above 540 is read as 540 (warning) — it must stay below the gateway's per-call limit (600) or a waiting call ends in a gateway error. Negative is 0 (waiting off — every wait answers at once, with `clamped`). Not a number is the default, with a warning. Read once at startup. |
+
 ### Card review
 
 `card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review

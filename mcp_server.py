@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import unquote
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -453,6 +453,46 @@ _A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 이름과 뜻(time
                "설명의 advanced 절이다.")
 _A_JOB_ID = "심의 잡 id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
 _A_PART = "응답이 쪽으로 나뉘었을 때 받을 쪽(1부터 — page.next 가 다음 쪽을 알려 준다)."
+
+# 진행 조회 기다림(deliberate_status wait_s — HWAXPortal docs/token-saving P3 · TS-5 사용자 결정 11-02) — 부르는 쪽이 고리로 거듭 묻지 않게 서버가 잡
+# 원장을 짧은 간격으로 보며(LLM 호출 없음) 상태 · 단계 · 라운드가 바뀌거나 끝날 때까지 기다린다. 본은 review_task_next 의 긴 폴링이다(status_wait 는
+# 챗 턴 것이다). 시간 층(dev 실측 11-02) — 게이트웨이 호출 한도 600초 · 백엔드 읽기 660초 · nginx 3600초 · SSE 15초 ping 이 연결을 살린다 ·
+# mcp-remote 는 요청마다 한도가 없다 · Claude Code MCP_TOOL_TIMEOUT 기본값은 아주 크다. 상한은 그 가운데 가장 작은 게이트웨이 600초보다 넉넉히
+# 아래다(기본 240 · 위쪽 STATUS_WAIT_CEIL_S — 안쪽이 먼저 걸려야 한다. 더 크게 적으면 기다리던 호출이 게이트웨이에서 오류로 끊긴다). 게이트웨이를
+# 재기동하면 도는 호출을 30초(GATEWAY_DRAIN_TIMEOUT)만 기다린다 — 그때 기다리던 호출은 끊길 수 있고 부르는 쪽은 그냥 다시 부른다. 이 서버가
+# 내려가기 시작하면(종료 신호 — delib_jobs.closing) · 기다리는 사이 운영이 새 심의를 멈추면(재기동 앞에 선다) 일찍 돌아온다.
+STATUS_WAIT_DEFAULT_S = 240.0
+STATUS_WAIT_CEIL_S = 540.0
+STATUS_POLL_S = 0.5     # 원장을 다시 보는 간격 — 종료 신호 뒤 uvicorn 이 열린 연결을 기다리는 AGENT_GRACEFUL_S(기본 1초) 안에 답하게
+
+
+def _status_wait_cap(env=os.environ) -> float:
+    """DELIB_STATUS_WAIT_MAX_S — 진행 조회 기다림의 상한(초). 비었거나 수가 아니면 기본값, 0 보다 작으면 0(기다림 끔), STATUS_WAIT_CEIL_S 보다
+    크면 그 값이다(경고 한 줄)."""
+    raw = str(env.get("DELIB_STATUS_WAIT_MAX_S") or "").strip()
+    try:
+        v = float(raw) if raw else STATUS_WAIT_DEFAULT_S
+    except ValueError:
+        v = math.nan
+    if math.isnan(v):
+        log.warning("env DELIB_STATUS_WAIT_MAX_S=%r 를 초로 읽지 못했다 — 기본값 %g", raw[:40], STATUS_WAIT_DEFAULT_S)
+        return STATUS_WAIT_DEFAULT_S
+    if v > STATUS_WAIT_CEIL_S:
+        log.warning("env DELIB_STATUS_WAIT_MAX_S=%g 는 게이트웨이 호출 한도(600초)에 너무 가깝다 — %g 로 읽는다", v, STATUS_WAIT_CEIL_S)
+        return STATUS_WAIT_CEIL_S
+    return max(0.0, v)
+
+
+STATUS_WAIT_MAX_S = _status_wait_cap()
+_Q_HEAD = 80            # brief 의 화두 머리(자)
+_A_WAIT = (f"초 — 주면 상태 · 단계 · 라운드가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초 · 그 밖이면 죄고 "
+           "wait.clamped). 깬 까닭은 wait.woke — ended · changed(wait.changed) · timeout · closing(서버 재기동) · paused(새 심의 멈춤) · "
+           "untracked(이 서버가 돌리지 않는 잡). 게이트웨이 재기동에 끊기면 다시 부른다. 기본 0(기다리지 않는다).")
+_A_BRIEF = ("참이면 부를 때마다 같은 큰 칸을 뺀다 — 화두는 앞 80자(question_head · question_chars), 좌석 키는 seat_count, 경고 · 빠진 근거는 "
+            "수(warnings_total · evidence_omitted_total)만. 다음 걸음을 정할 칸(상태 · 단계 · 라운드 · 줄 · 오류 · 재개)은 그대로다.")
+_A_VIEW = ("full(기본 — 결정문 전문에 쉬운 설명 · 좌석 상세 · 상태줄 · 손잡이 · 경고 · 빠진 근거 · 화두) | summary(결정문 · 표결 votes · 소수 의견 "
+           "minority · 수치 대조 numcheck · 보고서 번호와 주소 · full 의 쪽 수 full_parts 만 — 없는 칸은 null 이고 까닭은 missing). summary 를 먼저 "
+           "받고 모자랄 때만 full.")
 _A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
 _A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
 _A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
@@ -948,22 +988,106 @@ async def deliberate_continue(
 # 화두는 새 쪽에서 시작한다(tail_page) — 시작·이어하기가 화두 전문을 받으라고 보내는 곳이 도는 심의의 진행 조회다.
 _JOB_IDS = ("job_id", "status")
 _JOB_TAIL = ("question",)
+_LIVE = ("queued", "running")           # 바뀔 수 있는 상태 — 나머지(done · error · cancelled · interrupted)는 끝이다
+_WAIT_ON = ("status", "stage", "round")
+
+
+def _wait_span(asked) -> tuple[float, str]:
+    """(기다릴 초, 죈 사실) — 0 ~ STATUS_WAIT_MAX_S 밖이면 그 끝으로(수가 아니면 0으로) 죄고 그렇다고 적는다."""
+    want = float(asked)
+    use = 0.0 if math.isnan(want) else min(max(want, 0.0), STATUS_WAIT_MAX_S)
+    if use == want:
+        return use, ""
+    return use, f"wait_s={want:g} → {use:g}초(받는 범위 0~{STATUS_WAIT_MAX_S:g}초 — 상한 DELIB_STATUS_WAIT_MAX_S)"
+
+
+async def _status_wait(job_id: str, job: dict, asked) -> tuple[dict, dict]:
+    """deliberate_status(wait_s) — 이 프로세스의 잡 원장(메모리)을 STATUS_POLL_S 마다 본다. (그때의 잡, 응답의 wait 칸)을 돌려준다.
+
+    깨는 까닭(woke) — ended(끝난 상태 — 부를 때 이미 끝났으면 기다리지 않는다) · changed(status · stage · round 가 부를 때와 다르다 — changed 에
+    그 칸) · timeout(바뀐 것 없이 다 기다렸다) · closing(이 서버가 내려간다) · paused(기다리는 사이 새 심의 멈춤이 섰다 — 이미 서 있던 멈춤으로는
+    깨지 않는다: 곧바로 돌려보내면 부르는 쪽이 멈춤 내내(최대 6시간 · 사람의 고정은 끝없이) 쉬지 않고 다시 부른다) · untracked(이 프로세스가
+    돌리지 않는 잡 — 원장 파일에만 '도는 중' 이다. 여기서는 바뀌지 않고, 기다리면 파일(수 MB)을 거듭 읽는다)."""
+    use, clamped = _wait_span(asked)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    mark = {k: job.get(k) for k in _WAIT_ON}
+    was_paused = delib_jobs._paused()
+    while True:
+        live = delib_jobs._JOBS.get(job_id)
+        job = live if live is not None else job
+        changed = [k for k in _WAIT_ON if job.get(k) != mark[k]]
+        if job.get("status") not in _LIVE:
+            woke = "ended"
+        elif live is None:
+            woke = "untracked"
+        elif changed:
+            woke = "changed"
+        elif delib_jobs._CLOSING:
+            woke = "closing"
+        elif (paused := delib_jobs._paused()) and not was_paused:
+            woke = "paused"
+        elif loop.time() - t0 >= use:
+            woke = "timeout"
+        else:
+            was_paused = paused
+            await asyncio.sleep(min(STATUS_POLL_S, max(0.0, t0 + use - loop.time())))
+            continue
+        break
+    info = {"wait_s": use, "waited_s": round(loop.time() - t0, 1), "woke": woke}
+    if changed:
+        info["changed"] = changed
+    if clamped:
+        info["clamped"] = clamped
+    return job, info
+
+
+def _brief_status(out: dict, job: dict) -> dict:
+    """deliberate_status(brief=True) — 부를 때마다 같은 큰 칸을 머리 · 수로 바꾼다(화두 전문 → 앞 _Q_HEAD 자와 길이 · 좌석 키 목록 → 수 · 경고 →
+    전체 수(warnings_total 이 이미 있다) · 좌석에 주지 않은 근거 → 전체 수). 나머지 칸은 같은 자리 · 같은 값이다 — 다음 걸음(기다림 · 결과 받기 ·
+    이어하기 · 접기)을 정하는 칸(상태 · 단계 · 라운드 · 줄 · 오류 · 재개 · 마무리 중 · 경과)을 빼지 않는다."""
+    b: dict = {}
+    for k, v in out.items():
+        if k == "question":
+            q = str(v or "")
+            b["question_head"] = q if len(q) <= _Q_HEAD else q[:_Q_HEAD] + "…"
+            b["question_chars"] = len(q)
+        elif k == "seats":
+            b["seat_count"] = len(v or [])
+        elif k == "evidence_omitted":
+            # 상한(OMITTED_MAX) 뒤에는 원장이 [머리 · 안내 한 줄 · 꼬리]만 둔다 — 넘친 수(evidence_omitted_over)로 센다
+            over = int(job.get("evidence_omitted_over") or 0)
+            b["evidence_omitted_total"] = delib_jobs.OMITTED_MAX + over if over else len(v or [])
+        elif k != "warnings":
+            b[k] = v
+    b["brief"] = True
+    return b
 
 
 @mcp.tool(title="심의 진행 상황",
           description="HWAX 심의가 어디까지 갔는지 본다 — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지. "
+                      f"**고리로 거듭 묻지 마라** — wait_s 로 한 번 부르면 바뀌거나 끝날 때까지(최대 {STATUS_WAIT_MAX_S:g}초) 서버가 기다렸다 "
+                      "답한다. 화두 전문 · 목록 칸이 필요 없으면 brief=true. "
                       + _STATE_DESC + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
                       "칸이 다 실린다.")
 async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
+                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            wait_s: Annotated[float, Field(description=_A_WAIT)] = 0,
+                            brief: Annotated[bool, Field(description=_A_BRIEF)] = False,
+                            ctx: Context | None = None) -> dict:
     """심의 진행 상황. status 가 done 이면 deliberate_result 로 결정문을 받는다.
 
     queued 면 아직 시작 전이다 — queue 에 내 순번(position)과 앞에 선 수(ahead)가 있다.
-    part — 응답이 쪽으로 나뉘었을 때 받을 쪽(1부터, page.next 가 알려 준다)."""
+    part — 응답이 쪽으로 나뉘었을 때 받을 쪽(1부터, page.next 가 알려 준다). wait_s — 0 보다 크면 바뀌거나 끝날 때까지 기다린다(_status_wait —
+    응답의 wait 칸). brief — 큰 칸을 머리 · 수로(_brief_status). 둘 다 주지 않으면(기본) 응답은 종전과 바이트까지 같다 — 루틴(routine._job_status) ·
+    포털 · 게이트웨이가 기본값으로 부른다. page.next 는 brief 를 싣고 wait_s 는 싣지 않는다(다음 쪽은 곧바로 온다)."""
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
     _need_read(job, ctx)
+    waited = None
+    if wait_s:
+        job, waited = await _status_wait(job_id, job, wait_s)
     out = delib_jobs.summary(job)
     # 좌석에 주지 않은 근거는 **도는 동안** 보여야 한다 — 결정문을 받을 때 알면 이미 수십 분을
     # 쓴 뒤다. 목록(deliberate_list)에는 싣지 않으려고 summary 가 아니라 여기서 붙인다.
@@ -975,25 +1099,62 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
     if "idle_s" in out:
         # idle_s 를 무엇과 견줄지 — 좌석 발언 하나가 조용할 수 있는 최장 시간(무제한이면 None).
         out["quiet_ok_s"] = _quiet_ok_s(job)
-    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
+    if brief:
+        out = _brief_status(out, job)
+    if waited is not None:
+        out["wait"] = waited
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True,
+                           again={"job_id": job_id, **({"brief": True} if brief else {})})
 
 
-@mcp.tool(title="심의 결과(결정 문서) 회수",
-          description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중(running)이면 현재 단계만, "
-                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
-                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
-async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
-    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
-    job = delib_jobs.get(job_id)
-    if not job:
-        raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
-    _need_read(job, ctx)
+_VIEWS = ("full", "summary")
+
+
+def _result_full(job: dict) -> dict:
+    """deliberate_result 의 full 응답(쪽 나누기 전) — 기본 응답이고, 요약(view="summary")은 이것의 쪽 수를 센다(full_parts)."""
     out = delib_jobs.summary(job, full=True)
     if job.get("status") == "running":
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
     elif out.get("queue"):
         out["note"] = "아직 시작 전이다 — " + _queued_note(out["queue"])
+    return out
+
+
+def _result_summary(job_id: str, job: dict, full: dict) -> dict:
+    """view="summary" — 원장에 있는 칸만(delib_jobs.decision_summary)과 full 로 부를 때의 쪽 수(full_parts — 같은 잡을 view 없이 부르면 나오는
+    page.parts, 한 쪽이면 1). 결정문은 맨 뒤다 — 쪽으로 나뉘어도 짧은 칸(표결 · 소수 의견 · 수치 대조 · 보고서 · 쪽 수 · 까닭)이 첫 쪽에 다 있다."""
+    s = delib_jobs.decision_summary(job)
+    fp = mcp_pages.paged(full, part=1, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
+    out = {"job_id": job["id"], "status": job.get("status"), "view": "summary",
+           "full_parts": int((fp.get("page") or {}).get("parts") or 1),
+           **{k: v for k, v in s.items() if k != "decision"}}
+    if full.get("note"):
+        out["note"] = full["note"]
+    out["decision"] = s["decision"]
+    return out
+
+
+@mcp.tool(title="심의 결과(결정 문서) 회수",
+          description="끝난 HWAX 심의의 결정 문서를 받는다. **먼저 view=\"summary\"** — 결정문 · 표결 · 소수 의견 · 수치 대조 · 보고서만 준다"
+                      "(화두 되풀이 · 상태줄 · 좌석 상세 · 손잡이가 없다). full 은 그 밖이 필요할 때만. 아직 진행 중(running)이면 현재 단계만, "
+                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
+                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
+async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            view: Annotated[Literal["full", "summary"], Field(description=_A_VIEW)] = "full",
+                            ctx: Context | None = None) -> dict:
+    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
+    루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다)."""
+    if view not in _VIEWS:
+        raise ValueError(f"view 는 {' · '.join(_VIEWS)} 가운데 하나다 — 받은 값: {view!r}")
+    job = delib_jobs.get(job_id)
+    if not job:
+        raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
+    _need_read(job, ctx)
+    out = _result_full(job)
+    if view == "summary":
+        return mcp_pages.paged(_result_summary(job_id, job, out), part=part, ids=_JOB_IDS, tail=("decision",),
+                               again={"job_id": job_id, "view": "summary"})
     return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
 
 
