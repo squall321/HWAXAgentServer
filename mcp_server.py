@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from typing import Annotated
 from urllib.parse import unquote
@@ -369,22 +370,29 @@ def _queued_note(q: dict) -> str:
 def _quiet_ok_s(job: dict) -> float | None:
     """그 잡에서 좌석 발언 하나가 이벤트 없이 조용할 수 있는 최장 시간(초) — LLM 호출 한 번의 최악((호출 한도 ×
     시도 횟수) + 재시도 대기)에 그 발언이 잇는 호출 수(1 + 파싱 재시도)를 곱한다. 진행 조회의 idle_s 가 이
-    안이면 기다리는 중이다. 한도가 꺼져 있으면(무제한) None 이다. **상한은 아니다**(엔진 _quiet_calls 의 ⚠).
+    안이면 기다리는 중이다. 한도가 꺼져 있으면(무제한) None 이다 — 셈할 수 없을 만큼 큰 한도(inf · 실수로 바꾸지 못하는 시도 횟수)도
+    같다(수를 지어내지 않는다). **상한은 아니다**(엔진 _quiet_calls 의 ⚠).
 
     그 잡에 **실제로 걸린 값**으로 잰다 — 요청 timeout_s 로 돈 잡은 그 값(원장에 상한에서 죈 값이 적혀 있다),
     아니면 서버의 심의 LLM 에 걸린 값이다. 시도 횟수는 그 LLM 의 것이다(DELIB_LLM_MAX_RETRIES + 1)."""
     read, tries = _engine._llm_limit(getattr(getattr(_APP, "state", None), "delib_llm", None))
     opts = job.get("opts") or {}
     asked = opts.get("timeout_s")
-    if isinstance(asked, (int, float)) and not isinstance(asked, bool) and asked > 0:
-        read = float(asked)
-    if not (read > 0 and tries > 0):
+    try:
+        if isinstance(asked, (int, float)) and not isinstance(asked, bool) and asked > 0:
+            read = float(asked)
+        if not (read > 0 and tries > 0):
+            return None
+        # 잇는 호출 수는 **엔진이 읽는 대로** 센다 — 원장에는 보낸 손잡이만 있고(안 보낸 것은 서버 기본값), 인용
+        # 계약·웹 리서치가 파싱 재시도 하한을 올린다. 그 넷만 넘긴다(원장의 좌석·근거는 본문이 아니라 건수다).
+        eff = _engine._resolve_opts({k: opts[k] for k in ("parse_retries", "rebut_quote", "chair_bestof",
+                                                          "search_sources") if k in opts})
+        quiet = _engine._quiet_calls(eff) * (read * tries + 8)
+    except OverflowError:
+        # 시도 횟수(DELIB_LLM_MAX_RETRIES) · 원장의 timeout_s 가 실수로 바꾸지 못할 만큼 크다 — 종전엔 이 OverflowError 로 진행 조회가 통째로
+        # 넘어졌다(그런 값으로 기동 절차를 연 시험 뒤의 진행 조회 시험이 순서에 따라 붉었다). 무제한과 같게 None 이다.
         return None
-    # 잇는 호출 수는 **엔진이 읽는 대로** 센다 — 원장에는 보낸 손잡이만 있고(안 보낸 것은 서버 기본값), 인용
-    # 계약·웹 리서치가 파싱 재시도 하한을 올린다. 그 넷만 넘긴다(원장의 좌석·근거는 본문이 아니라 건수다).
-    eff = _engine._resolve_opts({k: opts[k] for k in ("parse_retries", "rebut_quote", "chair_bestof",
-                                                      "search_sources") if k in opts})
-    return round(_engine._quiet_calls(eff) * (read * tries + 8), 1)
+    return round(quiet, 1) if math.isfinite(quiet) else None      # inf 한도(DELIB_TIMEOUT_S=inf)도 None — JSON 에 Infinity 를 싣지 않는다
 
 
 def _evid_limits() -> dict:

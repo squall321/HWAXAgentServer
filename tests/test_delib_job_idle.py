@@ -119,6 +119,25 @@ def test_조용해도_되는_시간은_그_잡에_걸린_한도로_잰다(eng, m
     assert _play(lambda: scenario(SimpleNamespace(delib_llm=None))) is None
 
 
+def test_셈할_수_없을_만큼_큰_한도도_진행_조회를_넘어뜨리지_않고_quiet_ok_s_는_null_이다(monkeypatch):
+    """종전엔 시도 횟수가 실수로 바꾸지 못할 만큼 크면 quiet_ok_s 셈이 OverflowError 로 진행 조회를 통째로 넘어뜨렸다 — 그런 값
+    (DELIB_LLM_MAX_RETRIES=9…9 400자리)으로 기동 절차를 연 시험 뒤의 진행 조회 시험이 순서에 따라 붉었다(11-01). inf 한도는 Infinity 를 실었다.
+    한도가 꺼진 박스와 같게 null 이다(수를 지어내지 않는다)."""
+    _Clock(monkeypatch)
+    huge = int("9" * 400)       # 정수로는 읽힌다 — 실수로 바꾸는 순간 OverflowError 다(tests/test_external_llm_review2_fixes 의 _HUGE)
+    job = {"id": "t-huge-limit", "status": "running", "question": "q", "started_at": delib_jobs._now(),
+           "updated_at": delib_jobs._now()}
+    monkeypatch.setitem(delib_jobs._JOBS, job["id"], job)
+    for llm, opts in ((_llm(1800.0, huge), {}),                  # 시도 횟수가 그만큼 큰 박스
+                      (_llm(float("inf"), 1), {}),               # DELIB_TIMEOUT_S=inf
+                      (_llm(1800.0, 1), {"timeout_s": huge})):   # 원장의 요청 한도가 그만큼 크다(손으로 고친 원장)
+        monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(delib_llm=llm)))
+        job["opts"] = opts
+        out = asyncio.run(m.deliberate_status(job["id"]))
+        assert out["status"] == "running" and out["quiet_ok_s"] is None, (opts, out.get("quiet_ok_s"))
+        json.dumps(out, allow_nan=False)                         # 응답은 엄격한 JSON 이다
+
+
 @pytest.mark.parametrize("delib_opts,want", [
     ({"parse_retries": 0, "rebut_quote": 0}, 3608.0),       # 파싱 재시도를 끈 잡은 호출 한 번이다
     ({"parse_retries": 5}, 21648.0),                        # 5번 청한 잡은 호출 여섯이 이어진다

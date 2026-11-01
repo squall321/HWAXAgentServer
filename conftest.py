@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 두며, 심의 MCP 의 앱 자리(mcp_server._APP)는 시험 끝에 시험 앞의 것으로 되돌린다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -100,3 +100,15 @@ def _no_confirm_lists(monkeypatch, tmp_path):
         monkeypatch.setattr(app_mod, "CONFIRM_LISTS_PATH", tmp_path / "no-he-team.json")
         monkeypatch.setattr(app_mod, "_CONFIRM_LISTS", {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "없음"})
         monkeypatch.setattr(app_mod, "_CONFIRM_PENDING", OrderedDict())
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_mcp_app(monkeypatch):
+    """심의 MCP 의 앱 자리(mcp_server._APP) 격리 — 시험 끝에 시험 앞의 것으로 되돌린다. 기동 절차(app.lifespan)를 실제로 여는 시험(tests/
+    test_llm_limits._boot 와 그 사본들 · 줄 · heartbeat 시험)과 재기동을 흉내 내는 시험은 mcp_server.bind 로 제 앱을 걸고 풀지 않는다(내려가는
+    unbind 도 그대로 둔다). 모듈 상태라 뒤 시험의 진행 조회(quiet_ok_s)가 그 앱의 심의 LLM 을 읽었다 — DELIB_LLM_MAX_RETRIES 를 셈할 수 없을
+    만큼 크게 건 기동 시험(tests/test_external_llm_review2_fixes) 뒤에서 deliberate_status 가 OverflowError 로 넘어져 파일 순서에 따라 붉었다
+    (11-01). mcp_server 를 import 하지 않은 시험은 건드리지 않는다."""
+    mod = sys.modules.get("mcp_server")
+    if mod is not None and hasattr(mod, "_APP"):
+        monkeypatch.setattr(mod, "_APP", mod._APP)
