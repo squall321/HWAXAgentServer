@@ -71,6 +71,9 @@ _JOB_DEAD = ("error", "cancelled", "interrupted")          # 앞 프로세스가
 # 상한. 단계 실패가 아니라 쉬었다 다시 세운다(R3-design §8). 기다림은 엔진의 retry_after_s, 없으면 _DELIB_RETRY_S 에서 거절마다 두 배씩
 # _DELIB_RETRY_MAX 까지다 — 거절된 시작도 원장 한 줄 · 단계 예산 하나를 쓰므로 줄이 빠지기 전에 예산을 다 쓰지 않게.
 _DELIB_BUSY = ("새 심의를 잠시 멈췄다", "대기열도 찼다", "동시 실행 상한에 걸렸")
+# 엔진이 마무리 중인 심의의 접기를 거절한 글의 표지(delib_jobs.DelibFinishing — 의장이 결정문을 이미 냈다, 웹 멈춤의 409 finishing 과 같은 뜻).
+# 게이트웨이를 지나 도구 오류 글로 온다 — 그 잡은 결정문 · 보고서까지 끝난다(_delib_fold).
+_DELIB_FINISHING = "finishing — 마무리 중"
 _RETRY_AFTER = re.compile(r"retry_after_s=(\d+)")
 _DELIB_RETRY_S, _DELIB_RETRY_MAX = 60.0, 600.0
 _RUN_FINAL = ("done", "failed", "cancelled")    # 다시 이을 수 없는 실행 상태 — 이 실행이 세운 심의는 결정문을 읽을 데가 없다(접는다)
@@ -1720,8 +1723,13 @@ async def _delib_fold(ctx: _Ctx, job_id: str) -> None:
         if is_err:
             raise RoutineGatewayError((_text_of(content[0]) if content else "")[:300] or "deliberate_cancel 가 오류로 답했다")
     except RoutineGatewayError as exc:      # 인증 거절(_AuthRejected)도 — 접기 실패로 끝을 바꾸지 않는다
-        ctx.reason(f"(실행이 {state} 상태라 심의 {job_id} 를 접으려 했으나 못 했다 — {str(exc)[:200]}. 서버에서 계속 돌 수 있다 — "
-                   "deliberate_cancel 로 접는다)\n")
+        if _DELIB_FINISHING in str(exc):
+            # 마무리 중이라 엔진이 접기를 거절했다 — 잡은 결정문 · 보고서까지 끝난다. 종전 글은 이때도 'deliberate_cancel 로 접는다' 로 끝나 다시
+            # 접으라고 했다(다시 불러도 같은 거절이다).
+            ctx.reason(f"(실행이 {state} 상태라 심의 {job_id} 를 접으려 했으나 마무리 중이라 접지 않았다 — 결정문 · 보고서까지 끝난다)\n")
+        else:
+            ctx.reason(f"(실행이 {state} 상태라 심의 {job_id} 를 접으려 했으나 못 했다 — {str(exc)[:200]}. 서버에서 계속 돌 수 있다 — "
+                       "deliberate_cancel 로 접는다)\n")
         print(f"[routine] 심의 {job_id} 를 접지 못했다 — 실행 {ctx.run_id} · {exc}"[:300])
         return
     ctx.reason(f"(실행이 {state} 상태라 이 실행이 세운 심의 {job_id} 를 접었다)\n")

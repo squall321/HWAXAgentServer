@@ -1638,6 +1638,43 @@ def test_심의를_기다리는_사이_실행이_멈추면_진행_조회를_그�
     assert (f"심의 {NEW_JOB} 를 접었다" in _reasoning(evs)) is folds
 
 
+@pytest.mark.parametrize("refusal", ["finishing", "gone"])
+def test_세운_심의를_접는데_마무리_중이라_거절되면_다시_접으라고_하지_않고_결정문_보고서까지_끝난다고_적는다(kit, refusal):
+    """사람이 멈춰 세운 심의를 접는데 엔진이 마무리 중(delib_jobs.DelibFinishing — 의장이 결정문을 이미 냈다)이라 거절했다 — 잡은 결정문 · 보고서까지
+    끝난다. 종전 생각 칸 글은 그때도 'deliberate_cancel 로 접는다' 로 끝나 다시 접으라고 했다(다시 불러도 같은 거절이다). 다른 실패는 그 안내를 둔다.
+    거절 글은 엔진의 것 그대로다 — FastMCP 가 도구 오류로 내고 게이트웨이가 그대로 넘긴다."""
+    import delib_jobs  # noqa: PLC0415
+
+    gw = _delib_gw(statuses=[{"status": "running"}])
+    real = gw.tool
+    polls: list = []
+    why = (str(delib_jobs.DelibFinishing(NEW_JOB)) if refusal == "finishing"
+           else f"그런 심의 잡이 없다(또는 이미 이 프로세스 밖이다): {NEW_JOB}")
+
+    async def _refuse_fold(name, args):
+        if name == "deliberate_status":
+            polls.append(name)
+            if len(polls) == 2:
+                gw.state = "cancelled"               # 사람이 멈춤을 눌렀다 — 실행기가 세운 심의를 접는다
+        if name == "deliberate_cancel":
+            gw.cancelled.append(args.get("job_id"))
+            return _err(f"Error executing tool deliberate_cancel: {why}")
+        return await real(name, args)
+
+    gw.tool = _refuse_fold
+    llm = ScriptLLM()
+    _wire(kit, gw, llm)
+    evs = _ev(_run_bounded(_app_ns(llm), _req()))
+    said = _reasoning(evs)
+    assert gw.cancelled == [NEW_JOB] and _routine(evs, "done")[-1]["state"] == "cancelled", gw.cancelled
+    if refusal == "finishing":
+        assert f"심의 {NEW_JOB} 를 접으려 했으나 마무리 중이라 접지 않았다 — 결정문 · 보고서까지 끝난다" in said, said[-600:]
+        assert "deliberate_cancel 로 접는다" not in said, "마무리 중이라 거절된 접기에 다시 접으라고 했다"
+    else:
+        assert f"심의 {NEW_JOB} 를 접으려 했으나 못 했다 — Error executing tool deliberate_cancel: 그런 심의 잡이 없다" in said, said[-600:]
+        assert "서버에서 계속 돌 수 있다 — deliberate_cancel 로 접는다" in said and "마무리 중" not in said, said[-600:]
+
+
 def test_실행기가_내려가도_세운_심의는_접지_않는다(kit):
     """에이전트 서버 재기동(작업 취소) — 실행은 running 으로 남고 '이어서' 가 같은 잡을 잇는다. 접으면 이을 잡이 없다. 취소는 진행 조회 사이의
     쉼에 건다(게이트웨이 답을 받는 순간에 걸면 Python 3.10 의 asyncio.wait_for 가 취소를 삼킨다 — 이 시험이 볼 것이 아니다)."""
