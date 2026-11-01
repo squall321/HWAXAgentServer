@@ -3536,6 +3536,18 @@ def _ra_save_outcome(raw, append_to, do_save: bool) -> tuple[int | None, str]:
                  else f"\n\n📄 Report Archive 보고서 #{rid} 로 저장됨.")
 
 
+# RA 쓰기 응답의 보고서 주소(ai-draft POST · PATCH 의 data.url — "/w/<공간>/reports/<번호>") — 포털의 심의 결과 카드가 이 주소로 바로 연다
+# (포털 docs/wda-deck WD-D78). 꼴이 맞고 번호가 같을 때만 싣는다 — 없으면 포털이 번호로 찾아 연다.
+_RA_URL_RE = re.compile(r"/w/(?!\.{1,2}/)[A-Za-z0-9._-]{1,120}/reports/([0-9]{1,18})")
+
+
+def _ra_report_url(made, rid) -> str | None:
+    """RA 저장 응답의 보고서 주소 — 꼴(/w/<공간>/reports/<번호>)이 맞고 그 번호가 받은 보고서 번호일 때만, 아니면 None."""
+    u = made.get("url") if isinstance(made, dict) else None
+    hit = _RA_URL_RE.fullmatch(u) if isinstance(u, str) else None
+    return u if hit and rid is not None and int(hit.group(1)) == int(rid) else None
+
+
 def _ra_report_id(made) -> int | None:
     """RA 저장 응답에서 보고서 id — 응답 모양이 셋이라 전부 받는다.
 
@@ -7556,6 +7568,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _append_to = int(getattr(opts, "append_to_report_id", 0) or 0)
     report_note = ""
     rid = None
+    rurl = None                         # RA 가 준 보고서 주소(/w/<공간>/reports/<번호>) — outcome 에 싣는다(포털 WD-D78)
     if _rint is not None:
         decision = _rint["decision"]    # 되살림(S3) — 저장하려던 결정문(웹 인용 · 수치 대조까지 붙인 것)
     yield _delib("stage", stage="report")
@@ -7635,14 +7648,23 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
         rid, report_note = ((_rsav["rid"], _rsav["note"]) if _rsav is not None
                             else _ra_save_outcome(_raw_made, _append_to, _do_save))
+        rurl = (_rsav.get("url") if _rsav is not None
+                else _ra_report_url(_parse_json(_raw_made), rid) if rid is not None and _raw_made is not None else None)
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
+        # 사람에게도 말한다 — 종전엔 로그뿐이라 저장 · 이어붙이기가 도구 밖에서 터지면 결정문에 아무 말이 없었다(포털이 되살린 심의의
+        # 이어하기는 append_to_report_id 를 싣는다 — 포털 docs/wda-deck WD-D68). 새 보고서로 대신 저장하지는 않는다(원래 기기의 길과 같다).
+        if _do_save and _rsav is None and not report_note:
+            rid = None
+            report_note = (f"\n\n⚠ Report Archive 보고서 #{_append_to} 에 이 회차를 이어붙이지 못했다({exc.__class__.__name__}) — "
+                           "결정문은 이 대화에 있다." if _append_to else
+                           f"\n\n⚠ Report Archive 저장 실패({exc.__class__.__name__}) — 결정문은 이 대화에 있다.")
     for _c in _cred_notice():           # 보고서 저장에서 거절됐으면 — 수 시간 심의의 맨 끝이 가장 걸리기 쉽다
         yield _c
     if _rsav is None and _jon:
         # 재개 자료(HA-09 S3 — e:report_saved) — 받은 번호와 결정문 끝의 안내(저장 실패도 그대로 — 끊지 않았다면 그대로 끝났다). 이으면 다시
         # 저장하지 않는다.
-        delib_resume.write(sk, "e:report_saved", sync=True, rid=rid, note=report_note)
+        delib_resume.write(sk, "e:report_saved", sync=True, rid=rid, note=report_note, url=rurl)
 
     # 수렴 집계 — turn 이벤트와 동일한 canonical 정규화로 만장일치/다수결 판정(소수의견 배지의 근거)
     # ⚠ 분모는 **착석 수**다. 예전엔 len(last_list) — 즉 마지막 라운드 **응답자 수** 였고,
@@ -7680,7 +7702,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     elif out is not None:
         out["chair_failed"] = (_chair_failed, _chair_knob)
     yield _delib("decision", text=decision + report_note + wiki_note, **({"chair_failed": True} if _chair_failed else {}))
-    yield _delib("outcome", report_id=rid, title=_ra_report_title(question),
+    yield _delib("outcome", report_id=rid, **({"url": rurl} if rurl else {}), title=_ra_report_title(question),
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
                  # 그대로 좌석 유실까지 막는다(응답 못 한 좌석은 abstain 으로 들어간다).
@@ -7911,5 +7933,6 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     else:
         text = "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요."
     yield _sse("token", {"delta": text})
-    yield _sse("result", {"type": "text", "content": text})
+    # 저장한 보고서를 구조로도 — 포털이 이 답 옆에 '발표자료로' 단추를 세운다(포털 docs/wda-deck WD-D12). 글을 파싱하지 않게, 성공일 때만.
+    yield _sse("result", {"type": "text", "content": text, **({"ra_report": {"id": rid, "title": title}} if rid else {})})
     yield _sse("done", {})
