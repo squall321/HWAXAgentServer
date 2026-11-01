@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import unquote
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -490,6 +490,9 @@ _A_WAIT = (f"초 — 주면 상태 · 단계 · 라운드가 바뀌거나 끝날
            "untracked(이 서버가 돌리지 않는 잡). 게이트웨이 재기동에 끊기면 다시 부른다. 기본 0(기다리지 않는다).")
 _A_BRIEF = ("참이면 부를 때마다 같은 큰 칸을 뺀다 — 화두는 앞 80자(question_head · question_chars), 좌석 키는 seat_count, 경고 · 빠진 근거는 "
             "수(warnings_total · evidence_omitted_total)만. 다음 걸음을 정할 칸(상태 · 단계 · 라운드 · 줄 · 오류 · 재개)은 그대로다.")
+_A_VIEW = ("full(기본 — 결정문 전문에 쉬운 설명 · 좌석 상세 · 상태줄 · 손잡이 · 경고 · 빠진 근거 · 화두) | summary(결정문 · 표결 votes · 소수 의견 "
+           "minority · 수치 대조 numcheck · 보고서 번호와 주소 · full 의 쪽 수 full_parts 만 — 없는 칸은 null 이고 까닭은 missing). summary 를 먼저 "
+           "받고 모자랄 때만 full.")
 _A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
 _A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
 _A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
@@ -1104,22 +1107,54 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                            again={"job_id": job_id, **({"brief": True} if brief else {})})
 
 
-@mcp.tool(title="심의 결과(결정 문서) 회수",
-          description="끝난 HWAX 심의의 결정 문서 전문을 받는다. 아직 진행 중(running)이면 현재 단계만, "
-                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
-                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
-async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
-    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
-    job = delib_jobs.get(job_id)
-    if not job:
-        raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
-    _need_read(job, ctx)
+_VIEWS = ("full", "summary")
+
+
+def _result_full(job: dict) -> dict:
+    """deliberate_result 의 full 응답(쪽 나누기 전) — 기본 응답이고, 요약(view="summary")은 이것의 쪽 수를 센다(full_parts)."""
     out = delib_jobs.summary(job, full=True)
     if job.get("status") == "running":
         out["note"] = "아직 진행 중이다. 잠시 뒤 다시 부르거나 deliberate_status 로 지켜봐라."
     elif out.get("queue"):
         out["note"] = "아직 시작 전이다 — " + _queued_note(out["queue"])
+    return out
+
+
+def _result_summary(job_id: str, job: dict, full: dict) -> dict:
+    """view="summary" — 원장에 있는 칸만(delib_jobs.decision_summary)과 full 로 부를 때의 쪽 수(full_parts — 같은 잡을 view 없이 부르면 나오는
+    page.parts, 한 쪽이면 1). 결정문은 맨 뒤다 — 쪽으로 나뉘어도 짧은 칸(표결 · 소수 의견 · 수치 대조 · 보고서 · 쪽 수 · 까닭)이 첫 쪽에 다 있다."""
+    s = delib_jobs.decision_summary(job)
+    fp = mcp_pages.paged(full, part=1, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
+    out = {"job_id": job["id"], "status": job.get("status"), "view": "summary",
+           "full_parts": int((fp.get("page") or {}).get("parts") or 1),
+           **{k: v for k, v in s.items() if k != "decision"}}
+    if full.get("note"):
+        out["note"] = full["note"]
+    out["decision"] = s["decision"]
+    return out
+
+
+@mcp.tool(title="심의 결과(결정 문서) 회수",
+          description="끝난 HWAX 심의의 결정 문서를 받는다. **먼저 view=\"summary\"** — 결정문 · 표결 · 소수 의견 · 수치 대조 · 보고서만 준다"
+                      "(화두 되풀이 · 상태줄 · 좌석 상세 · 손잡이가 없다). full 은 그 밖이 필요할 때만. 아직 진행 중(running)이면 현재 단계만, "
+                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
+                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
+async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            view: Annotated[Literal["full", "summary"], Field(description=_A_VIEW)] = "full",
+                            ctx: Context | None = None) -> dict:
+    """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
+    루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다)."""
+    if view not in _VIEWS:
+        raise ValueError(f"view 는 {' · '.join(_VIEWS)} 가운데 하나다 — 받은 값: {view!r}")
+    job = delib_jobs.get(job_id)
+    if not job:
+        raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
+    _need_read(job, ctx)
+    out = _result_full(job)
+    if view == "summary":
+        return mcp_pages.paged(_result_summary(job_id, job, out), part=part, ids=_JOB_IDS, tail=("decision",),
+                               again={"job_id": job_id, "view": "summary"})
     return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
 
 
