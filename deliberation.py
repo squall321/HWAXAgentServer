@@ -7637,6 +7637,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             else _ra_save_outcome(_raw_made, _append_to, _do_save))
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
+        # 사람에게도 말한다 — 종전엔 로그뿐이라 저장 · 이어붙이기가 도구 밖에서 터지면 결정문에 아무 말이 없었다(포털이 되살린 심의의
+        # 이어하기는 append_to_report_id 를 싣는다 — 포털 docs/wda-deck WD-D68). 새 보고서로 대신 저장하지는 않는다(원래 기기의 길과 같다).
+        if _do_save and _rsav is None and not report_note:
+            rid = None
+            report_note = (f"\n\n⚠ Report Archive 보고서 #{_append_to} 에 이 회차를 이어붙이지 못했다({exc.__class__.__name__}) — "
+                           "결정문은 이 대화에 있다." if _append_to else
+                           f"\n\n⚠ Report Archive 저장 실패({exc.__class__.__name__}) — 결정문은 이 대화에 있다.")
     for _c in _cred_notice():           # 보고서 저장에서 거절됐으면 — 수 시간 심의의 맨 끝이 가장 걸리기 쉽다
         yield _c
     if _rsav is None and _jon:
