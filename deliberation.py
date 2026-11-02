@@ -993,8 +993,61 @@ _RISK_PRIOR_TOOLS = _RISK_REGISTRY_TOOLS + ("risk_list_panels", "risk_get_panel_
 # 이름으로 뺀다. apps 가 없을 때 러너와 같은 범위로 좁히는 길도 있었지만 그쪽이 더 크다 — 리스크 심사와 상관없는 앱(StepForge·
 # KooRemapper …)의 읽기 도구까지 손수 심사에서 다 빠진다. 이름으로 빼면 앞 패널 판정에 닿는 길만 닫힌다. 러너 패널은 _narrow 가
 # 이미 이것들을 빼므로 바뀌는 것은 도구-앱 매핑을 못 받아 전체 범위로 도는 때뿐이다(m1 2차 AF2-D18-manual-path-reason).
+# 지정 도구 길에도 건다(_risk_designated_refusal, 2026-11-02 — D-18 누수 셋 중 하나). 지정 도구로는 접두사와 상관없이 아무 도구나
+# 부를 수 있어, 접두사 화이트리스트에 걸리지 않아 자유 조회 후보에는 원래 없던 넷을 더했다 — ask_ontology(서버 LLM 의 위임 답 ·
+# 보고서 인용 · 근거 객체) · aggregate_reports(근거 보고서 제목 · 축 값) · run_saved_search(list_reports 꼴) · resolve(보고서 제목 ·
+# 객체 이름). 넷 다 자유 조회 후보 조립식(_FREE_ALLOW)에 걸리지 않으므로 자유 조회는 그대로다.
 _RISK_RA_REPORT_TOOLS = ("get_report", "get_report_outline", "get_reports_digest", "list_my_reports", "list_reports",
-                         "list_related_reports", "list_comments", "get_composite", "list_composites")
+                         "list_related_reports", "list_comments", "get_composite", "list_composites",
+                         "ask_ontology", "aggregate_reports", "run_saved_search", "resolve")
+
+# 리스크 앱의 게이트웨이 앱키와 노출 이름의 머리. 게이트웨이는 백엔드끼리 이름이 겹치면 '<앱키에서 - 를 뺀 것>_<원래 이름>' 으로
+# 목록에 싣고, 그 꼴은 겹침과 상관없이 늘 부를 수 있는 호출 별칭이다(HWAXMcpGateway _aggregate · alias_route). RA(앱키
+# reportarchive)도 같다 — RA 와 KooRemapper 가 함께 뜬 박스에서 RA 의 list_reports 는 reportarchive_list_reports 로만 실린다.
+_RISK_APP_KEY = "heax-hwax_risk"
+_RISK_APP_HEAD = _RISK_APP_KEY.replace("-", "") + "_"
+_RA_APP_HEAD = "reportarchive_"
+# 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
+_RISK_DESIGNATED_REFUSE = {
+    "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
+    "app": ("리스크 심사 좌석에게 리스크 앱에서 여는 것은 변경 전체와 스냅샷(risk_get_diff · risk_get_snapshot)뿐이다 — 선례 · "
+            "보고서 · 쟁점 · 셀처럼 같은 과제의 앞 판정이 실리는 도구가 있어 나머지는 모두 닫는다"),
+    "ra": "리스크 심사 좌석은 RA 보고서 읽기로 엔진이 남긴 앞 패널 심의 보고서(결정문이 든 초안)나 같은 과제의 판정을 보지 않는다",
+    "proxy": ("범용 실행기는 부를 도구를 호출할 때 정해 이 거절을 비켜 간다(목록에 없는 호출 별칭 "
+              f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
+}
+
+
+def _risk_designated_refusal(name: str) -> str:
+    """리스크 심사에 지정 도구(delib_opts.tools)로 온 이름이 D-18 로 닫힌 것이면 그 갈래(_RISK_DESIGNATED_REFUSE 의 열쇠), 아니면
+    빈 글. 지정 도구 결과는 전 좌석 프롬프트에 실린다.
+
+    닫는 것은 넷이다 — 등록부 · 앞 패널 기록(_RISK_PRIOR_TOOLS), 그 밖의 리스크 앱 도구(여는 것은 변경 전체와 스냅샷 둘뿐이다 —
+    선례 risk_get_precedents · 종합 보고서 risk_get_report · 쟁점 risk_get_issues · 전문가 보고서 risk_get_expert_report · 셀
+    risk_get_cells 가 같은 과제의 앞 판정을 싣는다), RA 보고서 읽기(_RISK_RA_REPORT_TOOLS), 범용 실행기 invoke_tool(부를 도구를
+    호출할 때 정한다 — 목록에 없는 호출 별칭에도 닿는다. 루틴 실행기 routine_call 은 엔진에 묶이지 않고(app._agent_denied),
+    rest_call 의 사이트에는 리스크 앱 · RA 가 없다). 이름은 게이트웨이가 싣는 꼴 그대로 본다 — 맨 이름과 겹침 접두 꼴
+    (heaxhwax_risk_<도구> · reportarchive_<도구>). 맨 이름 risk_* 는 다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱
+    매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 — 틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 ·
+    스냅샷은 이름만으로 정해 매핑을 묻지 않는다."""
+    n = str(name or "").strip()
+    if n == "invoke_tool":
+        return "proxy"
+    if n.startswith(_RISK_APP_HEAD):
+        base, risk = n[len(_RISK_APP_HEAD):], True
+    else:
+        base, risk = n.removeprefix(_RA_APP_HEAD), False
+        if base in _RISK_RA_REPORT_TOOLS:
+            return "ra"
+        if base != n or not base.startswith("risk_"):
+            return ""
+    if base in _RISK_READ_TOOLS[_RISK_APP_KEY]:
+        return ""
+    if base in _RISK_PRIOR_TOOLS:
+        return "prior"
+    if not risk and _app_of_tools().get(n, _RISK_APP_KEY) != _RISK_APP_KEY:
+        return ""
+    return "app"
 
 # 리스크 심사 유지 도구 — apps 밖 앱(RA·물성·열충격·VoC·문헌) 소속이라 앱 제한에서 잘려 나가는
 # 읽기 도구를 chair_template == 'risk-review' 일 때만 남긴다. 다른 심의 영향 0.
@@ -5970,7 +6023,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _used, _got = [], []                  # _got — (머리줄, 결과 원문). 좌석에 실을 때 몫을 다시 나눈다
         _tool_miss, _tool_fail = [], []       # 없는 도구 · 실패하거나 건너뛴 도구 — 끝에 카드 한 장으로 알린다
         _tool_unconf = []                     # 기준일 거름을 확인하지 못해(메아리 없음) 결과를 버린 도구 — 인자 문제가 아니라 다시 시키지 않는다
-        _tool_refused = []                    # 리스크 심사에 지정된 등록부·앞 패널 기록 도구 — 부르지 않는다(D-18)
+        _tool_refused = []                    # 리스크 심사에 지정된 D-18 도구(_risk_designated_refusal) — 부르지 않는다
         _tool_noev = []                       # 웹 리서치의 차단 · 빈 결과를 돌려준 도구 — 좌석에는 싣되 근거로 세지 않는다
         _tool_meta = []                       # 웹 리서치의 상태 · 기록 도구(_web_meta_tool) — 같다(서버를 말할 뿐 주제의 근거가 아니다)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
@@ -5979,10 +6032,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _ordered = sorted(opts.delib_tools,
                           key=lambda n: 0 if n.startswith(("list_", "search_", "find_")) else 1)
         for _tn in _ordered:
-            if opts.chair_template == "risk-review" and _tn in _RISK_PRIOR_TOOLS:
-                # 지정 도구 결과는 전 좌석 프롬프트에 실린다 — 등록부·앞 패널 기록을 부르면 좌석이 앞 패널 판정을 읽는다.
-                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — 리스크 심사 좌석은 같은 과제의 등록부·앞 패널 "
-                                              "기록(앞 패널 판정)을 보지 않는다", "tool": _tn})
+            _d18 = _risk_designated_refusal(_tn) if opts.chair_template == "risk-review" else ""
+            if _d18:
+                # 지정 도구 결과는 전 좌석 프롬프트에 실린다 — 등록부·앞 패널 기록 · 선례 · 앞 패널 초안을 부르면 좌석이 앞 패널 판정을 읽는다.
+                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — {_RISK_DESIGNATED_REFUSE[_d18]}", "tool": _tn})
                 _tool_refused.append(_tn)
                 continue
             _t = tools.get(_tn)
@@ -6084,8 +6137,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                   f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
                                   (f"기준일 {_as_of} 거름을 지식 허브가 확인해 주지 않아(메아리 applied_config.as_of 없음 — 옛 AIDataHub 는 "
                                    f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
-                                  (f"리스크 심사라 부르지 않은 등록부·앞 패널 기록 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 "
-                                   "판정을 좌석이 보지 않는다 — D-18)") if _tool_refused else "",
+                                  (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
+                                   "보지 않는다 — D-18. 리스크 앱에서는 변경 전체 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 "
+                                   "읽기 · 범용 실행기는 닫는다)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에

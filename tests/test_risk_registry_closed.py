@@ -437,3 +437,101 @@ def test_리스크_심사가_아니면_머리가_없어도_보고서_검색을_�
     events, _seen = _engine_search(monkeypatch, "default", {"tools": ["search_reports"]}, question=_Q_MANUAL)
     card = next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")
     assert _PRIOR_SNIPPET in card["text"], card["text"]
+
+
+
+# ── (8) 지정 도구 — 리스크 앱에서 여는 것은 변경 · 스냅샷뿐이다. 그 밖의 리스크 앱 도구 · RA 보고서 읽기 · 범용 실행기도 부르지 않는다 ──
+# 등록부 · 앞 패널 기록 넷만 거절하던 동안, 선례(risk_get_precedents — 이 대상 자신의 클러스터와 주장 · 등급 · 상태) · 종합 보고서 ·
+# 쟁점 · 전문가 보고서 · 셀을 지정한 리스크 심사는 그 결과를 전 좌석 프롬프트에 실었다. RA 보고서 읽기는 자유 조회에서만 뺐다
+# (D-18 누수 셋 가운데 하나, 2026-11-02). 이름은 게이트웨이가 싣는 꼴 그대로다 — 맨 이름과 겹침 접두(heaxhwax_risk_<도구> ·
+# reportarchive_<도구>). 호출 별칭(목록에 없는 같은 꼴)은 invoke_tool 로만 닿는다.
+# 리스크 앱 도구 33종 — HWAXRisk backend/app/mcp_server.py(d30bef6)와 dev 게이트웨이 /tools-map(2026-11-02)이 같다.
+_RISK_APP_TOOLS = (
+    "risk_ack_gate", "risk_add_finding", "risk_add_source", "risk_capture_snapshot", "risk_claims_for_ref", "risk_create_diff",
+    "risk_create_project", "risk_decide_sameas", "risk_find_ecad_boards", "risk_get_brief", "risk_get_cells", "risk_get_coverage",
+    "risk_get_diff", "risk_get_expert_report", "risk_get_issues", "risk_get_panel_transcript", "risk_get_precedents",
+    "risk_get_registry", "risk_get_report", "risk_get_sameas", "risk_get_snapshot", "risk_get_units", "risk_job_action",
+    "risk_list_panels", "risk_list_projects", "risk_next_step", "risk_open_target", "risk_repersist_panel", "risk_set_ecad_board",
+    "risk_similar_projects", "risk_start_job", "risk_submit_panel_result", "risk_taxonomy")
+_RISK_OPEN = ("risk_get_snapshot", "risk_get_diff")
+_RISK_CLOSED = tuple(n for n in _RISK_APP_TOOLS if n not in _RISK_OPEN)
+_RISK_MAP = {n: "heax-hwax_risk" for n in _RISK_APP_TOOLS}
+# RA 보고서 읽기 — 자유 조회에서 빼던 아홉(위 (6))에 지정 도구 길에서만 닿던 넷(위임 답 · 집계 · 저장 검색 · 이름 판별)을 더한 것.
+_RA_DESIGNATED = _RA_READERS + ("ask_ontology", "aggregate_reports", "run_saved_search", "resolve")
+
+
+def _designate(monkeypatch, chair, names, amap=None):
+    """names 를 지정 도구로 준 심의를 좌석 발굴 문턱까지 돌린다 — 지정 도구는 요청 하나에 6개까지라(_TOOLS_MAX) 그만큼씩 나눠 여러 번
+    돌린다. 돌린 회차의 이벤트 목록과 도구마다 받은 호출을 돌려준다. amap 은 도구-앱 매핑이다 — 없으면 빈 매핑(게이트웨이에 못 물은
+    것과 같다)."""
+    async def _planner(_llm, _system, _human):
+        return '{"target_key": "T-1", "diff_id": "d-1"}'
+
+    monkeypatch.setattr(d, "_llm_text", _planner)
+    monkeypatch.setattr(d, "_app_of_tools", lambda: dict(amap or {}))
+    tools, runs = {n: _Tool(n, _REG) for n in names}, []
+    for i in range(0, len(names), d._TOOLS_MAX):
+        part = list(names[i:i + d._TOOLS_MAX])
+        given = {n: tools[n] for n in part} | {"agent_search": _Tool("agent_search")}
+        runs.append(_stream(monkeypatch, {"chair_template": chair, "tools": part}, tools=given, until=_after_tools))
+    return runs, tools
+
+
+def _refused(runs, names):
+    """이름마다 거절 상태줄이 섰고, 그 회차의 미실행 카드가 그 이름과 D-18 을 적었는가. 거절한 도구의 결과 카드는 없다."""
+    for n in names:
+        events = next((ev for ev in runs if any(s.startswith(f"지정 도구 거절: {n} — ") for s in _steps(ev))), None)
+        assert events is not None, (n, [_steps(ev) for ev in runs])
+        card = next(c for c in _cards(events, included=False) if c["source"] == "지정 도구 미실행")
+        assert n in card["text"] and "D-18" in card["text"], (n, card["text"])
+        assert not [c for c in _cards(events, included=True) if c["source"] == f"지정 도구 {n}"], n
+
+
+@pytest.mark.parametrize("amap", (_RISK_MAP, {}), ids=("mapped", "map-unavailable"))
+def test_리스크_심사는_변경_스냅샷_밖의_리스크_앱_도구를_지정해도_부르지_않는다(monkeypatch, amap):
+    """D-18 — 리스크 앱에서 좌석에게 여는 것은 변경 전체와 스냅샷 둘뿐이다. 매핑을 못 받아도(빈 매핑) 닫힌 쪽으로 간다. 다른 심의는
+    같은 지정을 종전대로 부른다."""
+    runs, tools = _designate(monkeypatch, "risk-review", _RISK_APP_TOOLS, amap)
+    assert sorted(n for n in _RISK_APP_TOOLS if tools[n].calls) == sorted(_RISK_OPEN)
+    _refused(runs, _RISK_CLOSED)
+    _runs, tools = _designate(monkeypatch, "default", _RISK_APP_TOOLS, amap)
+    assert all(tools[n].calls for n in _RISK_APP_TOOLS), sorted(n for n in _RISK_APP_TOOLS if not tools[n].calls)
+
+
+def test_리스크_앱_도구는_겹침_접두_꼴로_와도_같다(monkeypatch):
+    """게이트웨이가 이름 겹침으로 'heaxhwax_risk_<도구>' 로 실은 꼴 — 변경 · 스냅샷은 열고 나머지는 닫는다(매핑과 상관없다)."""
+    names = tuple(f"heaxhwax_risk_{n}" for n in _RISK_APP_TOOLS)
+    runs, tools = _designate(monkeypatch, "risk-review", names)
+    assert sorted(n for n in names if tools[n].calls) == sorted(f"heaxhwax_risk_{n}" for n in _RISK_OPEN)
+    _refused(runs, [f"heaxhwax_risk_{n}" for n in _RISK_CLOSED])
+
+
+def test_다른_앱의_risk_이름은_매핑이_그_앱이라고_할_때만_부른다(monkeypatch):
+    """StepForge 의 risk_screen 은 그 앱의 읽기 도구다(리스크 앱의 앞 판정이 아니다) — 매핑이 StepForge 라고 하면 부르고, 매핑을
+    못 받았으면 리스크 앱 도구인지 가릴 수 없어 닫는다(틀릴 거면 닫힌 쪽으로)."""
+    _runs, tools = _designate(monkeypatch, "risk-review", ("risk_screen",), {"risk_screen": "heax-step_forge"})
+    assert tools["risk_screen"].calls
+    runs, tools = _designate(monkeypatch, "risk-review", ("risk_screen",), {})
+    assert not tools["risk_screen"].calls
+    _refused(runs, ["risk_screen"])
+
+
+def test_리스크_심사는_RA_보고서_읽기를_지정해도_부르지_않는다(monkeypatch):
+    """RA 보고서 읽기는 자유 조회에서만 뺐다 — 지정 도구로 고르면 잡 주인이 남긴 앞 패널 '심의 — …' 초안이 전 좌석에 실렸다. 맨 이름과
+    RA 의 겹침 접두 꼴(KooRemapper 와 함께 뜬 박스의 reportarchive_list_reports) 둘 다 닫는다. 다른 심의는 종전대로다."""
+    names = _RA_DESIGNATED + tuple(f"reportarchive_{n}" for n in _RA_DESIGNATED)
+    runs, tools = _designate(monkeypatch, "risk-review", names)
+    assert not [n for n in names if tools[n].calls], sorted(n for n in names if tools[n].calls)
+    _refused(runs, names)
+    _runs, tools = _designate(monkeypatch, "default", names)
+    assert all(tools[n].calls for n in names), sorted(n for n in names if not tools[n].calls)
+
+
+def test_리스크_심사는_범용_실행기를_지정해도_부르지_않는다(monkeypatch):
+    """invoke_tool 은 부를 도구를 호출할 때 정한다 — 목록에 없는 호출 별칭(heaxhwax_risk_risk_get_registry)으로도 등록부에 닿는다.
+    리스크 앱의 변경 원장은 그대로 연다. 다른 심의는 종전대로다."""
+    runs, tools = _designate(monkeypatch, "risk-review", ("invoke_tool", "risk_get_diff"))
+    assert not tools["invoke_tool"].calls and tools["risk_get_diff"].calls
+    _refused(runs, ["invoke_tool"])
+    _runs, tools = _designate(monkeypatch, "default", ("invoke_tool",))
+    assert tools["invoke_tool"].calls
