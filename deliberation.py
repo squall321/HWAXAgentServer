@@ -1013,6 +1013,10 @@ _RA_APP_HEAD = "reportarchive_"
 # 도구로만 닿으므로 거기서 닫는다. 심의 메뉴(deliberate_jobs)는 잡 기록이 아니라 남긴다.
 _DELIB_APP_HEAD = "hwaxdeliberation_"
 _RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_result", "deliberate_transcript")
+# 과제 인사이트 도구(게이트웨이 insight_find · insight_get — HWAXPortal docs/project-insight-graph M2)의 이름 머리. 같은 과제의 앞선 심의 결론을
+# 내주므로 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 11-02 'D-18 범위 그대로 · 새 길을 열지 않는다' — 지정 도구 · 자유 조회 ·
+# CALL 줄). 이름을 insight_ 로 시작해 자유 조회 접두(_FREE_ALLOW)에 걸리지 않게 했고, 리스크 심사에서는 접두와 상관없이 이 머리로 한 번 더 뺀다.
+_INSIGHT_TOOL_HEAD = "insight_"
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1022,6 +1026,7 @@ _RISK_DESIGNATED_REFUSE = {
     "proxy": ("범용 실행기는 부를 도구를 호출할 때 정해 이 거절을 비켜 간다(목록에 없는 호출 별칭 "
               f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
     "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
+    "insight": "리스크 심사 좌석은 과제 인사이트(같은 과제의 앞선 심의 결론)를 보지 않는다",
 }
 
 
@@ -1036,10 +1041,13 @@ def _risk_designated_refusal(name: str) -> str:
     rest_call 의 사이트에는 리스크 앱 · RA 가 없다), 심의 엔진의 잡 기록 읽기(_RISK_DELIB_READ_TOOLS). 이름은 게이트웨이가 싣는 꼴
     그대로 본다 — 맨 이름과 겹침 접두 꼴(heaxhwax_risk_<도구> · reportarchive_<도구> · hwaxdeliberation_<도구>). 맨 이름 risk_* 는
     다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱 매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 —
-    틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다."""
+    틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다. 과제 인사이트 도구(insight_*)도 닫는다
+    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD)."""
     n = str(name or "").strip()
     if n == "invoke_tool":
         return "proxy"
+    if n.startswith(_INSIGHT_TOOL_HEAD):
+        return "insight"
     if n.removeprefix(_DELIB_APP_HEAD) in _RISK_DELIB_READ_TOOLS:
         return "delib"
     if n.startswith(_RISK_APP_HEAD):
@@ -6131,7 +6139,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 조립식이어야 한다 — 아래 _narrow 에만 넣으면 그 도구는 _g 에 애초에 없어 무효다.
             # _FREE_DENY 는 어느 경로보다 우선한다. 앱 지정도 risk-review 도 아니면 도구-앱
             # 매핑을 조회하지 않으므로 기존 심의의 동작·호출 수가 그대로다. 리스크 심사는 RA 보고서
-            # 읽기 도구(_RISK_RA_REPORT_TOOLS)를 apps 와 상관없이 뺀다(D-18 — 앞 패널 초안).
+            # 읽기 도구(_RISK_RA_REPORT_TOOLS)를 apps 와 상관없이 뺀다(D-18 — 앞 패널 초안). 과제 인사이트 도구
+            # (_INSIGHT_TOOL_HEAD)도 같다 — 접두 허용 · 유지 목록에 걸려도 뺀다. 외부 응답자의 CALL 줄은 이 후보 안에서만 실행된다.
             _risk_chair = opts.chair_template == "risk-review"
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
@@ -6141,7 +6150,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY
-                  and not (_risk_chair and n in _RISK_RA_REPORT_TOOLS) and (
+                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
@@ -6388,7 +6397,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
                                   (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
                                    "보지 않는다 — D-18. 리스크 앱에서는 변경 전체 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 "
-                                   "읽기 · 범용 실행기 · 심의 잡 기록 읽기는 닫는다)") if _tool_refused else "",
+                                   "읽기 · 범용 실행기 · 심의 잡 기록 읽기 · 과제 인사이트는 닫는다)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에
