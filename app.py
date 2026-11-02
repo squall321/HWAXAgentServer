@@ -112,6 +112,7 @@ import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
 import ui_panels as _ui   # 포털 챗의 MCP Apps 패널 — 표지가 있는 턴만 패널 도구를 묶고 ui_resource 를 낸다(HWAXPortal docs/request-1027 HA-20)
 import publish_token as _publish_token   # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(확인 카드 — 사용자 결정 10-31 '내보내는 곳만 가린다')
+import onto_links as _onto   # 코어 어휘표 ontology 칸 — 챗 고정 몫 · 규칙 ⑧ · 입구 표지(HWAXPortal docs/ontology-first)
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -333,7 +334,24 @@ def _core_rules_text(d: dict) -> str:
         + f"⑤ 다른 허브({sib})로 건널 때는 앞 허브의 id 를 그대로 쓰지 말고 key 로 그 허브에서 다시 resolve 하세요. "
         "⑥ not_configured · 404 · 빈 출력은 '없다' 가 아니라 '조회하지 못했다' 로 말하세요. "
         + (f"⑦ {non} 는 코어 객체를 갖지 않습니다 — 표준 키 · 개수 · 관계는 코어에서 답하고, 코어 질문을 그쪽으로 보내지 마세요. "
-           if non else "⑦ Report Archive · MatNexus · ComponentCore 는 코어 객체를 갖지 않습니다 — 코어 질문을 그쪽으로 보내지 마세요. "))
+           if non else "⑦ Report Archive · MatNexus · ComponentCore 는 코어 객체를 갖지 않습니다 — 코어 질문을 그쪽으로 보내지 마세요. ")
+        # 온톨로지 먼저(HWAXPortal docs/ontology-first OF-6 · OF-14 ①) — 어휘표 ontology 에 입구(entry)가 하나라도 있을 때만. 앱 이름은 적지 않는다 —
+        # 시스템 프롬프트는 모든 사람에게 같아야 앞부분 캐시가 산다(W-3). 앱마다의 표시는 그 사람에게 보이는 입구 도구 설명의 표지다(챗 로드만).
+        + (_ONTO_RULE if _onto.validate(d.get("ontology"), family=_vocab_family(d))["entries"] else ""))
+
+
+# 규칙 ⑧ — 입구가 있는 박스에서만 코어 규칙 끝에 붙는다(HWAXPortal docs/ontology-first PLAN §4.2 의 글 그대로). 표지 이름은 onto_links.MARK 와 같다.
+_ONTO_RULE = (f"⑧ 코어 타입이 아닌 이름 · 코드(제품 · 문서 · CAD · 해석 과제의 거울 …)는 그 앱에서 '{_onto.MARK}' 표지가 달린 도구로 먼저 풀어 키를 얻고, "
+              "그 키로 다음 도구를 부르세요. 후보가 여럿이면 고르지 말고 물으세요. 코어 타입은 ① 대로 정본이 먼저입니다. 이미 id · key 를 쥔 "
+              "뒷걸음(같은 객체 다시 보기 · 잡 상태)은 다시 풀지 않습니다. ")
+
+
+def _vocab_family(d: dict) -> frozenset:
+    """어휘표의 허브 가족 — 정본 + role sibling 의 앱 키(늘 접두 · 다른 허브 id 막이의 허브). 꼴이 틀리면 있는 것만."""
+    can = d["canonical"].get("app") if isinstance(d.get("canonical"), dict) else None
+    sib = ({k for k, a in d["apps"].items() if isinstance(a, dict) and a.get("role") == "sibling"}
+           if isinstance(d.get("apps"), dict) else set())
+    return frozenset(sib | ({can} if isinstance(can, str) and can else set()))
 
 
 def _core_vocab() -> dict | None:
@@ -359,7 +377,9 @@ def _core_vocab() -> dict | None:
                             if (a or {}).get("role") == "sibling"}},
                 # 페르소나 연결(personas — HWAXPortal docs/request-1029 design-e5 E5-4)은 줄마다 검증한다(_persona_links). 틀린 줄이 표 전체를
                 # 버리지 않게 여기서는 원본과 타입 대응만 들고 간다. /health 에는 검증한 수만 싣는다.
-                "personas_raw": d.get("personas"), "types_map": dict(d.get("types") or {})}
+                "personas_raw": d.get("personas"), "types_map": dict(d.get("types") or {}),
+                # 온톨로지 먼저(HWAXPortal docs/ontology-first) — 앱 줄마다 검증한 고정 몫 · 입구. 틀린 줄만 버린다(onto_links — 예외를 내지 않는다).
+                "onto": _onto.validate(d.get("ontology"), family=_vocab_family(d))}
     if (mt, lmt) != _CORE_VOCAB["mtime"]:
         try:
             raw = json.loads(CORE_VOCAB_PATH.read_text(encoding="utf-8"))
@@ -441,7 +461,9 @@ def _core_vocab_health() -> dict:
             "fingerprint": d["fingerprint"], "base": d["base_fingerprint"],
             "overlay": dict(_CORE_VOCAB.get("overlay") or {"present": False}),
             # 페르소나 연결 — 줄 수 · 버린 줄과 까닭 · 대조 못 한 표 · 줄 없는 조직도 도메인 · 그림자 기록(design-e5 E5-4, 고르기는 바꾸지 않는다)
-            "personas": _persona_links_health()}
+            "personas": _persona_links_health(),
+            # 온톨로지 먼저 — 앱 · 고정 몫 수 · 입구 · 이 박스 도구 지도에 없는 이름 · 버린 줄(HWAXPortal docs/ontology-first PLAN §4.1)
+            "ontology": _onto_health()}
 
 
 # ── 페르소나 연결(코어 어휘표 personas — HWAXPortal docs/request-1029 design-e5 E5-4) ─────────────────────────────────────
@@ -2633,12 +2655,17 @@ def _slim_tool(tool, desc_max=None):
     return tool
 
 
-def _tag_tool_app(tool):
+def _tag_tool_app(tool, chat=False):
     """도구 설명 앞에 소유 앱 라벨을 붙인다 — get_*/list_* 처럼 이름이 겹치는 도구가 여러 앱에
-    걸쳐 있어(실측: get_* 7개 앱) LLM 이 도메인을 혼동한다. 이름을 안 바꾸므로 호출 계약은 불변."""
+    걸쳐 있어(실측: get_* 7개 앱) LLM 이 도메인을 혼동한다. 이름을 안 바꾸므로 호출 계약은 불변.
+    chat — 챗 로드(_prep_tool(chat=True))면 코어 어휘표의 입구 도구 라벨에 '온톨로지 입구' 표지를 단다(HWAXPortal docs/ontology-first OF-6 —
+    규칙 ⑧ 이 가리키는 표지). 심의 · 리스크 심사 로드는 이 래퍼를 같이 타지만 표지를 달지 않는다 — 리스크 좌석 후보에 '먼저 쓰라' 가 가면 안 된다.
+    라벨이 붙지 않는 도구(설명이 '[' 로 시작 — 허브 가족의 소개 줄)에는 표지도 없다. 입구가 없는 박스(기본)에서는 글자 그대로다."""
     try:
-        _, label = _group_of(getattr(tool, "name", ""))
+        key, label = _group_of(getattr(tool, "name", ""))
         if label and label != "기타" and not str(tool.description or "").startswith("["):
+            if chat and _onto_entry(getattr(tool, "name", ""), key):
+                label = f"{label}{_onto.MARK_TAIL}"
             tool.description = f"[{label}] {tool.description or ''}"
     except Exception:  # noqa: BLE001 — 태깅 실패해도 도구는 살린다
         pass
@@ -2671,7 +2698,7 @@ def _attach_validation_hint(tool):
 def _prep_tool(tool, result_max=None, desc_max=None, arg_defaults=None, chat=False):
     """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
     result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값. arg_defaults · chat 은 챗 경로만 준다(_CHAT_ARG_DEFAULTS)."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max), result_max, arg_defaults, chat)
+    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool, chat)), desc_max), result_max, arg_defaults, chat)
 
 
 # ── 컨텍스트 예산 (운영 타깃 = GLM on B300, 128K 창 기준) ────────────────────────────
@@ -2785,7 +2812,8 @@ def _ensure_tool_vecs(tools: list) -> dict | None:
         _TOOL_VEC.update(hit)
         return hit
     by = {getattr(t, "name", ""): t for t in tools}
-    texts = [f"{n}: {(getattr(by[n], 'description', '') or '')[:400]}" for n in names]
+    # 입구 표지는 떼고 짓는다 — 색인은 이름 묶음으로만 다시 지어(sig) 덧씌우기로 표지를 켜고 꺼도 벡터가 같아야 한다(onto_links.strip_mark)
+    texts = [f"{n}: {_onto.strip_mark(getattr(by[n], 'description', '') or '')[:400]}" for n in names]
     try:
         vecs = _embed(texts, "passage")
     except Exception as exc:  # noqa: BLE001 — 임베딩 미가용이면 어휘 매칭만으로 동작(회귀 0)
@@ -2884,6 +2912,59 @@ _ONTO_CORE = (
     "failuretrace_object_resolve", "failuretrace_objects_list", "failuretrace_objects_summary", "failuretrace_graph_neighbors",
     "list_tasks", "task_revisions", "compare_task_revisions", "find_plm_task",
 )
+
+
+# 온톨로지 먼저(HWAXPortal docs/ontology-first OF-5 · OF-14 ④) — 고정 몫의 정본은 코어 어휘표 ontology.apps(reserve 인 앱의 tools, (백엔드, 원래 이름))다.
+# 추적 기본값은 위 _ONTO_CORE 를 같은 차례로 옮긴 것이라 기본 표에서 고정 몫이 글자 그대로다(시험 — tests/test_ontology_first_chat.py). 어휘표가 없거나 그
+# 칸이 없으면 _ONTO_CORE 다. 노출 이름은 받아 둔 게이트웨이 도구 지도로 푼다(onto_links.exposed — 지도를 두드리지 않는다 · 도구 로드가 이미 받았다).
+def _onto_v() -> dict | None:
+    v = (_core_vocab() or {}).get("onto")
+    return v if v and v.get("present") else None
+
+
+def _onto_core() -> tuple:
+    """챗 고정 몫의 노출 이름 — 어휘표 ontology(reserve)에서, 없으면 _ONTO_CORE."""
+    v = _onto_v()
+    if v is None:
+        return _ONTO_CORE
+    names, _missing = _onto.reserve_names(v, tmap=_TOOLS_MAP_CACHE.get("map") or {}, orig=_TOOLS_MAP_CACHE.get("orig"),
+                                          family=frozenset(_hub_apps()))
+    return names
+
+
+def _onto_entries() -> tuple:
+    """어휘표의 입구 쌍 ((백엔드, 원래 이름) …) — 없으면 (). 챗 에이전트 캐시 열쇠에도 든다 — 덧씌우기로 입구를 켜고 끄면 표지를 단 도구 묶음을 새로 짓는다
+    (켜자마자 규칙 ⑧ 은 서는데 캐시된 묶음의 설명에 표지가 없으면 재는 동안 둘이 어긋난다)."""
+    v = _onto_v()
+    return tuple(v["entries"]) if v else ()
+
+
+def _onto_entry(name: str, key: str) -> bool:
+    """이 노출 이름(백엔드 key)이 입구인가 — 원래 이름으로 본다(onto_links.is_entry)."""
+    ents = _onto_entries()
+    return bool(ents) and _onto.is_entry(name, key, frozenset(ents), _TOOLS_MAP_CACHE.get("orig"))
+
+
+def _onto_health() -> dict:
+    """/health core_vocab.ontology — 앱 · 고정 몫 수 · 입구 · 이 박스 도구 지도에 없는 이름 · 버린 줄. 지도는 받아 둔 것만 본다(못 받았으면 missing 칸이 없다)."""
+    try:
+        v = ((_core_vocab() or {}).get("onto")) or {}
+        out = {"present": bool(v.get("present")), "apps": list(v.get("apps") or {}),
+               "entries": [f"{a}:{t}" for a, t in v.get("entries") or ()], "dropped": list(v.get("dropped") or ())[:20]}
+        if not v.get("present"):
+            return out
+        m = _TOOLS_MAP_CACHE.get("map") or {}
+        names, missing = _onto.reserve_names(v, tmap=m, orig=_TOOLS_MAP_CACHE.get("orig"), family=frozenset(_hub_apps()))
+        out["reserve"] = len(names)
+        if m:
+            gone = [f"{a}:{t}" for a, t in v["entries"]
+                    if not _onto.exposed(a, t, tmap=m, orig=_TOOLS_MAP_CACHE.get("orig"), family=frozenset(_hub_apps()))[1]]
+            out["missing"] = list(dict.fromkeys(missing + gone))[:40]
+        return out
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        return {"present": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 # 마지막 절단 — /health 가 싣는다(앞뒤 개수 · 상한 · 추정 토큰 · 뺀 앱별 수). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다.
 _TOOL_CUT: dict = {}
 
@@ -2963,7 +3044,9 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     운영자의 입구 도구(get_guide·list_projects 등)가 캡 밖으로 밀려났다.
 
     core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
-    core_list = (_TOOL_PRIORITY + _ONTO_CORE) if core_names is None else core_names
+    # 고정 몫은 어휘표 ontology 에서(없으면 _ONTO_CORE — 기본 표에서는 글자 그대로다, HWAXPortal docs/ontology-first OF-5). 한 번만 푼다.
+    onto = _onto_core() if core_names is None else ()
+    core_list = (_TOOL_PRIORITY + onto) if core_names is None else core_names
     if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
         # 캡이 없거나 안 걸리면 **아무것도 떨어뜨리지 않는다** — 스키마 총량이 예산 안이면. 다만 순서는 바꾼다 —
         # 전문가 도구를 465종 한가운데 묻어 두면 모델이 못 찾고, 상태줄이 "우선" 이라고
@@ -2982,7 +3065,7 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
         elif prefer:
             _r = {n: i for i, n in enumerate(prefer)}
             tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
-        keep = _GUIDE_FRONT + (_ONTO_CORE if core_names is None else ())
+        keep = _GUIDE_FRONT + onto
         # 고정 몫(안내대 · 코어)은 정해진 차례(keep — 안내대 먼저)로 맨 앞에 — 관련도 순서로 다시 놓이면 턴마다 도구 몫의 앞부분이 바뀌어
         # 접두 캐시가 깨진다(HWAXPortal docs/request-1029 W-3). 요청서는 이름순을 권했지만 정해진 차례도 턴마다 같고 안내대가 앞에 남는다.
         _ki = {n: i for i, n in enumerate(keep)}
@@ -3058,7 +3141,8 @@ _LABEL_HEAD = re.compile(r"^\[([^\]]*)\]\s*")
 
 
 def _lex_profile(t, qtok: set) -> str:
-    name, desc = getattr(t, "name", ""), getattr(t, "description", "") or ""
+    # 입구 표지(' · 온톨로지 입구')는 떼고 센다 — 표지는 모델이 읽는 글이지 순위 신호가 아니다(onto_links.strip_mark, HWAXPortal docs/ontology-first)
+    name, desc = getattr(t, "name", ""), _onto.strip_mark(getattr(t, "description", "") or "")
     m = _LABEL_HEAD.match(desc)
     if m:
         desc = desc[m.end():]
@@ -4485,9 +4569,12 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # 죽는다. 포털이 30분 창에 맞춰 같은 토큰을 주므로 캐시 적중은 그대로다.
     # ⚠ 패널 표지(allow_panels)도 키에 있어야 한다 — 표지 턴의 에이전트(패널 도구 · 인터셉터를 묶은)를 표지 없는 턴이 재사용하면 HA-05 가 풀린다.
     #   자격증명 해시 **앞에** 둔다 — 강등 저장(key[:-1] + 빈 해시)이 마지막 칸을 갈아 끼운다.
+    # 어휘표의 입구 쌍(온톨로지 먼저 — HWAXPortal docs/ontology-first)도 키에 든다 — 입구 표지는 묶을 때 도구 설명에 달려(_prep_tool(chat=True)), 덧씌우기로
+    # 입구를 켜고 끄면 묶음을 새로 지어야 규칙 ⑧(턴마다 짓는 시스템 프롬프트)과 표지가 어긋나지 않는다. 입구가 없는 박스(기본)는 늘 빈 것이다.
     key = (frozenset(groups), pin_key, q_key,
            tuple(sorted(sources)) if sources is not None else None,
            (user or "").strip().lower(),
+           _onto_entries(),
            bool(allow_panels),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
     _snap_key = (frozenset(groups), (user or "").strip().lower(), bool(allow_panels))   # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다

@@ -1,0 +1,230 @@
+# 코어 어휘표 ontology 칸 — 챗 고정 몫 · 규칙 ⑧ · 입구 표지(챗 로드만) · /health, 기본 표에서는 프롬프트 · 도구가 바이트까지 그대로(HWAXPortal docs/ontology-first)
+"""HWAXPortal docs/ontology-first PLAN §4 · OF-5 · OF-6 · OF-14 ①④.
+
+  · 고정 몫(_ONTO_CORE)의 정본이 어휘표 ontology.apps(reserve 인 앱의 tools — (백엔드, 원래 이름))로 옮겨 갔다. 추적 기본값은 _ONTO_CORE 를 같은 차례로
+    옮긴 것이라 기본 표에서 고정 몫 · 시스템 프롬프트 · 묶는 도구와 그 설명이 바이트까지 같다(사용자 결정 OF-14 ④).
+  · entry 가 있으면 코어 규칙 끝에 ⑧ 한 줄(앱 이름 없이)과 그 입구 도구 설명의 '온톨로지 입구' 표지가 선다 — 표지는 챗 로드에만(심의 · 리스크 좌석의 로드는
+    같은 래퍼를 타지만 달지 않는다), 순위(어휘 · 의미)는 표지와 상관없다.
+  · 검사는 앱 줄마다 — 틀린 줄만 버리고, 허브 가족의 entry 는 버린다(줄은 남는다). /health core_vocab.ontology 가 말한다.
+
+  실행:  .venv/bin/python -m pytest tests/test_ontology_first_chat.py -q
+"""
+import asyncio
+import json
+import sys
+import time
+import types
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest  # noqa: E402
+from langchain_core.tools import StructuredTool  # noqa: E402
+
+import app as a  # noqa: E402
+import onto_links  # noqa: E402
+
+_REAL = a.CORE_VOCAB_PATH          # 형제 포털 리포의 정본 — conftest 가 시험마다 '없음' 으로 돌리기 전의 기본 경로
+_TASK = {"list_tasks": "heax-kooremapper_mcp", "task_revisions": "heax-kooremapper_mcp", "compare_task_revisions": "heax-kooremapper_mcp",
+         "find_plm_task": "heax-step_forge"}
+# cae00 꼴 — 허브 둘이 붙어 가족 도구는 접두, 과제 도구는 맨 이름(운영 사본은 선언 백엔드라 그쪽만 접두 — OF-3)
+_CAE00 = {**{n: ("rootdesigndatahub" if n.startswith("rootdesigndatahub_") else "failuretrace")
+             for n in a._ONTO_CORE if n.startswith(("rootdesigndatahub_", "failuretrace_"))},
+          **_TASK, "stepforgeprod_find_plm_task": "stepforge-prod", "onto_search": "heax-step_forge", "list_parts": "heax-step_forge"}
+_CAE00_ORIG = {n: n.split("_", 1)[1] for n, bk in _CAE00.items() if bk in ("rootdesigndatahub", "failuretrace")} | \
+    {"stepforgeprod_find_plm_task": "find_plm_task"}
+# dev 꼴 — 허브가 없다
+_DEV = {**_TASK, "onto_search": "heax-step_forge", "list_parts": "heax-step_forge", "semantic_search_x": "ai-data-hub"}
+
+
+def _real_vocab() -> dict:
+    if not _REAL.exists():
+        pytest.skip(f"형제 포털 리포의 코어 어휘표가 없다: {_REAL}")
+    d = json.loads(_REAL.read_text(encoding="utf-8"))
+    assert "ontology" in d, "형제 포털 리포의 어휘표에 ontology 칸이 없다 — 이 판(docs/ontology-first)의 포털과 함께 돌린다"
+    return d
+
+
+def _use(monkeypatch, tmp_path, body: dict, overlay: dict | None = None):
+    p = tmp_path / "core_vocab.json"
+    p.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(a, "CORE_VOCAB_PATH", p)
+    loc = tmp_path / "core_vocab.local.json"
+    if overlay is not None:
+        loc.write_text(json.dumps(overlay, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(a, "CORE_VOCAB_LOCAL_PATH", loc)
+    monkeypatch.setattr(a, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "overlay": None})
+
+
+def _map(monkeypatch, tmap: dict, orig=None, labels=None):
+    monkeypatch.setattr(a, "_TOOLS_MAP_CACHE", {"at": time.time(), "map": dict(tmap), "areas": {}, "area_meta": {}, "routine_read": None,
+                                                "orig": orig, "declared": frozenset(), "family": frozenset()})
+    monkeypatch.setattr(a, "_APPS_CACHE", {"apps": {k: {"app": k, "label": v} for k, v in (labels or {}).items()}, "at": time.time()})
+
+
+def _tool(name: str, desc: str = "설명"):
+    return StructuredTool(name=name, description=desc, args_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+                          coroutine=lambda **_k: None)
+
+
+def _bare(d: dict) -> dict:
+    return {k: v for k, v in d.items() if k != "ontology"}
+
+
+# ── 기본 표 — 바이트까지 그대로 ───────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("box", ("empty", "cae00", "dev"))
+def test_기본_표의_고정_몫은_옛_ONTO_CORE_그대로다(monkeypatch, tmp_path, box):
+    _use(monkeypatch, tmp_path, _real_vocab())
+    tmap, orig = {"empty": ({}, None), "cae00": (_CAE00, _CAE00_ORIG), "dev": (_DEV, {})}[box]
+    _map(monkeypatch, tmap, orig)
+    assert a._core_vocab()["onto"]["present"] and a._core_vocab()["onto"]["entries"] == (), "기본 표에는 입구가 없다(OF-14 ④)"
+    assert a._onto_core() == a._ONTO_CORE, a._onto_core()
+
+
+def test_기본_표의_시스템_프롬프트는_ontology_칸이_없던_때와_바이트까지_같다(monkeypatch, tmp_path):
+    d = _real_vocab()
+    _use(monkeypatch, tmp_path, _bare(d))
+    before = a._system_prompt()
+    _use(monkeypatch, tmp_path, d)
+    assert a._system_prompt() == before and "⑧" not in before and onto_links.MARK not in before
+
+
+@pytest.mark.parametrize("cap", (0, 6))
+def test_기본_표에서_묶는_도구와_설명은_옛_고정_몫과_바이트까지_같다(monkeypatch, tmp_path, cap):
+    """캡 없는 길(운영 TOOL_MAX=0 — 예산을 넘겨 관련도로 자르는 길까지)과 캡 길 모두. 이름 · 차례 · 챗 로드의 설명이 같다."""
+    d = _real_vocab()
+    _map(monkeypatch, _CAE00, _CAE00_ORIG, labels={"heax-step_forge": "StepForge", "heax-kooremapper_mcp": "DynaForge"})
+    monkeypatch.setattr(a, "TOOL_MAX", cap)
+    monkeypatch.setattr(a, "CHAT_TOOL_SCHEMA_BUDGET", 300)        # 캡 없는 길도 예산을 넘겨 자르게 — 고정 몫(keep)이 드러난다
+    monkeypatch.setattr(a, "_semantic_order", lambda *_a, **_k: [])
+
+    def run(body):
+        _use(monkeypatch, tmp_path, body)
+        tools = [a._prep_tool(_tool(n), chat=True) for n in sorted(_CAE00)]
+        return [(t.name, t.description) for t in a._select_tools(tools, "과제 차수 비교")]
+    assert run(d) == run(_bare(d))
+
+
+def test_기본_표에서_챗_로드에도_표지가_없다(monkeypatch, tmp_path):
+    _use(monkeypatch, tmp_path, _real_vocab())
+    _map(monkeypatch, _DEV, {}, labels={"heax-step_forge": "StepForge"})
+    t = a._prep_tool(_tool("find_plm_task"), chat=True)
+    assert t.description.startswith("[StepForge] ") and onto_links.MARK not in t.description
+
+
+# ── 박스 덧씌우기로 입구를 켠다 ────────────────────────────────────────────────────────────────────
+_SF_ENTRY = {"ontology": {"apps": {"heax-step_forge": {"tools": ["find_plm_task", "onto_search"], "entry": "onto_search"}}}}
+
+
+def test_입구를_켜면_규칙_8_과_표지가_서고_고정_몫에_든다(monkeypatch, tmp_path):
+    d = _real_vocab()
+    _use(monkeypatch, tmp_path, d)
+    base_rules = a._system_prompt()
+    _use(monkeypatch, tmp_path, d, overlay=_SF_ENTRY)
+    _map(monkeypatch, _CAE00, _CAE00_ORIG, labels={"heax-step_forge": "StepForge"})
+    sp = a._system_prompt()
+    assert sp != base_rules and sp.replace(a._ONTO_RULE, "") == base_rules, "규칙 끝에 ⑧ 한 줄만 붙는다 — 나머지는 바이트까지 같다"
+    assert "StepForge" not in a._ONTO_RULE and "onto_search" not in a._ONTO_RULE, "규칙에 앱 · 도구 이름을 적지 않는다(앞부분 캐시 W-3)"
+    assert a._core_vocab()["onto"]["entries"] == (("heax-step_forge", "onto_search"),)
+    assert a._onto_core() == a._ONTO_CORE + ("onto_search",), "덧씌우기의 tools 차례로 고정 몫 끝에(merge patch — 목록은 통째로)"
+    chat = a._prep_tool(_tool("onto_search", "온톨로지에서 이름을 푼다"), chat=True)
+    assert chat.description.startswith(f"[StepForge · {onto_links.MARK}] "), chat.description
+    seat = a._prep_tool(_tool("onto_search", "온톨로지에서 이름을 푼다"))
+    assert seat.description.startswith("[StepForge] ") and onto_links.MARK not in seat.description, "심의 · 리스크 좌석 로드에는 표지가 없다"
+    other = a._prep_tool(_tool("find_plm_task"), chat=True)
+    assert onto_links.MARK not in other.description, "입구가 아닌 도구에는 없다"
+    h = a._core_vocab_health()["ontology"]
+    assert h["entries"] == ["heax-step_forge:onto_search"] and h["reserve"] == len(a._ONTO_CORE) + 1 and h["missing"] == [], h
+
+
+def test_표지는_순위를_바꾸지_않는다(monkeypatch, tmp_path):
+    """'온톨로지' 를 부른 질의가 입구 도구를 끌어올리면 '온톨로지가 있는 플랫폼으로 보낸다'(버린 안 — OF-1 (나))가 된다. 어휘 순위는 표지를 떼고 센다."""
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay=_SF_ENTRY)
+    _map(monkeypatch, _CAE00, _CAE00_ORIG, labels={"heax-step_forge": "StepForge"})
+    marked = a._prep_tool(_tool("onto_search", "이름을 푼다"), chat=True)
+    plain = a._prep_tool(_tool("onto_search", "이름을 푼다"))
+    assert marked.description != plain.description
+    for q in ("온톨로지 입구", "StepForge 온톨로지", "고장모드 목록"):
+        qt = a._tok_query(q)
+        assert a._lex_profile(marked, qt) == a._lex_profile(plain, qt), q
+
+
+def test_옛_게이트웨이_orig_없음에도_입구는_접두_꼴까지_알아본다(monkeypatch, tmp_path):
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay=_SF_ENTRY)
+    _map(monkeypatch, {"heaxstep_forge_onto_search": "heax-step_forge"}, None, labels={"heax-step_forge": "StepForge"})
+    t = a._prep_tool(_tool("heaxstep_forge_onto_search"), chat=True)
+    assert t.description.startswith(f"[StepForge · {onto_links.MARK}] ") and "heaxstep_forge_onto_search" in a._onto_core()
+
+
+def test_허브_가족의_entry_는_버리고_줄은_남긴다(monkeypatch, tmp_path):
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay={"ontology": {"apps": {"rootdesigndatahub": {"entry": "object_resolve"}}}})
+    _map(monkeypatch, _CAE00, _CAE00_ORIG)
+    v = a._core_vocab()["onto"]
+    assert v["entries"] == () and [x["app"] for x in v["dropped"]] == ["rootdesigndatahub"], v["dropped"]
+    assert "⑧" not in a._system_prompt() and a._onto_core() == a._ONTO_CORE, "가족 줄의 고정 몫은 그대로다"
+
+
+def test_틀린_앱_줄만_버리고_나머지는_돈다(monkeypatch, tmp_path):
+    bad = {"ontology": {"apps": {"Bad Key": {"tools": ["x"]}, "signalforge": {"tools": "resolve_product_keyword"},
+                                 "heax-kooremapper_mcp": {"entry": "nope"}, "mx-white-paper": {"tools": ["wiki_search"], "reserve": "yes"},
+                                 "heax-step_forge": {"tools": ["find_plm_task", "onto_search"], "entry": "onto_search", "weight": 3}}}}
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay=bad)
+    _map(monkeypatch, _CAE00, _CAE00_ORIG)
+    d = a._core_vocab()
+    assert d["fingerprint"] != d["base_fingerprint"], "덧씌우기는 받아들였다(표 전체를 버리지 않는다 — 게이트웨이와 지문이 같게)"
+    v = d["onto"]
+    assert sorted(x["app"] for x in v["dropped"]) == sorted(["Bad Key", "signalforge", "heax-kooremapper_mcp", "mx-white-paper", "heax-step_forge"])
+    assert list(v["apps"]) == ["rootdesigndatahub", "failuretrace"] and v["entries"] == ()
+    assert a._onto_core() == tuple(n for n in a._ONTO_CORE if n.startswith(("rootdesigndatahub_", "failuretrace_")))
+    assert "⑧" not in a._system_prompt(), "버린 줄의 입구는 규칙을 세우지 않는다"
+    assert a._core_vocab_health()["ontology"]["dropped"], "버린 줄과 까닭은 /health 에"
+
+
+def test_이_박스_도구_지도에_없는_이름을_health_가_말하고_남의_도구는_앞세우지_않는다(monkeypatch, tmp_path):
+    _use(monkeypatch, tmp_path, _real_vocab())
+    _map(monkeypatch, {**_DEV, "list_tasks": "other-app"}, {})
+    names = a._onto_core()
+    assert "list_tasks" not in names, "그 이름은 이 박스에서 다른 앱의 것이다 — 남의 도구를 고정 몫에 세우지 않는다"
+    miss = a._core_vocab_health()["ontology"]["missing"]
+    assert "heax-kooremapper_mcp:list_tasks" in miss and "rootdesigndatahub:object_resolve" in miss, miss
+
+
+def test_어휘표가_없으면_ONTO_CORE_이고_health_는_칸이_없다고_말한다():
+    assert a._onto_core() == a._ONTO_CORE and a._onto_entries() == ()
+    assert a._core_vocab_health() == {"loaded": False, "error": "없음"}
+
+
+def test_입구를_켜고_끄면_챗_에이전트_묶음을_새로_짓는다(monkeypatch, tmp_path):
+    """표지는 묶을 때 도구 설명에 달린다 — 입구 쌍이 캐시 열쇠에 없으면 켠 뒤에도 30분(AGENT_CACHE_TTL_S) 동안 표지 없는 묶음이 돌아 규칙 ⑧ 과 어긋났다."""
+    built = []
+
+    def _fake_react(_llm, tools, **_k):
+        built.append({t.name: t.description for t in tools})
+        return types.SimpleNamespace()
+
+    class _StubClient:
+        def __init__(self, _c):
+            pass
+
+        async def get_tools(self):
+            return [_tool("onto_search", "이름을 푼다"), _tool("list_parts")]
+
+    monkeypatch.setattr(a, "create_react_agent", _fake_react)
+    monkeypatch.setattr(a, "MultiServerMCPClient", _StubClient)
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    _map(monkeypatch, _DEV, {}, labels={"heax-step_forge": "StepForge"})
+    state = types.SimpleNamespace(llm=object(), connections={"gateway": {"url": "http://gw/mcp", "headers": {}}},
+                                  agent_cache={}, tool_degraded={}, tool_load_error={}, tool_snapshot={})
+    monkeypatch.setattr(a, "_chat_llm_of", lambda _app: object())
+    d = _real_vocab()
+
+    def build():
+        return asyncio.run(a._agent_for(types.SimpleNamespace(state=state), ["admin"], user="u@x"))
+
+    _use(monkeypatch, tmp_path, d)
+    build()
+    _use(monkeypatch, tmp_path, d, overlay=_SF_ENTRY)
+    build()
+    build()                                    # 같은 입구 — 캐시를 쓴다
+    assert len(built) == 2 and len(state.agent_cache) == 2, (len(built), list(state.agent_cache))
+    assert onto_links.MARK not in built[0]["onto_search"] and built[1]["onto_search"].startswith(f"[StepForge · {onto_links.MARK}]")
