@@ -1201,6 +1201,123 @@ def _risk_hide_prior_panels(tool, question: str):
     return tool
 
 
+# RA 온톨로지의 리스크 판정 객체 — 리스크 앱이 등록부 클러스터마다 RA 에 보내는 risk_finding(HWAXRisk ra_client._registry_object — RK-01).
+# value 는 '<과제 코드>@<메커니즘>.<세부>@<target_key>#<클러스터 키>' 이고 속성에 보낼 때의 등록부 status(사람의 판정)가 실린다. 과제가
+# 비공개 · 폐기로 거둬지면 value 가 '비공개@<target_key>#<클러스터 키>' 로 바뀌고 status 가 빠진다(클러스터 키는 해시라 판정을 싣지
+# 않는다). 그 송신이 켜지면 리스크 심사 좌석이 온톨로지 읽기 셋(_RISK_KEEP_TOOLS 에 있다)으로 같은 과제의 앞 판정을 읽는다(D-18 누수
+# 셋 가운데 하나, 2026-11-02). 꼴을 바꾸려면 그 리포와 같이 바꾼다.
+_RA_FINDING_TYPE = "risk_finding"
+_RISK_FINDING_TOOLS = ("search_objects", "get_object", "get_subgraph")
+_RISK_FINDING_WITHHELD = ("같은 과제({code})의 리스크 판정 객체(risk_finding) {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널 · "
+                          "사람의 판정을 읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+_RISK_FINDING_WITHHELD_ALL = ("리스크 판정 객체(risk_finding) {n}건은 리스크 심사 좌석에게 보이지 않는다 — 질문에서 과제를 읽지 못해 같은 "
+                              "과제의 판정을 가릴 수 없어 판정 객체를 전부 뺐다(다른 과제의 것도 함께 빠졌다). 이 심사는 앞 판정 없이 "
+                              "독립으로 판단한다.")
+
+
+def _risk_hide_prior_findings(tool, question: str):
+    """리스크 심사 좌석의 RA 온톨로지 읽기(search_objects · get_object · get_subgraph)에서 같은 과제의 리스크 판정 객체를 뺀다(사용자
+    결정 D-18 — _risk_hide_prior_panels 의 짝이다. 그쪽은 보고서 검색을 거른다).
+
+    빼는 것은 risk_finding 가운데 value 가 '<과제 코드>@' 로 시작하는 것이다 — 검색 항목(items) · 근거 객체(objects) · 그래프 노드
+    (nodes)와 그 노드에 닿는 엣지(edges) · 객체의 관계(relations — 상대 객체로 본다). 객체 자신(get_object)이나 그래프의 씨앗
+    (get_subgraph 의 entity_id)이 같은 과제의 판정 객체면 결과를 통째로 주지 않는다 — 그 둘레가 곧 판정의 근거(verified_by ·
+    refuted_by)다. 다른 과제의 판정 객체는 선례라 남긴다. 과제 코드를 읽지 못하면(머리 없는 손수 길 · 머리를 읽지 못한 길) 같은
+    과제를 가릴 수 없어 판정 객체를 전부 뺀다. 응답 꼴은 RA mcp_server 의 그 셋 그대로다 — search_objects · get_object 는
+    /api/ai/ontology/tool 의 data({items, total, shown, truncated, objects} · {type, id, label, kind, properties, relations, reports}),
+    get_subgraph 는 /api/entities/{id}/graph 의 data({nodes:[{id, value, type_slug …}], edges:[{src, dst, relation}]}).
+
+    응답은 풀어서 본다(글자열로만 대조하면 한글이 \\uXXXX 로 온 응답에서 샌다). 풀지 못한 응답에 판정 객체가 보이면(과제를 알면 그
+    과제의 머리까지 보이면) 결과를 통째로 주지 않는다."""
+    code = _risk_q_code(question)
+    orig = getattr(tool, "coroutine", None)
+    if orig is None:
+        return tool
+    head = None if code is None else f"{code}@".casefold()
+
+    def _mine(o) -> bool:
+        if not isinstance(o, dict) or str(o.get("type") or o.get("type_slug") or "") != _RA_FINDING_TYPE:
+            return False
+        return head is None or str(o.get("value") or o.get("label") or "").casefold().startswith(head)
+
+    def _withheld(n: int) -> str:
+        return (_RISK_FINDING_WITHHELD.format(code=code, n=n) if code is not None
+                else _RISK_FINDING_WITHHELD_ALL.format(n=n))
+
+    _opaque = ("조회 결과를 줄 수 없다 — 리스크 판정 객체(risk_finding)가 섞여 있는데 응답을 풀지 못해 "
+               + (f"같은 과제({code})의 판정을 가려낼 수 없다" if code is not None
+                  else "판정 객체를 가려낼 수 없다(질문에서 과제를 읽지 못해 판정 객체를 전부 뺀다)")
+               + ". 리스크 심사 좌석은 앞 판정을 보지 않는다. 조회를 좁혀 다시 찾아라.")
+
+    def _hide(text, seed):
+        if not isinstance(text, str):
+            return text
+        try:
+            got = json.loads(text)
+        except ValueError:
+            got = None
+        if not isinstance(got, dict):
+            low = text.casefold()
+            if _RA_FINDING_TYPE in low and (head is None or head in low or json.dumps(head)[1:-1] in low):
+                return _opaque
+            return text
+        nodes = got.get("nodes") if isinstance(got.get("nodes"), list) else []
+        seed = got.get("seed", seed)
+        if _mine(got) or (seed is not None and any(_mine(x) and str(x.get("id")) == str(seed) for x in nodes)):
+            return json.dumps({"withheld": _withheld(1)}, ensure_ascii=False)
+        out, gone = dict(got), set()
+        for key, inner in (("items", None), ("objects", None), ("nodes", None), ("relations", "object")):
+            rows = got.get(key)
+            if not isinstance(rows, list):
+                continue
+            keep = []
+            for r in rows:
+                o = r.get(inner) if inner and isinstance(r, dict) else r
+                if _mine(o):
+                    gone.add(str(o.get("id")))
+                else:
+                    keep.append(r)
+            out[key] = keep
+        if not gone:
+            return text
+        if isinstance(got.get("edges"), list):
+            out["edges"] = [e for e in got["edges"]
+                            if not (isinstance(e, dict) and (str(e.get("src")) in gone or str(e.get("dst")) in gone))]
+        if isinstance(got.get("items"), list):
+            if isinstance(got.get("shown"), int):
+                out["shown"] = len(out["items"])
+            if isinstance(got.get("total"), int):
+                out["total"] = max(len(out["items"]), got["total"] - (len(got["items"]) - len(out["items"])))
+        for key, rows in (("node_count", "nodes"), ("edge_count", "edges")):
+            if isinstance(got.get(key), int) and isinstance(out.get(rows), list):
+                out[key] = len(out[rows])
+        out["withheld"] = _withheld(len(gone))
+        return json.dumps(out, ensure_ascii=False)
+
+    async def hidden(*a, **kw):
+        out = await orig(*a, **kw)
+        args = kw or (a[0] if a and isinstance(a[0], dict) else {})
+        seed = args.get("entity_id") if isinstance(args, dict) else None
+        if isinstance(out, tuple) and len(out) == 2:       # (content, artifact) 형식 보존
+            return (_hide(out[0], seed), out[1])
+        return _hide(out, seed)
+
+    tool.coroutine = hidden
+    return tool
+
+
+def _risk_hide_ra_priors(tools: dict, question: str) -> None:
+    """리스크 심사의 RA 읽기에 D-18 거름 둘을 건다 — 보고서 검색(search_reports)은 같은 과제의 앞 패널 심의 보고서
+    (_risk_hide_prior_panels), 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(_risk_hide_prior_findings). 맨 이름과 RA 의 겹침 접두
+    꼴(reportarchive_<이름> — 다른 앱과 이름이 겹치면 게이트웨이가 그 꼴로만 싣는다) 둘 다 감싼다."""
+    for n, t in tools.items():
+        base = n.removeprefix(_RA_APP_HEAD)
+        if base == "search_reports":
+            _risk_hide_prior_panels(t, question)
+        elif base in _RISK_FINDING_TOOLS:
+            _risk_hide_prior_findings(t, question)
+
+
 def _risk_not_visible(out) -> bool:
     """리스크 앱 읽기 도구가 범위 밖이라 막았나 — `{"error": "not_visible", …}`(HWAXRisk mcp_server._guarded). isError 가
     아니라 게이트웨이 감사에도 성공으로 남는다(risk-entry SEC-3)."""
@@ -5823,36 +5940,42 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 리스크 심사는 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입)에서도 같은 과제의 앞 패널 보고서를 뺀다(D-18).
     # 둘 다 결과를 전 좌석 프롬프트에 싣는다 — 좌석 자유 조회만 거르던 동안 search_reports 를 지정하거나 선주입을 켠 리스크
     # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
-    if opts.chair_template == "risk-review" and tools.get("search_reports") is not None:
-        _risk_hide_prior_panels(tools.get("search_reports"), question)
+    # RA 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(risk_finding)를 뺀다(_risk_hide_ra_priors — 지정 도구로 와도 같다).
+    _risk_chair0 = opts.chair_template == "risk-review"
+    if _risk_chair0:
+        _risk_hide_ra_priors(tools, question)
     # 리스크 심사인데 과제 코드를 읽지 못했으면 위 거름(과 자유 조회의 거름)이 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서를
     # 전부 뺀다 — 다른 과제의 선례도 함께 빠지므로 조용히 넘기지 않는다. 머리가 보이는데 못 읽은 길(m1 2차 AF2-D18-code-space)과
     # 머리 없이 손수 부른 길(m1 3차 발견 5 — 실사용 팀의 길)을 가른다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
     # 러너가 패널에 옮겨 적는다.
-    _risk_chair0 = opts.chair_template == "risk-review"
     _unread = _risk_head_unread(question) if _risk_chair0 else ""
     _where = "보고서 검색(좌석 자유 조회·지정 도구·정량 근거 선주입)"
+    # 온톨로지 읽기의 판정 객체 거름(_risk_hide_prior_findings)도 같은 까닭으로 전부로 넓어진다 — 함께 말한다.
+    _onto = (" RA 온톨로지 읽기(search_objects · get_object · get_subgraph)의 리스크 판정 객체(risk_finding)도 같은 까닭으로 "
+             "전부 뺐다(다른 과제의 것도 함께).")
     if _unread and _pre is None:
         yield _sse("warning", {"code": "risk_head_unread",
                                "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해 같은 과제를 가릴 수 "
                                           f"없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 전부 "
-                                          "뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). 머리 꼴은 "
-                                          "'[리스크심사 <과제코드> <target_key>]' 입니다."})
+                                          "뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). RA 온톨로지의 리스크 판정 객체"
+                                          "(risk_finding)도 전부 뺍니다. 머리 꼴은 '[리스크심사 <과제코드> <target_key>]' 입니다."})
         yield _delib("evidence", source="앞 패널 보고서 거름 — 머리를 읽지 못해 심의 초안 전부를 뺐다", included=False,
                      notice=True,
                      text=f"질문 머리 {_unread} 에서 과제 코드와 target_key 를 읽지 못했다(머리 꼴은 '[리스크심사 <과제코드> "
                           f"<target_key>]'). 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 "
-                          f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).")
+                          f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_onto}")
     elif _risk_chair0 and _risk_q_code(question) is None and _pre is None:
         yield _sse("warning", {"code": "risk_head_missing",
                                "message": "질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제를 "
                                           f"가릴 수 없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 "
-                                          "전부 뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다)."})
+                                          "전부 뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). RA 온톨로지의 리스크 판정 "
+                                          "객체(risk_finding)도 전부 뺍니다."})
         yield _delib("evidence", source="앞 패널 보고서 거름 — 머리 없는 손수 길이라 심의 초안 전부를 뺐다", included=False,
                      notice=True,
                      text="질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제의 앞 패널 보고서를 "
                           f"가릴 수 없었다. 그래서 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 {_where}에서 전부 "
-                          "뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18). 과제를 밝혀 거름을 좁히려면 질문 머리를 붙여 부른다.")
+                          f"뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_onto} 과제를 밝혀 거름을 좁히려면 질문 머리를 붙여 "
+                          "부른다.")
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
     # 결정문 헤더(_evidence_note)에도 남지만, 심의가 도는 동안 보는 사람이 먼저 알아야 한다.
@@ -5897,9 +6020,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
-            # 리스크 심사 좌석의 보고서 검색에서 같은 과제의 앞 패널 심의 보고서를 뺀다(D-18 — _risk_hide_prior_panels).
-            if _risk_chair and "search_reports" in _g:
-                _risk_hide_prior_panels(_g["search_reports"], question)
+            # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체를 뺀다(D-18 —
+            # _risk_hide_ra_priors). 외부 응답자의 글 왕복(CALL 줄)도 이 도구들을 실행한다.
+            if _risk_chair:
+                _risk_hide_ra_priors(_g, question)
             # 웹 리서치 소스 토글 — 켜지 않은 소스의 도구는 목록에서 뺀다. 모델에게 금지를
             # 지키게 하는 것과 도구가 존재하지 않는 것은 다르다.
             if opts.search_sources is not None:

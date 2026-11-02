@@ -535,3 +535,246 @@ def test_리스크_심사는_범용_실행기를_지정해도_부르지_않는�
     _refused(runs, ["invoke_tool"])
     _runs, tools = _designate(monkeypatch, "default", ("invoke_tool",))
     assert tools["invoke_tool"].calls
+
+
+# ── (9) RA 온톨로지 읽기 — 같은 과제의 리스크 판정 객체(risk_finding)를 리스크 심사 좌석에게 주지 않는다 ─────────────────────────
+# 리스크 앱의 RA 송신(RK-01 — HWAXRisk ra_client._registry_object)이 켜지면 RA 에 등록부 클러스터마다 risk_finding 이 생긴다 — value 는
+# '<과제 코드>@<메커니즘>.<세부>@<target_key>#<클러스터 키>' 이고 속성에 사람의 판정(status)이 실린다. 좌석은 온톨로지 읽기 셋
+# (search_objects · get_object · get_subgraph — 리스크 심사 유지 도구)을 받으므로 같은 과제의 앞 판정을 읽을 수 있었다(D-18 누수 셋 가운데
+# 하나, 2026-11-02). 응답 꼴은 RA mcp_server 그대로다 — search_objects · get_object 는 /api/ai/ontology/tool 의 data, get_subgraph 는
+# /api/entities/{id}/graph 의 data. 다른 과제의 판정 객체는 선례라 남긴다. 'P1@' 와 'P12@' 는 다른 과제다.
+_F_MINE = {"id": 501, "value": "P1@mech.hinge_crack@diff:new#a1b2c3d4e5f6", "type": "risk_finding",
+           "properties": {"status": "confirmed", "cluster_key": "a1b2c3d4e5f6"}}
+_F_MINE_OLD = {"id": 502, "value": "P1@sim.drop_peak@snap:old#0f0e0d0c0b0a", "type": "risk_finding",
+               "properties": {"status": "dismissed"}}
+_F_OTHER = {"id": 601, "value": "P12@mech.hinge_crack@diff:x#ffeeddccbbaa", "type": "risk_finding",
+            "properties": {"status": "confirmed"}}
+_F_RETRACTED = {"id": 701, "value": "비공개@diff:z#123456789abc", "type": "risk_finding", "properties": {"visibility": "private"}}
+_INCIDENT = {"id": 301, "value": "INC-0412 힌지 크랙", "type": "incident", "properties": {}}
+
+
+def _objs_hits(*rows):
+    """search_objects 의 응답 모양 — content(items · total · shown · truncated)와 라우트가 덧붙이는 근거 객체(objects)."""
+    return {"items": [dict(r) for r in rows], "total": len(rows) + 3, "shown": len(rows), "truncated": True,
+            "objects": [{"type": r["type"], "id": str(r["id"]), "label": r["value"]} for r in rows]}
+
+
+# get_object — 사고 객체의 관계에 판정 객체가 둘 걸려 있다(FK 관계 꼴 {id, value, type} 과 수동 연결 꼴 {type, id, label}).
+_OBJ_INCIDENT = {"type": "incident", "id": "301", "label": "INC-0412 힌지 크랙", "kind": "record", "properties": {},
+                 "reports": [{"report_id": 9, "title": "힌지 낙하 시험 보고서", "workspace_slug": "w"}],
+                 "relations": [
+                     {"relation": "verified_by", "direction": "in",
+                      "object": {"id": 501, "value": _F_MINE["value"], "type": "risk_finding"}},
+                     {"relation": "verified_by", "direction": "in",
+                      "object": {"type": "risk_finding", "id": "601", "label": _F_OTHER["value"]}},
+                     {"relation": "occurs_in", "direction": "out", "object": {"id": 41, "value": "힌지 브래킷", "type": "part"}}],
+                 "objects": [{"type": "incident", "id": "301", "label": "INC-0412 힌지 크랙"}]}
+_OBJ_MINE = {"type": "risk_finding", "id": "501", "label": _F_MINE["value"], "kind": "record",
+             "properties": {"status": "confirmed"}, "reports": [],
+             "relations": [{"relation": "verified_by", "direction": "out",
+                            "object": {"id": 301, "value": "INC-0412 힌지 크랙", "type": "incident"}}],
+             "objects": [{"type": "risk_finding", "id": "501", "label": _F_MINE["value"]}]}
+# get_subgraph — 라우트 꼴(노드는 type_slug).
+_GRAPH = {"nodes": [{"id": 301, "value": "INC-0412 힌지 크랙", "type_id": 3, "type_slug": "incident", "degree": 3},
+                    {"id": 501, "value": _F_MINE["value"], "type_id": 9, "type_slug": "risk_finding", "degree": 1},
+                    {"id": 601, "value": _F_OTHER["value"], "type_id": 9, "type_slug": "risk_finding", "degree": 1},
+                    {"id": 41, "value": "힌지 브래킷", "type_id": 2, "type_slug": "part", "degree": 1}],
+          "edges": [{"src": 501, "dst": 301, "relation": "verified_by"},
+                    {"src": 601, "dst": 301, "relation": "verified_by"},
+                    {"src": 301, "dst": 41, "relation": "occurs_in"}]}
+
+
+def _onto_given(monkeypatch, chair, question, answers, apps=("heax-step_forge",)):
+    """심의를 좌석 발굴 문턱까지 돌려 좌석 에이전트가 받은 도구({이름: 도구})를 돌려준다 — answers 는 {RA 도구 이름: 정해 둔 답}."""
+    import langgraph.prebuilt
+
+    given = []
+
+    def _fake_agent(_llm, tools, **_k):
+        given.append({t.name: t for t in tools})
+        return SimpleNamespace()
+
+    monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", _fake_agent)
+    monkeypatch.setattr(d, "_app_of_tools", lambda: {n: "reportarchive" for n in answers})
+    tools = {"agent_search": _Tool("agent_search"), **{n: _CoTool(n, a) for n, a in answers.items()}}
+
+    async def _fake_tools(*_a, **_k):
+        return tools
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    opts = {"personas": [{"key": "mech-a", "role": "기구"}], "chair_template": chair, "free_tools": 1,
+            "voc": "off", "rescreen": 0, "persona_knowledge": 0, "apps": list(apps)}
+
+    async def go():
+        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), question, [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                assert ev != "error", data
+                if _after_tools(ev, data):
+                    break
+        finally:
+            await gen.aclose()
+
+    asyncio.run(go())
+    assert given and all(n in given[0] for n in answers), f"시험 전제 — 좌석 자유 조회 후보에 {sorted(answers)} 가 없다"
+    return given[0]
+
+
+def _ask(tool, **args):
+    """도구를 부른 답 — JSON 이면 풀고, 풀리지 않으면(거른 뒤의 알림 · 잘린 JSON) 글 그대로."""
+    out = asyncio.run(tool.coroutine(**args))
+    try:
+        return json.loads(out)
+    except (TypeError, ValueError):
+        return out
+
+
+def _ids(rows, key="id"):
+    return [int(r[key]) for r in rows]
+
+
+@pytest.mark.parametrize("apps", ((), ("heax-step_forge", "heax-kooremapper_mcp")), ids=("manual", "runner"))
+def test_리스크_심사_좌석의_온톨로지_검색은_같은_과제의_판정_객체를_뺀다(monkeypatch, apps):
+    hits = json.dumps(_objs_hits(_F_MINE, _F_MINE_OLD, _F_OTHER, _F_RETRACTED, _INCIDENT), ensure_ascii=False)
+    got = _ask(_onto_given(monkeypatch, "risk-review", _Q_NOW, {"search_objects": hits}, apps)["search_objects"],
+               type="risk_finding", q="힌지")
+    assert _ids(got["items"]) == [601, 701, 301] and _ids(got["objects"]) == [601, 701, 301], got
+    assert got["shown"] == 3 and got["total"] == 6, got
+    assert "2건" in got["withheld"] and "P1" in got["withheld"] and "confirmed" not in json.dumps(got["items"][2:]), got
+    # 다른 심의는 종전대로 준다(apps 없이 — 접두사로 열린다).
+    raw = _ask(_onto_given(monkeypatch, "default", _Q_NOW, {"search_objects": hits}, ())["search_objects"], q="힌지")
+    assert _ids(raw["items"]) == [501, 502, 601, 701, 301] and "withheld" not in raw, raw
+
+
+def test_리스크_심사_좌석의_객체_보기는_같은_과제의_판정_객체를_가린다(monkeypatch):
+    """관계의 상대가 같은 과제의 판정 객체면 그 관계를 뺀다(두 관계 꼴 모두) — 객체 자신이 그것이면 통째로 주지 않는다(그 둘레가 곧
+    판정의 근거다). 다른 심의는 종전대로다."""
+    answers = {"get_object": json.dumps(_OBJ_INCIDENT, ensure_ascii=False)}
+    got = _ask(_onto_given(monkeypatch, "risk-review", _Q_NOW, answers)["get_object"], type="incident", id="301")
+    assert [r["object"].get("value") or r["object"].get("label") for r in got["relations"]] == [_F_OTHER["value"], "힌지 브래킷"]
+    assert got["reports"] == _OBJ_INCIDENT["reports"] and "1건" in got["withheld"], got
+    answers = {"get_object": json.dumps(_OBJ_MINE, ensure_ascii=False)}
+    got = _ask(_onto_given(monkeypatch, "risk-review", _Q_NOW, answers)["get_object"], type="risk_finding", id="501")
+    assert set(got) == {"withheld"} and "P1" in got["withheld"], got
+    raw = _ask(_onto_given(monkeypatch, "default", _Q_NOW, answers, ())["get_object"], type="risk_finding", id="501")
+    assert raw == _OBJ_MINE, raw
+
+
+def test_리스크_심사_좌석의_그래프는_같은_과제의_판정_노드와_엣지를_뺀다(monkeypatch):
+    answers = {"get_subgraph": json.dumps(_GRAPH, ensure_ascii=False)}
+    tool = _onto_given(monkeypatch, "risk-review", _Q_NOW, answers)["get_subgraph"]
+    got = _ask(tool, entity_id=301)
+    assert _ids(got["nodes"]) == [301, 601, 41], got
+    assert got["edges"] == [{"src": 601, "dst": 301, "relation": "verified_by"}, {"src": 301, "dst": 41, "relation": "occurs_in"}]
+    assert "1건" in got["withheld"], got
+    seeded = _ask(tool, entity_id=501)                     # 씨앗이 같은 과제의 판정 객체다
+    assert set(seeded) == {"withheld"}, seeded
+    raw = _ask(_onto_given(monkeypatch, "default", _Q_NOW, answers, ())["get_subgraph"], entity_id=501)
+    assert raw == _GRAPH, raw
+
+
+@pytest.mark.parametrize("ascii_", (False, True), ids=("utf8", "escaped"))
+@pytest.mark.parametrize("question", (_Q_MANUAL, _Q_UNREAD), ids=("headless", "unread"))
+def test_과제를_모르는_리스크_심사는_판정_객체를_전부_뺀다(monkeypatch, question, ascii_):
+    """머리 없는 손수 길 · 머리를 읽지 못한 길 — 같은 과제를 가릴 수 없어 판정 객체를 전부 뺀다(다른 과제 · 거둔 꼴도). 판정이 아닌
+    객체는 남긴다."""
+    hits = json.dumps(_objs_hits(_F_MINE, _F_OTHER, _F_RETRACTED, _INCIDENT), ensure_ascii=ascii_)
+    got = _ask(_onto_given(monkeypatch, "risk-review", question, {"search_objects": hits}, ())["search_objects"], q="힌지")
+    assert _ids(got["items"]) == [301], got
+    assert "3건" in got["withheld"] and "가릴 수 없어" in got["withheld"], got
+
+
+def test_읽지_못한_온톨로지_응답에_같은_과제의_판정이_보이면_통째로_막는다(monkeypatch):
+    """잘린 JSON 은 항목을 가려낼 수 없다 — 같은 과제의 머리가 보이면 결과를 주지 않고, 다른 과제의 판정만 보이면 그대로 준다."""
+    mine = json.dumps(_objs_hits(_INCIDENT, _F_MINE), ensure_ascii=False)[:-30]
+    other = json.dumps(_objs_hits(_INCIDENT, _F_OTHER), ensure_ascii=False)[:-30]
+    tool = _onto_given(monkeypatch, "risk-review", _Q_NOW, {"search_objects": mine})["search_objects"]
+    out = _ask(tool, q="힌지")
+    assert isinstance(out, str) and "P1@" not in out and "가려낼 수 없다" in out, out
+    tool = _onto_given(monkeypatch, "risk-review", _Q_NOW, {"search_objects": other})["search_objects"]
+    assert _ask(tool, q="힌지") == other
+
+
+def test_한글_과제_코드는_유니코드_이스케이프_응답에서도_뺀다(monkeypatch):
+    code = "힌지 개선 2차"
+    mine = {**_F_MINE, "value": f"{code}@mech.hinge_crack@diff:new#a1b2c3d4e5f6"}
+    other = {**_F_OTHER, "value": f"{code} B@mech.hinge_crack@diff:x#ffeeddccbbaa"}
+    q = f"[리스크심사 {code} diff:new] 기준 P0 대비 변경이 각 도메인에서 어떤 리스크와 개선을 낳는가를 도구 근거로 판정하라."
+    hits = json.dumps(_objs_hits(mine, other, _INCIDENT), ensure_ascii=True)
+    got = _ask(_onto_given(monkeypatch, "risk-review", q, {"search_objects": hits})["search_objects"], q="힌지")
+    assert _ids(got["items"]) == [601, 301] and code in got["withheld"], got
+    truncated = hits[:-30]
+    out = _ask(_onto_given(monkeypatch, "risk-review", q, {"search_objects": truncated})["search_objects"], q="힌지")
+    assert isinstance(out, str) and "가려낼 수 없다" in out, out
+
+
+def _engine_with(monkeypatch, chair, req, tools, question=_Q_NOW):
+    """심의를 좌석 발굴 문턱까지 돌려 이벤트를 받는다 — 엔진이 직접 부르는 길(지정 도구)을 본다."""
+    async def _llm(_llm, _system, _human):
+        return '{"q": "힌지", "type": "risk_finding", "limit": 5}'
+
+    monkeypatch.setattr(d, "_llm_text", _llm)
+
+    async def _fake_tools(*_a, **_k):
+        return tools
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    opts = {"personas": [{"key": "mech-a", "role": "기구"}], "chair_template": chair, "free_tools": 0,
+            "voc": "off", "rescreen": 0, "persona_knowledge": 0, **req}
+
+    async def go():
+        out = []
+        gen = d.run_deliberation(SimpleNamespace(state=SimpleNamespace(llm=object(), delib_llm=None)), question, [], opts)
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                assert ev != "error", data
+                out.append((ev, data))
+                if _after_tools(ev, data):
+                    break
+        finally:
+            await gen.aclose()
+        return out
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("name", ("search_objects", "reportarchive_search_objects"))
+def test_리스크_심사의_지정_도구_온톨로지_검색도_같은_과제의_판정_객체를_뺀다(monkeypatch, name):
+    """엔진이 직접 부르는 길 — 지정 도구 결과는 전 좌석 프롬프트에 실린다. RA 의 겹침 접두 꼴로 실린 이름도 같다. 다른 심의는 종전대로다."""
+    hits = json.dumps(_objs_hits(_F_MINE, _F_OTHER, _INCIDENT), ensure_ascii=False)
+
+    def card(chair):
+        events = _engine_with(monkeypatch, chair, {"tools": [name]}, {"agent_search": _Tool("agent_search"),
+                                                                      name: _CoTool(name, hits)})
+        return next(c for c in _cards(events, included=True) if c["source"] == f"지정 도구 {name}")["text"]
+
+    text = card("risk-review")
+    assert _F_MINE["value"] not in text and _F_OTHER["value"] in text and "withheld" in text, text
+    assert _F_MINE["value"] in card("default")
+
+
+def test_리스크_심사의_지정_도구_보고서_검색은_RA_겹침_접두_꼴도_거른다(monkeypatch):
+    """RA 의 search_reports 가 다른 앱과 이름이 겹쳐 reportarchive_search_reports 로만 실린 박스 — 맨 이름만 감싸던 동안 그 꼴을 지정하면
+    앞 패널 초안이 전 좌석에 실렸다. 다른 심의는 종전대로다."""
+    name = "reportarchive_search_reports"
+    hits = json.dumps(_ra_hits(), ensure_ascii=False)
+
+    def card(chair):
+        events = _engine_with(monkeypatch, chair, {"tools": [name]}, {"agent_search": _Tool("agent_search"),
+                                                                      name: _CoTool(name, hits)})
+        return next(c for c in _cards(events, included=True) if c["source"] == f"지정 도구 {name}")["text"]
+
+    text = card("risk-review")
+    assert _PRIOR_SNIPPET not in text and "1.5m 낙하" in text and "withheld" in text, text
+    assert _PRIOR_SNIPPET in card("default")
+
+
+def test_과제를_모르는_리스크_심사는_판정_객체도_전부_뺐다고_알린다(monkeypatch):
+    """머리 없는 · 머리를 읽지 못한 리스크 심사의 경고와 카드가 보고서뿐 아니라 판정 객체도 전부 뺐다고 말한다(감추면 보고서만 넓어진
+    줄 안다)."""
+    for question, code in ((_Q_MANUAL, "risk_head_missing"), (_Q_UNREAD, "risk_head_unread")):
+        warn, cards = _head_notices(_events_for(monkeypatch, question), code)
+        assert len(warn) == 1 and len(cards) == 1, (code, warn, cards)
+        assert "risk_finding" in warn[0]["message"] and "risk_finding" in cards[0]["text"], (code, warn[0], cards[0])
