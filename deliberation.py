@@ -1559,10 +1559,12 @@ def _as_of_refusal(req_opts) -> dict | None:
 _AS_OF_ARGS = ("as_of", "as_of_undated")
 
 
-def _as_of_guard(tool, as_of: str | None):
+def _as_of_guard(tool, as_of: str | None, orig_names: dict | None = None):
     """agent_search 도구의 기준일 두 칸을 엔진이 정한다 — _tools_by_name 이 결과 상한(_prep_tool) **앞에서** 감싼다. 상한을 지난 글은 끝의
     applied_config 가 잘려 메아리를 볼 수 없다. as_of 가 None(심의 밖의 로드 — 챗 · 띵킹 · 카드 대조 따위)이거나 agent_search 가 아니면
-    그대로 돌려준다.
+    그대로 돌려준다. agent_search 인지는 원래 이름으로 본다(orig_names — 게이트웨이 /tools-map 의 노출 이름 → 원래 이름) — 겹침 때문에 게이트웨이가
+    접두를 단 꼴(aidatahub_agent_search)도 같은 거름을 탄다. 노출 이름으로만 보던 동안 좌석 자유 조회가 그 꼴을 원래 이름으로 들이자(HWAXPortal
+    docs/ontology-first F0) 기준일 심의의 좌석이 날짜 거름 없이 카드를 찾았다(반대 검토 11-02 — OF-22).
 
     심의의 로드(엔진의 사전 검색 · 지정 도구 · 좌석 자유 조회)는 늘 감싼다. 기준일이 있으면 부를 때마다 as_of · as_of_undated='keep' 을 덮어
     싣고(모델이 빼도, 다른 날이나 'exclude' 를 넣어도 이 심의의 값으로 간다) 응답은 _as_of_check 가 메아리로 확인한다. 기준일이 없으면(as_of
@@ -1570,7 +1572,8 @@ def _as_of_guard(tool, as_of: str | None):
     'exclude' 를 넣으면 허브가 날짜 없는 카드까지 빼고 걸렀는데 엔진은 아무것도 세지 않아 결정문에 흔적이 없었다(반대 검토 10-31). 좌석 ·
     계획자에게 묶는 스키마에서도 두 칸을 지운다 — 엔진이 정하는 값이라 고를 칸이 아니다."""
     orig = getattr(tool, "coroutine", None)
-    if as_of is None or orig is None or getattr(tool, "name", "") != "agent_search":
+    name = getattr(tool, "name", "")
+    if as_of is None or orig is None or (orig_names or {}).get(name, name) != "agent_search":
         return tool
     sc = getattr(tool, "args_schema", None)
     if isinstance(sc, dict) and isinstance(sc.get("properties"), dict):
@@ -2371,8 +2374,10 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         scoped = _with_groups(conns, sorted(groups), user, "")
         tools = await _load_tools(scoped)
         via_pat = False
-    # 기준일은 상한 래퍼보다 안쪽에 박는다 — 메아리(applied_config)는 응답 끝에 있어 잘린 글로는 확인할 수 없다(_as_of_guard).
-    tools = [_as_of_guard(t, as_of) for t in tools]
+    # 기준일은 상한 래퍼보다 안쪽에 박는다 — 메아리(applied_config)는 응답 끝에 있어 잘린 글로는 확인할 수 없다(_as_of_guard). agent_search 인지는
+    # 원래 이름으로 본다 — 겹침 접두 꼴도 같은 거름을 탄다(OF-22). 심의의 로드(as_of 가 None 이 아님)이고 감쌀 도구가 있을 때만 도구 지도를 본다.
+    _on = _tool_orig_names(refresh=True) if (as_of is not None and tools) else None
+    tools = [_as_of_guard(t, as_of, _on) for t in tools]
     # 챗 경로와 같은 래퍼를 반드시 통과시킨다. 우회하면 이미지 도구의 base64 원문이 그대로
     # '정량 근거'로 주입돼 그래프는 사라지고 근거 패널에 'iVBORw0KGgo…' 덩어리가 남는다
     # (감사 확인). 결과 절단·아티팩트 저장·인자 힌트도 전부 이 래퍼에 있다.
@@ -2393,7 +2398,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         async def _svc_tools() -> dict:
             async with _svc_lock:
                 if not _svc:
-                    got = [_as_of_guard(t, as_of) for t in await _load_tools(_with_groups(conns, sorted(groups), user, ""))]
+                    got = [_as_of_guard(t, as_of, _on) for t in await _load_tools(_with_groups(conns, sorted(groups), user, ""))]
                     try:
                         from app import _prep_tool  # noqa: PLC0415
                         got = [_prep_tool(t, result_max, desc_max) for t in got]
@@ -4431,6 +4436,33 @@ def _app_of_tools() -> dict:
         return {}
 
 
+def _tool_orig_names(*, refresh: bool = False) -> dict:
+    """{노출 이름: 원래 이름} — 게이트웨이 /tools-map 의 orig 전체(겹침 접두 · 허브 가족 접두 · 선언 백엔드까지, 둘이 다른 것만). 이름으로 거는 엔진
+    거름(기준일 _as_of_guard · 웹 리서치 소스)이 접두 꼴을 원래 이름으로 알아본다(HWAXPortal docs/ontology-first OF-22). refresh 면 지도를 낡았을 때만
+    새로 받는다 — 같은 로드의 도구 래퍼(_prep_tool 의 _tag_tool_app)가 곧 같은 지도를 받으니 더 묻지 않는다. 아니면 받아 둔 지도만 본다. orig 를
+    모르는 옛 게이트웨이 · 불통이면 {} — 맨 이름으로만 건다(지금 그대로)."""
+    try:
+        from app import _TOOLS_MAP_CACHE, _tools_map  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+        if refresh:
+            _tools_map()
+        o = _TOOLS_MAP_CACHE.get("orig")
+        return dict(o) if isinstance(o, dict) else {}
+    except Exception as exc:  # noqa: BLE001 — 지도를 못 읽어도 맨 이름 거름은 그대로 건다
+        print(f"[deliberation] 원래 이름 지도를 못 읽었다 — 이름 거름은 맨 이름으로만 건다: {exc!r}")
+        return {}
+
+
+def _free_orig_names() -> dict:
+    """{노출 이름: 원래 이름} — 좌석 자유 조회가 원래 이름으로 판정할 겹침 접두 이름(HWAXPortal docs/ontology-first F0, app._free_judge_names —
+    선언 백엔드 · 허브 가족은 뺀다). 실패하면 {}(지금처럼 노출 이름으로 판정한다). 리스크 심사는 부르지 않는다(조립식이 가른다)."""
+    try:
+        from app import _free_judge_names  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+        return _free_judge_names()
+    except Exception as exc:  # noqa: BLE001 — 판정을 넓히지 못해도 지금 판정 그대로 간다
+        print(f"[deliberation] 원래 이름 판정 자료를 못 읽었다 — 노출 이름으로 판정한다: {exc!r}")
+        return {}
+
+
 def _wrap_cached(tool, cache: dict, stats: dict | None = None):
     """같은 심의 안에서 같은 도구·같은 인자 재호출을 1회로 접는다 — 전문가 여럿이 같은 재료를
     조회하는 것이 정상 패턴이라 캐시가 곧 예산 절약이다(도구 객체는 이 심의 전용 로드라 안전).
@@ -6364,13 +6396,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
             _rmax = _free_result_chars(opts.tool_budget)
+            # 겹침 때문에 게이트웨이가 접두를 단 읽기는 원래 이름으로 판정한다(HWAXPortal docs/ontology-first F0 · OF-4 — dev 11-02 에 semantic_search ·
+            # list_jobs 넷이 이름 꼴 때문에 빠져 있었다). 닫기 목록 · 접두 허용 · 앱 지정의 물성 목록이 같은 이름을 본다. 리스크 심사(와 리스크 앱이 띄운
+            # 패널)는 지금 판정 그대로다 — D-18 의 이름 검사(_RISK_RA_REPORT_TOOLS)가 맨 이름이라 원래 이름으로 보면 reportarchive_list_reports 가 새로
+            # 열린다. 선언 백엔드 · 허브 가족 · orig 를 모르는 옛 게이트웨이도 그대로다(_free_orig_names). 기준일 심의(소급 검증)도 F0 로 아무것도 더
+            # 들이지 않는다 — 닫힌 쪽(반대 검토 11-02 — OF-22 — 겹침 접두 agent_search 가 기준일 거름 없이 들고, 날짜로 거르지 않는 semantic_search 가 새로 들었다).
+            _orig = {} if (_risk_chair or opts.started_by == "app" or _as_of) else _free_orig_names()
             # 기준일 심의면 좌석의 agent_search 에도 그 날을 박는다(_as_of_guard — 모델이 빼거나 바꿀 수 없다)
             _g = {n: _wrap_cached(t, _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
-                  if n.lower() not in _FREE_DENY
+                  if n.lower() not in _FREE_DENY and _orig.get(n, n).lower() not in _FREE_DENY
                   and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
-                      _free_tool_ok(n)
+                      _free_tool_ok(_orig.get(n, n))
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
             # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기 · 대화 검색에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체 · 앞 패널
@@ -6383,7 +6421,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 from app import _SOURCE_TOOLS, _ALL_SOURCE_TOOLS  # noqa: PLC0415 — 늦은 import(순환 회피)
                 _allow = {n for k in opts.search_sources if k in _SOURCE_TOOLS
                           for n in _SOURCE_TOOLS[k]}
-                _off = [n for n in _g if n in _ALL_SOURCE_TOOLS and n not in _allow]
+                # 원래 이름으로 본다 — 겹침 접두 search_web(heaxweb_research_mcp_search_web 꼴)도 뺀다(OF-22 — F0 가 그 꼴을 들이자 웹을 끈 심의에
+                # 남았다). 사외로 나가는 길의 울타리라 F0 의 판정 이름(_orig)이 아니라 게이트웨이가 아는 원래 이름 전부로 본다(받아 둔 지도 — 위 로드가 받았다).
+                _src = _tool_orig_names()
+                _off = [n for n in _g if _src.get(n, n) in _ALL_SOURCE_TOOLS and _src.get(n, n) not in _allow]
                 for n in _off:
                     _g.pop(n, None)
                 if _off:
@@ -6393,8 +6434,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 1인당 몇 회 안 되는 예산을 엉뚱한 앱을 헤매는 데 쓴다. agent_search 는 앱과 무관하게
             # 남긴다 — 페르소나 지식 조회 통로라 이걸 닫으면 전문가가 자기 지식을 못 본다.
             if opts.delib_apps:
+                # 지식 조회 · 물성 목록도 원래 이름으로 본다(F0 — 겹쳐 접두가 붙은 물성 읽기가 앱 지정에서 빠지지 않게, 리스크 심사는 _orig 가 비었다)
                 _narrow = {n: t for n, t in _g.items()
-                           if n == "agent_search" or n in _MATERIAL_TOOLS
+                           if _orig.get(n, n) == "agent_search" or _orig.get(n, n) in _MATERIAL_TOOLS
                            or _amap.get(n) in _apps
                            or (_risk_chair and n in _RISK_KEEP_TOOLS)}
                 # 매핑을 못 받았거나(게이트웨이 불통) 결과가 agent_search 뿐이면 좁히지 않는다 —
