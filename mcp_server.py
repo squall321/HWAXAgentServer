@@ -28,6 +28,7 @@ from pydantic import Field
 
 import delib_jobs
 import delib_resume
+import delib_subject
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
 import external_llm
 import mcp_pages
@@ -355,6 +356,8 @@ _START_DESC = (
     "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다. "
     f"응답의 question 은 받은 화두를 되돌려 보인 것이다 — 응답이 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한)를 "
     "넘으면 머리만 싣고 question_chars(전체 길이)와 note 로 전문 받는 곳을 말한다(받은 화두는 전부 쓰인다).\n\n"
+    "**과제 심의면 subject 에 과제 · 차수를 싣는다** — 사용자에게 과제(SP 허브 과제 key)와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다"
+    "(자세한 것은 subject 인자 설명).\n\n"
     "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
 
@@ -515,6 +518,26 @@ _A_APPEND = ("참(기본)이면 이전 회차의 Report Archive 보고서에 페
 _A_CONT_MODIFIERS = "이번 회차에 얹을 층 — 값과 상한은 deliberate_start 의 modifiers 와 같다."
 _A_CONT_EVIDENCE = ("이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같은 모양 · 상한). 이전 회차의 근거 본문은 이어지지 "
                     "않는다 — 다시 봐야 하면 여기 다시 싣는다.")
+# 심의 주제(과제 인사이트 그래프 M1 — HWAXPortal docs/project-insight-graph PLAN §4.1 · §4.3 · §4.6). 차수 코드 · 상한 · 열쇠 꼴은 delib_subject 에서 읽는다.
+_A_SUBJECT = (
+    "과제 주제(선택) — {sp_task, round, text, artifacts}. **과제 심의면 사용자에게 과제와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다**(비우면 "
+    "어느 과제에도 잇지 않는다). sp_task 는 SP 허브 과제 key(운영 허브는 과제명 — 과제코드가 아니다)다. 서버가 허브 거울 풀이"
+    f"(StepForge {delib_subject.RESOLVER_TOOL})로 다시 찾아 key 가 글자 그대로 같은 행이 하나일 때만 확인(subject.sp_state=confirmed)으로 적고, "
+    "아니면 주장(claimed — 까닭은 sp_why)으로 두며 그 심의는 과제에 잇지 않는다. 모르면 먼저 그 도구로 찾아 결과 행의 key 를 그대로 준다. "
+    f"round 는 차수 — {' · '.join(delib_subject.STAGES)} 가운데 하나다. 전각 · 공백 · 대소문자만 맞추고 그 밖은 차수 모름이다('2차' · 'C2' · "
+    "'양산' 은 차수가 아니다 — 받은 글은 text 에 남는다). text 는 사람이 적은 과제 이름 · 코드 · 차수 글"
+    f"({delib_subject.TEXT_MAX}자). artifacts 는 설계 자료 [{{kind, app, id, rev}}](최대 {delib_subject.ARTIFACTS_MAX}건) — "
+    "kind mcad 는 StepForge project_id(16진 23자) · ecad 는 ODB 허브 job_id(16진 16자) · cae 는 DynaForge 리포트 id(ULID 26자), rev 는 그 판 표지"
+    "(CAD content_fp · 보드 revision · 개발 단계). 모르는 칸은 거절한다(확인 상태 · 지문은 서버가 적는다). 리스크 심사(risk-review 계열)는 "
+    "받지 않는다 — 리스크 심사의 주제는 리스크 앱 과제다. 주제는 잡 기록(subject)에만 남고 결정문 · Report Archive 보고서에는 싣지 않는다. 같은 "
+    "과제의 앞선 심의는 deliberate_list(subject={sp_task, round})로 찾는다.")
+_A_CONT_SUBJECT = ("이 회차에 달 과제 주제 — 앞 잡에 주제가 없을 때만 받는다(꼴 · 확인은 deliberate_start 의 subject 와 같다). 앞 잡에 주제가 "
+                   "있으면 이어하기가 그대로 물려받고, 다른 주제를 주면 거절한다(다른 과제는 새 심의다). 리스크 심사로 잇는 회차는 주제를 물려받지 "
+                   "않는다.")
+_A_LIST_SUBJECT = ("주제로 거르기(선택) — {sp_task, round?}. 신원(사람 PAT)이 있는 호출만 받는다. 확인(confirmed)된 주제의 심의만, 과제 key "
+                   "글자 그대로 · 차수 정확 일치로 싣는다 — round 를 빼면 그 과제의 모든 차수(차수 모름 포함), "
+                   f"'{delib_subject.ROUND_UNKNOWN}' 이면 차수 모름 칸만. 볼 수 있는 심의만이다(내 것 · 같은 소속 · 관리자). 훑는 것은 최근 원장 "
+                   f"{delib_jobs.LIST_SCAN_MAX}개다(응답의 window — 그 밖의 옛 심의는 없다).")
 
 
 @mcp.tool(title="심의 시작 (원인규명·안선택·신뢰판정·해석설계·시험설계·구축계획·자유)",
@@ -535,6 +558,7 @@ async def deliberate_start(
     save_report: Annotated[bool, Field(description=_A_SAVE)] = True,
     wiki: Annotated[bool, Field(description=_A_WIKI)] = False,
     advanced: Annotated[dict | None, Field(description=_A_ADVANCED)] = None,
+    subject: Annotated[dict | None, Field(description=_A_SUBJECT)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """심의를 연다.
@@ -574,6 +598,8 @@ async def deliberate_start(
                   rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
                   parse_retries · timeout_s · voc · persona_knowledge · chair_template · sealed.
                   보통 비운다(뜻은 _ADV_DESC).
+        subject: 과제 주제 {sp_task, round, text, artifacts} — 꼴을 보고 SP 과제 key 를 서버가 다시 풀어 확인한 뒤 잡 기록에 싣는다
+                 (_subject_for · delib_subject). 리스크 심사 계열이면 거절한다. 뜻은 _A_SUBJECT.
     """
     # 좌석을 지정했는데 쓸 수 있는 것이 하나도 없으면 시작하지 않는다. 이대로 열면 서버가 발굴한 좌석으로
     # 수십 분을 돌고 보고서까지 남는다 — 지정한 패널이 아닌데 결과는 멀쩡해 보인다. 일부만 키가 없는 것은
@@ -591,11 +617,14 @@ async def deliberate_start(
                        search_sources=search_sources, stop_after_round=stop_after_round,
                        save_report=save_report, wiki=wiki, advanced=advanced)
     user, groups = _caller(ctx)
+    adv = advanced if isinstance(advanced, dict) else {}
+    subj = await _subject_for(subject, chair=delib_jobs.JOBS[delib_jobs.resolve_job(job)].get("chair") or adv.get("chair_template"),
+                              started_by=adv.get("started_by"), groups=groups, user=user)
     # owner — 외부 응답자 심의(advanced.llm=external)의 과제 주인은 게이트웨이 헤더를 푼 이름이다(과제 도구 쪽과 같은 규칙). 잡 기록의
     # 주인(user)은 종전 그대로 헤더 원문이다(견줄 때 양쪽을 delib_jobs._norm 으로 푼다). 소속은 같은 소속 열람(결정 6)이 견준다.
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1])
+                           owner_aff=_caller_view(ctx)[1], subject=subj)
     if personas:
         # 좌석을 지정해 연 심의의 화두 — 전문가 고르기 기준선 H 의 재료(기본 꺼짐 · 사람 · 잡은 적지 않는다, HWAXPortal docs/request-1029 design-e5 E5-2).
         # 지정 좌석은 적지 않는다 — 사람이 고른 것인지 부르는 쪽(개인 Claude)이 고른 것인지 모른다(L6).
@@ -613,7 +642,23 @@ async def deliberate_start(
                    "진행 조회의 idle_s(마지막 이벤트 뒤 경과)가 quiet_ok_s 안이면 멈춘 것이 아니라 LLM 을 "
                    "기다리는 중이다. 넘었다고 멈춘 것은 아니다 — 도는 잡은 스스로 끝난다. 다시 시작하지 마라"
                    "(그만두려면 deliberate_cancel).")
+    if subj is not None:
+        out["note"] += " " + delib_subject.say(subj) + "."
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
+
+
+async def _subject_for(subject, *, chair, started_by, groups: list, user: str) -> dict | None:
+    """시작 · 이어하기의 subject 인자 → 원장 주제(delib_subject.confirm — 꼴을 보고 SP 과제 key 를 그 호출의 자격으로 다시 푼다). 비었으면 None.
+    꼴이 틀리면 SubjectError(ValueError — 잡을 만들기 전에 거절한다). 리스크 심사 계열(의장 risk-review · started_by=app)이면 거절한다 — 리스크
+    심사의 주제는 리스크 앱 과제다(HWAXPortal docs/project-insight-graph PLAN §3.1 · §4.7). MCP 잡은 사람 PAT 가 없다 — 엔진이 그 잡의 도구를 부르는
+    자격(게이트웨이 공유 비밀 + 신원 · 그룹 머리)과 같다."""
+    parsed = delib_subject.parse(subject)
+    if parsed is None:
+        return None
+    if delib_subject.risk_family(chair, started_by):
+        raise ValueError("리스크 심사(risk-review 계열)는 subject 를 받지 않는다 — 리스크 심사의 주제는 리스크 앱 과제다(과제 · 차수는 리스크 "
+                         "앱의 과제에 단다). subject 를 빼고 다시 불러라")
+    return await delib_subject.confirm(_need_app(), parsed, groups=groups, user=user, user_pat="")
 
 
 def _carry_seats(prev: dict) -> list:
@@ -649,7 +694,7 @@ def _resume_summary(prev: dict, done: int, cap: int) -> str:
 
 
 def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int, non_negotiables, advanced, evidence,
-            ctx) -> dict:
+            ctx, subject: dict | None = None) -> dict:
     """재기동으로 끊긴(interrupted) 잡을 남은 라운드만 이어 돈다(HWAXPortal docs/delib-ops R3).
 
     처음 인자는 시작 인자 파일(R2)에서 그대로 쓴다 — 근거 본문 · 지정 좌석 · 사람 의견 · 손잡이. 없으면(이 판 이전의 잡) 원장의 손잡이만
@@ -663,7 +708,10 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
 
     **주인이 바꾼 값 없이 이으면 같은 잡을 제자리에서 잇는다**(HA-09 S1 — 사용자 결정 10-31 A-2 (가)). 진행 일지의 재개 자료(e:*)를 읽어
     끊기기 전에 끝난 라운드를 그대로 되살리고 끊긴 라운드부터 돈다(_resume_in_place). 재개 자료를 못 쓰면(남 · 일지 없음 · 꼴 다름 · 권한
-    줄어듦 · 상한 넘김 · 바꾼 값) 아래 요약 길이고, 그 까닭을 응답 note 와 resumed.why 에 싣는다. 남의 이어하기는 일지를 읽지도 않는다."""
+    줄어듦 · 상한 넘김 · 바꾼 값) 아래 요약 길이고, 그 까닭을 응답 note 와 resumed.why 에 싣는다. 남의 이어하기는 일지를 읽지도 않는다.
+
+    subject 는 이 이어하기의 주제다(deliberate_continue 가 정한다 — 앞 잡의 주제거나, 앞 잡에 없을 때 이번에 단 것). 제자리면 그 잡에, 요약 길이면
+    새 잡에 싣는다. 주제는 바꾼 값으로 치지 않는다 — 엔진에 가지 않는 잡 기록의 칸이라 끊긴 자리에서 잇는 데 걸리지 않는다."""
     pid = prev["id"]
     if prev.get("resumed_by"):
         raise ValueError(f"{pid} 는 이미 이어 돌렸다 → {prev['resumed_by']} — 그 잡을 deliberate_status 로 본다")
@@ -684,7 +732,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         res, why = delib_jobs.resume_load(prev, groups=groups)
         if res is not None:
             try:
-                return _resume_in_place(prev, res, user=user)
+                return _resume_in_place(prev, res, user=user, subject=subject)
             except OSError as exc:      # 일지를 고쳐 쓰지 못했다 — 잡은 그대로다(_reopen 이 바꾸기 전에 쓴다). 요약으로 잇는다
                 why = f"진행 일지를 고쳐 쓰지 못했다({type(exc).__name__})"
     args = None if foreign else delib_jobs._read_args(pid)
@@ -746,7 +794,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         o["append_to_report_id"] = int(prev["report_id"])     # 보고서 단계에서 끊겼으면 그 보고서에 잇는다
     rec = delib_jobs.start(_need_app(), prev.get("job") or "default", prev["question"], delib_opts=o,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1])
+                           owner_aff=_caller_view(ctx)[1], subject=subject)
     rec["resumed_from"] = pid
     delib_jobs._persist(rec)
     if foreign:
@@ -776,7 +824,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
-def _resume_in_place(prev: dict, res, *, user: str) -> dict:
+def _resume_in_place(prev: dict, res, *, user: str, subject: dict | None = None) -> dict:
     """제자리 이어하기(HA-09 S1 · S2 A5.4) — 끊긴 그 잡을 같은 job_id 로 다시 줄에 세운다. 인자는 시작 인자 파일 그대로(처음 그룹 · 신원 ·
     손잡이 — 이을 때 지금 그룹이 그것을 다 가졌는지 봤다), 재개 상태는 delib_jobs.start 의 키워드로만 넘긴다. 같은 잡을 두 번 잇지 못한다(start
     가 같은 동기 구간에서 상태를 보고 바꾼다). 응답은 같은 job_id 와 resumed{mode: in_place, sk, round, spoken, todo, rounds_done, attempt} —
@@ -786,7 +834,8 @@ def _resume_in_place(prev: dict, res, *, user: str) -> dict:
     res.by = user or ""
     rec = delib_jobs.start(_need_app(), prev.get("job") or "default", prev["question"], groups=list(args.get("groups") or []),
                            delib_opts=dict(args.get("opts") or {}), user_email=str(args.get("user_email") or ""),
-                           owner=str(args.get("owner") or ""), owner_aff=str(args.get("owner_aff") or ""), resume=res)
+                           owner=str(args.get("owner") or ""), owner_aff=str(args.get("owner_aff") or ""), resume=res,
+                           subject=subject)
     info = res.info
     k, n = int(info.get("restored") or 0), int(info.get("total") or 0)
     ro = int((rec.get("opts") or {}).get("rounds_so_far") or 0)
@@ -883,6 +932,7 @@ async def deliberate_continue(
     modifiers: Annotated[list[str] | None, Field(description=_A_CONT_MODIFIERS)] = None,
     advanced: Annotated[dict | None, Field(description=_A_CONT_ADVANCED)] = None,
     evidence: Annotated[list[dict] | None, Field(description=_A_CONT_EVIDENCE)] = None,
+    subject: Annotated[dict | None, Field(description=_A_CONT_SUBJECT)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """이전 심의를 이어 돌린다.
@@ -907,6 +957,7 @@ async def deliberate_continue(
                   _CONT_CARRY 손잡이를 이어받고, 여기 적은 것은 그 위에 덮인다. sealed 는 풀 수 없다.
         evidence: 이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같다). 이전 회차의 근거
                   본문은 원장에 건수만 남아 이어지지 않는다 — 다시 봐야 하면 여기 다시 싣는다.
+        subject: 이 회차에 달 과제 주제 — 앞 잡에 주제가 없을 때만 받는다. 앞 잡의 주제는 그대로 물려받는다(_cont_subject).
 
     라운드 번호는 이전 회차에 이어서 센다 — 3회차 회의록이 매번 '1R' 로 돌아가면
     어느 회차의 발언인지 구분이 안 된다.
@@ -920,9 +971,13 @@ async def deliberate_continue(
         # 제자리 이어하기로 이미 다시 도는 잡(HA-09 S1) — 같은 잡을 두 번 잇지 않는다(그 잡이 끝난 뒤의 이어하기는 아래 보통 길이다)
         raise ValueError(f"{previous_job_id} 는 이미 같은 잡에서 이어 돌고 있다(시도 {len(prev['attempts'])}번째 · {prev['status']}) — "
                          "다시 잇지 않는다. 진행은 deliberate_status 로 본다")
+    subj, subj_note = await _cont_subject(prev, subject, job=job, advanced=advanced, ctx=ctx)
     if prev.get("status") == "interrupted":
-        return _resume(prev, human_note=human_note, question=question, job=job, rounds=rounds,
-                       non_negotiables=non_negotiables, advanced=advanced, evidence=evidence, ctx=ctx)
+        out = _resume(prev, human_note=human_note, question=question, job=job, rounds=rounds,
+                      non_negotiables=non_negotiables, advanced=advanced, evidence=evidence, ctx=ctx, subject=subj)
+        if subj_note:
+            out["note"] = f"{out.get('note') or ''} {subj_note}".strip()
+        return out
     summary_text = (prev.get("decision") or prev.get("result_text") or "").strip()
     if not summary_text:
         raise ValueError(f"이전 심의에 결정문이 없다(status={prev.get('status')}) — 끝난 뒤 이어하라")
@@ -971,17 +1026,44 @@ async def deliberate_continue(
     rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1])
+                           owner_aff=_caller_view(ctx)[1], subject=subj)
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1
     out["appending_to_report"] = (prev.get("report_id") if append_report and not foreign else None)
     notes = ([_queued_note(out["queue"])] if out.get("queue") else []) + (
         ["남의 심의를 이어받았다 — 그 사람의 보고서에는 이어 붙이지 않는다(저장하면 새 보고서로 간다)."]
-        if foreign and append_report else [])
+        if foreign and append_report else []) + ([subj_note] if subj_note else [])
     if notes:
         out["note"] = " ".join(notes)
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
+
+
+async def _cont_subject(prev: dict, subject, *, job: str, advanced, ctx) -> tuple[dict | None, str]:
+    """이어하기의 주제 → (이번 잡에 실을 주제, 안내 한 줄). 앞 잡의 주제를 그대로 물려받는다(다시 풀지 않는다 — 그 잡을 열 때 서버가 확인한
+    값이다). 이번에 주면 — 앞 잡에 주제가 없거나 확인되지 않았으면(claimed · none) 꼴 · 확인을 거쳐 단다(PLAN §9 M1 '앞 잡에 주제가 없으면 이어하기에서
+    단다' — 주장으로 남은 key 를 고쳐 다는 길도 이것이다, 반대 검토 11-02). 앞 잡의 주제가 확인됐으면 같은 주제는 그대로 물려받고 다른 주제는 거절한다 —
+    다른 과제 · 차수는 새 심의다. 리스크 심사로 잇는 회차(의장 risk-review)는 주제를 받지도 물려받지도 않는다(PLAN §3.1)."""
+    adv = advanced if isinstance(advanced, dict) else {}
+    if prev.get("status") == "interrupted":     # 끊긴 잡은 같은 종류 · 같은 손잡이로만 잇는다(_resume) — 의장은 그 잡의 것이다
+        chair, started_by = prev.get("chair_template"), prev.get("started_by")
+    else:
+        chair = delib_jobs.JOBS[delib_jobs.resolve_job(job or prev.get("job") or "default")].get("chair") or adv.get("chair_template")
+        started_by = adv.get("started_by")
+    had = prev.get("subject") if isinstance(prev.get("subject"), dict) else None
+    parsed = delib_subject.parse(subject)
+    if parsed is not None:
+        if had is not None and had.get("sp_state") == delib_subject.CONFIRMED and not delib_subject.risk_family(chair, started_by):
+            if delib_subject.same_input(had, parsed):
+                return had, ""          # 같은 주제를 다시 실었다 — 물려받는다(다시 풀지 않는다)
+            raise ValueError(f"앞 잡({prev['id']})의 주제는 이미 확인됐다({delib_subject.say(had)}) — 이어하기는 그 주제를 물려받는다. 다른 과제 · "
+                             "차수는 deliberate_start 로 새로 연다(subject 를 빼거나 같은 주제로 부르면 그대로 잇는다)")
+        user, groups = _caller(ctx)
+        rec = await _subject_for(subject, chair=chair, started_by=started_by, groups=groups, user=user)
+        return rec, delib_subject.say(rec) + ("." if had is None else " — 앞 잡의 확인되지 않은 주제 대신 단다.")
+    if had is not None and delib_subject.risk_family(chair, started_by):
+        return None, "리스크 심사로 잇는 회차는 앞 잡의 주제를 물려받지 않는다(리스크 심사의 주제는 리스크 앱 과제다)."
+    return had, ""
 
 
 # 진행 조회·결과 회수가 쪽마다 되풀이하는 칸, 쪽을 나눌 때 맨 뒤로 보내는 칸 — 화두가 크면 첫 쪽에 상태 칸이 다 실리게 한다.
@@ -1161,15 +1243,22 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
 @mcp.tool(title="심의 목록",
           description="최근 HWAX 심의 잡 목록. 대기 중(queued)·진행 중·끝난 것을 최신순으로 본다. 내가 시작한 "
                       "심의와 **같은 소속**의 심의가 실린다(행의 mine 이 내 것인지, owner 가 시작한 사람이다 — 주인이 안 적힌 "
-                      "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. " + _PAGE_DESC)
+                      "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. "
+                      "subject={sp_task, round?} 를 주면 그 과제(· 차수)로 확인된 주제를 단 심의만 싣는다 — '이 과제 · 이 차수로 누가 이미 "
+                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). " + _PAGE_DESC)
 async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
-                          part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
+                          part: Annotated[int, Field(description=_A_PART)] = 1,
+                          subject: Annotated[dict | None, Field(description=_A_LIST_SUBJECT)] = None,
+                          ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
     신원 있는 호출자에게는 제 잡(과 주인이 안 적힌 잡)만 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는
-    길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다. part — 쪽으로 나뉘었을 때 받을 쪽(1부터)."""
+    길)은 종전대로 전부 본다 — 접기(deliberate_cancel)와 같은 규칙이다. part — 쪽으로 나뉘었을 때 받을 쪽(1부터).
+    subject — 주제 거름(_subject_list). 신원 없는 호출은 받지 않는다 — 원장을 다 보는 길로 주제를 거르면 남의 과제 심의가 다 보인다."""
     user, aff, admin = _caller_view(ctx)
     lim = max(1, min(100, int(limit or 20)))
+    if subject is not None:
+        return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin)
     rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin)
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
     caps = delib_jobs.limits()       # 판정 때와 같은 값(박스 덮개가 env 위에 덮인다 — HWAXPortal docs/delib-ops R4)
@@ -1181,6 +1270,31 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
     return mcp_pages.paged(out, part=part, again={"limit": lim},
                            ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
+
+
+def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: bool) -> dict:
+    """deliberate_list(subject) — 확인된 주제의 과제 key 글자 그대로 · 차수 정확 일치(delib_subject.matches)인 잡 가운데 그 사람이 볼 수 있는 것만
+    (can_read — 주인 · 같은 소속 · 관리자). 훑는 창은 목록과 같다(최근 원장 LIST_SCAN_MAX 개 — window 에 적는다). 차수별 수(rounds)는 실은 행만
+    센다 — 볼 수 없는 잡은 수에도 들지 않는다(넓은 쪽이 좁은 쪽이 있다는 것을 말하지 않는다 — PLAN §6.3)."""
+    filt = delib_subject.parse_filter(subject)
+    if not (user or "").strip():
+        raise ValueError("신원 없는 호출은 주제로 거르지 못한다 — 사람 PAT 로 게이트웨이를 거쳐 부른다(주제로 거른 목록은 그 사람이 볼 수 있는 "
+                         "심의만 싣는다)")
+    info: dict = {}
+    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin,
+                                where=lambda j: delib_subject.matches(j, filt), info=info)
+    rounds: dict = {}
+    for r in rows:
+        k = (r.get("subject") or {}).get("round") or delib_subject.ROUND_UNKNOWN
+        rounds[k] = rounds.get(k, 0) + 1
+    # 창은 몇 개를 훑었는지가 아니라 원장을 다 봤는지만 말한다 — 훑은 수는 이 박스의 원장 규모를 내보인다(반대 검토 11-02)
+    window, total = info.get("window", delib_jobs.LIST_SCAN_MAX), info.get("total")
+    out = {"subject": filt, "jobs": rows, "count": len(rows), "rounds": rounds,
+           "window": {"max": window, "complete": isinstance(total, int) and info.get("scanned", 0) >= total,
+                      "note": f"최근 원장 {window}개 창 안에서만 찾았다(complete 가 거짓이면 그보다 오래된 원장은 보지 않았다 — 그 심의는 이 목록에 "
+                              "없다). 확인된 주제(sp_state=confirmed)만 맞대고, 차수를 모르는 심의는 'unknown' 칸에만 있다(어느 차수에도 섞지 "
+                              "않는다). 웹 심의는 포털 대화에 남는다(주인만 본다)."}}
+    return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject}, ids=("subject", "count", "rounds"))
 
 
 @mcp.tool(title="심의 취소",

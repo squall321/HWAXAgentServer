@@ -395,6 +395,40 @@ portal and the gateway call with the defaults.
 |---|---|---|
 | `DELIB_STATUS_WAIT_MAX_S` | `240` | Longest `deliberate_status` wait. Above 540 is read as 540 (warning) — it must stay below the gateway's per-call limit (600) or a waiting call ends in a gateway error. Negative is 0 (waiting off — every wait answers at once, with `clamped`). Not a number is the default, with a warning. Read once at startup. |
 
+### Deliberation subject (portal docs/project-insight-graph M1)
+
+A deliberation can carry one **subject** — the project and stage it is about (`delib_subject.py`). The caller gives
+`{sp_task, round, text, artifacts}` (MCP `deliberate_start(subject)` · `deliberate_continue(subject)`, web
+`delib_opts.subject`); any other field — `sp_state`, `sp_resolved_by`, `round_by` — is refused, because the server writes
+those. No subject means nothing is linked: the ledger has no `subject` field and the answers are the old ones.
+
+- `sp_task` is an SP hub `plm_task` key (the live hub keys tasks by name; the code sits in `task_code`). The server calls
+  StepForge `find_plm_task` itself through the gateway's call-only alias `heaxstep_forge_find_plm_task`, with the same
+  credentials the deliberation's tools use (web: the person's PAT; MCP job: the gateway secret plus the identity and group
+  headers). It is `confirmed` only when exactly one result row has that key, character for character, and the hub still
+  lists it as active. The echoed `query`, partial matches, rows matched by task code or alias, two equal keys, an inactive
+  row (deleted or merged in the hub), a tool error, an unreachable gateway or the 20 s limit all leave it `claimed`, with the
+  reason in `sp_why` (which never repeats other rows' keys); the deliberation still starts. No `sp_task` is `none` (no call).
+- `round` is one of `pre · dv1 · dv2 · dv3 · dvr · pv1 · pv2 · pv3 · pvr · pra · mp` after NFKC, removing Unicode
+  White_Space characters and lower case — nothing else (a BOM or a zero-width space stays and does not match; the portal
+  picker uses the same character class). `2차`, `C2` or `양산` is no stage: `round` is `null` (stage unknown) and the text
+  stays in `text`.
+- `artifacts` are design data: `mcad` StepForge `project_id` (23 hex), `ecad` ODB hub `job_id` (16 hex), `cae` DynaForge
+  report id (ULID), each with an optional `app` and `rev`.
+- Risk-review deliberations (`chair_template` risk-review, `started_by=app`) take no subject — a risk review's subject is the
+  risk app's project. MCP refuses the call; the web path says so in a status line and runs without it.
+- The subject goes to the job ledger and its list index, never to the engine — the decision, the Report Archive report and the
+  wiki source cannot carry it. On the web path the server emits `delib{kind: "subject", subject}` just before the engine
+  starts — only when a deliberation runs, not when `/심의` asks back for a topic; the portal relay keeps that record in the
+  reply's meta (the browser's copy is never stored).
+- `deliberate_continue` inherits the previous job's subject without resolving again. A new one is attached when the previous
+  job had none or only a `claimed` one (that is how a wrong key is corrected); once confirmed, the same subject passed
+  again is inherited and a different one is refused. Continuing as a risk review drops it.
+- `deliberate_list(subject={sp_task, round?})` needs an identity and lists, among the jobs the caller may read (owner · same
+  affiliation · admin), only `confirmed` subjects with that exact key — `round` omitted is every stage, `unknown` is the
+  stage-unknown bucket only. It scans the newest `LIST_SCAN_MAX` (300) ledger files; `window.complete` is false when older
+  ledgers were left unread (the scanned count is not returned — it would show the box's volume).
+
 ### Card review
 
 `card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review

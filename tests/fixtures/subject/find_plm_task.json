@@ -1,0 +1,207 @@
+{
+ "_about": "StepForge find_plm_task 의 실제 응답 — StepForge 4253453 의 core/sp_core.py find_tasks 를 그 리포의 가짜 허브(tests/sp_fake_core.py)로 채운 거울에 대고 돌려 받아 적었다(2026-11-02, 임시 데이터 폴더 — 경로는 <데이터 폴더> 로 바꿨다). 과제는 운영 허브 꼴이다 — key 가 과제명이고 과제코드는 properties.task_code 다. exact_and_partial 은 MCP 도구(full=true)가 낸 글 그대로를 JSON 으로 읽은 것이다.",
+ "exact_and_partial": {
+  "query": "알파 개발_C2",
+  "body": {
+   "query": "알파 개발_C2",
+   "count": 2,
+   "truncated": false,
+   "omitted": 0,
+   "tasks": [
+    {
+     "key": "알파 개발_C2",
+     "label": "알파 개발_C2",
+     "active": true,
+     "task_status": "진행",
+     "hub_status": "active",
+     "project": {
+      "key": "PJ-ALPHA",
+      "label": "알파 프로젝트",
+      "active": true
+     },
+     "models": [
+      {
+       "key": "SM-A100",
+       "label": "모델 A100",
+       "model_revision": "C2"
+      }
+     ],
+     "models_count": 1,
+     "properties": {
+      "aliases": [
+       "알파"
+      ],
+      "project": "PJ-ALPHA",
+      "task_code": "TC-1001",
+      "task_status": "진행"
+     },
+     "hub_updated_at": "2026-10-01T00:00:02.000000Z",
+     "received_at": 1793590275.1868641,
+     "matched_by": [
+      "key",
+      "label"
+     ]
+    },
+    {
+     "key": "알파 개발_C2 보강",
+     "label": "알파 개발_C2 보강",
+     "active": true,
+     "task_status": "진행",
+     "hub_status": "active",
+     "project": {
+      "key": "PJ-ALPHA",
+      "label": "알파 프로젝트",
+      "active": true
+     },
+     "models": [],
+     "models_count": 0,
+     "properties": {
+      "project": "PJ-ALPHA",
+      "task_code": "TC-1002",
+      "task_status": "진행"
+     },
+     "hub_updated_at": "2026-10-01T00:00:03.000000Z",
+     "received_at": 1793590275.1868641,
+     "matched_by": [
+      "key",
+      "label"
+     ]
+    }
+   ],
+   "sync": {
+    "configured": true,
+    "pull_configured": true,
+    "mirror_available": true,
+    "tasks_as_of": "2026-10-01T00:00:04.000000Z",
+    "url": "http://hub.test/api",
+    "token_file": "<데이터 폴더>/secrets/sp_core.token",
+    "token_file_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 은 데이터 폴더 아래인데 이름이 secrets.env 가 아니다 — 허브가 띄운 앱이면 그 폴더는 허브의 app-data Drive 백업(appdata-to-drive.sh)에 함께 실린다(빼는 것은 이름이 cred.key·secrets.env 인 파일뿐). 데이터 폴더의 secrets.env 에 STEPFORGE_SP_TOKEN=… 줄로 옮기고 STEPFORGE_SP_TOKEN_FILE 를 비우면 빠진다",
+    "token_file_mode_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 의 권한이 0644 다 — 그룹·다른 사용자 몫이 있다(0600 이 아니다 — 다른 사용자가 읽을 수 있다). chmod 600 <데이터 폴더>/secrets/sp_core.token 로 이 계정만 읽게 할 것(막지는 않는다 — 읽어서 쓴다)",
+    "last_sync": {
+     "status": "ok",
+     "at": 1793590275.164184,
+     "ok_at": 1793590275.2082357,
+     "revision": "3-0000000001",
+     "job_id": null
+    }
+   }
+  }
+ },
+ "task_code": {
+  "query": "TC-1001",
+  "body": {
+   "query": "TC-1001",
+   "count": 1,
+   "truncated": false,
+   "omitted": 0,
+   "tasks": [
+    {
+     "key": "알파 개발_C2",
+     "label": "알파 개발_C2",
+     "active": true,
+     "task_status": "진행",
+     "hub_status": "active",
+     "project": {
+      "key": "PJ-ALPHA",
+      "label": "알파 프로젝트",
+      "active": true
+     },
+     "models": [
+      {
+       "key": "SM-A100",
+       "label": "모델 A100",
+       "model_revision": "C2"
+      }
+     ],
+     "models_count": 1,
+     "properties": {
+      "aliases": [
+       "알파"
+      ],
+      "project": "PJ-ALPHA",
+      "task_code": "TC-1001",
+      "task_status": "진행"
+     },
+     "hub_updated_at": "2026-10-01T00:00:02.000000Z",
+     "received_at": 1793590275.1868641,
+     "matched_by": [
+      "task_code"
+     ]
+    }
+   ],
+   "sync": {
+    "configured": true,
+    "pull_configured": true,
+    "mirror_available": true,
+    "tasks_as_of": "2026-10-01T00:00:04.000000Z",
+    "url": "http://hub.test/api",
+    "token_file": "<데이터 폴더>/secrets/sp_core.token",
+    "token_file_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 은 데이터 폴더 아래인데 이름이 secrets.env 가 아니다 — 허브가 띄운 앱이면 그 폴더는 허브의 app-data Drive 백업(appdata-to-drive.sh)에 함께 실린다(빼는 것은 이름이 cred.key·secrets.env 인 파일뿐). 데이터 폴더의 secrets.env 에 STEPFORGE_SP_TOKEN=… 줄로 옮기고 STEPFORGE_SP_TOKEN_FILE 를 비우면 빠진다",
+    "token_file_mode_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 의 권한이 0644 다 — 그룹·다른 사용자 몫이 있다(0600 이 아니다 — 다른 사용자가 읽을 수 있다). chmod 600 <데이터 폴더>/secrets/sp_core.token 로 이 계정만 읽게 할 것(막지는 않는다 — 읽어서 쓴다)",
+    "last_sync": {
+     "status": "ok",
+     "at": 1793590275.164184,
+     "ok_at": 1793590275.2082357,
+     "revision": "3-0000000001",
+     "job_id": null
+    }
+   }
+  }
+ },
+ "no_match": {
+  "query": "없는 과제",
+  "body": {
+   "query": "없는 과제",
+   "count": 0,
+   "truncated": false,
+   "omitted": 0,
+   "tasks": [],
+   "why": {
+    "cause": "no_match",
+    "message": "거울의 과제 2건 · 개발모델 1건 가운데 식별자(key) · 과제명(label) · 과제코드 칸(properties.task_code — 그 칸이 있는 과제 2건) · 별칭(properties.aliases — 1건) · 개발모델의 key·이름 · 프로젝트의 key·이름·별칭(properties.aliases)에 '없는 과제' 를 담은 것이 없다(부분 일치 · ASCII 대소문자 무시 · 마지막 받기 as_of 2026-10-01T00:00:04.000000Z)"
+   },
+   "sync": {
+    "configured": true,
+    "pull_configured": true,
+    "mirror_available": true,
+    "tasks_as_of": "2026-10-01T00:00:04.000000Z",
+    "url": "http://hub.test/api",
+    "token_file": "<데이터 폴더>/secrets/sp_core.token",
+    "token_file_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 은 데이터 폴더 아래인데 이름이 secrets.env 가 아니다 — 허브가 띄운 앱이면 그 폴더는 허브의 app-data Drive 백업(appdata-to-drive.sh)에 함께 실린다(빼는 것은 이름이 cred.key·secrets.env 인 파일뿐). 데이터 폴더의 secrets.env 에 STEPFORGE_SP_TOKEN=… 줄로 옮기고 STEPFORGE_SP_TOKEN_FILE 를 비우면 빠진다",
+    "token_file_mode_note": "토큰 파일 <데이터 폴더>/secrets/sp_core.token 의 권한이 0644 다 — 그룹·다른 사용자 몫이 있다(0600 이 아니다 — 다른 사용자가 읽을 수 있다). chmod 600 <데이터 폴더>/secrets/sp_core.token 로 이 계정만 읽게 할 것(막지는 않는다 — 읽어서 쓴다)",
+    "last_sync": {
+     "status": "ok",
+     "at": 1793590275.164184,
+     "ok_at": 1793590275.2082357,
+     "revision": "3-0000000001",
+     "job_id": null
+    }
+   }
+  }
+ },
+ "not_configured": {
+  "query": "알파 개발_C2",
+  "body": {
+   "query": "알파 개발_C2",
+   "count": 0,
+   "why": {
+    "cause": "not_configured",
+    "message": "허브 코어 API 설정 안 됨 — STEPFORGE_SP_CORE_URL 가 비었다 — 허브의 API 루트(예 https://<허브>/api) · 토큰이 없다 — STEPFORGE_SP_TOKEN_FILE 가 비었고 이 서버의 데이터 폴더에 secrets.env 가 없다(<데이터 폴더>/secrets.env) — 그 파일에 STEPFORGE_SP_TOKEN=<core:read 토큰> 한 줄(허브가 띄운 앱이면 호스트 HEAXHub/var/app_data/step_forge/secrets.env = 컨테이너 /data/secrets.env). 허브가 띄운 앱이면 ① 주소는 허브 루트의 .env 에 한 줄(APPTAINERENV_STEPFORGE_SP_CORE_URL=<허브 API 루트> — 앱은 .env 를 읽지 않는다: 허브가 APPTAINERENV_ 를 뗀 이름으로 넘긴다) ② 토큰은 호스트 HEAXHub/var/app_data/step_forge/secrets.env(컨테이너 안 /data/secrets.env — 컨테이너의 /data 가 그 폴더다 · 호스트의 /data/hwax/secrets 는 안 보인다)에 STEPFORGE_SP_TOKEN=<core:read 토큰> 한 줄 · chmod 600(STEPFORGE_SP_TOKEN_FILE 는 안 준다 — 비우면 그 파일을 읽는다 · 이 이름은 허브의 app-data Drive 백업이 뺀다 · 같은 파일의 다른 줄은 읽지 않는다) ③ deploy/apptainer/redeploy-app.sh step_forge 로 다시 띄운다(허브가 죽은 인스턴스를 스스로 되살릴 때는 허브가 기동할 때 읽은 .env 를 쓴다 — 허브를 다시 띄우기 전에는 그때 주소가 빠진다). 허브 밖에서 띄운 서버는 이 서버의 데이터 폴더(<데이터 폴더>)의 secrets.env 에 같은 줄을 두고 STEPFORGE_SP_CORE_URL 를 환경변수로 준다. 토큰 **값**은 파일에만 둔다 — 이 앱은 그 줄만 읽고 값을 리포·DB·로그·응답 어디에도 남기지 않는다. 주소와 core:read 토큰은 허브 관리자가 발급한다"
+   },
+   "tasks": [],
+   "sync": {
+    "configured": false,
+    "pull_configured": false,
+    "mirror_available": false,
+    "tasks_as_of": null,
+    "url": null,
+    "token_file": null,
+    "problems": [
+     "STEPFORGE_SP_CORE_URL 가 비었다 — 허브의 API 루트(예 https://<허브>/api)",
+     "토큰이 없다 — STEPFORGE_SP_TOKEN_FILE 가 비었고 이 서버의 데이터 폴더에 secrets.env 가 없다(<데이터 폴더>/secrets.env) — 그 파일에 STEPFORGE_SP_TOKEN=<core:read 토큰> 한 줄(허브가 띄운 앱이면 호스트 HEAXHub/var/app_data/step_forge/secrets.env = 컨테이너 /data/secrets.env)"
+    ],
+    "last_sync": null
+   }
+  }
+ }
+}
