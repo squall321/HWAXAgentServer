@@ -8,6 +8,7 @@ report_figures.PORTAL_TRANSPORT)과 가짜 게이트웨이 도구로 고정하�
   · RA 가 칸을 경고로 버리면 '못 들어감' 으로 센다. 몇 장 들어갔는지 /보고서 결과 · 심의 outcome 에 센다.
 """
 import asyncio
+import base64
 import copy
 import hashlib
 import json
@@ -283,4 +284,28 @@ def test_사람_PAT_가_없는_심의_MCP_잡_은_올리지_않고_보고서_그
     assert f"[그림 — 올리지 못함: {RF.NO_PAT}]" in json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
     assert view["report_figures"] == {"found": 1, "attached": 0, "failed": 1, "reasons": [RF.NO_PAT]}
     assert "그림 1장을 보고서에 싣지 못했다" in view["decision"]
+
+
+def test_심의_중_도구가_낸_그림은_본문에_주소가_없어도_보고서에_실린다(world, figs, monkeypatch):
+    """좌석은 조회로 받은 그림을 발언에 주소로 적지 않는다 — 에이전트가 저장한 그림(app._stash_image_items 의 자루)에서 본문에 없는 것을
+    근거 칸에 그림 줄로 더해 같은 길로 싣는다(RF-16). 그림 칸의 설명은 그 그림을 받은 좌석 · 도구다."""
+    portal, _d = figs
+    real = world.gather
+    done = []
+
+    async def gather(agent, persona, question, ctx, budget, prior=""):
+        k, calls, text, extra = await real(agent, persona, question, ctx, budget, prior)
+        if not done:                    # 처음 한 번 — 진짜 도구 래퍼(_cap_tool)처럼 MCP 이미지 블록을 저장하고 결과 끝에 주소를 단다
+            done.append(1)
+            urls = app._stash_image_items([{"type": "image", "data": base64.b64encode(PNG2).decode(), "mimeType": "image/png"}])
+            calls = [(t, a, o + "\n[생성된 이미지 URL]\n" + "\n".join(urls), c) for t, a, o, c in calls]
+        return k, calls, text, extra
+    monkeypatch.setattr(D, "_free_gather_one", gather)
+    res, view = _run_job(world, user_pat="pat-kim")
+    (args,) = res["reports"]
+    bg = json.dumps(args["blocks"]["background"], ensure_ascii=False)
+    assert "심의 중 도구가 낸 그림(본문에 주소가 없던 것)" in bg and "[그림 1 — " in bg and "· search_parts]" in bg, bg[-300:]
+    assert [b["id"] for b in args["extra_blocks"]] == [f"fig_{hashlib.sha256(PNG2).hexdigest()[:16]}"]
+    assert args["extra_blocks"][0]["content"]["files"][0]["caption"].endswith("· search_parts")
+    assert view["report_figures"]["attached"] == 1 and portal.got[0]["auth"] == "Bearer pat-kim"
 

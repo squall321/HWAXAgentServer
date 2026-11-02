@@ -62,6 +62,21 @@ def count(blocks: dict) -> int:
     return len(_scan(blocks))
 
 
+def uncited(blocks: dict, urls, label=None) -> str:
+    """에이전트가 저장한 그림(urls — /agent/artifacts/<이름>, 처음 나온 차례) 중 블록 글에 주소가 없는 것을 마크다운 그림 줄로 묶은 한 항목.
+    없으면 ''. label(주소 → 설명)이 주는 설명을 그림 줄에 단다(그 그림을 받은 좌석 · 도구). 심의는 좌석 조회가 받은 그림을 발언에 주소로 적지
+    않는다 — 이 항목이 없으면 그 그림들은 보고서에 길이 없다(RF-16)."""
+    have = {n for n, _a in _scan(blocks)}
+    lines: list[str] = []
+    for u in dict.fromkeys(urls or []):
+        m = _REF_RE.fullmatch(u) if isinstance(u, str) else None
+        if m is None or m.group(3) is None or m.group(3) in have:
+            continue
+        alt = re.sub(r"[\]\[\n]+", " ", str((label(u) if label else "") or "심의 중 도구 그림")).strip()[:120]
+        lines.append(f"![{alt}]({u})")
+    return ("심의 중 도구가 낸 그림(본문에 주소가 없던 것):\n" + "\n".join(lines)) if lines else ""
+
+
 @dataclass
 class Figures:
     """attach 의 결과 — 표지로 바꾼 블록 · 그림 칸 · 셈."""

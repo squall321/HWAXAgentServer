@@ -6332,10 +6332,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 유령 ID 게이트를 심의에도 켠다 — /chat 라우트가 _agent_stream 을 거치지 않고 여기로 바로
     # 분기하므로 종전엔 fail-open 이었다. 실측: get_material(material_id=6061)·get_mat_card
     # (test_id=1 → SUS201) 처럼 지어낸 ID 가 그대로 나갔다. 출처는 질문 + 도구 결과에서 늘어난다.
-    from app import _int_tokens, _turn_ids  # noqa: PLC0415
+    from app import _int_tokens, _turn_ids, _turn_images  # noqa: PLC0415
     # 되살릴 때는 끊기기 전 라운드 전 단계 끝의 출처 정수(e:pre ids — 그 단계의 도구 결과에서 배운 것까지)로 건다 — 다시 부르지 않은 도구의 id 를
     # 좌석 조회가 써도 막히지 않게(끊지 않았을 때와 같게)
     _turn_ids.set(set(_pre["ids"]) if _pre is not None else (_int_tokens(question) | _int_tokens(opts.human_note or "")))
+    # 이 단이 도구로 받은 그림 — 에이전트가 저장한 MCP 이미지 블록(app._stash_image_items 가 이 자루에 담는다). 좌석은 받은 그림을 발언에 주소로
+    # 적지 않으므로 보고서가 이 자루에서 본문에 없는 그림도 그림 칸으로 싣는다(HWAXPortal docs/report-figures RF-16). _turn_ids 처럼 이 단의
+    # 태스크 문맥에 건다 — 선주입 · 지정 도구 · 좌석 조회 태스크가 이 문맥을 물려받는다.
+    _fig_bag: list = []
+    _turn_images.set(_fig_bag)
 
     # 자유 조회 에이전트 — 라운드 중 전문가가 직접 데이터를 조회한다(읽기 전용·예산 제한).
     # 결과가 LLM 프롬프트로 들어가므로 여기서는 **기본 캡**(TOOL_RESULT_MAX)으로 다시 로드한다 —
@@ -8172,6 +8177,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                   "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
         # 도구 그림(HWAXPortal docs/report-figures RF-9) — 글 속 그림을 그 사람 명의로 먼저 올려 자리를 표지로 바꾸고, 그림 칸을 저장 호출에 함께
         # 싣는다. 사람 토큰이 없는 잡(MCP)은 올리지 않고 그 자리에 까닭을 남긴다. 그림이 없으면 인자 · 사건이 종전과 같다.
+        if _rsav is None and _do_save:
+            _unc = report_figures.uncited(blocks, _fig_bag, lambda u: next(
+                (f"{_s} · {_t}" for _r, _s, _t, _a, _o in gather_pool if u in str(_o)), ""))
+            if _unc:
+                blocks["background"] = list(blocks["background"]) + [_unc]
         _nfig = report_figures.count(blocks) if _rsav is None and _do_save else 0
         if _nfig:
             yield _sse("status", {"step": f"보고서에 실을 그림 {_nfig}장을 Report Archive 에 올리는 중", "tool": None})
