@@ -6400,7 +6400,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # list_jobs 넷이 이름 꼴 때문에 빠져 있었다). 닫기 목록 · 접두 허용 · 앱 지정의 물성 목록이 같은 이름을 본다. 리스크 심사(와 리스크 앱이 띄운
             # 패널)는 지금 판정 그대로다 — D-18 의 이름 검사(_RISK_RA_REPORT_TOOLS)가 맨 이름이라 원래 이름으로 보면 reportarchive_list_reports 가 새로
             # 열린다. 선언 백엔드 · 허브 가족 · orig 를 모르는 옛 게이트웨이도 그대로다(_free_orig_names). 기준일 심의(소급 검증)도 F0 로 아무것도 더
-            # 들이지 않는다 — 닫힌 쪽(반대 검토 11-02 — OF-22: 겹침 접두 agent_search 가 기준일 거름 없이 들고, 날짜로 거르지 않는 semantic_search 가 새로 들었다).
+            # 들이지 않는다 — 닫힌 쪽(반대 검토 11-02 — OF-22 — 겹침 접두 agent_search 가 기준일 거름 없이 들고, 날짜로 거르지 않는 semantic_search 가 새로 들었다).
             _orig = {} if (_risk_chair or opts.started_by == "app" or _as_of) else _free_orig_names()
             # 기준일 심의면 좌석의 agent_search 에도 그 날을 박는다(_as_of_guard — 모델이 빼거나 바꿀 수 없다)
             _g = {n: _wrap_cached(t, _fcache, _fstats)
