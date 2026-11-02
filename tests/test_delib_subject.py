@@ -59,16 +59,18 @@ def _confirm(raw, **kw):
 # ── 차수 ─────────────────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("raw,want", [
     ("dv1", "dv1"), ("DV1", "dv1"), (" Dv 2 ", "dv2"), ("ＤＶ１", "dv1"), ("ｐｖｒ", "pvr"), ("PRE", "pre"), ("mp", "mp"),
-    ("M P", "mp"), ("pra", "pra"), ("dvr", "dvr"), ("pv3", "pv3"), ("　dv3　", "dv3"),
+    ("M P", "mp"), ("pra", "pra"), ("dvr", "dvr"), ("pv3", "pv3"), ("\u3000dv3\u3000", "dv3"), ("dv\u00a01", "dv1"), ("dv\u00851", "dv1"),
+    ("\tdv\n2\r", "dv2"), ("pv\u20281", "pv1"),
 ])
 def test_차수는_전각_공백_대소문자만_맞추고_코드로_읽는다(raw, want):
     assert s.norm_round(raw) == want
 
 
 @pytest.mark.parametrize("raw", ["2차", "C2", "c2", "양산", "선행", "DV", "dv", "pre1", "pv4", "dv-1", "dv_1", "dv0", "mp1",
-                                 "", "  ", "dv1차", "PV 1차"])
+                                 "", "  ", "dv1차", "PV 1차", "dv1\ufeff", "\ufeffpv2", "dv\u001f1", "dv\u001c1", "dv\u200b1"])
 def test_꼴에_안_맞으면_차수가_아니다(raw):
-    """하이픈을 빼지 않고 '2차' · 'C2' · '양산' 을 dv2 · mp 로 읽지 않는다 — 원천이 그 대응을 적지 않았다(PLAN §4.6)."""
+    """하이픈을 빼지 않고 '2차' · 'C2' · '양산' 을 dv2 · mp 로 읽지 않는다 — 원천이 그 대응을 적지 않았다(PLAN §4.6). 공백이 아닌 글자(BOM ·
+    정보 분리 문자 · 폭 없는 공백)는 빼지 않는다 — 빼는 것은 유니코드 White_Space 묶음뿐이다(화면 subject.ts 와 같다 — 반대 검토 11-02)."""
     assert s.norm_round(raw) is None
     assert s.norm_round(None) is None and s.norm_round(1) is None
 
@@ -157,8 +159,9 @@ def test_질의를_되실은_결과는_확인이_아니다(monkeypatch):
 def test_부분_일치만_걸린_행은_확인이_아니다(monkeypatch):
     _fake(monkeypatch, body=_FIX["exact_and_partial"]["body"])       # 두 행 다 '알파 개발' 을 품지만 key 는 다르다
     rec = _confirm({"sp_task": "알파 개발"})
-    assert rec["sp_state"] == s.CLAIMED and "글자 그대로 같은 행이 없다" in rec["sp_why"]
-    assert "「알파 개발_C2」" in rec["sp_why"], "결과 행의 key 를 알려 그 key 로 다시 달게 한다"
+    assert rec["sp_state"] == s.CLAIMED and "글자 그대로 같은 행이 없다" in rec["sp_why"] and s.RESOLVER_TOOL in rec["sp_why"]
+    assert "알파 개발_C2" not in rec["sp_why"], \
+        "결과 행의 key 를 까닭에 싣지 않는다 — 원장을 읽는 같은 소속에게 StepForge 허가가 없을 수 있다(반대 검토 11-02)"
 
 
 def test_과제코드로_걸린_행은_key_가_달라_확인이_아니다(monkeypatch):
@@ -167,7 +170,37 @@ def test_과제코드로_걸린_행은_key_가_달라_확인이_아니다(monkey
     assert body["tasks"][0]["matched_by"] == ["task_code"] and body["tasks"][0]["key"] == KEY
     _fake(monkeypatch, body=body)
     rec = _confirm({"sp_task": "TC-1001"})
-    assert rec["sp_state"] == s.CLAIMED and rec["sp_task"] == "TC-1001" and f"「{KEY}」" in rec["sp_why"]
+    assert rec["sp_state"] == s.CLAIMED and rec["sp_task"] == "TC-1001" and KEY not in rec["sp_why"]
+
+
+def _variant(**row) -> dict:
+    """실제 응답의 확인 행 하나를 바꾼 판 — 그 밖의 칸은 실제 응답 그대로다."""
+    body = copy.deepcopy(_FIX["exact_and_partial"]["body"])
+    body["tasks"][0].update(row)
+    return body
+
+
+def test_과제명이_같아도_key_가_다르면_확인이_아니다(monkeypatch):
+    """SP 안내 꼴 허브는 key 가 과제코드이고 과제명은 label 이다(docs/procedures/app-project-keys.md 3절) — 과제명을 key 로 주면 label 만 맞는다."""
+    _fake(monkeypatch, body=_variant(key="TC-1001", label=KEY, matched_by=["label"]))
+    assert _confirm({"sp_task": KEY})["sp_state"] == s.CLAIMED
+
+
+@pytest.mark.parametrize("asked", ["알파 개발_c2", "알파  개발_C2", "알파\u00a0개발_C2", " 알파 개발_C2x"])
+def test_대소문자_공백이_다른_key_는_확인이_아니다(monkeypatch, asked):
+    """find_plm_task 는 ASCII 대소문자를 가리지 않고 찾는다 — 결과 행이 와도 key 는 글자 그대로 같아야 한다."""
+    _fake(monkeypatch, body=_FIX["exact_and_partial"]["body"])
+    assert _confirm({"sp_task": asked})["sp_state"] == s.CLAIMED
+
+
+def test_허브에서_비활성인_과제는_글자_그대로_같아도_확인이_아니다(monkeypatch):
+    """거울은 지워졌거나 합쳐진 과제도 낸다(활성이 앞 · 비활성이 뒤) — 받는 앱 자신도 hub_inactive 로 읽는 행이다(반대 검토 11-02)."""
+    _fake(monkeypatch, body=_variant(active=False, gone_reason="merged", merged_into="알파 개발_C3"))
+    rec = _confirm({"sp_task": KEY, "round": "dv1"})
+    assert rec["sp_state"] == s.CLAIMED and "비활성" in rec["sp_why"] and "merged" in rec["sp_why"] and rec["round"] == "dv1"
+    assert "알파 개발_C3" not in rec["sp_why"], "합쳐진 곳의 key 도 까닭에 싣지 않는다(결과 행의 key 와 같은 까닭)"
+    _fake(monkeypatch, body=_variant(active=False, gone_reason="deleted"))
+    assert "deleted" in _confirm({"sp_task": KEY})["sp_why"]
 
 
 def test_같은_key_가_둘이면_고르지_않는다(monkeypatch):
@@ -329,6 +362,41 @@ def test_게이트웨이에_풀이_도구가_없으면_주장이다(gw, monkeypa
     monkeypatch.setattr(s, "RESOLVER_CALL", "heaxstep_forge_no_such_tool")
     rec = asyncio.run(s.confirm(gw.app, s.parse({"sp_task": KEY}), groups=[], user="me@example.com"))
     assert rec["sp_state"] == s.CLAIMED and "오류로 답했다" in rec["sp_why"], rec
+
+
+def test_앞_연결에_도구가_없으면_다음_연결로_간다(monkeypatch):
+    """게이트웨이는 'unknown tool: …', FastMCP 서버는 'Unknown tool: …' 로 답한다 — 대소문자를 가리지 않고 다음 연결을 부른다(반대 검토 11-02)."""
+    import langchain_mcp_adapters.client as lc
+    from mcp.types import CallToolResult, TextContent
+    seen = []
+
+    class _Sess:
+        def __init__(self, name):
+            self.name = name
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def call_tool(self, tool, args):
+            seen.append(self.name)
+            if self.name == "demo":
+                return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {tool}")], isError=True)
+            return CallToolResult(content=[TextContent(type="text", text=_text(_FIX["exact_and_partial"]["body"]))], isError=False)
+
+    class _Client:
+        def __init__(self, conns):
+            self.conns = conns
+
+        def session(self, name):
+            return _Sess(name)
+    monkeypatch.setattr(lc, "MultiServerMCPClient", _Client)
+    app = SimpleNamespace(state=SimpleNamespace(connections={"demo": {"url": "http://demo.invalid/", "transport": "streamable_http"},
+                                                              "gateway": {"url": "http://gw.invalid/", "transport": "streamable_http"}}))
+    rec = asyncio.run(s.confirm(app, s.parse({"sp_task": KEY}), groups=[], user="me@example.com"))
+    assert rec["sp_state"] == s.CONFIRMED and seen == ["demo", "gateway"], (rec, seen)
 
 
 def test_연결_설정이_없으면_주장이다():

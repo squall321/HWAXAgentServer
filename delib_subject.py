@@ -68,12 +68,17 @@ class SubjectError(ValueError):
     """주제의 꼴이 틀렸다 — 무엇이 틀렸는지 말한다(시작 전에 거절한다)."""
 
 
+# 차수 정규화가 빼는 '공백' — 유니코드 White_Space 성질의 글자 그대로다. 파이썬 str.split 은 정보 분리 문자(U+001C ~ U+001F)까지, JS 의 \s 는
+# BOM(U+FEFF)까지 공백으로 읽어 두 쪽이 갈렸다(반대 검토 11-02) — 화면(HWAXPortal frontend subject.ts SPACE_RE)이 같은 글자 묶음을 쓴다(시험이 견준다).
+_SPACE_RE = re.compile("[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+")
+
+
 def norm_round(v) -> str | None:
-    """차수 글 → 코드(STAGES) · 아니면 None(차수 모름). NFKC(전각 → 반각) · 공백 빼기 · 소문자만 하고 글자 그대로 견준다 — 하이픈을 빼지 않고,
-    '2차' · 'C2' · '양산' · 'dv' · 'pre1' 을 코드로 읽지 않는다(PLAN §4.6)."""
+    """차수 글 → 코드(STAGES) · 아니면 None(차수 모름). NFKC(전각 → 반각) · 공백(_SPACE_RE) 빼기 · 소문자만 하고 글자 그대로 견준다 — 하이픈을
+    빼지 않고, '2차' · 'C2' · '양산' · 'dv' · 'pre1' 을 코드로 읽지 않는다(PLAN §4.6)."""
     if not isinstance(v, str):
         return None
-    s = "".join(unicodedata.normalize("NFKC", v).split()).lower()
+    s = _SPACE_RE.sub("", unicodedata.normalize("NFKC", v)).lower()
     return s if s in STAGES else None
 
 
@@ -185,7 +190,8 @@ async def call_resolver(app, *, groups, user: str, user_pat: str, args: dict) ->
         async with client.session(name) as s:
             res = await s.call_tool(RESOLVER_CALL, args)
         text = "\n".join(str(getattr(c, "text", "") or "") for c in (res.content or []) if getattr(c, "type", "") == "text")
-        if res.isError and text.lstrip().startswith("unknown tool"):
+        # 게이트웨이는 'unknown tool: …', FastMCP 서버는 'Unknown tool: …' 로 답한다 — 대소문자를 가리지 않는다(반대 검토 11-02)
+        if res.isError and text.lstrip().lower().startswith("unknown tool"):
             miss = text          # 이 연결에는 그 도구가 없다 — 다음 연결(게이트웨이가 하나면 여기서 끝난다)
             continue
         return bool(res.isError), text
@@ -228,6 +234,13 @@ async def confirm(app, parsed: dict, *, groups, user: str, user_pat: str = "") -
                        why=f"허브 과제 풀이({RESOLVER_TOOL})가 오류로 답했다 — {' '.join(text.split())[:200]}")
     rows, cause = _rows(text)
     exact = [r for r in rows if r.get("key") == key]
+    if len(exact) == 1 and exact[0].get("active") is False:
+        # 허브에서 지워졌거나 합쳐진 과제(거울은 비활성 행도 낸다 — StepForge task_view 의 active · gone_reason · merged_into). 받는 앱 자신도
+        # 이 행을 hub_inactive 로 읽는다(StepForge core/sp_core.py task_for_code) — 산 과제가 아니라 확인하지 않는다(반대 검토 11-02). 합쳐진 곳
+        # (merged_into)의 key 는 싣지 않는다 — 아래 '결과 행의 key' 와 같은 까닭이다.
+        return _record(parsed, state=CLAIMED, sp_task=key,
+                       why=f"허브에서 비활성인 과제다({str(exact[0].get('gone_reason') or '까닭 모름')[:40]}) — {RESOLVER_TOOL} 로 지금 산 과제를 "
+                           "찾아 그 key 로 단다")
     if len(exact) == 1:
         by = {"tool": RESOLVER_CALL, "app": RESOLVER_APP, "at": round(time.time(), 3),
               "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
@@ -235,10 +248,10 @@ async def confirm(app, parsed: dict, *, groups, user: str, user_pat: str = "") -
     if exact:
         why = f"풀이 결과에 key 가 글자 그대로 같은 행이 {len(exact)}개다 — 고르지 않는다"
     else:
-        near = [str(r.get("key"))[:60] for r in rows[:3] if isinstance(r.get("key"), str)]
+        # 결과 행의 key 를 까닭에 싣지 않는다 — 이 까닭은 잡 원장에 남아 같은 소속이 읽는데, 그 사람에게 StepForge 허가가 없을 수 있다(PLAN §6.2 —
+        # 좁은 근거가 넓은 자리로 옮겨 가면 샌다. 반대 검토 11-02). 부르는 쪽은 같은 풀이를 제 자격으로 다시 부르면 된다.
         why = (f"풀이 결과 {len(rows)}행 가운데 key 가 글자 그대로 같은 행이 없다" + (f"(풀이의 까닭 {cause})" if cause else "")
-               + (" — 결과 행의 key: " + " · ".join(f"「{k}」" for k in near) if near else "")
-               + " — 허브 과제의 key(운영 허브는 과제명)를 그대로 주면 확인된다")
+               + f" — {RESOLVER_TOOL} 로 찾아 결과 행의 key(운영 허브는 과제명 — 과제코드가 아니다)를 그대로 주면 확인된다")
     return _record(parsed, state=CLAIMED, sp_task=key, why=why)
 
 
