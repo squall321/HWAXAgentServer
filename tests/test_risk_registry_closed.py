@@ -16,6 +16,7 @@
 # (8) 지정 도구 — 리스크 앱은 변경 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 읽기 · 범용 실행기를 부르지 않는다(이름 꼴 셋).
 # (9) RA 온톨로지 읽기 — 같은 과제의 리스크 판정 객체(risk_finding)를 뺀다.
 # (10) 포털 대화 검색 · 심의 잡 기록 — 같은 과제의 앞 패널 대화를 빼고, 잡 기록 읽기는 지정 도구로 부르지 않는다.
+# (11) 쟁점 패널 초안 — 질문에 과제 코드가 없어 같은 과제의 것인지 가릴 수 없다. 제목이 다른 과제를 보일 때만 남긴다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -898,3 +899,79 @@ def test_과제를_모르는_리스크_심사는_대화도_전부_뺐다고_알�
         warn, cards = _head_notices(_events_for(monkeypatch, question), code)
         assert len(warn) == 1 and len(cards) == 1, (code, warn, cards)
         assert "대화 검색" in warn[0]["message"] and "search_conversations" in cards[0]["text"], (code, warn[0], cards[0])
+
+
+# ── (11) 쟁점 패널 초안 — 질문에 과제 코드가 없어 같은 과제의 것인지 가릴 수 없다. 닫힌 쪽으로 뺀다 ─────────────────────────────
+# 리스크 앱 쟁점 패널의 질문은 '[쟁점 <issue_id> · <유형>] …' 이라(HWAXRisk issues) 엔진이 남기는 RA 초안의 제목이 '심의 — [쟁점 …' 이다.
+# 과제 코드를 아는 리스크 심사에서 보고서 거름은 '[리스크심사 <과제코드> ' 머리만 봐서 그 초안을 스니펫째 좌석에게 줬다(D-18 누수 다섯째,
+# 2026-11-02). 초안의 제목이 다른 과제의 머리를 보일 때만 남긴다 — 다른 과제의 쟁점 패널 초안도 함께 빠진다(그 선례는 브리프로 간다).
+# 스니펫의 머리는 그 초안이 인용한 남의 보고서일 수 있어 그 초안의 과제로 읽지 않는다.
+_ISSUE_Q = "[쟁점 I-3 · 갈림] 부품 힌지 브래킷 의 판정이 쟁점별로 어떻게 갈리는가를 근거로 다시 판정하라."
+_ISSUE_SNIPPET = "쟁점 판정 — 힌지 FAIL 유지"
+
+
+def _issue_hits():
+    """_ra_hits() 에 쟁점 패널 초안 셋을 더한 응답 — 제목은 엔진이 실제로 다는 것(_ra_report_title)이다. 11 은 스니펫이 다른 과제의
+    머리를 인용하고(그 초안의 과제가 아니다), 12 는 제목에 다른 과제의 머리가 실린 꼴(쟁점 질문에 과제 표지가 붙으면 그렇게 된다)이다."""
+    rows = _ra_hits()["reports"] + [
+        {"report_id": 10, "title": d._ra_report_title(_ISSUE_Q), "snippet": f"{_ISSUE_SNIPPET} …", "boards": []},
+        {"report_id": 11, "title": d._ra_report_title(_ISSUE_Q), "snippet": "선례로 심의 — [리스크심사 P12 T-x] 의 판정을 든다",
+         "boards": []},
+        {"report_id": 12, "title": d._ra_report_title("[쟁점 I-9 · 갈림] [리스크심사 P12 T-x] 부품 힌지"),
+         "snippet": "다른 과제의 쟁점 판정", "boards": []},
+    ]
+    return {"reports": rows, "count": len(rows), "limit": 8}
+
+
+@pytest.mark.parametrize("ascii_", (False, True), ids=("utf8", "escaped"))
+def test_리스크_심사_좌석의_보고서_검색은_과제를_읽을_수_없는_쟁점_패널_초안을_뺀다(monkeypatch, ascii_):
+    hits = json.dumps(_issue_hits(), ensure_ascii=ascii_)
+    got = _search(_seat_pool(monkeypatch, "risk-review", _Q_NOW, hits))
+    assert [r["report_id"] for r in got["reports"]] == [8, 9, 12], got
+    assert got["count"] == 3 and "3건" in got["withheld"] and "P1" in got["withheld"], got
+    # 다른 심의는 종전대로 준다.
+    raw = _search(_seat_pool(monkeypatch, "default", _Q_NOW, hits, apps=()))
+    assert [r["report_id"] for r in raw["reports"]] == [7, 8, 9, 10, 11, 12] and "withheld" not in raw, raw
+
+
+def test_리스크_심사의_지정_도구_보고서_검색도_쟁점_패널_초안을_뺀다(monkeypatch):
+    """엔진이 직접 부르는 길(지정 도구) — 결과가 전 좌석 프롬프트에 실린다. 다른 심의는 종전대로다."""
+    hits = json.dumps(_issue_hits(), ensure_ascii=False)
+
+    def card(chair):
+        events = _engine_with(monkeypatch, chair, {"tools": ["search_reports"]},
+                              {"agent_search": _Tool("agent_search"), "search_reports": _CoTool("search_reports", hits)})
+        return next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_reports")["text"]
+
+    text = card("risk-review")
+    assert _ISSUE_SNIPPET not in text and "선례로 심의" not in text and _PRIOR_SNIPPET not in text, text
+    assert "다른 과제의 쟁점 판정" in text and "1.5m 낙하" in text and "withheld" in text, text
+    text = card("default")
+    assert _ISSUE_SNIPPET in text and "withheld" not in text, text
+
+
+def test_외부_응답자의_CALL_줄도_쟁점_패널_초안을_거른_결과를_받는다():
+    """글 왕복(CALL 줄)에서는 엔진이 좌석 도구를 실행한다 — 자유 조회 후보에 감싼 search_reports 를 그대로 부른다."""
+    from test_text_react_agent import _Script, _call
+
+    tool = _CoTool("search_reports", json.dumps(_issue_hits(), ensure_ascii=False))
+    d._risk_hide_priors({"search_reports": tool}, _Q_NOW)
+    llm = _Script(_call("search_reports", query="힌지 리스크"), "조회 요약: 끝")
+    _k, calls, _block, err = asyncio.run(d._free_gather_one(d._TextReactAgent(llm, [tool], 3),
+                                                             {"key": "mech-a", "role": "기구"}, "질문", "맥락", 3))
+    assert err == "" and len(calls) == 1, (err, calls)
+    out = json.loads(calls[0][2])
+    assert [r["report_id"] for r in out["reports"]] == [8, 9, 12] and "withheld" in out, out
+
+
+@pytest.mark.parametrize("ascii_", (False, True), ids=("utf8", "escaped"))
+def test_읽지_못한_보고서_검색_응답에_쟁점_패널_초안이_보이면_통째로_막는다(monkeypatch, ascii_):
+    """자유 조회의 결과 상한에서 잘린 JSON — 쟁점 패널 초안이 보이면 같은 과제의 것인지 가릴 수 없어 결과를 주지 않는다. 쟁점 패널 초안도
+    같은 과제의 머리도 없으면 그대로 준다."""
+    issue = {"reports": [_ra_hits()["reports"][2], _issue_hits()["reports"][3]], "count": 2, "limit": 8}
+    raw = json.dumps(issue, ensure_ascii=ascii_)[:-30]
+    out = asyncio.run(_seat_pool(monkeypatch, "risk-review", _Q_NOW, raw).coroutine(query="힌지"))
+    assert out != raw and _ISSUE_SNIPPET not in out and "가려낼 수 없다" in out, out
+    plain = {"reports": _ra_hits()["reports"][1:], "count": 2, "limit": 8}      # 다른 과제의 패널 보고서 · 일반 보고서
+    raw = json.dumps(plain, ensure_ascii=ascii_)[:-30]
+    assert asyncio.run(_seat_pool(monkeypatch, "risk-review", _Q_NOW, raw).coroutine(query="힌지")) == raw

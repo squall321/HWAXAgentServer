@@ -1117,8 +1117,12 @@ _RISK_Q_HEAD_RE = re.compile(r"\[리스크심사 ([^\]]+) ([^\s\]]+)\]")
 # 외부 응답자 심의의 대상 열쇠(delib_opts.target_key — X-D8 ⑦) — 리스크 앱 대상 열쇠의 꼴('diff:<id>' · 'snap:<id>', id 는 앱 DB 의
 # uuid hex). 쟁점 패널 질문은 '[쟁점 …]' 로 시작해 위 머리가 없으므로 앱이 이 칸으로 준다 — 외부 과제 머리와 과제 기록에만 싣는다.
 _RISK_TARGET_KEY_RE = re.compile(r"(?:diff|snap):[0-9A-Za-z][0-9A-Za-z_-]{0,63}")
-_RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서 {n}건은 리스크 심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 "
-                        "읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+# 리스크 앱 쟁점 패널의 RA 초안 제목 머리 — 쟁점 패널의 질문은 '[쟁점 <issue_id> · <유형>] …' 이라(HWAXRisk issues) 과제 코드가 없고,
+# 엔진은 그 초안에 '심의 — [쟁점 …' 제목을 단다(_ra_report_title). 제목으로는 어느 과제의 쟁점 패널인지 읽히지 않는다. 글자를 바꾸려면
+# 그 리포와 같이 바꾼다.
+_RISK_ISSUE_DRAFT_HEAD = _RA_TITLE_HEAD + "[쟁점"
+_RISK_PRIOR_WITHHELD = ("같은 과제({code})의 앞 패널 심의 보고서(과제를 읽을 수 없는 쟁점 패널 보고서 포함) {n}건은 리스크 심사 좌석에게 "
+                        "보이지 않는다 — 앞 패널의 판정을 읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
 # 과제 코드를 모르는 리스크 심사(머리 없는 손수 길 · 머리를 읽지 못한 길) — 같은 과제를 가릴 수 없어 심의 보고서를 전부 뺀다.
 _RISK_PRIOR_WITHHELD_ALL = (f"엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…') {{n}}건은 리스크 심사 좌석에게 보이지 않는다 — 질문에서 "
                             "과제를 읽지 못해 같은 과제의 앞 패널 판정을 가릴 수 없어 심의 보고서를 전부 뺐다(다른 과제의 선례도 "
@@ -1150,7 +1154,10 @@ def _risk_hide_prior_panels(tool, question: str):
     엔진은 패널마다 결정문이 든 RA 초안을 남기고(러너가 save_report 를 보내지 않는다 — 리스크 앱이 그 번호를 패널에 적는다),
     RA 는 소유한 초안도 검색 범위에 넣고 저장 때 본문 색인을 채운다. 그래서 같은 잡 자격으로 도는 다음 패널 좌석이
     '힌지 리스크' 만 찾아도 앞 패널의 판정이 걸렸다(engine-contract A-D18-ra-reports). 같은 과제는 질문 머리의 과제 코드로
-    가리고, 다른 과제의 보고서는 선례라 남긴다. 과제 코드를 읽지 못하면(머리 없는 손수 길 — 실사용 팀이 Claude 에서
+    가리고, 다른 과제의 보고서는 선례라 남긴다. 쟁점 패널의 초안(제목 '심의 — [쟁점 …' — _RISK_ISSUE_DRAFT_HEAD)은 질문에 과제
+    코드가 없어 같은 과제의 것인지 가릴 수 없다 — 그 초안의 제목이 다른 과제의 머리를 보일 때만 남기고 나머지는 뺀다(닫힌 쪽 —
+    다른 과제의 쟁점 패널 초안도 함께 빠진다. 2026-11-02, D-18 누수 다섯째). 머리는 제목에서만 읽는다 — 스니펫의 머리는 그 초안이
+    인용한 남의 보고서일 수 있어 그 초안의 과제가 아니다. 과제 코드를 읽지 못하면(머리 없는 손수 길 — 실사용 팀이 Claude 에서
     deliberate_start(job='risk-review')를 머리 없이 부른다 · 머리가 보이는데 못 읽은 길) 같은 과제를 가릴 수 없어 엔진이 남긴
     심의 보고서(제목 _RA_TITLE_HEAD)를 전부 뺀다 — 종전엔 감싸지 않아 앞 패널 초안이 스니펫째 좌석에 갔다(m1 3차 발견 5). 심의는
     그 사실을 경고와 카드로 알린다(_risk_head_unread · risk_head_missing).
@@ -1163,16 +1170,25 @@ def _risk_hide_prior_panels(tool, question: str):
         return tool
     if code is not None:
         mark = f"[리스크심사 {code} "
+        marks = (mark, _RISK_ISSUE_DRAFT_HEAD)
 
         def _prior(title: str) -> bool:
-            return mark in title
+            if mark in title:
+                return True
+            if not title.lstrip().startswith(_RISK_ISSUE_DRAFT_HEAD):
+                return False
+            # 쟁점 패널 초안 — 제목이 다른 과제의 머리를 보일 때만 남긴다(엔진이 질문을 읽는 식으로 읽는다).
+            heads = [m.group(1) for m in _RISK_Q_HEAD_RE.finditer(title)]
+            return not heads or code in heads
 
         def _withheld(n: int) -> str:
             return _RISK_PRIOR_WITHHELD.format(code=code, n=n)
-        _opaque = (f"검색 결과를 줄 수 없다 — 같은 과제({code})의 앞 패널 심의 보고서가 섞여 있는데 응답을 풀지 못해 "
-                   "가려낼 수 없다. 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 다시 찾아라.")
+        _opaque = (f"검색 결과를 줄 수 없다 — 같은 과제({code})의 앞 패널 심의 보고서(또는 과제를 읽을 수 없는 쟁점 패널 보고서)가 "
+                   "섞여 있는데 응답을 풀지 못해 가려낼 수 없다. 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 바꿔 다시 "
+                   "찾아라.")
     else:
         mark = _RA_TITLE_HEAD
+        marks = (mark,)
 
         def _prior(title: str) -> bool:
             return title.lstrip().startswith(mark)
@@ -1192,7 +1208,7 @@ def _risk_hide_prior_panels(tool, question: str):
             got = None
         rows = got.get("reports") if isinstance(got, dict) else None
         if not isinstance(rows, list):
-            if mark in text or json.dumps(mark)[1:-1] in text:
+            if any(m in text or json.dumps(m)[1:-1] in text for m in marks):
                 return _opaque
             return text
         keep = [r for r in rows if not (isinstance(r, dict) and _prior(str(r.get("title") or "")))]
