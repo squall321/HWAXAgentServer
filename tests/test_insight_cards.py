@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
 import app as a  # noqa: E402
 import delib_jobs  # noqa: E402
@@ -233,6 +234,90 @@ def test_보통_이어하기는_앞_잡을_continues_로_적는다(eng, monkeypa
         await _end(eng, rec)
         assert json.loads((delib_jobs.JOB_DIR / f"{rec['id']}.json").read_text(encoding="utf-8"))["continues"] == first["job_id"]
     _play(scenario)
+
+
+# ── 끝난 잡 창구 ─────────────────────────────────────────────────────────────────────────────
+def _put(tmp_path, jid, **kw):
+    job = {"id": jid, "job": "default", "status": "done", "finished_at": 1000.0, "user": ME, "owner_aff": "CAEG",
+           "chair_template": "default", "started_by": "human", "subject": {"sp_state": "confirmed", "sp_task": KEY},
+           "insights": {"default": {"stage": "default", "claim": "결론"}}, **kw}
+    delib_jobs._persist(job)
+    return job
+
+
+@pytest.fixture
+def ledger(monkeypatch, tmp_path):
+    monkeypatch.setattr(delib_jobs, "JOB_DIR", tmp_path)
+    monkeypatch.setattr(delib_jobs, "_JOBS", {})
+    return tmp_path
+
+
+def test_창구는_끝났고_주인과_주제가_있는_비리스크_잡만_낸다(ledger):
+    _put(ledger, "ok-1")
+    _put(ledger, "ok-claimed", subject={"sp_state": "claimed", "sp_task": "x"}, finished_at=1001.0, continues="ok-1")
+    _put(ledger, "running", status="running")
+    _put(ledger, "interrupted", status="interrupted")
+    _put(ledger, "cancelled", status="cancelled")
+    _put(ledger, "anon", user="")
+    _put(ledger, "none", subject={"sp_state": "none"})
+    _put(ledger, "nosubject", subject=None)
+    _put(ledger, "risk", chair_template="risk-review")
+    _put(ledger, "app", started_by="app")
+    _put(ledger, "nocards", insights={})
+    _put(ledger, "riskcard", insights={"risk-review": {"stage": "risk-review", "claim": "x"}})
+    _put(ledger, "err", status="error", finished_at=1002.0)
+    got = delib_jobs.insight_items(0.0, 50)
+    assert got["contract"] == delib_jobs.INSIGHT_CONTRACT and got["complete"] is True
+    assert [it["job_id"] for it in got["items"]] == ["ok-1", "ok-claimed", "err"]
+    one = got["items"][1]
+    assert one["continues"] == "ok-1" and one["subject"]["sp_state"] == "claimed" and one["cards"] == [{"stage": "default", "claim": "결론"}]
+    assert got["next_since"] == 1002.0
+
+
+def test_창구는_since_부터_상한까지_내고_다_냈는지_말한다(ledger):
+    for i in range(5):
+        _put(ledger, f"j{i}", finished_at=1000.0 + i)
+    page = delib_jobs.insight_items(1001.0, 2)
+    assert [it["job_id"] for it in page["items"]] == ["j1", "j2"] and page["complete"] is False and page["next_since"] == 1002.0
+    rest = delib_jobs.insight_items(page["next_since"], 10)
+    assert [it["job_id"] for it in rest["items"]] == ["j2", "j3", "j4"] and rest["complete"] is True, "경계는 다시 나온다"
+    assert delib_jobs.insight_items(5000.0, 10)["items"] == []
+
+
+def test_창구는_공유_비밀을_요구한다(ledger, monkeypatch):
+    _put(ledger, "ok-1")
+    import seat_box
+    monkeypatch.setattr(seat_box, "secret", lambda _app: "Bearer gw-secret")
+    c = TestClient(a.app)
+    assert c.get("/insights/cards").status_code == 401
+    assert c.get("/insights/cards", headers={"Authorization": "Bearer nope"}).status_code == 401
+    r = c.get("/insights/cards", params={"since": 0}, headers={"Authorization": "Bearer gw-secret"})
+    assert r.status_code == 200 and [it["job_id"] for it in r.json()["items"]] == ["ok-1"]
+    assert c.get("/insights/cards", params={"since": -1}, headers={"Authorization": "Bearer gw-secret"}).status_code == 422
+    monkeypatch.setattr(seat_box, "secret", lambda _app: "")
+    assert c.get("/insights/cards", headers={"Authorization": "Bearer gw-secret"}).status_code == 503
+
+
+# ── 주제 다시 풀기 창구 ──────────────────────────────────────────────────────────────────────
+def test_주제_다시_풀기는_사람_PAT_로_M1_규칙을_쓴다(monkeypatch):
+    seen = []
+
+    async def call(_app, *, groups, user, user_pat, args):
+        seen.append((tuple(groups), user, user_pat))
+        return False, json.dumps(_FIX["exact_and_partial"]["body"], ensure_ascii=False)
+    monkeypatch.setattr(s, "call_resolver", call)
+    c = TestClient(a.app)
+    body = {"subject": {"sp_task": KEY, "round": "DV1", "text": "알파"}, "groups": ["CAEG"], "user_email": ME, "user_pat": "pat-EXAMPLE"}
+    r = c.post("/deliberate/subject/confirm", json=body)
+    assert r.status_code == 200 and r.json()["subject"]["sp_state"] == "confirmed" and r.json()["subject"]["round"] == "dv1"
+    assert seen == [(("CAEG",), ME, "pat-EXAMPLE")]
+    assert c.post("/deliberate/subject/confirm", json={**body, "user_pat": " "}).json()["code"] == "bad_request"
+    r = c.post("/deliberate/subject/confirm", json={**body, "chair_template": "risk-review"})
+    assert r.status_code == 422 and r.json()["code"] == "risk_family"
+    r = c.post("/deliberate/subject/confirm", json={**body, "subject": {"sp_task": KEY, "sp_state": "confirmed"}})
+    assert r.status_code == 422 and "모르는 칸" in r.json()["message"]
+    assert c.post("/deliberate/subject/confirm", json={**body, "subject": {"sp_task": " "}}).json() == {"subject": None}
+    assert len(seen) == 1, "꼴이 틀리거나 빈 주제는 풀이를 부르지 않는다"
 
 
 # ── 웹 — 확인 · 주장인 주제만 엔진 앞에서 무장한다 ─────────────────────────────────────────────────

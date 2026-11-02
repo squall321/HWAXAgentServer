@@ -2272,3 +2272,65 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]
 
+
+# ── 과제 인사이트 — 끝난 MCP 잡의 카드 거리(HWAXPortal docs/project-insight-graph M2 · contracts §3.1) ─────────────────────────────
+# 포털이 공유 비밀 창구(app GET /insights/cards)로 읽어 들인다 — 엔진이 밀지 않는다(PG-9: 어느 쪽이 내려가 있어도 다음 읽기에 따라잡는다). 내는 잡은
+# 끝났고(done · error — 다단 심의의 끝난 앞 단은 결정문이 있다) 주인이 있고(@) 주제가 확인 · 주장이며 리스크 심사 계열이 아니고 카드 거리가 있는
+# 잡뿐이다. 주인 · 소속은 그때 게이트웨이가 실은 값(자칭)이다 — 포털은 주인이 포털에서 확인하기 전까지 그 주인만 보는 초안으로 둔다.
+INSIGHT_CONTRACT = "insight-cards/1"
+INSIGHT_LIMIT_MAX = 500
+_INSIGHT_DONE = ("done", "error")
+_INSIGHT_MTIME_SLACK_S = 5.0     # 끝 쓰기(_persist)는 finished_at 뒤다 — 원장 파일 mtime 이 since 보다 이 만큼 앞서면 볼 것이 없다
+
+
+def _insight_head_ok(j: dict, since: float) -> bool:
+    """목록 색인(또는 메모리 잡)의 칸만으로 가른다 — 끝남 · 시각 · 주인 · 주제 상태 · 의장 틀(started_by 는 원장 전부에서 다시 본다)."""
+    import delib_subject  # noqa: PLC0415
+    s = j.get("subject")
+    return (j.get("status") in _INSIGHT_DONE and float(j.get("finished_at") or 0) >= since and "@" in str(j.get("user") or "")
+            and isinstance(s, dict) and s.get("sp_state") in (delib_subject.CONFIRMED, delib_subject.CLAIMED)
+            and not delib_subject.risk_family(j.get("chair_template")))
+
+
+def _insight_item(j: dict) -> dict | None:
+    """원장 전부 → 창구의 항목 하나(카드 거리가 없거나 리스크 심사 계열이면 None). 카드의 단(stage)이 리스크 심사 틀이면 그 카드도 뺀다."""
+    import delib_subject  # noqa: PLC0415
+    if not insight_armed(j):
+        return None
+    cards = [c for c in (j.get("insights") or {}).values()
+             if isinstance(c, dict) and not delib_subject.risk_family(c.get("stage"))]
+    if not cards:
+        return None
+    return {"job_id": j["id"], "job": j.get("job"), "user": str(j.get("user") or ""), "owner_aff": str(j.get("owner_aff") or ""),
+            "chair_template": j.get("chair_template"), "started_by": j.get("started_by"), "status": j.get("status"),
+            "finished_at": float(j.get("finished_at") or 0), "continues": j.get("continues") or j.get("resumed_from") or None,
+            "subject": j["subject"], "cards": cards}
+
+
+def insight_items(since: float = 0.0, limit: int = 200) -> dict:
+    """끝난 잡의 카드 거리 — finished_at 오름차순, since 이상(경계는 다음 부름에 다시 나올 수 있다 — 받는 쪽이 id 로 하나로 만든다). 원장 파일은
+    mtime 으로 먼저 거르고 목록 색인으로 가른 뒤 고른 잡만 통째로 읽는다. 답 {contract, items, next_since, complete}."""
+    lim = max(1, min(int(limit), INSIGHT_LIMIT_MAX))
+    found: dict = {jid: j for jid, j in list(_JOBS.items()) if _insight_head_ok(j, since)}
+    try:
+        files = list(JOB_DIR.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        if f.stem in found:
+            continue
+        try:
+            if f.stat().st_mtime < since - _INSIGHT_MTIME_SLACK_S:
+                continue
+        except OSError:
+            continue
+        head = _list_load(f)
+        if head and _insight_head_ok(head, since):
+            full = _load(f.stem)
+            if full:
+                found[f.stem] = full
+    items = [it for it in (_insight_item(j) for j in sorted(found.values(), key=lambda j: float(j.get("finished_at") or 0)))
+             if it is not None]
+    page = items[:lim]
+    return {"contract": INSIGHT_CONTRACT, "items": page,
+            "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}

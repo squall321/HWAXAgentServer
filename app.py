@@ -9374,6 +9374,48 @@ def _seat_questions_health() -> dict:
         return {"collect": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
+# ── 과제 인사이트(HWAXPortal docs/project-insight-graph M2 · contracts §3) ─────────────────────────────────────────────────
+# GET /insights/cards — 끝난 MCP 잡의 카드 거리(delib_jobs.insight_items). 공유 비밀은 /seat-questions 와 같다 — 결정문 요약 · 근거 인자를 낸다.
+@app.get("/insights/cards")
+def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
+    import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if not (since >= 0.0) or limit < 1:
+        return JSONResponse({"error": "since 는 0 이상의 epoch 초, limit 은 1 이상이다"}, status_code=422)
+    return delib_jobs.insight_items(since, limit)
+
+
+class SubjectConfirmRequest(BaseModel):
+    """포털이 주제를 다시 풀 때(워크플로 대화 들이기 · 기다림 줄의 주제 확인) — 그 사람의 PAT 가 반드시 있다(PLAN §4.3 · contracts §3.2)."""
+    subject: dict | None = None
+    groups: list[str] = []
+    user_email: str = ""
+    user_pat: str = ""
+    chair_template: str | None = None
+    started_by: str | None = None
+
+
+# POST /deliberate/subject/confirm — 확인 규칙은 delib_subject.confirm 하나다(PG-19 — 확인하는 쪽은 에이전트 서버 하나). /chat 과 같은 루프백 신뢰에
+# 사람 PAT 를 요구한다 — 공유 비밀 + 신원 머리로 남의 이름을 풀지 않는다. 새 LLM 호출은 없다.
+@app.post("/deliberate/subject/confirm")
+async def deliberate_subject_confirm(body: SubjectConfirmRequest):
+    import delib_subject as _subject  # noqa: PLC0415
+    if not body.user_pat.strip():
+        return JSONResponse({"code": "bad_request", "message": "user_pat(그 사람의 PAT)이 있어야 주제를 다시 푼다"}, status_code=422)
+    if _subject.risk_family(body.chair_template, body.started_by):
+        return JSONResponse({"code": "risk_family", "message": "리스크 심사는 주제를 달지 않는다 — 리스크 심사의 주제는 리스크 앱 과제다"},
+                            status_code=422)
+    try:
+        parsed = _subject.parse(body.subject)
+    except _subject.SubjectError as exc:
+        return JSONResponse({"code": "bad_request", "message": str(exc)[:300]}, status_code=422)
+    if parsed is None:
+        return {"subject": None}
+    return {"subject": await _subject.confirm(app, parsed, groups=list(body.groups), user=body.user_email, user_pat=body.user_pat)}
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.
