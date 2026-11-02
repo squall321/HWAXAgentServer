@@ -28,7 +28,7 @@ import deliberation as D  # noqa: E402
 import delib_jobs  # noqa: E402
 import report_figures as RF  # noqa: E402
 from test_delib_silent_drops import _pin_context  # noqa: E402, F401 — 모델 창 고정(자동 픽스처)
-from test_ha09_s1_resume import OPTS, _result, _settle_all, _start_job, world  # noqa: E402, F401 — world 는 픽스처
+from test_ha09_s1_resume import _TOOL_NAMES, OPTS, _FTool, _result, _settle_all, _start_job, world  # noqa: E402, F401 — world 는 픽스처
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 300
 PNG2 = b"\x89PNG\r\n\x1a\n" + b"\x01" * 300
@@ -244,10 +244,10 @@ def _with_figure(w, monkeypatch, name: str):
     monkeypatch.setattr(D, "_llm_text", llm_text)
 
 
-def _run_job(w, **kw) -> tuple[dict, dict]:
+def _run_job(w, opts=None, **kw) -> tuple[dict, dict]:
     """잡으로 끝까지 — (결과, 잡 결과 보기 delib_jobs.summary(full)). 원장은 outcome 사건의 figures 를 report_figures 로 접는다."""
     async def go():
-        job = _start_job(OPTS, **kw)
+        job = _start_job(opts or OPTS, **kw)
         await _settle_all()
         return job
     job = asyncio.run(go())
@@ -308,4 +308,30 @@ def test_심의_중_도구가_낸_그림은_본문에_주소가_없어도_보고
     assert [b["id"] for b in args["extra_blocks"]] == [f"fig_{hashlib.sha256(PNG2).hexdigest()[:16]}"]
     assert args["extra_blocks"][0]["content"]["files"][0]["caption"].endswith("· search_parts")
     assert view["report_figures"]["attached"] == 1 and portal.got[0]["auth"] == "Bearer pat-kim"
+
+
+def test_이어붙이는_심의도_새_쪽에_그림_칸을_싣는다(world, figs, monkeypatch):
+    """이어하기 회차는 update_report_draft 로 그 보고서의 새 쪽에 붙는다 — 그 호출에도 그림 칸이 실린다."""
+    portal, _d = figs
+    real = world.answer
+
+    def answer(name, args):
+        if name == "update_report_draft":
+            world.reports.append(copy.deepcopy(args))
+            return json.dumps({"report": {"id": args["report_id"]}, "warnings": [], "url": f"/w/team/reports/{args['report_id']}"})
+        if name == "get_report":
+            return json.dumps({"report": {"id": args["report_id"], "pages": [{"page": 1}]}})
+        return real(name, args)
+
+    async def tools(*_a, **_k):
+        return {n: _FTool(world, n) for n in _TOOL_NAMES + ("get_report", "update_report_draft")}
+    monkeypatch.setattr(world, "answer", answer)
+    monkeypatch.setattr(D, "_tools_by_name", tools)
+    _with_figure(world, monkeypatch, _name(PNG, "png"))
+    res, view = _run_job(world, opts={**OPTS, "append_to_report_id": 41}, user_pat="pat-kim")
+    (args,) = res["reports"]
+    assert args["report_id"] == 41 and args["page"] == 2
+    assert args["extra_blocks"][0]["content"]["files"][0]["file_id"] == "f1"
+    assert "[그림 1 — 응력]" in json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
+    assert view["report_id"] == 41 and view["report_figures"]["attached"] == 1
 
