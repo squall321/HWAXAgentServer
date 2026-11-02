@@ -1287,10 +1287,12 @@ def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: b
     for r in rows:
         k = (r.get("subject") or {}).get("round") or delib_subject.ROUND_UNKNOWN
         rounds[k] = rounds.get(k, 0) + 1
+    # 창은 몇 개를 훑었는지가 아니라 원장을 다 봤는지만 말한다 — 훑은 수는 이 박스의 원장 규모를 내보인다(반대 검토 11-02)
+    window, total = info.get("window", delib_jobs.LIST_SCAN_MAX), info.get("total")
     out = {"subject": filt, "jobs": rows, "count": len(rows), "rounds": rounds,
-           "window": {"scanned": info.get("scanned", 0), "max": info.get("window", delib_jobs.LIST_SCAN_MAX),
-                      "note": f"최근 원장 {info.get('window', delib_jobs.LIST_SCAN_MAX)}개 창 안에서만 찾았다 — 그보다 오래된 심의는 이 목록에 "
-                              "없다. 확인된 주제(sp_state=confirmed)만 맞대고, 차수를 모르는 심의는 'unknown' 칸에만 있다(어느 차수에도 섞지 "
+           "window": {"max": window, "complete": isinstance(total, int) and info.get("scanned", 0) >= total,
+                      "note": f"최근 원장 {window}개 창 안에서만 찾았다(complete 가 거짓이면 그보다 오래된 원장은 보지 않았다 — 그 심의는 이 목록에 "
+                              "없다). 확인된 주제(sp_state=confirmed)만 맞대고, 차수를 모르는 심의는 'unknown' 칸에만 있다(어느 차수에도 섞지 "
                               "않는다). 웹 심의는 포털 대화에 남는다(주인만 본다)."}}
     return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject}, ids=("subject", "count", "rounds"))
 

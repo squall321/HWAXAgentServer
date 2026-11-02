@@ -2223,18 +2223,20 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
     볼 수 없는 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다.
 
     where(잡 → 참거짓)를 주면 볼 수 있는 잡 가운데 그것이 참인 잡만 싣는다 — 주제로 거르는 목록(delib_subject.matches)이 쓴다. 거름은 목록 색인의
-    칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned)와 훑는 창(window — 최근 몇 개를 보나)을 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
+    칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned) · 훑는 창(window — 최근 몇 개를 보나) · 원장 파일 수(total — 원장 폴더를 다 읽지
+    못했으면 None)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
         return can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
     seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
     window = max(limit * 3, LIST_SCAN_MAX)
-    scanned = 0
+    scanned = total = 0
     try:
         kept = 0
-        for f in sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
-                        reverse=True)[:window]:
+        files = sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        total = len(files)
+        for f in files[:window]:
             if kept >= limit * 3:
                 break
             scanned += 1
@@ -2245,8 +2247,8 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
             if j["id"] not in seen:
                 seen[j["id"]] = j
     except OSError:
-        pass
+        total = None        # 원장 폴더를 다 읽지 못했다(훑는 사이 지워진 파일 등) — 다 봤다고 말하지 않는다
     if info is not None:
-        info.update(scanned=scanned, window=window)
+        info.update(scanned=scanned, window=window, total=total)
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]

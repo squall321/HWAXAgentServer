@@ -298,7 +298,8 @@ def test_주제로_거르는_목록은_볼_수_있는_확인된_주제만_과제
         r, qs = await got({"sp_task": KEY})
         assert qs == {"내 dv1", "내 dv2", "내 차수 모름", "동료 dv1"}, qs
         assert r["rounds"] == {"dv1": 2, "dv2": 1, s.ROUND_UNKNOWN: 1} and r["count"] == 4
-        assert r["window"]["max"] == delib_jobs.LIST_SCAN_MAX and r["window"]["scanned"] == 8 and "300" in r["window"]["note"]
+        assert r["window"]["max"] == delib_jobs.LIST_SCAN_MAX and r["window"]["complete"] is True and "300" in r["window"]["note"]
+        assert "scanned" not in r["window"], "훑은 수는 내지 않는다 — 이 박스의 원장 규모를 내보인다(반대 검토 11-02)"
         assert all(row["subject"]["sp_task"] == KEY for row in r["jobs"])
         mine = {row["question"]: row["mine"] for row in r["jobs"]}
         assert mine["동료 dv1"] is False and mine["내 dv1"] is True
@@ -313,6 +314,30 @@ def test_주제로_거르는_목록은_볼_수_있는_확인된_주제만_과제
             {"내 dv1", "내 dv2", "내 차수 모름", "동료 dv1", "다른 소속 dv1"}, "관리자는 전부"
         plain = await m.deliberate_list(ctx=_ctx(ME, "CAEG"))
         assert len(plain["jobs"]) == 7 and "window" not in plain, "주제 없이 부르면 종전 목록 그대로"
+    _play(scenario)
+
+
+def test_창을_넘긴_원장이_있으면_다_봤다고_말하지_않는다(eng, monkeypatch, hub):
+    _caps(monkeypatch, 20)
+
+    async def scenario():
+        for i in range(4):
+            out = await m.deliberate_start(f"심의 {i}", subject={"sp_task": KEY, "round": "dv1"}, ctx=_ctx(ME, "CAEG"))
+            await _end(eng, delib_jobs.get(out["job_id"]))
+        monkeypatch.setattr(delib_jobs, "_JOBS", {})
+        monkeypatch.setattr(delib_jobs, "LIST_SCAN_MAX", 3)
+        r = await m.deliberate_list(limit=1, subject={"sp_task": KEY}, ctx=_ctx(ME, "CAEG"))
+        assert r["window"]["max"] == 3 and r["window"]["complete"] is False and r["count"] == 1
+        monkeypatch.setattr(delib_jobs, "LIST_SCAN_MAX", 300)
+        assert (await m.deliberate_list(limit=1, subject={"sp_task": KEY}, ctx=_ctx(ME, "CAEG")))["window"]["complete"] is False, \
+            "한 행만 청해 일찍 멈춘 훑기도 다 본 것이 아니다"
+        assert (await m.deliberate_list(limit=20, subject={"sp_task": KEY}, ctx=_ctx(ME, "CAEG")))["window"]["complete"] is True
+
+        def broken(*_a, **_k):
+            raise FileNotFoundError("훑는 사이 지워진 원장")
+        monkeypatch.setattr(delib_jobs.JOB_DIR.__class__, "glob", broken)
+        assert (await m.deliberate_list(subject={"sp_task": KEY}, ctx=_ctx(ME, "CAEG")))["window"]["complete"] is False, \
+            "원장 폴더를 다 읽지 못했으면 다 봤다고 말하지 않는다"
     _play(scenario)
 
 
