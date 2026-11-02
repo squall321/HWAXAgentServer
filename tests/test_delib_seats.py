@@ -355,7 +355,7 @@ def _eval_gate(code, name, *, chair, apps=(), amap=None):
         "_MATERIAL_TOOLS": d._MATERIAL_TOOLS, "_RISK_READ_TOOLS": d._RISK_READ_TOOLS,
         "_RISK_KEEP_TOOLS": d._RISK_KEEP_TOOLS, "_amap": amap or {}, "_apps": set(apps),
         "_risk_chair": chair == "risk-review",
-        "_RISK_RA_REPORT_TOOLS": d._RISK_RA_REPORT_TOOLS,
+        "_RISK_RA_REPORT_TOOLS": d._RISK_RA_REPORT_TOOLS, "_INSIGHT_TOOL_HEAD": d._INSIGHT_TOOL_HEAD,
     }
     return bool(eval(code, ns))  # noqa: S307 — 소스에서 뽑은 우리 코드다
 

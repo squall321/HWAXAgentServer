@@ -1013,6 +1013,10 @@ _RA_APP_HEAD = "reportarchive_"
 # 도구로만 닿으므로 거기서 닫는다. 심의 메뉴(deliberate_jobs)는 잡 기록이 아니라 남긴다.
 _DELIB_APP_HEAD = "hwaxdeliberation_"
 _RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_result", "deliberate_transcript")
+# 과제 인사이트 도구(게이트웨이 insight_find · insight_get — HWAXPortal docs/project-insight-graph M2)의 이름 머리. 같은 과제의 앞선 심의 결론을
+# 내주므로 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 11-02 'D-18 범위 그대로 · 새 길을 열지 않는다' — 지정 도구 · 자유 조회 ·
+# CALL 줄). 이름을 insight_ 로 시작해 자유 조회 접두(_FREE_ALLOW)에 걸리지 않게 했고, 리스크 심사에서는 접두와 상관없이 이 머리로 한 번 더 뺀다.
+_INSIGHT_TOOL_HEAD = "insight_"
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1022,6 +1026,7 @@ _RISK_DESIGNATED_REFUSE = {
     "proxy": ("범용 실행기는 부를 도구를 호출할 때 정해 이 거절을 비켜 간다(목록에 없는 호출 별칭 "
               f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
     "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
+    "insight": "리스크 심사 좌석은 과제 인사이트(같은 과제의 앞선 심의 결론)를 보지 않는다",
 }
 
 
@@ -1036,10 +1041,13 @@ def _risk_designated_refusal(name: str) -> str:
     rest_call 의 사이트에는 리스크 앱 · RA 가 없다), 심의 엔진의 잡 기록 읽기(_RISK_DELIB_READ_TOOLS). 이름은 게이트웨이가 싣는 꼴
     그대로 본다 — 맨 이름과 겹침 접두 꼴(heaxhwax_risk_<도구> · reportarchive_<도구> · hwaxdeliberation_<도구>). 맨 이름 risk_* 는
     다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱 매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 —
-    틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다."""
+    틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다. 과제 인사이트 도구(insight_*)도 닫는다
+    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD)."""
     n = str(name or "").strip()
     if n == "invoke_tool":
         return "proxy"
+    if n.startswith(_INSIGHT_TOOL_HEAD):
+        return "insight"
     if n.removeprefix(_DELIB_APP_HEAD) in _RISK_DELIB_READ_TOOLS:
         return "delib"
     if n.startswith(_RISK_APP_HEAD):
@@ -2437,6 +2445,9 @@ async def _call(tools: dict, name: str, args: dict):
     t = tools.get(name)
     if t is None:
         return None
+    _log = _SNAP_CALLS.get()          # 단 준비의 현황 조회 중이면 부른 이름을 적는다(_snap_with_tools — 과제 인사이트 카드의 근거 도구)
+    if _log is not None:
+        _log.append(name)
     try:
         out = await t.ainvoke(args)
         if isinstance(out, tuple):
@@ -3998,6 +4009,205 @@ def _wiki_off_back(off) -> None:
     st = _WIKI_STATE.get()
     if off is True and st is not None:
         st["off"] = True
+
+
+# ── 과제 인사이트의 카드 거리(HWAXPortal docs/project-insight-graph M2 · contracts §1) ──────────────────────────────────────
+# 단마다 결정 카드 하나를 **코드가** 짓는다(사용자 결정 11-02 PLAN §11-4 — 새 LLM 호출 0). 주장은 엔진이 이미 지은 '■ 핵심 요약' 불릿, 없으면 '■ 쉬운
+# 설명' 의 '### 한마디로' 줄이다 — 결정문 머리는 쓰지 않는다(코드가 찍는 표지가 맨 위에 온다). 카드 거리에는 주제가 없다 — 엔진은 주제를 모르고
+# (PG-21) 무장 표지(INSIGHT_ARM) 하나만 본다. 주제 · 주인 · 들인 길은 카드를 쥐는 쪽(잡 원장 · 포털 중계)이 붙인다.
+# 무장은 주제가 확인(confirmed) · 주장(claimed)이고 리스크 심사 계열이 아닐 때만이다 — MCP 잡은 delib_jobs._make_spawn 이 그 잡 태스크의 문맥에,
+# 웹은 app._with_delib_images 가 엔진 앞에서 건다. 무장하지 않은 심의(주제 없음 · 리스크 심사)는 사건이 하나도 늘지 않는다.
+INSIGHT_ARM: contextvars.ContextVar = contextvars.ContextVar("insight_arm", default=False)
+# 같은 심의(잡 · 웹 요청) 안에서 앞 걸음이 뒤 단에 넘긴 근거 {tools, untracked} — 단 준비의 현황 조회 도구(시험 설계 · 해석 설계 2단)와 앞 단 카드의
+# 근거 도구 · 범위 모름 표지. 뒤 단은 앞 단의 결정문(continue_summary)과 현황 글(사람 의견 칸)에 기대므로 카드의 범위가 그것을 다 담아야 한다
+# (PLAN §6.2 최소 범위). 무장하는 쪽이 빈 것을 걸고 카드를 낼 때마다 쌓인다 — 걸지 않았으면(엔진만 도는 시험) 아무것도 잇지 않는다. 제자리 이어하기는
+# 단에 들 때의 재개 자료(e:stage_in) · 단 경계 체크포인트에 적은 값으로 되살린다.
+INSIGHT_CARRY: contextvars.ContextVar = contextvars.ContextVar("insight_carry", default=None)
+# 단 준비가 현황 조회를 하는 동안만 거는 기록 — _call 이 부른 도구 이름을 적는다(그 밖의 _call — 좌석 전환 · 보고서 쓰기 · 위키 — 는 적지 않는다).
+_SNAP_CALLS: contextvars.ContextVar = contextvars.ContextVar("snap_calls", default=None)
+# 범위를 모르는 입력(카드 untracked) — 차례가 곧 표시 차례다. evidence 도구 없는 근거 글 · note 사람 의견(보강 글) · summary 앞 회차 요약 · images 그림.
+_INSIGHT_UNTRACKED = ("evidence", "note", "summary", "images")
+_INSIGHT_CLAIM_MAX = 500          # 주장 상한 — 루틴 Finding.text 와 같다(포털 app/procedures/routines.py)
+_INSIGHT_CALLS_MAX = 60           # 근거 표지 수 상한 — 카드는 짧은 주장 · 표지 · 주제만 쥔다(원문은 RA 보고서 · 잡 원장에)
+_INSIGHT_SUMMARY_HEAD = "■ 핵심 요약\n"
+_INSIGHT_PLAIN_HEAD = "■ 쉬운 설명"
+_INSIGHT_PLAIN_ONE = "### 한마디로"
+# 근거로 세지 않는 이름 — 좌석 그림 판독(_seat_image_transcripts)은 도구가 아니라 판독 모델이 옮긴 글이다(그 그림을 낸 도구는 따로 실린다).
+_INSIGHT_NOT_TOOLS = ("vision_transcribe",)
+_BULLET_RE = re.compile(r"^\s*(?:[-*•·]|\d+[.)])\s+")
+
+
+def _insight_clip(text: str, cap: int = _INSIGHT_CLAIM_MAX) -> str:
+    """주장을 cap 자 안으로 — 넘치면 줄 경계에서 자르고(앞이 반은 남을 때) 표식 '…' 을 단다."""
+    t = (text or "").strip()
+    if len(t) <= cap:
+        return t
+    cut = t.rfind("\n", 0, cap - 1)
+    return (t[:cut] if cut >= cap // 2 else t[:cap - 1]).rstrip() + "…"
+
+
+def _insight_summary_of(decision: str) -> str:
+    """결정문에서 엔진이 지은 '■ 핵심 요약' 불릿 — 되살린 단(HA-09 S3)은 요약을 다시 부르지 않아 결정문에서 읽는다. 코드가 맨 위에 찍는 표지
+    문단(외부 응답자 · 봉인 · 기준일 — 한 문단씩)만 건너뛴다. 불릿 사이의 빈 줄은 다음 줄이 불릿일 때만 넘는다. 없으면 빈 글."""
+    d = decision or ""
+    i = 0
+    while d.startswith("■ ", i) and not d.startswith(_INSIGHT_SUMMARY_HEAD, i):
+        j = d.find("\n\n", i)
+        if j < 0:
+            return ""
+        i = j + 2
+    if not d.startswith(_INSIGHT_SUMMARY_HEAD, i):
+        return ""
+    lines = d[i + len(_INSIGHT_SUMMARY_HEAD):].split("\n")
+    out: list = []
+    for k, ln in enumerate(lines):
+        if ln.strip():
+            out.append(ln.strip())
+            continue
+        nxt = next((x for x in lines[k + 1:] if x.strip()), "")
+        if not out or not _BULLET_RE.match(nxt):
+            break
+    return "\n".join(out)
+
+
+def _insight_plain_one(text: str) -> str:
+    """쉬운 설명(또는 그것이 붙은 결정문)의 '### 한마디로' 아래 첫 줄 — 머리가 없으면 빈 글(다른 줄을 결론으로 짐작하지 않는다)."""
+    t = text or ""
+    k = t.rfind(_INSIGHT_PLAIN_HEAD)
+    if k >= 0:
+        t = t[k:]
+    j = t.find(_INSIGHT_PLAIN_ONE)
+    if j < 0:
+        return ""
+    for ln in t[j + len(_INSIGHT_PLAIN_ONE):].split("\n")[1:]:
+        s = ln.strip()
+        if s.startswith("#"):
+            return ""
+        if s:
+            return _BULLET_RE.sub("", s).strip("() ").strip()
+    return ""
+
+
+def _carry_add(tools=(), untracked=()) -> None:
+    """같은 심의의 잇기(INSIGHT_CARRY)에 근거 도구 · 범위 모름 표지를 더한다 — 걸려 있지 않으면 아무것도 하지 않는다."""
+    c = INSIGHT_CARRY.get()
+    if isinstance(c, dict):
+        c["tools"] = sorted({str(x) for x in (c.get("tools") or ())} | {str(x) for x in (tools or ()) if x})
+        have = set(c.get("untracked") or ()) | set(untracked or ())
+        c["untracked"] = [u for u in _INSIGHT_UNTRACKED if u in have]
+
+
+def _carry() -> dict:
+    """지금 잇기의 사본 {tools, untracked} — 재개 자료에 적는 꼴이다."""
+    c = INSIGHT_CARRY.get()
+    return ({"tools": list(c.get("tools") or ()), "untracked": list(c.get("untracked") or ())} if isinstance(c, dict)
+            else {"tools": [], "untracked": []})
+
+
+def _carry_back(saved) -> None:
+    """재개 자료에 적은 잇기를 되살린다(제자리 이어하기 · 단 경계 체크포인트) — 옛 자료(칸 없음)는 아무것도 하지 않는다."""
+    if isinstance(saved, dict):
+        _carry_add(tools=saved.get("tools") or (), untracked=saved.get("untracked") or ())
+
+
+async def _snap_with_tools(fn, *args) -> str:
+    """단 준비의 현황 조회(_asset_snapshot · _material_evidence_snapshot) — 그동안 _call 이 부른 도구 이름을 잇기에 더한다. 그 글은 사람 의견 칸에
+    붙어 좌석에 실리므로 그 도구가 그 단 카드의 근거 도구다(포털이 넓힐 때의 plat 토큰). 기록은 이 await 안에서만 걸린다(yield 를 넘지 않는다)."""
+    log: list = []
+    tok = _SNAP_CALLS.set(log)
+    try:
+        return await fn(*args)
+    finally:
+        _SNAP_CALLS.reset(tok)
+        _carry_add(tools=log)
+
+
+def insight_claim(decision: str, summary: str = "", plain: str = "") -> tuple[str, str]:
+    """(주장, 출처 summary · plain · "") — summary · plain 은 이번 실행이 지은 글이고, 비면(되살린 단 · 실패) 결정문에서 찾는다. 포털 워크플로 길이 같은
+    규칙을 쓴다(HWAXPortal app/insights/cards.py claim_of — 시험이 견준다)."""
+    s = (summary or "").strip() or _insight_summary_of(decision)
+    if s:
+        return _insight_clip(s), "summary"
+    p = _insight_plain_one(plain) if (plain or "").strip() else _insight_plain_one(decision)
+    if p:
+        return _insight_clip(p), "plain"
+    return "", ""
+
+
+def _insight_calls(pool: list, evidence: list, designated: list) -> list:
+    """근거 표지 [{ref, tool, args, sha256, ok}] — 좌석 자유 조회(pool — (라운드, 좌석, 도구, 인자, 결과)) · 호출자 근거(evidence 의 tool 이 있는 항목) ·
+    지정 도구(designated — (도구, 인자, 결과)). 같은 (도구, 인자, 결과)는 하나다. 인자는 엔진의 인자 표기 상한(_EVID_ARGS_MAX)까지, sha256 은
+    엔진이 쥔 결과 글의 지문이다 — 지정 도구 · 호출자 근거는 받은 글, 좌석 자유 조회는 공용 풀에 실린 몫(좁은 창에서는 앞부분 — 다른 좌석이 본
+    것과 같은 글)이라 원문 전체의 지문이 아닐 수 있다(앞부분이 같은 두 결과는 표지 하나로 접힌다). ref 는 call:<도구 · 인자 · 결과 지문의 sha256 앞
+    16자>. 상한(_INSIGHT_CALLS_MAX)을 넘으면 앞에서부터다."""
+    out: list = []
+    seen: set = set()
+
+    def add(tool, args, result) -> None:
+        name = str(tool or "").strip()
+        if not name or name in _INSIGHT_NOT_TOOLS or len(out) >= _INSIGHT_CALLS_MAX:
+            return
+        a = args if isinstance(args, str) else json.dumps(args if args is not None else {}, ensure_ascii=False, default=str, sort_keys=True)
+        a = a[:_EVID_ARGS_MAX]
+        body = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        rs = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if (name, a, rs) in seen:
+            return
+        seen.add((name, a, rs))
+        fp = hashlib.sha256(f"{name}\n{a}\n{rs}".encode("utf-8")).hexdigest()[:16]
+        out.append({"ref": f"call:{fp}", "tool": name, "args": a, "sha256": rs, "ok": bool(_delib_tool_result_ok(body))})
+
+    for x in pool or ():
+        if isinstance(x, (list, tuple)) and len(x) >= 5:
+            add(x[2], x[3], x[4])
+    for e in evidence or ():
+        if isinstance(e, dict) and e.get("tool"):
+            bodies = _ev_bodies(e)
+            add(e.get("tool"), e.get("args"), bodies[0][1] if bodies else "")
+    for x in designated or ():
+        add(*x)
+    return out
+
+
+def insight_card(*, stage: str, decision: str, summary: str, plain: str, tally: dict, rid, rurl, model: str, pool: list,
+                 evidence: list, designated: list, pre_tools: list, amap: dict, human_note: str = "", continue_summary: str = "",
+                 images: bool = False, pre_calls=(), untracked_in=()) -> dict:
+    """단 하나의 카드 거리(contracts §1) — 칸은 늘 같다(모르면 빈 값). amap 은 {도구: 게이트웨이 백엔드 키}(/tools-map)이다 — 근거 도구의 앱을 몰라
+    거름이 빈 채면 apps_unknown 에 그 이름이 남는다(포털이 넓히기를 멈추는 까닭이다). untracked 는 근거 표지가 없어 범위를 모르는 입력이다 — 도구 없는
+    근거 글(evidence) · 사람 의견(human_note — 챗이 넘긴 보강 글일 수 있다) · 앞 회차 요약(continue_summary) · 그림(images), 그리고 같은 심의의
+    앞 걸음이 넘긴 것(untracked_in). pre_calls 는 제자리 이어하기가 재개 자료에서 되살린 지정 도구 표지다(이번 실행에 같은 것이 있으면 하나)."""
+    claim, claim_from = insight_claim(decision, summary, plain)
+    calls = _insight_calls(pool, evidence, designated)
+    have = {c["ref"] for c in calls}
+    for c in pre_calls or ():
+        if isinstance(c, dict) and c.get("ref") and c.get("tool") and c["ref"] not in have and len(calls) < _INSIGHT_CALLS_MAX:
+            calls.append({k: c.get(k) for k in ("ref", "tool", "args", "sha256", "ok")})
+            have.add(c["ref"])
+    flags = set(untracked_in or ())
+    if any(isinstance(e, dict) and not e.get("tool") and (e.get("result") or e.get("source")) for e in evidence or ()):
+        flags.add("evidence")
+    if str(human_note or "").strip():
+        flags.add("note")
+    if str(continue_summary or "").strip():
+        flags.add("summary")
+    if images:
+        flags.add("images")
+    tools = sorted({c["tool"] for c in calls}
+                   | {str(t).strip() for t in (pre_tools or ()) if str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
+    apps = sorted({amap[t] for t in tools if amap.get(t)})
+    for c in calls:
+        c["app"] = amap.get(c["tool"]) or None
+    return {"stage": stage or "default", "claim": claim, "claim_from": claim_from,
+            "tally": {k: int((tally or {}).get(k) or 0) for k in ("agree", "conditional", "oppose", "abstain")},
+            "report_id": rid, "report_url": rurl or None, "model": model or "", "calls": calls, "tools": tools, "apps": apps,
+            "apps_unknown": [t for t in tools if not amap.get(t)], "untracked": [u for u in _INSIGHT_UNTRACKED if u in flags],
+            "refs": ([f"rpt:{rid}"] if rid is not None else []) + [c["ref"] for c in calls]}
+
+
+def _insight_pre_tools(pre: list, designated: list, knowledge: dict) -> list:
+    """라운드 전 단계의 근거 도구 — VOC · 선주입(pre — 좌석에 실린 것만), 지정 도구(결과를 실은 것), 지식카드(실린 좌석이 있으면 agent_search)."""
+    return sorted({str(t) for t in pre or () if t} | {str(x[0]) for x in designated or ()}
+                  | ({"agent_search"} if knowledge else set()))
 
 
 def _tool_text_ok(s) -> bool:
@@ -5583,6 +5793,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             # ── 1단 — 끊기기 전에 끝났다(2단 안에서 끊겼다 — 체크포인트와 같은 값) ─────────
             decision_a, nn_a = str(_in2["decision_a"]), [str(x) for x in _in2["nn_a"]]
             personas_a = [dict(x) for x in _in2["personas_a"] if isinstance(x, dict)]
+            _carry_back(_in2.get("carry"))        # 1단 카드 · 현황 조회의 근거(과제 인사이트 — 2단 카드가 이어받는다)
             yield _sse("status", {"step": "1단(메커니즘)은 끊기기 전에 끝났다 — 그 결정문 · 2단 좌석 · 사내 자산 현황을 되살려 2단(해석 설계) "
                                           "안에서 잇는다(다시 부르지 않는다)", "tool": None})
         elif ckpt:
@@ -5590,6 +5801,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             decision_a = str(ckpt["decision_a"])
             personas_a = [x for x in (ckpt.get("personas_a") or []) if isinstance(x, dict) and x.get("key")]
             nn_a = [str(x) for x in (ckpt.get("nn_a") or [])]
+            _carry_back(ckpt.get("carry"))        # 앞 잡의 1단(과 2단) 카드 근거 — 이어받은 결정문이 기댄 것
             yield _sse("status", {"step": "1단(메커니즘)은 끊기기 전에 끝났다 — 그 결정문을 이어받아 건너뛴다(체크포인트)", "tool": None})
         else:
             # ── 1단 — 메커니즘 심의 ──────────────────────────────────────────────
@@ -5604,7 +5816,8 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             nn_a = out_a.get("non_negotiables") or []
             if decision_a:
                 yield _delib("checkpoint", stage="sim-1", decision_a=decision_a, nn_a=list(nn_a),
-                             personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)])
+                             personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
+                             carry=_carry())
         if not decision_a:
             # 의장이 결정문을 못 내 1단이 error 로 끝났으면 그 사유와 설정 이름을 이 오류에도 싣는다 — 잡 원장은
             # 마지막 오류만 남기므로, 안 실으면 '왜' 가 이 줄에 덮인다.
@@ -5674,6 +5887,8 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
         opts_b.human_note = ("사내 보유 도구를 우선 검토하라. 파라미터 식별성 판정과 "
                              "이 해석이 답할 수 없는 것을 비워두지 마라.")
         opts_b.rescreen_note = ""   # 이 단의 의견 칸은 엔진 지시문이다 — 재심사는 그것으로 축을 짓지 않고 종전 한 덩이 질의다(_rescreen_blob)
+        # 과제 인사이트 — 이 단의 의견 칸 · 앞 회차 요약은 엔진이 채운 것이다(지시문 · 현황 글 · 1단 결정문). 범위는 잇기(1단 카드 · 현황 도구)로 간다.
+        opts_b.insight_caller_note, opts_b.insight_carried = "", True
         # 보유 현황을 실제로 조회해 2단 근거로 깐다. 지시만으로는 모델이 아는 범위에서 답해
         # 실제 보유 목록과 어긋난다 — 계획서가 없는 도구를 쓰자고 하거나, 있는 물성을 새로
         # 측정하자고 한다. 조회 실패는 비치명이며 '조회하지 못함'으로 명시된다.
@@ -5684,7 +5899,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             try:
                 yield _sse("status", {"step": "사내 물성·도구 보유 현황 조회", "tool": None})
                 _tools_b = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-                _snap_add = "\n\n" + await _asset_snapshot(_tools_b, question)
+                _snap_add = "\n\n" + await _snap_with_tools(_asset_snapshot, _tools_b, question)
             except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
                 print(f"[sim-deliberation] asset snapshot failed: {exc!r}")
             opts_b.human_note += _snap_add
@@ -5693,7 +5908,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             # 꺼짐을 알렸나(되살릴 때 2단이 그 안내를 또 붙이지 않게).
             delib_resume.write(delib_resume.SIM2, "e:stage_in", sync=True, decision_a=decision_a, nn_a=list(nn_a),
                                personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
-                               seats=sim_seats, note=_snap_add, wiki_off=_wiki_off())
+                               seats=sim_seats, note=_snap_add, wiki_off=_wiki_off(), carry=_carry())
         sim_q = f"위 메커니즘을 계산으로 확인하고 설계 인자로 돌리기 위한 해석 설계 — 무엇을 어떤 도구로 계산할 것인가. 원 현상: {question}"
         async for chunk in _deliberation_stream(app, sim_q, groups, opts_b, user, user_pat,
                                                 history, out=out_b, sk=delib_resume.SIM2):
@@ -5702,7 +5917,8 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
         if opts.build_plan and decision_b:
             yield _delib("checkpoint", stage="sim-2", decision_a=decision_a, nn_a=list(nn_a), decision_b=decision_b,
                          personas_a=[{"key": x.get("key"), "role": x.get("role", "")} for x in personas_a if isinstance(x, dict)],
-                         sim_seats=[{"key": x.get("key"), "role": x.get("role", ""), "origin": x.get("origin")} for x in sim_seats])
+                         sim_seats=[{"key": x.get("key"), "role": x.get("role", ""), "origin": x.get("origin")} for x in sim_seats],
+                         carry=_carry())
         async for chunk in _sim_stage3(app, question, groups, req_opts, opts, user, user_pat, history, decision_b, sim_seats):
             yield chunk
     except Exception as exc:  # noqa: BLE001
@@ -5740,6 +5956,9 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
     opts_c.human_note = ("사내 자산(KooD3plotReader·StepForge·gmsh·oss-*·export_dyna_cards)을 우선 "
                          "재사용하라. 최소입력 계약·모델 IR 수렴·dry_run 게이트·페이즈별 수치 게이트를 비워두지 마라.")
     opts_c.rescreen_note = ""   # 엔진 지시문이다 — 재심사는 그것으로 축을 짓지 않는다(2단과 같다)
+    opts_c.insight_caller_note, opts_c.insight_carried = "", True   # 과제 인사이트 — 2단과 같다(범위는 1 · 2단 카드의 잇기로)
+    if _in3 is not None:
+        _carry_back(_in3.get("carry"))            # 3단 안에서 이을 때 — 1 · 2단 카드의 근거
     build_q = (f"위 해석 계획을 그 문제에 특화된 반복 실행형 파라메트릭 시뮬 모듈로 구축하는 계획 — "
                f"무엇을 어떤 사내 자산으로 자동 모델링하고 어떤 변수로 스윕할 것인가. 원 현상: {question}")
     if _in3 is None:
@@ -5747,7 +5966,7 @@ async def _sim_stage3(app, question: str, groups: list, req_opts, opts, user: st
         # 2단 줄과 같다(1 · 2단이 위키 꺼짐을 알렸나).
         delib_resume.write(delib_resume.SIM3, "e:stage_in", sync=True, decision_b=decision_b,
                            seats=[{"key": s["key"], "role": s.get("role", ""), "origin": s.get("origin")} for s in sim_seats],
-                           wiki_off=_wiki_off())
+                           wiki_off=_wiki_off(), carry=_carry())
     async for chunk in _deliberation_stream(app, build_q, groups, opts_c, user, user_pat, history, sk=delib_resume.SIM3):
         yield chunk
 
@@ -5906,6 +6125,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     # 밀려난다(좌석 재심사는 이 의견을 rescreen_note 로 따로 받는다).
     if _caller_note:
         opts.human_note += "\n\n[호출자가 넣은 사람 의견]\n" + _caller_note
+    opts.insight_caller_note = _caller_note or ""   # 과제 인사이트의 '사람 의견' 표지는 호출자가 쓴 몫만(현황 도구는 잇기로 — _snap_with_tools)
     # 단 안에서 잇기(HA-09 S4) — 제자리 이어하기면 끊기기 전에 붙인 물성 근거 현황 글(e:stage_in)을 그대로 붙이고 다시 조회하지 않는다. 심의 안은
     # 단 열쇠(tp)의 재개 상태로 되살린다. 없으면 아래는 지금 길 그대로다.
     _in = delib_resume.stage_in(delib_resume.TP)
@@ -5913,18 +6133,19 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
         if _in is not None:
             yield _sse("status", {"step": "물성 근거 현황은 끊기기 전의 것을 되살렸다 — 다시 조회하지 않는다", "tool": None})
             opts.human_note += _in["note"]
+            _carry_back(_in.get("carry"))         # 그 현황 글을 지은 도구(과제 인사이트 카드의 근거 도구)
         else:
             # 물성 근거 현황을 실제로 조회해 깐다. 이것이 없으면 계획서가 '있으면 좋은 것 목록'이 된다.
             _snap_add = ""          # 사람 의견에 붙인 글 — 시험 설계에 들 때의 재개 자료(e:stage_in)에 그대로 적는다
             try:
                 yield _sse("status", {"step": "물성 근거 현황 조회 — 무엇이 없는지 확인", "tool": None})
                 _tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
-                _snap_add = "\n\n" + await _material_evidence_snapshot(_tools, question)
+                _snap_add = "\n\n" + await _snap_with_tools(_material_evidence_snapshot, _tools, question)
             except Exception as exc:  # noqa: BLE001 — 스냅샷 실패가 심의를 막지 않는다
                 print(f"[test-plan] snapshot failed: {exc!r}")
             opts.human_note += _snap_add
             # 재개 자료(HA-09 S4 — e:stage_in) — 이 단에 들 때 붙인 현황 글. 심의 안에서 끊겨 이으면 다시 조회하지 않고 이 글을 붙인다.
-            delib_resume.write(delib_resume.TP, "e:stage_in", sync=True, note=_snap_add)
+            delib_resume.write(delib_resume.TP, "e:stage_in", sync=True, note=_snap_add, carry=_carry())
         q = (f"아래 목적을 위한 시험 계획 — 어떤 물성을 어떤 시험으로 언제 확보할 것인가. "
              f"목적: {question}")
         async for chunk in _deliberation_stream(app, q, groups, opts, user, user_pat, history, sk=delib_resume.TP):
@@ -6131,7 +6352,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 조립식이어야 한다 — 아래 _narrow 에만 넣으면 그 도구는 _g 에 애초에 없어 무효다.
             # _FREE_DENY 는 어느 경로보다 우선한다. 앱 지정도 risk-review 도 아니면 도구-앱
             # 매핑을 조회하지 않으므로 기존 심의의 동작·호출 수가 그대로다. 리스크 심사는 RA 보고서
-            # 읽기 도구(_RISK_RA_REPORT_TOOLS)를 apps 와 상관없이 뺀다(D-18 — 앞 패널 초안).
+            # 읽기 도구(_RISK_RA_REPORT_TOOLS)를 apps 와 상관없이 뺀다(D-18 — 앞 패널 초안). 과제 인사이트 도구
+            # (_INSIGHT_TOOL_HEAD)도 같다 — 접두 허용 · 유지 목록에 걸려도 뺀다. 외부 응답자의 CALL 줄은 이 후보 안에서만 실행된다.
             _risk_chair = opts.chair_template == "risk-review"
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
@@ -6141,7 +6363,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY
-                  and not (_risk_chair and n in _RISK_RA_REPORT_TOOLS) and (
+                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
@@ -6222,6 +6444,12 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                        "message": f"전문가 자유 조회를 준비하지 못했습니다({type(exc).__name__}) — "
                                                   "좌석이 도구 없이 논의합니다."})
 
+    # 과제 인사이트의 카드 거리(contracts §1) — 라운드 전 단계에서 좌석에 실린 근거의 도구(VOC 환기 · 정량 근거 선주입 · 지정 도구 · 지식카드)와 지정
+    # 도구 호출(도구, 인자, 결과). 되살릴 때(_pre)는 그 단계를 다시 돌지 않아 재개 자료(e:pre 의 ins_tools)에서 도구 이름만 되살린다.
+    _ins_pre: list = list(_pre.get("ins_tools") or []) if _pre is not None else []
+    _ins_des: list = []
+    # 되살릴 때는 지정 도구를 다시 부르지 않는다 — 그 표지(카드 calls)를 재개 자료(e:pre 의 ins_calls)에서 되살린다. 옛 일지는 빈 목록이다.
+    _ins_calls_pre: list = list(_pre.get("ins_calls") or []) if _pre is not None else []
     # 0) 불량 화두면 SignalForge 최근 이슈 환기 — 연관되면 심의 컨텍스트에 포함(best-effort)
     stream_head = _pre["stream_head"] if _pre is not None else ""   # token 으로 먼저 흘린 앞부분(최종 result 전문에도 포함해 상태 일치 유지)
     sf_inject = _pre["sf_inject"] if _pre is not None else ""
@@ -6237,6 +6465,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _c
         if sf_used:  # 활동 패널용 — 환기에서 실제 호출된 SF 도구들
             yield _sse("status", {"step": "불량 환기 완료", "tool": None, "tools_used": sf_used})
+        if sf_inject:
+            _ins_pre.extend(sf_used)    # 좌석에 실린 VOC 의 도구만 근거로 센다
         if sf_display:
             stream_head = sf_display + "\n\n"
             ev_count["voc"] += 1
@@ -6256,6 +6486,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _c
         if ev_used:
             yield _sse("status", {"step": "정량 근거 수집 완료", "tool": None, "tools_used": ev_used})
+        if ev_inject:
+            _ins_pre.extend(ev_used)    # 좌석에 실린 선주입의 도구만 근거로 센다
         if ev_display:
             ev_count["prepass"] += 1
             yield _delib("evidence", source="지식·보고서 검색", text=ev_display[:1500],
@@ -6354,6 +6586,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _head = f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
                 _got.append((_head, _good))
                 _used.append(_tn)
+                _ins_des.append((_tn, _argd, _good))      # 과제 인사이트의 근거 표지(카드 거리 calls)
                 # 웹 리서치의 차단 · 빈 결과 — 좌석에는 '차단은 없음이 아니다' 는 경고째 그대로 가되 근거로 세지 않는다(_envelope_no_evidence).
                 # 상태 · 기록 도구의 결과도 같다(_web_meta_tool).
                 if _web_meta_tool(_tn):
@@ -6388,7 +6621,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
                                   (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
                                    "보지 않는다 — D-18. 리스크 앱에서는 변경 전체 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 "
-                                   "읽기 · 범용 실행기 · 심의 잡 기록 읽기는 닫는다)") if _tool_refused else "",
+                                   "읽기 · 범용 실행기 · 심의 잡 기록 읽기 · 과제 인사이트는 닫는다)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에
@@ -6918,7 +7151,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                            personas=personas, seat_note=seat_note, knowledge=knowledge_by_key, ev_count=ev_count,
                            sf_inject=sf_inject, stream_head=stream_head, ev_inject=ev_inject, tool_inject=tool_inject,
                            ao_des=_ao_des, ao_pre=_ao_pre, ids=sorted(_ids_seen), free=sorted(free_pool),
-                           base=delib_resume.digest(base), blind=delib_resume.digest(base_blind))
+                           base=delib_resume.digest(base), blind=delib_resume.digest(base_blind),
+                           # 과제 인사이트의 근거 도구(라운드 전 몫 — 카드 거리 tools)와 지정 도구 표지(calls). 없는 옛 일지는 빈 목록으로 읽는다.
+                           ins_tools=_insight_pre_tools(_ins_pre, _ins_des, knowledge_by_key),
+                           ins_calls=_insight_calls([], [], _ins_des))
 
     # 3) 다중 라운드 심의 — N 라운드(1 초기 + N-2 심화 + 1 수렴). N=3 이면 종전 R1/R2/R3 와 동일.
     #    발언은 완료되는 순서대로 delib turn 으로 라이브 방출한다.
@@ -8026,6 +8262,29 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                  tally=tally, unanimous=(tally["total"] > 0
                                          and tally["agree"] == tally["total"]
                                          and tally["abstain"] == 0), votes=votes)
+    # 과제 인사이트의 카드 거리(HWAXPortal docs/project-insight-graph M2 · contracts §1) — 무장한 심의(주제가 확인 · 주장이고 리스크 심사 계열이 아니다 —
+    # INSIGHT_ARM)에서 의장이 결정문을 냈을 때만, 단마다 하나. 새 LLM 호출이 없다 — 이미 지은 요약 · 쉬운 설명 · 집계 · 근거에서 코드가 짓는다. 근거
+    # 도구의 앱은 게이트웨이 /tools-map 이다(막는 호출이라 스레드에서). 못 지으면 결정문 · 결과는 그대로 간다.
+    # 범위를 모르는 입력 — 사람 의견은 호출자가 쓴 몫(단 준비가 엔진 지시문 · 현황 글로 채운 단은 insight_caller_note — 현황 도구는 잇기로 간다),
+    # 앞 회차 요약은 호출자가 준 것만(다단 심의가 앞 단 결정문을 넘긴 것은 insight_carried — 앞 단 카드의 근거가 잇기로 간다). 같은 심의의 앞 걸음이
+    # 넘긴 근거 도구 · 표지(INSIGHT_CARRY)를 이 카드에 담고, 이 카드의 것을 다시 잇기에 더한다(뒤 단이 이 단의 결정문에 기댄다).
+    if INSIGHT_ARM.get() and not _chair_failed:
+        try:
+            _ins_amap = await asyncio.to_thread(_app_of_tools)
+            _ins_note = getattr(opts, "insight_caller_note", None)
+            _ins_cy = _carry()
+            _ins_card = insight_card(
+                stage=opts.chair_template or "default", decision=decision, summary=_summary, plain=_plain, tally=tally, rid=rid,
+                rurl=rurl, model=("external" if _ext else str(getattr(llm, "model_name", None) or getattr(llm, "model", None) or "")),
+                pool=gather_pool, evidence=list(opts.evidence or []), designated=_ins_des,
+                pre_tools=_insight_pre_tools(_ins_pre, _ins_des, knowledge_by_key) + _ins_cy["tools"], amap=dict(_ins_amap or {}),
+                human_note=str(opts.human_note if _ins_note is None else _ins_note) or "",
+                continue_summary="" if getattr(opts, "insight_carried", False) else str(opts.continue_summary or ""),
+                images=bool(DELIB_IMAGES.get()), pre_calls=_ins_calls_pre, untracked_in=_ins_cy["untracked"])
+            _carry_add(tools=_ins_card["tools"], untracked=_ins_card["untracked"])
+            yield _delib("insight", **_ins_card)
+        except Exception as exc:  # noqa: BLE001 — 카드 거리는 덧붙이는 것이다 — 결정문 · 결과를 막지 않는다
+            print(f"[deliberation] 과제 인사이트 카드 거리를 짓지 못했다({opts.chair_template}): {exc!r}")
 
     # 프론트 SSE 계약(token{delta} → result{type,content})에 맞춰 방출 — 기존 token{content}+text 는
     # chat.api.ts 가 읽지 못한다(delta undefined). result 전문에는 앞서 흘린 환기(stream_head)도 포함.

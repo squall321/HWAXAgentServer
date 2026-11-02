@@ -1027,6 +1027,10 @@ async def deliberate_continue(
                            question or prev["question"], delib_opts=opts,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
                            owner_aff=_caller_view(ctx)[1], subject=subj)
+    # 앞 잡을 원장에도 적는다 — 과제 인사이트의 카드가 앞 카드를 continues 로 잇는다(HWAXPortal docs/project-insight-graph contracts §2). 종전엔
+    # 응답의 continued_from 에만 있었다. 끊긴 잡의 요약 이어하기(_resume)는 resumed_from 을 이미 적는다.
+    rec["continues"] = previous_job_id
+    delib_jobs._persist(rec)
     out = delib_jobs.summary(rec)
     out["continued_from"] = previous_job_id
     out["rounds_start_at"] = delib_jobs.rounds_end(prev) + 1

@@ -8390,14 +8390,15 @@ async def _delib_with_topic(req):
         yield chunk
 
 
-async def _delib_subject_frames(req):
+async def _delib_subject_frames(req, got: dict | None = None):
     """웹 심의의 주제(delib_opts.subject — HWAXPortal docs/project-insight-graph M1) — 엔진 바로 앞(_with_delib_images 첫머리 — 화두를 정한 뒤라
     심의가 실제로 돌 때만)에서 꼴을 보고 SP 과제 key 를 **그 사람의 자격으로** 다시 풀어(delib_subject.confirm — MCP deliberate_start 와 같은 함수 ·
     새 LLM 호출 없음) 확인한 주제를 delib 사건(kind=subject)과 상태 줄로 먼저 낸다. 포털 중계가 그 사건을 답 meta.subject 로 남긴다 — 브라우저가
     보낸 값은 남지 않는다(믿지 않는다). 주제가 없으면 아무것도 내지 않는다(종전 그대로). 꼴이 틀리면 달지 않고 그렇다고 상태 줄로 말한다 — 심의는
     연다(포털이 먼저 422 로 막는 꼴이라 여기까지 오는 것은 포털 밖의 호출이다). 리스크 심사 계열(의장 risk-review · 앱이 띄운 패널)은 주제를 달지
     않는다(PLAN §3.1). 어느 경우든 엔진에는 subject 를 넘기지 않는다 — 엔진이 결정문 · RA 보고서 · 위키 원천에 주제를 실을 길을 만들지 않는다
-    (PLAN §4.1 · PG-11). 종전엔 세 트리거의 바깥에서 감싸 화두를 못 정해 되묻고 끝나는 '/심의' 에도 풀이를 부르고 주제 사건을 냈다(반대 검토 11-02)."""
+    (PLAN §4.1 · PG-11). 종전엔 세 트리거의 바깥에서 감싸 화두를 못 정해 되묻고 끝나는 '/심의' 에도 풀이를 부르고 주제 사건을 냈다(반대 검토 11-02).
+    got(사전)을 주면 확인한 주제를 got["subject"] 에 둔다 — 과제 인사이트의 무장(_with_delib_images)이 읽는다(엔진에는 여전히 넘기지 않는다)."""
     o = req.delib_opts if isinstance(req.delib_opts, dict) else None
     if o is not None and "subject" in o:
         import delib_subject as _subject  # noqa: PLC0415 — 주제를 단 웹 심의에만
@@ -8415,6 +8416,8 @@ async def _delib_subject_frames(req):
                 if parsed["sp_task"]:
                     yield _sse("status", {"step": f"주제 — 과제 「{parsed['sp_task']}」 를 허브 거울 풀이로 확인하는 중", "tool": None})
                 rec = await _subject.confirm(app, parsed, groups=req.groups, user=req.user_email, user_pat=req.user_pat)
+                if got is not None:
+                    got["subject"] = rec
                 yield _sse("delib", {"kind": "subject", "subject": rec})
                 yield _sse("status", {"step": _subject.say(rec), "tool": None})
 
@@ -8438,9 +8441,17 @@ async def _with_delib_images(req, q: str, start):
           근거 목록에 남는다. 심의 LLM 이 그림을 받아도 싣는다 — 그림은 짚을 번호가 없다.
       (2) 그림 조각 — 심의 LLM(VLLM_*)이 그림을 받는다고 판정되면 최근 VISION_HISTORY_IMAGES 장을 좌석 · 의장 호출마다(DELIB_IMAGES).
     start(opts) 가 엔진 생성기를 만든다 — 근거를 덧붙인 opts 를 받아야 해서 미리 만들어 두지 않는다.
-    심의 주제(delib_opts.subject)는 그보다 먼저 확인해 사건으로 내고 엔진의 opts 에서 뺀다(_delib_subject_frames)."""
-    async for chunk in _delib_subject_frames(req):
+    심의 주제(delib_opts.subject)는 그보다 먼저 확인해 사건으로 내고 엔진의 opts 에서 뺀다(_delib_subject_frames). 확인 · 주장인 주제면 엔진 앞에서
+    과제 인사이트 무장 표지(deliberation.INSIGHT_ARM)를 건다 — 엔진이 단마다 카드 거리(delib kind=insight)를 내고 포털 중계가 원장에 들인다
+    (HWAXPortal docs/project-insight-graph contracts §1 · §5). 주제가 없거나 none · 리스크 심사 계열이면 걸지 않는다(종전 그대로)."""
+    got: dict = {}
+    async for chunk in _delib_subject_frames(req, got):
         yield chunk
+    _rec = got.get("subject")
+    arm = (_delib_engine.INSIGHT_ARM.set(True)
+           if isinstance(_rec, dict) and _rec.get("sp_state") in ("confirmed", "claimed") else None)
+    # 이 요청의 단 사이 잇기(다단 심의의 뒤 단 카드가 앞 단의 근거를 담는다 — deliberation.INSIGHT_CARRY)
+    carry = _delib_engine.INSIGHT_CARRY.set({"tools": [], "untracked": []}) if arm is not None else None
     imgs = _delib_image_list(req)
     tok = None
     if imgs:
@@ -8468,6 +8479,12 @@ async def _with_delib_images(req, q: str, start):
             try:
                 tok[0].reset(tok[1])
             except ValueError:   # 다른 문맥에서 닫혔다 — 그 문맥(심의 태스크)은 곧 끝난다
+                pass
+        if arm is not None:
+            try:
+                _delib_engine.INSIGHT_ARM.reset(arm)
+                _delib_engine.INSIGHT_CARRY.reset(carry)
+            except ValueError:   # 위와 같다
                 pass
 
 
@@ -9358,6 +9375,48 @@ def _seat_questions_health() -> dict:
         return _sq.health()
     except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
         return {"collect": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+# ── 과제 인사이트(HWAXPortal docs/project-insight-graph M2 · contracts §3) ─────────────────────────────────────────────────
+# GET /insights/cards — 끝난 MCP 잡의 카드 거리(delib_jobs.insight_items). 공유 비밀은 /seat-questions 와 같다 — 결정문 요약 · 근거 인자를 낸다.
+@app.get("/insights/cards")
+def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
+    import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if not (since >= 0.0) or limit < 1:
+        return JSONResponse({"error": "since 는 0 이상의 epoch 초, limit 은 1 이상이다"}, status_code=422)
+    return delib_jobs.insight_items(since, limit)
+
+
+class SubjectConfirmRequest(BaseModel):
+    """포털이 주제를 다시 풀 때(워크플로 대화 들이기 · 기다림 줄의 주제 확인) — 그 사람의 PAT 가 반드시 있다(PLAN §4.3 · contracts §3.2)."""
+    subject: dict | None = None
+    groups: list[str] = []
+    user_email: str = ""
+    user_pat: str = ""
+    chair_template: str | None = None
+    started_by: str | None = None
+
+
+# POST /deliberate/subject/confirm — 확인 규칙은 delib_subject.confirm 하나다(PG-19 — 확인하는 쪽은 에이전트 서버 하나). /chat 과 같은 루프백 신뢰에
+# 사람 PAT 를 요구한다 — 공유 비밀 + 신원 머리로 남의 이름을 풀지 않는다. 새 LLM 호출은 없다.
+@app.post("/deliberate/subject/confirm")
+async def deliberate_subject_confirm(body: SubjectConfirmRequest):
+    import delib_subject as _subject  # noqa: PLC0415
+    if not body.user_pat.strip():
+        return JSONResponse({"code": "bad_request", "message": "user_pat(그 사람의 PAT)이 있어야 주제를 다시 푼다"}, status_code=422)
+    if _subject.risk_family(body.chair_template, body.started_by):
+        return JSONResponse({"code": "risk_family", "message": "리스크 심사는 주제를 달지 않는다 — 리스크 심사의 주제는 리스크 앱 과제다"},
+                            status_code=422)
+    try:
+        parsed = _subject.parse(body.subject)
+    except _subject.SubjectError as exc:
+        return JSONResponse({"code": "bad_request", "message": str(exc)[:300]}, status_code=422)
+    if parsed is None:
+        return {"subject": None}
+    return {"subject": await _subject.confirm(app, parsed, groups=list(body.groups), user=body.user_email, user_pat=body.user_pat)}
 
 
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
