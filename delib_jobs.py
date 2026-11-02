@@ -1234,6 +1234,12 @@ def _apply(job: dict, event: str, data: dict) -> None:
                 job["report_url"] = data["url"]
             else:
                 job.pop("report_url", None)
+            # 보고서에 실은 도구 그림의 셈(HWAXPortal docs/report-figures RF-9 — 찾은 수 · 그림 칸으로 들어간 수 · 못 들어간 수와 까닭). 그림이 없던
+            # 보고서는 칸이 없다(사건에 없으면 걷는다 — 다단 심의는 마지막 단의 것).
+            if isinstance(data.get("figures"), dict):
+                job["report_figures"] = data["figures"]
+            else:
+                job.pop("report_figures", None)
         elif kind == "plain":
             job["plain"] = data.get("text") or data.get("content")
         elif kind == "turn":
@@ -2048,6 +2054,7 @@ def summary(job: dict, *, full: bool = False) -> dict:
         "seats": [s.get("key") for s in (job.get("seats") or [])],
         "elapsed_s": round(elapsed, 1),
         "report_id": job.get("report_id"),
+        **({"report_figures": job["report_figures"]} if isinstance(job.get("report_figures"), dict) else {}),
         # 목록 색인(_list_rec)은 턴 대신 수만 담는다.
         "turn_count": len(job["turns"] or []) if "turns" in job else int(job.get("turn_count") or 0),
         "checkpoint": bool(job.get("checkpoint")),
