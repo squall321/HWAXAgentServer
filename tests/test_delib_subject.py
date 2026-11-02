@@ -261,6 +261,8 @@ def gw():
     @mcp.tool(name=s.RESOLVER_CALL)
     async def resolver(query: str, limit: int = 20, full: bool = False) -> str:
         state.calls.append({"query": query, "limit": limit, "full": full, **hdrs})
+        if query == "느린 과제":
+            await asyncio.sleep(3)        # 기한(RESOLVE_TIMEOUT_S)을 넘기는 풀이 — 진짜 MCP 세션이 기한에 끊겨도 예외가 새지 않아야 한다
         return _text(state.body)
 
     inner = mcp.streamable_http_app()
@@ -312,6 +314,15 @@ def test_진짜_MCP_길로_부르고_웹은_그_사람의_PAT_MCP_잡은_공유_
 def test_진짜_MCP_길에서도_부분_일치는_주장이다(gw):
     rec = asyncio.run(s.confirm(gw.app, s.parse({"sp_task": "알파"}), groups=[], user="me@example.com"))
     assert rec["sp_state"] == s.CLAIMED and "글자 그대로 같은 행이 없다" in rec["sp_why"]
+
+
+def test_진짜_MCP_길에서_기한을_넘기면_세션을_끊고_주장이다(gw, monkeypatch):
+    monkeypatch.setattr(s, "RESOLVE_TIMEOUT_S", 0.5)
+    t0 = time.monotonic()
+    rec = asyncio.run(s.confirm(gw.app, s.parse({"sp_task": "느린 과제"}), groups=[], user="me@example.com"))
+    assert rec["sp_state"] == s.CLAIMED and "안에 답하지 않았다" in rec["sp_why"] and time.monotonic() - t0 < 2.5, rec
+    again = asyncio.run(s.confirm(gw.app, s.parse({"sp_task": KEY}), groups=[], user="me@example.com"))
+    assert again["sp_state"] == s.CONFIRMED, "끊긴 뒤에도 다음 풀이는 그대로 선다"
 
 
 def test_게이트웨이에_풀이_도구가_없으면_주장이다(gw, monkeypatch):
