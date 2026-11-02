@@ -429,6 +429,27 @@ those. No subject means nothing is linked: the ledger has no `subject` field and
   stage-unknown bucket only. It scans the newest `LIST_SCAN_MAX` (300) ledger files; `window.complete` is false when older
   ledgers were left unread (the scanned count is not returned — it would show the box's volume).
 
+### Insight cards (portal docs/project-insight-graph M2)
+
+A deliberation with a `confirmed` or `claimed` subject that is not a risk review is **armed** (`deliberation.INSIGHT_ARM` —
+MCP jobs in `delib_jobs._make_spawn`, the web path in `_with_delib_images` once the subject event is out). An armed
+deliberation emits one `delib{kind: "insight"}` per stage, right after `outcome`, built by code from what the engine already
+has — no new LLM call. The engine still does not see the subject; the card carries none.
+
+- Fields: `stage` (that stage's chair template), `claim` (the "■ 핵심 요약" bullets, else the "### 한마디로" line of the plain
+  explanation, else empty; 500 characters, cut at a line), `claim_from`, `tally`, `report_id`, `report_url`, `model`,
+  `calls` (evidence markers for seat lookups, caller evidence with a tool and designated tools — tool, arguments up to 1,200
+  characters, result sha256, ok; `ref = call:<16 hex>`; 60 at most), `tools` (every evidence tool, including VOC recall,
+  the evidence prepass and persona knowledge — restored from `e:pre.ins_tools` on an in-place resume), `apps` /
+  `apps_unknown` (gateway `/tools-map`), `refs`. No card when the chair produced no decision.
+- MCP jobs keep the last card per stage in `job.insights`. A normal `deliberate_continue` now records `continues` (the
+  previous job id) on the new job.
+- `GET /insights/cards?since=&limit=` (gateway secret, like `/seat-questions`) lists finished jobs (`done` · `error`) with an
+  owner, a `confirmed` / `claimed` subject, no risk-review chair or `started_by=app`, and at least one card, oldest first —
+  `{contract: "insight-cards/1", items, next_since, complete}`. The portal pulls it; the engine never pushes.
+- `POST /deliberate/subject/confirm {subject, groups, user_email, user_pat, chair_template?, started_by?}` resolves a subject
+  with the M1 rule for the portal (workflow conversations, the owner's waiting queue). A person's PAT is required.
+
 ### Card review
 
 `card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review
