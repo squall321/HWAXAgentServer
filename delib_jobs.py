@@ -1470,6 +1470,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     entry = _entry(spec)
 
     opts = dict(delib_opts or {})
+    # 심의 주제는 키워드(subject)로만 받는다 — 요청 손잡이(MCP advanced 는 통째로 합쳐진다 · 시작 인자 파일)에 실어 와도 버린다. 남기면 확인되지 않은
+    # 주제가 엔진(결정문 · RA 보고서 · 위키 원천의 길)과 원장의 손잡이 메아리(opts)에 들어간다(HWAXPortal docs/project-insight-graph PG-21).
+    opts.pop("subject", None)
     if spec.get("chair"):
         opts["chair_template"] = spec["chair"]
     opts.update(spec.get("opts") or {})

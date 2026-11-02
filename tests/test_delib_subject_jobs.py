@@ -115,6 +115,22 @@ def test_리스크_심사는_주제를_받지_않는다(eng, monkeypatch, hub, k
     _play(scenario)
 
 
+def test_손잡이에_실은_주제는_버린다(eng, monkeypatch, hub):
+    """MCP advanced 는 손잡이 사전에 통째로 합쳐진다(mcp_server._build_opts) — 거기 subject 를 실어도 원장의 주제가 되지 않고, 엔진 · 원장의
+    손잡이 메아리에도 가지 않는다(확인되지 않은 주제가 결정문 · RA 보고서 길이나 원장에 남지 않게)."""
+    _caps(monkeypatch, 5)
+
+    async def scenario():
+        out = await m.deliberate_start("손잡이로 실은 주제", advanced={"subject": {"sp_task": KEY, "sp_state": "confirmed"}},
+                                       ctx=_ctx(ME, "CAEG"))
+        rec = delib_jobs.get(out["job_id"])
+        assert "subject" not in rec and "subject" not in rec["opts"] and "subject" not in out and hub == []
+        await _tick()                          # 엔진 가짜가 첫 걸음을 떼어 받은 인자를 적는다
+        assert "subject" not in (eng.seen["손잡이로 실은 주제"].opts or {}), "엔진에 가지 않는다"
+        assert "subject" not in (delib_jobs._read_args(out["job_id"]) or {}).get("opts", {}), "시작 인자 파일에도 없다"
+    _play(scenario)
+
+
 @pytest.mark.parametrize("bad,word", [({"sp_task": KEY, "sp_state": "confirmed"}, "모르는 칸"),
                                       ({"sp_task": KEY, "artifacts": [{"kind": "mcad", "id": "xyz"}]}, "16진 23자"),
                                       ("알파 개발_C2", "객체다")])
