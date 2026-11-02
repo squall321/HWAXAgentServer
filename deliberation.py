@@ -18,6 +18,7 @@ import call_trace                                       # 호출 추적(CALL_TRA
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
+import report_figures                                   # 보고서 글의 도구 그림을 그 사람 명의로 RA 그림 칸으로(HWAXPortal docs/report-figures)
 from evidence import fit_document, sig_numbers, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -8114,6 +8115,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     report_note = ""
     rid = None
     rurl = None                         # RA 가 준 보고서 주소(/w/<공간>/reports/<번호>) — outcome 에 싣는다(포털 WD-D78)
+    _figs = None                        # 보고서에 실은 도구 그림(report_figures.Figures) — outcome 의 figures(HWAXPortal docs/report-figures)
     if _rint is not None:
         decision = _rint["decision"]    # 되살림(S3) — 저장하려던 결정문(웹 인용 · 수치 대조까지 붙인 것)
     yield _delib("stage", stage="report")
@@ -8168,6 +8170,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _delib("evidence", source="보고서 블록 상한 초과", included=False, notice=True,
                              text="Report Archive 보고서에 " + " · ".join(_ra_cut) + " 실었다 — 나머지는 이 보고서에 없다"
                                   "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
+        # 도구 그림(HWAXPortal docs/report-figures RF-9) — 글 속 그림을 그 사람 명의로 먼저 올려 자리를 표지로 바꾸고, 그림 칸을 저장 호출에 함께
+        # 싣는다. 사람 토큰이 없는 잡(MCP)은 올리지 않고 그 자리에 까닭을 남긴다. 그림이 없으면 인자 · 사건이 종전과 같다.
+        _nfig = report_figures.count(blocks) if _rsav is None and _do_save else 0
+        if _nfig:
+            yield _sse("status", {"step": f"보고서에 실을 그림 {_nfig}장을 Report Archive 에 올리는 중", "tool": None})
+            _figs = await report_figures.attach(blocks, user_pat=user_pat)
+            blocks = _figs.blocks
+        _fig_kw = {"extra_blocks": _figs.extra_blocks} if _figs is not None and _figs.extra_blocks else {}
         if _rint is None and _jon:
             # 재개 자료(HA-09 S3 — e:report_intent) — RA 호출 직전. 이 줄만 남고 끊기면 저장됐는지 알 수 없다 — 이을 때 경고하고 새로 저장한다.
             # 수치 대조 칸(numcheck)도 싣는다 — 이은 실행은 대조를 다시 하지 않는다(위).
@@ -8184,11 +8194,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _raw_made = await _call(tools, "update_report_draft", {
                 "report_id": _append_to,
                 "page": (len(_pg) if isinstance(_pg, list) else 1) + 1,
-                "blocks": _ra_blocks(blocks)})
+                "blocks": _ra_blocks(blocks), **_fig_kw})
         else:
             _raw_made = await _call(tools, "create_report_draft", {
                 "template_id": "deliberation", "template_version": 1,
-                "title": _ra_report_title(question), "blocks": _ra_blocks(blocks),
+                "title": _ra_report_title(question), "blocks": _ra_blocks(blocks), **_fig_kw,
                 "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
         # 실패면 사유(게이트웨이의 RA 토큰 등록 안내 등)를 결정문 끝에 그대로 싣고, 성공일 때만 번호를 쓴다.
@@ -8196,8 +8206,17 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                             else _ra_save_outcome(_raw_made, _append_to, _do_save))
         rurl = (_rsav.get("url") if _rsav is not None
                 else _ra_report_url(_parse_json(_raw_made), rid) if rid is not None and _raw_made is not None else None)
+        if _figs is not None:
+            # 몇 장이 들어갔나 — RA 가 칸을 경고로 버렸으면 그 그림은 '못 들어감' 이다(RF-7). 결정문 끝 안내와 outcome 의 figures 가 말한다
+            if rid is not None:
+                _figs.saved(_parse_json(_raw_made))
+                report_note += "\n\n" + _figs.note()
+            else:
+                _figs.not_saved()
     except Exception as exc:  # noqa: BLE001 — 보고서 실패는 비치명적이되 무음은 피한다
         print(f"[deliberation] create_report_draft failed: {exc!r}")
+        if _figs is not None:
+            _figs.not_saved()
         # 사람에게도 말한다 — 종전엔 로그뿐이라 저장 · 이어붙이기가 도구 밖에서 터지면 결정문에 아무 말이 없었다(포털이 되살린 심의의
         # 이어하기는 append_to_report_id 를 싣는다 — 포털 docs/wda-deck WD-D68). 새 보고서로 대신 저장하지는 않는다(원래 기기의 길과 같다).
         if _do_save and _rsav is None and not report_note:
@@ -8256,6 +8275,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     yield _delib("decision", text=decision + report_note + wiki_note, **({"chair_failed": True} if _chair_failed else {}),
                  **({"numcheck": _numcheck} if isinstance(_numcheck, dict) else {}))
     yield _delib("outcome", report_id=rid, **({"url": rurl} if rurl else {}), title=_ra_report_title(question),
+                 **({"figures": _figs.summary()} if _figs is not None else {}),
                  # 만장일치는 **착석 전원이 동의를 표명했을 때만**이다. 미표명이 하나라도 있으면
                  # 아니다 — 침묵을 합의로 세지 않는다. total 이 착석 수로 바뀌었으므로 이 식이
                  # 그대로 좌석 유실까지 막는다(응답 못 한 좌석은 abstain 으로 들어간다).
@@ -8483,12 +8503,21 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     else:
         _tidy_cut = []
 
+    # 도구 그림(HWAXPortal docs/report-figures RF-9) — 대화 글 속 그림을 그 사람 명의로 먼저 올려 자리를 표지로 바꾸고 그림 칸을 저장 호출에
+    # 함께 싣는다. 못 올린 그림은 그 자리에 까닭이 남는다. 그림이 없으면 인자 · 사건이 종전과 같다.
+    figs = None
+    _nfig = report_figures.count(blocks)
+    if _nfig:
+        yield _sse("status", {"step": f"보고서에 실을 그림 {_nfig}장을 Report Archive 에 올리는 중", "tool": None})
+        figs = await report_figures.attach(blocks, user_pat=user_pat)
+        blocks = figs.blocks
     rid, fail = None, ""
     try:
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
         raw = await _call(tools, "create_report_draft", {
             "template_id": "deliberation", "template_version": 1,
             "title": title, "blocks": _ra_blocks(blocks),
+            **({"extra_blocks": figs.extra_blocks} if figs is not None and figs.extra_blocks else {}),
             "tags": ["심의", "conversation-report"]})
         # 도구 오류는 _call·_cap_tool 이 **문자열로 싸서 정상 반환**하므로 아래 except 가 안 걸린다.
         # 사유를 뭉개지 않는다 — 게이트웨이의 'RA 토큰을 등록하라' 가 여기로 온다(다시 시도해도 소용없다).
@@ -8496,10 +8525,16 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
         rid = None if fail else _ra_report_id(_parse_json(raw))
         if fail:
             print(f"[report] RA 저장 실패: {fail[:200]}")
+        if figs is not None and rid:
+            figs.saved(_parse_json(raw))       # RA 가 칸을 경고로 버렸으면 그 그림은 '못 들어감' 이다(RF-7)
     except Exception as exc:  # noqa: BLE001 — RA 미가용(cae00 등)은 비치명적 폴백
         print(f"[report-save] create_report_draft failed: {exc!r}")
+    if figs is not None and not rid:
+        figs.not_saved()
     if rid:
         text = f"📄 Report Archive 보고서 #{rid} 로 저장했습니다 — 「{title}」"
+        if figs is not None:
+            text += f"\n\n{figs.note()}"
         if _cut:
             text += f"\n\n⚠ 보고서 블록 건수 상한 — {' · '.join(_cut)}만 실었습니다(나머지는 대화에 남아 있습니다)."
         for _t in _tidy_cut:
@@ -8510,5 +8545,6 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
         text = "Report Archive 저장이 불가합니다(RA 미가용 또는 도구 없음). 대화는 서버에 남아 있으니 나중에 다시 시도하세요."
     yield _sse("token", {"delta": text})
     # 저장한 보고서를 구조로도 — 포털이 이 답 옆에 '발표자료로' 단추를 세운다(포털 docs/wda-deck WD-D12). 글을 파싱하지 않게, 성공일 때만.
-    yield _sse("result", {"type": "text", "content": text, **({"ra_report": {"id": rid, "title": title}} if rid else {})})
+    yield _sse("result", {"type": "text", "content": text, **({"ra_report": {"id": rid, "title": title}} if rid else {}),
+                          **({"figures": figs.summary()} if figs is not None else {})})
     yield _sse("done", {})
