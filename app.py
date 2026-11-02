@@ -2916,19 +2916,26 @@ _ONTO_CORE = (
 
 # 온톨로지 먼저(HWAXPortal docs/ontology-first OF-5 · OF-14 ④) — 고정 몫의 정본은 코어 어휘표 ontology.apps(reserve 인 앱의 tools, (백엔드, 원래 이름))다.
 # 추적 기본값은 위 _ONTO_CORE 를 같은 차례로 옮긴 것이라 기본 표에서 고정 몫이 글자 그대로다(시험 — tests/test_ontology_first_chat.py). 어휘표가 없거나 그
-# 칸이 없으면 _ONTO_CORE 다. 노출 이름은 받아 둔 게이트웨이 도구 지도로 푼다(onto_links.exposed — 지도를 두드리지 않는다 · 도구 로드가 이미 받았다).
+# 칸이 없으면 _ONTO_CORE 다. 입구가 없으면(기본) 옛 이름 규칙(허브 가족은 접두 · 나머지는 맨 이름)으로 짓고, 입구를 켠 박스만 받아 둔 게이트웨이 도구
+# 지도로 푼다(onto_links.exposed — 지도를 두드리지 않는다 · 도구 로드가 이미 받았다, OF-23).
 def _onto_v() -> dict | None:
     v = (_core_vocab() or {}).get("onto")
     return v if v and v.get("present") else None
 
 
 def _onto_core() -> tuple:
-    """챗 고정 몫의 노출 이름 — 어휘표 ontology(reserve)에서, 없으면 _ONTO_CORE."""
+    """챗 고정 몫의 노출 이름 — 어휘표 ontology(reserve)에서, 없으면 _ONTO_CORE.
+
+    입구(entry)가 하나도 없으면(기본 — 박스 덧씌우기로 켜지 않은 박스) 지도를 보지 않고 옛 고정 몫을 적은 이름 규칙(허브 가족은 접두 · 나머지는 맨
+    이름)으로 짓는다 — 추적 기본값에서 고정 몫이 지도 꼴과 상관없이 _ONTO_CORE 와 바이트까지 같다. 지도로 풀던 동안 두 꼴에서 갈렸다(반대 검토 11-02 —
+    OF-23): 허브 StepForge · DynaForge 가 내려가 선언 운영 사본이 맨 이름을 쥔 박스에서는 과제 도구 넷을 뺐고, 정적 백엔드가 list_tasks 를 더해 둘 다
+    접두가 붙은 박스에서는 heaxkooremapper_mcp_list_tasks 를 세웠다. 지도로 푸는 것(남의 도구는 세우지 않는다 — OF-17)은 입구를 켠 박스만이다."""
     v = _onto_v()
     if v is None:
         return _ONTO_CORE
-    names, _missing = _onto.reserve_names(v, tmap=_TOOLS_MAP_CACHE.get("map") or {}, orig=_TOOLS_MAP_CACHE.get("orig"),
-                                          family=frozenset(_hub_apps()))
+    on = bool(v["entries"])
+    names, _missing = _onto.reserve_names(v, tmap=(_TOOLS_MAP_CACHE.get("map") or {}) if on else {},
+                                          orig=_TOOLS_MAP_CACHE.get("orig") if on else None, family=frozenset(_hub_apps()))
     return names
 
 
@@ -2954,8 +2961,8 @@ def _onto_health() -> dict:
         if not v.get("present"):
             return out
         m = _TOOLS_MAP_CACHE.get("map") or {}
-        names, missing = _onto.reserve_names(v, tmap=m, orig=_TOOLS_MAP_CACHE.get("orig"), family=frozenset(_hub_apps()))
-        out["reserve"] = len(names)
+        _names, missing = _onto.reserve_names(v, tmap=m, orig=_TOOLS_MAP_CACHE.get("orig"), family=frozenset(_hub_apps()))
+        out["reserve"] = len(_onto_core())        # 실제로 세우는 수 — 입구가 없으면 옛 이름 규칙이다(OF-23). missing 은 늘 지도로 센다
         if m:
             gone = [f"{a}:{t}" for a, t in v["entries"]
                     if not _onto.exposed(a, t, tmap=m, orig=_TOOLS_MAP_CACHE.get("orig"), family=frozenset(_hub_apps()))[1]]

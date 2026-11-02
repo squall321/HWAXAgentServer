@@ -35,6 +35,20 @@ _CAE00_ORIG = {n: n.split("_", 1)[1] for n, bk in _CAE00.items() if bk in ("root
     {"stepforgeprod_find_plm_task": "find_plm_task"}
 # dev 꼴 — 허브가 없다
 _DEV = {**_TASK, "onto_search": "heax-step_forge", "list_parts": "heax-step_forge", "semantic_search_x": "ai-data-hub"}
+# 반대 검토 11-02(OF-23)의 두 꼴 — 지도로 풀면 옛 고정 몫과 갈렸다. (i) 허브 StepForge · DynaForge 가 내려가 선언 운영 사본이 과제 도구의 맨 이름을 쥔 박스
+# (옛 고정 몫은 그 맨 이름을 세운다 — 지도로 풀면 넷을 뺐다). (ii) 정적 백엔드 하나가 list_tasks 를 더해 둘 다 접두가 붙은 박스(옛 고정 몫의 맨 이름은
+# 이 박스에 없어 아무것도 세우지 않는다 — 지도로 풀면 heaxkooremapper_mcp_list_tasks 를 세웠다).
+_HUBS_DOWN = {**{n: bk for n, bk in _CAE00.items() if bk in ("rootdesigndatahub", "failuretrace")},
+              **{n: "dynaforge-prod" for n in ("list_tasks", "task_revisions", "compare_task_revisions")},
+              "find_plm_task": "stepforge-prod", "list_parts": "stepforge-prod"}
+_HUBS_DOWN_ORIG = {n: o for n, o in _CAE00_ORIG.items() if n.startswith(("rootdesigndatahub_", "failuretrace_"))}
+_COLLIDE = {**{n: bk for n, bk in _DEV.items() if n != "list_tasks"},
+            "heaxkooremapper_mcp_list_tasks": "heax-kooremapper_mcp", "taskmanager_list_tasks": "taskmanager"}
+_COLLIDE_ORIG = {"heaxkooremapper_mcp_list_tasks": "list_tasks", "taskmanager_list_tasks": "list_tasks"}
+_BOXES = {"empty": ({}, None), "cae00": (_CAE00, _CAE00_ORIG), "dev": (_DEV, {}), "hubs_down": (_HUBS_DOWN, _HUBS_DOWN_ORIG),
+          "static_collide": (_COLLIDE, _COLLIDE_ORIG)}
+_LABELS = {"heax-step_forge": "StepForge", "heax-kooremapper_mcp": "DynaForge", "stepforge-prod": "StepForge 운영",
+           "dynaforge-prod": "DynaForge 운영", "taskmanager": "TaskManager"}
 
 
 def _real_vocab() -> dict:
@@ -72,10 +86,11 @@ def _bare(d: dict) -> dict:
 
 
 # ── 기본 표 — 바이트까지 그대로 ───────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("box", ("empty", "cae00", "dev"))
+@pytest.mark.parametrize("box", tuple(_BOXES))
 def test_기본_표의_고정_몫은_옛_ONTO_CORE_그대로다(monkeypatch, tmp_path, box):
+    """지도 꼴과 상관없이 — 입구가 없으면(기본) 지도를 보지 않고 옛 이름 규칙으로 푼다(OF-23)."""
     _use(monkeypatch, tmp_path, _real_vocab())
-    tmap, orig = {"empty": ({}, None), "cae00": (_CAE00, _CAE00_ORIG), "dev": (_DEV, {})}[box]
+    tmap, orig = _BOXES[box]
     _map(monkeypatch, tmap, orig)
     assert a._core_vocab()["onto"]["present"] and a._core_vocab()["onto"]["entries"] == (), "기본 표에는 입구가 없다(OF-14 ④)"
     assert a._onto_core() == a._ONTO_CORE, a._onto_core()
@@ -89,18 +104,20 @@ def test_기본_표의_시스템_프롬프트는_ontology_칸이_없던_때와_�
     assert a._system_prompt() == before and "⑧" not in before and onto_links.MARK not in before
 
 
+@pytest.mark.parametrize("box", ("cae00", "dev", "hubs_down", "static_collide"))
 @pytest.mark.parametrize("cap", (0, 6))
-def test_기본_표에서_묶는_도구와_설명은_옛_고정_몫과_바이트까지_같다(monkeypatch, tmp_path, cap):
-    """캡 없는 길(운영 TOOL_MAX=0 — 예산을 넘겨 관련도로 자르는 길까지)과 캡 길 모두. 이름 · 차례 · 챗 로드의 설명이 같다."""
+def test_기본_표에서_묶는_도구와_설명은_옛_고정_몫과_바이트까지_같다(monkeypatch, tmp_path, cap, box):
+    """캡 없는 길(운영 TOOL_MAX=0 — 예산을 넘겨 관련도로 자르는 길까지)과 캡 길 모두. 이름 · 차례 · 챗 로드의 설명이 같다 — 지도 꼴마다(OF-23)."""
     d = _real_vocab()
-    _map(monkeypatch, _CAE00, _CAE00_ORIG, labels={"heax-step_forge": "StepForge", "heax-kooremapper_mcp": "DynaForge"})
+    tmap, orig = _BOXES[box]
+    _map(monkeypatch, tmap, orig, labels=_LABELS)
     monkeypatch.setattr(a, "TOOL_MAX", cap)
     monkeypatch.setattr(a, "CHAT_TOOL_SCHEMA_BUDGET", 300)        # 캡 없는 길도 예산을 넘겨 자르게 — 고정 몫(keep)이 드러난다
     monkeypatch.setattr(a, "_semantic_order", lambda *_a, **_k: [])
 
     def run(body):
         _use(monkeypatch, tmp_path, body)
-        tools = [a._prep_tool(_tool(n), chat=True) for n in sorted(_CAE00)]
+        tools = [a._prep_tool(_tool(n), chat=True) for n in sorted(tmap)]
         return [(t.name, t.description) for t in a._select_tools(tools, "과제 차수 비교")]
     assert run(d) == run(_bare(d))
 
@@ -180,13 +197,19 @@ def test_틀린_앱_줄만_버리고_나머지는_돈다(monkeypatch, tmp_path):
     assert a._core_vocab_health()["ontology"]["dropped"], "버린 줄과 까닭은 /health 에"
 
 
-def test_이_박스_도구_지도에_없는_이름을_health_가_말하고_남의_도구는_앞세우지_않는다(monkeypatch, tmp_path):
+def test_이_박스_도구_지도에_없는_이름을_health_가_말하고_입구를_켜면_남의_도구는_앞세우지_않는다(monkeypatch, tmp_path):
+    """입구가 없으면(기본) 고정 몫은 옛 이름 규칙 그대로다 — 그 이름이 이 박스에서 다른 앱의 것이어도 옛 고정 몫처럼 세운다(바이트 동일 — OF-23).
+    지도로 푸는 것(남의 도구는 세우지 않는다 — OF-17)은 입구를 켠 박스만이다. /health 의 missing 은 둘 다 지도로 센다."""
     _use(monkeypatch, tmp_path, _real_vocab())
     _map(monkeypatch, {**_DEV, "list_tasks": "other-app"}, {})
+    assert a._onto_core() == a._ONTO_CORE, "기본 — 옛 고정 몫 그대로"
+    h = a._core_vocab_health()["ontology"]
+    assert "heax-kooremapper_mcp:list_tasks" in h["missing"] and "rootdesigndatahub:object_resolve" in h["missing"], h["missing"]
+    assert h["reserve"] == len(a._ONTO_CORE), "/health 의 고정 몫 수는 실제로 세우는 수다"
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay=_SF_ENTRY)
     names = a._onto_core()
-    assert "list_tasks" not in names, "그 이름은 이 박스에서 다른 앱의 것이다 — 남의 도구를 고정 몫에 세우지 않는다"
-    miss = a._core_vocab_health()["ontology"]["missing"]
-    assert "heax-kooremapper_mcp:list_tasks" in miss and "rootdesigndatahub:object_resolve" in miss, miss
+    assert "list_tasks" not in names, "입구를 켠 박스 — 그 이름은 이 박스에서 다른 앱의 것이다(남의 도구를 고정 몫에 세우지 않는다)"
+    assert a._core_vocab_health()["ontology"]["reserve"] == len(names)
 
 
 def test_어휘표가_없으면_ONTO_CORE_이고_health_는_칸이_없다고_말한다():
