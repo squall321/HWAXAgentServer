@@ -1041,8 +1041,9 @@ async def deliberate_continue(
 
 async def _cont_subject(prev: dict, subject, *, job: str, advanced, ctx) -> tuple[dict | None, str]:
     """이어하기의 주제 → (이번 잡에 실을 주제, 안내 한 줄). 앞 잡의 주제를 그대로 물려받는다(다시 풀지 않는다 — 그 잡을 열 때 서버가 확인한
-    값이다). 앞 잡에 주제가 없으면 이번에 준 것을 꼴 · 확인을 거쳐 단다(PLAN §9 M1 '앞 잡에 주제가 없으면 이어하기에서 단다'). 앞 잡에 주제가 있는데
-    또 주면 거절한다 — 다른 과제는 새 심의다. 리스크 심사로 잇는 회차(의장 risk-review)는 주제를 받지도 물려받지도 않는다(PLAN §3.1)."""
+    값이다). 이번에 주면 — 앞 잡에 주제가 없거나 확인되지 않았으면(claimed · none) 꼴 · 확인을 거쳐 단다(PLAN §9 M1 '앞 잡에 주제가 없으면 이어하기에서
+    단다' — 주장으로 남은 key 를 고쳐 다는 길도 이것이다, 반대 검토 11-02). 앞 잡의 주제가 확인됐으면 같은 주제는 그대로 물려받고 다른 주제는 거절한다 —
+    다른 과제 · 차수는 새 심의다. 리스크 심사로 잇는 회차(의장 risk-review)는 주제를 받지도 물려받지도 않는다(PLAN §3.1)."""
     adv = advanced if isinstance(advanced, dict) else {}
     if prev.get("status") == "interrupted":     # 끊긴 잡은 같은 종류 · 같은 손잡이로만 잇는다(_resume) — 의장은 그 잡의 것이다
         chair, started_by = prev.get("chair_template"), prev.get("started_by")
@@ -1052,12 +1053,14 @@ async def _cont_subject(prev: dict, subject, *, job: str, advanced, ctx) -> tupl
     had = prev.get("subject") if isinstance(prev.get("subject"), dict) else None
     parsed = delib_subject.parse(subject)
     if parsed is not None:
-        if had is not None:
-            raise ValueError(f"앞 잡({prev['id']})에 이미 주제가 있다({delib_subject.say(had)}) — 이어하기는 그 주제를 물려받는다. 다른 과제 · "
-                             "차수는 deliberate_start 로 새로 연다(subject 를 빼고 다시 부르면 그대로 잇는다)")
+        if had is not None and had.get("sp_state") == delib_subject.CONFIRMED and not delib_subject.risk_family(chair, started_by):
+            if delib_subject.same_input(had, parsed):
+                return had, ""          # 같은 주제를 다시 실었다 — 물려받는다(다시 풀지 않는다)
+            raise ValueError(f"앞 잡({prev['id']})의 주제는 이미 확인됐다({delib_subject.say(had)}) — 이어하기는 그 주제를 물려받는다. 다른 과제 · "
+                             "차수는 deliberate_start 로 새로 연다(subject 를 빼거나 같은 주제로 부르면 그대로 잇는다)")
         user, groups = _caller(ctx)
         rec = await _subject_for(subject, chair=chair, started_by=started_by, groups=groups, user=user)
-        return rec, delib_subject.say(rec) + "."
+        return rec, delib_subject.say(rec) + ("." if had is None else " — 앞 잡의 확인되지 않은 주제 대신 단다.")
     if had is not None and delib_subject.risk_family(chair, started_by):
         return None, "리스크 심사로 잇는 회차는 앞 잡의 주제를 물려받지 않는다(리스크 심사의 주제는 리스크 앱 과제다)."
     return had, ""

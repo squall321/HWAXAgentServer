@@ -3,8 +3,8 @@
 
   · deliberate_start(subject) — 꼴을 보고 SP 과제 key 를 서버가 다시 풀어 잡 원장 · 목록 색인에 싣는다. 엔진에는 넘기지 않는다(결정문 ·
     RA 보고서에 주제가 실리지 않는다). 주제가 없으면 원장은 종전 그대로다. 리스크 심사 계열은 주제를 받지 않는다.
-  · deliberate_continue — 앞 잡의 주제를 물려받는다(앞 잡에 없으면 이어하기에서 단다 · 있으면 다른 주제는 거절 · 리스크 심사로 잇는 회차는
-    물려받지 않는다). 끊긴 잡의 이어하기(요약 길 · 제자리 길)도 같다.
+  · deliberate_continue — 앞 잡의 주제를 물려받는다(앞 잡에 없거나 확인되지 않았으면 이어하기에서 단다 · 확인됐으면 같은 주제는 물려받고 다른
+    주제는 거절 · 리스크 심사로 잇는 회차는 물려받지 않는다). 끊긴 잡의 이어하기(요약 길 · 제자리 길)도 같다.
   · deliberate_list(subject) — 신원이 있어야 하고, 볼 수 있는 잡(주인 · 같은 소속 · 관리자)만, 확인된 주제만, 과제 key 글자 그대로 · 차수 정확히.
     차수 모름은 그 칸에만 있다.
   풀이 가짜는 실제 StepForge 응답 꼴이다(tests/fixtures/subject/find_plm_task.json). 엔진은 test_delib_job_queue 의 가짜(문이 열릴 때까지 도는 생성기)다.
@@ -167,8 +167,32 @@ def test_이어하기는_앞_잡의_주제를_물려받고_다시_풀지_않는�
         nxt = await m.deliberate_continue(first["job_id"], human_note="이어서", ctx=_ctx(ME, "CAEG"))
         assert delib_jobs.get(nxt["job_id"])["subject"] == prev["subject"] and nxt["subject"] == prev["subject"]
         assert len(hub) == n, "물려받은 주제는 다시 풀지 않는다(그 잡을 열 때 서버가 확인한 값이다)"
-        with pytest.raises(ValueError, match="이미 주제가 있다"):
-            await m.deliberate_continue(first["job_id"], human_note="다른 과제로", subject={"sp_task": OTHER}, ctx=_ctx(ME, "CAEG"))
+        await _end(eng, delib_jobs.get(nxt["job_id"]))
+        same = await m.deliberate_continue(nxt["job_id"], human_note="같은 주제를 다시 실었다", subject={"sp_task": KEY, "round": "ＰＶ１"},
+                                           ctx=_ctx(ME, "CAEG"))
+        assert delib_jobs.get(same["job_id"])["subject"] == prev["subject"] and len(hub) == n, "같은 주제는 다시 풀지 않고 물려받는다"
+        for other in ({"sp_task": OTHER}, {"sp_task": KEY, "round": "pv2"}, {"sp_task": KEY, "round": "pv1", "text": "덧붙인 글"}):
+            with pytest.raises(ValueError, match="이미 확인됐다"):
+                await m.deliberate_continue(first["job_id"], human_note="다른 주제로", subject=other, ctx=_ctx(ME, "CAEG"))
+    _play(scenario)
+
+
+def test_앞_잡의_주제가_주장이면_이어하기에서_고쳐_단다(eng, monkeypatch, hub):
+    """과제코드로 단 주장(claimed)을 이어하기가 영영 물려받으면 그 과제의 목록에 끝내 못 든다 — 이어하기에서 key 를 고쳐 단다(반대 검토 11-02)."""
+    _caps(monkeypatch, 5)
+
+    async def scenario():
+        first = await m.deliberate_start("코드로 단 심의", subject={"sp_task": "TC-1001", "round": "dv1"}, ctx=_ctx(ME, "CAEG"))
+        prev = delib_jobs.get(first["job_id"])
+        assert prev["subject"]["sp_state"] == s.CLAIMED
+        await _end(eng, prev)
+        kept = await m.deliberate_continue(first["job_id"], human_note="그대로", ctx=_ctx(ME, "CAEG"))
+        assert delib_jobs.get(kept["job_id"])["subject"] == prev["subject"], "주지 않으면 주장도 그대로 물려받는다"
+        nxt = await m.deliberate_continue(first["job_id"], human_note="key 를 고쳐", subject={"sp_task": KEY, "round": "dv1"},
+                                          ctx=_ctx(ME, "CAEG"))
+        subj = delib_jobs.get(nxt["job_id"])["subject"]
+        assert subj["sp_state"] == s.CONFIRMED and subj["sp_task"] == KEY and "확인되지 않은 주제 대신" in nxt["note"]
+        assert delib_jobs.get(first["job_id"])["subject"]["sp_state"] == s.CLAIMED, "앞 잡의 원장은 바꾸지 않는다"
     _play(scenario)
 
 

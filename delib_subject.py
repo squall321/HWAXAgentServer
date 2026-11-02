@@ -255,6 +255,13 @@ async def confirm(app, parsed: dict, *, groups, user: str, user_pat: str = "") -
     return _record(parsed, state=CLAIMED, sp_task=key, why=why)
 
 
+def same_input(rec: dict, parsed: dict) -> bool:
+    """원장의 주제(rec)와 새로 받은 입력(parse)이 같은 주제인가 — 받는 칸 넷(과제 · 차수 · 글 · 설계 자료)을 _record 와 같은 꼴로 견준다. 확인 상태
+    · 지문은 보지 않는다(같은 주제를 다시 실은 이어하기를 거절하지 않으려고)."""
+    want = _record(parsed, state=NONE, sp_task=parsed.get("sp_task") or None)
+    return all(rec.get(k) == want.get(k) for k in ("sp_task", "round", "text", "artifacts"))
+
+
 def say(rec: dict) -> str:
     """주제 한 줄 — 화면 상태 줄 · MCP 응답 안내가 같은 글을 쓴다."""
     rnd = f" · 차수 {rec['round']}" if rec.get("round") else " · 차수 모름"
