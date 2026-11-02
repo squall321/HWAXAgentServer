@@ -3085,7 +3085,10 @@ def _lex_scores(tools, qtok: set) -> dict:
 _GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
 # routine_read — 게이트웨이가 읽기로 확인한 노출 이름(frozenset). 옛 게이트웨이는 그 칸이 없어 None('모름')이다. 상태 기다림(HA-28)의 울타리로만
 # 쓰고, 읽는 쪽은 .get 으로 읽는다(시험이 그 칸 없는 사전으로 통째로 바꿔 끼운다).
-_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}, "routine_read": None}
+# orig — 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 · 허브 가족 접두). declared · family — 선언 백엔드(connect:) · 허브 가족(정본 + 형제)의 앱 키.
+# 좌석 자유 조회의 원래 이름 판정(HWAXPortal docs/ontology-first F0)이 본다. orig 칸이 없는 옛 게이트웨이면 None — 지금처럼 노출 이름으로 판정한다.
+_TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}, "routine_read": None, "orig": None,
+                          "declared": frozenset(), "family": frozenset()}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
@@ -3153,15 +3156,35 @@ def _tools_map() -> dict:
             # 영역(tool_areas.json)도 같은 응답에 온다 — 따로 받지 않는다. 구 게이트웨이면 빈 채로
             # 두어 도구가 '미분류' 로 보인다(분류를 지어내지 않는다).
             _rr = data.get("routine_read")
+            _og = data.get("orig")
+            _rows = [a for a in (data.get("apps") or []) if isinstance(a, dict) and isinstance(a.get("app"), str)]
             _TOOLS_MAP_CACHE.update({"at": now, "map": m, "areas": data.get("areas") or {},
                                      "area_meta": {a["area"]: a for a in (data.get("area_meta") or [])
                                                    if isinstance(a, dict) and a.get("area")},
                                      "routine_read": (frozenset(x for x in _rr if isinstance(x, str))
-                                                      if isinstance(_rr, list) else None)})
+                                                      if isinstance(_rr, list) else None),
+                                     "orig": ({k: v for k, v in _og.items() if isinstance(k, str) and isinstance(v, str)}
+                                              if isinstance(_og, dict) else None),
+                                     "declared": frozenset(a["app"] for a in _rows if a.get("declared") is True),
+                                     "family": frozenset(a["app"] for a in _rows if a.get("role") in ("canonical", "sibling"))})
     except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
         print(f"[tools] map fetch failed — {_GW_RETRY_S:.0f}초 뒤 다시 묻는다: {exc!r}")
         _TOOLS_MAP_CACHE["retry_at"] = time.monotonic() + _GW_RETRY_S
     return _TOOLS_MAP_CACHE["map"]
+
+
+def _free_judge_names() -> dict:
+    """좌석 자유 조회가 원래 이름으로 판정할 노출 이름 → 원래 이름(HWAXPortal docs/ontology-first F0 · OF-4). 게이트웨이가 겹침 때문에 접두를 단
+    이름만이다 — 선언 백엔드(connect: — 운영 사본 · MatNexus · FMEA, 토큰을 등록하지 않은 사람에게는 부를 때 거절되고 허브 앱과 두 벌이 된다)와 허브 가족
+    (늘 접두 — 좌석에 허브를 열지는 온톨로지 결정의 몫이다 PLAN §5.4)은 뺀다. 받아 둔 맵만 본다(게이트웨이를 두드리지 않는다 — 심의 도구 로드가
+    _tag_tool_app 으로 이미 맵을 새로 받았다). orig 를 모르는 옛 게이트웨이 · 맵이 빈 때는 {} — 지금처럼 노출 이름으로 판정한다. 리스크 심사에는
+    부르는 쪽(엔진)이 쓰지 않는다 — D-18 의 이름 검사가 맨 이름이라 원래 이름으로 보면 reportarchive_list_reports 가 새로 열린다."""
+    m = _TOOLS_MAP_CACHE.get("map") or {}
+    orig = _TOOLS_MAP_CACHE.get("orig")
+    if not m or not isinstance(orig, dict):
+        return {}
+    skip = set(_TOOLS_MAP_CACHE.get("declared") or ()) | set(_TOOLS_MAP_CACHE.get("family") or ()) | set(_hub_apps())
+    return {n: o for n, o in orig.items() if m.get(n) and m[n] not in skip}
 
 
 def _pretty_group(key: str) -> str:

@@ -349,13 +349,15 @@ def _dictcomp_cond(marker: str, other: str):
     return compile(_ast.Expression(body=hits[0]), "<gate>", "eval")
 
 
-def _eval_gate(code, name, *, chair, apps=(), amap=None):
+def _eval_gate(code, name, *, chair, apps=(), amap=None, orig=None):
+    # _orig — 원래 이름으로 판정할 겹침 접두 이름(HWAXPortal docs/ontology-first F0). 리스크 심사에서는 조립식이 비워 둔다 — 기본은 빈 것(맨 이름 판정)
     ns = {
         "n": name, "_FREE_DENY": d._FREE_DENY, "_free_tool_ok": d._free_tool_ok,
         "_MATERIAL_TOOLS": d._MATERIAL_TOOLS, "_RISK_READ_TOOLS": d._RISK_READ_TOOLS,
         "_RISK_KEEP_TOOLS": d._RISK_KEEP_TOOLS, "_amap": amap or {}, "_apps": set(apps),
         "_risk_chair": chair == "risk-review",
         "_RISK_RA_REPORT_TOOLS": d._RISK_RA_REPORT_TOOLS, "_INSIGHT_TOOL_HEAD": d._INSIGHT_TOOL_HEAD,
+        "_orig": {} if chair == "risk-review" else dict(orig or {}),
     }
     return bool(eval(code, ns))  # noqa: S307 — 소스에서 뽑은 우리 코드다
 
@@ -484,6 +486,20 @@ def test_자유조회_조립식_게이트가_chair_와_앱_조건부다():
     assert not _eval_gate(gate, "pcb_warpage_surrogate", chair="diagnosis", amap=amap)
     # _FREE_DENY 는 어느 경로보다 우선한다.
     assert not _eval_gate(gate, "get_agent_session", chair="risk-review", apps=apps, amap=amap)
+
+
+def test_F0_조립식은_겹침_접두_이름을_원래_이름으로_본다():
+    """HWAXPortal docs/ontology-first F0 — 소스의 _g 조건식 그대로 돌린다. 원래 이름이 읽기면 들고, 원래 이름이 쓰기 · 닫기 목록이면 안 든다. _orig 가
+    없으면(옛 게이트웨이 · 리스크 심사 — 조립식이 비워 둔다, 실제 심의로 보는 시험은 tests/test_ontology_first_f0.py) 지금처럼 노출 이름이다."""
+    gate = _dictcomp_cond("_FREE_DENY", "_MATERIAL_TOOLS")
+    orig = {"aidatahub_semantic_search": "semantic_search", "smarttwinmcp_catalog_run": "catalog_run",
+            "heaxstep_forge_cancel_job": "cancel_job", "reportarchive_list_reports": "list_reports"}
+    assert _eval_gate(gate, "aidatahub_semantic_search", chair="default", orig=orig)
+    assert not _eval_gate(gate, "aidatahub_semantic_search", chair="default"), "orig 가 없으면 노출 이름의 머리로 본다(지금 그대로)"
+    assert not _eval_gate(gate, "smarttwinmcp_catalog_run", chair="default", orig=orig), "원래 이름이 닫기 목록이면 접두가 있어도 닫는다"
+    assert not _eval_gate(gate, "heaxstep_forge_cancel_job", chair="default", orig=orig)
+    assert _eval_gate(gate, "reportarchive_list_reports", chair="default", orig=orig)
+    assert not _eval_gate(gate, "reportarchive_list_reports", chair="risk-review", orig=orig), "D-18 — 리스크 심사는 맨 이름 판정 그대로다"
 
 
 def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():

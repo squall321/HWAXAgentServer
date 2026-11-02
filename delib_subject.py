@@ -52,8 +52,9 @@ _ART_ID = {
 _APP = re.compile(r"[a-z0-9][a-z0-9_.-]{0,79}")
 
 # 풀이 도구 — StepForge find_plm_task(허브 코어 API 거울에서 과제코드 · 별칭 · 과제명 · 모델 · 프로젝트로 찾는다, 결과 행마다 key — StepForge
-# core/sp_core.py find_tasks). 게이트웨이의 **호출 전용 별칭**(<백엔드 키에서 하이픈 뺀 것>_<도구>)으로 부른다 — 노출 이름은 박스마다 다르고(dev 는
-# 맨 이름 find_plm_task · cae00 은 stepforge-prod 와 겹쳐 둘 다 접두가 붙는다 — HWAXPortal docs/request-1027 HA-23 의 stepforgeprod_find_plm_task),
+# core/sp_core.py find_tasks). 게이트웨이의 **호출 전용 별칭**(<백엔드 키에서 하이픈 뺀 것>_<도구>)으로 부른다 — 노출 이름은 박스마다 다를 수 있고
+# (dev 는 맨 이름 find_plm_task · cae00 은 선언 백엔드 stepforge-prod(운영 사본)와 겹쳐 **그쪽에만** 접두가 붙는다 — HWAXPortal docs/request-1027 HA-23 의
+# stepforgeprod_find_plm_task 가 운영 사본이고 허브 StepForge 는 맨 이름이다, 게이트웨이 974e7ed 부터 · HWAXPortal docs/ontology-first OF-3),
 # 별칭은 겹침 · 접두와 무관하게 늘 선다(HWAXMcpGateway gateway.py _aggregate). 허브 앱 StepForge 하나를 정본으로 부른다.
 RESOLVER_APP, RESOLVER_TOOL = "heax-step_forge", "find_plm_task"
 RESOLVER_CALL = f"{RESOLVER_APP.replace('-', '')}_{RESOLVER_TOOL}"

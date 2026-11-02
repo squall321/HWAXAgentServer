@@ -4431,6 +4431,17 @@ def _app_of_tools() -> dict:
         return {}
 
 
+def _free_orig_names() -> dict:
+    """{노출 이름: 원래 이름} — 좌석 자유 조회가 원래 이름으로 판정할 겹침 접두 이름(HWAXPortal docs/ontology-first F0, app._free_judge_names —
+    선언 백엔드 · 허브 가족은 뺀다). 실패하면 {}(지금처럼 노출 이름으로 판정한다). 리스크 심사는 부르지 않는다(조립식이 가른다)."""
+    try:
+        from app import _free_judge_names  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+        return _free_judge_names()
+    except Exception as exc:  # noqa: BLE001 — 판정을 넓히지 못해도 지금 판정 그대로 간다
+        print(f"[deliberation] 원래 이름 판정 자료를 못 읽었다 — 노출 이름으로 판정한다: {exc!r}")
+        return {}
+
+
 def _wrap_cached(tool, cache: dict, stats: dict | None = None):
     """같은 심의 안에서 같은 도구·같은 인자 재호출을 1회로 접는다 — 전문가 여럿이 같은 재료를
     조회하는 것이 정상 패턴이라 캐시가 곧 예산 절약이다(도구 객체는 이 심의 전용 로드라 안전).
@@ -6364,13 +6375,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             _apps = set(opts.delib_apps or ())
             _amap = _app_of_tools() if (_apps or _risk_chair) else {}
             _rmax = _free_result_chars(opts.tool_budget)
+            # 겹침 때문에 게이트웨이가 접두를 단 읽기는 원래 이름으로 판정한다(HWAXPortal docs/ontology-first F0 · OF-4 — dev 11-02 에 semantic_search ·
+            # list_jobs 넷이 이름 꼴 때문에 빠져 있었다). 닫기 목록 · 접두 허용 · 앱 지정의 물성 목록이 같은 이름을 본다. 리스크 심사(와 리스크 앱이 띄운
+            # 패널)는 지금 판정 그대로다 — D-18 의 이름 검사(_RISK_RA_REPORT_TOOLS)가 맨 이름이라 원래 이름으로 보면 reportarchive_list_reports 가 새로
+            # 열린다. 선언 백엔드 · 허브 가족 · orig 를 모르는 옛 게이트웨이도 그대로다(_free_orig_names).
+            _orig = {} if (_risk_chair or opts.started_by == "app") else _free_orig_names()
             # 기준일 심의면 좌석의 agent_search 에도 그 날을 박는다(_as_of_guard — 모델이 빼거나 바꿀 수 없다)
             _g = {n: _wrap_cached(t, _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
-                  if n.lower() not in _FREE_DENY
+                  if n.lower() not in _FREE_DENY and _orig.get(n, n).lower() not in _FREE_DENY
                   and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
-                      _free_tool_ok(n)
+                      _free_tool_ok(_orig.get(n, n))
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
             # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기 · 대화 검색에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체 · 앞 패널
@@ -6393,8 +6409,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 1인당 몇 회 안 되는 예산을 엉뚱한 앱을 헤매는 데 쓴다. agent_search 는 앱과 무관하게
             # 남긴다 — 페르소나 지식 조회 통로라 이걸 닫으면 전문가가 자기 지식을 못 본다.
             if opts.delib_apps:
+                # 지식 조회 · 물성 목록도 원래 이름으로 본다(F0 — 겹쳐 접두가 붙은 물성 읽기가 앱 지정에서 빠지지 않게, 리스크 심사는 _orig 가 비었다)
                 _narrow = {n: t for n, t in _g.items()
-                           if n == "agent_search" or n in _MATERIAL_TOOLS
+                           if _orig.get(n, n) == "agent_search" or _orig.get(n, n) in _MATERIAL_TOOLS
                            or _amap.get(n) in _apps
                            or (_risk_chair and n in _RISK_KEEP_TOOLS)}
                 # 매핑을 못 받았거나(게이트웨이 불통) 결과가 agent_search 뿐이면 좁히지 않는다 —
