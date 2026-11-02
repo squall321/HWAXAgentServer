@@ -330,6 +330,13 @@ def test_창구는_끝났고_주인과_주제가_있는_비리스크_잡만_낸�
     assert got["next_since"] == 1002.0
 
 
+def test_창구는_퍼센트로_적힌_주인도_낸다(ledger):
+    """주인은 게이트웨이 머리의 원문(퍼센트 인코딩일 수 있다 — _norm)이다. 원문에 '@' 가 없다고 빼면 그 사람의 카드가 조용히 사라진다(반대 검토 11-02 의 12)."""
+    _put(ledger, "pct", user="me%40example.com")
+    got = delib_jobs.insight_items(0.0, 10)["items"]
+    assert [it["job_id"] for it in got] == ["pct"] and got[0]["user"] == "me%40example.com", "원문 그대로 낸다(포털이 푼다)"
+
+
 def test_창구는_since_부터_상한까지_내고_다_냈는지_말한다(ledger):
     for i in range(5):
         _put(ledger, f"j{i}", finished_at=1000.0 + i)

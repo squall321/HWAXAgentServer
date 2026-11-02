@@ -2288,7 +2288,7 @@ def _insight_head_ok(j: dict, since: float) -> bool:
     """목록 색인(또는 메모리 잡)의 칸만으로 가른다 — 끝남 · 시각 · 주인 · 주제 상태 · 의장 틀(started_by 는 원장 전부에서 다시 본다)."""
     import delib_subject  # noqa: PLC0415
     s = j.get("subject")
-    return (j.get("status") in _INSIGHT_DONE and float(j.get("finished_at") or 0) >= since and "@" in str(j.get("user") or "")
+    return (j.get("status") in _INSIGHT_DONE and float(j.get("finished_at") or 0) >= since and "@" in _norm(j.get("user"))
             and isinstance(s, dict) and s.get("sp_state") in (delib_subject.CONFIRMED, delib_subject.CLAIMED)
             and not delib_subject.risk_family(j.get("chair_template")))
 
