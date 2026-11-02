@@ -29,10 +29,12 @@ FIGURES_MAX = 40          # 한 보고서의 그림 칸 — RA 한 쪽 블록 �
 UPLOAD_TIMEOUT = httpx.Timeout(330.0, connect=10.0)
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
          "svg": "image/svg+xml"}
-_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}?\.(?:png|jpe?g|gif|webp|svg)\b"
-# 마크다운 그림(1: 설명 · 2: 이름) 또는 맨 주소(3: 이름). 앞에 붙은 절대 주소(https://포털/agent/artifacts/…)도 함께 바꾼다.
-_REF_RE = re.compile(r"!\[([^\]\n]{0,300})\]\(\s*(?:https?://[^\s/()]+)?/agent/artifacts/(" + _NAME + r")\s*\)"
-                     r"|(?:https?://[^\s/()\]]+)?/agent/artifacts/(" + _NAME + r")", re.I)
+# 이름 끝은 영숫자 · _ 가 아니면 된다 — \b 는 한글을 낱말 글자로 봐서 '…png에' 를 놓쳤다(반대 검토 F1).
+_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}?\.(?:png|jpe?g|gif|webp|svg)(?![A-Za-z0-9_])"
+# 마크다운 그림(1: 설명 · 2: 이름 — 꺾쇠 <주소> · 제목 "…" 도) 또는 맨 주소(3: 이름). 앞에 붙은 절대 주소(https://포털/agent/artifacts/…)도 함께 바꾼다.
+_REF_RE = re.compile(r"!\[([^\]\n]{0,300})\]\(\s*<?\s*(?:https?://[^\s/()<>]+)?/agent/artifacts/(" + _NAME + r")\s*>?"
+                     r"(?:\s+(?:\"[^\"\n]{0,300}\"|'[^'\n]{0,300}'))?\s*\)"
+                     r"|(?:https?://[^\s/()\]<>]+)?/agent/artifacts/(" + _NAME + r")", re.I)
 _CAPTION_MAX, _ALT_MAX = 500, 200          # RA image 위젯 files[].caption · alt 상한
 NO_PAT = "그 사람의 토큰이 없는 길(MCP 로 연 심의 등)이라 올리지 않았다 — 서비스 자격으로는 그림을 올리지 않는다"
 # 그림 하나만의 문제인 포털 답(꼴 · 크기 · 해시 · RA 가 그 파일만 거절) — 그 밖(자격 · 연결 · RA 오류)은 남은 그림도 같으니 더 부르지 않는다
@@ -62,19 +64,25 @@ def count(blocks: dict) -> int:
     return len(_scan(blocks))
 
 
-def uncited(blocks: dict, urls, label=None) -> str:
-    """에이전트가 저장한 그림(urls — /agent/artifacts/<이름>, 처음 나온 차례) 중 블록 글에 주소가 없는 것을 마크다운 그림 줄로 묶은 한 항목.
-    없으면 ''. label(주소 → 설명)이 주는 설명을 그림 줄에 단다(그 그림을 받은 좌석 · 도구). 심의는 좌석 조회가 받은 그림을 발언에 주소로 적지
-    않는다 — 이 항목이 없으면 그 그림들은 보고서에 길이 없다(RF-16)."""
+def uncited(blocks: dict, urls, label=None, *, upload: bool = True) -> tuple[str, list[str]]:
+    """에이전트가 저장한 그림(urls — /agent/artifacts/<이름>, 처음 나온 차례) 중 블록 글에 주소가 없는 것 → (블록에 더할 한 항목, 그 주소들).
+    없으면 ('', []). label(주소 → 설명)이 주는 설명을 그림 줄에 단다(그 그림을 받은 좌석 · 도구). 심의는 좌석 조회가 받은 그림을 발언에 주소로 적지
+    않는다 — 이 항목이 없으면 그 그림들은 보고서에 길이 없다(RF-16). upload 가 거짓이면(사람 토큰이 없다) 그림 줄 대신 장수와 까닭 한 줄이다 —
+    같은 까닭의 '올리지 못함' 줄을 그림마다 늘어놓지 않는다(반대 검토 F2). 그때 주소들은 부른 쪽이 셈(add_failed)에 넣는다."""
     have = {n for n, _a in _scan(blocks)}
-    lines: list[str] = []
+    refs, lines = [], []
     for u in dict.fromkeys(urls or []):
         m = _REF_RE.fullmatch(u) if isinstance(u, str) else None
         if m is None or m.group(3) is None or m.group(3) in have:
             continue
         alt = re.sub(r"[\]\[\n]+", " ", str((label(u) if label else "") or "심의 중 도구 그림")).strip()[:120]
+        refs.append(u)
         lines.append(f"![{alt}]({u})")
-    return ("심의 중 도구가 낸 그림(본문에 주소가 없던 것):\n" + "\n".join(lines)) if lines else ""
+    if not refs:
+        return "", []
+    if not upload:
+        return f"심의 중 도구가 낸 그림 {len(refs)}장(본문에 주소가 없던 것) — [그림 — 올리지 못함: {NO_PAT}]", refs
+    return "심의 중 도구가 낸 그림(본문에 주소가 없던 것):\n" + "\n".join(lines), refs
 
 
 @dataclass
@@ -107,10 +115,17 @@ class Figures:
         self.failed += [{"ref": ref, "reason": "보고서가 저장되지 않았다"} for _n, _b, ref in self._ok]
         self._ok = []
 
+    def add_failed(self, refs, reason: str) -> None:
+        """글에 줄로 싣지 않고 한 줄로 센 그림(uncited 의 upload=False) — 찾은 수 · 못 들어간 수에 넣는다."""
+        self.found += len(refs)
+        self.failed += [{"ref": r, "reason": reason} for r in refs]
+
     def summary(self) -> dict:
-        """결과 · outcome 사건에 싣는 셈 — 찾은 수 · 그림 칸으로 들어간 수 · 못 들어간 수와 까닭(앞 다섯)."""
+        """결과 · outcome 사건에 싣는 셈 — 찾은 수 · 그림 칸으로 들어간 수 · 못 들어간 수와 까닭(다른 것만 앞 다섯) · 못 들어간 그림의 주소(앞 스물 —
+        어느 그림인지 가리킨다, 반대 검토 F2)."""
         return {"found": self.found, "attached": self.attached, "failed": len(self.failed),
-                "reasons": [f["reason"] for f in self.failed][:5]}
+                "reasons": list(dict.fromkeys(f["reason"] for f in self.failed))[:5],
+                "failed_refs": [f["ref"] for f in self.failed][:20]}
 
     def note(self) -> str:
         """사람에게 — 몇 장이 들어갔고 몇 장이 못 들어갔나(까닭 하나)."""
@@ -152,32 +167,33 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
         return Figures(blocks=blocks)
     if artifact_dir is None:
         from app import ARTIFACT_DIR as artifact_dir  # noqa: PLC0415 — app 이 이 모듈을 늦게 읽는다(순환 import 회피)
-    res: dict[str, tuple] = {}      # 이름 → ("ok", 번호, 칸) | ("fail", 까닭)
-    by_sha: dict[str, str] = {}     # 내용 해시 → 먼저 올린 이름(이름이 달라도 같은 그림은 칸 하나)
+    res: dict[str, tuple] = {}      # 이름 → ("ok", 번호, 칸, 설명) | ("fail", 까닭, 설명)
+    by_sha: dict[str, str] = {}     # 내용 해시 → 먼저 올린 이름(이름이 달라도 같은 그림은 칸 하나 · 한 장으로 센다)
     out = Figures(blocks=blocks, found=len(found))
     n, stop = 0, NO_PAT if not user_pat else ""
     async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT, transport=PORTAL_TRANSPORT) as cli:
         for name, alt in found:
             try:
                 if stop:                    # 사람 토큰이 없거나 앞 그림이 자격 · 연결에서 막혔다 — 남은 그림도 같은 까닭이다
-                    res[name] = ("fail", stop)
+                    res[name] = ("fail", stop, alt)
                     continue
                 if n >= FIGURES_MAX:
-                    res[name] = ("fail", f"보고서 하나에 그림은 {FIGURES_MAX}장까지 싣는다 — 나머지는 대화에서 본다")
+                    res[name] = ("fail", f"보고서 하나에 그림은 {FIGURES_MAX}장까지 싣는다 — 나머지는 대화에서 본다", alt)
                     continue
                 p = os.path.join(artifact_dir, name)
                 if not os.path.isfile(p):
-                    res[name] = ("fail", "그림 파일이 서버에 없다 — 오래된 도구 그림은 지워진다(최근 것만 남긴다)")
+                    res[name] = ("fail", "그림 파일이 서버에 없다 — 오래된 도구 그림은 지워진다(최근 것만 남긴다)", alt)
                     continue
                 with open(p, "rb") as f:
                     raw = f.read()
                 sha = hashlib.sha256(raw).hexdigest()
                 if sha in by_sha:
                     res[name] = res[by_sha[sha]]
+                    out.found -= 1
                     continue
                 fid, why, fatal = await _upload(cli, user_pat, name, raw, sha, alt)
                 if fid is None:
-                    res[name] = ("fail", why)
+                    res[name] = ("fail", why, alt)
                     stop = why if fatal else ""
                     continue
                 n += 1
@@ -186,20 +202,21 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
                     cap = cap[:_CAPTION_MAX - 1] + "…"
                 blk = {"id": f"fig_{sha[:16]}", "type": "image", "props": {"max_count": 1},
                        "content": {"files": [{"file_id": fid, "caption": cap, "alt": (alt or "도구 그림")[:_ALT_MAX]}]}}
-                res[name] = ("ok", n, blk)
+                res[name] = ("ok", n, blk, alt)
                 by_sha[sha] = name
                 out.extra_blocks.append(blk)
                 out._ok.append((n, blk["id"], f"/agent/artifacts/{name}"))
             except Exception as exc:  # noqa: BLE001 — 그림 하나의 실패가 보고서를 막지 않는다(까닭은 그 자리에 남는다)
-                res[name] = ("fail", f"올리는 중 오류({type(exc).__name__})")
+                res[name] = ("fail", f"올리는 중 오류({type(exc).__name__})", alt)
     out.failed = [{"ref": f"/agent/artifacts/{name}", "reason": r[1]} for name, r in res.items() if r[0] == "fail"]
 
     def mark(m: re.Match) -> str:
-        r = res[m.group(2) or m.group(3)]          # 같은 정규식으로 찾은 이름이라 늘 있다
+        # 같은 정규식으로 찾은 이름이라 늘 있다. 설명은 그 그림의 것 하나(처음 나온 설명 — 캡션과 같다)라 같은 그림은 어디서나 같은 표지다.
+        # 못 올린 그림도 설명을 남긴다 — 어느 그림이었는지 읽는 사람이 안다(반대 검토 F2 · F5).
+        r = res[m.group(2) or m.group(3)]
         if r[0] == "fail":
-            return f"[그림 — 올리지 못함: {r[1]}]"
-        alt = (m.group(1) or "").strip()
-        return f"[그림 {r[1]} — {alt}]" if alt else f"[그림 {r[1]}]"
+            return f"[그림 — 올리지 못함: {r[1]} · {r[2]}]" if r[2] else f"[그림 — 올리지 못함: {r[1]}]"
+        return f"[그림 {r[1]} — {r[3]}]" if r[3] else f"[그림 {r[1]}]"
 
     out.blocks = {k: ([_REF_RE.sub(mark, it) if isinstance(it, str) else it for it in v] if isinstance(v, list) else v)
                   for k, v in blocks.items()}

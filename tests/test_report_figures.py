@@ -90,7 +90,7 @@ def test_마크다운_맨_주소_절대_주소를_찾아_한_번씩_올리고_�
     assert portal.got[0]["meta"]["mime"] == "image/png" and portal.got[0]["meta"]["caption"] == "응력 분포"
     assert out.blocks["results"] == ["응력은 이렇다.\n[그림 1 — 응력 분포]\n끝."]
     assert out.blocks["minutes"] == ["[생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n[그림 2]",
-                                     "다시 본다 [그림 1] 그리고 [그림 2]."]
+                                     "다시 본다 [그림 1 — 응력 분포] 그리고 [그림 2]."], "같은 그림은 어디서나 같은 표지(설명은 처음 것)"
     assert "/agent/artifacts/" not in json.dumps(out.blocks, ensure_ascii=False), "포털 상대 주소가 RA 로 가지 않는다"
     assert out.extra_blocks == [
         {"id": f"fig_{hashlib.sha256(PNG).hexdigest()[:16]}", "type": "image", "props": {"max_count": 1},
@@ -98,7 +98,7 @@ def test_마크다운_맨_주소_절대_주소를_찾아_한_번씩_올리고_�
         {"id": f"fig_{hashlib.sha256(PNG2).hexdigest()[:16]}", "type": "image", "props": {"max_count": 1},
          "content": {"files": [{"file_id": "f2", "caption": "그림 2", "alt": "도구 그림"}]}}]
     assert all(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", x["id"]) for x in out.extra_blocks), "RA 블록 id 규칙"
-    assert out.summary() == {"found": 2, "attached": 2, "failed": 0, "reasons": []}
+    assert out.summary() == {"found": 2, "attached": 2, "failed": 0, "reasons": [], "failed_refs": []}
     assert blocks["results"][0].endswith("끝.") and "/agent/artifacts/" in blocks["results"][0], "받은 블록은 바꾸지 않는다(새 사본)"
 
 
@@ -115,7 +115,7 @@ def test_PAT_가_없으면_부르지_않고_모든_그림_자리에_까닭(figs)
     a, b = _name(PNG, "png"), _name(PNG2, "png")
     out = _attach({"results": [f"![x](/agent/artifacts/{a}) /agent/artifacts/{b}"]}, pat="")
     assert portal.got == [], "서비스 자격으로는 올리지 않는다"
-    assert out.blocks["results"] == [f"[그림 — 올리지 못함: {RF.NO_PAT}] [그림 — 올리지 못함: {RF.NO_PAT}]"]
+    assert out.blocks["results"] == [f"[그림 — 올리지 못함: {RF.NO_PAT} · x] [그림 — 올리지 못함: {RF.NO_PAT}]"]
     assert out.extra_blocks == [] and out.summary()["failed"] == 2 and out.summary()["attached"] == 0
 
 
@@ -125,7 +125,7 @@ def test_파일이_없거나_SVG_면_그_그림만_까닭을_남기고_다음_�
     portal.refuse[s] = (415, "unsupported_media_type", "SVG 는 Report Archive 그림으로 넣지 않습니다 — PNG · JPEG · GIF · WebP 만.")
     out = _attach({"results": [f"![a](/agent/artifacts/{gone})", f"![b](/agent/artifacts/{s})", f"![c](/agent/artifacts/{ok})"]})
     assert out.blocks["results"][0].startswith("[그림 — 올리지 못함: 그림 파일이 서버에 없다")
-    assert out.blocks["results"][1] == "[그림 — 올리지 못함: SVG 는 Report Archive 그림으로 넣지 않습니다 — PNG · JPEG · GIF · WebP 만(HTTP 415)]"
+    assert out.blocks["results"][1] == "[그림 — 올리지 못함: SVG 는 Report Archive 그림으로 넣지 않습니다 — PNG · JPEG · GIF · WebP 만(HTTP 415) · b]"
     assert out.blocks["results"][2] == "[그림 1 — c]", "그림 하나의 문제는 다음 그림을 막지 않는다"
     assert [g["meta"]["filename"] for g in portal.got] == [s, ok] and portal.got[0]["meta"]["mime"] == "image/svg+xml"
     assert out.summary()["found"] == 3 and out.summary()["attached"] == 1 and out.summary()["failed"] == 2
@@ -208,7 +208,7 @@ def test_보고서는_대화의_도구_그림을_그림_칸으로_싣고_몇_장
     dumped = json.dumps(args["blocks"], ensure_ascii=False)
     assert "[그림 1 — 생성된 그래프]" in dumped and "/agent/artifacts/" not in dumped
     assert list(args) == ["template_id", "template_version", "title", "blocks", "extra_blocks", "tags"]
-    assert res["figures"] == {"found": 1, "attached": 1, "failed": 0, "reasons": []}
+    assert res["figures"] == {"found": 1, "attached": 1, "failed": 0, "reasons": [], "failed_refs": []}
     assert "그림 1장을 보고서에 그림 칸으로 실었다" in res["content"] and res["ra_report"]["id"] == 58
     assert portal.got[0]["auth"] == "Bearer pat-kim"
 
@@ -221,7 +221,7 @@ def test_보고서에서_못_올린_그림은_그_자리에_까닭이_남는다(
     tool, res = _report_save(monkeypatch, history)
     (args,) = tool.calls
     assert "extra_blocks" not in args, "실은 그림이 없으면 칸도 없다"
-    assert "[그림 — 올리지 못함: SVG 는 Report Archive 그림으로 넣지 않습니다(HTTP 415)]" in json.dumps(args["blocks"], ensure_ascii=False)
+    assert "[그림 — 올리지 못함: SVG 는 Report Archive 그림으로 넣지 않습니다(HTTP 415) · 도면]" in json.dumps(args["blocks"], ensure_ascii=False)
     assert res["figures"]["failed"] == 1 and "싣지 못했다" in res["content"]
 
 
@@ -269,7 +269,7 @@ def test_심의_보고서는_사람_PAT_로_그림을_그림_칸으로_싣고_ou
     rec = json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
     assert "[그림 1 — 응력]" in rec and "/agent/artifacts/" not in json.dumps(args["blocks"], ensure_ascii=False)
     assert portal.got[0]["auth"] == "Bearer pat-kim"
-    assert view["report_figures"] == {"found": 1, "attached": 1, "failed": 0, "reasons": []}, "잡 결과가 센다"
+    assert view["report_figures"] == {"found": 1, "attached": 1, "failed": 0, "reasons": [], "failed_refs": []}, "잡 결과가 센다"
     assert "그림 1장을 보고서에 그림 칸으로 실었다" in view["decision"], "결정문 끝 안내"
     assert "![응력](/agent/artifacts/" in view["decision"], "대화에 보이는 결정문의 그림은 그대로다(보고서 사본만 바꾼다)"
 
@@ -281,8 +281,9 @@ def test_사람_PAT_가_없는_심의_MCP_잡_은_올리지_않고_보고서_그
     (args,) = res["reports"]
     assert portal.got == [], "서비스 자격으로는 올리지 않는다"
     assert "extra_blocks" not in args
-    assert f"[그림 — 올리지 못함: {RF.NO_PAT}]" in json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
-    assert view["report_figures"] == {"found": 1, "attached": 0, "failed": 1, "reasons": [RF.NO_PAT]}
+    assert f"[그림 — 올리지 못함: {RF.NO_PAT} · 응력]" in json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
+    assert view["report_figures"] == {"found": 1, "attached": 0, "failed": 1, "reasons": [RF.NO_PAT],
+                                      "failed_refs": [f"/agent/artifacts/{_name(PNG, 'png')}"]}
     assert "그림 1장을 보고서에 싣지 못했다" in view["decision"]
 
 
@@ -335,3 +336,73 @@ def test_이어붙이는_심의도_새_쪽에_그림_칸을_싣는다(world, fig
     assert "[그림 1 — 응력]" in json.dumps(args["blocks"]["recommendation"], ensure_ascii=False)
     assert view["report_id"] == 41 and view["report_figures"]["attached"] == 1
 
+
+
+# ── 반대 검토(11-02)에서 재현한 것 ────────────────────────────────────────────────────────────────────────────────
+def test_조사가_바로_붙은_맨_주소도_찾는다(figs):
+    """\\b 는 한글을 낱말 글자로 본다 — '…png에' 가 맞지 않아 그림이 표지도 셈도 없이 포털 상대 주소로 RA 에 갔다(검토 F1)."""
+    portal, _d = figs
+    a = _name(PNG, "png")
+    out = _attach({"results": [f"그래프는 /agent/artifacts/{a}에 있습니다."]})
+    assert out.blocks["results"] == ["그래프는 [그림 1]에 있습니다."] and len(portal.got) == 1
+
+
+def test_제목_꺾쇠가_붙은_마크다운_그림도_통째로_바꾸고_설명을_잇는다(figs):
+    """검토 F5 — ![a](url "제목") · ![a](<url>) 가 '![a]([그림 1] "…")' 로 깨지고 캡션이 설명을 잃었다."""
+    _portal, _d = figs
+    a, b = _name(PNG, "png"), _name(PNG2, "png")
+    out = _attach({"results": [f'![응력 분포](/agent/artifacts/{a} "낙하 1.2 m")', f"![변형](</agent/artifacts/{b}>)"]})
+    assert out.blocks["results"] == ["[그림 1 — 응력 분포]", "[그림 2 — 변형]"]
+    assert [x["content"]["files"][0]["caption"] for x in out.extra_blocks] == ["그림 1 — 응력 분포", "그림 2 — 변형"]
+
+
+def test_같은_그림은_어디서나_같은_표지이고_캡션과_맞는다(figs):
+    """검토 F5 — 같은 그림을 다른 설명으로 두 번 인용하면 글은 '그림 1 — 변위', 캡션은 '그림 1 — 최대 응력' 이었다."""
+    _portal, _d = figs
+    a = _name(PNG, "png")
+    out = _attach({"results": [f"![최대 응력](/agent/artifacts/{a})"], "minutes": [f"![변위](/agent/artifacts/{a}) 그리고 /agent/artifacts/{a}"]})
+    assert out.blocks["minutes"] == ["[그림 1 — 최대 응력] 그리고 [그림 1 — 최대 응력]"]
+    assert out.extra_blocks[0]["content"]["files"][0]["caption"] == "그림 1 — 최대 응력"
+
+
+def test_이름만_다른_같은_그림은_한_장으로_센다(figs):
+    """검토 F5 — 같은 바이트 · 다른 이름 둘이 found 2 · attached 1 · failed 0 으로 셈이 맞지 않았다."""
+    _portal, d = figs
+    (d / ("f" * 20 + ".png")).write_bytes(PNG)
+    out = _attach({"results": [f"/agent/artifacts/{_name(PNG, 'png')} /agent/artifacts/{'f' * 20}.png"]})
+    s = out.summary()
+    assert (s["found"], s["attached"], s["failed"]) == (1, 1, 0)
+
+
+def test_못_올린_그림의_표지에_설명이_남고_셈에_주소가_남는다(figs):
+    """검토 F2 — 못 올린 그림의 자리 표지가 설명을 버리고 셈에도 주소가 없어 어느 그림인지 알 길이 없었다. 같은 까닭은 한 번만 적는다."""
+    _portal, _d = figs
+    a, b = _name(PNG, "png"), _name(PNG2, "png")
+    out = _attach({"results": [f"![응력](/agent/artifacts/{a}) ![변위](/agent/artifacts/{b})"]}, pat="")
+    assert out.blocks["results"] == [f"[그림 — 올리지 못함: {RF.NO_PAT} · 응력] [그림 — 올리지 못함: {RF.NO_PAT} · 변위]"]
+    s = out.summary()
+    assert s["reasons"] == [RF.NO_PAT], "같은 까닭은 한 번"
+    assert s["failed_refs"] == [f"/agent/artifacts/{a}", f"/agent/artifacts/{b}"]
+
+
+def test_사람_토큰_없는_심의는_본문에_없던_그림을_한_줄로_세고_주소를_결과에(world, figs, monkeypatch):
+    """검토 F2 — PAT 없는 MCP 잡에서 좌석 조회 그림 N장이 똑같은 '올리지 못함' 줄 N개가 됐다. 한 줄에 장수와 까닭, 잡 결과에 주소."""
+    portal, _d = figs
+    real = world.gather
+    imgs = [PNG + bytes([i]) * 50 for i in range(4)]
+    urls: list = []
+
+    async def gather(agent, persona, question, ctx, budget, prior=""):
+        k, calls, text, extra = await real(agent, persona, question, ctx, budget, prior)
+        if imgs:
+            urls.extend(app._stash_image_items([{"type": "image", "data": base64.b64encode(imgs.pop()).decode(),
+                                                 "mimeType": "image/png"}]))
+        return k, calls, text, extra
+    monkeypatch.setattr(D, "_free_gather_one", gather)
+    res, view = _run_job(world)
+    (args,) = res["reports"]
+    bg = [x for x in args["blocks"]["background"] if "심의 중 도구가 낸 그림" in x]
+    assert bg == [f"심의 중 도구가 낸 그림 4장(본문에 주소가 없던 것) — [그림 — 올리지 못함: {RF.NO_PAT}]"]
+    assert portal.got == [] and "extra_blocks" not in args
+    f = view["report_figures"]
+    assert (f["found"], f["attached"], f["failed"]) == (4, 0, 4) and sorted(f["failed_refs"]) == sorted(urls)

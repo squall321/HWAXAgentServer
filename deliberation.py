@@ -8177,16 +8177,20 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                   "(결정문 전문은 deliberate_result, 발언 전문은 deliberate_transcript 에 있다).")
         # 도구 그림(HWAXPortal docs/report-figures RF-9) — 글 속 그림을 그 사람 명의로 먼저 올려 자리를 표지로 바꾸고, 그림 칸을 저장 호출에 함께
         # 싣는다. 사람 토큰이 없는 잡(MCP)은 올리지 않고 그 자리에 까닭을 남긴다. 그림이 없으면 인자 · 사건이 종전과 같다.
+        _unc_left: list = []            # 사람 토큰이 없어 줄 대신 한 줄로 센 본문 밖 그림(RF-16 · 반대 검토 F2)
         if _rsav is None and _do_save:
-            _unc = report_figures.uncited(blocks, _fig_bag, lambda u: next(
-                (f"{_s} · {_t}" for _r, _s, _t, _a, _o in gather_pool if u in str(_o)), ""))
+            _unc, _unc_refs = report_figures.uncited(blocks, _fig_bag, lambda u: next(
+                (f"{_s} · {_t}" for _r, _s, _t, _a, _o in gather_pool if u in str(_o)), ""), upload=bool(user_pat))
             if _unc:
                 blocks["background"] = list(blocks["background"]) + [_unc]
+                _unc_left = [] if user_pat else _unc_refs
         _nfig = report_figures.count(blocks) if _rsav is None and _do_save else 0
-        if _nfig:
-            yield _sse("status", {"step": f"보고서에 실을 그림 {_nfig}장을 Report Archive 에 올리는 중", "tool": None})
+        if _nfig or _unc_left:
+            if _nfig:
+                yield _sse("status", {"step": f"보고서에 실을 그림 {_nfig}장을 Report Archive 에 올리는 중", "tool": None})
             _figs = await report_figures.attach(blocks, user_pat=user_pat)
             blocks = _figs.blocks
+            _figs.add_failed(_unc_left, report_figures.NO_PAT)
         _fig_kw = {"extra_blocks": _figs.extra_blocks} if _figs is not None and _figs.extra_blocks else {}
         if _rint is None and _jon:
             # 재개 자료(HA-09 S3 — e:report_intent) — RA 호출 직전. 이 줄만 남고 끊기면 저장됐는지 알 수 없다 — 이을 때 경고하고 새로 저장한다.
