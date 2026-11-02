@@ -8450,6 +8450,8 @@ async def _with_delib_images(req, q: str, start):
     _rec = got.get("subject")
     arm = (_delib_engine.INSIGHT_ARM.set(True)
            if isinstance(_rec, dict) and _rec.get("sp_state") in ("confirmed", "claimed") else None)
+    # 이 요청의 단 사이 잇기(다단 심의의 뒤 단 카드가 앞 단의 근거를 담는다 — deliberation.INSIGHT_CARRY)
+    carry = _delib_engine.INSIGHT_CARRY.set({"tools": [], "untracked": []}) if arm is not None else None
     imgs = _delib_image_list(req)
     tok = None
     if imgs:
@@ -8481,6 +8483,7 @@ async def _with_delib_images(req, q: str, start):
         if arm is not None:
             try:
                 _delib_engine.INSIGHT_ARM.reset(arm)
+                _delib_engine.INSIGHT_CARRY.reset(carry)
             except ValueError:   # 위와 같다
                 pass
 

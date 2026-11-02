@@ -89,7 +89,8 @@ def _card(**kw):
 def test_카드_칸은_늘_같고_근거_표지는_하나씩_지문과_앱을_단다():
     c = _card()
     assert set(c) == {"stage", "claim", "claim_from", "tally", "report_id", "report_url", "model", "calls", "tools", "apps",
-                      "apps_unknown", "refs"}
+                      "apps_unknown", "untracked", "refs"}
+    assert c["untracked"] == ["evidence"], "도구 없는 근거(메모)는 표지가 없어 범위를 모르는 입력으로 적는다"
     assert c["stage"] == "diagnosis" and c["claim"] == SUMMARY and c["tally"] == {"agree": 2, "conditional": 1, "oppose": 0, "abstain": 1}
     tools = [x["tool"] for x in c["calls"]]
     assert tools == ["find_part", "query_voc", "get_spec"], "같은 (도구, 인자, 결과)는 하나 · 판독문은 도구가 아니다 · 도구 없는 근거는 표지가 없다"
@@ -100,7 +101,32 @@ def test_카드_칸은_늘_같고_근거_표지는_하나씩_지문과_앱을_�
     assert c["apps"] == ["_gateway", "ai-data-hub", "heax-step_forge", "signalforge"] and c["apps_unknown"] == ["alert_check"]
     assert c["refs"] == ["rpt:7"] + [x["ref"] for x in c["calls"]]
     bare = _card(rid=None, pool=[], evidence=[], designated=[], pre_tools=[], summary="", plain="")
-    assert bare["refs"] == [] and bare["calls"] == [] and bare["claim"] == "" and bare["report_id"] is None
+    assert bare["refs"] == [] and bare["calls"] == [] and bare["claim"] == "" and bare["report_id"] is None and bare["untracked"] == []
+
+
+def test_범위를_모르는_입력은_untracked_에_적는다():
+    """도구 없는 근거 글 · 사람 의견(보강 글) · 앞 회차 요약 · 그림은 근거 표지가 없어 그 범위(남의 보고서 · 다른 앱의 결과가 섞였나)를 모른다 —
+    카드가 그 사실을 적어야 포털이 조직 공개를 멈춘다(반대 검토 11-02 의 2 — 표지가 비면 '근거 범위를 다 안다' 로 읽혀 조직에 열렸다)."""
+    bare = dict(pool=[], evidence=[], designated=[], pre_tools=[])
+    assert _card(**bare)["untracked"] == []
+    assert _card(**{**bare, "evidence": [{"source": "RA 보고서 발췌", "result": "기밀 412 MPa"}]})["untracked"] == ["evidence"]
+    assert _card(**{**bare, "evidence": [{"tool": "query_voc", "result": "VOC"}]})["untracked"] == [], "도구가 있는 근거는 표지로 센다"
+    assert _card(**bare, human_note="현장 의견")["untracked"] == ["note"]
+    assert _card(**bare, continue_summary="앞 회차 요약")["untracked"] == ["summary"]
+    assert _card(**bare, images=True)["untracked"] == ["images"]
+    assert _card(**bare, human_note="  ", continue_summary="")["untracked"] == [], "빈 글은 입력이 아니다"
+    every = _card(**{**bare, "evidence": [{"source": "x", "result": "y"}]}, human_note="n", continue_summary="s", images=True)
+    assert every["untracked"] == ["evidence", "note", "summary", "images"]
+
+
+def test_되살린_단의_지정_도구_표지는_재개_자료에서_다시_싣는다():
+    """제자리 이어하기는 지정 도구를 다시 부르지 않는다(재개 자료 e:pre) — 그 표지를 재개 자료에서 되살려 실어야 이어 돈 단의 카드가 끊지 않은 실행과
+    같다(반대 검토 11-02 의 미확인 하나 — 도구 이름은 남고 표지 · refs 만 빠졌다)."""
+    pre = d._insight_calls([], [], [("get_spec", {"id": 3}, "스펙 3")])
+    c = _card(designated=[], pre_calls=pre)
+    got = [x for x in c["calls"] if x["tool"] == "get_spec"]
+    assert [x["ref"] for x in got] == [pre[0]["ref"]] and got[0]["app"] == "_gateway" and pre[0]["ref"] in c["refs"]
+    assert [x["tool"] for x in _card(pre_calls=pre)["calls"]].count("get_spec") == 1, "이번 실행에도 있으면 하나다"
 
 
 def test_인자는_엔진의_인자_표기_상한까지다():
@@ -109,7 +135,7 @@ def test_인자는_엔진의_인자_표기_상한까지다():
 
 
 # ── 엔진 끝까지 — 무장한 심의만 카드 거리를 낸다 ─────────────────────────────────────────────────
-def _run_engine(monkeypatch, tmp_path, *, subject=None, job="default"):
+def _run_engine(monkeypatch, tmp_path, *, subject=None, job="default", **start_kw):
     """실제 MCP 도구(deliberate_start)로 열어 실제 엔진을 끝까지 돌린다(test_delib_sealed._run 과 같은 대역 — 요약 · 쉬운 설명만 정해 둔 글)."""
     import langgraph.prebuilt
 
@@ -151,7 +177,7 @@ def _run_engine(monkeypatch, tmp_path, *, subject=None, job="default"):
     async def go():
         out = await m.deliberate_start("힌지 브래킷 리브를 보강할 것인가", job=job, rounds=2,
                                        personas=[{"key": "mech-a", "role": "기구"}, {"key": "rel-b", "role": "신뢰성"}],
-                                       subject=subject, ctx=_ctx(ME, "CAEG"))
+                                       subject=subject, ctx=_ctx(ME, "CAEG"), **start_kw)
         await delib_jobs._TASKS[out["job_id"]]
         return delib_jobs._JOBS[out["job_id"]]
 
@@ -167,6 +193,36 @@ def test_주제를_단_MCP_잡은_단마다_카드_거리를_원장에_남긴다
     assert card["claim"] == SUMMARY and card["claim_from"] == "summary" and card["report_id"] == 7 and card["model"] == "glm-test"
     assert card["tally"]["agree"] + card["tally"]["abstain"] + card["tally"]["conditional"] + card["tally"]["oppose"] == 2
     assert "kind" not in card and KEY not in json.dumps(card, ensure_ascii=False), "카드 거리에는 주제가 없다(엔진은 주제를 모른다)"
+
+
+def test_엔진은_도구_없는_근거와_사람_의견을_카드에_범위_모름으로_적는다(monkeypatch, tmp_path, hub):
+    rec, _ins, _evs = _run_engine(monkeypatch, tmp_path, subject={"sp_task": KEY}, human_note="현장 의견 — 리브부터",
+                                  evidence=[{"source": "붙인 문서", "result": "낙하 1.5 m 에서 412 MPa"}])
+    assert rec["insights"]["default"]["untracked"] == ["evidence", "note"]
+
+
+@pytest.mark.parametrize("job,stage,snap", [("test-plan", "test-plan", {"database_summary", "coverage_gaps", "list_materials"}),
+                                            ("sim", "sim-plan", {"list_tool_apps"})])
+def test_단_준비의_현황_조회_도구는_그_단_카드의_근거_도구다(monkeypatch, tmp_path, hub, job, stage, snap):
+    """시험 설계의 물성 근거 현황 · 해석 설계 2단의 사내 자산 현황은 엔진 밖(단 준비)에서 도구를 불러 사람 의견 칸에 붙인다 — 그 도구가 카드의 근거
+    도구에 들어야 포털이 넓힐 때 그 앱의 plat 토큰을 단다(빠지면 그 앱 권한 없는 같은 소속이 그 결과로 지은 카드를 본다). 엔진이 채운 의견 칸
+    (지시문 · 현황 글)은 '범위 모름' 이 아니다 — 호출자가 쓴 의견만 그렇다."""
+    rec, _ins, _evs = _run_engine(monkeypatch, tmp_path, subject={"sp_task": KEY}, job=job)
+    card = rec["insights"][stage]
+    assert snap <= set(card["tools"]), card["tools"]
+    assert card["untracked"] == [], card["untracked"]
+
+
+def test_다단_심의의_뒤_단_카드는_앞_단_카드의_근거와_범위_모름을_담는다(monkeypatch, tmp_path, hub):
+    """해석 설계 2단은 1단 결정문(앞 회차 요약 칸)에 기댄다 — 2단 카드는 1단 카드의 근거 도구 · 범위 모름 표지를 다 담는다(PLAN §6.2 최소 범위).
+    호출자의 사람 의견은 1단의 입력이라 1단에서 표지가 서고 2단으로 이어진다."""
+    rec, _ins, _evs = _run_engine(monkeypatch, tmp_path, subject={"sp_task": KEY}, job="sim", human_note="현장 의견",
+                                  evidence=[{"tool": "find_part", "args": "{}", "result": "부품 12"}])
+    one, two = rec["insights"]["mechanism"], rec["insights"]["sim-plan"]
+    assert "find_part" in one["tools"] and set(one["tools"]) <= set(two["tools"])
+    assert one["untracked"] == ["note"] and two["untracked"] == ["note"], (one["untracked"], two["untracked"])
+    tp = _run_engine(monkeypatch, tmp_path / "tp", subject={"sp_task": KEY}, job="test-plan", human_note="현장 의견")[0]
+    assert tp["insights"]["test-plan"]["untracked"] == ["note"], "시험 설계는 호출자가 쓴 의견만 표지가 선다"
 
 
 def test_주장으로_남은_주제도_카드_거리를_짓는다(monkeypatch, tmp_path, hub):

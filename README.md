@@ -441,7 +441,12 @@ has — no new LLM call. The engine still does not see the subject; the card car
   `calls` (evidence markers for seat lookups, caller evidence with a tool and designated tools — tool, arguments up to 1,200
   characters, result sha256, ok; `ref = call:<16 hex>`; 60 at most), `tools` (every evidence tool, including VOC recall,
   the evidence prepass and persona knowledge — restored from `e:pre.ins_tools` on an in-place resume), `apps` /
-  `apps_unknown` (gateway `/tools-map`), `refs`. No card when the chair produced no decision.
+  `apps_unknown` (gateway `/tools-map`), `untracked` (inputs with no evidence marker, so their scope is unknown — `evidence`
+  for caller evidence without a tool, `note` for the caller's human note, `summary` for a caller's continue summary, `images`),
+  `refs`. Designated-tool markers are restored from `e:pre.ins_calls` on an in-place resume. Within one deliberation the
+  later stage's card carries the earlier stages' evidence tools and `untracked` flags, plus the tools the stage prep called
+  (test-plan material snapshot, sim stage-2 asset snapshot) — `deliberation.INSIGHT_CARRY`, saved in `e:stage_in` and the
+  stage checkpoint. No card when the chair produced no decision.
 - MCP jobs keep the last card per stage in `job.insights`. A normal `deliberate_continue` now records `continues` (the
   previous job id) on the new job.
 - `GET /insights/cards?since=&limit=` (gateway secret, like `/seat-questions`) lists finished jobs (`done` · `error`) with an

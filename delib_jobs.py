@@ -1383,8 +1383,9 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
     """잡을 띄울 때 부를 것 — 시작(start)과 재기동 뒤 다시 세우기(_requeue)가 같은 것을 만든다. 주제를 단 잡이면(insight_armed) 그 태스크 문맥에
     과제 인사이트 무장 표지를 건다 — 줄 · 다시 세우기 · 제자리 이어하기가 다 이 자리를 지난다."""
     if insight_armed(job):
-        from deliberation import INSIGHT_ARM  # noqa: PLC0415 — 순환 import 회피(_entry 와 같다)
+        from deliberation import INSIGHT_ARM, INSIGHT_CARRY  # noqa: PLC0415 — 순환 import 회피(_entry 와 같다)
         ctx.run(INSIGHT_ARM.set, True)
+        ctx.run(INSIGHT_CARRY.set, {"tools": [], "untracked": []})   # 이 잡의 단 사이 잇기(다단 심의의 뒤 단이 앞 단의 근거를 담는다)
 
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
