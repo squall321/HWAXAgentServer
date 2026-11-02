@@ -4584,7 +4584,9 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
            _onto_entries(),
            bool(allow_panels),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
-    _snap_key = (frozenset(groups), (user or "").strip().lower(), bool(allow_panels))   # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다
+    # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다. 입구 쌍도 든다 — 없으면 입구를 켠 뒤 게이트웨이가 불통일 때 켜기 전에 지은(표지 없는) 묶음이
+    # 규칙 ⑧ 과 함께 돌았다(반대 검토 11-02 — HWAXPortal docs/ontology-first OF-24). 입구가 다를 때 지은 스냅샷은 쓰지 않는다(그 턴은 도구 없이 돈다).
+    _snap_key = (frozenset(groups), (user or "").strip().lower(), _onto_entries(), bool(allow_panels))
     cache = app.state.agent_cache
     hit = cache.get(key)
     if hit is not None and AGENT_CACHE_TTL_S > 0 and time.time() - getattr(hit, "_hwax_at", time.time()) > AGENT_CACHE_TTL_S:

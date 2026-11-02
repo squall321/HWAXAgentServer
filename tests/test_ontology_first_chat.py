@@ -251,3 +251,51 @@ def test_입구를_켜고_끄면_챗_에이전트_묶음을_새로_짓는다(mon
     build()                                    # 같은 입구 — 캐시를 쓴다
     assert len(built) == 2 and len(state.agent_cache) == 2, (len(built), list(state.agent_cache))
     assert onto_links.MARK not in built[0]["onto_search"] and built[1]["onto_search"].startswith(f"[StepForge · {onto_links.MARK}]")
+
+
+def test_스냅샷_폴백은_입구가_다를_때_지은_묶음을_쓰지_않는다(monkeypatch, tmp_path):
+    """게이트웨이 불통 때의 스냅샷 폴백도 입구 쌍으로 가른다 — 캐시 열쇠에는 입구가 있었고 스냅샷 열쇠에는 없어, 입구를 켠 뒤 불통이면 규칙 ⑧ 은 서는데
+    켜기 전에 지은(표지 없는) 묶음이 돌았다(반대 검토 11-02 — OF-24). 같은 입구로 지은 스냅샷은 그대로 쓴다."""
+    built = []
+
+    def _fake_react(_llm, tools, **_k):
+        built.append({t.name: t.description for t in tools})
+        return types.SimpleNamespace()
+    down = {"on": False}
+
+    class _StubClient:
+        def __init__(self, _c, **_k):
+            pass
+
+        async def get_tools(self):
+            if down["on"]:
+                raise RuntimeError("gateway down 503")
+            return [_tool("onto_search", "이름을 푼다"), _tool("list_parts")]
+
+    monkeypatch.setattr(a, "create_react_agent", _fake_react)
+    monkeypatch.setattr(a, "MultiServerMCPClient", _StubClient)
+    monkeypatch.setattr(a, "TOOL_MAX", 0)
+    monkeypatch.setattr(a, "_chat_llm_of", lambda _app: object())
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda *_a, **_k: _real_sleep(0))      # 다시 받기(_get_tools_retry)의 기다림을 건너뛴다
+    _map(monkeypatch, _DEV, {}, labels={"heax-step_forge": "StepForge"})
+    state = types.SimpleNamespace(llm=object(), connections={"gateway": {"url": "http://gw/mcp", "headers": {}}},
+                                  agent_cache={}, tool_degraded={}, tool_load_error={}, tool_snapshot={})
+    d = _real_vocab()
+
+    def build() -> dict:
+        asyncio.run(a._agent_for(types.SimpleNamespace(state=state), ["admin"], user="u@x"))
+        return built[-1]
+
+    _use(monkeypatch, tmp_path, d)
+    assert onto_links.MARK not in build()["onto_search"], "입구 없음 — 표지 없는 묶음이 스냅샷에 남는다"
+    _use(monkeypatch, tmp_path, d, overlay=_SF_ENTRY)
+    down["on"] = True
+    got = build()
+    assert "⑧" in a._system_prompt(), "시험 전제 — 입구를 켜 규칙 ⑧ 이 섰다"
+    assert got == {}, ("입구가 다를 때 지은 스냅샷은 쓰지 않는다 — 규칙 ⑧ 과 표지 없는 입구 도구가 함께 돌지 않게", got)
+    down["on"] = False
+    assert build()["onto_search"].startswith(f"[StepForge · {onto_links.MARK}]")
+    state.agent_cache.clear()                 # 캐시 창(AGENT_CACHE_TTL_S)이 지난 것처럼 — 다시 지을 때 불통이면 스냅샷 폴백을 탄다
+    down["on"] = True
+    assert build()["onto_search"].startswith(f"[StepForge · {onto_links.MARK}]"), "같은 입구로 지은 스냅샷은 그대로 쓴다"
