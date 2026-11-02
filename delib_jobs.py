@@ -807,9 +807,12 @@ def _path(job_id: str) -> Path:
 # (_list_load). 시각을 견주지 않는다 — 다른 박스에서 옮겨 온 원장처럼 mtime 이 앞서 있으면 '색인이 더 새것' 이 영영 안 선다.
 # 원장 옆 하위 폴더라 원장의 glob("*.json") 에 걸리지 않는다.
 _LIST_DIR = "list"
+# subject(심의 주제 — 과제 · 차수 · 글 · 설계 자료, HWAXPortal docs/project-insight-graph M1)는 주제로 거르는 목록(deliberate_list(subject))이 원장을
+# 통째로 읽지 않고 이 색인만으로 가른다. 주제가 없는 잡의 색인에는 칸이 없다(아래 _list_rec 은 잡에 있는 칸만 옮긴다).
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
-              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts", "finishing")
+              "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts", "finishing",
+              "subject")
 
 
 def _list_path(job_id: str) -> Path:
@@ -1373,7 +1376,7 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
-          owner_aff: str = "", resume: "delib_resume.Resume | None" = None) -> dict:
+          owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None) -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
@@ -1391,7 +1394,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본).
 
     owner 는 외부 응답자 심의(delib_opts.llm=external)의 과제 주인이다 — MCP 호출자 길이 게이트웨이 헤더를 푼 이름을 준다
-    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다."""
+    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다.
+
+    subject 는 서버가 꼴을 보고 SP 과제 key 를 다시 확인한 심의 주제다(delib_subject.confirm — HWAXPortal docs/project-insight-graph M1). 주면
+    잡 기록의 subject 칸에 싣고(제자리 이어하기로 다시 연 잡이면 그 잡에), 안 주면 그 칸을 만들지 않는다 — 주제가 없는 심의의 원장은 종전 그대로다.
+    요청 손잡이(delib_opts)로는 받지 않고 엔진에도 넘기지 않는다 — 부르는 쪽이 확인 상태를 지어내지 못하고, 결정문 · 보고서에 주제가 실리지 않는다."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
@@ -1522,6 +1529,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         **({"task_owner": x_owner, "tool_mode": "tools" if _read.free_tools else "evidence_only"}
            if _read.llm == "external" else {}),
     }
+    if subject is not None:
+        job["subject"] = subject
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {
@@ -2024,6 +2033,9 @@ def summary(job: dict, *, full: bool = False) -> dict:
     if _external(job):
         # 판단 LLM 이 외부 응답자였다 — tool_mode 는 좌석 자유 조회의 길(리스크 원장의 tool_mode 와 같은 말).
         out["llm"], out["tool_mode"] = "external", _tool_mode(job)
+    if isinstance(job.get("subject"), dict):
+        # 심의 주제(HWAXPortal docs/project-insight-graph M1) — 주제를 단 잡만 이 칸이 있다(없는 잡의 응답은 종전 그대로).
+        out["subject"] = job["subject"]
     if job["status"] == "interrupted":
         # 재기동으로 끊겼다 — 끝난 라운드 수와 이어 돌 라운드 수(deliberate_continue 한 번으로 잇는다 — R3).
         out["resume"] = resume_info(job)
@@ -2197,25 +2209,32 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
 LIST_SCAN_MAX = 300
 
 
-def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer_admin: bool = False) -> list[dict]:
+def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer_admin: bool = False,
+              where=None, info: dict | None = None) -> list[dict]:
     """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게는 **볼 수 있는 잡만**(can_read — 제 잡 · 같은
     소속의 잡, 관리자는 전부) 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)은 종전대로 전부 본다.
 
     행마다 mine(내가 시작한 잡인가)과 owner(시작한 사람 — 사용자 결정 10-18 '같은 소속 것도 목록에, 주인 표시')를 싣는다.
     종전엔 남의 잡을 아예 싣지 않아 주인을 적을 일이 없었다(거절 · 순번 문구에서 남의 job_id 를 뺀 까닭과 같다 — 지금은
     볼 수 있는 잡만 싣는다).
-    볼 수 없는 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다."""
+    볼 수 없는 것을 **뺀 뒤에** limit 을 건다. 먼저 자르면 남의 최근 잡이 제 잡을 목록 밖으로 민다.
+
+    where(잡 → 참거짓)를 주면 볼 수 있는 잡 가운데 그것이 참인 잡만 싣는다 — 주제로 거르는 목록(delib_subject.matches)이 쓴다. 거름은 목록 색인의
+    칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned)와 훑는 창(window — 최근 몇 개를 보나)을 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
-        return can_read(j, viewer, viewer_aff, viewer_admin)
+        return can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
     seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
+    window = max(limit * 3, LIST_SCAN_MAX)
+    scanned = 0
     try:
         kept = 0
         for f in sorted(JOB_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
-                        reverse=True)[:max(limit * 3, LIST_SCAN_MAX)]:
+                        reverse=True)[:window]:
             if kept >= limit * 3:
                 break
+            scanned += 1
             j = _list_load(f)        # 목록 색인 — 원장 파일(수 MB)을 통째로 읽지 않는다
             if not j or not ok(j):
                 continue
@@ -2224,5 +2243,7 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
                 seen[j["id"]] = j
     except OSError:
         pass
+    if info is not None:
+        info.update(scanned=scanned, window=window)
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]
