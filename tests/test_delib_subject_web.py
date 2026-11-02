@@ -122,3 +122,15 @@ def test_주제가_없는_웹_심의는_종전_그대로다(hub, engines):
     assert engines["run_deliberation"]["opts"] == {"rounds": 4}
     _chat("/심의 화두", None)
     assert [ev for ev, _d in _drain(engines["_streams"][-1])] == ["delib", "done"]
+
+
+def test_화두를_못_정해_되묻고_끝나면_주제를_풀지도_내지도_않는다(hub, engines, monkeypatch):
+    """'/심의' 만 치고 대화에서 화두도 못 뽑으면 심의 없이 되묻는다 — 그 턴에 풀이를 부르거나 주제 사건을 내면 심의 없는 답에 주제가 남는다
+    (반대 검토 11-02 — 종전엔 세 트리거의 바깥에서 감싸 이 길에도 풀었다)."""
+    async def no_topic(_history, _q):
+        return {}
+    monkeypatch.setattr(a, "_derive_topic", no_topic)
+    _chat("/심의", {"subject": {"sp_task": KEY, "round": "dv1"}}, history=[{"role": "user", "content": "앞 대화"}])
+    events = _drain(engines["_streams"][-1])
+    assert not [d for ev, d in events if ev == "delib"] and hub == [] and "run_deliberation" not in engines
+    assert any("한 줄로 적어 주세요" in (d.get("content") or "") for ev, d in events if ev == "result")

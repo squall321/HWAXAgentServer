@@ -7769,23 +7769,22 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 시뮬레이션 심의: "/시뮬심의 <현상>" → 메커니즘 심의 → CAE 해석 설계 심의 2단.
         # 일반 심의보다 먼저 검사한다 — 트리거가 겹치지는 않지만 의도를 코드 순서로 남긴다.
         _q = strip_sim_trigger(req.message)
-        stream = _detach_stream(_with_delib_subject(req, _with_delib_images(req, _q, lambda o: run_sim_deliberation(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req)))), "sim", started_by,
+        stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_sim_deliberation(
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "sim", started_by,
             conv=req.conversation_id, user=req.user_email)
     elif is_test_plan(req.message):
         # 시험 계획 심의: "/시험계획 <목적>" → 물성 근거 공백을 조회한 뒤 우선순위·조건축까지.
         # 해석은 물성이 없으면 시작할 수 없어, 실무에서 가장 먼저 막히는 지점이다.
         _q = strip_test_plan_trigger(req.message)
-        stream = _detach_stream(_with_delib_subject(req, _with_delib_images(req, _q, lambda o: run_test_plan(
-            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req)))), "test-plan", started_by,
+        stream = _detach_stream(_with_delib_images(req, _q, lambda o: run_test_plan(
+            app, _q, req.groups, o, req.user_email, req.user_pat, req.history, **_wiki_kw(req))), "test-plan", started_by,
             conv=req.conversation_id, user=req.user_email)
     elif is_deliberation(req.message):
         # `/심의 <질문>` 은 사람이 **대놓고 적은 의도**라 그대로 화두가 된다. 다만 `/심의` 만
         # 치거나 "이거 어떻게 할까" 처럼 짧게 던지면 화두가 비어 좌석이 논의할 게 없다
         # (종전엔 빈 문자열로 그대로 심의가 돌았다 — 가드가 없었다).
         # 그때만 대화에서 뽑고, **무엇을 화두로 삼았는지 화면에 밝힌다.**
-        stream = _detach_stream(_with_delib_subject(req, _delib_with_topic(req)), "delib", started_by, conv=req.conversation_id,
-                                user=req.user_email)
+        stream = _detach_stream(_delib_with_topic(req), "delib", started_by, conv=req.conversation_id, user=req.user_email)
     elif is_report_save(req.message):
         # "/보고서 <선택: 결론>" → 대화 이력을 코드가 blocks 로 만들어 RA 저장(결정적 — LLM 미경유).
         stream = run_report_save(app, strip_report_trigger(req.message), req.history, req.groups,
@@ -8391,13 +8390,14 @@ async def _delib_with_topic(req):
         yield chunk
 
 
-async def _with_delib_subject(req, inner):
-    """웹 심의의 주제(delib_opts.subject — HWAXPortal docs/project-insight-graph M1) — 엔진 앞에서 꼴을 보고 SP 과제 key 를 **그 사람의 자격으로**
-    다시 풀어(delib_subject.confirm — MCP deliberate_start 와 같은 함수 · 새 LLM 호출 없음) 확인한 주제를 delib 사건(kind=subject)과 상태 줄로 먼저
-    낸다. 포털 중계가 그 사건을 답 meta.subject 로 남긴다 — 브라우저가 보낸 값은 남지 않는다(믿지 않는다). 주제가 없으면 아무것도 내지 않는다(종전
-    그대로). 꼴이 틀리면 달지 않고 그렇다고 상태 줄로 말한다 — 심의는 연다(포털이 먼저 422 로 막는 꼴이라 여기까지 오는 것은 포털 밖의 호출이다).
-    리스크 심사 계열(의장 risk-review · 앱이 띄운 패널)은 주제를 달지 않는다(PLAN §3.1). 어느 경우든 엔진에는 subject 를 넘기지 않는다 — 엔진이
-    결정문 · RA 보고서 · 위키 원천에 주제를 실을 길을 만들지 않는다(PLAN §4.1 · PG-11)."""
+async def _delib_subject_frames(req):
+    """웹 심의의 주제(delib_opts.subject — HWAXPortal docs/project-insight-graph M1) — 엔진 바로 앞(_with_delib_images 첫머리 — 화두를 정한 뒤라
+    심의가 실제로 돌 때만)에서 꼴을 보고 SP 과제 key 를 **그 사람의 자격으로** 다시 풀어(delib_subject.confirm — MCP deliberate_start 와 같은 함수 ·
+    새 LLM 호출 없음) 확인한 주제를 delib 사건(kind=subject)과 상태 줄로 먼저 낸다. 포털 중계가 그 사건을 답 meta.subject 로 남긴다 — 브라우저가
+    보낸 값은 남지 않는다(믿지 않는다). 주제가 없으면 아무것도 내지 않는다(종전 그대로). 꼴이 틀리면 달지 않고 그렇다고 상태 줄로 말한다 — 심의는
+    연다(포털이 먼저 422 로 막는 꼴이라 여기까지 오는 것은 포털 밖의 호출이다). 리스크 심사 계열(의장 risk-review · 앱이 띄운 패널)은 주제를 달지
+    않는다(PLAN §3.1). 어느 경우든 엔진에는 subject 를 넘기지 않는다 — 엔진이 결정문 · RA 보고서 · 위키 원천에 주제를 실을 길을 만들지 않는다
+    (PLAN §4.1 · PG-11). 종전엔 세 트리거의 바깥에서 감싸 화두를 못 정해 되묻고 끝나는 '/심의' 에도 풀이를 부르고 주제 사건을 냈다(반대 검토 11-02)."""
     o = req.delib_opts if isinstance(req.delib_opts, dict) else None
     if o is not None and "subject" in o:
         import delib_subject as _subject  # noqa: PLC0415 — 주제를 단 웹 심의에만
@@ -8417,8 +8417,6 @@ async def _with_delib_subject(req, inner):
                 rec = await _subject.confirm(app, parsed, groups=req.groups, user=req.user_email, user_pat=req.user_pat)
                 yield _sse("delib", {"kind": "subject", "subject": rec})
                 yield _sse("status", {"step": _subject.say(rec), "tool": None})
-    async for chunk in inner:
-        yield chunk
 
 
 def _delib_image_list(req) -> list:
@@ -8439,7 +8437,10 @@ async def _with_delib_images(req, q: str, start):
       (1) 판독문 — 그림을 읽는 모델(Qwen)이 옮긴 글을 원천 근거(delib_opts.evidence)에 덧붙인다. 좌석 · 의장이 [e:N] 으로 짚고, 결정문의
           근거 목록에 남는다. 심의 LLM 이 그림을 받아도 싣는다 — 그림은 짚을 번호가 없다.
       (2) 그림 조각 — 심의 LLM(VLLM_*)이 그림을 받는다고 판정되면 최근 VISION_HISTORY_IMAGES 장을 좌석 · 의장 호출마다(DELIB_IMAGES).
-    start(opts) 가 엔진 생성기를 만든다 — 근거를 덧붙인 opts 를 받아야 해서 미리 만들어 두지 않는다."""
+    start(opts) 가 엔진 생성기를 만든다 — 근거를 덧붙인 opts 를 받아야 해서 미리 만들어 두지 않는다.
+    심의 주제(delib_opts.subject)는 그보다 먼저 확인해 사건으로 내고 엔진의 opts 에서 뺀다(_delib_subject_frames)."""
+    async for chunk in _delib_subject_frames(req):
+        yield chunk
     imgs = _delib_image_list(req)
     tok = None
     if imgs:
