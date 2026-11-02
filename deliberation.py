@@ -1007,6 +1007,12 @@ _RISK_RA_REPORT_TOOLS = ("get_report", "get_report_outline", "get_reports_digest
 _RISK_APP_KEY = "heax-hwax_risk"
 _RISK_APP_HEAD = _RISK_APP_KEY.replace("-", "") + "_"
 _RA_APP_HEAD = "reportarchive_"
+# 심의 엔진의 잡 기록을 읽는 도구 — 이 서버의 MCP(게이트웨이 앱키 hwax-deliberation)다. 목록(deliberate_list)은 행마다 화두를 통째로
+# 싣고, 나머지 셋은 잡 id 로 상태 · 결정문 · 좌석 발언을 준다. 리스크 앱 러너의 패널도 손수 돈 리스크 심사도 이 원장의 잡이라 앞 패널을
+# 그대로 읽는다(D-18 누수 넷째 — 포털 대화 검색과 같은 앞 패널이다, 2026-11-02). 자유 조회 후보 조립식(_FREE_ALLOW)에 걸리지 않아 지정
+# 도구로만 닿으므로 거기서 닫는다. 심의 메뉴(deliberate_jobs)는 잡 기록이 아니라 남긴다.
+_DELIB_APP_HEAD = "hwaxdeliberation_"
+_RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_result", "deliberate_transcript")
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1015,6 +1021,7 @@ _RISK_DESIGNATED_REFUSE = {
     "ra": "리스크 심사 좌석은 RA 보고서 읽기로 엔진이 남긴 앞 패널 심의 보고서(결정문이 든 초안)나 같은 과제의 판정을 보지 않는다",
     "proxy": ("범용 실행기는 부를 도구를 호출할 때 정해 이 거절을 비켜 간다(목록에 없는 호출 별칭 "
               f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
+    "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
 }
 
 
@@ -1022,17 +1029,19 @@ def _risk_designated_refusal(name: str) -> str:
     """리스크 심사에 지정 도구(delib_opts.tools)로 온 이름이 D-18 로 닫힌 것이면 그 갈래(_RISK_DESIGNATED_REFUSE 의 열쇠), 아니면
     빈 글. 지정 도구 결과는 전 좌석 프롬프트에 실린다.
 
-    닫는 것은 넷이다 — 등록부 · 앞 패널 기록(_RISK_PRIOR_TOOLS), 그 밖의 리스크 앱 도구(여는 것은 변경 전체와 스냅샷 둘뿐이다 —
+    닫는 것은 다섯이다 — 등록부 · 앞 패널 기록(_RISK_PRIOR_TOOLS), 그 밖의 리스크 앱 도구(여는 것은 변경 전체와 스냅샷 둘뿐이다 —
     선례 risk_get_precedents · 종합 보고서 risk_get_report · 쟁점 risk_get_issues · 전문가 보고서 risk_get_expert_report · 셀
     risk_get_cells 가 같은 과제의 앞 판정을 싣는다), RA 보고서 읽기(_RISK_RA_REPORT_TOOLS), 범용 실행기 invoke_tool(부를 도구를
     호출할 때 정한다 — 목록에 없는 호출 별칭에도 닿는다. 루틴 실행기 routine_call 은 엔진에 묶이지 않고(app._agent_denied),
-    rest_call 의 사이트에는 리스크 앱 · RA 가 없다). 이름은 게이트웨이가 싣는 꼴 그대로 본다 — 맨 이름과 겹침 접두 꼴
-    (heaxhwax_risk_<도구> · reportarchive_<도구>). 맨 이름 risk_* 는 다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱
-    매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 — 틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 ·
-    스냅샷은 이름만으로 정해 매핑을 묻지 않는다."""
+    rest_call 의 사이트에는 리스크 앱 · RA 가 없다), 심의 엔진의 잡 기록 읽기(_RISK_DELIB_READ_TOOLS). 이름은 게이트웨이가 싣는 꼴
+    그대로 본다 — 맨 이름과 겹침 접두 꼴(heaxhwax_risk_<도구> · reportarchive_<도구> · hwaxdeliberation_<도구>). 맨 이름 risk_* 는
+    다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱 매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 —
+    틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다."""
     n = str(name or "").strip()
     if n == "invoke_tool":
         return "proxy"
+    if n.removeprefix(_DELIB_APP_HEAD) in _RISK_DELIB_READ_TOOLS:
+        return "delib"
     if n.startswith(_RISK_APP_HEAD):
         base, risk = n[len(_RISK_APP_HEAD):], True
     else:
@@ -1048,6 +1057,7 @@ def _risk_designated_refusal(name: str) -> str:
     if not risk and _app_of_tools().get(n, _RISK_APP_KEY) != _RISK_APP_KEY:
         return ""
     return "app"
+
 
 # 리스크 심사 유지 도구 — apps 밖 앱(RA·물성·열충격·VoC·문헌) 소속이라 앱 제한에서 잘려 나가는
 # 읽기 도구를 chair_template == 'risk-review' 일 때만 남긴다. 다른 심의 영향 0.
@@ -1306,16 +1316,112 @@ def _risk_hide_prior_findings(tool, question: str):
     return tool
 
 
-def _risk_hide_ra_priors(tools: dict, question: str) -> None:
-    """리스크 심사의 RA 읽기에 D-18 거름 둘을 건다 — 보고서 검색(search_reports)은 같은 과제의 앞 패널 심의 보고서
-    (_risk_hide_prior_panels), 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(_risk_hide_prior_findings). 맨 이름과 RA 의 겹침 접두
-    꼴(reportarchive_<이름> — 다른 앱과 이름이 겹치면 게이트웨이가 그 꼴로만 싣는다) 둘 다 감싼다."""
+# 포털 대화 검색 — 게이트웨이 자체 도구 search_conversations(포털 /agent/conversations/search)가 호출자 자신의 지난 대화(심의 · 웹 챗)를
+# 뜻으로 찾아 준다. 응답은 {query, results:[{score, conversation_id, title, role, persona, ts, text, message_id, chunk_ix}], low_confidence,
+# note, index} 다(포털 agent/conv_search._rank — 대화당 두 조각까지). 리스크 앱은 패널마다 잡 주인 이름으로 포털 대화를 만들고(HWAXRisk
+# engine_client — 제목 '[리스크심사] <패널 질문 앞 160자>', 패널 질문은 '[리스크심사 <과제코드> <target_key>]' 로 시작한다) 그 대화에 좌석
+# 발언과 결정문이 쌓인다. Claude Code 워크플로가 저장하는 심의 대화의 제목은 '심의 — <질문 앞 50자>'(이어하기는 '심의(이어하기) — ')다
+# (infra/pipeline/hwax-deliberate.js 의 conv-save). 그래서 좌석이 대화 검색으로 같은 과제의 앞 패널을 읽었다(D-18 누수 넷째, 2026-11-02).
+# 대화를 id 로 읽는 도구는 게이트웨이에 없다(포털 REST 는 rest_call 의 사이트가 아니다).
+_RISK_CONV_TOOL = "search_conversations"
+_DELIB_CONV_HEADS = (_RA_TITLE_HEAD, "심의(이어하기) — ")
+_RISK_CONV_WITHHELD = ("같은 과제({code})의 앞 패널 대화(과제를 읽을 수 없는 리스크 심사 대화 — 쟁점 패널 — 를 포함해) {n}건은 리스크 "
+                       "심사 좌석에게 보이지 않는다 — 앞 패널의 판정을 읽고 따라 말하지 않도록 이 심사는 그 판정 없이 독립으로 판단한다.")
+_RISK_CONV_WITHHELD_ALL = ("리스크 심사 대화('[리스크심사' 머리)와 심의 대화(제목 '심의 — …') {n}건은 리스크 심사 좌석에게 보이지 않는다 — "
+                           "질문에서 과제를 읽지 못해 같은 과제의 앞 패널을 가릴 수 없어 전부 뺐다(다른 과제의 것도 함께 빠졌다). 이 심사는 "
+                           "앞 패널의 판정 없이 독립으로 판단한다.")
+
+
+def _risk_hide_prior_conversations(tool, question: str):
+    """리스크 심사 좌석의 포털 대화 검색(search_conversations)에서 같은 과제의 앞 패널 대화를 뺀다(사용자 결정 D-18 — 패널의 대화도 앞
+    패널이다. _risk_hide_prior_panels 의 짝이다).
+
+    대화 제목이나 본문 조각에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 있고 그 과제 코드가 이 심사의 것이면 그 조각을
+    뺀다. 머리는 엔진이 질문을 읽는 식(_RISK_Q_HEAD_RE)으로 읽는다. 제목이 리스크 심사 대화('[리스크심사')인데 제목에서 머리가 읽히지
+    않는 것(쟁점 패널 — HWAXRisk issues 의 질문은 '[쟁점 <id> · …]' 라 과제 코드가 없다)은 조각이 무엇을 인용하든 같은 과제일 수 있어
+    뺀다. 다른 과제라고 읽힌 패널 대화만 선례라 남긴다. 과제 코드를 읽지 못하면(머리 없는 손수 길 · 머리를 읽지 못한 길) 같은 과제를 가릴 수 없어 리스크 심사 대화
+    ('[리스크심사')와 심의 대화(제목 '심의 — …' — 머리 없는 리스크 심사의 대화가 이 꼴이다)를 전부 뺀다 — 보고서 검색의 같은 길
+    (_RISK_PRIOR_WITHHELD_ALL)과 같다. 결과에는 withheld 로 뺀 대화 수를 적는다(이 응답에는 shown · total 칸이 없다).
+
+    응답은 풀어서 본다. 풀지 못한 응답(자유 조회의 결과 상한에서 잘린 JSON 이 그렇다 — app._cap)은 조각을 가려낼 수 없어, 리스크 심사
+    대화의 표지가 보이면(과제를 모르면 심의 대화의 제목 머리까지) 결과를 통째로 주지 않는다 — 다른 과제의 것인지도 가릴 수 없다."""
+    code = _risk_q_code(question)
+    orig = getattr(tool, "coroutine", None)
+    if orig is None:
+        return tool
+    if code is not None:
+        marks = (_RISK_Q_MARK,)
+
+        def _prior(title: str, body: str) -> bool:
+            heads = [m.group(1) for m in _RISK_Q_HEAD_RE.finditer(title)]
+            # 제목이 리스크 심사 대화인데 제목에서 어느 과제인지 읽히지 않으면(쟁점 패널 — 질문이 '[쟁점 <id> · …]' 라 과제 코드가 없다)
+            # 같은 과제일 수 있어 뺀다 — 조각이 다른 과제의 머리를 인용해도 그 대화의 과제는 아니다. 다른 과제라고 읽힌 것만 남긴다.
+            if _RISK_Q_MARK in title and not heads:
+                return True
+            return code in heads or any(m.group(1) == code for m in _RISK_Q_HEAD_RE.finditer(body))
+
+        def _withheld(n: int) -> str:
+            return _RISK_CONV_WITHHELD.format(code=code, n=n)
+    else:
+        marks = (_RISK_Q_MARK, *_DELIB_CONV_HEADS)
+
+        def _prior(title: str, body: str) -> bool:
+            return _RISK_Q_MARK in title or _RISK_Q_MARK in body or title.lstrip().startswith(_DELIB_CONV_HEADS)
+
+        def _withheld(n: int) -> str:
+            return _RISK_CONV_WITHHELD_ALL.format(n=n)
+    _opaque = ("대화 검색 결과를 줄 수 없다 — "
+               + ("리스크 심사 대화가 섞여 있는데 응답을 풀지 못해 같은 과제(" + code + ")의 것을 가려낼 수 없다" if code is not None
+                  else "리스크 심사 · 심의 대화가 섞여 있는데 응답을 풀지 못해 가려낼 수 없다")
+               + ". 리스크 심사 좌석은 앞 패널의 판정을 보지 않는다. 검색어를 좁혀 다시 찾아라.")
+
+    def _hide(text):
+        if not isinstance(text, str):
+            return text
+        try:
+            got = json.loads(text)
+        except ValueError:
+            got = None
+        rows = got.get("results") if isinstance(got, dict) else None
+        if not isinstance(rows, list):
+            if any(m in text or json.dumps(m)[1:-1] in text for m in marks):
+                return _opaque
+            return text
+        keep, gone = [], []
+        for r in rows:
+            if isinstance(r, dict) and _prior(str(r.get("title") or ""), str(r.get("text") or "")):
+                gone.append(r)
+            else:
+                keep.append(r)
+        if not gone:
+            return text
+        n = len({str(r.get("conversation_id") or id(r)) for r in gone})
+        return json.dumps({**got, "results": keep, "withheld": _withheld(n)}, ensure_ascii=False)
+
+    async def hidden(*a, **kw):
+        out = await orig(*a, **kw)
+        if isinstance(out, tuple) and len(out) == 2:       # (content, artifact) 형식 보존
+            return (_hide(out[0]), out[1])
+        return _hide(out)
+
+    tool.coroutine = hidden
+    return tool
+
+
+def _risk_hide_priors(tools: dict, question: str) -> None:
+    """리스크 심사의 조회 결과에 D-18 거름 셋을 건다 — 보고서 검색(search_reports)은 같은 과제의 앞 패널 심의 보고서
+    (_risk_hide_prior_panels), RA 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(_risk_hide_prior_findings), 포털 대화 검색
+    (search_conversations)은 같은 과제의 앞 패널 대화(_risk_hide_prior_conversations). RA 의 것은 맨 이름과 RA 의 겹침 접두 꼴
+    (reportarchive_<이름> — 다른 앱과 이름이 겹치면 게이트웨이가 그 꼴로만 싣는다) 둘 다 감싼다. 대화 검색은 게이트웨이 자체 도구라
+    접두가 붙지 않는다."""
     for n, t in tools.items():
         base = n.removeprefix(_RA_APP_HEAD)
         if base == "search_reports":
             _risk_hide_prior_panels(t, question)
         elif base in _RISK_FINDING_TOOLS:
             _risk_hide_prior_findings(t, question)
+        elif n == _RISK_CONV_TOOL:
+            _risk_hide_prior_conversations(t, question)
 
 
 def _risk_not_visible(out) -> bool:
@@ -5940,41 +6046,44 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     # 리스크 심사는 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입)에서도 같은 과제의 앞 패널 보고서를 뺀다(D-18).
     # 둘 다 결과를 전 좌석 프롬프트에 싣는다 — 좌석 자유 조회만 거르던 동안 search_reports 를 지정하거나 선주입을 켠 리스크
     # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
-    # RA 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(risk_finding)를 뺀다(_risk_hide_ra_priors — 지정 도구로 와도 같다).
+    # RA 온톨로지 읽기 셋은 같은 과제의 리스크 판정 객체(risk_finding)를, 포털 대화 검색은 같은 과제의 앞 패널 대화를 뺀다
+    # (_risk_hide_priors — 지정 도구로 와도 같다).
     _risk_chair0 = opts.chair_template == "risk-review"
     if _risk_chair0:
-        _risk_hide_ra_priors(tools, question)
+        _risk_hide_priors(tools, question)
     # 리스크 심사인데 과제 코드를 읽지 못했으면 위 거름(과 자유 조회의 거름)이 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서를
     # 전부 뺀다 — 다른 과제의 선례도 함께 빠지므로 조용히 넘기지 않는다. 머리가 보이는데 못 읽은 길(m1 2차 AF2-D18-code-space)과
     # 머리 없이 손수 부른 길(m1 3차 발견 5 — 실사용 팀의 길)을 가른다. 카드는 좌석에 주지 않은 것(included=False)이라 리스크 앱
     # 러너가 패널에 옮겨 적는다.
     _unread = _risk_head_unread(question) if _risk_chair0 else ""
     _where = "보고서 검색(좌석 자유 조회·지정 도구·정량 근거 선주입)"
-    # 온톨로지 읽기의 판정 객체 거름(_risk_hide_prior_findings)도 같은 까닭으로 전부로 넓어진다 — 함께 말한다.
-    _onto = (" RA 온톨로지 읽기(search_objects · get_object · get_subgraph)의 리스크 판정 객체(risk_finding)도 같은 까닭으로 "
-             "전부 뺐다(다른 과제의 것도 함께).")
+    # 온톨로지 읽기의 판정 객체 거름(_risk_hide_prior_findings)과 대화 검색의 거름(_risk_hide_prior_conversations)도 같은 까닭으로 전부로
+    # 넓어진다 — 함께 말한다.
+    _widened = (" RA 온톨로지 읽기(search_objects · get_object · get_subgraph)의 리스크 판정 객체(risk_finding)와 포털 대화 검색"
+                "(search_conversations)의 리스크 심사 · 심의 대화도 같은 까닭으로 전부 뺐다(다른 과제의 것도 함께).")
     if _unread and _pre is None:
         yield _sse("warning", {"code": "risk_head_unread",
                                "message": f"질문의 리스크 심사 머리({_unread})에서 과제 코드를 읽지 못해 같은 과제를 가릴 수 "
                                           f"없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 전부 "
                                           "뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). RA 온톨로지의 리스크 판정 객체"
-                                          "(risk_finding)도 전부 뺍니다. 머리 꼴은 '[리스크심사 <과제코드> <target_key>]' 입니다."})
+                                          "(risk_finding)와 포털 대화 검색의 리스크 심사 · 심의 대화도 전부 뺍니다. 머리 꼴은 "
+                                          "'[리스크심사 <과제코드> <target_key>]' 입니다."})
         yield _delib("evidence", source="앞 패널 보고서 거름 — 머리를 읽지 못해 심의 초안 전부를 뺐다", included=False,
                      notice=True,
                      text=f"질문 머리 {_unread} 에서 과제 코드와 target_key 를 읽지 못했다(머리 꼴은 '[리스크심사 <과제코드> "
                           f"<target_key>]'). 같은 과제를 가릴 수 없어 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 "
-                          f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_onto}")
+                          f"{_where}에서 전부 뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_widened}")
     elif _risk_chair0 and _risk_q_code(question) is None and _pre is None:
         yield _sse("warning", {"code": "risk_head_missing",
                                "message": "질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제를 "
                                           f"가릴 수 없어서, 좌석의 보고서 검색에서 엔진이 남긴 심의 보고서('{_RA_TITLE_HEAD}…')를 "
                                           "전부 뺍니다(D-18 — 다른 과제의 선례도 함께 빠집니다). RA 온톨로지의 리스크 판정 "
-                                          "객체(risk_finding)도 전부 뺍니다."})
+                                          "객체(risk_finding)와 포털 대화 검색의 리스크 심사 · 심의 대화도 전부 뺍니다."})
         yield _delib("evidence", source="앞 패널 보고서 거름 — 머리 없는 손수 길이라 심의 초안 전부를 뺐다", included=False,
                      notice=True,
                      text="질문에 리스크 심사 머리('[리스크심사 <과제코드> <target_key>]')가 없어 같은 과제의 앞 패널 보고서를 "
                           f"가릴 수 없었다. 그래서 엔진이 남긴 심의 보고서(제목 '{_RA_TITLE_HEAD}…')를 {_where}에서 전부 "
-                          f"뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_onto} 과제를 밝혀 거름을 좁히려면 질문 머리를 붙여 "
+                          f"뺐다 — 다른 과제의 선례도 함께 빠졌다(D-18).{_widened} 과제를 밝혀 거름을 좁히려면 질문 머리를 붙여 "
                           "부른다.")
 
     # 도구는 실렸지만 사용자 PAT 가 거절돼 서비스 계정으로 강등됐다면 라이브로 알린다.
@@ -6020,10 +6129,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                       _free_tool_ok(n)
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
-            # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체를 뺀다(D-18 —
-            # _risk_hide_ra_priors). 외부 응답자의 글 왕복(CALL 줄)도 이 도구들을 실행한다.
+            # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기 · 대화 검색에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체 · 앞 패널
+            # 대화를 뺀다(D-18 — _risk_hide_priors). 외부 응답자의 글 왕복(CALL 줄)도 이 도구들을 실행한다.
             if _risk_chair:
-                _risk_hide_ra_priors(_g, question)
+                _risk_hide_priors(_g, question)
             # 웹 리서치 소스 토글 — 켜지 않은 소스의 도구는 목록에서 뺀다. 모델에게 금지를
             # 지키게 하는 것과 도구가 존재하지 않는 것은 다르다.
             if opts.search_sources is not None:
@@ -6263,7 +6372,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
                                   (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
                                    "보지 않는다 — D-18. 리스크 앱에서는 변경 전체 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 "
-                                   "읽기 · 범용 실행기는 닫는다)") if _tool_refused else "",
+                                   "읽기 · 범용 실행기 · 심의 잡 기록 읽기는 닫는다)") if _tool_refused else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에

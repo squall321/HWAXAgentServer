@@ -13,6 +13,9 @@
 # (6) apps 없이 손수 돈 리스크 심사 — 좌석이 RA 보고서 읽기 도구로 앞 패널 초안을 읽었다. 이름으로 뺀다.
 # (7) 질문 머리 없이(또는 머리를 읽지 못한 채) 돈 리스크 심사 — 같은 과제를 가릴 수 없어 search_reports 거름이 없었다. 엔진이
 #     남긴 심의 보고서('심의 — …')를 전부 빼고 알린다.
+# (8) 지정 도구 — 리스크 앱은 변경 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 읽기 · 범용 실행기를 부르지 않는다(이름 꼴 셋).
+# (9) RA 온톨로지 읽기 — 같은 과제의 리스크 판정 객체(risk_finding)를 뺀다.
+# (10) 포털 대화 검색 · 심의 잡 기록 — 같은 과제의 앞 패널 대화를 빼고, 잡 기록 읽기는 지정 도구로 부르지 않는다.
 #
 #   실행:  .venv/bin/python -m pytest tests/test_risk_registry_closed.py -q
 import asyncio
@@ -584,8 +587,9 @@ _GRAPH = {"nodes": [{"id": 301, "value": "INC-0412 힌지 크랙", "type_id": 3,
                     {"src": 301, "dst": 41, "relation": "occurs_in"}]}
 
 
-def _onto_given(monkeypatch, chair, question, answers, apps=("heax-step_forge",)):
-    """심의를 좌석 발굴 문턱까지 돌려 좌석 에이전트가 받은 도구({이름: 도구})를 돌려준다 — answers 는 {RA 도구 이름: 정해 둔 답}."""
+def _onto_given(monkeypatch, chair, question, answers, apps=("heax-step_forge",), amap=None):
+    """심의를 좌석 발굴 문턱까지 돌려 좌석 에이전트가 받은 도구({이름: 도구})를 돌려준다 — answers 는 {도구 이름: 정해 둔 답}, amap 은
+    도구-앱 매핑(없으면 answers 를 모두 RA 도구로 본다)."""
     import langgraph.prebuilt
 
     given = []
@@ -595,7 +599,7 @@ def _onto_given(monkeypatch, chair, question, answers, apps=("heax-step_forge",)
         return SimpleNamespace()
 
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", _fake_agent)
-    monkeypatch.setattr(d, "_app_of_tools", lambda: {n: "reportarchive" for n in answers})
+    monkeypatch.setattr(d, "_app_of_tools", lambda: dict({n: "reportarchive" for n in answers} if amap is None else amap))
     tools = {"agent_search": _Tool("agent_search"), **{n: _CoTool(n, a) for n, a in answers.items()}}
 
     async def _fake_tools(*_a, **_k):
@@ -778,3 +782,119 @@ def test_과제를_모르는_리스크_심사는_판정_객체도_전부_뺐다�
         warn, cards = _head_notices(_events_for(monkeypatch, question), code)
         assert len(warn) == 1 and len(cards) == 1, (code, warn, cards)
         assert "risk_finding" in warn[0]["message"] and "risk_finding" in cards[0]["text"], (code, warn[0], cards[0])
+
+
+# ── (10) 포털 대화 검색 · 심의 잡 기록 — 패널의 대화와 잡 기록도 앞 패널이다 ─────────────────────────────────────────────
+# 리스크 앱은 패널마다 잡 주인 이름으로 포털 대화를 만들고(HWAXRisk engine_client — 제목 '[리스크심사] <패널 질문 앞 160자>') 거기에 좌석
+# 발언과 결정문이 쌓인다. 게이트웨이 search_conversations(접두사 search_ 라 apps 없는 리스크 심사의 자유 조회 후보에 든다 · 지정 도구 ·
+# 외부 응답자의 CALL 줄)가 그 제목과 발언 조각을 돌려줘, 좌석이 같은 과제의 앞 패널을 읽었다(D-18 누수 넷째, 2026-11-02). 응답 꼴은 포털
+# agent/conv_search 그대로다. 심의 엔진의 잡 기록 읽기(deliberate_list · status · result · transcript)는 지정 도구로만 닿고 거기서 닫는다.
+def _conv_hit(cid, title, text, mid):
+    return {"score": 0.91, "conversation_id": cid, "title": title, "role": "persona", "persona": "mech-a",
+            "ts": 1793500000, "text": text, "message_id": mid, "chunk_ix": 0}
+
+
+def _conv_hits(*rows):
+    """search_conversations 의 응답 모양 — 포털 /agent/conversations/search 의 본문을 게이트웨이가 그대로 싣는다."""
+    return {"query": "힌지 리스크", "results": [dict(r) for r in rows], "low_confidence": False, "note": "",
+            "index": {"messages": 40, "indexed": 40, "embed_space": "bge-m3", "just_indexed": 0, "too_short": 0,
+                      "not_indexed_yet": 0, "budget_hit": False, "in_background": 0, "partial": False}}
+
+
+_C_MINE = _conv_hit("c-p1", f"[리스크심사] {_Q_PREV}"[:200], "힌지 FAIL — 판정 근거 …", 11)       # 같은 과제의 앞 패널 대화
+_C_MINE_2 = _conv_hit("c-p1", f"[리스크심사] {_Q_PREV}"[:200], "결정: 힌지 브래킷 FAIL 유지", 12)    # 같은 대화의 둘째 조각
+_C_OTHER = _conv_hit("c-p12", f"[리스크심사] {_Q_OTHER}"[:200], "다른 과제의 판정", 21)
+_C_ISSUE = _conv_hit("c-issue", "[리스크심사] [쟁점 I-3 · 갈림] 부품 힌지 브래킷 의 판정이 갈린다", "쟁점 판정 …", 31)
+# 쟁점 패널 대화의 조각이 다른 과제의 머리를 인용한다 — 그 대화의 과제는 제목으로 가린다(조각의 머리는 그 대화의 과제가 아니다).
+_C_ISSUE_Q = _conv_hit("c-issue2", "[리스크심사] [쟁점 I-4 · 갈림] 부품 힌지 의 판정이 갈린다",
+                       "선례로 심의 — [리스크심사 P12 diff:x] 의 판정을 든다", 35)
+_C_WF = _conv_hit("c-wf", "심의 — " + _Q_PREV[:50], "워크플로가 저장한 심의 …", 41)              # 머리가 실린 워크플로 대화
+_C_NOTE = _conv_hit("c-note", "주간 메모", "[리스크심사 P1 T-old] 판정 메모 …", 51)                 # 조각에 같은 과제의 머리
+_C_HEADLESS = _conv_hit("c-headless", "심의 — 힌지 크랙이 각 도메인에서 어떤 리스크를 낳는가", "머리 없는 심의 …", 61)
+_C_CHAT = _conv_hit("c-chat", "힌지 낙하 시험 정리", "1.5m 낙하 …", 71)
+_CONV_ALL = (_C_MINE, _C_MINE_2, _C_OTHER, _C_ISSUE, _C_ISSUE_Q, _C_WF, _C_NOTE, _C_HEADLESS, _C_CHAT)
+
+
+def _cids(got):
+    return [r["conversation_id"] for r in got["results"]]
+
+
+@pytest.mark.parametrize("apps,amap", (((), {"search_conversations": "_gateway"}),
+                                       (("heax-step_forge", "heax-kooremapper_mcp"), {})),
+                         ids=("manual", "runner-map-unavailable"))
+def test_리스크_심사_좌석의_대화_검색은_같은_과제의_앞_패널_대화를_뺀다(monkeypatch, apps, amap):
+    """같은 과제의 패널 대화(제목 · 조각의 머리)와 과제를 읽을 수 없는 리스크 심사 대화(쟁점 패널)를 뺀다 — 다른 과제의 패널 대화 · 머리
+    없는 심의 대화 · 일반 대화는 남긴다. 러너 apps 라도 매핑을 못 받으면 좁히지 않아 대화 검색이 좌석에 간다. 다른 심의는 종전대로다."""
+    hits = json.dumps(_conv_hits(*_CONV_ALL), ensure_ascii=False)
+    got = _ask(_onto_given(monkeypatch, "risk-review", _Q_NOW, {"search_conversations": hits}, apps, amap)["search_conversations"],
+               query="힌지 리스크")
+    assert _cids(got) == ["c-p12", "c-headless", "c-chat"], got
+    assert "5건" in got["withheld"] and "P1" in got["withheld"] and got["index"]["messages"] == 40, got
+    raw = _ask(_onto_given(monkeypatch, "default", _Q_NOW, {"search_conversations": hits}, (),
+                           {"search_conversations": "_gateway"})["search_conversations"], query="힌지 리스크")
+    assert raw == json.loads(hits), raw
+
+
+@pytest.mark.parametrize("ascii_", (False, True), ids=("utf8", "escaped"))
+@pytest.mark.parametrize("question", (_Q_MANUAL, _Q_UNREAD), ids=("headless", "unread"))
+def test_과제를_모르는_리스크_심사의_대화_검색은_리스크_심사_심의_대화를_전부_뺀다(monkeypatch, question, ascii_):
+    """같은 과제를 가릴 수 없다 — '[리스크심사' 가 보이는 대화와 심의 대화(제목 '심의 — …')를 전부 뺀다(다른 과제의 것도). 일반 대화는 남긴다."""
+    hits = json.dumps(_conv_hits(*_CONV_ALL), ensure_ascii=ascii_)
+    got = _ask(_onto_given(monkeypatch, "risk-review", question, {"search_conversations": hits}, (),
+                           {"search_conversations": "_gateway"})["search_conversations"], query="힌지 리스크")
+    assert _cids(got) == ["c-chat"], got
+    assert "7건" in got["withheld"] and "가릴 수 없어" in got["withheld"], got
+
+
+def test_읽지_못한_대화_검색_응답에_리스크_심사_대화가_보이면_통째로_막는다(monkeypatch):
+    """자유 조회의 결과 상한에서 잘린 JSON 은 조각을 가려낼 수 없다 — 리스크 심사 대화가 보이면(다른 과제의 것이라도) 결과를 주지 않고,
+    보이지 않으면 그대로 준다. 과제를 모르면 심의 대화의 제목 머리도 막는다."""
+    amap = {"search_conversations": "_gateway"}
+
+    def ask(question, rows):
+        raw = json.dumps(_conv_hits(*rows), ensure_ascii=False)[:-30]
+        tool = _onto_given(monkeypatch, "risk-review", question, {"search_conversations": raw}, (), amap)["search_conversations"]
+        return raw, _ask(tool, query="힌지 리스크")
+
+    for question, rows in ((_Q_NOW, (_C_CHAT, _C_OTHER)), (_Q_MANUAL, (_C_CHAT, _C_HEADLESS))):
+        raw, out = ask(question, rows)
+        assert isinstance(out, str) and out != raw and "가려낼 수 없다" in out and "다른 과제의 판정" not in out, out
+    raw, out = ask(_Q_NOW, (_C_CHAT, _C_HEADLESS))
+    assert out == raw
+
+
+def test_리스크_심사의_지정_도구_대화_검색도_같은_과제의_앞_패널_대화를_뺀다(monkeypatch):
+    """엔진이 직접 부르는 길 — 지정 도구 결과는 전 좌석 프롬프트에 실린다. 다른 심의는 종전대로다."""
+    hits = json.dumps(_conv_hits(*_CONV_ALL), ensure_ascii=False)
+
+    def card(chair):
+        events = _engine_with(monkeypatch, chair, {"tools": ["search_conversations"]},
+                              {"agent_search": _Tool("agent_search"),
+                               "search_conversations": _CoTool("search_conversations", hits)})
+        return next(c for c in _cards(events, included=True) if c["source"] == "지정 도구 search_conversations")["text"]
+
+    text = card("risk-review")
+    assert "힌지 FAIL — 판정 근거" not in text and "쟁점 판정" not in text and "1.5m 낙하" in text, text
+    assert "다른 과제의 판정" in text and "withheld" in text, text
+    text = card("default")
+    assert "힌지 FAIL — 판정 근거" in text and "withheld" not in text, text
+
+
+def test_리스크_심사는_심의_잡_기록_읽기를_지정해도_부르지_않는다(monkeypatch):
+    """심의 엔진의 잡 기록(목록은 행마다 화두 · 셋은 잡 id 로 상태 · 결정문 · 좌석 발언)도 앞 패널이다 — 맨 이름과 겹침 접두 꼴
+    (hwaxdeliberation_<도구>) 둘 다 닫는다. 심의 메뉴(deliberate_jobs)는 잡 기록이 아니라 그대로 부른다. 다른 심의는 종전대로다."""
+    reads = ("deliberate_list", "deliberate_status", "deliberate_result", "deliberate_transcript")
+    names = reads + tuple(f"hwaxdeliberation_{n}" for n in reads)
+    runs, tools = _designate(monkeypatch, "risk-review", names + ("deliberate_jobs",))
+    assert sorted(n for n in tools if tools[n].calls) == ["deliberate_jobs"], sorted(n for n in tools if tools[n].calls)
+    _refused(runs, names)
+    _runs, tools = _designate(monkeypatch, "default", names)
+    assert all(tools[n].calls for n in names), sorted(n for n in names if not tools[n].calls)
+
+
+def test_과제를_모르는_리스크_심사는_대화도_전부_뺐다고_알린다(monkeypatch):
+    """머리 없는 · 머리를 읽지 못한 리스크 심사의 경고와 카드가 대화 검색도 전부로 넓어졌다고 말한다."""
+    for question, code in ((_Q_MANUAL, "risk_head_missing"), (_Q_UNREAD, "risk_head_unread")):
+        warn, cards = _head_notices(_events_for(monkeypatch, question), code)
+        assert len(warn) == 1 and len(cards) == 1, (code, warn, cards)
+        assert "대화 검색" in warn[0]["message"] and "search_conversations" in cards[0]["text"], (code, warn[0], cards[0])
