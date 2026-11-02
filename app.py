@@ -2655,19 +2655,32 @@ def _slim_tool(tool, desc_max=None):
     return tool
 
 
-def _tag_tool_app(tool, chat=False):
+def _tag_tool_app(tool):
     """도구 설명 앞에 소유 앱 라벨을 붙인다 — get_*/list_* 처럼 이름이 겹치는 도구가 여러 앱에
-    걸쳐 있어(실측: get_* 7개 앱) LLM 이 도메인을 혼동한다. 이름을 안 바꾸므로 호출 계약은 불변.
-    chat — 챗 로드(_prep_tool(chat=True))면 코어 어휘표의 입구 도구 라벨에 '온톨로지 입구' 표지를 단다(HWAXPortal docs/ontology-first OF-6 —
-    규칙 ⑧ 이 가리키는 표지). 심의 · 리스크 심사 로드는 이 래퍼를 같이 타지만 표지를 달지 않는다 — 리스크 좌석 후보에 '먼저 쓰라' 가 가면 안 된다.
-    라벨이 붙지 않는 도구(설명이 '[' 로 시작 — 허브 가족의 소개 줄)에는 표지도 없다. 입구가 없는 박스(기본)에서는 글자 그대로다."""
+    걸쳐 있어(실측: get_* 7개 앱) LLM 이 도메인을 혼동한다. 이름을 안 바꾸므로 호출 계약은 불변."""
     try:
-        key, label = _group_of(getattr(tool, "name", ""))
+        _, label = _group_of(getattr(tool, "name", ""))
         if label and label != "기타" and not str(tool.description or "").startswith("["):
-            if chat and _onto_entry(getattr(tool, "name", ""), key):
-                label = f"{label}{_onto.MARK_TAIL}"
             tool.description = f"[{label}] {tool.description or ''}"
     except Exception:  # noqa: BLE001 — 태깅 실패해도 도구는 살린다
+        pass
+    return tool
+
+
+def _mark_onto_entry(tool):
+    """챗 로드(_prep_tool(chat=True))에서 코어 어휘표의 입구 도구 라벨에 '온톨로지 입구' 표지를 단다(HWAXPortal docs/ontology-first OF-6 — 규칙 ⑧ 이
+    가리키는 표지). 심의 · 리스크 심사 로드는 달지 않는다 — 리스크 좌석 후보에 '먼저 쓰라' 가 가면 안 된다. 앱 라벨([라벨] — _tag_tool_app)이 붙은
+    도구에만 단다 — 설명이 '[' 로 시작해 라벨이 붙지 않은 도구(허브 가족의 소개 줄)에는 없다. 입구가 없는 박스(기본)에서는 글자 그대로다.
+    설명 상한(_slim_tool) **뒤에** 단다 — 앞에서 달면 상한에 닿는 긴 설명이 꼬리 낱말을 잃어 어휘 점수가 바뀌었다(반대 검토 11-02 — OF-25). 표지
+    몫(10자)만큼 상한을 넘는다 — 표지를 떼면 표지 없는 설명과 글자 그대로 같다(어휘 · 의미 순위는 표지를 떼고 센다)."""
+    try:
+        name = getattr(tool, "name", "")
+        key, label = _group_of(name)
+        head = f"[{label}] "
+        desc = str(tool.description or "")
+        if label and desc.startswith(head) and _onto_entry(name, key):
+            tool.description = f"[{label}{_onto.MARK_TAIL}] {desc[len(head):]}"
+    except Exception:  # noqa: BLE001 — 표지를 못 달아도 도구는 살린다
         pass
     return tool
 
@@ -2696,9 +2709,12 @@ def _attach_validation_hint(tool):
 
 
 def _prep_tool(tool, result_max=None, desc_max=None, arg_defaults=None, chat=False):
-    """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + 결과 절단.
+    """도구 로드 직후 한 번에 적용하는 체인: 앱 태깅 + 검증힌트 + 스키마 슬림 + (챗 로드만) 입구 표지 + 결과 절단.
     result_max·desc_max 는 각각 결과·설명 절단 한도 — None 이면 LLM 경로 기본값. arg_defaults · chat 은 챗 경로만 준다(_CHAT_ARG_DEFAULTS)."""
-    return _cap_tool(_slim_tool(_attach_validation_hint(_tag_tool_app(tool, chat)), desc_max), result_max, arg_defaults, chat)
+    tool = _slim_tool(_attach_validation_hint(_tag_tool_app(tool)), desc_max)
+    if chat:
+        tool = _mark_onto_entry(tool)       # 설명 상한 뒤에 단다(OF-25)
+    return _cap_tool(tool, result_max, arg_defaults, chat)
 
 
 # ── 컨텍스트 예산 (운영 타깃 = GLM on B300, 128K 창 기준) ────────────────────────────

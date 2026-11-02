@@ -299,3 +299,23 @@ def test_스냅샷_폴백은_입구가_다를_때_지은_묶음을_쓰지_않는
     state.agent_cache.clear()                 # 캐시 창(AGENT_CACHE_TTL_S)이 지난 것처럼 — 다시 지을 때 불통이면 스냅샷 폴백을 탄다
     down["on"] = True
     assert build()["onto_search"].startswith(f"[StepForge · {onto_links.MARK}]"), "같은 입구로 지은 스냅샷은 그대로 쓴다"
+
+
+def test_표지는_설명_상한_뒤에_달아_상한_안의_글이_표지와_상관없이_같다(monkeypatch, tmp_path):
+    """표지를 상한(TOOL_DESC_MAX) 앞에서 달면 상한에 닿는 긴 설명은 꼬리 낱말을 잃어 어휘 점수가 바뀌었다 — 표지는 순위의 신호가 아닌데(OF-18) 그 길로
+    순위가 갈렸다(반대 검토 11-02 — OF-25). 상한으로 자른 뒤에 단다 — 표지를 떼면 표지 없는 설명과 글자 그대로 같다."""
+    _use(monkeypatch, tmp_path, _real_vocab(), overlay=_SF_ENTRY)
+    _map(monkeypatch, _CAE00, _CAE00_ORIG, labels={"heax-step_forge": "StepForge"})
+    head = len("[StepForge] ")
+    desc = "가" * (a.TOOL_DESC_MAX - head - 5) + " 해석과제"        # 라벨까지 정확히 상한 — 앞에서 단 표지(10자)는 꼬리 낱말을 밀어냈다
+    marked = a._prep_tool(_tool("onto_search", desc), chat=True)
+    plain = a._prep_tool(_tool("onto_search", desc))
+    assert marked.description.startswith(f"[StepForge · {onto_links.MARK}] "), marked.description[:40]
+    assert plain.description.endswith(" 해석과제") and onto_links.strip_mark(marked.description) == plain.description
+    others = [_tool(f"t{i}", f"도구 {i} 설명") for i in range(5)]
+    qt = a._tok_query("해석과제")
+    sm = a._lex_scores([marked, *others], qt).get("onto_search", 0)
+    assert sm == a._lex_scores([plain, *others], qt).get("onto_search", 0) and sm > 0, sm
+    long_ = a._prep_tool(_tool("onto_search", desc + " 더 긴 꼬리"), chat=True)
+    assert onto_links.strip_mark(long_.description) == a._prep_tool(_tool("onto_search", desc + " 더 긴 꼬리")).description, \
+        "상한을 넘는 설명도 자른 글이 같다 — 표지는 그 뒤에 붙는다"
