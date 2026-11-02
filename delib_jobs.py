@@ -1251,6 +1251,11 @@ def _apply(job: dict, event: str, data: dict) -> None:
                 job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
         elif kind == "checkpoint":
             job["checkpoint"] = {k: v for k, v in data.items() if k != "kind"}
+        elif kind == "insight":
+            # 과제 인사이트의 카드 거리(HWAXPortal docs/project-insight-graph M2 · contracts §2) — 단마다 하나다(같은 단을 다시 내면 덮는다 — 제자리
+            # 이어하기가 끝난 단을 다시 내도 하나). 포털이 끝난 잡 창구(app GET /insights/cards)로 읽어 들인다.
+            stage = str(data.get("stage") or "default")
+            job.setdefault("insights", {})[stage] = {k: v for k, v in data.items() if k != "kind"}
         elif kind == "evidence" and data.get("included") is False:
             # 좌석에 **주지 않은** 근거. 웹은 근거 패널에 카드로 뜨지만 MCP 호출자가 보는 것은
             # 이 원장뿐인데, 근거 카드를 통째로 안 적고 있었다 — 본문 키가 달라 근거 25건이
@@ -1365,8 +1370,22 @@ def _entry(spec: dict):
     return {"general": run_deliberation, "sim": run_sim_deliberation, "test-plan": run_test_plan}[spec["engine"]]
 
 
+def insight_armed(job: dict) -> bool:
+    """이 잡이 과제 인사이트의 카드 거리를 짓나 — 주제가 확인(confirmed) · 주장(claimed)이고 리스크 심사 계열이 아니다(HWAXPortal
+    docs/project-insight-graph contracts §1). 주제가 없거나 none 이면 짓지 않는다(과제 대상이 아닌 질문은 카드가 없다 — PLAN §3.4)."""
+    import delib_subject  # noqa: PLC0415 — 주제 모듈은 늦게 읽는다(이 모듈의 다른 늦은 import 와 같다)
+    s = job.get("subject")
+    return (isinstance(s, dict) and s.get("sp_state") in (delib_subject.CONFIRMED, delib_subject.CLAIMED)
+            and not delib_subject.risk_family(job.get("chair_template"), job.get("started_by")))
+
+
 def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_email: str, user_pat: str, ext_kw: dict, ctx):
-    """잡을 띄울 때 부를 것 — 시작(start)과 재기동 뒤 다시 세우기(_requeue)가 같은 것을 만든다."""
+    """잡을 띄울 때 부를 것 — 시작(start)과 재기동 뒤 다시 세우기(_requeue)가 같은 것을 만든다. 주제를 단 잡이면(insight_armed) 그 태스크 문맥에
+    과제 인사이트 무장 표지를 건다 — 줄 · 다시 세우기 · 제자리 이어하기가 다 이 자리를 지난다."""
+    if insight_armed(job):
+        from deliberation import INSIGHT_ARM  # noqa: PLC0415 — 순환 import 회피(_entry 와 같다)
+        ctx.run(INSIGHT_ARM.set, True)
+
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         ctx.run(call_trace.tag, job=job["id"])   # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
@@ -2252,3 +2271,4 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
         info.update(scanned=scanned, window=window, total=total)
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
     return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]
+
