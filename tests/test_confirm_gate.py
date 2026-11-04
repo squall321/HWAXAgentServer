@@ -882,8 +882,11 @@ def test_health_에_confirm_gate_가_실린다(gate, monkeypatch, tmp_path):
     reached = []
     _card_turn(monkeypatch, {"run_job": _gw("run_job", reached)}, [("run_job", P1_GRAPH)])
     h = TestClient(a.app).get("/health").json()["confirm_gate"]
+    # overlay — 박스 덧씌우기(포털 docs/he-team-overlay)가 없는 꼴: 지문은 운영자 정의의 지문이다
+    no_ov = {"state": "none", "error": None, "changed": [], "added": [], "removed": [], "missing": [],
+             "fingerprint": a._json_fp(json.loads(gate.read_text(encoding="utf-8")))}
     assert h == {"on": True, "lists": {"loaded": True, "error": None, "jobs": 25, "writes": len(a._confirm_lists()["writes"]),
-                                       "confirm": len(a._confirm_lists()["confirm"])},
+                                       "confirm": len(a._confirm_lists()["confirm"]), "overlay": no_ov},
                  "pending": 1, "counts": {"cards": 1, "held_calls": 1, "approved": 0, "executed": 0, "declined": 0,
                                           "unknown_reply": 0, "ordered": 0}}
     assert str(gate) not in json.dumps(h), "경로는 싣지 않는다"
@@ -1293,3 +1296,85 @@ def test_rv2_새어_나온_호출이_막히면_호출문을_본문에_남기지_
     res = _result(evs)
     assert reached == [] and llm == [] and len([d for e, d in evs if e == "confirm"]) == 1
     assert "<tool_call>" not in res and res.startswith("`run_job` 를 부르려 했습니다"), res[:200]
+
+
+# ── 박스 덧씌우기(HWAXPortal docs/he-team-overlay — 사용자 결정 11-04) ─────────────────────────────────────────────────────────
+# cae00 이 he-team.local.json 으로 이 박스에만 있는 앱의 운영자를 더하고 덮고 뺀다. 관문은 합친 정의의 목록을 쓰고, 깨지면 통째로 버리고 기본으로
+# 돈다(그 상태를 /health 에). 셈은 포털 infra/personas/he_team.py 와 같아야 한다 — 형제 리포가 곁에 있으면 같은 입력에 같은 결과인지 견준다.
+PORTAL_HE_MOD = ROOT.parent / "HWAXPortal" / "infra" / "personas" / "he_team.py"
+
+
+def test_덧씌우기로_더하고_덮고_빼면_관문_목록이_따른다(gate, monkeypatch, tmp_path):
+    loc = tmp_path / "he-team.local.json"
+    monkeypatch.setattr(a, "CONFIRM_LISTS_LOCAL_PATH", loc)
+    assert a._confirm_class("rootdesigndatahub_lineage_repin") == (None, ""), "전제 — 기본에는 없다"
+    assert a._confirm_class("slurm_job_control")[0] == "confirm", "전제 — 뺄 운영자(he-sim-smarttwin)의 선택 칸 확인 이름"
+    loc.write_text(json.dumps({"_doc": "cae00 이 정본 허브 운영자를 더한다",
+                               "personas": {"he-data-coreontology": {"apps": ["rootdesigndatahub"], "writes": ["rootdesigndatahub_relation_add"],
+                                                                     "confirm": ["rootdesigndatahub_lineage_repin"]},
+                                            "he-cad-stepforge": {"confirm": ["delete_project"]},
+                                            "he-sim-smarttwin": None}}), encoding="utf-8")
+    assert a._confirm_class("failuretrace_lineage_repin") == ("confirm", "lineage_repin"), "더한 운영자 — 접두를 뗀 꼬리로 형제 허브까지"
+    assert a._confirm_class("rootdesigndatahub_relation_add")[0] == "write"
+    assert a._confirm_class("heaxstep_forge_cancel_job") == (None, ""), "덮은 칸은 목록이 통째로 바뀐다(cancel_job 이 빠졌다)"
+    assert a._confirm_class("delete_project")[0] == "confirm" and a._confirm_class("rename_part")[0] == "write"
+    assert a._confirm_class("slurm_job_control")[0] != "confirm", "뺀 운영자의 목록은 관문에서도 빠진다"
+    assert a._confirm_class("smarttwinmcp_submit_job")[0] == "job", "잡 시작 바닥 목록은 운영자 정의와 상관없이 그대로다"
+    li = a._confirm_health()["lists"]
+    ov = li["overlay"]
+    assert li["loaded"] is True and ov["state"] == "ok" and ov["error"] is None, li
+    assert (ov["changed"], ov["added"], ov["removed"]) == (["he-cad-stepforge"], ["he-data-coreontology"], ["he-sim-smarttwin"]), ov
+    assert re.fullmatch(r"[0-9a-f]{12}", ov["fingerprint"]), ov
+
+
+def test_덧씌우기가_깨지면_통째로_버리고_기본으로_돈다(gate, monkeypatch, tmp_path, capsys):
+    loc = tmp_path / "he-team.local.json"
+    monkeypatch.setattr(a, "CONFIRM_LISTS_LOCAL_PATH", loc)
+    base_fp = a._confirm_health()["lists"]["overlay"]["fingerprint"]
+    assert a._confirm_health()["lists"]["overlay"]["state"] == "none"
+    for raw, why in (("{not json", "Expecting"), (json.dumps({"personas": [{"key": "he-x"}]}), "운영자 키로 묶은 객체"),
+                     (json.dumps({"personas": {"he-cad-stepforge": {"key": "he-cad-other"}}}), "키는 바꾸지 않는다")):
+        loc.write_text(raw, encoding="utf-8")
+        li = a._confirm_health()["lists"]
+        assert li["loaded"] is True and li["overlay"]["state"] == "error" and why in li["overlay"]["error"], li
+        assert li["overlay"]["fingerprint"] == base_fp, "버렸으면 기본 정의의 지문이다"
+        assert a._confirm_class("delete_project")[0] == "confirm" and a._confirm_class("heaxstep_forge_cancel_job")[0] == "confirm", "기본 목록 그대로"
+    assert "운영자 박스 덧씌우기를 버렸다(he-team.local.json)" in capsys.readouterr().out
+    loc.unlink()
+    assert a._confirm_health()["lists"]["overlay"]["state"] == "none", "파일을 지우면 다시 읽어 없음으로 돌아온다"
+
+
+def test_덧씌우기_기본_자리는_운영자_정의_곁이다(tmp_path):
+    """루트 conftest 가 시험마다 '없음' 으로 돌리므로 모듈의 처음 값을 새 인터프리터로 본다."""
+    code = "import app; print(app.CONFIRM_LISTS_LOCAL_PATH)"
+    base = {**os.environ, "ARTIFACT_DIR": str(tmp_path / "art"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(ROOT)}
+    base.pop("CONFIRM_LISTS_PATH", None)
+    base.pop("CONFIRM_LISTS_LOCAL_PATH", None)
+    got = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=base, capture_output=True, text=True, timeout=120)
+    assert got.stdout.strip().splitlines()[-1] == str(ROOT.parent / "HWAXPortal" / "infra" / "personas" / "he-team.local.json"), got.stderr[-800:]
+
+
+@pytest.mark.skipif(not PORTAL_HE_MOD.exists(), reason="형제 포털 리포의 he_team.py 가 곁에 없다")
+def test_덧씌우기_셈이_포털_he_team_과_같다():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("portal_he_team", PORTAL_HE_MOD)
+    ht = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ht)
+    base = {"groups": {"cad": "CAD"}, "personas": [
+        {"key": "he-cad-a", "apps": ["a"], "writes": ["x"], "extra": {"k": 1, "j": 2}, "optional": [{"app": "o", "confirm": ["c"]}]},
+        {"key": "he-cad-b", "apps": ["b"]}]}
+    good = [{}, {"_doc": "d"}, {"groups": {"box": "박스", "cad": None}},
+            {"personas": {"he-cad-a": {"writes": ["x", "y"], "extra": {"j": None}}, "he-cad-b": None, "he-cad-c": {"apps": ["c"]},
+                          "he-cad-gone": None}},
+            {"personas": {"he-cad-a": {"key": "he-cad-a", "optional": []}}}]
+    for ov in good:
+        mine, his = a._he_overlay(json.loads(json.dumps(base)), ov), ht.apply_overlay(json.loads(json.dumps(base)), ov)
+        assert mine == his, ov
+        assert a._json_fp(mine[0]) == ht.fingerprint(his[0]), ov
+    assert a._json_fp({**base, "_doc": "x"}) == ht.fingerprint(base)
+    for ov in ([], {"persona": {}}, {"personas": []}, {"personas": {"he-cad-a": ["x"]}}, {"personas": {"he-cad-a": {"key": "z"}}},
+               {"groups": ["x"]}, {"personas": {" ": {}}}):
+        with pytest.raises(ValueError):
+            a._he_overlay(json.loads(json.dumps(base)), ov)
+        with pytest.raises(ValueError):
+            ht.apply_overlay(json.loads(json.dumps(base)), ov)
