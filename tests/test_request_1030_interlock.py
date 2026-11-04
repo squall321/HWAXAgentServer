@@ -470,6 +470,8 @@ def test_I8_health_한_번에_네_관문의_칸과_허브_접기가_함께_실�
     assert h["status_wait"] == {"on": True, "poll_s": 0.02, "max_s": 5.0, "waits": 1, "ended": 1, "capped": 0, "failed": 0}
     cg = h["confirm_gate"]
     assert set(cg) == {"on", "lists", "pending", "counts"} and cg["on"] is True and cg["pending"] == 1
+    ov = cg["lists"].pop("overlay")
+    assert ov["state"] == "none" and ov["error"] is None, ("박스 덧씌우기 없음(포털 docs/he-team-overlay)", ov)
     assert cg["lists"] == {"loaded": True, "error": None, "jobs": len(a._CONFIRM_JOB_TOOLS), "writes": 4, "confirm": 4}, \
         ("접두 별칭 둘씩과 그 접두를 뗀 꼴", cg["lists"])
     assert cg["counts"] == {"cards": 1, "held_calls": 1, "approved": 0, "executed": 0, "declined": 0, "unknown_reply": 0, "ordered": 0}

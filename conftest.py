@@ -98,7 +98,10 @@ def _no_confirm_lists(monkeypatch, tmp_path):
     app_mod = sys.modules.get("app")
     if app_mod is not None and hasattr(app_mod, "CONFIRM_LISTS_PATH"):
         monkeypatch.setattr(app_mod, "CONFIRM_LISTS_PATH", tmp_path / "no-he-team.json")
-        monkeypatch.setattr(app_mod, "_CONFIRM_LISTS", {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "없음"})
+        # 박스 덧씌우기도 '없음' — 실제 정의를 읽는 시험(형제 포털 리포)에도 이 박스의 he-team.local.json 이 끼어들지 않게(HWAXPortal docs/he-team-overlay)
+        monkeypatch.setattr(app_mod, "CONFIRM_LISTS_LOCAL_PATH", tmp_path / "no-he-team.local.json")
+        monkeypatch.setattr(app_mod, "_CONFIRM_LISTS", {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "없음",
+                                                        "overlay": None})
         monkeypatch.setattr(app_mod, "_CONFIRM_PENDING", OrderedDict())
 
 

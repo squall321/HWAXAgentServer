@@ -3709,7 +3709,59 @@ def _agent_external_call(name, args) -> bool:
 _CONFIRM_LISTS_ENV = os.environ.get("CONFIRM_LISTS_PATH", "").strip()
 CONFIRM_LISTS_PATH = (Path(__file__).resolve().parent / Path(_CONFIRM_LISTS_ENV).expanduser() if _CONFIRM_LISTS_ENV
                       else Path(__file__).resolve().parent.parent / "HWAXPortal" / "infra" / "personas" / "he-team.json")
-_CONFIRM_LISTS: dict = {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "아직 읽지 않음"}
+# 박스 덧씌우기(HWAXPortal docs/he-team-overlay — 사용자 결정 11-04) — cae00 이 이 박스에만 있는 앱의 운영자를 같은 자리의 he-team.local.json(포털 리포의
+# gitignore 박스 파일)으로 더하고 덮고 뺀다. 셈은 포털 infra/personas/he_team.py 와 같다(운영자 키로 묶은 merge patch · 목록은 통째로 · 깨지면 통째로
+# 버리고 기본 · 지문) — 시험이 그 모듈과 같은 합친 정의 · 지문을 견준다. 실행 중에 형제 리포의 코드는 들이지 않는다(판이 어긋나면 서버가 뜨지 못한다).
+# CONFIRM_LISTS_LOCAL_PATH 로 다른 파일을 가리킬 수 있다(시험은 없는 자리로 비켜 간다 — conftest).
+_CONFIRM_LOCAL_ENV = os.environ.get("CONFIRM_LISTS_LOCAL_PATH", "").strip()
+CONFIRM_LISTS_LOCAL_PATH = (Path(__file__).resolve().parent / Path(_CONFIRM_LOCAL_ENV).expanduser() if _CONFIRM_LOCAL_ENV
+                            else CONFIRM_LISTS_PATH.with_name("he-team.local.json"))
+_CONFIRM_LISTS: dict = {"key": None, "writes": frozenset(), "confirm": frozenset(), "error": "아직 읽지 않음", "overlay": None}
+_HE_OVERLAY_TOP = frozenset({"_doc", "groups", "personas"})
+
+
+def _he_overlay(spec: dict, overlay) -> tuple:
+    """운영자 정의 + 박스 덧씌우기 → (합친 정의, {changed, added, removed, missing}). 포털 he_team.apply_overlay 와 같은 셈 · 같은 거절(ValueError) —
+    있는 키는 그 운영자에 merge patch(목록은 통째로), 없는 키는 새 운영자, null 은 뺀다. 합친 차례는 기본 차례 그대로이고 새 운영자는 뒤에 붙는다."""
+    if not isinstance(overlay, dict):
+        raise ValueError(f"덧씌우기는 객체여야 한다({type(overlay).__name__})")
+    extra = sorted(set(overlay) - _HE_OVERLAY_TOP)
+    if extra:
+        raise ValueError(f"모르는 칸 {', '.join(extra)} — groups · personas · _doc 만 받는다")
+    groups = overlay.get("groups")
+    if groups is not None and not isinstance(groups, dict):
+        raise ValueError("groups 는 묶음 → 라벨의 객체여야 한다")
+    pats = overlay.get("personas")
+    if pats is None:
+        pats = {}
+    if not isinstance(pats, dict):
+        raise ValueError("personas 는 운영자 키로 묶은 객체여야 한다(정본처럼 목록으로 적지 않는다)")
+    for k, v in pats.items():
+        if not k.strip():
+            raise ValueError("운영자 키가 비었다")
+        if v is not None and not isinstance(v, dict):
+            raise ValueError(f"{k} — 운영자 덧씌우기는 객체이거나 null 이어야 한다({type(v).__name__})")
+        if isinstance(v, dict) and v.get("key") not in (None, k):
+            raise ValueError(f"{k} — 키는 바꾸지 않는다(바꾸려면 null 로 빼고 새 키로 더한다)")
+    base = list(spec.get("personas") or [])
+    have = {p.get("key") for p in base if isinstance(p, dict)}
+    merged, changed, removed = [], [], []
+    for p in base:
+        k = p.get("key") if isinstance(p, dict) else None
+        if k not in pats:
+            merged.append(p)
+        elif pats[k] is None:
+            removed.append(k)
+        else:
+            merged.append({**_merge_patch(p, pats[k]), "key": k})
+            changed.append(k)
+    added = [k for k, v in pats.items() if k not in have and v is not None]
+    merged += [{**_merge_patch({}, pats[k]), "key": k} for k in added]
+    missing = [k for k, v in pats.items() if k not in have and v is None]
+    out = {**spec, "personas": merged}
+    if groups:
+        out["groups"] = _merge_patch(spec.get("groups") or {}, groups)
+    return out, {"changed": changed, "added": added, "removed": removed, "missing": missing}
 # 잡 시작 바닥 목록 — 운영자 정의 없이도 막는다(요청서가 이름 댄 잡 · 클러스터 제출 · StepForge 의 다른 잡 넣기 — 같은 단일 러너 · 심의 · 리스크 잡).
 # 이름 규칙은 거절 관문과 같다(_named — 그대로이거나 게이트웨이 별칭 · 충돌 접두를 단 꼴).
 _CONFIRM_JOB_TOOLS = (
@@ -3780,18 +3832,25 @@ def _confirm_lists() -> dict:
     맨 이름으로 불러도 맞게). 없으면 두 목록이 비고(바닥 목록만 돈다) 까닭은 error 다 — 로그는 처음 한 번. 꼴이 틀린 항목(글이 아닌 이름 ·
     app 이 빠진 선택 앱 …)은 그것만 건너뛰고 error 에 수를 적으며, 파일을 통째로 못 읽으면(JSON 이 깨짐 · personas 가 없음) 마지막으로 읽은 목록을
     쥔 채 error 만 적는다 — 종전엔 항목 하나의 실수가 앞서 읽어 둔 좋은 목록까지 버려 박스 전체의 쓰기 · 확인 부류가 카드 없이 나갔다(반대 검토 2차).
-    error 가 있으면 /health lists.loaded 가 거짓이다(update-all §7 의 ⚠)."""
+    error 가 있으면 /health lists.loaded 가 거짓이다(update-all §7 의 ⚠). 같은 자리의 박스 덧씌우기(he-team.local.json — 포털 docs/he-team-overlay)를
+    합친 정의로 읽는다 — 덧씌우기가 깨졌으면 통째로 버리고 기본 정의로 돌며 그 상태를 overlay 칸(/health)에 적는다. 다시 읽는 열쇠는 두 파일의 바뀐 시각 · 크기다."""
     try:
         st = CONFIRM_LISTS_PATH.stat()
     except OSError:
         if _CONFIRM_LISTS["error"] != "없음":
             print(f"[confirm] ⚠ 운영자 정의가 없다({CONFIRM_LISTS_PATH}) — 확인 관문은 잡 시작 바닥 목록만으로 돈다", flush=True)
-        _CONFIRM_LISTS.update(key=None, writes=frozenset(), confirm=frozenset(), error="없음")
+        _CONFIRM_LISTS.update(key=None, writes=frozenset(), confirm=frozenset(), error="없음", overlay=None)
         return _CONFIRM_LISTS
-    key = (str(CONFIRM_LISTS_PATH), st.st_mtime_ns, st.st_size)
+    try:
+        lst_ = CONFIRM_LISTS_LOCAL_PATH.stat()
+        lkey = (lst_.st_mtime_ns, lst_.st_size)
+    except OSError:
+        lkey = None
+    key = (str(CONFIRM_LISTS_PATH), st.st_mtime_ns, st.st_size, lkey)
     if key != _CONFIRM_LISTS["key"]:
         try:
-            personas = json.loads(CONFIRM_LISTS_PATH.read_text(encoding="utf-8"))["personas"]
+            doc = json.loads(CONFIRM_LISTS_PATH.read_text(encoding="utf-8"))
+            personas = doc["personas"]
             if not isinstance(personas, list):
                 raise TypeError("personas 가 목록이 아니다")
         except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -3799,6 +3858,23 @@ def _confirm_lists() -> dict:
                   f"(쓰기 {len(_CONFIRM_LISTS['writes'])} · 확인 {len(_CONFIRM_LISTS['confirm'])})으로 돈다: {exc!r}"[:400], flush=True)
             _CONFIRM_LISTS.update(key=key, error=f"못 읽음({type(exc).__name__})")
             return _CONFIRM_LISTS
+        ov: dict = {"state": "none", "error": None, "changed": [], "added": [], "removed": [], "missing": []}
+        if lkey is not None:
+            try:
+                raw = CONFIRM_LISTS_LOCAL_PATH.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                ov.update(state="error", error=f"못 읽었다({type(exc).__name__})")
+            else:
+                try:
+                    doc, diff = _he_overlay(doc, json.loads(raw))
+                    personas = doc["personas"]
+                    ov.update(diff, state="ok")
+                except ValueError as exc:            # json.JSONDecodeError 도 ValueError 다
+                    ov.update(state="error", error=str(exc)[:300])
+            if ov["state"] == "error":
+                print(f"[confirm] ⚠ 운영자 박스 덧씌우기를 버렸다({CONFIRM_LISTS_LOCAL_PATH.name}) — 기본 정의로 돈다(cae00 이 더한 확인 이름이 빠진다): "
+                      f"{ov['error']}"[:400], flush=True)
+        ov["fingerprint"] = _json_fp(doc)
         got: dict = {"writes": set(), "confirm": set()}
         bad = 0
 
@@ -3834,7 +3910,7 @@ def _confirm_lists() -> dict:
         if bad:
             print(f"[confirm] ⚠ 운영자 정의({CONFIRM_LISTS_PATH})에서 꼴이 틀린 항목 {bad}개를 건너뛰었다 — 나머지 목록으로 돈다", flush=True)
         _CONFIRM_LISTS.update(key=key, writes=frozenset(got["writes"]), confirm=frozenset(got["confirm"]),
-                              error=f"항목 {bad}개를 건너뜀(꼴이 틀렸다)" if bad else None)
+                              error=f"항목 {bad}개를 건너뜀(꼴이 틀렸다)" if bad else None, overlay=ov)
     return _CONFIRM_LISTS
 
 
@@ -4524,7 +4600,9 @@ def _confirm_health() -> dict:
         counts = {k: _CONFIRM_STAT.get(k, 0) for k in _CONFIRM_COUNT_KEYS}
     return {"on": CHAT_CONFIRM_GATE,
             "lists": {"loaded": lists["error"] is None, "error": lists["error"], "jobs": len(_CONFIRM_JOB_TOOLS),
-                      "writes": len(lists["writes"]), "confirm": len(lists["confirm"])},
+                      "writes": len(lists["writes"]), "confirm": len(lists["confirm"]),
+                      # 박스 덧씌우기(포털 docs/he-team-overlay) — state none · ok · error, 지문은 포털 동기화의 합친 정의 지문과 같아야 한다(update-all §7 이 견준다)
+                      "overlay": lists.get("overlay")},
             "pending": pending, "counts": counts}
 
 
