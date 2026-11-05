@@ -111,6 +111,7 @@ import deliberation as _delib_engine   # DELIB_IMAGES 는 모듈로 읽는다 �
 import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
 import ui_panels as _ui   # 포털 챗의 MCP Apps 패널 — 표지가 있는 턴만 패널 도구를 묶고 ui_resource 를 낸다(HWAXPortal docs/request-1027 HA-20)
+import embeds as _embeds   # 챗 뷰어 카드 — 도구 결과의 같은 출처 /apps/ 뷰어 주소를 모아 result 앞에 SSE embeds 로 낸다(HWAXPortal docs/chat-embeds)
 import publish_token as _publish_token   # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(확인 카드 — 사용자 결정 10-31 '내보내는 곳만 가린다')
 import onto_links as _onto   # 코어 어휘표 ontology 칸 — 챗 고정 몫 · 규칙 ⑧ · 입구 표지(HWAXPortal docs/ontology-first)
 from langgraph.errors import GraphRecursionError
@@ -2632,6 +2633,9 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # ── R5 원문 붙잡기(HA-27) — 접기 · 자르기 전 원문을 이번 챗 턴 그릇에(턴 밖 · 관문 끔이면 아무것도 안 한다). 자기검증 관문이 검토자의
         # 바꿀 곳을 이 원문과 다시 대조한다 — 검토자 사본은 아래 접기 · 상한을 지나 원문의 수가 빠져 있었다(OT-04 34 → 13).
         _sc_keep_raw(raw)
+        # ── R5b 뷰어 카드(HWAXPortal docs/chat-embeds) — 같은 원문에서 같은 출처 /apps/ 뷰어 주소를 이번 챗 턴 그릇에(턴 밖이면 글을 읽지도 않는다).
+        # 앱은 게이트웨이 도구 지도의 백엔드 · 도구는 경유면 안쪽 이름(R1). 스트림이 result 앞에 embeds 로 한 번 낸다 — 모델에 가는 결과는 그대로다.
+        _embeds.add(raw, _eff, (_TOOLS_MAP_CACHE.get("map") or {}).get(_eff, ""))
         # ── R6 접기 → 자르기 → 인자 힌트
         body = _maybe_repair_hint(_cap(_fold_hub_result(_eff, raw, _via_inv), result_max))
         # ── R7 id 배우기 — 정수(유령 ID 막이) · UUID → 허브(HA-30, 모델이 보는 글에서 · 경유면 안쪽 이름으로)
@@ -6899,6 +6903,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
     _turn_models: dict = {}     # 이 턴의 모델 호출 수(모델 이름 → 횟수) — 턴 끝 'meta' 사건(C3)
     turn_imgs: list = []
     _turn_images.set(turn_imgs)
+    turn_embeds: list = []          # 뷰어 카드(HWAXPortal docs/chat-embeds) — 도구 래퍼(R5b)가 더하고 result 앞에서 embeds 로 한 번 낸다
+    _embeds.TURN.set(turn_embeds)
     _turn_image_events: list = []   # 그림 손질이 낸 화면 사건(올린 그림 주소 · 상태 줄) — 메시지를 짓기 전에 흘린다
     _TURN_IMAGE_EVENTS.set(_turn_image_events)
     # 근거 블록·수치 대조용 — 이번 턴에 실제로 실행된 도구와 그 출력 원문.
@@ -7482,6 +7488,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 yield _sse("token", {"delta": _cctx.card})
             for _uev in (_ui_turn.rest() if _ui_turn is not None else ()):    # 패널(HA-20) — 이 길에서도 남은 사건을 버리지 않는다
                 yield _sse(_ui.EVENT, _uev)
+            for _emb in _embeds.rest(turn_embeds):      # 뷰어 카드(docs/chat-embeds) — result 로 끝나는 길마다 그 앞에 한 번
+                yield _sse(_embeds.EVENT, _emb)
             yield _sse("result", {"type": "text", "content": text})
             yield _sse("done", {})
             return
@@ -7513,6 +7521,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                      ("\n\n⚠ 처리 중 내부 오류로 응답이 여기서 중단되었습니다"
                       f"{detail}. 같은 질문을 다시 보내면 재시도합니다."))
             yield _sse("token", {"delta": _note})
+            for _emb in _embeds.rest(turn_embeds):      # 뷰어 카드 — 끊기기 전에 돈 도구의 카드도 버리지 않는다
+                yield _sse(_embeds.EVENT, _emb)
             yield _sse("result", {"type": "text", "content": _partial + _note})
         elif _loop_cap:
             yield _sse("error", {"code": "tool_loop_limit", "message": _loop_cap})
@@ -7581,10 +7591,14 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                     box.update(draft=text, calls=list(turn_calls), outputs=list(turn_out), confirm=_cctx.card)
                 else:
                     yield _sse("token", {"delta": _cctx.card})
+                for _emb in _embeds.rest(turn_embeds):      # 뷰어 카드 — 재시도(ainvoke) 안에서 부른 도구의 카드도
+                    yield _sse(_embeds.EVENT, _emb)
                 yield _sse("result", {"type": "text", "content": text})
             elif _rescued:
                 print(f"[agent] auto-retry 성공 — 오류 턴 복구(시도 {_attempt}회)")
                 yield _sse("token", {"delta": _rescued})
+                for _emb in _embeds.rest(turn_embeds):
+                    yield _sse(_embeds.EVENT, _emb)
                 yield _sse("result", {"type": "text", "content": _rescued})
             else:
                 # 원인을 뭉뚱그리지 않는다. LLM 미도달은 '에이전트 오류' 가 아니라 인프라
@@ -7924,6 +7938,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 패널(HA-20) — 끝 사건이 없던 길(재시도의 ainvoke)의 ui_resource 를 call 없이 낸다. 결과 · 끝 앞이다(자기검증 감싸개는 그대로 넘긴다)
         for _uev in _ui_turn.rest():
             yield _sse(_ui.EVENT, _uev)
+    # 뷰어 카드(HWAXPortal docs/chat-embeds) — 이 턴의 도구 결과에서 모은 같은 출처 /apps/ 뷰어 주소를 result 앞에 한 번. 모델이 쓴 글은 읽지 않는다.
+    # 자기검증 감싸개는 모르는 사건이라 그대로 흘리고 result 는 붙잡았다 내므로 순서가 지켜진다
+    for _emb in _embeds.rest(turn_embeds):
+        yield _sse(_embeds.EVENT, _emb)
     if _turn_models:
         # 답한 모델 · 생각 설정 — 화면이 메시지 아래에 보인다(C3). 챗 서버가 아닌 모델이 섞였으면 넘김이 일어났다.
         _ci = getattr(app.state, "chat_llm_info", None) or {}
