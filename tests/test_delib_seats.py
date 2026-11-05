@@ -349,9 +349,11 @@ def _dictcomp_cond(marker: str, other: str):
     return compile(_ast.Expression(body=hits[0]), "<gate>", "eval")
 
 
-def _eval_gate(code, name, *, chair, apps=(), amap=None, orig=None):
+def _eval_gate(code, name, *, chair, apps=(), amap=None, orig=None, conn=(), conn_keep=()):
     # _orig — 원래 이름으로 판정할 겹침 접두 이름(HWAXPortal docs/ontology-first F0). 리스크 심사에서는 조립식이 비워 둔다 — 기본은 빈 것(맨 이름 판정)
+    # _conn_ok · _conn_keep — 좌석 자유 조회에 들일 선언 백엔드의 확인된 읽기 · 앱 목록 좁히기에서도 남길 것(HWAXPortal docs/siren-delib HA-36)
     ns = {
+        "_conn_ok": frozenset(conn), "_conn_keep": frozenset(conn_keep),
         "n": name, "_FREE_DENY": d._FREE_DENY, "_free_tool_ok": d._free_tool_ok,
         "_MATERIAL_TOOLS": d._MATERIAL_TOOLS, "_RISK_READ_TOOLS": d._RISK_READ_TOOLS,
         "_RISK_KEEP_TOOLS": d._RISK_KEEP_TOOLS, "_amap": amap or {}, "_apps": set(apps),
@@ -486,6 +488,13 @@ def test_자유조회_조립식_게이트가_chair_와_앱_조건부다():
     assert not _eval_gate(gate, "pcb_warpage_surrogate", chair="diagnosis", amap=amap)
     # _FREE_DENY 는 어느 경로보다 우선한다.
     assert not _eval_gate(gate, "get_agent_session", chair="risk-review", apps=apps, amap=amap)
+    # 외부 연결의 확인된 읽기(HA-36) — 이름 머리와 상관없이 든다. 리스크 심사에도(사용자 결정 11-06), 닫기 목록 · D-18 거름이 앞선다.
+    conn = {"siren_search_cases", "get_agent_session", "list_reports"}
+    assert not _eval_gate(gate, "siren_search_cases", chair="default", amap=amap)
+    assert _eval_gate(gate, "siren_search_cases", chair="default", amap=amap, conn=conn)
+    assert _eval_gate(gate, "siren_search_cases", chair="risk-review", amap=amap, conn=conn)
+    assert not _eval_gate(gate, "get_agent_session", chair="risk-review", amap=amap, conn=conn), "닫기 목록이 앞선다"
+    assert not _eval_gate(gate, "list_reports", chair="risk-review", amap=amap, conn=conn), "D-18 — RA 보고서 읽기는 리스크 심사에서 빠진다"
 
 
 def test_F0_조립식은_겹침_접두_이름을_원래_이름으로_본다():
@@ -520,6 +529,11 @@ def test_앱_제한_narrow_는_keep_도구를_chair_조건부로_남긴다():
         assert d._free_tool_ok(n), n
         assert not _eval_gate(gate, n, chair="default", apps=apps, amap=amap), n
         assert _eval_gate(gate, n, chair="risk-review", apps=apps, amap=amap), n
+    # 외부 연결 읽기(HA-36) — 앱이 실은 앱 목록(리스크 심사 · 앱이 띄운 패널)이면 좁히기에서도 남는다(_conn_keep). 사람이 고른 앱이면 고른 것만.
+    amap["siren_search_cases"] = "siren"
+    assert not _eval_gate(gate, "siren_search_cases", chair="default", apps=apps, amap=amap)
+    assert _eval_gate(gate, "siren_search_cases", chair="risk-review", apps=apps, amap=amap, conn_keep={"siren_search_cases"})
+    assert _eval_gate(gate, "siren_search_cases", chair="default", apps=("siren",), amap=amap)
 
 
 # 러너가 실제로 보내는 apps — 어댑터 앱 둘(HWAXRisk runner._delib_apps · adapters/registry.ADAPTERS). 리스크 앱
