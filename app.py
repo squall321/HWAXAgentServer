@@ -3218,8 +3218,10 @@ _GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
 # 쓰고, 읽는 쪽은 .get 으로 읽는다(시험이 그 칸 없는 사전으로 통째로 바꿔 끼운다).
 # orig — 노출 이름 → 원래 이름(둘이 다른 것만 — 겹침 · 허브 가족 접두). declared · family — 선언 백엔드(connect:) · 허브 가족(정본 + 형제)의 앱 키.
 # 좌석 자유 조회의 원래 이름 판정(HWAXPortal docs/ontology-first F0)이 본다. orig 칸이 없는 옛 게이트웨이면 None — 지금처럼 노출 이름으로 판정한다.
+# panel_read — 게이트웨이가 표지 · 읽기 목록으로 **확인한** 읽기(이름 낱말 갈래 없이 — _panel_read). 좌석 자유 조회가 선언 백엔드의 읽기를 들일 때
+# 본다(HWAXPortal docs/siren-delib HA-36). 옛 게이트웨이는 그 칸이 없어 None — 선언 백엔드 도구를 들이지 않는다(닫힌 쪽).
 _TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}, "routine_read": None, "orig": None,
-                          "declared": frozenset(), "family": frozenset()}
+                          "declared": frozenset(), "family": frozenset(), "panel_read": None}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
@@ -3287,6 +3289,7 @@ def _tools_map() -> dict:
             # 영역(tool_areas.json)도 같은 응답에 온다 — 따로 받지 않는다. 구 게이트웨이면 빈 채로
             # 두어 도구가 '미분류' 로 보인다(분류를 지어내지 않는다).
             _rr = data.get("routine_read")
+            _pr = data.get("panel_read")
             _og = data.get("orig")
             _rows = [a for a in (data.get("apps") or []) if isinstance(a, dict) and isinstance(a.get("app"), str)]
             _TOOLS_MAP_CACHE.update({"at": now, "map": m, "areas": data.get("areas") or {},
@@ -3294,6 +3297,8 @@ def _tools_map() -> dict:
                                                    if isinstance(a, dict) and a.get("area")},
                                      "routine_read": (frozenset(x for x in _rr if isinstance(x, str))
                                                       if isinstance(_rr, list) else None),
+                                     "panel_read": (frozenset(x for x in _pr if isinstance(x, str))
+                                                    if isinstance(_pr, list) else None),
                                      "orig": ({k: v for k, v in _og.items() if isinstance(k, str) and isinstance(v, str)}
                                               if isinstance(_og, dict) else None),
                                      "declared": frozenset(a["app"] for a in _rows if a.get("declared") is True),
@@ -3316,6 +3321,22 @@ def _free_judge_names() -> dict:
         return {}
     skip = set(_TOOLS_MAP_CACHE.get("declared") or ()) | set(_TOOLS_MAP_CACHE.get("family") or ()) | set(_hub_apps())
     return {n: o for n, o in orig.items() if m.get(n) and m[n] not in skip}
+
+
+def _conn_free_reads() -> frozenset:
+    """좌석 자유 조회에 들일 선언 백엔드(외부 연결 — 박스 권한표 connect:)의 읽기 도구 노출 이름(HWAXPortal docs/siren-delib HA-36). 이름 머리
+    (_FREE_ALLOW)가 아니라 게이트웨이가 **확인한** 읽기(panel_read — 앱의 readOnlyHint · 읽기 목록 · 선언의 read_tools)로 고른다 — 외부 플랫폼은
+    제 이름을 앞에 붙여 내 머리 규칙에 걸리지 않는다(SIREN 의 siren_search_cases). 받아 둔 지도만 본다(게이트웨이를 두드리지 않는다). panel_read 를
+    모르는 옛 게이트웨이 · 지도가 빈 때는 빈 집합 — 들이지 않는다(닫힌 쪽)."""
+    m = _TOOLS_MAP_CACHE.get("map") or {}
+    pr = _TOOLS_MAP_CACHE.get("panel_read")
+    orig = _TOOLS_MAP_CACHE.get("orig")
+    declared = _TOOLS_MAP_CACHE.get("declared") or frozenset()
+    if not m or not isinstance(pr, frozenset) or not isinstance(orig, dict) or not declared:
+        return frozenset()
+    # 겹침 접두가 붙은 이름(노출 이름 ≠ 원래 이름 — 허브 앱과 같은 도구의 두 벌, 운영 사본)은 뺀다 — F0 가 선언 백엔드를 원래 이름 판정에서 뺀 까닭과
+    # 같다. 제 이름으로 붙은 도구(siren_search_cases — 원래 이름 그대로)만 든다. orig 를 모르는 옛 게이트웨이면 가를 수 없어 들이지 않는다.
+    return frozenset(n for n in pr if m.get(n) in declared and n not in orig)
 
 
 def _pretty_group(key: str) -> str:

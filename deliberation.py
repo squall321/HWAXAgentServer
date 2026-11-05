@@ -4424,6 +4424,25 @@ def _free_tool_ok(name: str) -> bool:
     return n not in _FREE_DENY and n.startswith(_FREE_ALLOW)
 
 
+def _list_first(name: str) -> int:
+    """지정 도구 차례 — 목록 · 검색 · 찾기 도구가 먼저(0), 나머지(1). 노출 이름만 보던 때는 앱 이름이 앞에 붙은 도구가 늘 1 이었다 — 외부 연결
+    플랫폼은 제 이름을 붙여 낸다(SIREN 의 siren_search_cases). 그러면 siren_get_case 가 검색보다 먼저 불려 사례 ID 를 몰라 건너뛰었다(HWAXPortal
+    docs/siren-delib HA-37). 게이트웨이가 아는 원래 이름(겹침 · 허브 가족 접두를 뗀 꼴)으로 보고, 그 이름이 제 앱 키로 시작하면 그 머리도 떼어 본다.
+    받아 둔 도구 지도만 본다(게이트웨이를 두드리지 않는다 — 심의 도구 로드가 방금 받았다). 지도가 없으면 노출 이름으로만(종전 그대로)."""
+    try:
+        from app import _TOOLS_MAP_CACHE  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+        orig = _TOOLS_MAP_CACHE.get("orig") or {}
+        app_key = (_TOOLS_MAP_CACHE.get("map") or {}).get(name) or ""
+    except Exception:  # noqa: BLE001 — 지도를 못 읽어도 차례는 노출 이름으로 정한다
+        orig, app_key = {}, ""
+    n = orig.get(name, name) if isinstance(orig, dict) else name
+    heads = [name, n]
+    for k in {app_key, app_key.replace("-", "_")}:
+        if k and n.startswith(k + "_"):
+            heads.append(n[len(k) + 1:])
+    return 0 if any(h.startswith(("list_", "search_", "find_")) for h in heads) else 1
+
+
 def _app_of_tools() -> dict:
     """{도구명: 소속 앱키} — 게이트웨이 /tools-map 이 정본. 실패하면 {}(좁히지 않는다).
 
@@ -4461,6 +4480,16 @@ def _free_orig_names() -> dict:
     except Exception as exc:  # noqa: BLE001 — 판정을 넓히지 못해도 지금 판정 그대로 간다
         print(f"[deliberation] 원래 이름 판정 자료를 못 읽었다 — 노출 이름으로 판정한다: {exc!r}")
         return {}
+
+
+def _free_conn_reads() -> frozenset:
+    """좌석 자유 조회에 들일 선언 백엔드의 확인된 읽기(app._conn_free_reads — HWAXPortal docs/siren-delib HA-36). 실패하면 빈 집합(들이지 않는다)."""
+    try:
+        from app import _conn_free_reads  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+        return _conn_free_reads()
+    except Exception as exc:  # noqa: BLE001 — 못 읽으면 종전 판정 그대로 간다
+        print(f"[deliberation] 외부 연결 읽기 목록을 못 읽었다 — 들이지 않는다: {exc!r}")
+        return frozenset()
 
 
 def _wrap_cached(tool, cache: dict, stats: dict | None = None):
@@ -4502,6 +4531,161 @@ def _wrap_cached(tool, cache: dict, stats: dict | None = None):
 
     tool.coroutine = cached
     return tool
+
+
+# ── 외부 연결(선언 백엔드 — 박스 권한표 connect:) 호출 줄 — 한 잡 안에서(HWAXPortal docs/siren-delib HA-36) ─────────────────────────
+# 좌석들은 잡 주인 토큰 하나로 그쪽을 함께 부른다 — SIREN 은 토큰당 동시 2건 · 검색 1분 10번이라, 좌석 여럿이 한꺼번에 부르면 셋째부터 429 다.
+# 백엔드마다 실제 호출을 DELIB_CONN_CONCURRENCY(기본 2)건씩 줄 세우고, 429 를 받은 백엔드는 그 잡에서 다시 부르지 않는다(그쪽 한도를 계속
+# 두드리지 않는다 — 같은 토큰의 다른 호출까지 막힌다). 같은 도구 · 같은 인자는 잡 캐시(_wrap_cached)가 먼저 합친다 — 줄은 그 안쪽에 건다.
+_CONN_CONC = _env_int("DELIB_CONN_CONCURRENCY", 2)
+# 429 는 상태 꼴로만 — 게이트웨이 안내 '(429 — …)' · 원래 오류의 repr "'429 rate_limited'" · httpx "'429 Too Many Requests'" · 이 줄의 막음
+# '(429 — …)'. 글 속 아무 429(사람 이메일 kim429@ · 인자를 되울린 C-429)에 걸리면 그 잡에서 그쪽을 통째로 끈다(반대 검토 11-06).
+_CONN_429_RE = re.compile(r"(?:\(|['\"])429(?![0-9])|(?<![0-9])429 (?:rate_limited|Too Many Requests)")
+_CONN_401_RE = re.compile(r"(?:\(|['\"])401(?![0-9])")
+_CONN_UNREG_MARK = "(미연결)"      # 이 줄이 미연결 백엔드의 뒤 호출을 막을 때 싣는 표지 — _conn_unregistered 가 알아본다
+_TRUST_KEY_RE = re.compile(r'"(?:trust|human_verified)"\s*:')
+_FAIL_MARK = "✖"           # app._TOOL_FAIL_MARK — 실패한 호출의 결과 글 머리(app 은 늦게 import 해서 글자로 둔다)
+
+
+def _fail_text(out) -> str:
+    """도구 결과가 실패 글이면 그 글(app._cap_tool 이 ✖ 로 시작하게 만든다), 아니면 빈 글."""
+    s = out[0] if isinstance(out, tuple) and out else out
+    return s if isinstance(s, str) and s.lstrip().startswith(_FAIL_MARK) else ""
+
+
+def _conn_rate_limited(out) -> bool:
+    """선언 백엔드 호출이 한도 초과(429)로 실패했나 — 게이트웨이 안내(HG-26 '…(429 — …)')와 옛 게이트웨이의 원래 오류(…'429 rate_limited'…) 둘 다.
+    등록 안내('등록되어 있지 않습니다')면 한도 초과가 아니다(그 글 속 숫자에 걸리지 않게)."""
+    s = _fail_text(out)
+    return bool(s) and "등록되어 있지 않습니다" not in s and _CONN_429_RE.search(s[:800]) is not None
+
+
+_CONN_NOTE_HEAD = "[외부 연결 "       # _conn_note 의 머리 — _capped_at 이 이 머리줄을 건너 잰다
+
+
+def _conn_note(bk: str) -> str:
+    """외부 연결 결과의 안내 한 줄(HWAXPortal docs/siren-delib RK-12 — 사용자 결정 11-06 '엔진이 결과에 한 줄'). 바깥 플랫폼의 사례 · 기록은 사람이
+    확인한 것과 기계가 만든 것이 섞여 온다(SIREN — 「확정(사람 검증)」 · 「AI 초안 — 미검증」). 지정 도구 결과 묶음의 머리줄과 좌석 자유 조회 결과의
+    머리에 같은 글로 싣는다."""
+    return (f"[외부 연결 {bk} 의 결과 — 결과가 사례 · 항목마다 주는 신뢰 · 확인 칸(trust 등)을 그대로 옮겨 적고, 사람이 확인하지 않은 것은 "
+            "후보로만 쓴다(판정의 근거로 단정하지 않는다). 결과가 비었다고 리스크가 없다는 뜻은 아니다]")
+
+
+def _has_trust(s) -> bool:
+    """결과가 신뢰 · 확인 칸(trust · human_verified)을 싣고 있나 — 안내는 그 칸이 있는 결과에만 붙인다. 그런 칸이 없는 외부 연결(물성 DB 등)의 결과에
+    '사람이 확인하지 않은 것은 후보로만' 을 붙이면 좌석이 측정값까지 후보로 낮춘다(반대 검토 11-06)."""
+    return isinstance(s, str) and _TRUST_KEY_RE.search(s) is not None
+
+
+def _with_conn_note(out, bk: str):
+    """성공한 결과(글)의 머리에 _conn_note 를 붙인다 — 신뢰 · 확인 칸이 있는 결과만(_has_trust). 실패 글 · 오류 봉투 · 빈 결과는 그대로 둔다(빈 결과에
+    붙이면 근거로 읽힌다). 끝이 아니라 머리다 — 좌석 발언 턴에 실을 때 몫에 맞춰 뒤를 자른다(_capped_at 은 이 머리줄을 건너 잰다)."""
+    s = out[0] if isinstance(out, tuple) and out else out
+    if (not isinstance(s, str) or not _delib_tool_result_ok(s) or s.strip() in ("[]", "{}", "null", "")
+            or not _has_trust(s)):
+        return out
+    s = _conn_note(bk) + "\n" + s
+    return (s, *out[1:]) if isinstance(out, tuple) else s
+
+
+def _conn_unregistered(out) -> bool:
+    """선언 백엔드 호출이 잡 주인의 등록 토큰이 없거나 그쪽이 받지 않아(401) 실패했나 — 게이트웨이의 등록 안내(/tokens?tab=connect)가 실린 실패와
+    이 줄이 미연결 뒤의 호출을 막은 글(_CONN_UNREG_MARK). 401 은 상태 꼴로만 보고, 한도 초과는 먼저 가른다(옛 게이트웨이는 429 에도 '다시
+    등록하세요' 라고 썼다)."""
+    s = _fail_text(out)
+    if not s:
+        return False
+    if _CONN_UNREG_MARK in s[:400] or ("/tokens?tab=connect" in s and "등록되어 있지 않습니다" in s):
+        return True
+    return "/tokens?tab=connect" in s and not _conn_rate_limited(out) and _CONN_401_RE.search(s[:800]) is not None
+
+
+def _conn_labels(bks) -> list:
+    """백엔드 키들의 표시 이름(게이트웨이 앱 라벨 — SIREN 의 'SIREN') — 경고 사건의 labels 칸. 리스크 앱이 '○○ 미연결' 로 보인다(RK-12). 못 읽으면 키."""
+    out = []
+    for bk in bks:
+        try:
+            from app import _app_label  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+            out.append(_app_label(bk) or bk)
+        except Exception:  # noqa: BLE001 — 이름을 못 읽어도 경고는 낸다
+            out.append(bk)
+    return out
+
+
+class _ConnGate:
+    """한 잡의 선언 백엔드 호출 줄. 도구 객체를 감싸 백엔드마다 동시 n 건으로 줄 세우고, 429 를 받은 백엔드는 그 잡에서 다시 부르지 않는다(막은 호출은
+    실패 글을 돌려준다 — 좌석 · 계획자가 인자를 바꿔 되풀이하지 않게 까닭을 말한다). 백엔드는 받아 둔 도구 지도(선언 백엔드 키)로 안다 — 지도가 없으면
+    아무것도 감싸지 않는다(종전 그대로). 지정 도구(엔진 로드)와 좌석 자유 조회(따로 로드)가 같은 줄을 쓴다."""
+
+    def __init__(self, n: int):
+        self.n = max(1, n)
+        self._sems: dict = {}
+        self.limited: dict = {}      # 백엔드 → 429 를 처음 받은 도구
+        self.noconn: dict = {}       # 백엔드 → 미연결(등록 토큰 없음 · 401)을 처음 받은 도구 — 같은 잡에서 다시 부르면 같은 거절이다
+        self.told: set = set()       # 이미 알린 (code, 백엔드)(라운드 끝 알림이 새로 걸린 것만 낸다)
+
+    @staticmethod
+    def backend(name: str) -> str:
+        try:
+            from app import _TOOLS_MAP_CACHE  # noqa: PLC0415 — app 이 이 모듈을 import 한다(순환 회피)
+            b = (_TOOLS_MAP_CACHE.get("map") or {}).get(name) or ""
+            return b if b in (_TOOLS_MAP_CACHE.get("declared") or frozenset()) else ""
+        except Exception:  # noqa: BLE001 — 지도를 못 읽으면 줄을 걸지 않는다(종전 그대로)
+            return ""
+
+    def refusal(self, tool, bk: str):
+        if bk in self.noconn:
+            msg = (f"{_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {bk} {_CONN_UNREG_MARK} — 잡 주인의 등록 토큰이 없거나 그쪽이 받지 "
+                   f"않았다({self.noconn[bk]} 에서 받았다). 이 심의에서는 {bk} 를 다시 부르지 않는다 — 인자 문제가 아니다. 포털 '개인 토큰 › 외부 "
+                   "연결'(/tokens?tab=connect)에 등록하면 다음 심의부터 실린다. 다른 근거로 발언하라")
+        else:
+            msg = (f"{_FAIL_MARK} 도구 {getattr(tool, 'name', '?')} 호출 실패: {bk} 가 이 심의에서 호출 한도를 넘었다(429 — "
+                   f"{self.limited.get(bk, '?')} 에서 받았다). 이 심의에서는 {bk} 를 다시 부르지 않는다 — 인자 문제가 아니다. 다른 근거로 발언하라")
+        return (msg, None) if getattr(tool, "response_format", "") == "content_and_artifact" else msg
+
+    def closed(self, bk: str) -> bool:
+        return bk in self.limited or bk in self.noconn
+
+    def wrap(self, tool, note: bool = False):
+        """note — 성공한 결과 머리에 외부 연결 안내(_conn_note)를 붙인다(좌석 자유 조회 — 지정 도구는 결과 묶음의 머리줄이 싣는다)."""
+        bk = self.backend(getattr(tool, "name", ""))
+        orig = getattr(tool, "coroutine", None)
+        if not bk or orig is None:
+            return tool
+        gate = self
+
+        async def gated(*a, **kw):
+            if gate.closed(bk):
+                return gate.refusal(tool, bk)
+            sem = gate._sems.get(bk)
+            if sem is None:
+                sem = gate._sems[bk] = asyncio.Semaphore(gate.n)
+            async with sem:
+                if gate.closed(bk):                 # 줄을 서는 동안 다른 호출이 429 · 미연결을 받았다
+                    return gate.refusal(tool, bk)
+                out = await orig(*a, **kw)
+            if _conn_rate_limited(out):
+                gate.limited.setdefault(bk, getattr(tool, "name", "?"))
+            elif _conn_unregistered(out):
+                gate.noconn.setdefault(bk, getattr(tool, "name", "?"))
+            elif note:
+                out = _with_conn_note(out, bk)
+            return out
+
+        tool.coroutine = gated
+        return tool
+
+    def fresh(self) -> list:
+        """아직 알리지 않은, 새로 닫힌 (code, 백엔드, 처음 받은 도구) — conn_rate_limited(429) · conn_unregistered(미연결). 부르면 알린 것으로 친다."""
+        new = [(code, b, first) for code, got in (("conn_rate_limited", self.limited), ("conn_unregistered", self.noconn))
+               for b, first in got.items() if (code, b) not in self.told]
+        self.told.update((code, b) for code, b, _f in new)
+        return new
+
+
+# 이번 심의 실행의 줄 — 진입점(run_deliberation · run_sim_deliberation 의 단들 · run_test_plan)이 새로 두고, 그 실행의 단들(_deliberation_stream)이
+# 같이 쓴다(시뮬 심의 1단이 받은 429 · 미연결을 2 · 3단이 다시 두드리지 않게). 진입점 밖에서 스트림을 바로 돌리면(시험) 스트림이 새로 둔다.
+_CONN_GATE: contextvars.ContextVar = contextvars.ContextVar("hwax_conn_gate", default=None)
 
 
 # 자유 조회에 바인딩할 도구 스키마의 **천장**(추정 토큰). 실제 값은 모델 컨텍스트에서
@@ -5181,7 +5365,9 @@ def _capped_at(out) -> tuple | None:
     if not m:
         return None
     full, lim = int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
-    return (full, lim) if m.start() == lim and full > lim else None
+    # 외부 연결 결과면 머리에 안내 한 줄이 붙어 있다(_with_conn_note — 줄 관문이 조회 턴 래퍼 바깥에서 붙인다) — 그 줄을 건너 잰다
+    off = s.index("\n") + 1 if s.startswith(_CONN_NOTE_HEAD) and "\n" in s else 0
+    return (full, lim) if m.start() - off == lim and full > lim else None
 
 
 def _orig_len(out) -> int:
@@ -5782,6 +5968,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
                       history: list | None = None, *, owner: str = "", job_id: str = "", affiliation: str = ""):
     """run_sim_deliberation 의 본체 — 단 스트림을 차례로 흘린다(단마다의 done 은 바깥 _one_done 이 걷는다)."""
     call_trace.tag(kind="sim-delib")
+    _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄 — 1 · 2 · 3단이 같이 쓴다(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
     if _refused:
@@ -6095,6 +6282,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     call_trace.tag(kind="delib")      # 호출 추적의 자리 — 이 제너레이터를 돌리는 태스크(웹 _detach_stream · MCP 잡)에 붙는다
+    _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
@@ -6127,6 +6315,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
     call_trace.tag(kind="test-plan")
+    _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
     if _refused:
@@ -6313,6 +6502,13 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("error", {"code": "gateway_unavailable",
                              "message": f"게이트웨이 MCP 도구를 불러오지 못했습니다({_why} — 게이트웨이 확인)."})
         yield _sse("done", {}); return
+    # 외부 연결(선언 백엔드) 호출 줄 — 엔진이 부르는 지정 도구와 좌석 자유 조회(아래 따로 로드)가 같은 줄을 쓴다(HA-36 — _ConnGate).
+    _cgate = _CONN_GATE.get()
+    if _cgate is None:
+        _cgate = _ConnGate(_CONN_CONC)
+        _CONN_GATE.set(_cgate)
+    for _ct in tools.values():
+        _cgate.wrap(_ct)
     # 리스크 심사는 엔진이 직접 부르는 보고서 검색(지정 도구 · 정량 근거 선주입)에서도 같은 과제의 앞 패널 보고서를 뺀다(D-18).
     # 둘 다 결과를 전 좌석 프롬프트에 싣는다 — 좌석 자유 조회만 거르던 동안 search_reports 를 지정하거나 선주입을 켠 리스크
     # 심사는 질문 머리(과제 코드)로 찾은 앞 패널 판정을 전 좌석에 실었다. 자유 조회는 따로 로드하므로 거기서 다시 감싼다.
@@ -6402,13 +6598,19 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 열린다. 선언 백엔드 · 허브 가족 · orig 를 모르는 옛 게이트웨이도 그대로다(_free_orig_names). 기준일 심의(소급 검증)도 F0 로 아무것도 더
             # 들이지 않는다 — 닫힌 쪽(반대 검토 11-02 — OF-22 — 겹침 접두 agent_search 가 기준일 거름 없이 들고, 날짜로 거르지 않는 semantic_search 가 새로 들었다).
             _orig = {} if (_risk_chair or opts.started_by == "app" or _as_of) else _free_orig_names()
+            # 외부 연결(선언 백엔드 — 박스 권한표 connect:)의 읽기 — 이름 머리가 아니라 게이트웨이가 확인한 읽기(panel_read)로 들인다(HWAXPortal
+            # docs/siren-delib HA-36 — SIREN 은 제 이름을 앞에 붙여 낸다). 리스크 심사(와 리스크 앱이 띄운 패널)에도 들인다 — 사용자 결정 11-06. 닫기
+            # 목록 · D-18 거름(RA 보고서 읽기 · 과제 인사이트 · _risk_hide_priors)이 앞선다. 기준일 심의는 들이지 않는다 — 그쪽 데이터를 그 날로 거를
+            # 길이 없다(닫힌 쪽, F0 의 OF-22 와 같다). 실제 호출은 잡 줄(_cgate — 백엔드마다 동시 _CONN_CONC 건 · 429 뒤엔 그 잡에서 안 부름)을 탄다.
+            _conn_ok = frozenset() if _as_of else _free_conn_reads()
             # 기준일 심의면 좌석의 agent_search 에도 그 날을 박는다(_as_of_guard — 모델이 빼거나 바꿀 수 없다)
-            _g = {n: _wrap_cached(t, _fcache, _fstats)
+            _g = {n: _wrap_cached(_cgate.wrap(t, note=True), _fcache, _fstats)
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY and _orig.get(n, n).lower() not in _FREE_DENY
                   and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
                       _free_tool_ok(_orig.get(n, n))
+                      or n in _conn_ok
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
                       or (_risk_chair and n in _RISK_KEEP_TOOLS))}
             # 리스크 심사 좌석의 보고서 검색 · 온톨로지 읽기 · 대화 검색에서 같은 과제의 앞 패널 심의 보고서 · 리스크 판정 객체 · 앞 패널
@@ -6435,10 +6637,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 남긴다 — 페르소나 지식 조회 통로라 이걸 닫으면 전문가가 자기 지식을 못 본다.
             if opts.delib_apps:
                 # 지식 조회 · 물성 목록도 원래 이름으로 본다(F0 — 겹쳐 접두가 붙은 물성 읽기가 앱 지정에서 빠지지 않게, 리스크 심사는 _orig 가 비었다)
+                # 리스크 심사 · 앱이 띄운 패널의 앱 목록은 사람이 고른 것이 아니라 앱이 싣는 것이다 — 외부 연결 읽기(HA-36)는 그 좁히기에서도
+                # 남긴다(사용자 결정 11-06 — 리스크 심사에도 SIREN). 사람이 앱을 고른 심의는 고른 앱의 것만 남는다(종전 그대로).
+                _conn_keep = _conn_ok if (_risk_chair or opts.started_by == "app") else frozenset()
                 _narrow = {n: t for n, t in _g.items()
                            if _orig.get(n, n) == "agent_search" or _orig.get(n, n) in _MATERIAL_TOOLS
                            or _amap.get(n) in _apps
-                           or (_risk_chair and n in _RISK_KEEP_TOOLS)}
+                           or (_risk_chair and n in _RISK_KEEP_TOOLS)
+                           or n in _conn_keep}
                 # 매핑을 못 받았거나(게이트웨이 불통) 결과가 agent_search 뿐이면 좁히지 않는다 —
                 # 조용히 도구 0종이 되면 자유 조회가 죽은 채 심의만 계속된다.
                 if len(_narrow) > 1:
@@ -6554,12 +6760,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _tool_unconf = []                     # 기준일 거름을 확인하지 못해(메아리 없음) 결과를 버린 도구 — 인자 문제가 아니라 다시 시키지 않는다
         _tool_refused = []                    # 리스크 심사에 지정된 D-18 도구(_risk_designated_refusal) — 부르지 않는다
         _tool_noev = []                       # 웹 리서치의 차단 · 빈 결과를 돌려준 도구 — 좌석에는 싣되 근거로 세지 않는다
+        # 외부 연결(선언 백엔드)의 실패 둘 — 인자 문제가 아니라 다시 시키지 않는다(HA-36). 리스크 앱 러너가 경고 사건으로 '미연결' 을 안다(RK-12).
+        _tool_noconn = []                     # 잡 주인의 등록 토큰이 없거나 그쪽이 받지 않았다(401) — 등록 안내로 끝났다
+        _tool_limited = []                    # 그쪽 호출 한도(429) — 이 잡에서는 그 백엔드를 다시 부르지 않는다(_ConnGate)
         _tool_meta = []                       # 웹 리서치의 상태 · 기록 도구(_web_meta_tool) — 같다(서버를 말할 뿐 주제의 근거가 아니다)
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
-        # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다.
-        _ordered = sorted(opts.delib_tools,
-                          key=lambda n: 0 if n.startswith(("list_", "search_", "find_")) else 1)
+        # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다. 같은 무리 안에서는 받은 차례 그대로다(안정 정렬 —
+        # 리스크 앱은 siren_list_groups → siren_search_cases 처럼 차례를 정해 싣는다). 이름은 원래 이름 · 앱 접두를 뗀 꼴로 본다(_list_first — HA-37).
+        _ordered = sorted(opts.delib_tools, key=_list_first)
         for _tn in _ordered:
             _d18 = _risk_designated_refusal(_tn) if opts.chair_template == "risk-review" else ""
             if _d18:
@@ -6571,6 +6780,18 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             if _t is None:
                 yield _sse("status", {"step": f"지정 도구 없음: {_tn} — 건너뜀", "tool": _tn})
                 _tool_miss.append(_tn)
+                continue
+            _cbk = _cgate.backend(_tn)
+            if _cbk and _cbk in _cgate.limited:
+                # 앞선 지정 도구가 그 백엔드의 한도(429)를 받았다 — 인자를 짓는 LLM 도 부르지 않는다
+                yield _sse("status", {"step": f"지정 도구 건너뜀: {_tn} — {_cbk} 가 이 심의에서 호출 한도를 넘었다(429)", "tool": _tn})
+                _tool_limited.append(_tn)
+                continue
+            if _cbk and _cbk in _cgate.noconn:
+                # 앞선 지정 도구가 미연결(등록 토큰 없음 · 401)을 받았다 — 같은 거절이다. 인자를 짓는 LLM 도 부르지 않는다
+                yield _sse("status", {"step": f"지정 도구 건너뜀: {_tn} — {_cbk} 미연결(잡 주인의 등록 토큰이 없거나 그쪽이 받지 않았다)",
+                                      "tool": _tn})
+                _tool_noconn.append(_tn)
                 continue
             _brief = _tool_schema_brief(_t)
             # 인자 구성 → 호출. 도구가 스키마 위반 등 에러 응답(ok:false/errors)을 주면 그 에러를
@@ -6627,11 +6848,22 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     if _as_of and _tn == "agent_search":
                         _ao_des["undated"] += _out.count(_AS_OF_UNDATED_MARK)
                     break
+                # 외부 연결의 한도 초과 · 등록 토큰 없음은 인자 문제가 아니다 — 계획자에게 다시 시키지 않는다(같은 거절을 한 번 더 받을 뿐이다)
+                if _cbk and _conn_rate_limited(_out):
+                    _tool_limited.append(_tn)
+                    _cgate.limited.setdefault(_cbk, _tn)        # 줄이 감싸지 못한 도구(코루틴 없는 것)도 같은 잡 상태로
+                    break
+                if _cbk and _conn_unregistered(_out):
+                    _tool_noconn.append(_tn)
+                    _cgate.noconn.setdefault(_cbk, _tn)         # 같은 잡의 뒤 지정 도구 · 좌석 조회도 부르지 않는다
+                    break
                 # 재시도 계획자에게 주는 오류 — 좁은 창은 종전 앞 500자(원문 길이 표식), 넓은 창은 전부(교정 단서가 뒤에 있다).
                 _err_note = _cut_mark(_out or "(빈 응답)", _narrow_cap(500))
             if _good:
-                # 머리줄의 인자 — 좌석이 어떤 인자로 조회한 값인지 보는 자리다. 좁은 창만 종전 160자(표식).
-                _head = f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
+                # 머리줄의 인자 — 좌석이 어떤 인자로 조회한 값인지 보는 자리다. 좁은 창만 종전 160자(표식). 외부 연결 결과면 안내 한 줄을
+                # 머리줄에 함께 싣는다(_conn_note — 결과 본문은 몫에 맞춰 뒤가 잘려도 머리줄은 남는다, RK-12).
+                _head = (f"### {_tn} ← {_cut_mark(json.dumps(_argd, ensure_ascii=False), _narrow_cap(160))}\n"
+                         + (f"{_conn_note(_cbk)}\n" if _cbk and _has_trust(_good) else ""))
                 _got.append((_head, _good))
                 _used.append(_tn)
                 _ins_des.append((_tn, _argd, _good))      # 과제 인사이트의 근거 표지(카드 거리 calls)
@@ -6647,6 +6879,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             elif _tn in _tool_unconf:
                 yield _sse("status", {"step": f"지정 도구 결과를 싣지 않음: {_tn} — 기준일 {_as_of} 거름을 지식 허브가 확인해 주지 "
                                               "않았다(메아리 없음)", "tool": _tn})
+            elif _tn in _tool_noconn:
+                yield _sse("status", {"step": f"지정 도구 미연결: {_tn} — {_cbk} 의 등록 토큰이 없거나 그쪽이 받지 않았다", "tool": _tn})
+            elif _tn in _tool_limited:
+                yield _sse("status", {"step": f"지정 도구 한도 초과: {_tn} — {_cbk} 가 호출 한도를 넘었다(429), 이 심의에서는 다시 부르지 "
+                                              "않는다", "tool": _tn})
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
                 _tool_fail.append(_tn)
@@ -6658,13 +6895,31 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                    "message": f"기준일 {_as_of} 거름이 걸렸다는 확인(메아리)이 지식 허브 응답에 없어 지정 도구 "
                                               f"{', '.join(_tool_unconf)} 의 결과를 싣지 않았습니다. 옛 AIDataHub 는 기준일을 말없이 버려 그 날 "
                                               "뒤의 카드가 섞였을 수 있습니다."})
-        if _tool_miss or _tool_fail or _tool_refused or _tool_unconf:
+        # 외부 연결의 미연결 · 한도 초과 — 백엔드와 도구를 실은 경고 사건으로도 낸다. 리스크 앱 러너가 이 code 로 패널 결과에 '미연결' 을 남긴다
+        # (HWAXPortal docs/siren-delib RK-12 — 카드 글을 읽어 가르지 않게). 패널은 그대로 간다.
+        for _code, _names, _why in (("conn_unregistered", _tool_noconn,
+                                     "잡 주인의 등록 토큰이 없거나 그쪽이 받지 않아(401) 부르지 못했습니다 — 포털 '개인 토큰 › 외부 연결' 에서 "
+                                     "등록하면 다음 심의부터 실립니다"),
+                                    ("conn_rate_limited", _tool_limited,
+                                     "그쪽 호출 한도(429)를 넘어 이 심의에서는 다시 부르지 않았습니다 — 토큰 문제가 아닙니다")):
+            if _names:
+                _bks = sorted({_cgate.backend(n) for n in _names} - {""})
+                _cgate.told.update((_code, b) for b in _bks)       # 라운드 끝 알림(_cgate.fresh)이 같은 백엔드를 두 번 알리지 않게
+                _lbs = _conn_labels(_bks)
+                yield _sse("warning", {"code": _code, "backends": _bks, "labels": _lbs, "tools": list(_names),
+                                       "message": f"외부 연결 {', '.join(_lbs)} 의 지정 도구 {', '.join(_names)} 는 {_why}."})
+        if _tool_miss or _tool_fail or _tool_refused or _tool_unconf or _tool_noconn or _tool_limited:
             yield _delib("evidence", source="지정 도구 미실행", included=False,
                          text=f"지정 도구 {len(_ordered)}개 중 "
-                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused) + len(_tool_unconf)}개는 결과를 좌석에 주지 못했다 — "
+                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused) + len(_tool_unconf) + len(_tool_noconn) + len(_tool_limited)}"
+                              "개는 결과를 좌석에 주지 못했다 — "
                               + " · ".join(x for x in (
                                   f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
                                   f"호출 실패·인자를 못 정해 건너뜀: {', '.join(_tool_fail)}" if _tool_fail else "",
+                                  (f"외부 연결 미연결(잡 주인의 등록 토큰이 없거나 그쪽이 받지 않았다): {', '.join(_tool_noconn)}"
+                                   if _tool_noconn else ""),
+                                  (f"외부 연결 호출 한도 초과(429 — 이 심의에서 다시 부르지 않았다): {', '.join(_tool_limited)}"
+                                   if _tool_limited else ""),
                                   (f"기준일 {_as_of} 거름을 지식 허브가 확인해 주지 않아(메아리 applied_config.as_of 없음 — 옛 AIDataHub 는 "
                                    f"모르는 인자를 말없이 버린다) 결과를 버림: {', '.join(_tool_unconf)}") if _tool_unconf else "",
                                   (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
@@ -7612,6 +7867,21 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 yield _sse("status", {"step": f"조회 캐시 — 실제 호출 {_fstats.get('miss', 0)}회 · "
                                               f"공유 {_fstats['hit']}회(같은 도구·같은 인자)",
                                       "tool": None})
+            # 좌석 조회가 외부 연결의 호출 한도(429)에 걸려 이 잡에서 그 백엔드를 더 부르지 않게 됐다 — 새로 걸린 것만 라운드마다 한 번(HA-36).
+            # 지정 도구에서 걸린 것은 거기서 이미 알렸다(told). 카드는 좌석에 준 것이 아니다(리스크 앱 러너가 패널에 옮겨 적는다).
+            for _lcode, _lbk, _lfirst in _cgate.fresh():
+                _lab = _conn_labels([_lbk])
+                _what = ("호출 한도(429)를 넘어" if _lcode == "conn_rate_limited"
+                         else "미연결(잡 주인의 등록 토큰이 없거나 그쪽이 받지 않았다)이라")
+                yield _sse("warning", {"code": _lcode, "backends": [_lbk], "labels": _lab, "tools": [_lfirst],
+                                       "message": f"외부 연결 {_lab[0]} 가 {_what} 이 심의에서는 더 부르지 않습니다"
+                                                  + (" — 토큰 문제가 아닙니다. 좌석들은 잡 주인 토큰 하나를 같이 씁니다(DELIB_CONN_CONCURRENCY)."
+                                                     if _lcode == "conn_rate_limited" else
+                                                     " — 포털 '개인 토큰 › 외부 연결' 에 등록하면 다음 심의부터 실립니다.")})
+                yield _delib("evidence", source=("외부 연결 한도 초과" if _lcode == "conn_rate_limited" else "외부 연결 미연결"),
+                             included=False,
+                             text=f"{_dr(rnd)}라운드 좌석 조회가 외부 연결 {_lab[0]}({_lbk})에서 {_what}({_lfirst}) 이 심의에서는 {_lbk} 를 더 "
+                                  f"부르지 않았다. 그 뒤 좌석은 {_lbk} 결과 없이 발언했다.")
         if _jon and _look:
             # 재개 자료(HA-09 S1 — e:gather) — 이 라운드의 조회가 바꾼 상태. 끝난 라운드를 되살릴 때 다음 라운드의 프롬프트가 이것으로 만들어진다.
             # 끊긴 라운드에서 되살린 조회(S2)는 다시 적지 않는다 — 앞 시도의 그 줄이 새 일지에 옮겨 적혔다(delib_resume.parse carry).
