@@ -2110,6 +2110,19 @@ def _prune_artifacts() -> None:
         pass
 
 
+_SVG_PROLOG = re.compile(rb"^(?:<\?xml[^>]*\?>\s*)?(?:<!--.*?-->\s*|<!DOCTYPE[^>]*>\s*)*", re.S)
+
+
+def _artifact_kind(raw: bytes) -> str | None:
+    """도구 그림의 꼴을 내용으로 — 래스터는 vision.sniff, SVG 는 BOM · 공백 · XML 선언 · 주석 · DOCTYPE 을 지나 `<svg` 로 여는지. 선언된 mime 이
+    그림이라고 그림인 것은 아니다 — 챗은 이 파일을 그 확장자의 그림으로 그린다(SVG 는 격리 iframe, 포털 docs/report-figures RF-36)."""
+    real = _vision.sniff(raw)
+    if real:
+        return real
+    head = _SVG_PROLOG.sub(b"", raw[:4096].lstrip(b"\xef\xbb\xbf").lstrip(), count=1)
+    return "image/svg+xml" if head[:4].lower() == b"<svg" else None
+
+
 def _stash_image_items(items) -> list:
     """MCP content 의 이미지 블록(base64)을 파일로 저장하고 서빙 URL 목록을 돌려준다."""
     import base64
@@ -2127,7 +2140,14 @@ def _stash_image_items(items) -> list:
             raw = base64.b64decode(data)
         except Exception:  # noqa: BLE001 — 손상 base64 는 건너뜀
             continue
-        name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT.get(mime, "png")
+        # 내용으로 꼴을 보고 크기를 잰다 — 전에는 선언된 image/* 면 무엇이든 그 확장자로 저장했다(그림이 아닌 것 · 아주 큰 것도). 상한은 그림 하나
+        # VISION_MAX_BYTES(8 MiB — 게이트웨이 그림 보관과 같은 셈). 넘거나 꼴이 아니면 저장하지 않고 한 줄 남긴다(포털 docs/report-figures RF-36).
+        real = _artifact_kind(raw)
+        if not real or len(raw) > _vision.MAX_BYTES:
+            logging.getLogger("agent").warning("[agent] 도구 그림을 저장하지 않음 — %s(선언 %s)",
+                                               "꼴을 모름" if not real else f"{len(raw)} 바이트 > {_vision.MAX_BYTES}", mime)
+            continue
+        name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT[real]
         with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
             f.write(raw)
         _prune_artifacts()
