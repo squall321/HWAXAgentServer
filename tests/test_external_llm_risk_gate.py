@@ -121,8 +121,13 @@ def test_그_칸이_없는_리스크_잡_시작과_REST_다리는_종전대로_�
         ("risk_job_action", {"job_id": "j-1", "action": "resume"}),
     ]
     outs = [asyncio.run(inv.ainvoke({"name": n, "arguments": args})) for n, args in calls]
-    assert outs == [f"gateway called {n}" for n, _ in calls]
-    assert reached == calls
+    # 반출 동의 칸이 없는 REST 다리 POST 셋은 동의 판정에 걸리지 않는다 — 챗 턴 밖(이 대역은 엔진 로드의 꼴)이라 REST 다리 쓰기 관문(G2b —
+    # HWAXPortal docs/core-link)이 따로 막는다(tests/test_core_link_rest_gate.py).
+    posts = {i for i, (n, args) in enumerate(calls) if n == "rest_call" and args.get("method") == "POST"}
+    assert len(posts) == 3
+    assert all("REST 다리 쓰기" in outs[i] and "consent_external" not in outs[i] for i in posts), [outs[i] for i in posts]
+    assert [o for i, o in enumerate(outs) if i not in posts] == [f"gateway called {n}" for i, (n, _) in enumerate(calls) if i not in posts]
+    assert reached == [c for i, c in enumerate(calls) if i not in posts]
     direct = []
     out = asyncio.run(_gw("risk_start_job", direct).ainvoke({"target_key": "diff:ab", "mode": "reviews"}))
     assert out == "gateway called risk_start_job" and direct == [("risk_start_job", {"target_key": "diff:ab", "mode": "reviews"})]

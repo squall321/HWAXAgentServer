@@ -2462,8 +2462,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
 
     async def capped(*a, _hwax_rc: RunnableConfig = _NO_RC, **kw):
         # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
-        # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G3 유령 ID →
-        # G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
+        # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G2b 챗 턴 밖 REST 다리 쓰기 거부 →
+        # G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
         # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
@@ -2504,6 +2504,20 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                        "보내지 않았다. 사용자가 외부 응답자 심의를 원하면 리스크 앱이나 자기 Claude Code 에서 직접 열라고 알려라. 인자 "
                        "문제가 아니다 — 그 칸을 실어 다시 부르지 마라")
                 return _refuse(tool, msg)
+        # ── G2b REST 다리 쓰기(HWAXPortal docs/core-link §7) — 사람의 확인 카드가 서지 않는 곳(챗 턴 밖 — 심의의 지정 도구 · 좌석 자유 조회 ·
+        # 외부 응답자의 CALL 줄, 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다(invoke_tool 의 안쪽도). 게이트웨이는 그 사람의
+        # 단언을 실어 StepForge 에 쓴다. 챗 턴이면 G5 가 확인 카드로 멈춘다 — 챗에 묶는 도구(chat)는 관문 손잡이(CHAT_CONFIRM_GATE)를 따르고,
+        # 승인 실행(_confirm_send)은 턴 맥락이 있어 G5 의 승인 열쇠로 지난다. 조회(GET · HEAD)는 그대로 간다.
+        if not chat and _turn_confirm.get() is None:
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _rw = _rest_write(getattr(tool, "name", ""), _args)
+                if _rw:
+                    _tn = str(getattr(tool, "name", ""))[:80]
+                    print(f"[gate] {_tn}({_rw[:80]}) 차단 — 챗 턴 밖이라 확인 카드가 서지 않는다(REST 다리 쓰기)")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {_tn} 호출 실패: REST 다리 쓰기(rest_call {_rw}) — 사람의 확인 카드가 서지 않는 곳"
+                           "(심의 · 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다. 조회(GET · HEAD)만 보낸다. 쓰기는 사람이 "
+                           "챗에서 확인 카드로 승인한다. 인자 문제가 아니다 — 쓰기 메서드로 다시 부르지 마라")
+                    return _refuse(tool, msg)
         # ── G3 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
@@ -3971,6 +3985,21 @@ def _rest_method(args) -> str:
     return (str(d.get("method") or "GET").strip() or "GET").upper()
 
 
+def _rest_write(name, args) -> str:
+    """REST 다리의 쓰기 호출이면 '메서드 경로'(경로는 공백을 접어 앞 120자), 아니면 빈 글 — rest_call(별칭 · 충돌 접두 꼴도, _named)이고
+    메서드가 GET · HEAD 가 아니다(_rest_method). 범용 실행기(invoke_tool)면 안쪽 이름 · 인자로 본다 — 심의 지정 도구로 invoke_tool 을 고르면
+    계획자가 안쪽에 rest_call 을 실을 수 있다."""
+    if str(name or "").strip().lower() == "invoke_tool":
+        d = _arg_dict(args) or {}
+        name, args = d.get("name"), d.get("arguments")
+    if not _named(name, _AGENT_REST_BRIDGE):
+        return ""
+    m = _rest_method(args)
+    if m in ("GET", "HEAD"):
+        return ""
+    return f"{m} {' '.join(str((_arg_dict(args) or {}).get('path') or '').split())[:120]}".strip()
+
+
 def _confirm_class(name, args=None) -> tuple:
     """(부류, 맞은 목록 이름) — 부류는 confirm > job > write(겹치면 더 엄한 쪽), 목록 밖이면 (None, ""). 맞은 이름은 그 부류에서 가장 긴 것이고
     승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠). REST 다리(rest_call — 별칭 · 충돌 접두를 단
@@ -3979,7 +4008,7 @@ def _confirm_class(name, args=None) -> tuple:
     n = str(name or "").strip().lower()
     if not n:
         return None, ""
-    if _named(n, _AGENT_REST_BRIDGE) and _rest_method(args) not in ("GET", "HEAD"):
+    if _rest_write(n, args):
         return "confirm", _AGENT_REST_BRIDGE[0]
     lists = _confirm_lists()
     for kind, names in (("confirm", lists["confirm"]), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
@@ -4325,19 +4354,18 @@ def _confirm_args_text(args) -> str:
 
 
 def _confirm_rest_text(args) -> str:
-    """REST 다리(rest_call) 카드에 보이는 인자 — site · method(게이트웨이가 보내는 꼴) · path 와 본문 요약(정규 JSON 의 앞 _CARD_REST_BODY_MAX 자,
-    HWAXPortal docs/core-link §7). 잎 펼치기(_confirm_args_text)는 본문을 값마다 잘라 흩어 무엇을 쓰는지 한눈에 안 보인다. query 가 있으면 path
-    뒤에 싣는다(보내는 것이 카드에 다 보이게). 글 본문은 따옴표째 적는다 — 게이트웨이는 객체 · 목록 본문만 싣는다. 줄바꿈은 ⏎ 로 적는다."""
+    """REST 다리(rest_call) 카드에 보이는 인자 — 게이트웨이 _rest_call 이 읽는 다섯 칸 site · method · path · query · body(HWAXPortal
+    docs/core-link §7). 인자는 승인 때 서버가 보내는 그대로여야 한다(정규 인자는 빈 칸을 빼 query {"force": ""} 같은 칸이 카드에 안 보였다 —
+    _confirm_card 가 넘긴다). 값은 칸마다 JSON 으로 적는다 — 글은 따옴표 · 이스케이프째라 값 안의 ' · ' · '=' 가 칸을 꾸며 내지 못하고 줄바꿈도
+    카드 글에 들지 않는다. method 는 게이트웨이가 보내는 꼴(_rest_method)이다. 칸마다 앞 _CARD_REST_BODY_MAX 자에서 자르고 '…(N자)' 를 단다.
+    query · body 는 인자에 칸이 있을 때만 싣는다."""
     d = _arg_dict(args) or {}
 
-    def cut(t: str) -> str:
-        t = t.replace("\r\n", "\n").replace("\n", "⏎")
-        return t if len(t) <= _CARD_REST_BODY_MAX else t[:_CARD_REST_BODY_MAX] + f"…({len(t):,}자)"
-
     def js(v) -> str:
-        return json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    out = [f"site={cut(str(d.get('site') or ''))}", f"method={cut(_rest_method(d))}", f"path={cut(str(d.get('path') or ''))}"]
-    out += [f"{k}={cut(js(d[k]))}" for k in ("query", "body") if k in d]
+        t = json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return t if len(t) <= _CARD_REST_BODY_MAX else t[:_CARD_REST_BODY_MAX] + f"…({len(t):,}자)"
+    out = [f"site={js(d.get('site'))}", f"method={js(_rest_method(d))}", f"path={js(d.get('path'))}"]
+    out += [f"{k}={js(d[k])}" for k in ("query", "body") if k in d]
     return " · ".join(out)
 
 
@@ -4507,9 +4535,17 @@ async def _confirm_card(app_, req, ctx):
         c["app_key"] = (_TOOLS_MAP_CACHE.get("map") or {}).get(c["name"], "")
         # 카드 글(답 본문 — 대화에 저장된다) · 카드 사건의 인자는 RA 게시 확인 토큰을 가린 꼴이다(publish_token — 사용자 결정 10-31). 맡아 둔 호출
         # (args · canon)은 진짜 값 그대로다 — 승인하면 서버가 그것을 보낸다(_confirm_send). 사람은 토큰 값을 보고 고를 것이 없다.
-        c["args_shown"] = _publish_token.mask(c["canon"])
-        c["args_text"] = (_confirm_rest_text(c["args_shown"]) if c["base"] == _AGENT_REST_BRIDGE[0]
-                          else _confirm_args_text(c["args_shown"]))
+        if c["base"] == _AGENT_REST_BRIDGE[0]:
+            # REST 다리는 승인 때 보낼 인자 그대로를 싣는다(카드 글 · 카드 사건 둘 다) — 정규 인자(canon)는 빈 칸을 빼서, 승인이 그 칸째 보내는
+            # query {"force": ""} · 본문 "note": "" 가 카드에 보이지 않았다. 승인 · 중복 판정 열쇠는 그대로 정규 인자다.
+            _send = _confirm_with_defaults(c["name"], c["args"])
+            _sd = _arg_dict(_send)
+            c["args_shown"] = _publish_token.mask(json.dumps(_send if _sd is None else _sd, ensure_ascii=False, sort_keys=True,
+                                                             separators=(",", ":"), default=str))
+            c["args_text"] = _confirm_rest_text(c["args_shown"])
+        else:
+            c["args_shown"] = _publish_token.mask(c["canon"])
+            c["args_text"] = _confirm_args_text(c["args_shown"])
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})

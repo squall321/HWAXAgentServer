@@ -6764,6 +6764,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         _tool_noconn = []                     # 잡 주인의 등록 토큰이 없거나 그쪽이 받지 않았다(401) — 등록 안내로 끝났다
         _tool_limited = []                    # 그쪽 호출 한도(429) — 이 잡에서는 그 백엔드를 다시 부르지 않는다(_ConnGate)
         _tool_meta = []                       # 웹 리서치의 상태 · 기록 도구(_web_meta_tool) — 같다(서버를 말할 뿐 주제의 근거가 아니다)
+        # REST 다리 쓰기(HWAXPortal docs/core-link §7) — 계획자가 rest_call(invoke_tool 의 안쪽 포함)에 쓰기 메서드를 지었다. 심의에는 사람의 확인
+        # 카드가 없어 보내지 않는다(조회 GET · HEAD 는 그대로). 같은 판정을 도구 래퍼도 한다(app G2b) — 이 자리는 알림과 다시 시키지 않기 몫이다.
+        from app import _rest_write  # noqa: PLC0415 — 늦은 import(순환 회피)
+        _tool_rest_write = []                 # '도구 메서드 경로' — 끝 카드 · 경고에 싣는다
         # 목록·검색 도구를 먼저 돌린다. 상세 도구(get_material·get_mat_card 등)는 식별자가 필요한데
         # 그 값은 목록 조회 결과에만 있다 — 순서가 반대면 상세 도구가 ID 를 지어낼 수밖에 없다.
         # 사용자가 패널에서 고른 순서는 의미가 없으므로(체크박스 순) 재정렬해도 잃는 게 없다. 같은 무리 안에서는 받은 차례 그대로다(안정 정렬 —
@@ -6803,6 +6807,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 상한·같은 몫으로 준다(_fit_tool_results): 전부 조금씩 보이는 쪽이 낫다. 줄였으면 글에 표식이 붙고
             # (계획자가 잘린 뒤쪽의 id 를 아는 척하지 않게) 상태줄이 그렇다고 말한다.
             _prev_ctx, _prev_share = _fit_tool_results(_got, _tool_inject_caps()[1]) if _got else ("", 0)
+            _rw = ""
             for _attempt in (1, 2):
                 yield _sse("status", {"step": f"지정 도구 인자 구성: {_tn}"
                                               + (" (재시도)" if _attempt == 2 else "")
@@ -6829,6 +6834,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 except Exception:  # noqa: BLE001
                     _argd = None
                 if not isinstance(_argd, dict) or _argd.get("skip"):
+                    break
+                _rw = _rest_write(_tn, _argd)
+                if _rw:
+                    _tool_rest_write.append(f"{_tn} {_rw}")
                     break
                 yield _sse("status", {"step": f"지정 도구 호출: {_tn}", "tool": _tn,
                                       "detail": _delib_preview(_argd, 200)})
@@ -6884,6 +6893,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             elif _tn in _tool_limited:
                 yield _sse("status", {"step": f"지정 도구 한도 초과: {_tn} — {_cbk} 가 호출 한도를 넘었다(429), 이 심의에서는 다시 부르지 "
                                               "않는다", "tool": _tn})
+            elif _rw:
+                yield _sse("status", {"step": f"지정 도구 거절: {_tn} — REST 다리 쓰기({_rw})는 사람의 확인 카드가 없는 심의에서 보내지 "
+                                              "않는다(조회 GET · HEAD 만)", "tool": _tn})
             else:
                 yield _sse("status", {"step": f"지정 도구 실패/건너뜀: {_tn}", "tool": _tn})
                 _tool_fail.append(_tn)
@@ -6908,10 +6920,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _lbs = _conn_labels(_bks)
                 yield _sse("warning", {"code": _code, "backends": _bks, "labels": _lbs, "tools": list(_names),
                                        "message": f"외부 연결 {', '.join(_lbs)} 의 지정 도구 {', '.join(_names)} 는 {_why}."})
-        if _tool_miss or _tool_fail or _tool_refused or _tool_unconf or _tool_noconn or _tool_limited:
+        if _tool_rest_write:
+            # 경고 사건으로도 낸다 — 상태줄은 잡 원장의 창 밖으로 밀려나고, MCP 로 띄운 잡 · 리스크 앱 러너는 code 로 가른다
+            yield _sse("warning", {"code": "rest_write_refused", "tools": list(_tool_rest_write),
+                                   "message": f"지정 도구 {', '.join(_tool_rest_write)} 는 REST 다리 쓰기라 보내지 않았습니다 — 심의에는 사람의 "
+                                              "확인 카드가 없어 rest_call 은 조회(GET · HEAD)만 보냅니다. 쓰기는 사람이 챗에서 확인 카드로 "
+                                              "승인합니다."})
+        if _tool_miss or _tool_fail or _tool_refused or _tool_unconf or _tool_noconn or _tool_limited or _tool_rest_write:
             yield _delib("evidence", source="지정 도구 미실행", included=False,
                          text=f"지정 도구 {len(_ordered)}개 중 "
-                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused) + len(_tool_unconf) + len(_tool_noconn) + len(_tool_limited)}"
+                              f"{len(_tool_miss) + len(_tool_fail) + len(_tool_refused) + len(_tool_unconf) + len(_tool_noconn) + len(_tool_limited) + len(_tool_rest_write)}"
                               "개는 결과를 좌석에 주지 못했다 — "
                               + " · ".join(x for x in (
                                   f"없는 도구: {', '.join(_tool_miss)}" if _tool_miss else "",
@@ -6925,6 +6943,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                   (f"리스크 심사라 부르지 않은 도구: {', '.join(_tool_refused)}(같은 과제의 앞 패널 판정을 좌석이 "
                                    "보지 않는다 — D-18. 리스크 앱에서는 변경 전체 · 스냅샷만 열고, 그 밖의 리스크 앱 도구 · RA 보고서 "
                                    "읽기 · 범용 실행기 · 심의 잡 기록 읽기 · 과제 인사이트는 닫는다)") if _tool_refused else "",
+                                  (f"REST 다리 쓰기라 보내지 않은 호출: {', '.join(_tool_rest_write)}(심의에는 사람의 확인 카드가 없어 "
+                                   "rest_call 은 조회(GET · HEAD)만 보낸다 — 쓰기는 사람이 챗에서 확인 카드로 승인한다)") if _tool_rest_write else "",
                               ) if x) + ".")
         if _got:
             # 합이 상한을 넘으면 **도구마다 같은 몫**으로 줄인다(_fit_rows — 짧은 결과가 안 쓴 몫은 긴 결과에
