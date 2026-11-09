@@ -3959,12 +3959,23 @@ def _confirm_lists() -> dict:
     return _CONFIRM_LISTS
 
 
-def _confirm_class(name) -> tuple:
+def _rest_method(args) -> str:
+    """REST 다리(rest_call) 인자의 메서드 — 게이트웨이 _rest_call · 읽기 전용 판정과 같은 읽기다(없거나 빈 글이면 GET, 앞뒤 공백을 떼고 대문자).
+    인자는 dict 이거나 JSON 글(invoke_tool 의 arguments)이고, 못 읽으면 칸이 없는 셈이다."""
+    d = _arg_dict(args) or {}
+    return (str(d.get("method") or "GET").strip() or "GET").upper()
+
+
+def _confirm_class(name, args=None) -> tuple:
     """(부류, 맞은 목록 이름) — 부류는 confirm > job > write(겹치면 더 엄한 쪽), 목록 밖이면 (None, ""). 맞은 이름은 그 부류에서 가장 긴 것이고
-    승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠)."""
+    승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠). REST 다리(rest_call — 별칭 · 충돌 접두를 단
+    꼴도, _named)는 인자로 가른다 — 메서드가 GET · HEAD 가 아니면 운영자 목록 · 주문 말과 상관없이 늘 카드(confirm)다(HWAXPortal docs/core-link
+    §7 — 게이트웨이가 사람 단언을 실어 StepForge 온톨로지에 쓴다). GET · HEAD 는 종전 판정 그대로다."""
     n = str(name or "").strip().lower()
     if not n:
         return None, ""
+    if _named(n, _AGENT_REST_BRIDGE) and _rest_method(args) not in ("GET", "HEAD"):
+        return "confirm", _AGENT_REST_BRIDGE[0]
     lists = _confirm_lists()
     for kind, names in (("confirm", lists["confirm"]), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
         hit = [t for t in names if n == t or n.endswith("_" + t)]
@@ -4196,7 +4207,7 @@ def _confirm_parse(tool, a, kw):
     via = getattr(tool, "name", "") == "invoke_tool"
     args = kw if kw else next((x for x in a if isinstance(x, dict)), kw)
     name, targs = (args.get("name"), args.get("arguments")) if via else (getattr(tool, "name", ""), args)
-    kind, base = _confirm_class(name)
+    kind, base = _confirm_class(name, targs)
     return None if kind is None else (name, targs, via, kind, base, (base, _confirm_canon(targs)))
 
 
@@ -4267,6 +4278,7 @@ _CARD_ARGS_MAX = 600            # 카드 글에 펼치는 인자 합(자) — �
 _CARD_VALUE_MAX = 80            # 값 하나(자) — 넘으면 앞부분과 '…(N자)'
 _CARD_LIST_SHOW = 5             # 수 · 글 목록에서 보이는 원소 수
 _CARD_SSE_ARGS_MAX = 20_000     # 카드 사건 args(정규 JSON) 상한 — 넘으면 앞부분과 args_cut
+_CARD_REST_BODY_MAX = 400       # REST 다리 카드의 본문 요약(자) — 넘으면 앞부분과 '…(N자)'(HWAXPortal docs/core-link §7)
 
 
 def _confirm_args_text(args) -> str:
@@ -4304,6 +4316,23 @@ def _confirm_args_text(args) -> str:
             break
         out.append(leaf)
         used += len(leaf) + 3
+    return " · ".join(out)
+
+
+def _confirm_rest_text(args) -> str:
+    """REST 다리(rest_call) 카드에 보이는 인자 — site · method(게이트웨이가 보내는 꼴) · path 와 본문 요약(정규 JSON 의 앞 _CARD_REST_BODY_MAX 자,
+    HWAXPortal docs/core-link §7). 잎 펼치기(_confirm_args_text)는 본문을 값마다 잘라 흩어 무엇을 쓰는지 한눈에 안 보인다. query 가 있으면 path
+    뒤에 싣는다(보내는 것이 카드에 다 보이게). 글 본문은 따옴표째 적는다 — 게이트웨이는 객체 · 목록 본문만 싣는다. 줄바꿈은 ⏎ 로 적는다."""
+    d = _arg_dict(args) or {}
+
+    def cut(t: str) -> str:
+        t = t.replace("\r\n", "\n").replace("\n", "⏎")
+        return t if len(t) <= _CARD_REST_BODY_MAX else t[:_CARD_REST_BODY_MAX] + f"…({len(t):,}자)"
+
+    def js(v) -> str:
+        return json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    out = [f"site={cut(str(d.get('site') or ''))}", f"method={cut(_rest_method(d))}", f"path={cut(str(d.get('path') or ''))}"]
+    out += [f"{k}={cut(js(d[k]))}" for k in ("query", "body") if k in d]
     return " · ".join(out)
 
 
@@ -4474,7 +4503,8 @@ async def _confirm_card(app_, req, ctx):
         # 카드 글(답 본문 — 대화에 저장된다) · 카드 사건의 인자는 RA 게시 확인 토큰을 가린 꼴이다(publish_token — 사용자 결정 10-31). 맡아 둔 호출
         # (args · canon)은 진짜 값 그대로다 — 승인하면 서버가 그것을 보낸다(_confirm_send). 사람은 토큰 값을 보고 고를 것이 없다.
         c["args_shown"] = _publish_token.mask(c["canon"])
-        c["args_text"] = _confirm_args_text(c["args_shown"])
+        c["args_text"] = (_confirm_rest_text(c["args_shown"]) if c["base"] == _AGENT_REST_BRIDGE[0]
+                          else _confirm_args_text(c["args_shown"]))
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
@@ -7456,7 +7486,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # 화면과 원장이 두 줄로 갈라진다.
                 _tname2, _iv = _inner_tool(str(event.get("name") or ""),
                                            (event.get("data") or {}).get("input"))
-                if CHAT_CONFIRM_GATE and _confirm_class(_tname2)[0]:
+                if CHAT_CONFIRM_GATE and _confirm_class(_tname2, (event.get("data") or {}).get("input") if _iv is None else _iv)[0]:
                     _cctx.done.append((_tname2, out[:160]))      # 이 턴에 나간 잡 · 쓰기 — 카드가 서면 카드 글이 밝힌다(HA-29)
                 _cid2 = str(event.get("run_id") or "")
                 _t0 = _t0_by_call.pop(_cid2, None)
