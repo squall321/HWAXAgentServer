@@ -1,17 +1,20 @@
-# REST 다리 쓰기의 확인 관문(HWAXPortal docs/core-link §7 — SRC-15 챗 쪽)
+# REST 다리 쓰기의 확인 관문과 StepForge 운영자 챗의 rest_call 묶음(HWAXPortal docs/core-link §7 — SRC-15 챗 쪽)
 #
 # 게이트웨이가 StepForge 의 정해진 쓰기 경로(POST /api/onto-link · onto-put · onto-define)에 그 사람의 단언을 실어 보내게 된다(design §5).
 # 챗에서 그 길은 rest_call 의 POST 인데, rest_call 은 운영자 정의의 writes · confirm 어디에도 없어 카드 없이 나갔다(PLAN §4 SRC-15).
 #   A. 부류 — 메서드가 GET · HEAD 가 아니면(대소문자 · 앞뒤 공백 무시, 빠지면 게이트웨이처럼 GET) 운영자 목록 · 주문 말과 상관없이 늘 confirm 이다.
 #      GET · HEAD 는 종전 판정 그대로이고, 운영자 목록 · 잡 바닥 목록의 판정도 그대로다.
 #   B. 턴 — 직접 · invoke_tool · 별칭 모두 카드이고, 카드는 site · method · path 와 본문 앞 400자를 싣는다. 승인하면 처음 꼴 그대로 한 번 간다.
+#   C. 묶음 — StepForge 운영자를 고르면 그 앱 도구가 캡(dev 40)을 다 채워 rest_call 이 묶이지 않았다. 입구 도구로 묶는다(챗만 — 좌석은 그대로).
 #
 #   실행:  .venv/bin/python -m pytest tests/test_core_link_rest_gate.py -q
+import asyncio
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
@@ -21,6 +24,7 @@ import pytest  # noqa: E402
 import app as a  # noqa: E402
 from test_confirm_gate import HE_TEAM, _card_turn, _GateAgent, _gw, _held, _result, _run, _turn  # noqa: E402
 from test_confirm_gate import gate, maps, turn_ctx  # noqa: E402, F401 — 픽스처
+from test_operator_persona import OP_SESSION, PLAIN_SESSION, _FakeAgent, _prime_tools_map, _run_stream, _stub_session, _tool  # noqa: E402
 
 # 미리 보기(MCP onto_link dry_run=true)와 같은 인자를 본문에 싣고 적용한다 — 포털 he-team.json he-cad-stepforge 에 더할 줄(design §7)의 꼴
 ONTO_BODY = {"project_id": "P1", "links": [{"from": "cad_part:BAT-1", "rel": "instance_of", "to": "part:battery"}], "dry_run": False}
@@ -128,3 +132,67 @@ def test_카드의_본문은_앞_400자이고_query_와_글_본문도_보인다(
     nl = a._confirm_rest_text({"site": "s", "method": "POST", "path": "/p\n/q"})
     assert "\n" not in nl and "⏎" in nl
 
+
+# ── C. 묶음 ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+SF_KEY = ["list_projects", "get_project_meta", "measurement_guide"]
+SF_SESSION = {"agent_type": "he-cad-stepforge", "name": "StepForge 운영자", "description": "StepForge 운영자",
+              "system_prompt": "# StepForge 운영자\n역할 본문",
+              "response_config": {"persona_kind": "mcp_operator", "mcp_apps": ["heax-step_forge"], "key_tools": SF_KEY}}
+# 게이트웨이 /tools-map 은 rest_call · rest_catalog 를 싣지 않는다(로컬 도구 중 REST 다리는 빠졌다) — 앱 핀으로는 닿지 않는다
+SF_MAP = {**{f"sf_tool_{i:02d}": "heax-step_forge" for i in range(60)}, **{k: "heax-step_forge" for k in SF_KEY}, "query_voc": "signalforge"}
+
+
+def test_StepForge_운영자를_고르면_rest_catalog_와_rest_call_이_입구_도구로_묶인다(monkeypatch):
+    sink, _out, _ = _run_stream(monkeypatch, SF_SESSION, SF_MAP)
+    assert sink["first"] == [*SF_KEY, "rest_catalog", "rest_call"], sink["first"]
+    assert sink["core"] == a._GUIDE_TOOLS, "운영자의 상시 예약(안내대)은 그대로다"
+    # 캡 경로(dev TOOL_MAX=40) — 그 앱 도구 63개가 핀이라 입구 도구가 아니면 rest_call 은 캡 밖이었다
+    monkeypatch.setattr(a, "TOOL_MAX", 40)
+    monkeypatch.setattr(a, "TOOL_SCHEMA_BUDGET", 0)
+    monkeypatch.setattr(a, "_semantic_order", lambda q, tools: [])
+    tools = [_tool(n, "stepforge 파트") for n in SF_MAP] + [_tool(n, "게이트웨이 도구") for n in (*a._GUIDE_TOOLS, "rest_catalog", "rest_call")]
+    kept = [t.name for t in a._select_tools(tools, "선 적용", sink["pinned"], sink["first"], sink["core"])]
+    assert {"rest_catalog", "rest_call"} <= set(kept) and set(a._GUIDE_TOOLS) <= set(kept), kept
+    old_first = [n for n in sink["first"] if n not in ("rest_catalog", "rest_call")]
+    old = [t.name for t in a._select_tools(tools, "선 적용", [n for n in sink["pinned"] if n not in ("rest_catalog", "rest_call")],
+                                           old_first, sink["core"])]
+    assert "rest_call" not in old, "입구 도구가 아니던 때는 앱 도구가 캡을 다 채웠다(고치기 전의 꼴)"
+
+
+def test_다른_운영자와_일반_전문가는_종전_그대로다(monkeypatch):
+    sink, _out, _ = _run_stream(monkeypatch, OP_SESSION, {"predict_sed": "heax-thermal_shock_mcp"})
+    assert sink["first"] == ["predict_sed", "get_dataset_summary"]
+    sink, _out, _ = _run_stream(monkeypatch, PLAIN_SESSION, {"predict_sed": "heax-thermal_shock_mcp"})
+    assert sink["first"] == [] and sink["pinned"] == []
+
+
+def test_보조로_고른_StepForge_운영자도_입구_도구로_빌려준다(monkeypatch):
+    """보조 운영자는 입구 도구만 빌려준다(앱 통째 핀은 하지 않는다) — rest_call 도 그 입구 도구다."""
+    sink: dict = {}
+    _stub_session(monkeypatch, {"he-calc-thermalshock": OP_SESSION, "he-cad-stepforge": SF_SESSION})
+    _prime_tools_map(monkeypatch, {**SF_MAP, "predict_sed": "heax-thermal_shock_mcp"})
+
+    async def fake_agent_for(app, groups, pinned=None, query="", sources=None, user="", user_pat="", first=None, core_names=None, prefer=None):
+        sink["first"] = list(first or [])
+        return _FakeAgent(sink)
+
+    async def no_knowledge(*_a, **_k):
+        return ""
+    monkeypatch.setattr(a, "_agent_for", fake_agent_for)
+    monkeypatch.setattr(a, "_persona_knowledge", no_knowledge)
+    a._persona_knowledge.last_note = ""
+    req = a.ChatRequest(message="SED 예측해줘", groups=[], pinned_agents=["he-calc-thermalshock", "he-cad-stepforge"])
+
+    async def consume():
+        return [c async for c in a._agent_stream(NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False)), req)]
+    asyncio.run(consume())
+    assert sink["first"] == ["predict_sed", "get_dataset_summary", *SF_KEY, "rest_catalog", "rest_call"], sink["first"]
+
+
+def test_좌석이_읽는_운영자_설정에는_더하지_않는다(monkeypatch):
+    """심의 좌석 · 좌석 탐침(seat_probe)은 _persona_meta 를 읽고 확인 관문이 없다 — 게이트웨이 도구는 챗의 입구 도구에서만 더한다."""
+    _stub_session(monkeypatch, {"he-cad-stepforge": SF_SESSION})
+    m = asyncio.run(a._persona_meta(NS(state=NS()), [], "he-cad-stepforge"))
+    assert m["key_tools"] == SF_KEY and m["apps"] == ["heax-step_forge"]
+    assert a._operator_entry(m) == [*SF_KEY, "rest_catalog", "rest_call"] and a._operator_entry({"operator": False, "apps": ["heax-step_forge"]}) == []

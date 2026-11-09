@@ -2786,6 +2786,11 @@ _TOOL_PRIORITY = (
 # 컨텍스트에서는 초과 400 으로 턴이 죽는다(실측 dev 16K: StepForge 운영자 77개 → 16,385토큰).
 # 다른 앱이 필요하면 recommend_agents·list_tool_apps 로 안내하고, 바인딩 밖 도구는 invoke_tool 로 부른다.
 _GUIDE_TOOLS = ("search_tools", "invoke_tool", "list_tool_apps", "recommend_agents")
+# 운영자 앱 → 그 운영자의 입구 도구에 더하는 게이트웨이 도구(HWAXPortal docs/core-link §7 — StepForge 온톨로지 적용은 REST 다리 rest_call 의 POST 로
+# 하고 확인 카드가 선다 · 경로 · 본문 꼴은 rest_catalog 로 본다). 운영자 정의(포털 he-team.json)의 key_tools 는 그 앱의 도구만 받아(포털
+# sync-he-personas 가 앱 밖 이름을 거절한다) 여기 둔다. 입구 도구(first)라 캡 · 스키마 예산에 잘리지 않는다 — 앱을 통째로 핀하면 캡(dev 40)을
+# 그 앱 도구가 다 채워 rest_call 이 묶이지 않았다.
+_OPERATOR_GATEWAY_TOOLS = {"heax-step_forge": ("rest_catalog", "rest_call")}
 # 지목한 전문가의 분야 도구를 몇 개까지 먼저 앉힐지. 캡(dev 40)의 3할 남짓이라 질문 어휘로
 # 고르는 자리를 다 먹지 않는다 — 전문가 짐작이 빗나가도 관련 도구가 들어올 여지를 남긴다.
 _PERSONA_PREFER_N = _env_int("CHAT_PERSONA_PREFER_N", 12)
@@ -5853,6 +5858,13 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
     return meta
 
 
+def _operator_entry(meta: dict) -> list:
+    """운영자의 입구 도구 — 운영자 정의의 key_tools 뒤에 모는 앱의 게이트웨이 도구(_OPERATOR_GATEWAY_TOOLS)를 붙인다. 운영자가 아니면 빈 목록."""
+    if not meta.get("operator"):
+        return []
+    return [*(meta.get("key_tools") or []), *(t for app_ in meta.get("apps") or [] for t in _OPERATOR_GATEWAY_TOOLS.get(app_, ()))]
+
+
 # 지정 전문가의 지식카드 주입 예산(문자). 심의 경로(DELIB_KNOWLEDGE_BUDGET)와 같은 기본값이다 —
 # 챗은 인원 1명·라운드 1회라 심의처럼 곱해지지 않으므로 더 조일 이유가 없다.
 CHAT_KNOWLEDGE_BUDGET = _env_int("CHAT_KNOWLEDGE_BUDGET", 12000)
@@ -7040,11 +7052,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
-        # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools). 앱을 통째로 핀하면
+        # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools · 그 앱의 게이트웨이 도구 — _operator_entry). 앱을 통째로 핀하면
         # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
-        first = list(dict.fromkeys([*pinned, *(persona.get("key_tools") or [] if operator else []),
-                                    *[t for _k, _m in helpers if _m.get("operator")
-                                      for t in (_m.get("key_tools") or [])]]))
+        first = list(dict.fromkeys([*pinned, *_operator_entry(persona),
+                                    *[t for _k, _m in helpers for t in _operator_entry(_m)]]))
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
