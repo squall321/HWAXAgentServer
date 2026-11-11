@@ -2462,8 +2462,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
 
     async def capped(*a, _hwax_rc: RunnableConfig = _NO_RC, **kw):
         # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
-        # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G3 유령 ID →
-        # G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
+        # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G2b 챗 턴 밖 REST 다리 쓰기 거부 →
+        # G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
         # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
@@ -2504,6 +2504,20 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                        "보내지 않았다. 사용자가 외부 응답자 심의를 원하면 리스크 앱이나 자기 Claude Code 에서 직접 열라고 알려라. 인자 "
                        "문제가 아니다 — 그 칸을 실어 다시 부르지 마라")
                 return _refuse(tool, msg)
+        # ── G2b REST 다리 쓰기(HWAXPortal docs/core-link §7) — 사람의 확인 카드가 서지 않는 곳(챗 턴 밖 — 심의의 지정 도구 · 좌석 자유 조회 ·
+        # 외부 응답자의 CALL 줄, 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다(invoke_tool 의 안쪽도). 게이트웨이는 그 사람의
+        # 단언을 실어 StepForge 에 쓴다. 챗 턴이면 G5 가 확인 카드로 멈춘다 — 챗에 묶는 도구(chat)는 관문 손잡이(CHAT_CONFIRM_GATE)를 따르고,
+        # 승인 실행(_confirm_send)은 턴 맥락이 있어 G5 의 승인 열쇠로 지난다. 조회(GET · HEAD)는 그대로 간다.
+        if not chat and _turn_confirm.get() is None:
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _rw = _rest_write(getattr(tool, "name", ""), _args)
+                if _rw:
+                    _tn = str(getattr(tool, "name", ""))[:80]
+                    print(f"[gate] {_tn}({_rw[:80]}) 차단 — 챗 턴 밖이라 확인 카드가 서지 않는다(REST 다리 쓰기)")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {_tn} 호출 실패: REST 다리 쓰기(rest_call {_rw}) — 사람의 확인 카드가 서지 않는 곳"
+                           "(심의 · 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다. 조회(GET · HEAD)만 보낸다. 쓰기는 사람이 "
+                           "챗에서 확인 카드로 승인한다. 인자 문제가 아니다 — 쓰기 메서드로 다시 부르지 마라")
+                    return _refuse(tool, msg)
         # ── G3 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
         src = _turn_ids.get()
@@ -2786,6 +2800,11 @@ _TOOL_PRIORITY = (
 # 컨텍스트에서는 초과 400 으로 턴이 죽는다(실측 dev 16K: StepForge 운영자 77개 → 16,385토큰).
 # 다른 앱이 필요하면 recommend_agents·list_tool_apps 로 안내하고, 바인딩 밖 도구는 invoke_tool 로 부른다.
 _GUIDE_TOOLS = ("search_tools", "invoke_tool", "list_tool_apps", "recommend_agents")
+# 운영자 앱 → 그 운영자의 입구 도구에 더하는 게이트웨이 도구(HWAXPortal docs/core-link §7 — StepForge 온톨로지 적용은 REST 다리 rest_call 의 POST 로
+# 하고 확인 카드가 선다 · 경로 · 본문 꼴은 rest_catalog 로 본다). 운영자 정의(포털 he-team.json)의 key_tools 는 그 앱의 도구만 받아(포털
+# sync-he-personas 가 앱 밖 이름을 거절한다) 여기 둔다. 입구 도구(first)라 캡 · 스키마 예산에 잘리지 않는다 — 앱을 통째로 핀하면 캡(dev 40)을
+# 그 앱 도구가 다 채워 rest_call 이 묶이지 않았다.
+_OPERATOR_GATEWAY_TOOLS = {"heax-step_forge": ("rest_catalog", "rest_call")}
 # 지목한 전문가의 분야 도구를 몇 개까지 먼저 앉힐지. 캡(dev 40)의 3할 남짓이라 질문 어휘로
 # 고르는 자리를 다 먹지 않는다 — 전문가 짐작이 빗나가도 관련 도구가 들어올 여지를 남긴다.
 _PERSONA_PREFER_N = _env_int("CHAT_PERSONA_PREFER_N", 12)
@@ -3959,12 +3978,38 @@ def _confirm_lists() -> dict:
     return _CONFIRM_LISTS
 
 
-def _confirm_class(name) -> tuple:
+def _rest_method(args) -> str:
+    """REST 다리(rest_call) 인자의 메서드 — 게이트웨이 _rest_call · 읽기 전용 판정과 같은 읽기다(없거나 빈 글이면 GET, 앞뒤 공백을 떼고 대문자).
+    인자는 dict 이거나 JSON 글(invoke_tool 의 arguments)이고, 못 읽으면 칸이 없는 셈이다."""
+    d = _arg_dict(args) or {}
+    return (str(d.get("method") or "GET").strip() or "GET").upper()
+
+
+def _rest_write(name, args) -> str:
+    """REST 다리의 쓰기 호출이면 '메서드 경로'(경로는 공백을 접어 앞 120자), 아니면 빈 글 — rest_call(별칭 · 충돌 접두 꼴도, _named)이고
+    메서드가 GET · HEAD 가 아니다(_rest_method). 범용 실행기(invoke_tool)면 안쪽 이름 · 인자로 본다 — 심의 지정 도구로 invoke_tool 을 고르면
+    계획자가 안쪽에 rest_call 을 실을 수 있다."""
+    if str(name or "").strip().lower() == "invoke_tool":
+        d = _arg_dict(args) or {}
+        name, args = d.get("name"), d.get("arguments")
+    if not _named(name, _AGENT_REST_BRIDGE):
+        return ""
+    m = _rest_method(args)
+    if m in ("GET", "HEAD"):
+        return ""
+    return f"{m} {' '.join(str((_arg_dict(args) or {}).get('path') or '').split())[:120]}".strip()
+
+
+def _confirm_class(name, args=None) -> tuple:
     """(부류, 맞은 목록 이름) — 부류는 confirm > job > write(겹치면 더 엄한 쪽), 목록 밖이면 (None, ""). 맞은 이름은 그 부류에서 가장 긴 것이고
-    승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠)."""
+    승인 · 중복 판정 열쇠의 앞 칸이다(노출 이름 · 별칭 · 경유로 불러도 같은 호출이면 같은 열쇠). REST 다리(rest_call — 별칭 · 충돌 접두를 단
+    꼴도, _named)는 인자로 가른다 — 메서드가 GET · HEAD 가 아니면 운영자 목록 · 주문 말과 상관없이 늘 카드(confirm)다(HWAXPortal docs/core-link
+    §7 — 게이트웨이가 사람 단언을 실어 StepForge 온톨로지에 쓴다). GET · HEAD 는 종전 판정 그대로다."""
     n = str(name or "").strip().lower()
     if not n:
         return None, ""
+    if _rest_write(n, args):
+        return "confirm", _AGENT_REST_BRIDGE[0]
     lists = _confirm_lists()
     for kind, names in (("confirm", lists["confirm"]), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
         hit = [t for t in names if n == t or n.endswith("_" + t)]
@@ -4196,7 +4241,7 @@ def _confirm_parse(tool, a, kw):
     via = getattr(tool, "name", "") == "invoke_tool"
     args = kw if kw else next((x for x in a if isinstance(x, dict)), kw)
     name, targs = (args.get("name"), args.get("arguments")) if via else (getattr(tool, "name", ""), args)
-    kind, base = _confirm_class(name)
+    kind, base = _confirm_class(name, targs)
     return None if kind is None else (name, targs, via, kind, base, (base, _confirm_canon(targs)))
 
 
@@ -4267,6 +4312,7 @@ _CARD_ARGS_MAX = 600            # 카드 글에 펼치는 인자 합(자) — �
 _CARD_VALUE_MAX = 80            # 값 하나(자) — 넘으면 앞부분과 '…(N자)'
 _CARD_LIST_SHOW = 5             # 수 · 글 목록에서 보이는 원소 수
 _CARD_SSE_ARGS_MAX = 20_000     # 카드 사건 args(정규 JSON) 상한 — 넘으면 앞부분과 args_cut
+_CARD_REST_BODY_MAX = 400       # REST 다리 카드의 본문 요약(자) — 넘으면 앞부분과 '…(N자)'(HWAXPortal docs/core-link §7)
 
 
 def _confirm_args_text(args) -> str:
@@ -4304,6 +4350,22 @@ def _confirm_args_text(args) -> str:
             break
         out.append(leaf)
         used += len(leaf) + 3
+    return " · ".join(out)
+
+
+def _confirm_rest_text(args) -> str:
+    """REST 다리(rest_call) 카드에 보이는 인자 — 게이트웨이 _rest_call 이 읽는 다섯 칸 site · method · path · query · body(HWAXPortal
+    docs/core-link §7). 인자는 승인 때 서버가 보내는 그대로여야 한다(정규 인자는 빈 칸을 빼 query {"force": ""} 같은 칸이 카드에 안 보였다 —
+    _confirm_card 가 넘긴다). 값은 칸마다 JSON 으로 적는다 — 글은 따옴표 · 이스케이프째라 값 안의 ' · ' · '=' 가 칸을 꾸며 내지 못하고 줄바꿈도
+    카드 글에 들지 않는다. method 는 게이트웨이가 보내는 꼴(_rest_method)이다. 칸마다 앞 _CARD_REST_BODY_MAX 자에서 자르고 '…(N자)' 를 단다.
+    query · body 는 인자에 칸이 있을 때만 싣는다."""
+    d = _arg_dict(args) or {}
+
+    def js(v) -> str:
+        t = json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return t if len(t) <= _CARD_REST_BODY_MAX else t[:_CARD_REST_BODY_MAX] + f"…({len(t):,}자)"
+    out = [f"site={js(d.get('site'))}", f"method={js(_rest_method(d))}", f"path={js(d.get('path'))}"]
+    out += [f"{k}={js(d[k])}" for k in ("query", "body") if k in d]
     return " · ".join(out)
 
 
@@ -4473,8 +4535,17 @@ async def _confirm_card(app_, req, ctx):
         c["app_key"] = (_TOOLS_MAP_CACHE.get("map") or {}).get(c["name"], "")
         # 카드 글(답 본문 — 대화에 저장된다) · 카드 사건의 인자는 RA 게시 확인 토큰을 가린 꼴이다(publish_token — 사용자 결정 10-31). 맡아 둔 호출
         # (args · canon)은 진짜 값 그대로다 — 승인하면 서버가 그것을 보낸다(_confirm_send). 사람은 토큰 값을 보고 고를 것이 없다.
-        c["args_shown"] = _publish_token.mask(c["canon"])
-        c["args_text"] = _confirm_args_text(c["args_shown"])
+        if c["base"] == _AGENT_REST_BRIDGE[0]:
+            # REST 다리는 승인 때 보낼 인자 그대로를 싣는다(카드 글 · 카드 사건 둘 다) — 정규 인자(canon)는 빈 칸을 빼서, 승인이 그 칸째 보내는
+            # query {"force": ""} · 본문 "note": "" 가 카드에 보이지 않았다. 승인 · 중복 판정 열쇠는 그대로 정규 인자다.
+            _send = _confirm_with_defaults(c["name"], c["args"])
+            _sd = _arg_dict(_send)
+            c["args_shown"] = _publish_token.mask(json.dumps(_send if _sd is None else _sd, ensure_ascii=False, sort_keys=True,
+                                                             separators=(",", ":"), default=str))
+            c["args_text"] = _confirm_rest_text(c["args_shown"])
+        else:
+            c["args_shown"] = _publish_token.mask(c["canon"])
+            c["args_text"] = _confirm_args_text(c["args_shown"])
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
@@ -5823,6 +5894,13 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
     return meta
 
 
+def _operator_entry(meta: dict) -> list:
+    """운영자의 입구 도구 — 운영자 정의의 key_tools 뒤에 모는 앱의 게이트웨이 도구(_OPERATOR_GATEWAY_TOOLS)를 붙인다. 운영자가 아니면 빈 목록."""
+    if not meta.get("operator"):
+        return []
+    return [*(meta.get("key_tools") or []), *(t for app_ in meta.get("apps") or [] for t in _OPERATOR_GATEWAY_TOOLS.get(app_, ()))]
+
+
 # 지정 전문가의 지식카드 주입 예산(문자). 심의 경로(DELIB_KNOWLEDGE_BUDGET)와 같은 기본값이다 —
 # 챗은 인원 1명·라운드 1회라 심의처럼 곱해지지 않으므로 더 조일 이유가 없다.
 CHAT_KNOWLEDGE_BUDGET = _env_int("CHAT_KNOWLEDGE_BUDGET", 12000)
@@ -7010,11 +7088,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 사용자 지정 우선 도구 — 도구 카탈로그에서 직접 고른 것. 바인딩 보장(+캡 환경 우선순위)
         # 과 시스템 프롬프트 지시 둘 다로 강제한다(모델의 자율 선택은 유지 — 금지가 아니라 우선).
         pinned = [str(n)[:80] for n in (req.pinned_tools or []) if isinstance(n, str) and n.strip()][:12]
-        # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools). 앱을 통째로 핀하면
+        # 캡에서 먼저 사는 도구 — 콕 집은 것과 운영자의 입구 도구(key_tools · 그 앱의 게이트웨이 도구 — _operator_entry). 앱을 통째로 핀하면
         # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
-        first = list(dict.fromkeys([*pinned, *(persona.get("key_tools") or [] if operator else []),
-                                    *[t for _k, _m in helpers if _m.get("operator")
-                                      for t in (_m.get("key_tools") or [])]]))
+        first = list(dict.fromkeys([*pinned, *_operator_entry(persona),
+                                    *[t for _k, _m in helpers for t in _operator_entry(_m)]]))
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
@@ -7456,7 +7533,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 # 화면과 원장이 두 줄로 갈라진다.
                 _tname2, _iv = _inner_tool(str(event.get("name") or ""),
                                            (event.get("data") or {}).get("input"))
-                if CHAT_CONFIRM_GATE and _confirm_class(_tname2)[0]:
+                if CHAT_CONFIRM_GATE and _confirm_class(_tname2, (event.get("data") or {}).get("input") if _iv is None else _iv)[0]:
                     _cctx.done.append((_tname2, out[:160]))      # 이 턴에 나간 잡 · 쓰기 — 카드가 서면 카드 글이 밝힌다(HA-29)
                 _cid2 = str(event.get("run_id") or "")
                 _t0 = _t0_by_call.pop(_cid2, None)
