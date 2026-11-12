@@ -99,3 +99,14 @@ def test_보고서는_SVG_자리에_짝_PNG_를_올린다(monkeypatch, tmp_path)
     assert len(got) == 1 and f'"filename": "{stem}.png"'.encode() in got[0] or f'"filename":"{stem}.png"'.encode() in got[0]
     assert PNG in got[0] and SVG not in got[0], "보고서에는 래스터를 올린다"
     assert out.blocks["results"] == ["단면이다.\n[그림 1 — PCB 단면]\n끝."]
+
+
+def test_앞_대화의_답에_SVG_만_있어도_판독은_짝_PNG_를_본다():
+    stem = hashlib.sha256(PNG).hexdigest()[:20]
+    hist = [{"role": "user", "content": "단면 보여 줘"},
+            {"role": "assistant", "content": f"PCB 단면이다.\n![PCB 단면](/agent/artifacts/{stem}.svg)"},
+            {"role": "user", "content": "간극이 어디 좁아?"}]
+    got = [u for u, _why in vision.history_images(hist)]
+    assert got == [f"/agent/artifacts/{stem}.png"], "답에 실린 호버 SVG 의 짝 PNG 를 판독 후보로"
+    assert vision.svg_pair_urls("/agent/artifacts/../x.svg") == [], "경로를 벗어나는 이름은 받지 않는다"
+
