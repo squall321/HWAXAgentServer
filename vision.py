@@ -50,6 +50,21 @@ def image_urls(*texts) -> list[str]:
     return out
 
 
+# 단면 짝(HWAXPortal docs/report-figures RF-40) — 챗 답에는 호버 SVG 를 싣고 판독용 PNG 는 같은 줄기 이름에 둔다. 앞 대화의 답에서 SVG 를 보면 그 짝 PNG 를
+# 판독 후보로 넣는다(짝이 없으면 load 가 None 을 돌려 건너뛴다). 글자는 영숫자 · _ . - 뿐이라 경로를 벗어나지 않는다.
+SVG_PAIR_RE = re.compile(r"/agent/artifacts/([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\.svg(?![A-Za-z0-9_])", re.I)
+
+
+def svg_pair_urls(text) -> list[str]:
+    """글에 나온 같은 출처 SVG 그림의 짝 PNG 주소 — 처음 나온 순서, 중복 없이."""
+    out: list[str] = []
+    for m in SVG_PAIR_RE.finditer(str(text or "")):
+        u = f"/agent/artifacts/{m.group(1)}.png"
+        if u not in out and ".." not in u:
+            out.append(u)
+    return out
+
+
 def history_images(history) -> list[tuple[str, str]]:
     """앞 대화의 그림 — [(주소, 출처 설명)] 시간순. 사람이 올린 그림(images) · 그 턴의 조회 근거와 답에 나온 그림 주소.
     설명에 '(N턴 전)' 을 단다 — 그 항목 뒤의 사람 발화 수다(사람 항목은 자신까지, 답 · 근거는 그 턴의 물음까지 센다). 몇 번째 항목인지만
@@ -82,6 +97,8 @@ def history_images(history) -> list[tuple[str, str]]:
                         add(u, f"{i + 1}번째 답 앞에 도구 {str(e.get('tool') or '')[:80]} 가 낸 그림{ago}")
             for u in image_urls(m.get("content")):
                 add(u, f"{i + 1}번째 답에 실린 그림{ago}")
+            for u in svg_pair_urls(m.get("content")):
+                add(u, f"{i + 1}번째 답에 실린 그림(호버 SVG 의 판독용 짝){ago}")
     return out
 
 
