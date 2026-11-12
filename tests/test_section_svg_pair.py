@@ -110,3 +110,24 @@ def test_앞_대화의_답에_SVG_만_있어도_판독은_짝_PNG_를_본다():
     assert got == [f"/agent/artifacts/{stem}.png"], "답에 실린 호버 SVG 의 짝 PNG 를 판독 후보로"
     assert vision.svg_pair_urls("/agent/artifacts/../x.svg") == [], "경로를 벗어나는 이름은 받지 않는다"
 
+
+def test_format_인자가_없는_도구에는_설명에_값이_있어도_넣지_않는다(monkeypatch, tmp_path):
+    monkeypatch.setattr(a, "ARTIFACT_DIR", str(tmp_path))
+    seen: list = []
+
+    async def inner(**kw):
+        seen.append(kw)
+        return [{"type": "text", "text": "결과"}]
+    t = StructuredTool(name="section_batch_result", description="묶음 결과 — png+svg_live 로 짝이 온다",
+                       args_schema={"type": "object", "properties": {"job_id": {"type": "string"}}}, coroutine=inner)
+    _call(a._prep_tool(t, arg_defaults=a._CHAT_ARG_DEFAULTS, chat=True), {"job_id": "j1"})
+    assert "format" not in seen[-1], "인자가 없는 도구에 모르는 인자를 넣으면 호출이 실패한다"
+
+
+def test_묶음_결과_도구도_짝으로_둔다(monkeypatch, tmp_path):
+    monkeypatch.setattr(a, "ARTIFACT_DIR", str(tmp_path))
+    items = [{"type": "text", "text": "묶음"}, _img(PNG, "image/png"), _img(SVG, "image/svg+xml")]
+    out = _call(_tool("section_batch_result", False, items, []), {"project_id": "p1"})
+    stem = hashlib.sha256(PNG).hexdigest()[:20]
+    assert f"답에 넣을 것: /agent/artifacts/{stem}.svg" in out
+

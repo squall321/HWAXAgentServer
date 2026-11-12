@@ -2230,19 +2230,23 @@ _CHAT_ARG_DEFAULTS = {
 _SECTION_PAIR_FORMAT = "png+svg_live"
 _SECTION_PAIR_NOTE = (f"이 대화에서는 format 을 주지 않으면 {_SECTION_PAIR_FORMAT} 다 — 화면은 호버되는 SVG, 판독 · 보고서는 PNG. "
                       "사용자가 PNG 만 원하면 format 을 준다")
-_SECTION_PAIR_TOOLS = {s: ({}, "") for s in ("section_view", "section_pair_view", "section_batch", "section_atlas")}
+# section_batch 의 그림은 section_batch_result 로 나온다(StepForge D-690) — 짝 처리는 그 도구에도 건다. 기본값은 format 인자가 있는 도구에만 들어간다.
+_SECTION_PAIR_TOOLS = {s: ({}, "") for s in ("section_view", "section_pair_view", "section_batch", "section_batch_result", "section_atlas")}
 for _sec in _SECTION_PAIR_TOOLS:
     _CHAT_ARG_DEFAULTS[_sec] = ({"format": _SECTION_PAIR_FORMAT}, _SECTION_PAIR_NOTE, _SECTION_PAIR_FORMAT)
 
 
-def _schema_knows(tool, needle: str) -> bool:
-    """그 도구의 인자 스키마(설명 포함) 또는 도구 설명에 needle 글자가 있나 — 앱의 새 인자 값은 그 앱이 지원하는 판에서만 기본값으로 채운다."""
+def _schema_knows(tool, needle: str, keys) -> bool:
+    """채울 인자(keys)가 그 도구의 인자 스키마에 모두 있고, 그 인자 정의(설명 포함)에 needle 글자가 있나 — 앱의 새 인자 값은 그 앱이 지원하는 판에서만
+    기본값으로 채운다. 도구 설명만 보지 않는다 — 인자가 없는 도구에 모르는 인자를 넣으면 그 호출이 실패한다."""
     sc = getattr(tool, "args_schema", None)
+    props = sc.get("properties") if isinstance(sc, dict) else None
+    if not isinstance(props, dict) or not keys:
+        return False
     try:
-        blob = json.dumps(sc, ensure_ascii=False, default=str) if isinstance(sc, dict) else ""
+        return all(k in props and needle in json.dumps(props[k], ensure_ascii=False, default=str) for k in keys)
     except (TypeError, ValueError):
-        blob = ""
-    return needle in blob or needle in str(getattr(tool, "description", "") or "")
+        return False
 
 
 def _arg_defaults_for(name, table) -> tuple[dict, str] | None:
@@ -2470,7 +2474,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     # 단면 도구 넷만 그림을 PNG · SVG 짝으로 둔다(RF-40) — 다른 도구가 낸 서로 무관한 PNG · SVG 를 짝으로 묶지 않게
     _pair = _arg_defaults_for(getattr(tool, "name", ""), _SECTION_PAIR_TOOLS) is not None
     _own = _arg_defaults_for(getattr(tool, "name", ""), arg_defaults)
-    if _own and len(_own) > 2 and not _schema_knows(tool, _own[2]):
+    if _own and len(_own) > 2 and not _schema_knows(tool, _own[2], _own[0].keys()):
         _own = None                    # 그 판의 도구가 아직 이 값을 모른다 — 채우지 않는다(옛 판이 모르는 값을 받으면 실패한다)
     if _own:
         tool.description = f"{tool.description or ''} [{_own[1]}]"
