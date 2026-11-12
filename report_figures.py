@@ -180,7 +180,11 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
                 if n >= FIGURES_MAX:
                     res[name] = ("fail", f"보고서 하나에 그림은 {FIGURES_MAX}장까지 싣는다 — 나머지는 대화에서 본다", alt)
                     continue
-                p = os.path.join(artifact_dir, name)
+                p, up_name = os.path.join(artifact_dir, name), name
+                if name.lower().endswith(".svg") and os.path.isfile(os.path.join(artifact_dir, name[:-4] + ".png")):
+                    # 단면 짝(HWAXPortal docs/report-figures RF-40) — 챗은 같은 그림을 PNG(판독) · SVG(화면 호버) 짝으로 같은 줄기에 둔다. 보고서는 래스터다.
+                    up_name = name[:-4] + ".png"
+                    p = os.path.join(artifact_dir, up_name)
                 if not os.path.isfile(p):
                     res[name] = ("fail", "그림 파일이 서버에 없다 — 오래된 도구 그림은 지워진다(최근 것만 남긴다)", alt)
                     continue
@@ -191,7 +195,7 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
                     res[name] = res[by_sha[sha]]
                     out.found -= 1
                     continue
-                fid, why, fatal = await _upload(cli, user_pat, name, raw, sha, alt)
+                fid, why, fatal = await _upload(cli, user_pat, up_name, raw, sha, alt)
                 if fid is None:
                     res[name] = ("fail", why, alt)
                     stop = why if fatal else ""

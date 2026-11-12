@@ -2124,11 +2124,12 @@ def _artifact_kind(raw: bytes) -> str | None:
     return "image/svg+xml" if head[:4].lower() == b"<svg" else None
 
 
-def _stash_image_items(items) -> list:
-    """MCP content 의 이미지 블록(base64)을 파일로 저장하고 서빙 URL 목록을 돌려준다."""
+def _stash_image_items(items, pair: bool = False) -> list:
+    """MCP content 의 이미지 블록(base64)을 파일로 저장하고 서빙 URL 목록을 돌려준다. pair 면(단면 도구 넷 — RF-40) PNG · SVG 를 짝으로 둔다."""
     import base64
     import hashlib
     urls = []
+    got: list[tuple[bytes, str]] = []      # (내용, 꼴) — 먼저 다 읽고 짝을 지은 뒤 저장한다
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -2148,7 +2149,17 @@ def _stash_image_items(items) -> list:
             logging.getLogger("agent").warning("[agent] 도구 그림을 저장하지 않음 — %s(선언 %s)",
                                                "꼴을 모름" if not real else f"{len(raw)} 바이트 > {_vision.MAX_BYTES}", mime)
             continue
-        name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT[real]
+        got.append((raw, real))
+    # 단면 짝(RF-40) — StepForge format="png+svg_live" 는 그림마다 PNG 다음 그 짝 SVG 를 낸다. i 번째 SVG 를 i 번째 PNG 와 같은 줄기 이름에 둔다 —
+    # 모델 안내(_norm)와 보고서(report_figures — SVG 자리에 짝 PNG)가 이름만으로 짝을 안다. 한쪽만 온 결과는 종전대로 내용 해시 이름이다.
+    pngs = [hashlib.sha256(raw).hexdigest()[:20] for raw, real in got if real == "image/png"] if pair else []
+    svg_i = 0
+    for raw, real in got:
+        if real == "image/svg+xml" and svg_i < len(pngs):
+            name = pngs[svg_i] + ".svg"
+            svg_i += 1
+        else:
+            name = hashlib.sha256(raw).hexdigest()[:20] + "." + _ARTIFACT_EXT[real]
         with open(os.path.join(ARTIFACT_DIR, name), "wb") as f:
             f.write(raw)
         _prune_artifacts()
@@ -2159,6 +2170,28 @@ def _stash_image_items(items) -> list:
             if u not in bag:
                 bag.append(u)
     return urls
+
+
+def _svg_pairs(urls: list) -> list[tuple[str, str]]:
+    """같은 줄기의 (PNG, SVG) 짝 — 단면 짝(RF-40)은 _stash_image_items 가 같은 줄기 이름에 둔다."""
+    have = set(urls)
+    return [(u[:-4] + ".png", u) for u in urls if u.endswith(".svg") and u[:-4] + ".png" in have]
+
+
+def _image_note(urls: list) -> str:
+    """도구 그림 주소를 모델에게 — 짝이면 SVG 를 답에(화면에서 호버된다), PNG 는 판독용이라 답에 넣지 않는다(판독은 PNG 주소를 저절로 집는다 —
+    vision.IMG_URL_RE 는 래스터만 본다). 짝이 없으면 종전 글 그대로다."""
+    pairs = _svg_pairs(urls)
+    if not pairs:
+        return "\n[생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n" + "\n".join(urls)
+    paired = {u for p in pairs for u in p}
+    rest = [u for u in urls if u not in paired]
+    note = ("\n[생성된 이미지 — 같은 그림이 PNG · SVG 짝으로 왔다. 답에는 SVG 를 ![설명](svg 주소) 로 넣는다(화면에서 호버로 파트 이름 · 치수가 보인다). "
+            "PNG 는 판독용이라 답에 넣지 않는다]\n"
+            + "\n".join(f"- 답에 넣을 것: {s}\n- 판독용(답에 넣지 않음): {p}" for p, s in pairs))
+    if rest:
+        note += "\n[그 밖의 생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n" + "\n".join(rest)
+    return note
 
 
 def _extract_artifacts_text(s):
@@ -2191,6 +2224,25 @@ _CHAT_ARG_DEFAULTS = {
     "plm_defect_search": ({"enrich": 0}, "이 대화에서는 enrich 를 주지 않으면 0 이다(PLM 원본을 다시 부르지 않는다) — "
                                          "사용자가 PLM 의 실시간 상태를 요구할 때만 enrich 를 준다"),
 }
+# 단면 짝(HWAXPortal docs/report-figures RF-40 — 사용자 결정 11-13) — 챗 화면은 호버되는 SVG, 모델 판독 · 보고서는 PNG. StepForge 단면 도구 넷이
+# format="png+svg_live" 로 PNG 와 SVG 를 짝으로 낸다. 셋째 칸은 '그 도구의 인자 스키마 · 설명에 이 글자가 있을 때만 채운다' 다 — 옛 판은 이 값을 몰라 실패하므로
+# 지원하는 판이 실린 박스에서만 저절로 켜진다(_schema_knows).
+_SECTION_PAIR_FORMAT = "png+svg_live"
+_SECTION_PAIR_NOTE = (f"이 대화에서는 format 을 주지 않으면 {_SECTION_PAIR_FORMAT} 다 — 화면은 호버되는 SVG, 판독 · 보고서는 PNG. "
+                      "사용자가 PNG 만 원하면 format 을 준다")
+_SECTION_PAIR_TOOLS = {s: ({}, "") for s in ("section_view", "section_pair_view", "section_batch", "section_atlas")}
+for _sec in _SECTION_PAIR_TOOLS:
+    _CHAT_ARG_DEFAULTS[_sec] = ({"format": _SECTION_PAIR_FORMAT}, _SECTION_PAIR_NOTE, _SECTION_PAIR_FORMAT)
+
+
+def _schema_knows(tool, needle: str) -> bool:
+    """그 도구의 인자 스키마(설명 포함) 또는 도구 설명에 needle 글자가 있나 — 앱의 새 인자 값은 그 앱이 지원하는 판에서만 기본값으로 채운다."""
+    sc = getattr(tool, "args_schema", None)
+    try:
+        blob = json.dumps(sc, ensure_ascii=False, default=str) if isinstance(sc, dict) else ""
+    except (TypeError, ValueError):
+        blob = ""
+    return needle in blob or needle in str(getattr(tool, "description", "") or "")
 
 
 def _arg_defaults_for(name, table) -> tuple[dict, str] | None:
@@ -2415,7 +2467,11 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     orig = tool.coroutine
     if orig is None:
         return tool
+    # 단면 도구 넷만 그림을 PNG · SVG 짝으로 둔다(RF-40) — 다른 도구가 낸 서로 무관한 PNG · SVG 를 짝으로 묶지 않게
+    _pair = _arg_defaults_for(getattr(tool, "name", ""), _SECTION_PAIR_TOOLS) is not None
     _own = _arg_defaults_for(getattr(tool, "name", ""), arg_defaults)
+    if _own and len(_own) > 2 and not _schema_knows(tool, _own[2]):
+        _own = None                    # 그 판의 도구가 아직 이 값을 모른다 — 채우지 않는다(옛 판이 모르는 값을 받으면 실패한다)
     if _own:
         tool.description = f"{tool.description or ''} [{_own[1]}]"
 
@@ -2426,10 +2482,10 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
         # 여기서 파일로 저장하고 URL 을 텍스트에 덧붙여야 LLM 이 ![](url) 로 인용할 수 있다.
         if isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
             texts = [str(i.get("text", "")) for i in v if "text" in i]
-            urls = _stash_image_items(v)
+            urls = _stash_image_items(v, pair=_pair)
             v = "".join(texts)
             if urls:
-                v += "\n[생성된 이미지 URL — 답변에 ![설명](url) 로 포함하세요]\n" + "\n".join(urls)
+                v += _image_note(urls)
         return _extract_artifacts_text(v)
 
     def _arg_hint() -> str:
@@ -2557,6 +2613,8 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                 kw.setdefault(_k, _v)
         elif arg_defaults and getattr(tool, "name", "") == "invoke_tool":
             _inner = _arg_defaults_for(kw.get("name"), arg_defaults) if isinstance(kw.get("name"), str) else None
+            if _inner and len(_inner) > 2:
+                _inner = None              # 조건부 기본값(셋째 칸)은 안쪽 도구의 스키마를 볼 수 없어 채우지 않는다
             _inner_def = _inner[0] if _inner else None
             _ia = kw.get("arguments")
             if _inner_def and isinstance(_ia, str):
