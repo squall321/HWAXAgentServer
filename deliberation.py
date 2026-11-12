@@ -8769,6 +8769,18 @@ def _split_md_sections(md: str) -> dict:
     return out
 
 
+# 챗 답 끝의 근거 블록(app.py _evidence_block — 표지 _EVIDENCE_MARK)은 보고서에 싣지 않는다. 실제로 조회한 도구 목록은 디버깅 · 복사에는 쓸모가 있지만
+# 보고서에는 도움이 되지 않는다(사용자 요청 11-12 — 포털 화면은 접어 보이고 복사는 그대로 싣는다). 표지를 여기 따로 적는 까닭은 app.py 를 import 하면
+# 순환이라서다 — 시험(test_report_strips_evidence)이 app._EVIDENCE_MARK 와 같은 글인지 본다.
+_CHAT_EVIDENCE_SPLIT = "\n---\n**근거** — 이번 답변이 실제로 조회한 것"
+
+
+def _strip_chat_evidence(text: str) -> str:
+    """답 끝의 근거 블록을 뗀다(블록은 늘 맨 끝에 붙는다). 없으면 그대로."""
+    i = text.rfind(_CHAT_EVIDENCE_SPLIT)
+    return text[:i].rstrip() if i >= 0 else text
+
+
 async def run_report_save(app, note: str, history: list, groups: list, user: str = "",
                           user_pat: str = ""):
     """대화 이력 → Report Archive 보고서(결정적). LLM 을 거치지 않고 코드가 blocks 를 만든다.
@@ -8786,6 +8798,9 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     # 게시는 대화 저장소의 이력에서 읽으므로 그쪽은 그대로다. 정리본(LLM 재구성)도 가린 이력을 읽는다. 찾은 값은 이 대화 전부에서 가린다.
     _tok = publish_token.found(note, *(str(m.get("content") or "") for m in history if isinstance(m, dict)))
     history = [{**m, "content": publish_token.mask(m["content"], _tok)} if isinstance(m, dict) and isinstance(m.get("content"), str) else m
+               for m in history]
+    history = [{**m, "content": _strip_chat_evidence(m["content"])}
+               if isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("content"), str) else m
                for m in history]
     note = publish_token.mask(note, _tok)
     _tidy = False
