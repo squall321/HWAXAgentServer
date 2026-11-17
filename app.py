@@ -3731,7 +3731,9 @@ _ROUTINE_TOOLS = frozenset({"routine_list", "routine_get", "routine_run_start", 
 # 게이트웨이 온톨로지 조회(HWAXPortal docs/ontology-first PLAN §12 · cae00 요청 11-16 OL-1) — 개인 Claude 의 입구다. 웹 챗 · 심의 · 루틴은 도구 목록에
 # 묶지 않는다(OF-14 ④ — 챗 기본은 바이트까지 같다, 챗의 입구는 M2 측정 뒤 따로 — OF-41). 부르기는 막지 않는다 — 박스가 게이트웨이 검색 손잡이
 # onto_lookup_first 를 켜면 챗의 search_tools 답에도 첫 줄로 서므로, 그때 모델이 invoke_tool 로 부르면 닿게 둔다.
-_UNBOUND_TOOLS = frozenset({"ontology_lookup"})
+# gateway_readonly_allowlist — 게이트웨이 관리자 보기(읽기 전용 PAT 허용 목록, HWAXPortal docs/request-1117 GW-02 · R-10 ③). 관리자의 tools/list 에만 서므로
+# 관리자의 웹 챗 묶음이 바뀌지 않게 같이 뺀다.
+_UNBOUND_TOOLS = frozenset({"ontology_lookup", "gateway_readonly_allowlist"})
 
 
 def _agent_denied(name: str) -> bool:

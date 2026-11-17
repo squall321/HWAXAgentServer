@@ -17,3 +17,9 @@ def test_게이트웨이_온톨로지_조회는_묶지_않지만_부르기는_�
     assert not a._bindable(t) and not a._bindable(t, allow_panels=True)
     assert not a._agent_denied("ontology_lookup"), "invoke_tool 로는 닿는다(검색 손잡이를 켠 박스에서 챗의 search_tools 답에 선다)"
     assert a._bindable(SimpleNamespace(name="search_tools", annotations=None, meta=None))
+
+
+def test_게이트웨이_관리자_보기도_챗에_묶지_않는다():
+    """HWAXPortal docs/request-1117 R-10 ③ — 관리자의 tools/list 에만 서는 읽기 전용 허용 목록 보기가 관리자의 웹 챗 묶음을 바꾸지 않는다."""
+    from types import SimpleNamespace
+    assert not a._bindable(SimpleNamespace(name="gateway_readonly_allowlist", annotations=None, meta=None))
