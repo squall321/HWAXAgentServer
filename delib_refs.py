@@ -55,8 +55,11 @@ ID_MAX = 200
 _ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,%d}" % ID_MAX)
 REFS_MAX = 40                   # 한 근거 목록의 참조 수 — 펼친 뒤의 항목 수 상한은 엔진(_EVID_ITEMS)이 건다
 RESOLVE_TIMEOUT_S = 30.0        # 참조 하나를 푸는 기한(초) — MCP 시작 응답 안에서 기다린다(게이트웨이 호출 한도 600초보다 한참 안쪽)
+RESOLVE_CONCURRENCY = 8         # 한 근거 목록에서 동시에 푸는 참조 수
+RESOLVE_TOTAL_S = 120.0         # 한 근거 목록을 다 푸는 전체 기한(초) — 넘은 참조는 불통으로 뺀다
 OMIT_SOURCE = "근거 참조 풀이"
 _FP_RE = re.compile(r"[0-9a-f]{64}")
+MASK_MARK = "[가림:"             # 게이트웨이 개인정보 가림이 값 자리에 넣는 표지(HWAXMcpGateway gateway.py _pii_mask_text)
 
 
 class RefError(ValueError):
@@ -72,18 +75,22 @@ def label(kind: str, rid: str) -> str:
     return f"ref:{kind}:{rid}"
 
 
+REF_SIDE = ("source", "key")      # 참조 항목에 함께 둘 수 있는 칸 — 한 항목을 내는 kind 의 근거 표식 · 키로 쓴다(묶음 항목은 제 것을 쓴다)
+
+
 def _ref_of(i: int, it) -> dict | None:
-    """항목 하나가 참조면 {kind, id}, 아니면 None. 꼴이 틀리면 RefError."""
-    if not isinstance(it, dict) or "ref" not in it:
+    """항목 하나가 참조면 {kind, id(, source, key)}, 아니면 None. 참조는 ref 가 **객체**이고 본문 칸(_EVID_BODY_KEYS)이 하나도 없는 항목뿐이다 —
+    ref 가 글이거나 본문이 있는 항목은 종전처럼 보통 근거다(반대 검토 M3 — 출처 표식으로 ref 글을 실어 보내던 호출이 깨지지 않게). 참조의 꼴이
+    틀리면 RefError."""
+    if not isinstance(it, dict) or not isinstance(it.get("ref"), dict) or any(k in it for k in _engine._EVID_BODY_KEYS):
         return None
-    extra = sorted(set(it) - {"ref"})
+    extra = sorted(set(it) - {"ref", *REF_SIDE})
     if extra:
-        raise RefError(f"evidence[{i}] 는 참조(ref) 항목인데 다른 칸 {extra[:5]} 이 함께 있다 — 참조 항목은 {{ref: {{kind, id}}}} 하나만 둔다"
+        raise RefError(f"evidence[{i}] 는 참조(ref) 항목인데 모르는 칸 {extra[:5]} 이 함께 있다 — 참조 항목은 {{ref: {{kind, id}}, source?, key?}} 다"
                        "(본문은 result 를 쓴 따로 된 항목으로)")
     ref = it["ref"]
-    if not isinstance(ref, dict) or sorted(ref) != ["id", "kind"]:
-        raise RefError(f"evidence[{i}].ref 는 {{kind, id}} 객체다 — 받은 꼴: "
-                       + (f"칸 {sorted(ref)[:5]}" if isinstance(ref, dict) else type(ref).__name__))
+    if sorted(ref) != ["id", "kind"]:
+        raise RefError(f"evidence[{i}].ref 는 {{kind, id}} 객체다 — 받은 칸 {sorted(ref)[:5]}")
     kind, rid = ref.get("kind"), ref.get("id")
     if not isinstance(kind, str) or kind not in KINDS:
         if kind in NOT_OPENED:
@@ -92,11 +99,11 @@ def _ref_of(i: int, it) -> dict | None:
         raise RefError(f"evidence[{i}].ref.kind 는 {' · '.join(KINDS)} 가운데 하나다 — 받은 값: {str(kind)[:40]!r}")
     if not isinstance(rid, str) or not _ID_RE.fullmatch(rid.strip()):
         raise RefError(f"evidence[{i}].ref.id 는 영문 · 숫자 · _.:- {ID_MAX}자 안의 글이다 — 받은 값: {str(rid)[:40]!r}")
-    return {"kind": kind, "id": rid.strip()}
+    return {"kind": kind, "id": rid.strip(), **{k: it[k] for k in REF_SIDE if isinstance(it.get(k), str) and it[k].strip()}}
 
 
 def parse(evidence) -> list | None:
-    """근거 목록의 참조 자리 — [(자리, {kind, id} 또는 None)]. 참조가 하나도 없으면 None(종전 길 그대로). 꼴이 틀리면 RefError."""
+    """근거 목록의 참조 자리 — [(자리, {kind, id, …} 또는 None)]. 참조가 하나도 없으면 None(종전 길 그대로). 꼴이 틀리면 RefError."""
     if not isinstance(evidence, list):
         return None
     slots = [(i, _ref_of(i, it)) for i, it in enumerate(evidence)]
@@ -106,11 +113,6 @@ def parse(evidence) -> list | None:
     if n > REFS_MAX:
         raise RefError(f"참조가 {n}건이다 — 한 번에 {REFS_MAX}건까지 받는다")
     return slots
-
-
-def has_refs(evidence) -> bool:
-    """참조가 든 근거 목록인가(꼴은 보지 않는다 — 보는 것은 parse)."""
-    return isinstance(evidence, list) and any(isinstance(it, dict) and "ref" in it for it in evidence)
 
 
 def body_chars(items: list) -> int:
@@ -194,7 +196,11 @@ def _check_bundle(rid: str, text: str) -> tuple[list | None, dict]:
            "_version": _scalar(cite.get("source_version")),
            "_scope": _scalar(cite.get("scope")) if cite.get("scope") is not None else _scalar(body.get("target_key"))}
     if got != fp:
-        return None, {**rec, "why": f"지문이 다르다 — 묶음이 적은 {fp[:12]}… · 펼친 근거를 다시 잰 {got[:12]}…(묶음을 싣지 않았다)"}
+        # 게이트웨이는 백엔드 답에 개인정보 가림(GATEWAY_PII_MASK — 메일 · 사설 주소 · IMEI · 계정 꼴을 '[가림:…]' 으로)을 건다. 묶음 글에 그 꼴이
+        # 있으면 앱이 잰 지문과 늘 다르다 — 그 까닭을 따로 말한다(조용히 싣지 않는 것은 같다).
+        masked = MASK_MARK in json.dumps(ev, ensure_ascii=False)
+        return None, {**rec, "why": (f"지문이 다르다 — 묶음이 적은 {fp[:12]}… · 펼친 근거를 다시 잰 {got[:12]}…(묶음을 싣지 않았다)"
+                                     + (" — 게이트웨이 개인정보 가림(GATEWAY_PII_MASK)이 묶음 글을 바꿨다(그 글에 '[가림:' 이 있다)" if masked else ""))}
     return ev, rec
 
 
@@ -259,44 +265,83 @@ def _check_sf_job(rid: str, text: str) -> tuple[list | None, dict]:
 _CHECKS = {"risk_bundle": _check_bundle, "reportarchive_file": _check_ra_file, "stepforge_job": _check_sf_job}
 
 
+async def _resolve_one(app, ref: dict, *, groups, user: str, user_pat: str) -> tuple[list | None, dict]:
+    """참조 하나 → (펼칠 항목 또는 None, 기록). 한 항목을 내는 kind 는 참조 항목의 source · key 를 그 항목에 단다(지문은 단 뒤에 잰다)."""
+    kind, rid = ref["kind"], ref["id"]
+    app_key, tool, args_of, platform = KINDS[kind]
+    rec: dict = {"kind": kind, "id": rid, "ok": False, "at": round(time.time(), 3)}
+    try:
+        is_err, text = await asyncio.wait_for(
+            call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}", args=args_of(rid)),
+            RESOLVE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        rec["why"] = f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)"
+        return None, rec
+    except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
+        log.warning("근거 참조 %s 풀이 실패: %r", label(kind, rid), exc)
+        rec["why"] = f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)"
+        return None, rec
+    if is_err:
+        rec["why"] = _why_error(text)
+        return None, rec
+    ev, got = _CHECKS[kind](rid, text)
+    version, scope = got.pop("_version", None), got.pop("_scope", None)
+    rec.update(got)
+    if ev is None:
+        return None, rec
+    if kind != "risk_bundle" and any(k in ref for k in REF_SIDE):
+        ev = [{**ev[0], **{k: ref[k] for k in REF_SIDE if k in ref}}]
+        rec["fingerprint"] = fingerprint(ev)
+    rec["ok"] = True
+    # 인용(사용자 결정 C1) — RA 인용의 source_kind 와 같은 낱말. 판 · 자리는 답이 말할 때만(지어내지 않는다)
+    rec["cite"] = {"source_platform": platform, "source_kind": kind, "source_id": rid, "source_version": version, "scope": scope}
+    return ev, rec
+
+
 async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "", slots: list | None = None) -> dict:
-    """참조를 풀어 펼친다 → {evidence(펼친 목록), refs[기록], omitted[evidence_omitted 줄]}. slots 는 parse 의 것(없으면 여기서 읽는다)."""
+    """참조를 풀어 펼친다 → {evidence(펼친 목록), refs[기록], omitted[evidence_omitted 줄]}. slots 는 parse 의 것(없으면 여기서 읽는다).
+
+    **신원이 있어야 푼다**(반대 검토 M5) — 신원 없이 부르면 게이트웨이 공유 비밀만으로 가서 서비스 계정 시야가 된다(남의 묶음 · 파일 · 잡이 보일 수
+    있다). 참조는 동시에(RESOLVE_CONCURRENCY) 풀고, 전체 기한(RESOLVE_TOTAL_S — 게이트웨이 호출 한도 600초보다 한참 안쪽) 안에 못 푼 것은
+    불통으로 뺀다(반대 검토 L5). 펼친 차례는 근거 목록 차례 그대로다."""
     slots = slots if slots is not None else parse(evidence)
     if slots is None:
         return {"evidence": list(evidence or []), "refs": [], "omitted": []}
+    if not str(user or "").strip():
+        raise RefError("근거 참조는 신원(사람)이 있는 호출만 푼다 — 신원 없이 풀면 게이트웨이 공유 비밀만으로 서비스 계정 시야가 된다. 사람 PAT 로 "
+                       "게이트웨이를 거쳐 부르거나 참조 대신 본문(result)을 싣는다")
+    sem = asyncio.Semaphore(RESOLVE_CONCURRENCY)
+
+    async def one(ref):
+        async with sem:
+            return await _resolve_one(app, ref, groups=groups, user=user, user_pat=user_pat)
+    tasks = {i: asyncio.ensure_future(one(ref)) for i, ref in slots if ref is not None}
+    if tasks:
+        _done, late = await asyncio.wait(list(tasks.values()), timeout=RESOLVE_TOTAL_S)
+        for t in late:
+            t.cancel()
+        if late:
+            await asyncio.gather(*late, return_exceptions=True)
     out, refs, omitted = [], [], []
     for i, ref in slots:
         if ref is None:
             out.append(evidence[i])
             continue
-        kind, rid = ref["kind"], ref["id"]
-        app_key, tool, args_of, platform = KINDS[kind]
-        rec: dict = {"kind": kind, "id": rid, "ok": False, "at": round(time.time(), 3)}
-        try:
-            is_err, text = await asyncio.wait_for(
-                call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}",
-                           args=args_of(rid)), RESOLVE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            rec["why"] = f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)"
-        except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
-            log.warning("근거 참조 %s 풀이 실패: %r", label(kind, rid), exc)
-            rec["why"] = f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)"
+        t = tasks[i]
+        if t.cancelled():
+            ev, rec = None, {"kind": ref["kind"], "id": ref["id"], "ok": False, "at": round(time.time(), 3),
+                             "why": f"전체 기한 {RESOLVE_TOTAL_S:g}초 안에 풀지 못했다(불통)"}
+        elif t.exception() is not None:
+            log.warning("근거 참조 %s 답 읽기 실패: %r", label(ref["kind"], ref["id"]), t.exception())
+            ev, rec = None, {"kind": ref["kind"], "id": ref["id"], "ok": False, "at": round(time.time(), 3),
+                             "why": f"답을 읽다 오류가 났다({type(t.exception()).__name__})"}
         else:
-            if is_err:
-                rec["why"] = _why_error(text)
-            else:
-                ev, got = _CHECKS[kind](rid, text)
-                version, scope = got.pop("_version", None), got.pop("_scope", None)
-                rec.update(got)
-                if ev is not None:
-                    rec["ok"] = True
-                    # 인용(사용자 결정 C1) — RA 인용의 source_kind 와 같은 낱말. 판 · 자리는 답이 말할 때만(지어내지 않는다)
-                    rec["cite"] = {"source_platform": platform, "source_kind": kind, "source_id": rid, "source_version": version,
-                                   "scope": scope}
-                    out.extend(ev)
+            ev, rec = t.result()
         refs.append(rec)
-        if not rec["ok"]:
-            omitted.append({"source": OMIT_SOURCE, "text": f"{label(kind, rid)} — {rec['why']}"})
+        if ev is not None:
+            out.extend(ev)
+        else:
+            omitted.append({"source": OMIT_SOURCE, "text": f"{label(rec['kind'], rec['id'])} — {rec['why']}"})
     return {"evidence": out, "refs": refs, "omitted": omitted}
 
 

@@ -9911,15 +9911,34 @@ async def deliberate_verify_http(request: Request):
         return _dl_error("bad_request", str(exc), 422)
 
 
-# POST /deliberate/evidence/resolve {evidence} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음). 참조는 머리의 신원으로 푼다.
+# POST /deliberate/evidence/resolve {evidence, user_email, user_pat, groups?} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음).
+# 사람의 참조를 푸는 창구라 /deliberate/subject/confirm 과 같은 규칙이다 — 루프백 신뢰에 **그 사람의 PAT** 를 요구하고 그 PAT 로 푼다(공유 비밀 + 신원
+# 머리만으로 이름 붙은 사람의 참조를 풀지 않는다 — 반대 검토 M5). 모르는 칸은 422.
+_RESOLVE_FIELDS = ("evidence", "user_email", "user_pat", "groups")
+
+
 @app.post("/deliberate/evidence/resolve")
 async def deliberate_evidence_resolve(request: Request):
-    body, who, denied = await _dl_open(request, ("evidence",))
-    if denied:
-        return denied
-    user, groups, _aff, _admin = who
+    if _delib_mcp_module is None:
+        return _dl_error("delib_mcp_unavailable", "심의 MCP 모듈이 비활성이다(기동 로그를 본다)", 503)
     try:
-        return await _delib_mcp_module.resolve_preview(body.get("evidence"), user=user, groups=groups)
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(_RESOLVE_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    user, pat, groups = body.get("user_email"), body.get("user_pat"), body.get("groups") or []
+    if not (isinstance(user, str) and user.strip() and isinstance(pat, str) and pat.strip()):
+        return _dl_error("bad_request", "user_email 과 user_pat(그 사람의 PAT)이 있어야 참조를 푼다", 422)
+    if not isinstance(groups, list) or not all(isinstance(g, str) for g in groups):
+        return _dl_error("bad_request", "groups 는 글 목록이다", 422)
+    try:
+        return await _delib_mcp_module.resolve_preview(body.get("evidence"), user=user.strip(), groups=groups, user_pat=pat.strip())
     except ValueError as exc:
         return _dl_error("bad_request", str(exc), 422)
 

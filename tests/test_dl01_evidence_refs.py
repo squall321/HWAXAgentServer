@@ -87,8 +87,8 @@ def test_지문은_계약의_식이다():
     ({"ref": {"kind": "nope", "id": "X"}}, "가운데 하나다"),
     ({"ref": {"kind": "risk_bundle"}}, "{kind, id}"),
     ({"ref": {"kind": "risk_bundle", "id": "a b"}}, "ref.id"),
-    ({"ref": {"kind": "risk_bundle", "id": "B"}, "result": "본문"}, "다른 칸"),
-    ({"ref": "risk_bundle:B"}, "{kind, id}"),
+    ({"ref": {"kind": "risk_bundle", "id": "B"}, "tool": "x"}, "모르는 칸"),
+    ({"ref": {"kind": "risk_bundle", "id": "B", "x": 1}}, "{kind, id}"),
 ])
 def test_꼴이_틀린_참조와_열지_않은_kind_는_거절한다(item, msg):
     with pytest.raises(r.RefError) as e:
@@ -97,7 +97,29 @@ def test_꼴이_틀린_참조와_열지_않은_kind_는_거절한다(item, msg):
 
 
 def test_참조가_없으면_종전_길이다():
-    assert r.parse([_ev_inline()]) is None and r.parse(None) is None and not r.has_refs([_ev_inline()])
+    assert r.parse([_ev_inline()]) is None and r.parse(None) is None
+
+
+@pytest.mark.parametrize("item", [
+    {"source": "RA #12", "ref": "ABC-001", "result": "gap 0.12 mm"},            # 출처 표식으로 ref 글을 싣던 호출(반대 검토 M3)
+    {"ref": {"kind": "risk_bundle", "id": "BND-A"}, "result": "본문이 있으면 보통 근거다"},
+    {"ref": ["목록"], "text": "본문"},
+])
+def test_ref_가_객체가_아니거나_본문이_있으면_보통_근거다(item):
+    assert r.parse([item]) is None, "참조는 ref 가 객체이고 본문 칸이 없는 항목뿐이다"
+
+
+def test_ref_글_칸을_실은_종전_호출은_엔진에_그대로_간다(eng, gw, monkeypatch):
+    _caps(monkeypatch, 2)
+    item = {"source": "RA #12", "ref": "ABC-001", "result": "gap 0.12 mm"}
+
+    async def scenario():
+        out = await m.deliberate_start("종전 꼴", evidence=[item], ctx=_ctx(ME))
+        await _tick()
+        assert eng.seen["종전 꼴"].opts["evidence"] == [item] and gw.calls == [] and "evidence_refs" not in out
+        await _end(eng, delib_jobs.get(out["job_id"]))
+
+    _play(scenario)
 
 
 # ── 풀이 ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -346,21 +368,66 @@ def test_미리_보기는_상한을_넘으면_까닭을_단다(eng, gw, monkeypa
     assert set(out["over"]) == {"items", "chars"}
 
 
-def test_HTTP_미리_보기는_머리의_신원으로_푼다(eng, gw, monkeypatch):
+def test_HTTP_미리_보기는_그_사람의_PAT_로만_푼다(eng, gw, monkeypatch):
+    """/deliberate/subject/confirm 과 같은 규칙 — 공유 비밀 + 신원 머리만으로 이름 붙은 사람의 참조를 풀지 않는다(반대 검토 M5)."""
     from fastapi.testclient import TestClient
     import app as a
-    import seat_box
-    monkeypatch.setattr(seat_box, "secret", lambda _app: "Bearer gw-secret")
     c = TestClient(a.app)
-    body = {"evidence": [{"ref": {"kind": "risk_bundle", "id": "BND-A"}}]}
-    assert c.post("/deliberate/evidence/resolve", json=body).status_code == 401
-    rr = c.post("/deliberate/evidence/resolve", json=body,
-                headers={"Authorization": "Bearer gw-secret", "x-hwax-user": ME, "x-hwax-groups": "CAEG,feat%3Achat"})
+    ev = [{"ref": {"kind": "risk_bundle", "id": "BND-A"}}]
+    r1 = c.post("/deliberate/evidence/resolve", json={"evidence": ev, "user_email": ME}, headers={"x-hwax-user": ME})
+    assert r1.status_code == 422 and "user_pat" in r1.json()["message"] and gw.calls == []
+    rr = c.post("/deliberate/evidence/resolve", json={"evidence": ev, "user_email": ME, "user_pat": "pat-EXAMPLE", "groups": ["CAEG"]})
     assert rr.status_code == 200 and rr.json()["refs"][0]["ok"] is True
-    assert gw.calls[-1]["user"] == ME and gw.calls[-1]["groups"] == ["CAEG", "feat:chat"]
-    bad = c.post("/deliberate/evidence/resolve", json={"evidence": [{"ref": {"kind": "dynaforge_report", "id": "D"}}]},
-                 headers={"Authorization": "Bearer gw-secret"})
+    assert gw.calls[-1] == {"groups": ["CAEG"], "user": ME, "user_pat": "pat-EXAMPLE", "alias": ALIAS, "args": {"bundle_id": "BND-A"}}
+    bad = c.post("/deliberate/evidence/resolve", json={"evidence": [{"ref": {"kind": "dynaforge_report", "id": "D"}}], "user_email": ME,
+                                                       "user_pat": "pat-EXAMPLE"})
     assert bad.status_code == 422 and "kind not opened yet" in bad.json()["message"]
+    assert c.post("/deliberate/evidence/resolve", json={"evidence": ev, "user_email": ME, "user_pat": "p", "x": 1}).status_code == 422
+
+
+def test_신원_없는_호출은_참조를_풀지_않는다(eng, gw, monkeypatch):
+    _caps(monkeypatch, 2)
+    ev = [{"ref": {"kind": "risk_bundle", "id": "BND-A"}}]
+    with pytest.raises(ValueError, match="신원"):
+        asyncio.run(m.deliberate_start("신원 없음", evidence=ev, ctx=_ctx("")))
+    with pytest.raises(ValueError, match="신원"):
+        asyncio.run(m.deliberate_resolve_evidence(ev, ctx=_ctx("")))
+    assert gw.calls == [] and delib_jobs._JOBS == {}
+
+
+def test_참조는_동시에_풀고_전체_기한을_넘은_것은_뺀다(gw, monkeypatch):
+    import time as _t
+
+    async def slow(_app, *, groups, user, user_pat, alias, args):
+        await asyncio.sleep(0.3 if args["bundle_id"] != "LATE" else 5)
+        return False, json.dumps(_bundle(bid=args["bundle_id"]), ensure_ascii=False)
+    monkeypatch.setattr(r, "call_alias", slow)
+    ev = [{"ref": {"kind": "risk_bundle", "id": f"B-{i}"}} for i in range(4)]
+    t0 = _t.perf_counter()
+    res = asyncio.run(r.resolve(object(), ev, groups=[], user=ME))
+    assert _t.perf_counter() - t0 < 1.0 and all(x["ok"] for x in res["refs"]), "넷을 차례로 풀면 1.2초 — 동시에 푼다"
+    assert [x["id"] for x in res["refs"]] == ["B-0", "B-1", "B-2", "B-3"], "차례는 근거 목록 그대로"
+    monkeypatch.setattr(r, "RESOLVE_TOTAL_S", 0.5)
+    res = asyncio.run(r.resolve(object(), [ev[0], {"ref": {"kind": "risk_bundle", "id": "LATE"}}], groups=[], user=ME))
+    assert res["refs"][0]["ok"] and not res["refs"][1]["ok"] and "전체 기한" in res["refs"][1]["why"]
+
+
+def test_게이트웨이_가림이_묶음을_바꾸면_그_까닭을_말한다(gw):
+    masked = [{**_ROW1, "result": "담당 [가림:메일] 판정 12.5"}]
+    gw.answers["BND-A"] = (False, json.dumps(_bundle(ev=masked, fp=_fp([_ROW1])), ensure_ascii=False))
+    (rec,) = asyncio.run(r.resolve(object(), [{"ref": {"kind": "risk_bundle", "id": "BND-A"}}], groups=[], user=ME))["refs"]
+    assert rec["ok"] is False and "지문이 다르다" in rec["why"] and "개인정보 가림" in rec["why"]
+
+
+def test_한_항목_kind_는_참조의_source_key_를_단다(gw):
+    gw.answers[_SF_ID] = _sf()
+    ev = [{"ref": {"kind": "stepforge_job", "id": _SF_ID}, "source": "치수 잡 — 판 B", "key": "SF-1"}]
+    res = asyncio.run(r.resolve(object(), ev, groups=[], user=ME))
+    (item,) = res["evidence"]
+    assert (item["source"], item["key"]) == ("치수 잡 — 판 B", "SF-1") and res["refs"][0]["fingerprint"] == _fp([item])
+    gw.answers["BND-A"] = (False, json.dumps(_bundle(), ensure_ascii=False))
+    res = asyncio.run(r.resolve(object(), [{"ref": {"kind": "risk_bundle", "id": "BND-A"}, "source": "무시", "key": "X"}], groups=[], user=ME))
+    assert res["evidence"] == _BUNDLE_EV, "묶음 항목은 제 source · key 를 쓴다"
 
 
 def test_설명은_kind_목록을_모듈에서_읽는다():

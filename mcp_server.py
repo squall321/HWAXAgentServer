@@ -730,12 +730,13 @@ def _say_refs(out: dict, refs: dict | None, carried: bool = False) -> None:
     out["note"] = f"{out.get('note') or ''} {line}".strip()
 
 
-async def resolve_preview(evidence, *, user: str, groups: list) -> dict:
-    """deliberate_resolve_evidence · POST /deliberate/evidence/resolve — 참조를 풀어 크기 · 지문만 낸다(잡을 만들지 않는다 · 본문 없음)."""
+async def resolve_preview(evidence, *, user: str, groups: list, user_pat: str = "") -> dict:
+    """deliberate_resolve_evidence · POST /deliberate/evidence/resolve — 참조를 풀어 크기 · 지문만 낸다(잡을 만들지 않는다 · 본문 없음). 참조는 신원이
+    있어야 푼다(delib_refs.resolve). HTTP 창구는 그 사람의 PAT(user_pat)로 푼다 — MCP 는 게이트웨이가 실은 신원 머리로."""
     if not isinstance(evidence, list) or not evidence:
         raise ValueError("evidence 는 비지 않은 목록이다 — deliberate_start 의 evidence 와 같은 꼴")
     slots = delib_refs.parse(evidence)
-    res = (await delib_refs.resolve(_need_app(), evidence, groups=groups, user=user, slots=slots) if slots is not None
+    res = (await delib_refs.resolve(_need_app(), evidence, groups=groups, user=user, user_pat=user_pat, slots=slots) if slots is not None
            else {"evidence": [e for e in evidence if isinstance(e, dict)], "refs": [], "omitted": []})
     return delib_refs.preview(res, len(evidence), _evid_limits())
 
