@@ -28,7 +28,9 @@
     줄 선 항목의 본문 근거는 원장에 든다 — 합이 INLINE_MAX 를 넘으면 받지 않는다(참조를 쓴다).
 
 **끝남 알림.** 바깥 주소로 보내지 않는다(웹훅 없음 — 사용자 결정 R-5 ③). 끝나면 묶음 원장에 finished_at · notice 를 쓰고 진행 조회
-(deliberate_batch_status)가 finished · notice 로 보인다. 포털 알림은 포털이 이 조회를 읽어 남기는 몫이다(엔진이 밀지 않는다).
+(deliberate_batch_status)가 finished · notice 로 보인다. 포털은 끝난 묶음 창구(finished_since — app POST /deliberate/batch/finished, 공유 비밀만 ·
+HWAXPortal docs/request-1117 contracts §7)를 주기로 읽어 주인에게 알림을 남긴다(엔진이 밀지 않는다 — 사용자 결정 R-12 ②). 끝난 묶음의 끝난 시각 ·
+수 · 알림 글은 원장과 그 요약 색인에 남아 재기동을 넘기고, 보존 기한(KEEP_S)이 지나 지워지면 창구에서도 사라진다.
 
 **권한.** 시작은 신원(사람)이 있는 호출만 — 묶음의 잡은 그 사람 이름으로 돈다(그 사람의 사람별 한도 안). 조회는 잡과 같은 규칙(주인 · 같은 소속 ·
 관리자 · 신원 없는 운영), 멈춤은 주인만(deliberate_cancel 과 같다).
@@ -63,6 +65,7 @@ RETRIES_MAX = 5
 STALL_FLOOR_S = 600.0
 TICK_S = 10.0
 _LIVE = ("running", "stopping")             # 묶음이 아직 할 일이 있는 상태
+_FINISHED = ("done", "stopped", "failed")   # 끝난 묶음 — failed 는 멈추지 않고 끝났는데 끝난(done · skipped) 항목이 없고 실패한 항목이 있다
 _FLIGHT = ("starting", "running")           # 항목이 엔진에 있거나 들어가는 중
 _TERMINAL = ("done", "failed", "cancelled", "stopped", "skipped")
 BATCH_ID_RE = re.compile(r"batch-\d{8}-\d{6}-[0-9a-f]{6}")
@@ -131,11 +134,13 @@ def _summary(b: dict) -> dict:
             "done": {it["key"]: (it.get("done_in") or {"batch_id": b["id"], "job_id": it.get("job_id")})
                      for it in b.get("items") or [] if it.get("state") in ("done", "skipped")},
             "trust": {it["key"]: {"trust": it.get("trust"), "seat_loss": it.get("seat_loss")}
-                      for it in b.get("items") or [] if it.get("state") in ("done", "skipped")}}
+                      for it in b.get("items") or [] if it.get("state") in ("done", "skipped")},
+            # 끝난 묶음 창구(finished_since)가 원장을 다시 읽지 않고 내는 칸
+            **({"counts": _counts(b), "notice": b.get("notice")} if b.get("status") in _FINISHED else {})}
 
 
 def _expired(sm: dict) -> bool:
-    return sm.get("status") in ("done", "stopped") and delib_jobs._now() - float(sm.get("finished_at") or 0) > KEEP_S
+    return sm.get("status") in _FINISHED and delib_jobs._now() - float(sm.get("finished_at") or 0) > KEEP_S
 
 
 def _index() -> dict:
@@ -579,10 +584,12 @@ def _finish_if_done(b: dict) -> None:
     """모든 항목이 끝났으면 묶음을 닫는다 — done(멈춘 묶음은 stopped) · finished_at · notice. 바깥으로 알리지 않는다(진행 조회가 보인다)."""
     if b.get("status") not in _LIVE or any(it.get("state") not in _TERMINAL for it in b["items"]):
         return
-    b["status"] = "stopped" if b.get("status") == "stopping" else "done"
-    b["finished_at"] = delib_jobs._now()
     c = _counts(b)
-    b["notice"] = (f"묶음 「{b['name']}」 이 끝났다({'멈춤' if b['status'] == 'stopped' else '모두 끝남'}) — 끝남 {c['done']} · 건너뜀 {c['skipped']} · "
+    b["status"] = ("stopped" if b.get("status") == "stopping" else
+                   "failed" if c["failed"] and not (c["done"] or c["skipped"]) else "done")
+    b["finished_at"] = delib_jobs._now()           # 끝난 시각 — 부른 쪽이 곧바로 원장에 쓴다(feed · create · stop) · 색인 요약에도 실린다
+    b["notice"] = (f"묶음 「{b['name']}」 이 끝났다({ {'stopped': '멈춤', 'failed': '모두 실패'}.get(b['status'], '모두 끝남') }) — 끝남 {c['done']} · "
+                   f"건너뜀 {c['skipped']} · "
                    f"실패 {c['failed']} · 접힘 {c['cancelled']} · 멈춤 {c['stopped']}"
                    + (f" · 좌석 유실로 믿을 수 없는 결정 {c['not_trustworthy']}건" if c["not_trustworthy"] else "") + ".")
     for it in b["items"]:
@@ -650,7 +657,7 @@ def view(b: dict) -> dict:
                 row["live"] = {k: s.get(k) for k in ("status", "stage", "round", "total_rounds", "idle_s", "queue") if s.get(k) is not None}
         items.append(row)
     c = _counts(b)
-    finished = b.get("status") in ("done", "stopped")
+    finished = b.get("status") in _FINISHED
     out = {"batch_id": b["id"], "name": b["name"], "status": b["status"], "finished": finished,
            "owner": delib_jobs._norm(b.get("owner")), "created_at": b.get("created_at"), "finished_at": b.get("finished_at"),
            "concurrency": b.get("concurrency"), "retries": b.get("retries"), "stall_s": b.get("stall_s"),
@@ -660,8 +667,35 @@ def view(b: dict) -> dict:
             out[k] = b[k]
     out["note"] = (b.get("notice") if finished else
                    f"도는 중 — 동시 {b.get('concurrency')}건씩 차례로 띄운다(남은 {c['pending']} · 도는 {c['running'] + c['starting']}). "
-                   "끝나면 status 가 done(멈추면 stopped) · finished 가 참 · notice 가 붙는다 — 바깥으로 알리지 않는다. 몇 분 간격으로 다시 본다.")
+                   "끝나면 status 가 done(멈추면 stopped · 끝난 항목 없이 실패만 있으면 failed) · finished 가 참 · notice 가 붙는다 — 바깥으로 알리지 "
+                   "않는다(포털은 끝난 묶음 창구를 읽어 알린다). 몇 분 간격으로 다시 본다.")
     return out
+
+
+# ── 끝난 묶음 창구(HWAXPortal docs/request-1117 contracts §7) ────────────────────────────────────────────────────
+FINISHED_LIMIT_DEFAULT, FINISHED_LIMIT_MAX = 100, 500
+
+
+def finished_since(since: float, limit: int = FINISHED_LIMIT_DEFAULT) -> dict:
+    """끝난 묶음 — finished_at 이 since 이상인 것을 (finished_at, batch_id) 차례로 limit 개까지. 같은 since 로 다시 물으면 같은 답이다(그 사이 새로 끝난
+    묶음은 뒤에 붙는다). next_since 는 실은 마지막 묶음의 finished_at(없으면 since) — 경계의 묶음은 다음 부름에 다시 나온다(포털이 batch_id 로 한 번만
+    알린다 — /insights/cards 와 같은 규칙). 보존 기한이 지나 지운 묶음은 없다. counts 의 stopped 에는 사람이 접은 잡(cancelled)도 센다.
+    답 {batches: [{batch_id, owner, name, status, finished_at, counts{done, failed, stopped, skipped, not_trustworthy}, notice}], next_since}."""
+    lim = max(1, min(int(limit), FINISHED_LIMIT_MAX))
+    rows = sorted((sm for sm in _index().values()
+                   if sm.get("status") in _FINISHED and isinstance(sm.get("finished_at"), (int, float)) and float(sm["finished_at"]) >= since
+                   and not _expired(sm)),
+                  key=lambda sm: (float(sm["finished_at"]), sm["id"]))[:lim]
+    out = []
+    for sm in rows:
+        c = sm.get("counts") or {}
+        out.append({"batch_id": sm["id"], "owner": sm["owner"], "name": sm["name"], "status": sm["status"],
+                    "finished_at": float(sm["finished_at"]),
+                    "counts": {"done": int(c.get("done") or 0), "failed": int(c.get("failed") or 0),
+                               "stopped": int(c.get("stopped") or 0) + int(c.get("cancelled") or 0), "skipped": int(c.get("skipped") or 0),
+                               "not_trustworthy": int(c.get("not_trustworthy") or 0)},
+                    "notice": str(sm.get("notice") or "")})
+    return {"batches": out, "next_since": out[-1]["finished_at"] if out else float(since)}
 
 
 # ── 기동 · 틱 ────────────────────────────────────────────────────────────────────────────────────────────

@@ -9972,6 +9972,40 @@ async def deliberate_batch_status_http(request: Request):
         return _dl_error("batch_not_found", str(exc), 404)
 
 
+# POST /deliberate/batch/finished {since, limit?} — 끝난 묶음 창구(HWAXPortal docs/request-1117 contracts §7 · 사용자 결정 R-12 ②). 포털 서비스가 주기로 읽어
+# 묶음마다 주인에게 알림을 남긴다. **공유 비밀만** — 모든 사람의 끝난 묶음(주인 이메일 · 이름 · 알림 글)을 내므로 사람 PAT 는 받지 않고(비밀과 다르면 401),
+# 신원 머리(x-hwax-user)를 실은 호출도 받지 않는다(403 — 사람의 길이 아니다). 답은 delib_batch.finished_since 그대로다.
+_FINISHED_FIELDS = ("since", "limit")
+
+
+@app.post("/deliberate/batch/finished")
+async def deliberate_batch_finished(request: Request):
+    import delib_batch  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "끝난 묶음 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다(제 묶음은 "
+                         "deliberate_batch_status 로 본다)", 403)
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(_FINISHED_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    since, limit = body.get("since"), body.get("limit", delib_batch.FINISHED_LIMIT_DEFAULT)
+    if isinstance(since, bool) or not isinstance(since, (int, float)) or not since >= 0:
+        return _dl_error("bad_request", "since 는 0 이상의 epoch 초다", 422)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= delib_batch.FINISHED_LIMIT_MAX:
+        return _dl_error("bad_request", f"limit 은 1~{delib_batch.FINISHED_LIMIT_MAX} 의 정수다", 422)
+    return delib_batch.finished_since(float(since), limit)
+
+
 @app.post("/deliberate/batch/stop")
 async def deliberate_batch_stop_http(request: Request):
     body, who, denied = await _dl_open(request, ("batch_id",))

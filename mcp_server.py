@@ -1677,7 +1677,8 @@ def batch_read(batch_id: str, *, user: str, aff: str, admin: bool, groups=None) 
 
 
 @mcp.tool(title="심의 묶음 진행",
-          description=("심의 묶음이 어디까지 갔는지 본다 — 묶음 status(running · stopping · done · stopped) · finished(끝났나) · notice(끝난 뒤의 한 줄) · "
+          description=("심의 묶음이 어디까지 갔는지 본다 — 묶음 status(running · stopping · done · stopped · failed — 끝난 항목 없이 실패만) · "
+                       "finished(끝났나) · notice(끝난 뒤의 한 줄) · "
                        "counts(pending · running · done · failed · cancelled · stopped · skipped · not_trustworthy) · 항목마다 state · job_id · tries · "
                        "attempts · trust(trustworthy · not_trustworthy · unknown) · seat_loss(좌석 유실 — lost · by_round · notices · unanswered) · 도는 "
                        "잡의 live(status · stage · round · idle_s · queue). 항목의 결정문은 그 job_id 의 deliberate_result 로 받는다. 고리로 거듭 묻지 "

@@ -609,3 +609,92 @@ def test_본문_근거_합이_상한을_넘으면_받지_않는다(bt, monkeypat
     with pytest.raises(ValueError, match="참조"):
         _new(items=[{"key": "A", "question": "q", "evidence": [{"source": "s", "result": "x" * 11}]}])
     _new(name="묶음-참조", items=[{"key": "A", "question": "q", "evidence": [{"ref": {"kind": "risk_bundle", "id": "B-1"}}]}])
+
+
+# ── 끝난 묶음 창구(HWAXPortal docs/request-1117 contracts §7 — 포털 알림) ───────────────────────────────────────
+def _finished(name: str, at: float, items=None) -> dict:
+    """끝난 묶음 하나 — 멈춰 닫고(stopped) 끝난 시각을 at 으로 박아 원장에 쓴다."""
+    b = _new(name=name, items=items or _items("가"))
+    m.batch_stop(b["id"], user=ME)
+    assert b["status"] == "stopped"
+    b["finished_at"] = at
+    B._persist(b)
+    return b
+
+
+def test_끝난_묶음은_끝난_시각과_수_알림을_원장에_남긴다(bt):
+    async def scenario():
+        b = _new(items=_items("가"))
+        await B.feed(b)
+        await _tick()
+        await _end(bt, _job_of(b, "K-1"))
+        await B.feed(b)
+        disk = _on_disk(b)
+        assert disk["status"] == "done" and isinstance(disk["finished_at"], float) and disk["notice"].startswith("묶음 「묶음-가」")
+        (row,) = B.finished_since(0)["batches"]
+        assert row == {"batch_id": b["id"], "owner": ME, "name": "묶음-가", "status": "done", "finished_at": disk["finished_at"],
+                       "counts": {"done": 1, "failed": 0, "stopped": 0, "skipped": 0, "not_trustworthy": 0}, "notice": disk["notice"]}
+
+    _play(scenario)
+
+
+def test_끝난_항목_없이_실패만_있으면_failed(bt):
+    async def scenario():
+        b = _new(items=_items("가"), retries=0)
+        bt.fail.add("가")
+        await B.feed(b)
+        await _tick()
+        await _end(bt, _job_of(b, "K-1"), fail=True)
+        await B.feed(b)
+        assert b["status"] == "failed" and "모두 실패" in b["notice"] and B.view(b)["finished"] is True
+        (row,) = B.finished_since(0)["batches"]
+        assert row["status"] == "failed" and row["counts"]["failed"] == 1
+
+    _play(scenario)
+
+
+def test_창구는_끝난_시각_차례로_쪽을_나누고_같은_since_는_같은_답이다(bt):
+    t0 = float(int(delib_jobs._now()) - 10_000)      # 보존 기한(30일) 안의 시각
+    a, b, c = _finished("묶음-1", t0 + 1), _finished("묶음-2", t0 + 2), _finished("묶음-3", t0 + 3)
+    _new(name="묶음-도는")                           # 도는 묶음은 싣지 않는다
+    p1 = B.finished_since(0, 2)
+    assert [x["batch_id"] for x in p1["batches"]] == [a["id"], b["id"]] and p1["next_since"] == t0 + 2
+    assert B.finished_since(0, 2) == p1, "같은 since 는 같은 답"
+    p2 = B.finished_since(p1["next_since"], 2)
+    assert [x["batch_id"] for x in p2["batches"]] == [b["id"], c["id"]], "경계의 묶음은 다시 나온다(포털이 batch_id 로 한 번만)"
+    assert B.finished_since(t0 + 3.5) == {"batches": [], "next_since": t0 + 3.5}
+    assert B.finished_since(0, 10 ** 6)["batches"][-1]["batch_id"] == c["id"] and len(B.finished_since(0, 10 ** 6)["batches"]) == 3
+
+
+def test_창구는_재기동을_넘기고_보존이_지난_묶음은_사라진다(bt):
+    old = _finished("묶음-옛", delib_jobs._now() - B.KEEP_S - 60)
+    keep = _finished("묶음-남음", delib_jobs._now() - 60)
+    B._BATCHES.clear()
+    B._INDEX = None                                   # 재기동 — 원장 폴더에서 다시 읽는다
+    rows = B.finished_since(0)["batches"]
+    assert [x["batch_id"] for x in rows] == [keep["id"]] and rows[0]["finished_at"] == keep["finished_at"]
+    assert not B._path(old["id"]).exists(), "보존 기한이 지난 끝난 묶음은 지웠다"
+
+
+def test_HTTP_끝난_묶음_창구는_공유_비밀만_받는다(bt, monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as a
+    import seat_box
+    at = float(int(delib_jobs._now()) - 100) + 0.5
+    b = _finished("묶음-창구", at)
+    monkeypatch.setattr(seat_box, "secret", lambda _app: "Bearer gw-secret")
+    c = TestClient(a.app)
+    url, auth = "/deliberate/batch/finished", {"Authorization": "Bearer gw-secret"}
+    assert c.post(url, json={"since": 0}).status_code == 401, "신원 머리만으로는 받지 않는다"
+    assert c.post(url, json={"since": 0}, headers={"x-hwax-user": ME}).status_code == 401
+    assert c.post(url, json={"since": 0}, headers={"Authorization": "Bearer pat-EXAMPLE-person"}).status_code == 401, "사람 PAT 는 받지 않는다"
+    r = c.post(url, json={"since": 0}, headers={**auth, "x-hwax-user": ME})
+    assert r.status_code == 403 and r.json()["code"] == "service_only"
+    r = c.post(url, json={"since": 0, "limit": 5}, headers=auth)
+    assert r.status_code == 200 and r.json() == {"batches": [{
+        "batch_id": b["id"], "owner": ME, "name": "묶음-창구", "status": "stopped", "finished_at": at,
+        "counts": {"done": 0, "failed": 0, "stopped": 1, "skipped": 0, "not_trustworthy": 0}, "notice": b["notice"]}], "next_since": at}
+    for bad in ({"since": -1}, {"since": "0"}, {"since": 0, "limit": 0}, {"since": 0, "limit": 501}, {"since": 0, "x": 1}, {}):
+        assert c.post(url, json=bad, headers=auth).status_code == 422, bad
+    monkeypatch.setattr(seat_box, "secret", lambda _app: "")
+    assert c.post(url, json={"since": 0}, headers=auth).status_code == 503
