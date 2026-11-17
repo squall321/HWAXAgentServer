@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import json
 import re
 
@@ -23,8 +24,53 @@ import deliberation as _engine   # 근거 키 꼴(_EVID_KEY_MAX)을 읽어 표�
 
 # ── parse_risk_spec — HWAXRisk backend/app/narrative.py 와 같은 규칙의 사본(리포를 import 하지 않는다 — contracts §3) ──────────────
 # (1) 마지막 ```json 펜스 → (2) 없거나 깨지면 텍스트 끝에서 역방향 마지막 균형 중괄호 블록 → (3) dict 이고 schema == "risk_spec" 이 아니면 None.
-# 펜스 정규식도 그쪽 그대로다(hwax-sim-deliberate.js parseSimSpec 과 같다). 규칙을 바꾸면 두 리포를 함께 고친다.
+# 펜스는 _fence_blocks 로 읽는다 — 그쪽 함수를 글자 그대로 옮겼다(시험이 형제 리포의 함수 원문과 견준다 — 고치면 두 리포를 함께 고친다). 정규식
+# _FENCE_RE.findall 과 같은 목록을 길이에 비례해 낸다 — 정규식은 '```{}x' 반복 같은 결정문에서 길이의 제곱으로 느려졌다(1만 6천 번 반복 5초 —
+# 리스크 앱 반대 검토 H1). _FENCE_RE 는 같음을 재는 시험(tests/test_dl03_decision_json.py)의 기준으로만 남긴다.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
+_TICKS = "```"
+
+
+def _fence_blocks(s: str) -> list[str]:
+    """`_FENCE_RE.findall(s)` 와 글자까지 같은 목록을 한 번 훑기로 낸다(길이에 비례).
+
+    펜스 끝 후보 — 모든 '```' 자리 q(겹친 자리 포함)마다 그 앞 공백(str.isspace — 정규식 \\s 와 같은 글자)을 건너뛴 마지막 글자 k 가 '}' 이면
+    (q, k) 다. 후보의 k 는 q 를 따라 커진다. 펜스 머리 i('```' — 지금 자리 뒤의 것만)에서 'json'(있으면 먼저, 안 되면 빼고 — 정규식
+    `(?:json)?` 의 되짚기와 같다) · 공백을 건너 '{' 자리 p 를 찾고, k > p 인 첫 후보가 게으른 `[\\s\\S]*?` 가 고르는 끝이다 — s[p:k+1] 을 내고 q+3
+    부터 다시 훑는다. 그런 후보가 없으면 다음 '```' 머리를 본다."""
+    starts: list[int] = []
+    at = s.find(_TICKS)
+    while at != -1:
+        starts.append(at)
+        at = s.find(_TICKS, at + 1)
+    ends_q: list[int] = []
+    ends_k: list[int] = []
+    for q in starts:
+        k = q - 1
+        while k >= 0 and s[k].isspace():
+            k -= 1
+        if k >= 0 and s[k] == "}":
+            ends_q.append(q)
+            ends_k.append(k)
+    out: list[str] = []
+    n = len(s)
+    pos = 0
+    for i in starts:
+        if i < pos:
+            continue
+        heads = (i + 7, i + 3) if s.startswith("json", i + 3) else (i + 3,)
+        for head in heads:
+            p = head
+            while p < n and s[p].isspace():
+                p += 1
+            if p >= n or s[p] != "{":
+                continue
+            j = bisect.bisect_right(ends_k, p)
+            if j < len(ends_k):
+                out.append(s[p:ends_k[j] + 1])
+                pos = ends_q[j] + 3
+                break
+    return out
 
 
 def _last_balanced_block(s: str) -> str | None:
@@ -48,7 +94,7 @@ def parse_risk_spec(text) -> dict | None:
     """결정문 텍스트에서 risk_spec JSON 을 뽑는다. 실패는 None(예외 없음)."""
     s = "" if text is None else str(text)
     obj = None
-    fences = _FENCE_RE.findall(s)
+    fences = _fence_blocks(s)
     if fences:
         try:
             obj = json.loads(fences[-1])

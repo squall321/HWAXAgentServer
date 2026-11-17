@@ -73,14 +73,64 @@ def test_마지막_펜스를_쓰고_깨지면_끝의_균형_중괄호로_읽는�
     assert dd.parse_risk_spec("") is None and dd.parse_risk_spec(None) is None and dd.parse_risk_spec("{ 깨짐") is None
 
 
-def test_펜스_규칙이_리스크_앱과_글자_그대로_같다():
-    src = ROOT.parent / "HWAXRisk" / "backend" / "app" / "narrative.py"
-    if not src.exists():
-        pytest.skip(f"형제 리포 없음: {src}")
-    text = src.read_text(encoding="utf-8")
-    want = re.search(r'^_FENCE_RE = re\.compile\(r"(.+)"\)$', text, re.M)
-    assert want and want.group(1) == dd._FENCE_RE.pattern, "리스크 앱 parse_risk_spec 의 펜스 정규식이 바뀌었다 — 두 리포를 함께 고친다"
-    assert 'obj.get("schema") != "risk_spec"' in text
+# 형제 리포의 원문 — 본 체크아웃(병합 뒤의 자리)이 먼저다. 리스크 앱 가지(wt1117/rk)가 병합되기 전에는 본 체크아웃에 함수가 없어 그 가지의 작업 트리를
+# 본다(병합 뒤에는 본 체크아웃이 이긴다). 둘 다 없으면 건너뛰되 까닭을 적는다 — 있는데 다르면 늘 진다.
+_RISK_NARRATIVE = (ROOT.parent / "HWAXRisk" / "backend" / "app" / "narrative.py",
+                   ROOT.parent / "HWAXRisk-wt-1117" / "backend" / "app" / "narrative.py")
+
+
+def _sibling_source(name: str):
+    """형제 리포 narrative.py 에서 그 이름의 최상위 정의 원문 → (경로, 원문, 모듈 원문). 그 정의가 있는 첫 파일이다 — 없으면 (None, None, None)."""
+    import ast
+    for path in _RISK_NARRATIVE:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for node in ast.parse(text).body:
+            if getattr(node, "name", None) == name or (isinstance(node, ast.Assign) and any(getattr(t, "id", "") == name for t in node.targets)):
+                return path, ast.get_source_segment(text, node), text
+    return None, None, None
+
+
+def test_펜스_함수가_리스크_앱과_글자_그대로_같다():
+    """parse_risk_spec 의 펜스 읽기는 리스크 앱 _fence_blocks 의 사본이다 — 함수 원문(독스트링 포함)을 글자 그대로 견준다."""
+    import ast
+    import inspect
+    path, want, text = _sibling_source("_fence_blocks")
+    if path is None:
+        pytest.skip("형제 리포의 narrative.py 에 _fence_blocks 가 없다(본 체크아웃 · 리스크 앱 가지 작업 트리 모두) — 견줄 원문이 없다")
+    mine = ast.get_source_segment(inspect.getsource(dd), next(n for n in ast.parse(inspect.getsource(dd)).body
+                                                               if getattr(n, "name", None) == "_fence_blocks"))
+    assert mine == want, f"리스크 앱({path})의 _fence_blocks 와 다르다 — 두 리포를 함께 고친다"
+    _p, ticks, _t = _sibling_source("_TICKS")
+    assert ticks == f'_TICKS = "{dd._TICKS}"' == '_TICKS = "```"'
+    assert "fences = _fence_blocks(s)" in text and 'obj.get("schema") != "risk_spec"' in text, "그쪽 parse_risk_spec 이 같은 길을 쓴다"
+
+
+@pytest.mark.parametrize("text", [
+    "", "```", "``````", "```{}```", "```json{}```", "```json {\"a\": 1} ```", "```jsonx{}```", "``` {a}\n} ```", "````{}```",
+    "```{}``````{}```", "```{```{}```", "```json\n{\"x\": {\"y\": 1}}\n```", "글 ```{} 끝", "```{}\t\n```", "```{}`` ```",
+])
+def test_펜스_함수는_정규식과_같은_목록을_낸다(text):
+    assert dd._fence_blocks(text) == dd._FENCE_RE.findall(text)
+
+
+def test_펜스_함수는_무작위_글에서도_정규식과_같다():
+    import random
+    rnd = random.Random(1117)
+    alphabet = ["`", "```", "{", "}", "json", " ", "\n", "\t", "a", "\"", ":"]
+    for _ in range(3000):
+        t = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 40)))
+        assert dd._fence_blocks(t) == dd._FENCE_RE.findall(t), repr(t)
+
+
+@pytest.mark.parametrize("name,text", [("```{}x", "```{}x" * 16000), ("```{", "```{" * 16000)])
+def test_결정문_읽기는_악성_펜스_글에도_1초_안이다(name, text):
+    import time
+    t = time.perf_counter()
+    dd.parse_risk_spec(text)
+    dd.consensus_claim(text)
+    assert time.perf_counter() - t < 1.0, f"{name} × 16000 — 펜스 읽기가 제곱으로 느려졌다(리스크 앱 반대 검토 H1)"
 
 
 # ── 만장일치 문장 ────────────────────────────────────────────────────────────────────────────────────────────
