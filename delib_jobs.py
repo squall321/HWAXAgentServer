@@ -1419,6 +1419,49 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
     return spawn
 
 
+def _admission(delib_opts, user_email: str, owner: str = "") -> tuple:
+    """동시 한도 판정 — (외부 응답자인가, 과제 주인, 도는 GLM 잡 수, 한도, 손잡이 이름, 신원, 그 사람의 도는 잡, 셀 사람, 걸린 상한 글들). start 가 거절 ·
+    줄 세우기를 가르고, 묶음이 띄우기 전에 '지금 받나' 를 묻는다(accepts — 같은 판정을 두 벌 두지 않는다, HWAXPortal docs/request-1117 2차 검토 5)."""
+    from deliberation import _wants_external  # noqa: PLC0415 — 아래의 늦은 import 와 같은 까닭(순환 방지)
+    external = _wants_external(delib_opts)
+    x_owner = str(owner or user_email or "").strip().lower() if external else ""
+    total = _glm_running_count()
+    lim = limits()          # 판정 때마다 읽는다(R4) — 박스 파일이 env 위에 덮인다
+    _mr, _pu = lim["max_running"], lim["max_running_per_user"]
+    # 거절 문구가 말하는 손잡이 — 값이 덮개에서 왔으면 덮개다(env 이름을 대면 그 값을 고쳐도 안 바뀐다).
+    _knob = {k: ("박스 덮개 POST /limits" if lim["source"][k] == "file" else env)
+             for k, env in (("max_running", "DELIB_JOB_MAX_RUNNING"), ("max_running_per_user", "DELIB_JOB_MAX_RUNNING_PER_USER"),
+                            ("queue_max", "DELIB_JOB_QUEUE_MAX"), ("max_seats_running", "DELIB_JOB_MAX_SEATS_RUNNING"))}
+    me = (user_email or "").strip().lower()
+    mine = _external_running_of(x_owner) if external else _running_of(me)
+    who = x_owner if external else me
+    # 어느 상한에 걸렸는지 말한다 — 사용자별이면 제 것을 접으면 풀리고, 전역뿐이면 기다려야 한다.
+    hit = []
+    if external:
+        if x_owner and len(mine) >= EXTERNAL_PER_OWNER:
+            hit.append(f"외부 응답자 심의 주인마다 {EXTERNAL_PER_OWNER}건 — GLM 심의 자리와는 따로다")
+    else:
+        if total >= _mr:
+            hit.append(f"전역 {_mr}건 — {_knob['max_running']}")
+        if me and len(mine) >= _pu:
+            hit.append(f"사용자별 {_pu}건 — {_knob['max_running_per_user']}")
+        _sc = lim["max_seats_running"]
+        if _sc > 0 and total > 0:
+            _w, _sr = _seats_est(dict(delib_opts or {})), seats_running()
+            if _sr + _w > _sc:
+                hit.append(f"좌석 합 {_sc}석(도는 {_sr}석 + 이 심의 {_w}석 어림) — {_knob['max_seats_running']}")
+    return external, x_owner, total, lim, _knob, me, mine, who, hit
+
+
+def accepts(user_email: str, owner: str = "", delib_opts=None) -> bool:
+    """start 가 지금 이 사람의 새 잡을 받나 — 새 심의 멈춤이 아니고, 상한에 안 걸렸거나 걸려도 줄에 자리가 있다(start 의 거절 두 갈래와 같은 판정).
+    줄이 찼어도 상한에 안 걸린 사람은 받는다 — 남이 줄을 채워 이 사람의 묶음이 굶지 않게."""
+    if _paused():
+        return False
+    *_rest, lim, _knob, _me, _mine, _who, hit = _admission(delib_opts, user_email, owner)
+    return not hit or (lim["queue_max"] > 0 and len(_PENDING) < lim["queue_max"])
+
+
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
           owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None,
@@ -1471,34 +1514,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
     # 외부 응답자 잡(delib_opts.llm=external)은 GLM 자리(전역·사용자별) 대신 주인마다 EXTERNAL_PER_OWNER 건이다 — 어느 몫을 셀지 먼저
     # 가린다. 주인은 과제를 받는 사람이다(owner — 비면 user_email, 엔진과 같게 공백·대소문자만 맞춘다).
-    from deliberation import _wants_external  # noqa: PLC0415 — 아래의 늦은 import 와 같은 까닭(순환 방지)
-    external = _wants_external(delib_opts)
-    x_owner = str(owner or user_email or "").strip().lower() if external else ""
-    total = _glm_running_count()
-    lim = limits()          # 판정 때마다 읽는다(R4) — 박스 파일이 env 위에 덮인다
+    external, x_owner, total, lim, _knob, me, mine, who, hit = _admission(delib_opts, user_email, owner)
     _mr, _pu, _qm = lim["max_running"], lim["max_running_per_user"], lim["queue_max"]
-    # 거절 문구가 말하는 손잡이 — 값이 덮개에서 왔으면 덮개다(env 이름을 대면 그 값을 고쳐도 안 바뀐다).
-    _knob = {k: ("박스 덮개 POST /limits" if lim["source"][k] == "file" else env)
-             for k, env in (("max_running", "DELIB_JOB_MAX_RUNNING"), ("max_running_per_user", "DELIB_JOB_MAX_RUNNING_PER_USER"),
-                            ("queue_max", "DELIB_JOB_QUEUE_MAX"), ("max_seats_running", "DELIB_JOB_MAX_SEATS_RUNNING"))}
-    me = (user_email or "").strip().lower()
-    mine = _external_running_of(x_owner) if external else _running_of(me)
-    who = x_owner if external else me
-    # 어느 상한에 걸렸는지 말한다 — 사용자별이면 제 것을 접으면 풀리고, 전역뿐이면 기다려야 한다.
-    hit = []
-    if external:
-        if x_owner and len(mine) >= EXTERNAL_PER_OWNER:
-            hit.append(f"외부 응답자 심의 주인마다 {EXTERNAL_PER_OWNER}건 — GLM 심의 자리와는 따로다")
-    else:
-        if total >= _mr:
-            hit.append(f"전역 {_mr}건 — {_knob['max_running']}")
-        if me and len(mine) >= _pu:
-            hit.append(f"사용자별 {_pu}건 — {_knob['max_running_per_user']}")
-        _sc = lim["max_seats_running"]
-        if _sc > 0 and total > 0:
-            _w, _sr = _seats_est(dict(delib_opts or {})), seats_running()
-            if _sr + _w > _sc:
-                hit.append(f"좌석 합 {_sc}석(도는 {_sr}석 + 이 심의 {_w}석 어림) — {_knob['max_seats_running']}")
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
     # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.

@@ -59,6 +59,12 @@ def _on_disk(b) -> dict:
     return json.loads(B._path(b["id"]).read_text(encoding="utf-8"))
 
 
+def _elapse(b) -> None:
+    """물러서기(retry_at)가 다 지난 것으로 — 시험이 시계를 기다리지 않는다."""
+    for it in b["items"]:
+        it.pop("retry_at", None)
+
+
 # ── 만들기 ────────────────────────────────────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("items,msg", [
     ([], "비지 않은"),
@@ -127,7 +133,10 @@ def test_실패는_retries_번까지만_다시_띄운다(bt):
         await B.feed(b)
         await _tick()
         await _end(bt, _job_of(b, "K-1"), fail=True)
-        await B.feed(b)                      # 실패 → 다시 띄운다(문이 이미 열려 곧바로 또 실패한다)
+        await B.feed(b)                      # 실패한 시도 — 물러선다(같은 틱에 다시 띄우지 않는다)
+        assert b["items"][0]["state"] == "pending" and b["items"][0]["retry_at"] > delib_jobs._now() and bt.started == ["가"]
+        _elapse(b)
+        await B.feed(b)                      # 물러서기가 지났다 — 다시 띄운다(문이 이미 열려 곧바로 또 실패한다)
         await _tick()
         await B.feed(b)
         (it,) = b["items"]
@@ -146,6 +155,8 @@ def test_다시_띄운_시도가_되면_끝난다(bt):
         await _tick()
         await _end(bt, _job_of(b, "K-1"), fail=True)
         bt.fail.discard("가")
+        await B.feed(b)
+        _elapse(b)
         await B.feed(b)
         await _tick()
         await B.feed(b)
@@ -320,7 +331,9 @@ def test_멈춤_감지를_켜면_오래_조용한_잡을_접고_다시_띄운다
         await B.feed(b)                       # 접는다
         await _tick()
         assert job["status"] == "cancelled"
-        await B.feed(b)                       # 실패한 시도로 세고 다시 띄운다
+        await B.feed(b)                       # 실패한 시도로 센다(물러선다)
+        _elapse(b)
+        await B.feed(b)                       # 다시 띄운다
         await _tick()
         (it,) = b["items"]
         assert it["state"] == "running" and it["tries"] == 2 and "멈춤 감지" in it["attempts"][1]["why"]
@@ -383,6 +396,8 @@ def test_끊긴_잡을_제자리로_못_이으면_실패한_시도로_다시_띄
         assert job["status"] == "interrupted"
         delib_jobs._drop_args(job["id"])      # 시작 인자 파일이 없다 — 제자리 이어하기를 못 한다
         await B.feed(b)
+        _elapse(b)
+        await B.feed(b)
         await _tick()
         (it,) = b["items"]
         assert it["attempts"][1]["status"] == "interrupted" and "제자리로 잇지 못했다" in it["attempts"][1]["why"]
@@ -395,8 +410,9 @@ def test_끊긴_잡을_제자리로_못_이으면_실패한_시도로_다시_띄
 def test_MCP_시작_진행_멈춤(bt):
     async def scenario():
         out = await m.deliberate_batch_start("묶음-엠", _items("가", "나"), ctx=_ctx(ME, "TEAM-A", "CAEG"))
-        assert out["status"] == "running" and out["in_engine"] == [{"key": "K-1", "job_id": out["in_engine"][0]["job_id"]}]
+        assert out["status"] == "running" and out["in_engine"] == [], "첫 먹이기는 요청 밖에서 돈다(응답을 붙잡지 않는다)"
         assert "items" not in out and "batch_id" in out and "deliberate_batch_status" in out["note"]
+        await asyncio.gather(*list(B._KICKS))
         st = await m.deliberate_batch_status(out["batch_id"], ctx=_ctx(MATE, "TEAM-A"))
         assert st["counts"]["running"] == 1 and st["items"][0]["live"]["status"] in ("running", "queued")
         with pytest.raises(PermissionError):
@@ -465,6 +481,7 @@ def test_띄우다_뜻밖의_오류는_실패한_시도이고_묶음을_막지_�
     async def scenario():
         out = await m.batch_start(name="묶음-오류", items=_items("가", "나"), concurrency=1, retries=0, stall_s=0, user=ME, groups=[], aff="")
         b = B.get(out["batch_id"])
+        await asyncio.gather(*list(B._KICKS))
         await _tick()
         assert b["items"][0]["state"] == "failed" and "TypeError" in b["items"][0]["error"], b["items"][0]
         assert b["items"][1]["state"] == "running" and bt.started == ["나"], "다음 항목은 그대로 띄운다"
@@ -516,6 +533,10 @@ def test_참조를_다_풀지_못한_항목은_띄우지_않고_실패한_시도
     async def scenario():
         b = _new(items=[{"key": "K-1", "question": "가", "evidence": [{"ref": {"kind": "risk_bundle", "id": "BND-1"}}]}], retries=1)
         await B.feed(b)
+        assert b["items"][0]["tries"] == 1 and b["items"][0]["state"] == "pending", "한 틱에 시도 하나"
+        await B.feed(b)
+        assert b["items"][0]["tries"] == 1, "물러서는 동안은 다시 띄우지 않는다"
+        _elapse(b)
         await B.feed(b)
         (it,) = b["items"]
         assert it["state"] == "failed" and it["tries"] == 2 and bt.started == [], "근거 없이 돌지 않는다"
@@ -605,9 +626,13 @@ def test_보존_기한이_지난_끝난_묶음은_지운다_만들기는_원장�
 
 
 def test_본문_근거_합이_상한을_넘으면_받지_않는다(bt, monkeypatch):
-    monkeypatch.setattr(B, "INLINE_MAX", 10)
+    monkeypatch.setattr(B, "INLINE_MAX", 300)
     with pytest.raises(ValueError, match="참조"):
-        _new(items=[{"key": "A", "question": "q", "evidence": [{"source": "s", "result": "x" * 11}]}])
+        _new(items=[{"key": "A", "question": "q", "evidence": [{"source": "s", "result": "x" * 400}]}])
+    with pytest.raises(ValueError, match="참조"):        # 본문 칸 하나가 아니라 항목 전부(JSON 길이)를 센다(2차 검토 6)
+        _new(items=[{"key": "A", "question": "q", "evidence": [{"source": "s", "result": "x", "text": "y" * 200, "args": "z" * 200}]}])
+    with pytest.raises(ValueError, match="참조"):
+        _new(items=[{"key": "A", "question": "q", "advanced": {"knowledge_query": "w" * 400}}])
     _new(name="묶음-참조", items=[{"key": "A", "question": "q", "evidence": [{"ref": {"kind": "risk_bundle", "id": "B-1"}}]}])
 
 
@@ -698,3 +723,105 @@ def test_HTTP_끝난_묶음_창구는_공유_비밀만_받는다(bt, monkeypatch
         assert c.post(url, json=bad, headers=auth).status_code == 422, bad
     monkeypatch.setattr(seat_box, "secret", lambda _app: "")
     assert c.post(url, json={"since": 0}, headers=auth).status_code == 503
+
+
+# ── 2차 검토(1 · 5 · 7 · 이음새) ──────────────────────────────────────────────────────────────────────────────────
+def test_한_틱에_같은_항목의_시도를_둘_쓰지_않는다(bt, monkeypatch):
+    calls = []
+
+    async def call(_app, *, groups, user, user_pat, alias, args):
+        calls.append(args["job_id"])
+        return True, "도구 오류: 일시 오류"
+    monkeypatch.setattr(delib_refs, "call_alias", call)
+
+    async def scenario():
+        b = _new(items=[{"key": f"K-{i}", "question": f"q{i}", "evidence": [{"ref": {"kind": "stepforge_job", "id": f"j{i}"}}]}
+                        for i in range(5)], retries=3)
+        await B.feed(b)                       # 틱 하나
+        assert sorted(calls) == [f"j{i}" for i in range(5)], "항목마다 한 번만 불렀다"
+        assert [it["tries"] for it in b["items"]] == [1] * 5 and all(it["state"] == "pending" for it in b["items"])
+        assert all(it["retry_at"] > delib_jobs._now() + B.RETRY_BACKOFF_S - 5 for it in b["items"]), "물러선다"
+        assert b["status"] == "running"
+        await B.feed(b)
+        assert len(calls) == 5, "물러서는 동안 다시 부르지 않는다"
+
+    _play(scenario)
+
+
+def test_게이트웨이_불통은_시도가_아니라_물러서기다(bt, monkeypatch):
+    async def call(*_a, **_kw):
+        raise ConnectionError("게이트웨이 내려감")
+    monkeypatch.setattr(delib_refs, "call_alias", call)
+    monkeypatch.setattr(B, "UNREACHABLE_WAITS_MAX", 2)
+
+    async def scenario():
+        b = _new(items=[{"key": "K-1", "question": "q", "evidence": [{"ref": {"kind": "stepforge_job", "id": "j1"}}]}], retries=0)
+        await B.feed(b)
+        (it,) = b["items"]
+        assert (it["state"], it["tries"], it["waits"]) == ("pending", 0, 1) and "불통" in it["last_error"] and not it["attempts"]
+        _elapse(b)
+        await B.feed(b)
+        assert (it["tries"], it["waits"]) == (0, 2)
+        _elapse(b)
+        await B.feed(b)                       # 기다림 상한을 넘었다 — 실패한 시도(retries 0 이라 끝)
+        assert it["state"] == "failed" and it["tries"] == 1 and b["status"] == "failed"
+
+    _play(scenario)
+
+
+def test_남이_줄을_채워도_상한에_안_걸린_사람의_묶음은_간다(bt, monkeypatch):
+    _caps(monkeypatch, 3, per_user=1, queue=1)
+
+    async def scenario():
+        a1 = delib_jobs.start(m._APP, "default", "남 1", user_email=OUT)
+        a2 = delib_jobs.start(m._APP, "default", "남 2", user_email=OUT)       # 남의 사람별 상한 — 줄에 선다(줄이 찬다)
+        await _tick()
+        assert a1["status"] == "running" and a2["status"] == "queued" and len(delib_jobs._PENDING) == 1
+        assert delib_jobs.accepts(ME) is True and delib_jobs.accepts(OUT) is False, "같은 판정 — 이 사람은 상한에 안 걸렸다"
+        b = _new(items=_items("가"))
+        await B.feed(b)
+        await _tick()
+        assert b["items"][0]["state"] == "running" and _job_of(b, "K-1")["status"] == "running"
+
+    _play(scenario)
+
+
+def test_빈_본문_칸의_참조도_묶음에서_다_풀려야_띄운다(bt, monkeypatch):
+    async def call(*_a, **_kw):
+        return True, "forbidden: 권한이 없다"
+    monkeypatch.setattr(delib_refs, "call_alias", call)
+
+    async def scenario():
+        b = _new(items=[{"key": "K-1", "question": "가", "evidence": [{"ref": {"kind": "stepforge_job", "id": "j1"}, "result": None}]}],
+                 retries=0)
+        await B.feed(b)
+        assert b["items"][0]["state"] == "failed" and bt.started == [], "빈 본문 칸이 있어도 참조다(2차 검토 7)"
+
+    _play(scenario)
+
+
+def test_멈춤도_주인의_그룹을_고친다(bt):
+    b = B.create(m._APP, name="묶음-멈춤그룹", items=_items("가"), user=ME, groups=["CAEG"], owner_aff="TEAM-A")
+    m.batch_stop(b["id"], user=ME, groups=["TEAM-ONLY", "portal-admin"])
+    assert _on_disk(b)["groups"] == ["TEAM-ONLY"]
+
+
+def test_보존_정리는_틱마다_하루_간격으로_돈다(bt):
+    old = _finished("묶음-하루", delib_jobs._now() - B.KEEP_S - 60)
+    B._LAST_PRUNE = delib_jobs._now()
+    asyncio.run(B.tick())
+    assert B._path(old["id"]).exists(), "하루가 안 지났으면 지우지 않는다"
+    B._LAST_PRUNE = delib_jobs._now() - B.PRUNE_EVERY_S - 1
+    asyncio.run(B.tick())
+    assert not B._path(old["id"]).exists() and old["id"] not in B._index()
+
+
+def test_HTTP_끝난_묶음_창구는_무한대_since_를_받지_않는다(bt, monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as a
+    import seat_box
+    monkeypatch.setattr(seat_box, "secret", lambda _app: "Bearer gw-secret")
+    c = TestClient(a.app)
+    for raw in (b'{"since": Infinity}', b'{"since": NaN}'):
+        r = c.post("/deliberate/batch/finished", content=raw, headers={"Authorization": "Bearer gw-secret", "content-type": "application/json"})
+        assert r.status_code == 422, raw

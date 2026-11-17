@@ -9945,6 +9945,12 @@ async def deliberate_evidence_resolve(request: Request):
 
 # POST /deliberate/batch/start {name, items, concurrency?, retries?, stall_s?} · /status {batch_id} · /stop {batch_id} — deliberate_batch_* 와 같은 답(DL-02).
 # 시작은 신원 머리가 있어야 한다(묶음의 잡은 그 사람 이름으로 돈다). 끝남은 바깥으로 알리지 않는다 — status 의 finished · notice 를 읽는다.
+# **왜 사람 PAT 가 아니라 공유 비밀 + 신원 머리인가(2차 검토 8 — 사용자가 열어 둔 설계 판단).** 같은 신뢰가 MCP 길이다 — 게이트웨이는 사람의 PAT 를
+# 검증한 뒤 그 신원을 머리(x-hwax-user · x-hwax-groups)에 박고 이 공유 비밀로 에이전트 서버를 부른다. 이 창구는 그 길을 HTTP 로 연 것뿐이다. 묶음은
+# 수 시간 ~ 며칠 돌고 MCP 잡처럼 토큰을 쥐지 않으므로(원장 · 시작 인자 파일에 토큰을 남기지 않는다 — delib_jobs) PAT 를 받아도 시작 때 한 번 보는 것이
+# 전부다. 대신 이 비밀을 쥔 쪽이 곧 신원을 말할 수 있는 쪽이다 — 비밀은 게이트웨이 연결의 Authorization(Bearer GW_TOKEN — seat_box.secret)이고 같은
+# 값을 쥐는 것은 게이트웨이(GW_TOKEN)와 포털(GATEWAY_SHARED_TOKEN)뿐이다(다른 곳에 나눠 주지 않는다). 근거 참조를 사람 이름으로 미리 푸는
+# /deliberate/evidence/resolve 만은 그 사람의 PAT 를 요구한다(/deliberate/subject/confirm 과 같다 — 결과를 그 자리에서 돌려주는 창구다).
 @app.post("/deliberate/batch/start")
 async def deliberate_batch_start_http(request: Request):
     body, who, denied = await _dl_open(request, ("name", "items", "concurrency", "retries", "stall_s"))
@@ -9980,6 +9986,8 @@ _FINISHED_FIELDS = ("since", "limit")
 
 @app.post("/deliberate/batch/finished")
 async def deliberate_batch_finished(request: Request):
+    import math  # noqa: PLC0415
+
     import delib_batch  # noqa: PLC0415
     denied = _seat_auth(request)
     if denied:
@@ -9999,7 +10007,7 @@ async def deliberate_batch_finished(request: Request):
         return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
                              "fields": shown, "fields_n": len(extra)}, status_code=422)
     since, limit = body.get("since"), body.get("limit", delib_batch.FINISHED_LIMIT_DEFAULT)
-    if isinstance(since, bool) or not isinstance(since, (int, float)) or not since >= 0:
+    if isinstance(since, bool) or not isinstance(since, (int, float)) or not math.isfinite(since) or not since >= 0:
         return _dl_error("bad_request", "since 는 0 이상의 epoch 초다", 422)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= delib_batch.FINISHED_LIMIT_MAX:
         return _dl_error("bad_request", f"limit 은 1~{delib_batch.FINISHED_LIMIT_MAX} 의 정수다", 422)
@@ -10012,7 +10020,7 @@ async def deliberate_batch_stop_http(request: Request):
     if denied:
         return denied
     try:
-        return _delib_mcp_module.batch_stop(body.get("batch_id"), user=who[0])
+        return _delib_mcp_module.batch_stop(body.get("batch_id"), user=who[0], groups=who[1])
     except PermissionError as exc:
         return _dl_error("forbidden", str(exc), 403)
     except ValueError as exc:

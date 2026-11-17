@@ -9,12 +9,16 @@
     건너뛴다(skipped · done_in) — 멈춘 묶음을 같은 이름으로 다시 시작하면 남은 것만 돈다.
   · 멈춘 뒤에는 새로 띄우지 않는다 — 멈춤은 줄 선(pending) 항목과 엔진 줄에 서 있기만 한(아직 돌지 않은) 잡을 stopped 로 닫는다. 이미 도는 잡은 끝까지
     지켜본다(접으려면 그 job_id 로 deliberate_cancel — 도는 잡을 접을지는 사용자 결정으로 남아 있다).
-  · 실패한 항목은 retries 번까지만 새 잡으로 다시 띄운다(한 항목의 시도는 1 + retries 번). 사람이 접은 잡은 다시 띄우지 않는다(cancelled). 항목의
+  · 실패한 항목은 retries 번까지만 새 잡으로 다시 띄운다(한 항목의 시도는 1 + retries 번) — 다시 띄우기는 물러섰다가(retry_at — RETRY_BACKOFF_S 에서
+    두 배씩, 위 RETRY_BACKOFF_MAX_S) 다음 틱부터다. 한 틱에서 같은 항목의 시도를 둘 쓰지 않는다(2차 검토 1 — 종전엔 게이트웨이가 잠깐 끊긴 6ms 에 시도가
+    다 탔다). 근거 참조가 불통(시간 초과 · 게이트웨이를 못 부름)이면 시도로 세지 않고 물러섰다 다시 본다(UNREACHABLE_WAITS_MAX 번까지 — 그 뒤는 실패한
+    시도). 사람이 접은 잡은 다시 띄우지 않는다(cancelled). 항목의
     인자는 묶음을 받을 때 엔진의 검사(delib_jobs.start(dry_run))로 먼저 거른다 — 틀리면 묶음을 만들지 않는다. 띄울 때 생긴 뜻밖의 오류도 실패한 시도다.
   · 근거 참조는 다 풀려야 띄운다 — 묶음 항목의 참조가 하나라도 풀리지 않으면 그 시도는 실패다(근거 없이 돌아 '믿을 만한' 결정으로 끝나지 않게).
     deliberate_start 하나는 종전대로 빼고 evidence_omitted 로 알린다.
   · 동시 한도 안에서 하나씩 — 이 묶음의 도는 · 줄 선 잡은 concurrency 건까지(기본 1 — 아래 CONCURRENCY_DEFAULT). 엔진의 사람별 · 전역 · 좌석 합 한도와 줄
-    (delib_jobs)은 그대로 걸린다 — 줄이 차거나 새 심의 멈춤이면 그 항목은 pending 으로 남고 다음 틱에 다시 본다(시도로 세지 않는다).
+    (delib_jobs)은 그대로 걸린다 — 엔진이 지금 이 사람의 잡을 받지 않으면(delib_jobs.accepts — start 와 같은 판정: 멈춤이거나, 이 사람이 상한에 걸렸고 줄도
+    찼다) 그 항목은 pending 으로 남고 다음 틱에 다시 본다(시도로 세지 않는다 · 참조도 풀지 않는다). 남이 줄을 채워도 상한에 안 걸린 사람의 묶음은 간다.
   · 좌석 유실 — 끝난 잡의 좌석 가운데 어느 라운드든 발언하지 못한 좌석(엔진의 '좌석 유실' 알림 · 라운드별 전사 · 마지막 표결의 응답 못 함)이 하나라도
     있으면 그 항목의 결정은 '믿을 수 없음(not_trustworthy)' 이다. 비율로 가르지 않는다 — 하나라도 빠지면 늘 그렇다.
   · 멈춤 감지(stall_s — 기본 0 · 끔) — 켜면 도는 잡이 마지막 사건 뒤 max(stall_s, 그 잡의 quiet_ok_s) 초 넘게 조용할 때 접고 실패한 시도로 센다.
@@ -25,7 +29,9 @@
     게이트웨이가 '지금' 관리자일 때만 싣는다)는 적지 않고, 주인이 진행 조회 · 멈춤을 부를 때마다 그때의 그룹으로 고쳐 적는다. 끊긴 잡의 제자리
     이어하기는 그 그룹으로 resume_load 의 '권한이 줄었다' 검사를 받는다.
   · 원장 — 묶음 id 꼴(BATCH_ID_RE)이 아니면 파일을 보지 않는다. 끝난 묶음은 KEEP_S(30일) 뒤 지운다(그 뒤로는 그 묶음의 끝난 key 를 모른다).
-    줄 선 항목의 본문 근거는 원장에 든다 — 합이 INLINE_MAX 를 넘으면 받지 않는다(참조를 쓴다).
+    줄 선 항목의 근거 · 손잡이는 원장에 든다 — 항목마다 evidence · advanced 를 JSON 으로 적은 길이의 합이 INLINE_MAX 를 넘으면 받지 않는다(큰 근거는
+    참조). 보존 정리는 기동 때와 하루마다(PRUNE_EVERY_S) 돈다.
+  · 첫 먹이기는 요청 밖에서 돈다(kick — 근거 참조 풀이가 길어도 게이트웨이의 호출 한도 600초에 걸리지 않게). 시작 응답에는 아직 엔진에 든 잡이 없을 수 있다.
 
 **끝남 알림.** 바깥 주소로 보내지 않는다(웹훅 없음 — 사용자 결정 R-5 ③). 끝나면 묶음 원장에 finished_at · notice 를 쓰고 진행 조회
 (deliberate_batch_status)가 finished · notice 로 보인다. 포털은 끝난 묶음 창구(finished_since — app POST /deliberate/batch/finished, 공유 비밀만 ·
@@ -34,6 +40,10 @@ HWAXPortal docs/request-1117 contracts §7)를 주기로 읽어 주인에게 알
 
 **권한.** 시작은 신원(사람)이 있는 호출만 — 묶음의 잡은 그 사람 이름으로 돈다(그 사람의 사람별 한도 안). 조회는 잡과 같은 규칙(주인 · 같은 소속 ·
 관리자 · 신원 없는 운영), 멈춤은 주인만(deliberate_cancel 과 같다).
+신원은 게이트웨이가 사람의 PAT 를 검증한 뒤 머리(x-hwax-user · x-hwax-groups)에 박아 공유 비밀로 부를 때의 그것이다 — HTTP 창구(app
+/deliberate/batch/*)도 같은 신뢰로 연다(2차 검토 8 — 사용자가 열어 둔 설계 판단). 묶음은 수 시간 ~ 며칠 돌고 토큰을 쥐지 않으므로(원장 · 시작 인자 파일에
+토큰을 남기지 않는다) 사람 PAT 를 받아도 시작 때 한 번 보는 것이 전부다. 그 비밀(게이트웨이 연결의 Authorization — seat_box.secret)을 쥔 쪽은 게이트웨이
+(GW_TOKEN)와 포털(GATEWAY_SHARED_TOKEN)뿐이다 — 그 둘만이 신원을 말할 수 있다.
 """
 from __future__ import annotations
 
@@ -70,13 +80,18 @@ _FLIGHT = ("starting", "running")           # 항목이 엔진에 있거나 들�
 _TERMINAL = ("done", "failed", "cancelled", "stopped", "skipped")
 BATCH_ID_RE = re.compile(r"batch-\d{8}-\d{6}-[0-9a-f]{6}")
 KEEP_S = 30 * 86400                         # 끝난 묶음 원장의 보존(초) — 지나면 bind · 색인을 읽을 때 지운다
-INLINE_MAX = 2_000_000                      # 한 묶음의 본문 근거(참조가 아닌 항목) 합 상한(자) — 원장이 줄 선 항목의 근거를 들고 있다
+INLINE_MAX = 2_000_000                      # 한 묶음의 항목 근거 · 손잡이(JSON 길이) 합 상한(자) — 원장이 줄 선 항목의 그것을 들고 있다
+RETRY_BACKOFF_S, RETRY_BACKOFF_MAX_S = 60.0, 1800.0     # 다시 띄우기 · 불통 기다림의 물러서기(초) — n 번째에 60 · 120 · 240 … · 위 30분
+UNREACHABLE_WAITS_MAX = 12                  # 근거 참조 불통으로 물러서는 횟수의 위 — 넘으면 실패한 시도로 센다(합 약 5시간)
+PRUNE_EVERY_S = 86400.0                     # 보존 정리 간격(초) — 기동 때 한 번, 그 뒤로 하루마다
 ADMIN_GROUP = "portal-admin"                # 게이트웨이가 '지금' 관리자일 때만 싣는 표지(mcp_server._ADMIN_GROUP 와 같다) — 묶음에 적지 않는다
 TRUST_OK, TRUST_BAD, TRUST_UNKNOWN = "trustworthy", "not_trustworthy", "unknown"
 
 _BATCHES: dict[str, dict] = {}
 _INDEX: dict | None = None                   # 묶음 id → 요약(_summary) — 처음 쓸 때 원장 폴더를 한 번 읽고, 쓸 때마다 고친다
 _FEEDING: set = set()
+_KICKS: set = set()                          # 요청 밖에서 도는 첫 먹이기 태스크(kick) — 끝날 때까지 붙잡아 둔다
+_LAST_PRUNE = 0.0
 _APP = None
 _TICKER = None
 
@@ -249,10 +264,12 @@ def create(app, *, name, items, concurrency=None, retries=None, stall_s=None, us
     if not name or len(name) > NAME_MAX:
         raise ValueError(f"name 은 1~{NAME_MAX}자 글이다")
     rows = _items(items, app=app, user=str(user).strip())
-    inline = sum(delib_refs.body_chars(it.get("evidence") or []) for it in rows)     # 참조 항목은 본문이 없어 0 이다
+    # 원장에 드는 것은 본문 칸 하나가 아니라 항목 전부다 — 다른 칸(text · args …)에 실은 큰 값도 센다(2차 검토 6)
+    inline = sum(len(json.dumps({"evidence": it.get("evidence"), "advanced": it.get("advanced")}, ensure_ascii=False, default=str))
+                 for it in rows)
     if inline > INLINE_MAX:
-        raise ValueError(f"항목들의 본문 근거가 합 {inline:,}자다 — 묶음 원장이 줄 선 항목의 근거를 들고 있어 {INLINE_MAX:,}자까지 받는다. 큰 근거는 "
-                         "참조({ref: {kind, id}})로 준다")
+        raise ValueError(f"항목들의 근거 · 손잡이가 JSON 으로 합 {inline:,}자다 — 묶음 원장이 줄 선 항목의 그것을 들고 있어 {INLINE_MAX:,}자까지 받는다. "
+                         "큰 근거는 참조({ref: {kind, id}})로 준다")
     cap = max(1, min(CONCURRENCY_MAX, int(delib_jobs.limits()["max_running_per_user"])))
     conc = _int("concurrency", concurrency, 1, CONCURRENCY_MAX, CONCURRENCY_DEFAULT)
     notes = []
@@ -314,13 +331,18 @@ def _terminal(it: dict, state: str, why: str = "") -> None:
         it["evidence_n"] = len(ev)
     it["evidence"] = None           # 끝난 항목의 근거(참조 또는 본문)는 원장에 남기지 않는다 — 잡의 시작 인자 파일과 같은 규칙
     it.pop("token", None)
+    it.pop("retry_at", None)
+
+
+def _backoff(n: int) -> float:
+    return min(RETRY_BACKOFF_S * (2 ** max(0, int(n) - 1)), RETRY_BACKOFF_MAX_S)
 
 
 def _failed_try(b: dict, it: dict, why: str) -> None:
-    """실패한 시도 — 시도가 1 + retries 번 안이고 묶음이 멈추지 않았으면 다시 띄우도록 pending, 아니면 failed."""
+    """실패한 시도 — 시도가 1 + retries 번 안이고 묶음이 멈추지 않았으면 물러섰다(retry_at) 다시 띄우도록 pending, 아니면 failed."""
     it.pop("stalled", None)
     if b.get("status") == "running" and int(it.get("tries") or 0) <= int(b.get("retries") or 0):
-        it.update(state="pending", job_id=None)
+        it.update(state="pending", job_id=None, retry_at=round(delib_jobs._now() + _backoff(int(it.get("tries") or 1)), 3))
         it["last_error"] = str(why)[:400]
     else:
         _terminal(it, "failed", why)
@@ -473,18 +495,19 @@ def _adopt(b: dict, it: dict) -> None:
         _terminal(it, "stopped", "묶음을 멈췄다 — 띄우지 않았다")
 
 
-def _engine_full() -> bool:
-    """엔진이 지금 받지 않을 때 — 새 심의 멈춤이거나 줄이 찼다(줄을 끈 박스는 시작이 직접 가른다). 참조를 풀기 전에 본다(반대 검토 L2)."""
-    if delib_jobs.pause_info() is not None:
-        return True
-    qm = int(delib_jobs.limits()["queue_max"])
-    return qm > 0 and len(delib_jobs._PENDING) >= qm
+def _engine_full(b: dict, it: dict) -> bool:
+    """엔진이 지금 이 사람의 잡을 받지 않을 때 — start 와 같은 판정(delib_jobs.accepts — 멈춤이거나, 이 사람이 상한에 걸렸고 줄도 찼다). 참조를 풀기 전에
+    본다(반대 검토 L2). 줄 길이만 보면 남이 줄을 채운 동안 상한에 안 걸린 이 사람의 묶음도 굶었다(2차 검토 5)."""
+    import external_llm  # noqa: PLC0415
+    import mcp_server  # noqa: PLC0415
+    return not delib_jobs.accepts(b["owner"], owner=external_llm.header_owner(b["owner"]),
+                                  delib_opts=mcp_server._build_opts(advanced=it.get("advanced")) or None)
 
 
 async def _launch(b: dict, it: dict) -> tuple[str, str]:
     """항목 하나를 띄운다 → (결과, 까닭). 결과 — started · later(멈춤 · 줄 참 — 시도로 세지 않는다) · stopped(푸는 사이 멈췄다) · refused(다시 해도
     같다 — 끝) · failed_try(실패한 시도 — retries 안이면 다시)."""
-    if _engine_full():
+    if _engine_full(b, it):
         return "later", ""
     it["state"], it["token"] = "starting", uuid.uuid4().hex
     _persist(b)                                     # 띄우기 전에 쓴다 — 재기동이 끼면 표지로 잡을 찾는다(_adopt)
@@ -502,8 +525,11 @@ async def _launch(b: dict, it: dict) -> tuple[str, str]:
     if b.get("status") != "running":                # 근거를 푸는 사이에 멈췄다 — 띄우지 않는다
         return "stopped", ""
     if refs is not None and refs["omitted"]:
-        # 묶음 항목은 근거가 다 있어야 돈다(반대 검토 M7) — 빠진 채 돌면 근거 없는 결정이 '믿을 만한' 끝으로 남는다
-        return "failed_try", "근거 참조를 다 풀지 못했다 — " + " / ".join(x["text"] for x in refs["omitted"][:5])
+        # 묶음 항목은 근거가 다 있어야 돈다(반대 검토 M7) — 빠진 채 돌면 근거 없는 결정이 '믿을 만한' 끝으로 남는다. 빠진 것이 모두 불통(시간 초과 ·
+        # 게이트웨이를 못 부름)이면 시도가 아니라 물러섰다 다시 본다(2차 검토 1).
+        why = "근거 참조를 다 풀지 못했다 — " + " / ".join(x["text"] for x in refs["omitted"][:5])
+        bad = [r for r in refs["refs"] if not r.get("ok")]
+        return ("wait" if bad and all(r.get("unreachable") for r in bad) else "failed_try"), why
     try:
         import external_llm  # noqa: PLC0415
         import mcp_server  # noqa: PLC0415 — 도구 인자 → 엔진 손잡이를 같은 함수로(_build_opts)
@@ -527,7 +553,7 @@ async def _launch(b: dict, it: dict) -> tuple[str, str]:
 def _sig(b: dict) -> tuple:
     """원장을 다시 쓸지 가르는 서명 — 묶음 상태와 항목마다 (상태 · 잡 · 시도 · 기록 수 · 믿음 · 멈춤 표지)."""
     return (b.get("status"), *((it.get("state"), it.get("job_id"), it.get("tries"), len(it.get("attempts") or []), it.get("trust"),
-                               bool(it.get("stalled"))) for it in b["items"]))
+                               bool(it.get("stalled")), it.get("retry_at"), it.get("waits")) for it in b["items"]))
 
 
 async def feed(b: dict) -> None:
@@ -537,14 +563,18 @@ async def feed(b: dict) -> None:
         return
     _FEEDING.add(b["id"])
     before = _sig(b)
+    tried: set = set()
     try:
         _reconcile(b)
         while b.get("status") == "running" and not delib_jobs._CLOSING and _APP is not None:
             if sum(1 for x in b["items"] if x.get("state") in _FLIGHT) >= int(b.get("concurrency") or 1):
                 break
-            it = next((x for x in b["items"] if x.get("state") == "pending"), None)
+            now = delib_jobs._now()
+            it = next((x for x in b["items"] if x.get("state") == "pending" and float(x.get("retry_at") or 0) <= now
+                       and x["key"] not in tried), None)
             if it is None:
                 break
+            tried.add(it["key"])            # 한 틱에서 같은 항목을 두 번 띄우지 않는다(2차 검토 1)
             outcome, why = await _launch(b, it)
             if outcome == "later":                  # 줄이 찼거나 새 심의 멈춤 — 띄우지 않았다(시도로 세지 않는다). 다음 틱에 다시 본다
                 if it.get("state") == "starting":
@@ -558,7 +588,11 @@ async def feed(b: dict) -> None:
             elif outcome == "refused":
                 _attempt(it, None, "refused", why)
                 _terminal(it, "failed", why)
-            elif outcome == "failed_try":
+            elif outcome == "wait" and int(it.get("waits") or 0) < UNREACHABLE_WAITS_MAX:
+                it["waits"] = int(it.get("waits") or 0) + 1
+                it.pop("token", None)
+                it.update(state="pending", last_error=why[:400], retry_at=round(delib_jobs._now() + _backoff(it["waits"]), 3))
+            elif outcome in ("failed_try", "wait"):
                 it["tries"] = int(it.get("tries") or 0) + 1
                 it.pop("token", None)
                 _attempt(it, None, "failed", why)
@@ -703,8 +737,9 @@ def bind(app) -> int:
     """기동 — 원장의 할 일이 남은 묶음을 메모리에 올린다(재기동 정리 reap_orphans 뒤 — 끊긴 잡이 이미 interrupted 다). 올린 수."""
     global _APP  # noqa: PLW0603
     _APP = app
-    global _INDEX  # noqa: PLW0603
+    global _INDEX, _LAST_PRUNE  # noqa: PLW0603
     _INDEX = None                           # 원장 폴더를 다시 읽는다(보존 기한이 지난 끝난 묶음은 여기서 지운다)
+    _LAST_PRUNE = delib_jobs._now()
     n = 0
     for sm in list(_index().values()):
         if sm.get("status") in _LIVE and sm["id"] not in _BATCHES:
@@ -717,7 +752,45 @@ def bind(app) -> int:
     return n
 
 
+def prune() -> int:
+    """보존 기한(KEEP_S)이 지난 끝난 묶음 원장을 지운다 — 지운 수. 기동 때(색인을 다시 읽으며)와 하루마다(tick) 돈다."""
+    global _LAST_PRUNE  # noqa: PLW0603
+    _LAST_PRUNE = delib_jobs._now()
+    n = 0
+    idx = _index()
+    for bid, sm in list(idx.items()):
+        if _expired(sm):
+            try:
+                _path(bid).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("[batch %s] 보존이 지난 원장을 못 지웠다: %r", bid, exc)
+                continue
+            idx.pop(bid, None)
+            n += 1
+    return n
+
+
+def kick(b: dict):
+    """첫 먹이기를 요청 밖(이 이벤트 루프의 따로 된 태스크)에서 돌린다 — 근거 참조 풀이가 길어도 부른 요청이 기다리지 않는다. 태스크를 돌려준다."""
+    t = asyncio.ensure_future(feed(b))
+    _KICKS.add(t)
+
+    def done(task):
+        _KICKS.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("[batch %s] 첫 먹이기 실패 — 주기 먹이기가 다시 본다: %r", b.get("id"), task.exception())
+    t.add_done_callback(done)
+    return t
+
+
 async def tick() -> None:
+    if delib_jobs._now() - _LAST_PRUNE >= PRUNE_EVERY_S:
+        try:
+            prune()
+        except Exception:  # noqa: BLE001
+            log.exception("묶음 보존 정리 실패 — 다음 틱에 다시 본다")
     for b in list(_BATCHES.values()):
         try:
             await feed(b)

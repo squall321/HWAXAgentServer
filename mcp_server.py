@@ -1634,14 +1634,15 @@ async def batch_start(*, name, items, concurrency, retries, stall_s, user: str, 
     """deliberate_batch_start · POST /deliberate/batch/start — 묶음을 만들고 곧바로 한 번 먹인다(띄울 수 있는 만큼)."""
     b = delib_batch.create(_need_app(), name=name, items=items, concurrency=concurrency, retries=retries, stall_s=stall_s,
                            user=user, groups=groups, owner_aff=aff)
-    try:
-        await delib_batch.feed(b)
-    except Exception:  # noqa: BLE001 — 묶음은 이미 원장에 있다 — 오류로 답하면 같은 이름이 잠긴 줄 모른다(주기 먹이기가 다시 본다)
-        log.exception("[batch %s] 첫 먹이기 실패 — 주기 먹이기가 다시 본다", b["id"])
+    # 첫 먹이기는 요청 밖에서 — 근거 참조 풀이(최대 RESOLVE_TOTAL_S)가 이 응답을 붙잡아 게이트웨이 호출 한도(600초)에 걸리지 않게(2차 검토). 묶음은 이미
+    # 원장에 있다 — 먹이기가 터져도 주기 먹이기가 다시 본다.
+    if b["status"] in ("running", "stopping"):
+        delib_batch.kick(b)
     out = _batch_brief(b)
     if not out["finished"]:
         paused = delib_jobs.pause_info()
-        out["note"] = (f"묶음을 시작했다({out['batch_id']}) — 동시 {b['concurrency']}건씩 차례로 띄운다. 진행 · 끝남은 deliberate_batch_status"
+        out["note"] = (f"묶음을 시작했다({out['batch_id']}) — 첫 항목은 곧(이 응답 뒤에) 띄우고 동시 {b['concurrency']}건씩 차례로 띄운다. 진행 · 끝남은 "
+                       "deliberate_batch_status"
                        "(batch_id)로 본다(끝남은 바깥으로 알리지 않는다). 다시 시작하지 마라 — 같은 이름은 돌고 있는 동안 거절된다. "
                        + ("지금 새 심의를 잠시 멈춘 서버라 풀리면 띄운다. " if paused else "")
                        + "사용자에게 batch_id 를 알려라.")
@@ -1692,8 +1693,12 @@ async def deliberate_batch_status(batch_id: Annotated[str, Field(description=_A_
     return mcp_pages.paged(out, part=part, ids=("batch_id", "status"), again={"batch_id": out["batch_id"]})
 
 
-def batch_stop(batch_id: str, *, user: str) -> dict:
-    """deliberate_batch_stop · POST /deliberate/batch/stop — 주인만(남의 것이면 PermissionError). 엔진 줄에 서 있기만 한 잡은 빼고, 도는 잡은 둔다."""
+def batch_stop(batch_id: str, *, user: str, groups=None) -> dict:
+    """deliberate_batch_stop · POST /deliberate/batch/stop — 주인만(남의 것이면 PermissionError). 엔진 줄에 서 있기만 한 잡은 빼고, 도는 잡은 둔다.
+    주인이 부르면 진행 조회처럼 묶음의 그룹을 그때의 그룹으로 고친다(delib_batch.touch — 지켜보는 도는 잡의 제자리 이어하기가 그 그룹을 본다)."""
+    b0 = delib_batch.get(str(batch_id or "").strip())
+    if b0 is not None and groups is not None:
+        delib_batch.touch(b0, user=user, groups=groups)
     b = delib_batch.stop(str(batch_id or "").strip(), by=user)
     out = _batch_brief(b)
     running = [x["job_id"] for x in out["in_engine"] if x.get("job_id")]
@@ -1712,8 +1717,8 @@ def batch_stop(batch_id: str, *, user: str) -> dict:
                        "멈춘다. 같은 이름으로 다시 시작하면 끝난 key 는 건너뛰고 남은 것만 돈다."))
 async def deliberate_batch_stop(batch_id: Annotated[str, Field(description=_A_BATCH_ID)], ctx: Context | None = None) -> dict:
     """심의 묶음 멈춤(batch_stop)."""
-    user, _groups = _caller(ctx)
-    return batch_stop(batch_id, user=user)
+    user, groups = _caller(ctx)
+    return batch_stop(batch_id, user=user, groups=groups)
 
 
 # ── 외부 응답자 과제(리스크 심사 Claude 길 X-1) — 외부 응답자 길이 열린 서버(EXTERNAL_LLM_ENABLED=1 · 설정이 맞다)에서만 등록한다 ──
