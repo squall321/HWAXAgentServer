@@ -395,6 +395,22 @@ def test_신원_없는_호출은_참조를_풀지_않는다(eng, gw, monkeypatch
     assert gw.calls == [] and delib_jobs._JOBS == {}
 
 
+def test_신원_없는_이어하기는_앞_참조를_다시_풀지_않고_잇는다(eng, gw, monkeypatch):
+    _caps(monkeypatch, 2)
+
+    async def scenario():
+        first = await m.deliberate_start("앞 회차 신원", evidence=[{"ref": {"kind": "risk_bundle", "id": "BND-A"}}], ctx=_ctx(ME))
+        await _tick()
+        a = delib_jobs.get(first["job_id"])
+        await _end(eng, a)
+        n = len(gw.calls)
+        again = await m.deliberate_continue(a["id"], human_note="운영의 이어하기", ctx=_ctx(""))
+        assert len(gw.calls) == n and "evidence_refs" not in again and "다시 풀지 않았다" in again["note"]
+        await _tick()
+
+    _play(scenario)
+
+
 def test_참조는_동시에_풀고_전체_기한을_넘은_것은_뺀다(gw, monkeypatch):
     import time as _t
 

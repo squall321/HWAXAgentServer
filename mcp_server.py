@@ -1076,7 +1076,9 @@ async def deliberate_continue(
     # 근거 참조(DL-01) — 이번에 준 참조를 그 사람 신원으로 푼다. 끝난 잡을 잇는데 근거를 주지 않았으면 앞 잡에서 실린 참조를 다시 풀어 싣는다(근거
     # 본문은 원장에 없어 종전엔 이어하기가 근거를 잃었다 — 참조는 다시 풀 수 있다). 끊긴 잡은 시작 인자 파일에 펼친 근거가 그대로 있어 잇지 않는다.
     _cu, _cg = _caller(ctx)
-    carry_refs = evidence is None and prev.get("status") != "interrupted" and bool(delib_refs.carried(prev.get("evidence_refs")))
+    # 신원 없는 호출은 참조를 풀지 않는다(delib_refs.resolve — 반대 검토 M5) — 앞 잡의 참조를 저절로 다시 풀지도 않는다(그때는 종전처럼 근거 없이 잇는다)
+    can_carry = evidence is None and prev.get("status") != "interrupted" and bool(delib_refs.carried(prev.get("evidence_refs")))
+    carry_refs = can_carry and bool(_cu.strip())
     if carry_refs:
         evidence = delib_refs.carried(prev.get("evidence_refs"))
     evidence, refs = await _expand_refs(evidence, user=_cu, groups=_cg, prev=prev)
@@ -1149,6 +1151,9 @@ async def deliberate_continue(
     if notes:
         out["note"] = " ".join(notes)
     _say_refs(out, refs, carried=carry_refs)
+    if can_carry and not carry_refs:
+        out["note"] = (f"{out.get('note') or ''} 신원 없는 호출이라 앞 잡의 근거 참조를 다시 풀지 않았다 — 근거 없이 잇는다(사람 PAT 로 게이트웨이를 거쳐 "
+                       "부르면 다시 푼다).").strip()
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
