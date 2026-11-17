@@ -1,0 +1,592 @@
+# 심의 묶음 실행 — 항목을 동시 한도 안에서 하나씩 띄우고, 같은 key 를 두 번 · 끝난 key 를 다시 돌리지 않으며, 멈춤 · 재시도 · 좌석 유실 표지를 단다(DL-02)
+"""HWAXPortal docs/request-1117 (DL-02) — deliberate_batch_start · deliberate_batch_status · deliberate_batch_stop.
+
+**규칙(굳은 것).**
+  · 같은 key 는 두 번 돌지 않는다 — 묶음 안 key 는 유일하고, 항목은 상태 기계(pending → starting → running → 끝)를 한 동기 구간에서만 넘어가며,
+    '띄우는 중(starting)' 은 띄우기 전에 원장에 쓰고 잡에 표지(batch.token)를 단다 — 재기동이 그 사이에 끼면 표지로 잡을 찾아 잇는다(새로 띄우지 않는다).
+    같은 사람의 같은 이름 묶음이 돌고 있으면 새 묶음을 받지 않는다.
+  · 끝난 key 는 다시 돌지 않는다 — done 은 끝이다. 같은 사람이 같은 이름으로 다시 시작하면 앞 묶음(가장 최근)에서 끝난 key 는 건너뛴다(skipped ·
+    done_in) — 멈춘 묶음을 같은 이름으로 다시 시작하면 남은 것만 돈다.
+  · 멈춘 뒤에는 새로 띄우지 않는다 — 멈춤은 줄 선(pending) 항목을 stopped 로 닫고, 도는 잡은 끝까지 지켜본다(접으려면 그 job_id 로 deliberate_cancel).
+  · 실패한 항목은 retries 번까지만 새 잡으로 다시 띄운다(한 항목의 시도는 1 + retries 번). 사람이 접은 잡은 다시 띄우지 않는다(cancelled). 시작 인자가
+    틀려 거절된 항목(ValueError)은 다시 해도 같아 바로 failed 다.
+  · 동시 한도 안에서 하나씩 — 이 묶음의 도는 · 줄 선 잡은 concurrency 건까지(기본 1 — 아래 CONCURRENCY_DEFAULT). 엔진의 사람별 · 전역 · 좌석 합 한도와 줄
+    (delib_jobs)은 그대로 걸린다 — 줄이 차거나 새 심의 멈춤이면 그 항목은 pending 으로 남고 다음 틱에 다시 본다(시도로 세지 않는다).
+  · 좌석 유실 — 끝난 잡의 좌석 가운데 어느 라운드든 발언하지 못한 좌석(엔진의 '좌석 유실' 알림 · 라운드별 전사 · 마지막 표결의 응답 못 함)이 하나라도
+    있으면 그 항목의 결정은 '믿을 수 없음(not_trustworthy)' 이다. 비율로 가르지 않는다 — 하나라도 빠지면 늘 그렇다.
+  · 멈춤 감지(stall_s — 기본 0 · 끔) — 켜면 도는 잡이 마지막 사건 뒤 max(stall_s, 그 잡의 quiet_ok_s) 초 넘게 조용할 때 접고 실패한 시도로 센다.
+    엔진은 시간으로 잡을 죽이지 않는다(조용한 것이 멈춘 것이 아니다 — delib_jobs.summary 의 ⚠) — 그래서 끄는 것이 기본이고 하한(STALL_FLOOR_S)을 둔다.
+  · 재기동 — 묶음 원장(<잡 원장>/batches/<id>.json, 0600)으로 넘긴다. 줄 선 잡은 엔진이 다시 세우고, 끊긴 잡(interrupted)은 제자리 이어하기
+    (delib_jobs.resume_load — deliberate_continue 의 같은 잡 길)로 잇는다. 못 이으면 실패한 시도다.
+
+**끝남 알림.** 바깥 주소로 보내지 않는다(웹훅 없음 — 사용자 결정 R-5 ③). 끝나면 묶음 원장에 finished_at · notice 를 쓰고 진행 조회
+(deliberate_batch_status)가 finished · notice 로 보인다. 포털 알림은 포털이 이 조회를 읽어 남기는 몫이다(엔진이 밀지 않는다).
+
+**권한.** 시작은 신원(사람)이 있는 호출만 — 묶음의 잡은 그 사람 이름으로 돈다(그 사람의 사람별 한도 안). 조회는 잡과 같은 규칙(주인 · 같은 소속 ·
+관리자 · 신원 없는 운영), 멈춤은 주인만(deliberate_cancel 과 같다).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+
+import delib_jobs
+import delib_refs
+
+log = logging.getLogger("agent.batch")
+
+BATCH_DIR = "batches"
+ITEMS_MAX = 200
+NAME_MAX = 120
+KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+ITEM_FIELDS = ("key", "question", "job", "evidence", "advanced")
+# 기본 동시 수 1 — 10~11석 심의 둘을 함께 돌리면 공유 LLM 에 줄을 서 거의 모든 좌석이 시간 초과로 빠졌다(11-17 요청 — 4시간 손실). 올릴 때는 좌석 수와
+# LLM 서버를 보고 올린다. 위는 엔진의 사람별 한도와 CONCURRENCY_MAX 가운데 작은 쪽이다.
+CONCURRENCY_DEFAULT = 1
+CONCURRENCY_MAX = 6
+RETRIES_DEFAULT = 1
+RETRIES_MAX = 5
+STALL_FLOOR_S = 600.0
+TICK_S = 10.0
+_LIVE = ("running", "stopping")             # 묶음이 아직 할 일이 있는 상태
+_FLIGHT = ("starting", "running")           # 항목이 엔진에 있거나 들어가는 중
+_TERMINAL = ("done", "failed", "cancelled", "stopped", "skipped")
+TRUST_OK, TRUST_BAD, TRUST_UNKNOWN = "trustworthy", "not_trustworthy", "unknown"
+
+_BATCHES: dict[str, dict] = {}
+_FEEDING: set = set()
+_APP = None
+_TICKER = None
+
+
+# ── 원장 ──────────────────────────────────────────────────────────────────────────────────────────────────
+def _dir() -> Path:
+    return delib_jobs.JOB_DIR / BATCH_DIR
+
+
+def _path(bid: str) -> Path:
+    return _dir() / f"{bid}.json"
+
+
+def _persist(b: dict) -> None:
+    """묶음 원장을 원자적으로 쓴다(폴더 0700 · 파일 0600 — 화두 · 근거가 든다). 못 쓰면 경고만 — 묶음은 메모리에서 계속 돈다."""
+    b["updated_at"] = delib_jobs._now()
+    d = _dir()
+    tmp = d / f".{b['id']}.{os.getpid()}.tmp"
+    try:
+        delib_jobs._private_dir(d)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(b, ensure_ascii=False))
+        os.replace(tmp, _path(b["id"]))
+    except (OSError, TypeError, ValueError) as exc:
+        log.warning("[batch %s] 원장을 못 썼다: %r", b.get("id"), exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load(bid: str) -> dict | None:
+    try:
+        b = json.loads(_path(bid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return b if isinstance(b, dict) and b.get("v") == 1 and isinstance(b.get("items"), list) else None
+
+
+def get(bid: str) -> dict | None:
+    return _BATCHES.get(bid) or _load(bid)
+
+
+def _all_files() -> list[dict]:
+    try:
+        files = list(_dir().glob("*.json"))
+    except OSError:
+        return []
+    out = []
+    for f in files:
+        b = _BATCHES.get(f.stem) or _load(f.stem)
+        if b is not None:
+            out.append(b)
+    return out
+
+
+# ── 만들기 ────────────────────────────────────────────────────────────────────────────────────────────────
+def _int(name: str, v, lo: int, hi: int, default: int) -> int:
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v):
+        raise ValueError(f"{name} 는 정수다 — 받은 값 {str(v)[:40]}")
+    v = int(v)
+    if not lo <= v <= hi:
+        raise ValueError(f"{name} 는 {lo}~{hi} 다 — 받은 값 {v}")
+    return v
+
+
+def _items(raw) -> list[dict]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("items 는 비지 않은 목록이다 — [{key, question, job, evidence, advanced}]")
+    if len(raw) > ITEMS_MAX:
+        raise ValueError(f"items 가 {len(raw)}건이다 — 한 묶음은 {ITEMS_MAX}건까지 받는다")
+    seen, out = set(), []
+    for i, it in enumerate(raw):
+        if not isinstance(it, dict):
+            raise ValueError(f"items[{i}] 는 객체다 — 받은 꼴: {type(it).__name__}")
+        extra = sorted(set(it) - set(ITEM_FIELDS))
+        if extra:
+            raise ValueError(f"items[{i}] 에 모르는 칸 {extra[:5]} — 받는 칸은 {' · '.join(ITEM_FIELDS)} 다")
+        key = it.get("key")
+        if not isinstance(key, str) or not KEY_RE.fullmatch(key):
+            raise ValueError(f"items[{i}].key 는 영문 · 숫자 · _.:- 64자 안의 글이다 — 받은 값: {str(key)[:40]!r}")
+        if key in seen:
+            raise ValueError(f"items 에 key {key!r} 가 둘이다 — 같은 key 는 한 묶음에 하나다(두 번 돌지 않는다)")
+        seen.add(key)
+        q = it.get("question")
+        if not isinstance(q, str) or not q.strip():
+            raise ValueError(f"items[{i}]({key}).question 이 비었다 — 심의할 화두가 필요하다")
+        job = delib_jobs.resolve_job(str(it.get("job") or "default"))
+        ev = it.get("evidence")
+        if ev is not None and not isinstance(ev, list):
+            raise ValueError(f"items[{i}]({key}).evidence 는 목록이다 — deliberate_start 의 evidence 와 같은 꼴")
+        try:
+            delib_refs.parse(ev)
+        except delib_refs.RefError as exc:
+            raise ValueError(f"items[{i}]({key}) — {exc}") from None
+        adv = it.get("advanced")
+        if adv is not None and not isinstance(adv, dict):
+            raise ValueError(f"items[{i}]({key}).advanced 는 객체다 — deliberate_start 의 advanced 와 같다")
+        out.append({"key": key, "question": q.strip(), "job": job, "evidence": list(ev) if ev else None,
+                    "advanced": dict(adv) if adv else None, "state": "pending", "job_id": None, "tries": 0, "attempts": []})
+    return out
+
+
+def _previous(owner: str, name: str) -> dict | None:
+    """같은 사람의 같은 이름 묶음 가운데 가장 최근 것."""
+    me = delib_jobs._norm(owner)
+    same = [b for b in _all_files() if delib_jobs._norm(b.get("owner")) == me and b.get("name") == name]
+    return max(same, key=lambda b: float(b.get("created_at") or 0)) if same else None
+
+
+def create(app, *, name, items, concurrency=None, retries=None, stall_s=None, user: str, groups: list, owner_aff: str = "") -> dict:
+    """묶음을 만들고 곧바로 한 번 먹인다(띄울 수 있는 만큼). 틀리면 ValueError — 아무것도 만들지 않는다."""
+    if not str(user or "").strip():
+        raise ValueError("신원 없는 호출은 묶음을 시작하지 못한다 — 묶음의 잡은 그 사람 이름으로 돈다(사람 PAT 로 게이트웨이를 거쳐 부른다)")
+    name = str(name or "").strip()
+    if not name or len(name) > NAME_MAX:
+        raise ValueError(f"name 은 1~{NAME_MAX}자 글이다")
+    rows = _items(items)
+    cap = max(1, min(CONCURRENCY_MAX, int(delib_jobs.limits()["max_running_per_user"])))
+    conc = _int("concurrency", concurrency, 1, CONCURRENCY_MAX, CONCURRENCY_DEFAULT)
+    notes = []
+    if conc > cap:
+        notes.append(f"concurrency {conc} → {cap}(엔진의 사람별 한도 안)")
+        conc = cap
+    tries = _int("retries", retries, 0, RETRIES_MAX, RETRIES_DEFAULT)
+    if stall_s is None or stall_s == 0:
+        stall = 0.0
+    else:
+        if isinstance(stall_s, bool) or not isinstance(stall_s, (int, float)) or stall_s < 0:
+            raise ValueError(f"stall_s 는 0(끔) 이상의 초다 — 받은 값 {str(stall_s)[:40]}")
+        stall = float(stall_s)
+        if stall < STALL_FLOOR_S:
+            notes.append(f"stall_s {stall:g} → {STALL_FLOOR_S:g}초(하한 — 조용한 좌석 발언 하나를 멈춘 것으로 읽지 않게)")
+            stall = STALL_FLOOR_S
+    prev = _previous(user, name)
+    if prev is not None and prev.get("status") in _LIVE:
+        raise ValueError(f"같은 이름의 묶음 {prev['id']} 가 아직 돈다 — 같은 key 를 두 번 돌리지 않는다. deliberate_batch_status 로 보거나 "
+                         "deliberate_batch_stop 으로 멈춘 뒤(끝난 뒤) 같은 이름으로 다시 시작하면 남은 key 만 돈다")
+    if prev is not None:
+        done = {it["key"]: it for it in prev.get("items") or [] if it.get("state") in ("done", "skipped")}
+        for it in rows:
+            p = done.get(it["key"])
+            if p is not None:
+                src = p.get("done_in") or {"batch_id": prev["id"], "job_id": p.get("job_id")}
+                it.update(state="skipped", job_id=src.get("job_id"), done_in=src, evidence=None,
+                          trust=p.get("trust"), seat_loss=p.get("seat_loss"))
+    now = delib_jobs._now()
+    b = {"v": 1, "id": f"batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}", "name": name, "owner": str(user).strip(),
+         "groups": list(groups or []), "owner_aff": str(owner_aff or "").strip(), "status": "running", "created_at": now,
+         "finished_at": None, "concurrency": conc, "retries": tries, "stall_s": stall, "items": rows, "notes": notes,
+         **({"previous": prev["id"]} if prev is not None else {})}
+    _BATCHES[b["id"]] = b
+    _persist(b)
+    global _APP  # noqa: PLW0603 — 먹이기가 쓰는 앱(바인드 전 시험에서도 돈다)
+    _APP = app if app is not None else _APP
+    log.info("[batch %s] 시작 %s — 항목 %d · 동시 %d · 재시도 %d · 멈춤 감지 %s", b["id"], name, len(rows), conc, tries, stall or "끔")
+    _finish_if_done(b)
+    return b
+
+
+# ── 먹이기 ────────────────────────────────────────────────────────────────────────────────────────────────
+def _attempt(it: dict, job_id, status: str, why: str = "") -> None:
+    it["attempts"] = [*(it.get("attempts") or []), {"job_id": job_id, "status": status, "at": round(delib_jobs._now(), 3),
+                                                     **({"why": str(why)[:300]} if why else {})}]
+
+
+def _terminal(it: dict, state: str, why: str = "") -> None:
+    it["state"] = state
+    if why:
+        it["error"] = str(why)[:400]
+    ev = it.get("evidence")
+    if ev:
+        it["evidence_n"] = len(ev)
+    it["evidence"] = None           # 끝난 항목의 근거(참조 또는 본문)는 원장에 남기지 않는다 — 잡의 시작 인자 파일과 같은 규칙
+    it.pop("token", None)
+
+
+def _failed_try(b: dict, it: dict, why: str) -> None:
+    """실패한 시도 — 시도가 1 + retries 번 안이고 묶음이 멈추지 않았으면 다시 띄우도록 pending, 아니면 failed."""
+    it.pop("stalled", None)
+    if b.get("status") == "running" and int(it.get("tries") or 0) <= int(b.get("retries") or 0):
+        it.update(state="pending", job_id=None)
+        it["last_error"] = str(why)[:400]
+    else:
+        _terminal(it, "failed", why)
+
+
+def seat_loss(job: dict) -> dict:
+    """끝난 잡의 좌석 유실 — {lost[좌석], by_round{라운드: [좌석]}, notices(엔진의 '좌석 유실' 알림 수), unanswered(마지막 표결에 응답 못 한 좌석),
+    transcript_capped, known}. 셋 가운데 하나라도 있으면 유실이다. known 이 거짓이면(좌석 · 표결 · 전사가 없다) 가를 수 없다."""
+    seats = [s.get("key") for s in (job.get("seats") or []) if isinstance(s, dict) and s.get("key")]
+    t = job.get("turns") or []
+    tf = job.get("turns_from")
+    tf = tf if isinstance(tf, int) and not isinstance(tf, bool) and 0 <= tf <= len(t) else 0
+    rows = t[tf:]
+    capped = any(delib_jobs._turn_cap_row(x) for x in t)
+    total = job.get("total_rounds")
+    by_round: dict = {}
+    if seats and isinstance(total, int) and total > 0 and not capped:
+        for r in range(1, total + 1):
+            spoke = {x.get("persona") for x in rows if isinstance(x, dict) and x.get("round") == r}
+            miss = [s for s in seats if s not in spoke]
+            if miss:
+                by_round[str(r)] = miss
+    unanswered = [v.get("seat") for v in (job.get("votes") or []) if isinstance(v, dict) and v.get("responded") is False]
+    notices = sum(1 for x in (job.get("evidence_omitted") or []) if isinstance(x, dict) and x.get("source") == "좌석 유실")
+    tally = job.get("tally") if isinstance(job.get("tally"), dict) else {}
+    short = int(tally.get("total") or 0) - int(tally.get("responded") or 0) if tally else 0
+    lost = list(dict.fromkeys([s for ks in by_round.values() for s in ks] + unanswered))
+    known = bool(seats or job.get("votes") or rows)
+    return {"lost": lost, "by_round": by_round, "notices": notices, "unanswered": unanswered,
+            "transcript_capped": capped, "known": known, "lost_any": bool(lost or notices or short > 0)}
+
+
+def _trust(sl: dict) -> str:
+    if sl["lost_any"]:
+        return TRUST_BAD
+    return TRUST_OK if sl["known"] else TRUST_UNKNOWN
+
+
+def _finished_job(b: dict, it: dict, job: dict) -> None:
+    """엔진이 끝낸 잡 → 항목. done 이고 결정문이 있으면 끝(좌석 유실을 본다), 그 밖은 실패한 시도 · 사람의 접기."""
+    st = job.get("status")
+    if st == "done" and (job.get("decision") or job.get("result_text")):
+        sl = seat_loss(job)
+        it["seat_loss"], it["trust"] = sl, _trust(sl)
+        _attempt(it, job["id"], "done")
+        _terminal(it, "done")
+        return
+    if st == "cancelled" and not it.get("stalled"):
+        _attempt(it, job["id"], "cancelled", job.get("error") or "")
+        _terminal(it, "cancelled", "사람이 접었다 — 다시 띄우지 않는다")
+        return
+    why = ("멈춤 감지(stall_s)로 접었다" if st == "cancelled" else
+           "결정문 없이 끝났다" if st == "done" else str(job.get("error") or st))
+    _attempt(it, job["id"], st, why)
+    _failed_try(b, it, why)
+
+
+def _resume_interrupted(b: dict, it: dict, job: dict) -> str:
+    """끊긴 잡을 제자리로 잇는다(mcp_server._resume_in_place 와 같은 길). 이었으면 '', 다음 틱에 다시 볼 일이면 'later', 못 이으면 까닭."""
+    if b.get("status") != "running":
+        return "묶음을 멈췄다 — 끊긴 잡을 다시 띄우지 않는다"
+    res, why = delib_jobs.resume_load(job, groups=list(b.get("groups") or []))
+    if res is None:
+        return f"끊겼고 제자리로 잇지 못했다({why})"
+    args = delib_jobs._read_args(job["id"]) or {}
+    res.by = b["owner"]
+    try:
+        delib_jobs.start(_APP, job.get("job") or "default", job["question"], groups=list(args.get("groups") or []),
+                         delib_opts=dict(args.get("opts") or {}), user_email=str(args.get("user_email") or ""),
+                         owner=str(args.get("owner") or ""), owner_aff=str(args.get("owner_aff") or ""), resume=res)
+    except (RuntimeError, delib_jobs.DelibPaused):
+        return "later"
+    except (ValueError, OSError) as exc:
+        return f"끊겼고 제자리로 잇지 못했다({type(exc).__name__}: {str(exc)[:160]})"
+    _attempt(it, job["id"], "resumed")
+    return ""
+
+
+def _stall(b: dict, it: dict, job: dict) -> None:
+    """멈춤 감지 — 켠 묶음에서 도는 잡이 너무 오래 조용하면 접는다(다음 틱에 cancelled 로 보고 실패한 시도로 센다)."""
+    if not b.get("stall_s") or job.get("status") != "running" or job.get("finishing"):
+        return
+    idle = delib_jobs._now() - float(job.get("updated_at") or delib_jobs._now())
+    try:
+        import mcp_server  # noqa: PLC0415 — 진행 조회와 같은 셈(quiet_ok_s)을 쓴다
+        quiet = mcp_server._quiet_ok_s(job) or 0.0
+    except Exception:  # noqa: BLE001 — 셈하지 못하면 stall_s 만 본다
+        quiet = 0.0
+    limit = max(float(b["stall_s"]), float(quiet))
+    if idle <= limit:
+        return
+    try:
+        delib_jobs.cancel(job["id"], by=b["owner"])
+    except delib_jobs.DelibFinishing:
+        return
+    except (ValueError, PermissionError) as exc:
+        log.warning("[batch %s] 멈춘 잡 %s 를 접지 못했다: %r", b["id"], job["id"], exc)
+        return
+    it["stalled"] = True
+    log.warning("[batch %s] %s 의 잡 %s 가 %.0f초 조용해(한도 %.0f초) 접었다 — 실패한 시도로 센다", b["id"], it["key"], job["id"], idle, limit)
+
+
+def _reconcile(b: dict) -> None:
+    """엔진에 있는 항목을 원장과 맞춘다(동기 — await 없음)."""
+    for it in b["items"]:
+        if it.get("state") == "starting" and it.get("token") and not it.get("job_id"):
+            _adopt(b, it)
+        if it.get("state") != "running":
+            continue
+        job = delib_jobs.get(it.get("job_id") or "")
+        if job is None:
+            _attempt(it, it.get("job_id"), "missing", "잡 원장이 없다")
+            _failed_try(b, it, "잡 원장이 없다")
+            continue
+        st = job.get("status")
+        if st in ("queued", "running"):
+            _stall(b, it, job)
+            continue
+        if st == "interrupted":
+            why = _resume_interrupted(b, it, job)
+            if why == "later" or not why:
+                continue
+            _attempt(it, job["id"], "interrupted", why)
+            if b.get("status") != "running":
+                _terminal(it, "stopped", why + f" — deliberate_continue({job['id']}) 로 이어 볼 수 있다")
+            else:
+                _failed_try(b, it, why)
+            continue
+        _finished_job(b, it, job)
+
+
+def _adopt(b: dict, it: dict) -> None:
+    """'띄우는 중' 에 끊긴 항목 — 그 표지(token)를 단 잡이 원장에 있으면 그 잡을 잇고, 없으면 pending 으로 되돌린다(띄우지 않았다)."""
+    tok = it["token"]
+    try:
+        files = list(delib_jobs.JOB_DIR.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        rec = delib_jobs._list_load(f)
+        if rec and (rec.get("batch") or {}).get("token") == tok:
+            it.update(state="running", job_id=rec["id"])
+            it["tries"] = int(it.get("tries") or 0) + 1
+            _attempt(it, rec["id"], "started")
+            return
+    it.update(state="pending")
+    it.pop("token", None)
+
+
+async def _launch(b: dict, it: dict) -> str:
+    """항목 하나를 띄운다 — 띄웠으면 '', 다음 틱에 다시 볼 일이면 'later'(줄 참 · 멈춤 — 시도로 세지 않는다), 끝낼 일이면 까닭('fail:' 머리)."""
+    it["state"], it["token"] = "starting", uuid.uuid4().hex
+    _persist(b)                                     # 띄우기 전에 쓴다 — 재기동이 끼면 표지로 잡을 찾는다(_adopt)
+    ev, refs = it.get("evidence"), None
+    try:
+        slots = delib_refs.parse(ev)
+        if slots is not None:
+            res = await delib_refs.resolve(_APP, ev, groups=list(b.get("groups") or []), user=b["owner"], slots=slots)
+            ev, refs = res["evidence"], res
+    except delib_refs.RefError as exc:
+        return f"fail:{exc}"
+    if b.get("status") != "running":                # 근거를 푸는 사이에 멈췄다 — 띄우지 않는다
+        return "stopped"
+    import external_llm  # noqa: PLC0415
+    import mcp_server  # noqa: PLC0415 — 도구 인자 → 엔진 손잡이를 같은 함수로(_build_opts)
+    opts = mcp_server._build_opts(evidence=ev, advanced=it.get("advanced"))
+    try:
+        job = delib_jobs.start(_APP, it["job"], it["question"], delib_opts=opts or None, groups=list(b.get("groups") or []),
+                               user_email=b["owner"], owner=external_llm.header_owner(b["owner"]), owner_aff=b.get("owner_aff") or "",
+                               refs=refs, batch={"id": b["id"], "key": it["key"], "token": it["token"]})
+    except (RuntimeError, delib_jobs.DelibPaused):
+        return "later"
+    except ValueError as exc:
+        return f"fail:{exc}"
+    it.update(state="running", job_id=job["id"])
+    it["tries"] = int(it.get("tries") or 0) + 1
+    _attempt(it, job["id"], "started")
+    return ""
+
+
+def _sig(b: dict) -> tuple:
+    """원장을 다시 쓸지 가르는 서명 — 묶음 상태와 항목마다 (상태 · 잡 · 시도 · 기록 수 · 믿음 · 멈춤 표지)."""
+    return (b.get("status"), *((it.get("state"), it.get("job_id"), it.get("tries"), len(it.get("attempts") or []), it.get("trust"),
+                               bool(it.get("stalled"))) for it in b["items"]))
+
+
+async def feed(b: dict) -> None:
+    """묶음 하나를 먹인다 — 엔진과 맞추고(_reconcile) 빈 자리만큼 차례대로 띄운다(_launch). 같은 묶음을 겹쳐 먹이지 않는다. 원장은 바뀐 것이 있을
+    때만 다시 쓴다(줄 선 항목의 근거 본문이 들어 있어 틱마다 쓰면 무겁다)."""
+    if b["id"] in _FEEDING or b.get("status") not in _LIVE:
+        return
+    _FEEDING.add(b["id"])
+    before = _sig(b)
+    try:
+        _reconcile(b)
+        while b.get("status") == "running" and not delib_jobs._CLOSING and _APP is not None:
+            if sum(1 for x in b["items"] if x.get("state") in _FLIGHT) >= int(b.get("concurrency") or 1):
+                break
+            it = next((x for x in b["items"] if x.get("state") == "pending"), None)
+            if it is None:
+                break
+            why = await _launch(b, it)
+            if why == "later":                      # 줄이 찼거나 새 심의 멈춤 — 띄우지 않았다(시도로 세지 않는다). 다음 틱에 다시 본다
+                it["state"] = "pending"
+                it.pop("token", None)
+            elif why == "stopped":
+                _terminal(it, "stopped", "묶음을 멈췄다 — 띄우지 않았다")
+            elif why.startswith("fail:"):
+                _attempt(it, None, "refused", why[5:])
+                _terminal(it, "failed", why[5:])
+            _persist(b)                             # '띄우는 중' 을 쓴 원장을 곧바로 고쳐 쓴다
+            before = _sig(b)
+            if why == "later":
+                break
+        _finish_if_done(b)
+        if _sig(b) != before:
+            _persist(b)
+    finally:
+        _FEEDING.discard(b["id"])
+
+
+def _counts(b: dict) -> dict:
+    c = {k: 0 for k in ("pending", "starting", "running", "done", "failed", "cancelled", "stopped", "skipped")}
+    for it in b["items"]:
+        c[it.get("state")] = c.get(it.get("state"), 0) + 1
+    c["not_trustworthy"] = sum(1 for it in b["items"] if it.get("trust") == TRUST_BAD)
+    return c
+
+
+def _finish_if_done(b: dict) -> None:
+    """모든 항목이 끝났으면 묶음을 닫는다 — done(멈춘 묶음은 stopped) · finished_at · notice. 바깥으로 알리지 않는다(진행 조회가 보인다)."""
+    if b.get("status") not in _LIVE or any(it.get("state") not in _TERMINAL for it in b["items"]):
+        return
+    b["status"] = "stopped" if b.get("status") == "stopping" else "done"
+    b["finished_at"] = delib_jobs._now()
+    c = _counts(b)
+    b["notice"] = (f"묶음 「{b['name']}」 이 끝났다({'멈춤' if b['status'] == 'stopped' else '모두 끝남'}) — 끝남 {c['done']} · 건너뜀 {c['skipped']} · "
+                   f"실패 {c['failed']} · 접힘 {c['cancelled']} · 멈춤 {c['stopped']}"
+                   + (f" · 좌석 유실로 믿을 수 없는 결정 {c['not_trustworthy']}건" if c["not_trustworthy"] else "") + ".")
+    for it in b["items"]:
+        it["evidence"] = None
+    log.info("[batch %s] %s", b["id"], b["notice"])
+
+
+# ── 멈춤 · 조회 ───────────────────────────────────────────────────────────────────────────────────────────
+def stop(bid: str, *, by: str) -> dict:
+    b = _BATCHES.get(bid) or _load(bid)
+    if b is None:
+        raise ValueError(f"그런 묶음이 없다: {bid}")
+    if delib_jobs._foreign({"user": b.get("owner")}, by):
+        raise PermissionError(f"내가 시작한 묶음이 아니다: {bid} — 멈출 수 있는 것은 제 것뿐이다")
+    if b.get("status") in _LIVE:
+        _BATCHES[bid] = b
+        b["status"] = "stopping"
+        b["stopped_by"], b["stopped_at"] = str(by or ""), delib_jobs._now()
+        for it in b["items"]:
+            if it.get("state") == "pending":
+                _terminal(it, "stopped", "묶음을 멈췄다 — 띄우지 않았다")
+        _finish_if_done(b)
+        _persist(b)
+    return b
+
+
+def can_read(b: dict, viewer: str, aff: str = "", admin: bool = False) -> bool:
+    """잡과 같은 규칙(delib_jobs.can_read — 주인 · 같은 소속 · 관리자 · 신원 없는 운영)."""
+    return delib_jobs.can_read({"user": b.get("owner"), "owner_aff": b.get("owner_aff")}, viewer, aff, admin)
+
+
+def view(b: dict) -> dict:
+    """진행 조회의 답 — 묶음 칸 · 항목마다 상태 · 잡 · 시도 · 믿음 · 좌석 유실. 도는 항목은 잡의 상태 · 단계 · 라운드 · 조용한 시간을 덧붙인다."""
+    items = []
+    for it in b["items"]:
+        row = {k: it.get(k) for k in ("key", "state", "job", "job_id", "tries", "attempts", "trust", "seat_loss", "error", "last_error",
+                                      "done_in") if it.get(k) not in (None, [], {})}
+        row.setdefault("tries", int(it.get("tries") or 0))
+        if it.get("state") == "running" and it.get("job_id"):
+            j = delib_jobs.get(it["job_id"])
+            if j is not None:
+                s = delib_jobs.summary(j)
+                row["live"] = {k: s.get(k) for k in ("status", "stage", "round", "total_rounds", "idle_s", "queue") if s.get(k) is not None}
+        items.append(row)
+    c = _counts(b)
+    finished = b.get("status") in ("done", "stopped")
+    out = {"batch_id": b["id"], "name": b["name"], "status": b["status"], "finished": finished,
+           "owner": delib_jobs._norm(b.get("owner")), "created_at": b.get("created_at"), "finished_at": b.get("finished_at"),
+           "concurrency": b.get("concurrency"), "retries": b.get("retries"), "stall_s": b.get("stall_s"),
+           "counts": c, "items": items}
+    for k in ("previous", "notes", "stopped_by", "notice"):
+        if b.get(k):
+            out[k] = b[k]
+    out["note"] = (b.get("notice") if finished else
+                   f"도는 중 — 동시 {b.get('concurrency')}건씩 차례로 띄운다(남은 {c['pending']} · 도는 {c['running'] + c['starting']}). "
+                   "끝나면 status 가 done(멈추면 stopped) · finished 가 참 · notice 가 붙는다 — 바깥으로 알리지 않는다. 몇 분 간격으로 다시 본다.")
+    return out
+
+
+# ── 기동 · 틱 ────────────────────────────────────────────────────────────────────────────────────────────
+def bind(app) -> int:
+    """기동 — 원장의 할 일이 남은 묶음을 메모리에 올린다(재기동 정리 reap_orphans 뒤 — 끊긴 잡이 이미 interrupted 다). 올린 수."""
+    global _APP  # noqa: PLW0603
+    _APP = app
+    n = 0
+    for b in _all_files():
+        if b.get("status") in _LIVE and b["id"] not in _BATCHES:
+            _BATCHES[b["id"]] = b
+            n += 1
+    if n:
+        log.info("재기동 — 할 일이 남은 심의 묶음 %d개를 다시 먹인다", n)
+    return n
+
+
+async def tick() -> None:
+    for b in list(_BATCHES.values()):
+        try:
+            await feed(b)
+        except Exception:  # noqa: BLE001 — 한 묶음의 실패가 다른 묶음을 멈추지 않는다
+            log.exception("[batch %s] 먹이기 실패 — 다음 틱에 다시 본다", b.get("id"))
+        if b.get("status") not in _LIVE:
+            _BATCHES.pop(b["id"], None)
+
+
+async def _loop() -> None:
+    while True:
+        await asyncio.sleep(TICK_S)
+        await tick()
+
+
+def start_ticker() -> None:
+    """묶음을 TICK_S 마다 먹인다 — 기동 때(mcp_server.bind, 도는 이벤트 루프 안). 루프 밖에서 부르면 아무것도 안 한다(시험)."""
+    global _TICKER  # noqa: PLW0603
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _TICKER is None or _TICKER.done():
+        _TICKER = loop.create_task(_loop(), name="delib-batch-tick")
+
+
+def stop_ticker() -> None:
+    global _TICKER  # noqa: PLW0603
+    if _TICKER is not None:
+        _TICKER.cancel()
+        _TICKER = None

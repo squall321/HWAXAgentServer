@@ -812,7 +812,10 @@ _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
               "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts", "finishing",
-              "subject")
+              "subject",
+              # 심의 묶음이 띄운 잡의 표지 {id, key, token}(HWAXPortal docs/request-1117 DL-02) — 묶음이 재기동 뒤 '띄우는 중' 이던 항목의 잡을 색인으로
+              # 찾는다(같은 key 를 두 번 띄우지 않게). 묶음 밖 잡의 색인에는 칸이 없다.
+              "batch")
 
 
 def _list_path(job_id: str) -> Path:
@@ -1403,7 +1406,7 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
           owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None,
-          refs: dict | None = None) -> dict:
+          refs: dict | None = None, batch: dict | None = None) -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
@@ -1429,7 +1432,10 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
 
     refs 는 근거 참조를 푼 결과다(delib_refs.resolve — HWAXPortal docs/request-1117 DL-01). delib_opts 의 evidence 는 이미 펼친 목록이고, 주면 풀이
     기록(refs — 본문 없음)을 잡 원장 evidence_refs 에, 빠진 참조의 까닭(omitted)을 evidence_omitted 맨 앞에 싣는다. 새 잡에만 쓴다(제자리 이어하기는
-    그 잡의 기록 그대로다). 안 주면 원장은 종전 그대로다."""
+    그 잡의 기록 그대로다). 안 주면 원장은 종전 그대로다.
+
+    batch 는 심의 묶음이 띄우는 잡의 표지 {id, key, token} 다(delib_batch — DL-02). 새 잡의 원장 · 목록 색인 batch 칸에 싣는다(요청 손잡이로는 받지
+    않는다 · 엔진에 넘기지 않는다). 안 주면 칸이 없다."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
@@ -1568,6 +1574,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     if refs is not None and resume is None:
         job["evidence_refs"] = list(refs.get("refs") or [])
         job["evidence_omitted"] = list(refs.get("omitted") or [])[:OMITTED_MAX] + list(job.get("evidence_omitted") or [])
+    if batch is not None and resume is None:
+        job["batch"] = {k: str(batch.get(k) or "") for k in ("id", "key", "token")}
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {

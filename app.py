@@ -9909,6 +9909,48 @@ async def deliberate_evidence_resolve(request: Request):
         return _dl_error("bad_request", str(exc), 422)
 
 
+# POST /deliberate/batch/start {name, items, concurrency?, retries?, stall_s?} · /status {batch_id} · /stop {batch_id} — deliberate_batch_* 와 같은 답(DL-02).
+# 시작은 신원 머리가 있어야 한다(묶음의 잡은 그 사람 이름으로 돈다). 끝남은 바깥으로 알리지 않는다 — status 의 finished · notice 를 읽는다.
+@app.post("/deliberate/batch/start")
+async def deliberate_batch_start_http(request: Request):
+    body, who, denied = await _dl_open(request, ("name", "items", "concurrency", "retries", "stall_s"))
+    if denied:
+        return denied
+    user, groups, aff, _admin = who
+    try:
+        return await _delib_mcp_module.batch_start(name=body.get("name"), items=body.get("items"), concurrency=body.get("concurrency"),
+                                                   retries=body.get("retries"), stall_s=body.get("stall_s"), user=user, groups=groups, aff=aff)
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+@app.post("/deliberate/batch/status")
+async def deliberate_batch_status_http(request: Request):
+    body, who, denied = await _dl_open(request, ("batch_id",))
+    if denied:
+        return denied
+    user, _groups, aff, admin = who
+    try:
+        return _delib_mcp_module.batch_read(body.get("batch_id"), user=user, aff=aff, admin=admin)
+    except PermissionError as exc:
+        return _dl_error("forbidden", str(exc), 403)
+    except ValueError as exc:
+        return _dl_error("batch_not_found", str(exc), 404)
+
+
+@app.post("/deliberate/batch/stop")
+async def deliberate_batch_stop_http(request: Request):
+    body, who, denied = await _dl_open(request, ("batch_id",))
+    if denied:
+        return denied
+    try:
+        return _delib_mcp_module.batch_stop(body.get("batch_id"), user=who[0])
+    except PermissionError as exc:
+        return _dl_error("forbidden", str(exc), 403)
+    except ValueError as exc:
+        return _dl_error("batch_not_found", str(exc), 404)
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.
