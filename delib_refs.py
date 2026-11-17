@@ -8,16 +8,25 @@ ref 밖의 칸을 두지 않는다 — 본문과 참조를 한 항목에 함께 
 delib_subject.call_resolver 와 같다)으로 게이트웨이의 호출 전용 별칭(<백엔드 키에서 하이픈 뺀 것>_<도구>)을 한 번 부른다. 새 토큰 · 신원 길은 없다.
 풀린 항목은 그 자리에 차례대로 펼친다.
 
-  · risk_bundle → heax-hwax_risk 의 risk_get_evidence_bundle(bundle_id=id) → 답의 evidence 를 펼친다. 펼친 evidence 를 §1 의 식으로 다시 재어 묶음의
-    fingerprint 와 다르면 그 묶음을 싣지 않는다(조용히 싣지 않는다 — 까닭을 evidence_omitted 에).
-  · 풀이 실패(권한 · 없음 · 불통 · 답 꼴 다름)는 그 항목을 빼고 evidence_omitted 에 `ref:<kind>:<id> — 까닭`. 심의는 연다.
+kind 이름은 넷 그대로다(사용자 결정 C1 — Report Archive 의 인용 source_kind 와 같은 낱말) — risk_bundle · reportarchive_file · dynaforge_report ·
+stepforge_job. 연 차례는 사용자 결정 C2(남의 판을 기다리지 않고 id 가 이미 있는 것부터).
+
+  · risk_bundle → heax-hwax_risk 의 risk_get_evidence_bundle(bundle_id=id)(contracts §1 '받기' — 리스크 앱이 짓는 중이라 그 꼴로 짓는다) → 답의
+    evidence 를 펼친다. 펼친 evidence 를 §1 의 식으로 다시 재어 묶음의 fingerprint 와 다르면 그 묶음을 싣지 않는다(조용히 싣지 않는다).
+  · reportarchive_file → reportarchive 의 download_file(file_id=id)(ReportArchive mcp_server/server.py — 답 {file_id, filename, mime_type, size, is_image,
+    encoding: base64, data_base64} · 실패는 {error}). 바이트를 주므로 **글 파일만** 싣는다(text/* · JSON · XML · YAML · CSV — UTF-8 로 풀리는 것).
+    그림 · 바이너리는 판독 규칙이 없어 빼고 까닭을 남긴다. 항목 하나.
+  · stepforge_job → heax-step_forge 의 job_status(job_id=id, full=true)(StepForge app/mcp_server.py — 없는 잡은 도구 오류 '잡 를 찾을 수 없다'). 끝난
+    (status done) 잡만 싣는다 — 결과와 그 낡음 표지(result_stale 등)를 JSON 항목 하나로. 판(source_version)은 결과의 잰 때 형상 키(result.job.geo_key)다.
+  · dynaforge_report 는 열지 않았다 — DynaForge 의 DF-01(리포트를 근거로 내는 도구)을 기다린다.
+  · 풀이 실패(권한 · 없음 · 불통 · 답 꼴 다름 · 글이 아님 · 끝나지 않음)는 그 항목을 빼고 evidence_omitted 에 `ref:<kind>:<id> — 까닭`. 심의는 연다.
   · 꼴이 틀린 참조와 열지 않은 kind 는 **잡을 만들기 전에** 거절한다(RefError) — 그대로 열면 그 근거 없이 수 시간을 돈다.
-    reportarchive_file(RA download_file 은 바이트를 base64 로 준다 — 글 근거로 바꾸는 규칙이 아직 없다) · dynaforge_report · stepforge_job(도구 · 답 꼴을
-    근거로 옮기는 규칙을 정하지 않았다)은 이름만 알고 열지 않았다.
 
 **원장.** 풀이 결과(kind · id · 실렸나 · 항목 수 · 자수 · 지문 · 시각 · 까닭)를 잡 원장 evidence_refs 에 남긴다(본문은 남기지 않는다 — 시작 인자
-파일에는 펼친 근거가 그대로 있어 재기동 · 끊긴 잡의 이어하기가 같은 근거로 돈다). deliberate_continue 는 앞 잡의 참조를 다시 풀어 같은 근거를 싣고,
-지문이 앞 잡과 같은지 적는다(previous).
+파일에는 펼친 근거가 그대로 있어 재기동 · 끊긴 잡의 이어하기가 같은 근거로 돈다). 실린 참조마다 인용 cite {source_platform, source_kind, source_id,
+source_version, scope} 를 단다 — source_version 은 답이 판을 말할 때만(리스크 묶음은 답의 cite.source_version), 아니면 null. scope 는 답이 말하는 자리
+(리스크 묶음은 답의 cite.scope, 없으면 target_key · StepForge 잡은 project_id · RA 파일은 null). deliberate_continue 는 앞 잡의 참조를 다시 풀어 같은
+근거를 싣고, 지문이 앞 잡과 같은지 적는다(previous).
 """
 from __future__ import annotations
 
@@ -32,12 +41,16 @@ import deliberation as _engine   # 근거 본문 고르기(_ev_bodies) · 상한
 
 log = logging.getLogger("agent.refs")
 
-# kind → (게이트웨이 백엔드 키, 도구, 인자 이름). 답의 꼴은 contracts §1 '받기'.
-KINDS: dict[str, tuple[str, str, str]] = {
-    "risk_bundle": ("heax-hwax_risk", "risk_get_evidence_bundle", "bundle_id"),
+# kind → (게이트웨이 백엔드 키, 도구, 인자를 짓는 함수, 인용의 source_platform). 답을 읽는 함수는 아래 _CHECKS 다(모듈 머리말).
+KINDS: dict[str, tuple] = {
+    "risk_bundle": ("heax-hwax_risk", "risk_get_evidence_bundle", lambda rid: {"bundle_id": rid}, "hwax_risk"),
+    "reportarchive_file": ("reportarchive", "download_file", lambda rid: {"file_id": rid}, "reportarchive"),
+    "stepforge_job": ("heax-step_forge", "job_status", lambda rid: {"job_id": rid, "full": True}, "step_forge"),
 }
-# 이름은 알지만 열지 않은 kind — 도구 · 답 꼴을 근거로 옮기는 규칙을 확인하지 않았다(모듈 머리말).
-NOT_OPENED = ("reportarchive_file", "dynaforge_report", "stepforge_job")
+# 이름은 정했지만 열지 않은 kind → 까닭(사용자 결정 C2 — 그 플랫폼의 판을 기다린다).
+NOT_OPENED: dict[str, str] = {
+    "dynaforge_report": "DynaForge 의 DF-01(리포트를 근거로 내는 도구)을 기다린다",
+}
 ID_MAX = 200
 _ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,%d}" % ID_MAX)
 REFS_MAX = 40                   # 한 근거 목록의 참조 수 — 펼친 뒤의 항목 수 상한은 엔진(_EVID_ITEMS)이 건다
@@ -74,8 +87,8 @@ def _ref_of(i: int, it) -> dict | None:
     kind, rid = ref.get("kind"), ref.get("id")
     if not isinstance(kind, str) or kind not in KINDS:
         if kind in NOT_OPENED:
-            raise RefError(f"evidence[{i}].ref.kind={kind} 는 아직 열지 않은 kind 다(kind not opened yet) — 도구 · 답 꼴을 근거로 옮기는 규칙을 "
-                           f"확인한 kind 만 연다. 지금 받는 kind: {' · '.join(KINDS)}. 그 근거는 도구로 뽑아 result 에 넣는다")
+            raise RefError(f"evidence[{i}].ref.kind={kind} 는 아직 열지 않은 kind 다(kind not opened yet — {NOT_OPENED[kind]}). 지금 받는 "
+                           f"kind: {' · '.join(KINDS)}. 그 근거는 도구로 뽑아 result 에 넣는다")
         raise RefError(f"evidence[{i}].ref.kind 는 {' · '.join(KINDS)} 가운데 하나다 — 받은 값: {str(kind)[:40]!r}")
     if not isinstance(rid, str) or not _ID_RE.fullmatch(rid.strip()):
         raise RefError(f"evidence[{i}].ref.id 는 영문 · 숫자 · _.:- {ID_MAX}자 안의 글이다 — 받은 값: {str(rid)[:40]!r}")
@@ -136,34 +149,114 @@ def _why_error(text: str) -> str:
     t = " ".join(str(text or "").split())
     low = t.lower()
     if low.startswith("unknown tool"):
-        return "게이트웨이에 그 도구가 없다(리스크 앱 판이 묶음 받기 전이거나 앱이 꺼졌다)"
+        return "게이트웨이에 그 도구가 없다(그 앱의 판이 이 도구 전이거나 앱이 꺼졌다)"
     if "forbidden" in low or "403" in low or "권한" in t:
         return f"권한이 없다(게이트웨이가 막았다 — {t[:160]})"
+    if "찾을 수 없" in t or "not found" in low or "404" in low:
+        return f"없다 — {t[:200]}"
     return f"도구가 오류로 답했다 — {t[:200]}"
 
 
-def _check_bundle(rid: str, text: str) -> tuple[list | None, dict]:
-    """risk_get_evidence_bundle 답 → (펼칠 evidence 또는 None, 기록 칸). contracts §1 '받기' 꼴 {bundle_id, target_key, version, fingerprint, evidence}."""
+def _scalar(v):
+    """인용 칸에 싣는 값 — 글 · 정수만(참 · 거짓 · 객체는 없음)."""
+    return v if isinstance(v, (str, int)) and not isinstance(v, bool) else None
+
+
+def _body(text: str, who: str) -> tuple[dict | None, str]:
+    """답 글 → (객체, 까닭). 앱의 MCP 도구는 예외 대신 {error, message} 로 답하기도 한다(리스크 앱 · RA — 없음 · 남의 것은 같은 not found)."""
     try:
         body = json.loads(text)
     except ValueError:
-        return None, {"why": "답을 JSON 으로 읽지 못했다"}
+        return None, "답을 JSON 으로 읽지 못했다"
     if not isinstance(body, dict):
-        return None, {"why": "답이 객체가 아니다"}
+        return None, "답이 객체가 아니다"
     if body.get("error"):
-        # 리스크 앱의 MCP 도구는 예외 대신 {error: 코드, message} 로 답한다(없음 · 남의 과제는 같은 not found — 존재를 숨긴다)
-        return None, {"why": f"리스크 앱이 거절했다({str(body.get('error'))[:40]} — {' '.join(str(body.get('message') or '').split())[:160]})"}
+        return None, f"{who} 거절했다({' '.join(str(body.get('error')).split())[:80]}" + (
+            f" — {' '.join(str(body.get('message')).split())[:160]}" if body.get("message") else "") + ")"
+    return body, ""
+
+
+def _check_bundle(rid: str, text: str) -> tuple[list | None, dict]:
+    """risk_get_evidence_bundle 답 → (펼칠 evidence 또는 None, 기록 칸). contracts §1 '받기' 꼴 {bundle_id, target_key, version, fingerprint, evidence}
+    (+ 답이 싣는 인용 cite{source_version, scope} — 있으면 판 · 자리를 그것에서 읽는다)."""
+    body, why = _body(text, "리스크 앱이")
+    if body is None:
+        return None, {"why": why}
     ev, fp = body.get("evidence"), body.get("fingerprint")
     if not isinstance(ev, list) or not all(isinstance(x, dict) for x in ev) or not isinstance(fp, str) or not _FP_RE.fullmatch(fp):
         return None, {"why": "답 꼴이 다르다 — {bundle_id, fingerprint(sha256 hex), evidence[항목 …]} 가 아니다"}
     if str(body.get("bundle_id") or "") != rid:
         return None, {"why": f"다른 묶음이 왔다(요청 {rid} · 답 {str(body.get('bundle_id'))[:60]})"}
     got = fingerprint(ev)
+    cite = body.get("cite") if isinstance(body.get("cite"), dict) else {}
     rec = {"items": len(ev), "chars": body_chars(ev), "fingerprint": got, "bundle_fingerprint": fp,
-           **{k: body[k] for k in ("target_key", "version") if isinstance(body.get(k), (str, int)) and not isinstance(body.get(k), bool)}}
+           **{k: body[k] for k in ("target_key", "version") if _scalar(body.get(k)) is not None},
+           "_version": _scalar(cite.get("source_version")),
+           "_scope": _scalar(cite.get("scope")) if cite.get("scope") is not None else _scalar(body.get("target_key"))}
     if got != fp:
         return None, {**rec, "why": f"지문이 다르다 — 묶음이 적은 {fp[:12]}… · 펼친 근거를 다시 잰 {got[:12]}…(묶음을 싣지 않았다)"}
     return ev, rec
+
+
+# RA 파일 가운데 글로 싣는 것 — mime 이 이것이거나 이름 끝이 이것이면 글이다(그 밖은 판독 규칙이 없다).
+_TEXT_MIMES = frozenset(("application/json", "application/xml", "application/x-yaml", "application/yaml", "application/csv",
+                         "application/x-ndjson", "application/ld+json"))
+_TEXT_EXTS = (".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".xml", ".yaml", ".yml", ".log")
+
+
+def _check_ra_file(rid: str, text: str) -> tuple[list | None, dict]:
+    """download_file 답(ReportArchive mcp_server/server.py) → (항목 하나 또는 None, 기록 칸). 글 파일만 UTF-8 로 풀어 싣는다. 판은 답에 없다(null)."""
+    import base64  # noqa: PLC0415 — 이 kind 만 쓴다
+    body, why = _body(text, "Report Archive 가")
+    if body is None:
+        return None, {"why": why}
+    if str(body.get("file_id") or "") != rid:
+        return None, {"why": f"다른 파일이 왔다(요청 {rid} · 답 {str(body.get('file_id'))[:60]})"}
+    name, mime = str(body.get("filename") or rid), str(body.get("mime_type") or "").split(";")[0].strip().lower()
+    meta = {"filename": name[:200], "mime_type": mime[:80], **({"size": body["size"]} if _scalar(body.get("size")) is not None else {})}
+    if body.get("encoding") != "base64" or not isinstance(body.get("data_base64"), str):
+        return None, {**meta, "why": "답 꼴이 다르다 — {file_id, encoding: base64, data_base64} 가 아니다"}
+    if body.get("is_image") or not (mime.startswith("text/") or mime in _TEXT_MIMES or name.lower().endswith(_TEXT_EXTS)):
+        return None, {**meta, "why": f"글이 아닌 파일이다({mime or '형식 모름'}) — 그림 · 바이너리는 판독 규칙이 없어 근거로 싣지 않는다"}
+    try:
+        body_text = base64.b64decode(body["data_base64"], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None, {**meta, "why": "파일을 UTF-8 글로 풀지 못했다"}
+    item = {"source": f"Report Archive 파일 · {name[:160]}", "tool": "download_file",
+            "args": json.dumps({"file_id": rid}, ensure_ascii=False), "result": body_text}
+    return [item], {**meta, "items": 1, "chars": len(body_text), "fingerprint": fingerprint([item]), "_version": None, "_scope": None}
+
+
+# StepForge job_status 답에서 근거로 싣는 칸 — 결과와 그 결과를 읽는 데 필요한 표지(잰 뒤 형상이 바뀌었나 · 낡음 · 맨 앞 경고)만(서버 경로 · 러너
+# 표식 · 로그는 싣지 않는다).
+_SF_KEEP = ("id", "kind", "project_id", "status", "finished_at", "params", "first_warning", "result", "result_stale", "result_stale_by",
+            "result_stale_note", "result_unknowns", "also_in_now")
+
+
+def _check_sf_job(rid: str, text: str) -> tuple[list | None, dict]:
+    """job_status(job_id, full=true) 답(StepForge app/mcp_server.py _job_view) → (항목 하나 또는 None, 기록 칸). 끝난(done) 잡만. 판은 결과의 잰 때
+    형상 키(result.job.geo_key — 측정 · 치수 잡의 표식), 자리는 project_id."""
+    body, why = _body(text, "StepForge 가")
+    if body is None:
+        return None, {"why": why}
+    if str(body.get("id") or "") != rid:
+        return None, {"why": f"다른 잡이 왔다(요청 {rid} · 답 {str(body.get('id'))[:60]})"}
+    st = body.get("status")
+    meta = {"job_kind": _scalar(body.get("kind")), "status": _scalar(st)}
+    if st != "done":
+        return None, {**meta, "why": f"잡이 끝나지 않았다(status {str(st)[:20]}) — 끝난(done) 잡만 근거로 싣는다"}
+    if "result" not in body:
+        return None, {**meta, "why": "끝난 잡에 결과(result)가 없다"}
+    keep = {k: body[k] for k in _SF_KEEP if k in body}
+    item = {"source": f"StepForge 잡 {str(body.get('kind') or '')[:40]} · {rid}", "tool": "job_status",
+            "args": json.dumps({"job_id": rid, "full": True}, ensure_ascii=False), "result": json.dumps(keep, ensure_ascii=False, default=str)}
+    res = body.get("result") if isinstance(body.get("result"), dict) else {}
+    mark = res.get("job") if isinstance(res.get("job"), dict) else {}
+    return [item], {**meta, "items": 1, "chars": len(item["result"]), "fingerprint": fingerprint([item]),
+                    "_version": _scalar(mark.get("geo_key")), "_scope": _scalar(body.get("project_id"))}
+
+
+_CHECKS = {"risk_bundle": _check_bundle, "reportarchive_file": _check_ra_file, "stepforge_job": _check_sf_job}
 
 
 async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "", slots: list | None = None) -> dict:
@@ -177,12 +270,12 @@ async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "",
             out.append(evidence[i])
             continue
         kind, rid = ref["kind"], ref["id"]
-        app_key, tool, arg = KINDS[kind]
+        app_key, tool, args_of, platform = KINDS[kind]
         rec: dict = {"kind": kind, "id": rid, "ok": False, "at": round(time.time(), 3)}
         try:
             is_err, text = await asyncio.wait_for(
                 call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}",
-                           args={arg: rid}), RESOLVE_TIMEOUT_S)
+                           args=args_of(rid)), RESOLVE_TIMEOUT_S)
         except asyncio.TimeoutError:
             rec["why"] = f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)"
         except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
@@ -192,10 +285,14 @@ async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "",
             if is_err:
                 rec["why"] = _why_error(text)
             else:
-                ev, got = _check_bundle(rid, text)
+                ev, got = _CHECKS[kind](rid, text)
+                version, scope = got.pop("_version", None), got.pop("_scope", None)
                 rec.update(got)
                 if ev is not None:
                     rec["ok"] = True
+                    # 인용(사용자 결정 C1) — RA 인용의 source_kind 와 같은 낱말. 판 · 자리는 답이 말할 때만(지어내지 않는다)
+                    rec["cite"] = {"source_platform": platform, "source_kind": kind, "source_id": rid, "source_version": version,
+                                   "scope": scope}
                     out.extend(ev)
         refs.append(rec)
         if not rec["ok"]:

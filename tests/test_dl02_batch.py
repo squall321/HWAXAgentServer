@@ -66,7 +66,7 @@ def _on_disk(b) -> dict:
     ([{"key": "A", "question": " "}], "비었다"),
     ([{"key": "A", "question": "q", "personas": []}], "모르는 칸"),
     ([{"key": "A", "question": "q", "job": "nope"}], "알 수 없는 심의 종류"),
-    ([{"key": "A", "question": "q", "evidence": [{"ref": {"kind": "stepforge_job", "id": "J"}}]}], "kind not opened yet"),
+    ([{"key": "A", "question": "q", "evidence": [{"ref": {"kind": "dynaforge_report", "id": "D"}}]}], "kind not opened yet"),
 ])
 def test_틀린_묶음은_만들지_않는다(bt, items, msg):
     with pytest.raises(ValueError, match=msg):

@@ -55,7 +55,8 @@ class _GW:
 
     async def __call__(self, _app, *, groups, user, user_pat, alias, args):
         self.calls.append({"groups": list(groups), "user": user, "user_pat": user_pat, "alias": alias, "args": dict(args)})
-        a = self.answers.get(args.get("bundle_id"), (False, json.dumps({"error": "E404", "message": "그런 묶음이 없다"})))
+        rid = args.get("bundle_id") or args.get("file_id") or args.get("job_id")
+        a = self.answers.get(rid, (False, json.dumps({"error": "E404", "message": "그런 묶음이 없다"})))
         if isinstance(a, BaseException):
             raise a
         if a == "slow":
@@ -82,9 +83,7 @@ def test_지문은_계약의_식이다():
 
 
 @pytest.mark.parametrize("item,msg", [
-    ({"ref": {"kind": "stepforge_job", "id": "J1"}}, "kind not opened yet"),
-    ({"ref": {"kind": "reportarchive_file", "id": "F1"}}, "kind not opened yet"),
-    ({"ref": {"kind": "dynaforge_report", "id": "D1"}}, "kind not opened yet"),
+    ({"ref": {"kind": "dynaforge_report", "id": "D1"}}, "DF-01"),
     ({"ref": {"kind": "nope", "id": "X"}}, "가운데 하나다"),
     ({"ref": {"kind": "risk_bundle"}}, "{kind, id}"),
     ({"ref": {"kind": "risk_bundle", "id": "a b"}}, "ref.id"),
@@ -135,6 +134,90 @@ def test_못_푼_참조는_빼고_까닭을_남긴다(gw, answer, why):
     assert row["source"] == r.OMIT_SOURCE and row["text"].startswith("ref:risk_bundle:BND-A — ") and why in row["text"]
 
 
+def test_실린_참조마다_인용을_단다_판은_답이_말할_때만(gw):
+    one = [{"ref": {"kind": "risk_bundle", "id": "BND-A"}}]
+    (rec,) = asyncio.run(r.resolve(object(), one, groups=[], user=ME))["refs"]
+    assert rec["cite"] == {"source_platform": "hwax_risk", "source_kind": "risk_bundle", "source_id": "BND-A", "source_version": None,
+                           "scope": "diff:합성"}, "묶음 답에 cite 가 없으면 판은 null · 자리는 target_key"
+    gw.answers["BND-A"] = (False, json.dumps({**_bundle(), "cite": {"source_version": "rev-7", "scope": "proj:합성"}}, ensure_ascii=False))
+    (rec,) = asyncio.run(r.resolve(object(), one, groups=[], user=ME))["refs"]
+    assert rec["cite"]["source_version"] == "rev-7" and rec["cite"]["scope"] == "proj:합성"
+    gw.answers["BND-A"] = (False, json.dumps(_bundle(fp="0" * 64)))
+    (rec,) = asyncio.run(r.resolve(object(), one, groups=[], user=ME))["refs"]
+    assert "cite" not in rec, "못 푼 참조에는 인용이 없다"
+
+
+# ── reportarchive_file — Report Archive download_file(file_id) ──────────────────────────────────────────────
+_RA_ID = "0a1b2c3d-0000-4000-8000-00000000abcd"
+
+
+def _ra(data: bytes, mime="text/markdown", name="note.md", **kw) -> tuple:
+    import base64
+    return False, json.dumps({"file_id": _RA_ID, "filename": name, "mime_type": mime, "size": len(data), "is_image": False,
+                              "encoding": "base64", "data_base64": base64.b64encode(data).decode("ascii"), **kw}, ensure_ascii=False)
+
+
+def test_RA_글_파일은_한_항목으로_싣는다(gw):
+    gw.answers[_RA_ID] = _ra("# 합성 메모\n값 3.5".encode("utf-8"))
+    res = asyncio.run(r.resolve(object(), [{"ref": {"kind": "reportarchive_file", "id": _RA_ID}}], groups=["CAEG"], user=ME))
+    (item,) = res["evidence"]
+    assert item == {"source": "Report Archive 파일 · note.md", "tool": "download_file", "args": json.dumps({"file_id": _RA_ID}),
+                    "result": "# 합성 메모\n값 3.5"}
+    (rec,) = res["refs"]
+    assert rec["ok"] and rec["items"] == 1 and rec["chars"] == len(item["result"]) and rec["fingerprint"] == _fp([item])
+    assert rec["cite"] == {"source_platform": "reportarchive", "source_kind": "reportarchive_file", "source_id": _RA_ID,
+                           "source_version": None, "scope": None}
+    assert gw.calls[-1]["alias"] == "reportarchive_download_file" and gw.calls[-1]["args"] == {"file_id": _RA_ID}
+
+
+@pytest.mark.parametrize("answer,why", [
+    (_ra(b"\x89PNG", mime="image/png", name="fig.png", is_image=True), "글이 아닌 파일"),
+    (_ra(b"\xff\xfe\x00", mime="text/plain", name="x.txt"), "UTF-8"),
+    ((False, json.dumps({"file_id": _RA_ID, "filename": "big.md", "mime_type": "text/markdown", "size": 9, "error": "파일이 너무 큽니다"})),
+     "Report Archive 가 거절했다"),
+    ((False, json.dumps({"error": "없는 파일"})), "Report Archive 가 거절했다"),
+])
+def test_RA_글이_아니거나_거절된_파일은_뺀다(gw, answer, why):
+    gw.answers[_RA_ID] = answer
+    res = asyncio.run(r.resolve(object(), [{"ref": {"kind": "reportarchive_file", "id": _RA_ID}}], groups=[], user=ME))
+    assert res["evidence"] == [] and why in res["refs"][0]["why"], res["refs"]
+
+
+# ── stepforge_job — StepForge job_status(job_id, full=true) ───────────────────────────────────────────────
+_SF_ID = "0190a1b2c3d4e5f60718293"
+
+
+def _sf(status="done", **kw) -> tuple:
+    body = {"id": _SF_ID, "project_id": "p-합성", "kind": "measure", "status": status, "params": {"part": "부품-가"},
+            "result": {"gap_mm": 0.12, "job": {"geo_key": "g-1234"}}, "log_path": "/서버/경로", "runner": {"build": "x"}, **kw}
+    return False, json.dumps(body, ensure_ascii=False)
+
+
+def test_StepForge_끝난_잡은_결과를_한_항목으로_싣고_판은_형상_키다(gw):
+    gw.answers[_SF_ID] = _sf(result_stale=False)
+    res = asyncio.run(r.resolve(object(), [{"ref": {"kind": "stepforge_job", "id": _SF_ID}}], groups=[], user=ME))
+    (item,) = res["evidence"]
+    body = json.loads(item["result"])
+    assert body["result"] == {"gap_mm": 0.12, "job": {"geo_key": "g-1234"}} and body["result_stale"] is False and body["status"] == "done"
+    assert "log_path" not in body and "runner" not in body, "서버 경로 · 러너 표식은 싣지 않는다"
+    assert item["tool"] == "job_status" and json.loads(item["args"]) == {"job_id": _SF_ID, "full": True}
+    (rec,) = res["refs"]
+    assert rec["cite"] == {"source_platform": "step_forge", "source_kind": "stepforge_job", "source_id": _SF_ID,
+                           "source_version": "g-1234", "scope": "p-합성"}
+    assert gw.calls[-1]["alias"] == "heaxstep_forge_job_status" and gw.calls[-1]["args"] == {"job_id": _SF_ID, "full": True}
+
+
+@pytest.mark.parametrize("answer,why", [
+    (_sf(status="running"), "끝나지 않았다"),
+    ((True, f"Error executing tool job_status: 잡 를 찾을 수 없다: {_SF_ID}"), "없다"),
+    (_sf(id="other"), "다른 잡이 왔다"),
+])
+def test_StepForge_끝나지_않았거나_없는_잡은_뺀다(gw, answer, why):
+    gw.answers[_SF_ID] = answer
+    res = asyncio.run(r.resolve(object(), [{"ref": {"kind": "stepforge_job", "id": _SF_ID}}], groups=[], user=ME))
+    assert res["evidence"] == [] and why in res["refs"][0]["why"], res["refs"]
+
+
 def test_늦은_참조는_불통으로_뺀다(gw, monkeypatch):
     monkeypatch.setattr(r, "RESOLVE_TIMEOUT_S", 0.05)
     gw.answers["BND-A"] = "slow"
@@ -182,7 +265,7 @@ def test_참조가_없는_시작은_원장이_종전_그대로다(eng, gw, monke
 def test_열지_않은_kind_는_잡을_만들기_전에_거절한다(eng, gw, monkeypatch):
     _caps(monkeypatch, 2)
     with pytest.raises(ValueError, match="kind not opened yet"):
-        asyncio.run(m.deliberate_start("거절", evidence=[{"ref": {"kind": "stepforge_job", "id": "J1"}}], ctx=_ctx(ME)))
+        asyncio.run(m.deliberate_start("거절", evidence=[{"ref": {"kind": "dynaforge_report", "id": "D1"}}], ctx=_ctx(ME)))
     assert delib_jobs._JOBS == {} and gw.calls == []
 
 
@@ -275,7 +358,7 @@ def test_HTTP_미리_보기는_머리의_신원으로_푼다(eng, gw, monkeypatc
                 headers={"Authorization": "Bearer gw-secret", "x-hwax-user": ME, "x-hwax-groups": "CAEG,feat%3Achat"})
     assert rr.status_code == 200 and rr.json()["refs"][0]["ok"] is True
     assert gw.calls[-1]["user"] == ME and gw.calls[-1]["groups"] == ["CAEG", "feat:chat"]
-    bad = c.post("/deliberate/evidence/resolve", json={"evidence": [{"ref": {"kind": "stepforge_job", "id": "J"}}]},
+    bad = c.post("/deliberate/evidence/resolve", json={"evidence": [{"ref": {"kind": "dynaforge_report", "id": "D"}}]},
                  headers={"Authorization": "Bearer gw-secret"})
     assert bad.status_code == 422 and "kind not opened yet" in bad.json()["message"]
 

@@ -255,9 +255,12 @@ _EVID_DESC = (
     f"**참조** — 항목을 본문 대신 {{ref: {{kind, id}}}} 하나로 줄 수 있다(본문 항목과 섞어 쓴다 · 한 번에 {delib_refs.REFS_MAX}건). "
     "서버가 시작 전에 **부른 사람의 신원으로** 게이트웨이를 불러 풀고 그 자리에 차례대로 펼친다 — kind "
     f"{' · '.join(delib_refs.KINDS)}(risk_bundle 은 리스크 앱 risk_get_evidence_bundle(bundle_id=id) 의 evidence 를 펼치고 지문을 다시 재어 "
-    "묶음의 fingerprint 와 다르면 싣지 않는다). 권한 · 없음 · 불통으로 못 푼 참조는 빼고 evidence_omitted 에 'ref:<kind>:<id> — 까닭' 으로, 풀이 "
-    "기록(항목 수 · 자수 · 지문 · 시각)은 잡의 evidence_refs 에 남는다. 꼴이 틀린 참조와 아직 열지 않은 kind"
-    f"({' · '.join(delib_refs.NOT_OPENED)})는 시작 전에 거절한다. 크기 · 지문만 미리 보려면 deliberate_resolve_evidence."
+    "묶음의 fingerprint 와 다르면 싣지 않는다 · reportarchive_file 은 Report Archive download_file(file_id=id) 의 글 파일(UTF-8 — 그림 · "
+    "바이너리는 싣지 않는다) 한 항목 · stepforge_job 은 StepForge job_status(job_id=id, full=true) 의 끝난(done) 잡 결과 한 항목). 권한 · 없음 · "
+    "불통 · 글이 아님 · 끝나지 않음으로 못 푼 참조는 빼고 evidence_omitted 에 'ref:<kind>:<id> — 까닭' 으로, 풀이 기록(항목 수 · 자수 · 지문 · "
+    "시각 · 인용 cite{source_platform, source_kind, source_id, source_version, scope})은 잡의 evidence_refs 에 남는다. 꼴이 틀린 참조와 아직 "
+    f"열지 않은 kind({' · '.join(f'{k} — {v}' for k, v in delib_refs.NOT_OPENED.items())})는 시작 전에 거절한다. 크기 · 지문만 미리 보려면 "
+    "deliberate_resolve_evidence."
 )
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
