@@ -3728,6 +3728,12 @@ _ROUTINE_TOOLS = frozenset({"routine_list", "routine_get", "routine_run_start", 
                             "routine_report_submit"})
 
 
+# 게이트웨이 온톨로지 조회(HWAXPortal docs/ontology-first PLAN §12 · cae00 요청 11-16 OL-1) — 개인 Claude 의 입구다. 웹 챗 · 심의 · 루틴은 도구 목록에
+# 묶지 않는다(OF-14 ④ — 챗 기본은 바이트까지 같다, 챗의 입구는 M2 측정 뒤 따로 — OF-41). 부르기는 막지 않는다 — 박스가 게이트웨이 검색 손잡이
+# onto_lookup_first 를 켜면 챗의 search_tools 답에도 첫 줄로 서므로, 그때 모델이 invoke_tool 로 부르면 닿게 둔다.
+_UNBOUND_TOOLS = frozenset({"ontology_lookup"})
+
+
 def _agent_denied(name: str) -> bool:
     """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
     n = str(name or "").strip().lower()
@@ -3747,6 +3753,8 @@ def _bindable(tool, allow_panels: bool = False) -> bool:
     표지 턴(allow_panels)은 패널 도구(HA-05 이름 집합 · `_meta.ui.resourceUri`)를 resourceUri 가 있을 때만 남기고 — 이름 집합이라도 주소가 없으면
     부를 패널이 없다 — `_meta.ui.visibility` 에 "model" 이 없는 도구(패널 전용)는 모델에 묶지 않는다."""
     n = str(getattr(tool, "name", "") or "").strip().lower()
+    if n in _UNBOUND_TOOLS:
+        return False
     if not allow_panels:
         return not _agent_denied(n)
     if any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or n in _ROUTINE_TOOLS:

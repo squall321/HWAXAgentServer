@@ -8,3 +8,12 @@ def test_일반_챗은_루틴_도구를_묶지도_invoke_tool_로_부르지도_�
         assert a._agent_denied(n) and a._agent_denied(n.upper()), n
     assert not a._agent_denied("routine_summary") and not a._agent_denied("search_tools"), "정확한 이름만"
     assert a._AGENT_DENY_TOOLS == frozenset(a._external_llm.TASK_TOOLS), "외부 응답자 과제 도구 집합은 그대로다(따로 둔다)"
+
+
+def test_게이트웨이_온톨로지_조회는_묶지_않지만_부르기는_막지_않는다():
+    """HWAXPortal docs/ontology-first PLAN §12 · OF-41 — 개인 Claude 의 입구라 웹 챗 기본(묶인 도구)은 그대로다. 표지 턴(패널)도 같다."""
+    from types import SimpleNamespace
+    t = SimpleNamespace(name="ontology_lookup", annotations=None, meta=None)
+    assert not a._bindable(t) and not a._bindable(t, allow_panels=True)
+    assert not a._agent_denied("ontology_lookup"), "invoke_tool 로는 닿는다(검색 손잡이를 켠 박스에서 챗의 search_tools 답에 선다)"
+    assert a._bindable(SimpleNamespace(name="search_tools", annotations=None, meta=None))
