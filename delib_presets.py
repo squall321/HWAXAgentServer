@@ -31,6 +31,8 @@ LOCAL_PATH = PATH.with_name("delib_presets.local.json")
 ARGS = ("job", "rounds", "modifiers", "save_report", "advanced")
 # deliberate_start 의 인자 기본값 — 이 값이면 부른 쪽이 주지 않은 것으로 본다
 DEFAULTS = {"job": "default", "rounds": 0, "modifiers": None, "save_report": True, "advanced": None}
+# 부른 쪽 advanced 에 같은 이름이 있으면 위 인자를 이기는 손잡이 — 엔진이 advanced 의 그 이름을 읽는 것만(job 은 엔진 손잡이가 아니다 — 2차 검토)
+_ADV_OVERRIDES = ("rounds", "modifiers", "save_report")
 _CACHE: dict = {"key": None, "presets": {}, "errors": [], "overlay": {"present": False}}
 
 
@@ -177,7 +179,7 @@ def apply(name: str, given: dict) -> tuple[dict, dict]:
                     cur[ak] = av
                     applied[f"advanced.{ak}"] = {"value": av, "from": "preset"}
             final["advanced"] = cur
-        elif adv_given.get(k) is not None:
+        elif k in _ADV_OVERRIDES and adv_given.get(k) is not None:
             # 부른 쪽 advanced 의 같은 이름 손잡이가 위 인자를 이긴다(mcp_server._build_opts 가 advanced 를 맨 뒤에 덮는다) — 메아리도 그것을 말한다
             applied[k] = {"value": adv_given[k], "from": "caller", "via": "advanced"}
         elif given.get(k) != DEFAULTS[k]:

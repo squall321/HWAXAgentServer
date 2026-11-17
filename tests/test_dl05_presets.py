@@ -158,3 +158,9 @@ def test_시작_설명이_묶음을_가리킨다():
     assert "preset" in t.inputSchema["properties"] and t.inputSchema["properties"]["preset"].get("default") is None
     assert "preset" in t.description and NAME in t.description
     assert "준 것으로 보지 않는다" in t.description, "기본값과 같은 인자는 묶음을 이기지 않는다는 규칙을 도구 설명에 적는다"
+
+
+def test_advanced_의_job_은_위_인자를_이기지_않는다():
+    """엔진이 advanced 로 읽는 것은 rounds · modifiers · save_report 뿐이다 — advanced.job 을 'caller via advanced' 로 말하면 거짓이다(2차 검토)."""
+    final, echo = P.apply(NAME, {"job": "default", "rounds": 0, "modifiers": None, "save_report": True, "advanced": {"job": "diagnosis"}})
+    assert final["job"] == "risk-review" and echo["applied"]["job"] == {"value": "risk-review", "from": "preset"}
