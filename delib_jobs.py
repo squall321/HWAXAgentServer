@@ -1402,7 +1402,8 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
 
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
-          owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None) -> dict:
+          owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None,
+          refs: dict | None = None) -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
@@ -1424,7 +1425,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
 
     subject 는 서버가 꼴을 보고 SP 과제 key 를 다시 확인한 심의 주제다(delib_subject.confirm — HWAXPortal docs/project-insight-graph M1). 주면
     잡 기록의 subject 칸에 싣고(제자리 이어하기로 다시 연 잡이면 그 잡에), 안 주면 그 칸을 만들지 않는다 — 주제가 없는 심의의 원장은 종전 그대로다.
-    요청 손잡이(delib_opts)로는 받지 않고 엔진에도 넘기지 않는다 — 부르는 쪽이 확인 상태를 지어내지 못하고, 결정문 · 보고서에 주제가 실리지 않는다."""
+    요청 손잡이(delib_opts)로는 받지 않고 엔진에도 넘기지 않는다 — 부르는 쪽이 확인 상태를 지어내지 못하고, 결정문 · 보고서에 주제가 실리지 않는다.
+
+    refs 는 근거 참조를 푼 결과다(delib_refs.resolve — HWAXPortal docs/request-1117 DL-01). delib_opts 의 evidence 는 이미 펼친 목록이고, 주면 풀이
+    기록(refs — 본문 없음)을 잡 원장 evidence_refs 에, 빠진 참조의 까닭(omitted)을 evidence_omitted 맨 앞에 싣는다. 새 잡에만 쓴다(제자리 이어하기는
+    그 잡의 기록 그대로다). 안 주면 원장은 종전 그대로다."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
@@ -1560,6 +1565,9 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     }
     if subject is not None:
         job["subject"] = subject
+    if refs is not None and resume is None:
+        job["evidence_refs"] = list(refs.get("refs") or [])
+        job["evidence_omitted"] = list(refs.get("omitted") or [])[:OMITTED_MAX] + list(job.get("evidence_omitted") or [])
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {

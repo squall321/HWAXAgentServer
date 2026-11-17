@@ -28,6 +28,7 @@ from pydantic import Field
 
 import delib_decision
 import delib_jobs
+import delib_refs
 import delib_resume
 import delib_subject
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
@@ -241,7 +242,14 @@ _EVID_DESC = (
     "호출자 표식(예: E1-CH-015)은 `source` 에 "
     "넣으면 [e:N] 옆에 그대로 찍힌다. 제 번호를 `key`(선택 — 영문·숫자·`_.-`, "
     f"{_engine._EVID_KEY_MAX}자 이내)에 넣으면 표지가 [e:N|KEY] 로 찍혀, 엔진 번호 N 이 빠진 항목 "
-    "때문에 밀려도 결정문의 인용을 제 원장과 맞춰 볼 수 있다. 결론이 아니라 원천만 넣어라."
+    "때문에 밀려도 결정문의 인용을 제 원장과 맞춰 볼 수 있다. 결론이 아니라 원천만 넣어라. "
+    # 근거 참조(HWAXPortal docs/request-1117 DL-01) — 받는 kind 는 delib_refs 에서 읽는다(손으로 적은 목록은 낡는다).
+    f"**참조** — 항목을 본문 대신 {{ref: {{kind, id}}}} 하나로 줄 수 있다(본문 항목과 섞어 쓴다 · 한 번에 {delib_refs.REFS_MAX}건). "
+    "서버가 시작 전에 **부른 사람의 신원으로** 게이트웨이를 불러 풀고 그 자리에 차례대로 펼친다 — kind "
+    f"{' · '.join(delib_refs.KINDS)}(risk_bundle 은 리스크 앱 risk_get_evidence_bundle(bundle_id=id) 의 evidence 를 펼치고 지문을 다시 재어 "
+    "묶음의 fingerprint 와 다르면 싣지 않는다). 권한 · 없음 · 불통으로 못 푼 참조는 빼고 evidence_omitted 에 'ref:<kind>:<id> — 까닭' 으로, 풀이 "
+    "기록(항목 수 · 자수 · 지문 · 시각)은 잡의 evidence_refs 에 남는다. 꼴이 틀린 참조와 아직 열지 않은 kind"
+    f"({' · '.join(delib_refs.NOT_OPENED)})는 시작 전에 거절한다. 크기 · 지문만 미리 보려면 deliberate_resolve_evidence."
 )
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
@@ -447,7 +455,8 @@ _A_ROUNDS = "라운드 수 — 0 이면 기본 3, 2~8 로 클램프된다."
 _A_MODIFIERS = ("얹을 층(최대 5개) — voi(교착 정산) · premortem(사전부검) · toulmin(논증 엄밀) · eliminative(완결 기준) · "
                 "anon1r(익명 1R). 언제 쓰나는 deliberate_jobs 의 modifiers.")
 _A_EVIDENCE = (f"원천 근거 [{{source, tool, args, result, key}}](최대 {_engine._EVID_ITEMS}건) — 이미 도구로 뽑아 둔 결과를 좌석에 "
-               "'검증 대상' 으로 깐다. 본문은 result 에 넣는다. 항목 · 합계 글자 상한은 도구 설명의 evidence 절과 deliberate_jobs 의 "
+               "'검증 대상' 으로 깐다. 본문은 result 에 넣는다. 항목을 {ref: {kind, id}} 참조로 주면 서버가 시작 전에 부른 사람의 신원으로 "
+               "풀어 그 자리에 펼친다(도구 설명의 evidence 절). 항목 · 합계 글자 상한은 도구 설명의 evidence 절과 deliberate_jobs 의 "
                "limits 다.")
 _A_PERSONAS = ("좌석 지정 [{key, role}] — key 는 전문가 키(recommend_agents 의 agent_type), role 은 비워도 된다. 비우면 서버가 "
                "발굴한다. 상한과 다단 심의에서 앉는 자리는 도구 설명의 personas 절이다.")
@@ -533,8 +542,9 @@ _A_KEEP_SEATS = "참(기본)이면 이전 좌석을 그대로 앉힌다(발굴 �
 _A_APPEND = ("참(기본)이면 이전 회차의 Report Archive 보고서에 페이지로 이어 붙인다(없으면 새로 만든다 — 저장하지 않고 돈 심의는 "
              "이어가도 저장하지 않는다).")
 _A_CONT_MODIFIERS = "이번 회차에 얹을 층 — 값과 상한은 deliberate_start 의 modifiers 와 같다."
-_A_CONT_EVIDENCE = ("이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같은 모양 · 상한). 이전 회차의 근거 본문은 이어지지 "
-                    "않는다 — 다시 봐야 하면 여기 다시 싣는다.")
+_A_CONT_EVIDENCE = ("이번 회차 좌석에 줄 원천 근거(deliberate_start 의 evidence 와 같은 모양 · 상한 · 참조 {ref: {kind, id}} 도 받는다). 이전 "
+                    "회차의 근거 본문은 이어지지 않는다 — 다시 봐야 하면 여기 다시 싣는다. 이전 회차가 참조로 실은 근거는 비우면 서버가 그 참조를 "
+                    "다시 풀어 싣는다(evidence_refs 의 previous.same 이 앞 회차와 지문이 같은지 말한다).")
 # 심의 주제(과제 인사이트 그래프 M1 — HWAXPortal docs/project-insight-graph PLAN §4.1 · §4.3 · §4.6). 차수 코드 · 상한 · 열쇠 꼴은 delib_subject 에서 읽는다.
 _A_SUBJECT = (
     "과제 주제(선택) — {sp_task, round, text, artifacts}. **과제 심의면 사용자에게 과제와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다**(비우면 "
@@ -629,19 +639,21 @@ async def deliberate_start(
                else type(personas[0]).__name__)
             + ". 이대로 시작하면 지정한 패널이 아니라 서버가 발굴한 좌석으로 돈다 — 고쳐서 다시 불러라"
               "(좌석을 서버에 맡기려면 personas 를 비운다).")
-    opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
-                       tools=tools, apps=apps, human_note=human_note, options=options,
-                       search_sources=search_sources, stop_after_round=stop_after_round,
-                       save_report=save_report, wiki=wiki, advanced=advanced)
     user, groups = _caller(ctx)
     adv = advanced if isinstance(advanced, dict) else {}
     subj = await _subject_for(subject, chair=delib_jobs.JOBS[delib_jobs.resolve_job(job)].get("chair") or adv.get("chair_template"),
                               started_by=adv.get("started_by"), groups=groups, user=user)
+    # 근거 참조 — 시작 전에 그 사람 신원으로 풀어 펼친다(참조가 없으면 evidence 그대로 · refs None — 종전 길)
+    evidence, refs = await _expand_refs(evidence, user=user, groups=groups)
+    opts = _build_opts(rounds=rounds, modifiers=modifiers, evidence=evidence, personas=personas,
+                       tools=tools, apps=apps, human_note=human_note, options=options,
+                       search_sources=search_sources, stop_after_round=stop_after_round,
+                       save_report=save_report, wiki=wiki, advanced=advanced)
     # owner — 외부 응답자 심의(advanced.llm=external)의 과제 주인은 게이트웨이 헤더를 푼 이름이다(과제 도구 쪽과 같은 규칙). 잡 기록의
     # 주인(user)은 종전 그대로 헤더 원문이다(견줄 때 양쪽을 delib_jobs._norm 으로 푼다). 소속은 같은 소속 열람(결정 6)이 견준다.
     rec = delib_jobs.start(_need_app(), job, question, delib_opts=opts or None,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1], subject=subj)
+                           owner_aff=_caller_view(ctx)[1], subject=subj, refs=refs)
     if personas:
         # 좌석을 지정해 연 심의의 화두 — 전문가 고르기 기준선 H 의 재료(기본 꺼짐 · 사람 · 잡은 적지 않는다, HWAXPortal docs/request-1029 design-e5 E5-2).
         # 지정 좌석은 적지 않는다 — 사람이 고른 것인지 부르는 쪽(개인 Claude)이 고른 것인지 모른다(L6).
@@ -661,7 +673,43 @@ async def deliberate_start(
                    "(그만두려면 deliberate_cancel).")
     if subj is not None:
         out["note"] += " " + delib_subject.say(subj) + "."
+    _say_refs(out, refs)
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
+
+
+async def _expand_refs(evidence, *, user: str, groups: list, prev: dict | None = None) -> tuple:
+    """근거 참조(ref {kind, id})를 시작 전에 그 사람 신원으로 푼다(delib_refs — HWAXPortal docs/request-1117 DL-01) → (펼친 근거, 풀이 결과).
+    참조가 없으면 (evidence 그대로, None) — 종전 길이다. 꼴이 틀리거나 열지 않은 kind 면 RefError(ValueError — 잡을 만들기 전에 거절한다). 새 심의를
+    멈춘 서버면 게이트웨이를 부르기 전에 거절한다(시작이 어차피 거절한다). prev 를 주면(이어하기) 앞 잡의 같은 참조와 지문을 견준다."""
+    slots = delib_refs.parse(evidence)
+    if slots is None:
+        return evidence, None
+    paused = delib_jobs.pause_info()
+    if paused:
+        raise delib_jobs.DelibPaused(paused)
+    res = await delib_refs.resolve(_need_app(), evidence, groups=groups, user=user, slots=slots)
+    if prev is not None:
+        delib_refs.compare(res["refs"], prev.get("evidence_refs"), prev["id"])
+    return res["evidence"], res
+
+
+def _say_refs(out: dict, refs: dict | None, carried: bool = False) -> None:
+    """시작 · 이어하기 응답에 풀이 기록(evidence_refs)과 안내 한 줄을 싣는다 — 참조가 없으면 아무것도 안 한다(응답은 종전 그대로)."""
+    if refs is None:
+        return
+    out["evidence_refs"] = refs["refs"]
+    line = (("앞 잡의 근거 참조를 다시 풀어 실었다 — " if carried else "") + delib_refs.say(refs["refs"]))
+    out["note"] = f"{out.get('note') or ''} {line}".strip()
+
+
+async def resolve_preview(evidence, *, user: str, groups: list) -> dict:
+    """deliberate_resolve_evidence · POST /deliberate/evidence/resolve — 참조를 풀어 크기 · 지문만 낸다(잡을 만들지 않는다 · 본문 없음)."""
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("evidence 는 비지 않은 목록이다 — deliberate_start 의 evidence 와 같은 꼴")
+    slots = delib_refs.parse(evidence)
+    res = (await delib_refs.resolve(_need_app(), evidence, groups=groups, user=user, slots=slots) if slots is not None
+           else {"evidence": [e for e in evidence if isinstance(e, dict)], "refs": [], "omitted": []})
+    return delib_refs.preview(res, len(evidence), _evid_limits())
 
 
 async def _subject_for(subject, *, chair, started_by, groups: list, user: str) -> dict | None:
@@ -711,7 +759,7 @@ def _resume_summary(prev: dict, done: int, cap: int) -> str:
 
 
 def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int, non_negotiables, advanced, evidence,
-            ctx, subject: dict | None = None) -> dict:
+            ctx, subject: dict | None = None, refs: dict | None = None) -> dict:
     """재기동으로 끊긴(interrupted) 잡을 남은 라운드만 이어 돈다(HWAXPortal docs/delib-ops R3).
 
     처음 인자는 시작 인자 파일(R2)에서 그대로 쓴다 — 근거 본문 · 지정 좌석 · 사람 의견 · 손잡이. 없으면(이 판 이전의 잡) 원장의 손잡이만
@@ -728,7 +776,10 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     줄어듦 · 상한 넘김 · 바꾼 값) 아래 요약 길이고, 그 까닭을 응답 note 와 resumed.why 에 싣는다. 남의 이어하기는 일지를 읽지도 않는다.
 
     subject 는 이 이어하기의 주제다(deliberate_continue 가 정한다 — 앞 잡의 주제거나, 앞 잡에 없을 때 이번에 단 것). 제자리면 그 잡에, 요약 길이면
-    새 잡에 싣는다. 주제는 바꾼 값으로 치지 않는다 — 엔진에 가지 않는 잡 기록의 칸이라 끊긴 자리에서 잇는 데 걸리지 않는다."""
+    새 잡에 싣는다. 주제는 바꾼 값으로 치지 않는다 — 엔진에 가지 않는 잡 기록의 칸이라 끊긴 자리에서 잇는 데 걸리지 않는다.
+
+    refs 는 이번에 준 근거 참조를 푼 결과다(evidence 는 이미 펼친 목록 — DL-01). 참조를 줬으면 다 못 풀어 펼친 근거가 비어도 바꾼 값이다(요약 길 · 새
+    잡의 evidence_refs 에 빠진 까닭이 남는다)."""
     pid = prev["id"]
     if prev.get("resumed_by"):
         raise ValueError(f"{pid} 는 이미 이어 돌렸다 → {prev['resumed_by']} — 그 잡을 deliberate_status 로 본다")
@@ -741,7 +792,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
     # 제자리 이어하기를 못 하는 까닭 — 일지를 읽지 않고 가를 수 있는 것부터(남에게는 일지를 읽지 않는다 — HA-06). 결정문이 원장에 있어도(결정문
     # 사건 뒤 · 결과 전에 끊겼다) 제자리로 잇는다 — 끝난 단계(의장 · 보고서 · 위키)를 다시 하지 않고 결과를 끝까지 낸다(HA-09 S3).
     changed = [k for k, v in (("human_note", bool(human_note and human_note.strip())), ("rounds", bool(rounds)),
-                              ("non_negotiables", bool(non_negotiables)), ("evidence", bool(evidence)),
+                              ("non_negotiables", bool(non_negotiables)), ("evidence", bool(evidence) or refs is not None),
                               ("advanced", isinstance(advanced, dict) and any(x is not None for x in advanced.values()))) if v]
     why = ("남의 심의다 — 재개 자료(그 사람이 본 근거 · 지식카드 · 발언)는 주인의 이어하기만 쓴다" if foreign else
            f"이어 돌리며 바꾼 값이 있다({' · '.join(changed)}) — 끊긴 자리에서 그대로 잇는 길은 처음 인자 그대로만 돈다" if changed else "")
@@ -811,7 +862,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         o["append_to_report_id"] = int(prev["report_id"])     # 보고서 단계에서 끊겼으면 그 보고서에 잇는다
     rec = delib_jobs.start(_need_app(), prev.get("job") or "default", prev["question"], delib_opts=o,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1], subject=subject)
+                           owner_aff=_caller_view(ctx)[1], subject=subject, refs=refs)
     rec["resumed_from"] = pid
     delib_jobs._persist(rec)
     if foreign:
@@ -838,6 +889,7 @@ def _resume(prev: dict, *, human_note: str, question: str, job: str, rounds: int
         [] if args is not None else ["시작 인자 파일이 없는 잡이라(이 판 이전) 처음 근거 본문 · 지정 좌석 역할 전문은 잇지 못했다 — "
                                      "다시 봐야 하면 evidence 로 싣는다."])
     out["note"] = " ".join(notes)
+    _say_refs(out, refs)
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
@@ -934,7 +986,8 @@ _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 adva
                  "(그 보고서에 이어 붙는다), 다단 심의(sim-plan·test-plan·build-plan)로는 이어받지 않는다. "
                  "봉인 없이 돈 심의를 봉인으로 이어받지도 않는다. 열어서 다시 보려면 새 심의를 시작한다. "
                  "이전 회차의 근거(evidence) 본문은 원장에 건수만 남아 **이어지지 않는다** — 좌석이 다시 봐야 하면 "
-                 "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한). 응답의 question 이 길어 "
+                 "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한). 단 이전 회차가 참조({ref: {kind, id}})로 실은 "
+                 "근거는 evidence 를 비우면 그 참조를 다시 풀어 싣는다(응답 evidence_refs — previous.same 이 지문이 같은지). 응답의 question 이 길어 "
                  "Claude Code 의 MCP 결과 상한을 넘으면 deliberate_start 처럼 머리만 싣는다(question_chars·note)."),
 )
 async def deliberate_continue(
@@ -989,9 +1042,16 @@ async def deliberate_continue(
         raise ValueError(f"{previous_job_id} 는 이미 같은 잡에서 이어 돌고 있다(시도 {len(prev['attempts'])}번째 · {prev['status']}) — "
                          "다시 잇지 않는다. 진행은 deliberate_status 로 본다")
     subj, subj_note = await _cont_subject(prev, subject, job=job, advanced=advanced, ctx=ctx)
+    # 근거 참조(DL-01) — 이번에 준 참조를 그 사람 신원으로 푼다. 끝난 잡을 잇는데 근거를 주지 않았으면 앞 잡에서 실린 참조를 다시 풀어 싣는다(근거
+    # 본문은 원장에 없어 종전엔 이어하기가 근거를 잃었다 — 참조는 다시 풀 수 있다). 끊긴 잡은 시작 인자 파일에 펼친 근거가 그대로 있어 잇지 않는다.
+    _cu, _cg = _caller(ctx)
+    carry_refs = evidence is None and prev.get("status") != "interrupted" and bool(delib_refs.carried(prev.get("evidence_refs")))
+    if carry_refs:
+        evidence = delib_refs.carried(prev.get("evidence_refs"))
+    evidence, refs = await _expand_refs(evidence, user=_cu, groups=_cg, prev=prev)
     if prev.get("status") == "interrupted":
         out = _resume(prev, human_note=human_note, question=question, job=job, rounds=rounds,
-                      non_negotiables=non_negotiables, advanced=advanced, evidence=evidence, ctx=ctx, subject=subj)
+                      non_negotiables=non_negotiables, advanced=advanced, evidence=evidence, ctx=ctx, subject=subj, refs=refs)
         if subj_note:
             out["note"] = f"{out.get('note') or ''} {subj_note}".strip()
         return out
@@ -1043,7 +1103,7 @@ async def deliberate_continue(
     rec = delib_jobs.start(_need_app(), job,
                            question or prev["question"], delib_opts=opts,
                            groups=groups, user_email=user, owner=external_llm.header_owner(user),
-                           owner_aff=_caller_view(ctx)[1], subject=subj)
+                           owner_aff=_caller_view(ctx)[1], subject=subj, refs=refs)
     # 앞 잡을 원장에도 적는다 — 과제 인사이트의 카드가 앞 카드를 continues 로 잇는다(HWAXPortal docs/project-insight-graph contracts §2). 종전엔
     # 응답의 continued_from 에만 있었다. 끊긴 잡의 요약 이어하기(_resume)는 resumed_from 을 이미 적는다.
     rec["continues"] = previous_job_id
@@ -1057,6 +1117,7 @@ async def deliberate_continue(
         if foreign and append_report else []) + ([subj_note] if subj_note else [])
     if notes:
         out["note"] = " ".join(notes)
+    _say_refs(out, refs, carried=carry_refs)
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
@@ -1380,6 +1441,24 @@ async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_
     return mcp_pages.paged(out, part=part, ids=_TRANSCRIPT_IDS, tail=("note",),
                            again={"job_id": job_id, "round": round, "seat": seat,
                                   "offset": out["offset"], "limit": out["limit"], "full": full})
+
+
+_A_RESOLVE_EVIDENCE = ("미리 볼 근거 — deliberate_start 의 evidence 와 같은 꼴이다(본문 항목 {source, tool, args, result, key} 와 참조 "
+                       "{ref: {kind, id}} 를 섞어 쓴다).")
+
+
+@mcp.tool(title="근거 참조 미리 보기 — 크기 · 지문만",
+          description=("deliberate_start 에 넣을 evidence 의 참조({ref: {kind, id}})를 **부른 사람의 신원으로** 지금 풀어 크기 · 지문만 본다 — "
+                       "잡을 만들지 않고 본문을 돌려주지 않는다. 답 — refs(참조마다 kind · id · ok · items · chars · fingerprint · "
+                       "bundle_fingerprint · at · why), inline(본문 항목 수 · 자수), expanded(펼친 뒤 항목 수 · 자수 · 지문), limits(지금 걸리는 "
+                       "근거 상한 — deliberate_jobs 의 limits 와 같다), over(상한을 넘으면 그 까닭), omitted(시작하면 evidence_omitted 에 실릴 줄). "
+                       f"받는 kind — {' · '.join(delib_refs.KINDS)}. 꼴이 틀린 참조 · 아직 열지 않은 kind({' · '.join(delib_refs.NOT_OPENED)})는 "
+                       "시작과 같은 글로 거절한다. 미리 본 뒤 묶음이 바뀌면 시작할 때의 지문이 달라진다(시작이 다시 푼다)."))
+async def deliberate_resolve_evidence(evidence: Annotated[list[dict], Field(description=_A_RESOLVE_EVIDENCE)],
+                                      ctx: Context | None = None) -> dict:
+    """근거 참조 미리 보기(HWAXPortal docs/request-1117 DL-01) — resolve_preview 와 같다(HTTP 창구 POST /deliberate/evidence/resolve 도)."""
+    user, groups = _caller(ctx)
+    return await resolve_preview(evidence, user=user, groups=groups)
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",

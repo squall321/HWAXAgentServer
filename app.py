@@ -9896,6 +9896,19 @@ async def deliberate_result_decision(request: Request):
     return delib_decision.build(job)
 
 
+# POST /deliberate/evidence/resolve {evidence} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음). 참조는 머리의 신원으로 푼다.
+@app.post("/deliberate/evidence/resolve")
+async def deliberate_evidence_resolve(request: Request):
+    body, who, denied = await _dl_open(request, ("evidence",))
+    if denied:
+        return denied
+    user, groups, _aff, _admin = who
+    try:
+        return await _delib_mcp_module.resolve_preview(body.get("evidence"), user=user, groups=groups)
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.
