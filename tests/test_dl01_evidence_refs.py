@@ -453,3 +453,47 @@ def test_설명은_kind_목록을_모듈에서_읽는다():
         assert k in tools["deliberate_start"].description and k in tools["deliberate_resolve_evidence"].description
     for k in r.NOT_OPENED:
         assert k in tools["deliberate_start"].description
+
+
+# ── 2차 검토(4 · 7 · 9) ──────────────────────────────────────────────────────────────────────────────────────────
+def test_다시_푼_참조는_source_key_를_잃지_않고_지문이_같다(gw):
+    gw.answers[_SF_ID] = _sf()
+    ev = [{"ref": {"kind": "stepforge_job", "id": _SF_ID}, "source": "내 출처", "key": "SF-1"}]
+    first = asyncio.run(r.resolve(object(), ev, groups=[], user=ME))
+    again = r.carried(first["refs"])
+    assert again == ev, "이어하기가 곁 칸까지 같은 꼴로 다시 싣는다"
+    second = asyncio.run(r.resolve(object(), again, groups=[], user=ME))
+    r.compare(second["refs"], first["refs"], "job-1")
+    assert second["evidence"][0]["key"] == "SF-1" and second["refs"][0]["previous"]["same"] is True
+
+
+@pytest.mark.parametrize("item", [
+    {"ref": {"kind": "stepforge_job", "id": "j1"}, "result": None},
+    {"ref": {"kind": "stepforge_job", "id": "j1"}, "text": ""},
+    {"ref": {"kind": "stepforge_job", "id": "j1"}, "result": []},
+])
+def test_빈_본문_칸은_본문이_아니라_참조다(item):
+    (slot,) = r.parse([item])
+    assert slot[1] == {"kind": "stepforge_job", "id": "j1"}, "엔진이 고를 본문이 없으면 참조다(말없이 빠지지 않는다)"
+
+
+def test_부른_쪽이_접으면_게이트웨이_호출도_접는다(monkeypatch):
+    done, started = [], []
+
+    async def slow(_app, *, groups, user, user_pat, alias, args):
+        started.append(args)
+        await asyncio.sleep(0.5)
+        done.append(args)
+        return True, "x"
+    monkeypatch.setattr(r, "call_alias", slow)
+
+    async def main():
+        ev = [{"ref": {"kind": "stepforge_job", "id": f"j{i}"}} for i in range(5)]
+        t = asyncio.ensure_future(r.resolve(object(), ev, groups=[], user=ME))
+        await asyncio.sleep(0.1)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        await asyncio.sleep(0.7)
+    asyncio.run(main())
+    assert started and done == [], "접힌 뒤에 끝난 게이트웨이 호출이 없다"

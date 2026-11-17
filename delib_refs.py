@@ -79,12 +79,12 @@ REF_SIDE = ("source", "key")      # 참조 항목에 함께 둘 수 있는 칸 �
 
 
 def _ref_of(i: int, it) -> dict | None:
-    """항목 하나가 참조면 {kind, id(, source, key)}, 아니면 None. 참조는 ref 가 **객체**이고 본문 칸(_EVID_BODY_KEYS)이 하나도 없는 항목뿐이다 —
-    ref 가 글이거나 본문이 있는 항목은 종전처럼 보통 근거다(반대 검토 M3 — 출처 표식으로 ref 글을 실어 보내던 호출이 깨지지 않게). 참조의 꼴이
-    틀리면 RefError."""
-    if not isinstance(it, dict) or not isinstance(it.get("ref"), dict) or any(k in it for k in _engine._EVID_BODY_KEYS):
+    """항목 하나가 참조면 {kind, id(, source, key)}, 아니면 None. 참조는 ref 가 **객체**이고 엔진이 고를 본문(_ev_bodies — 비지 않은 본문 칸)이
+    없는 항목뿐이다 — ref 가 글이거나 본문이 있는 항목은 종전처럼 보통 근거다(반대 검토 M3 — 출처 표식으로 ref 글을 실어 보내던 호출이 깨지지
+    않게). 빈 본문 칸({"result": null} · {"text": ""})은 본문이 아니다 — 그런 항목도 참조다(2차 검토 7 — 종전엔 말없이 빠졌다). 꼴이 틀리면 RefError."""
+    if not isinstance(it, dict) or not isinstance(it.get("ref"), dict) or _engine._ev_bodies(it):
         return None
-    extra = sorted(set(it) - {"ref", *REF_SIDE})
+    extra = sorted(set(it) - {"ref", *REF_SIDE, *_engine._EVID_BODY_KEYS})
     if extra:
         raise RefError(f"evidence[{i}] 는 참조(ref) 항목인데 모르는 칸 {extra[:5]} 이 함께 있다 — 참조 항목은 {{ref: {{kind, id}}, source?, key?}} 다"
                        "(본문은 result 를 쓴 따로 된 항목으로)")
@@ -270,16 +270,19 @@ async def _resolve_one(app, ref: dict, *, groups, user: str, user_pat: str) -> t
     kind, rid = ref["kind"], ref["id"]
     app_key, tool, args_of, platform = KINDS[kind]
     rec: dict = {"kind": kind, "id": rid, "ok": False, "at": round(time.time(), 3)}
+    side = {k: ref[k] for k in REF_SIDE if k in ref}
+    if side:
+        rec["side"] = side          # 이어하기가 같은 꼴로 다시 풀게(carried) — 한 항목 kind 는 이것이 지문에 든다(2차 검토 4)
     try:
         is_err, text = await asyncio.wait_for(
             call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}", args=args_of(rid)),
             RESOLVE_TIMEOUT_S)
     except asyncio.TimeoutError:
-        rec["why"] = f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)"
+        rec.update(why=f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)", unreachable=True)
         return None, rec
     except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
         log.warning("근거 참조 %s 풀이 실패: %r", label(kind, rid), exc)
-        rec["why"] = f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)"
+        rec.update(why=f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)", unreachable=True)
         return None, rec
     if is_err:
         rec["why"] = _why_error(text)
@@ -316,8 +319,13 @@ async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "",
         async with sem:
             return await _resolve_one(app, ref, groups=groups, user=user, user_pat=user_pat)
     tasks = {i: asyncio.ensure_future(one(ref)) for i, ref in slots if ref is not None}
-    if tasks:
-        _done, late = await asyncio.wait(list(tasks.values()), timeout=RESOLVE_TOTAL_S)
+    try:
+        if tasks:
+            await asyncio.wait(list(tasks.values()), timeout=RESOLVE_TOTAL_S)
+    finally:
+        # 전체 기한을 넘었거나 부른 쪽이 접었다(요청이 끊김 · 묶음 멈춤) — 남은 게이트웨이 호출을 접고 끝날 때까지 기다린다(2차 검토 9 — 종전엔 부른
+        # 쪽이 접혀도 호출이 남아 돌았다)
+        late = [t for t in tasks.values() if not t.done()]
         for t in late:
             t.cancel()
         if late:
@@ -330,7 +338,8 @@ async def resolve(app, evidence: list, *, groups, user: str, user_pat: str = "",
         t = tasks[i]
         if t.cancelled():
             ev, rec = None, {"kind": ref["kind"], "id": ref["id"], "ok": False, "at": round(time.time(), 3),
-                             "why": f"전체 기한 {RESOLVE_TOTAL_S:g}초 안에 풀지 못했다(불통)"}
+                             "why": f"전체 기한 {RESOLVE_TOTAL_S:g}초 안에 풀지 못했다(불통)", "unreachable": True,
+                             **({"side": {k: ref[k] for k in REF_SIDE if k in ref}} if any(k in ref for k in REF_SIDE) else {})}
         elif t.exception() is not None:
             log.warning("근거 참조 %s 답 읽기 실패: %r", label(ref["kind"], ref["id"]), t.exception())
             ev, rec = None, {"kind": ref["kind"], "id": ref["id"], "ok": False, "at": round(time.time(), 3),
@@ -356,8 +365,9 @@ def compare(refs: list, prev_refs, prev_job_id: str) -> None:
 
 def carried(prev_refs) -> list:
     """앞 잡에서 실린 참조 → 다시 풀 근거 목록([{ref}] — 실리지 못한 참조는 잇지 않는다)."""
-    return [{"ref": {"kind": r["kind"], "id": r["id"]}} for r in (prev_refs or [])
-            if isinstance(r, dict) and r.get("ok") and r.get("kind") in KINDS and isinstance(r.get("id"), str)]
+    return [{"ref": {"kind": r["kind"], "id": r["id"]},
+             **{k: v for k, v in (r.get("side") or {}).items() if k in REF_SIDE and isinstance(v, str)}}
+            for r in (prev_refs or []) if isinstance(r, dict) and r.get("ok") and r.get("kind") in KINDS and isinstance(r.get("id"), str)]
 
 
 def say(refs: list) -> str:
