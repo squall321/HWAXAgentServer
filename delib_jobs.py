@@ -1576,6 +1576,11 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
         job["evidence_omitted"] = list(refs.get("omitted") or [])[:OMITTED_MAX] + list(job.get("evidence_omitted") or [])
     if batch is not None and resume is None:
         job["batch"] = {k: str(batch.get(k) or "") for k in ("id", "key", "token")}
+    if resume is None and isinstance(opts.get("evidence"), list) and opts["evidence"]:
+        # 근거 항목마다 낱말 색인(수 · ID · 부품 번호 · 넷 이름 — 본문은 남기지 않는다) — 결정문 원천 대조(deliberate_verify, HWAXPortal docs/request-1117
+        # DL-04)가 끝난 뒤에도 '그 값이 든 근거 항목' 을 말하게. 근거 본문은 시작 인자 파일과 함께 끝나면 지워진다.
+        import delib_verify  # noqa: PLC0415 — 늦은 import(deliberation 을 읽는다 — 위의 늦은 import 와 같다)
+        job["evidence_index"] = delib_verify.index(opts["evidence"])
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {

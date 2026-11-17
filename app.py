@@ -9896,6 +9896,21 @@ async def deliberate_result_decision(request: Request):
     return delib_decision.build(job)
 
 
+# POST /deliberate/verify {job_id, scope?, forbidden?} — deliberate_verify 와 같은 답(DL-04 — 쪽 나누기 없이 한 번에).
+@app.post("/deliberate/verify")
+async def deliberate_verify_http(request: Request):
+    body, who, denied = await _dl_open(request, ("job_id", "scope", "forbidden"))
+    if denied:
+        return denied
+    job, denied = _dl_job(body, who)
+    if denied:
+        return denied
+    try:
+        return _delib_mcp_module.verify_job(job, scope=body.get("scope") or "num,id,part,net", forbidden=body.get("forbidden"))
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
 # POST /deliberate/evidence/resolve {evidence} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음). 참조는 머리의 신원으로 푼다.
 @app.post("/deliberate/evidence/resolve")
 async def deliberate_evidence_resolve(request: Request):

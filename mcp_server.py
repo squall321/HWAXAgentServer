@@ -32,6 +32,7 @@ import delib_jobs
 import delib_refs
 import delib_resume
 import delib_subject
+import delib_verify
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
 import external_llm
 import mcp_pages
@@ -1452,6 +1453,49 @@ async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_
     return mcp_pages.paged(out, part=part, ids=_TRANSCRIPT_IDS, tail=("note",),
                            again={"job_id": job_id, "round": round, "seat": seat,
                                   "offset": out["offset"], "limit": out["limit"], "full": full})
+
+
+_A_VERIFY_SCOPE = (f"볼 낱말 종류를 쉼표로 — {','.join(delib_verify.KINDS)}(수 — 작은 정수까지 · ID 꼴 코드 · 부품 번호 · 넷 이름). 기본은 넷 다.")
+_A_VERIFY_FORBIDDEN = (f"결정문에 나오면 안 되는 값(선택, {delib_verify.FORBIDDEN_MAX}개까지 · 값마다 {delib_verify.FORBIDDEN_LEN}자) — 낱말 경계로 "
+                       "찾아('53' 이 '1532' 에 걸리지 않는다) 자리와 수를 준다. 예 — 앞 판 쌍의 비교값.")
+
+
+def verify_job(job: dict, *, scope, forbidden) -> dict:
+    """deliberate_verify · POST /deliberate/verify — 낱말 대조(delib_verify.verify)에 쪽 이음 점검(결정문이 있을 때 — deliberate_result 의 full ·
+    summary 를 같은 쪽 나누기로 받아 잇는다)을 붙인다."""
+    jid = job["id"]
+    pages = None
+    if delib_decision.decision_text(job):
+        full = _result_full(job)
+        summ = _result_summary(jid, job, full)
+        pages = {"page_chars": mcp_pages.PAGE_CHARS,
+                 "full": delib_verify.page_join(full, lambda p: mcp_pages.paged(full, part=p, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True,
+                                                                                again={"job_id": jid})),
+                 "summary": delib_verify.page_join(summ, lambda p: mcp_pages.paged(summ, part=p, ids=_JOB_IDS, tail=("decision",),
+                                                                                   again={"job_id": jid, "view": "summary"}))}
+    return delib_verify.verify(job, scope=scope, forbidden=forbidden, pages=pages)
+
+
+@mcp.tool(title="결정문 원천 대조 — 수 · ID · 부품 번호 · 넷 이름",
+          description=("끝난 심의의 결정문에서 수(작은 정수까지) · ID 꼴 코드 · 부품 번호 · 넷 이름을 낱말로 뽑아, 낱말마다 결정문의 자리(pos)와 그 값이 "
+                       "든 근거 항목 key(없으면 'no source')를 준다 — totals 는 종류마다 낱말 수 · 서로 다른 값 수 · 출처 없는 값 수. 판정하지 않는다 — "
+                       "같은 수가 다른 판 쌍의 비교값일 수 있다('53 → 53'). 출처 없는 낱말을 드러낼 뿐이니 자리를 열어 사람이 읽는다. 출처는 그 잡의 근거 "
+                       "항목(시작 때 낱말 색인 — evidence_index) · 화두 · 사람 의견이다(좌석 자유 조회 · 지식카드의 수는 deliberate_result(view=\"summary\") "
+                       "의 numcheck 가 본다 — 그 칸은 그대로다). pages 는 deliberate_result 의 full · summary 를 쪽마다 받아 결정문 조각을 이으면 원문과 "
+                       "같은지(ok · gaps · overlaps)다. forbidden 을 주면 그 값들이 결정문 어디에 나오는지 준다. " + _PAGE_DESC))
+async def deliberate_verify(job_id: Annotated[str, Field(description=_A_JOB_ID)],
+                            scope: Annotated[str, Field(description=_A_VERIFY_SCOPE)] = ",".join(delib_verify.KINDS),
+                            forbidden: Annotated[list[str] | None, Field(description=_A_VERIFY_FORBIDDEN)] = None,
+                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            ctx: Context | None = None) -> dict:
+    """결정문 원천 대조(HWAXPortal docs/request-1117 DL-04 — verify_job)."""
+    job = delib_jobs.get(job_id)
+    if not job:
+        raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
+    _need_read(job, ctx)
+    out = verify_job(job, scope=scope, forbidden=forbidden)
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=("tokens",),
+                           again={"job_id": job_id, "scope": scope, **({"forbidden": forbidden} if forbidden is not None else {})})
 
 
 _A_RESOLVE_EVIDENCE = ("미리 볼 근거 — deliberate_start 의 evidence 와 같은 꼴이다(본문 항목 {source, tool, args, result, key} 와 참조 "
