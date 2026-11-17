@@ -1,0 +1,15 @@
+{
+  "_doc": "심의 기본값 묶음(preset) — deliberate_start(preset=이름) 가 고른다. 부른 쪽이 직접 준 인자가 이기고, 응답의 preset.applied 가 최종 값과 출처(preset · caller)를 말한다. 인자 이름은 deliberate_start 의 진짜 이름이다(job · rounds · modifiers · save_report · advanced 의 엔진 손잡이 — 엔진이 그 값으로 읽는지 읽을 때 확인한다). 박스 덧씌우기는 같은 자리의 delib_presets.local.json(JSON merge patch — null 은 그 칸을 지운다, 바뀐 시각으로 다시 읽는다, 깨지면 버리고 이 표로 돈다). HWAXPortal docs/request-1117 DL-05.",
+  "presets": {
+    "risk-review-batch": {
+      "label": "리스크 심사 — 묶음 실행용",
+      "what": "리스크 심사를 여러 건 이어 돌릴 때. 2라운드 · 사전부검(premortem) · VOC 환기 끔 · 좌석 자유 조회 끔 · LLM 호출 1회 한도 3,600초.",
+      "args": {
+        "job": "risk-review",
+        "rounds": 2,
+        "modifiers": ["premortem"],
+        "advanced": {"voc": "off", "free_tools": 0, "timeout_s": 3600}
+      }
+    }
+  }
+}

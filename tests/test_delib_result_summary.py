@@ -260,7 +260,8 @@ def test_루틴의_심의_단계는_요약_줄인_응답_기다림을_쓰지_않
 def test_결과_회수_설명이_summary_를_먼저_부르라고_가르친다():
     t = next(x for x in asyncio.run(m.mcp.list_tools()) if x.name == "deliberate_result")
     v = t.inputSchema["properties"]["view"]
-    assert v.get("default") == "full" and v.get("enum") == ["full", "summary"], v
+    # decision_json(구조화 결정 — HWAXPortal docs/request-1117 DL-03)이 더해졌다. 기본은 그대로 full 이다.
+    assert v.get("default") == "full" and v.get("enum") == ["full", "summary", "decision_json"], v
     assert 'view="summary"' in t.description and "full" in t.description, t.description[:300]
     for k in ("full_parts", "missing"):
         assert k in v["description"], k

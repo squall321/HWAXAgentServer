@@ -812,7 +812,10 @@ _LIST_DIR = "list"
 _LIST_KEYS = ("id", "job", "kind", "label", "status", "question", "chair_template", "stage", "step", "round",
               "total_rounds", "report_id", "error", "started_at", "updated_at", "finished_at", "queued_at", "user",
               "last_step", "owner_aff", "tool_mode", "resumed_by", "resumed_from", "seat_resume", "attempts", "finishing",
-              "subject")
+              "subject",
+              # 심의 묶음이 띄운 잡의 표지 {id, key, token}(HWAXPortal docs/request-1117 DL-02) — 묶음이 재기동 뒤 '띄우는 중' 이던 항목의 잡을 색인으로
+              # 찾는다(같은 key 를 두 번 띄우지 않게). 묶음 밖 잡의 색인에는 칸이 없다.
+              "batch")
 
 
 def _list_path(job_id: str) -> Path:
@@ -1313,7 +1316,19 @@ def _apply(job: dict, event: str, data: dict) -> None:
         job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
 
 
-async def _drive(job: dict, gen) -> None:
+async def _index_off_loop(job: dict, evidence) -> None:
+    """큰 근거의 낱말 색인을 스레드에서 짓는다(delib_verify.index — CPU 를 쓰는 정규식이 이벤트 루프를 붙잡지 않게, 반대 검토 H1). 못 지으면 색인
+    없이 간다(대조가 '근거 항목 출처는 모른다' 로 말한다)."""
+    import delib_verify  # noqa: PLC0415
+    try:
+        job["evidence_index"] = await asyncio.to_thread(delib_verify.index, evidence)
+    except Exception:  # noqa: BLE001 — 색인이 심의를 막지 않는다
+        log.exception("[delib-job %s] 근거 색인을 짓지 못했다 — 색인 없이 간다", job["id"])
+    finally:
+        job.pop("evidence_index_pending", None)
+
+
+async def _drive(job: dict, gen, index_ev=None) -> None:
     """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다.
 
     반영한 사건은 진행 일지에도 한 줄씩 적는다(HA-09 S0) — 원장은 끝날 때 쓰는데, 프로세스가 죽으면 그 finally 가 돌지 않는다. 엔진은 같은
@@ -1326,6 +1341,8 @@ async def _drive(job: dict, gen) -> None:
     _JOURNALS[job["id"]] = jr
     tok = delib_resume.journal.set(jr)
     try:
+        if index_ev is not None:
+            await _index_off_loop(job, index_ev)
         async for chunk in gen:
             ev, data = _parse_sse(chunk)
             if jr.again(ev, data):
@@ -1396,56 +1413,21 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         ctx.run(call_trace.tag, job=job["id"])   # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
-        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job['id']}")
+        # 큰 근거의 낱말 색인(start 가 미룬 것 — evidence_index_pending)은 이 잡 태스크가 스레드에서 짓는다
+        index_ev = (opts or {}).get("evidence") if job.get("evidence_index_pending") else None
+        return ctx.run(asyncio.create_task, _drive(job, gen, index_ev=index_ev), name=f"delib-job-{job['id']}")
     return spawn
 
 
-def start(app, job_kind: str, question: str, *, groups: list | None = None,
-          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
-          owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None) -> dict:
-    """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
-
-    resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
-    **키워드로만** 넘긴다(요청 손잡이 delib_opts 로는 받지 않는다 — 받으면 남의 잡 id 로 그 사람의 재개 자료를 읽는 길이 된다). 주면 새 잡을
-    만들지 않고 끊긴 그 잡(resume.job_id)을 같은 줄 규칙으로 다시 세우고(_reopen), 그 잡의 태스크 문맥에만 재개 상태를 건다 — 엔진이 끝난
-    라운드를 되살린다. 상한 · 멈춤 · 거절 판정은 새 잡과 같다(걸리면 그 잡은 끊긴 채 그대로다).
-
-    돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
-    스스로 시작한다)다. 줄까지 찼으면(또는 QUEUE_MAX 가 0 이면) RuntimeError 로 거절한다.
-
-    job_kind 는 JOBS 의 키(별칭 허용). 진입 함수는 여기서 늦게 import 한다 —
-    deliberation 모듈이 app.py 를 다시 부르는 순환을 피한다.
-
-    ⚠ 웹과 같은 조합을 만든다 — 트리거(어느 run_*)와 chair_template 을 한 곳에서 세운다.
-    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본).
-
-    owner 는 외부 응답자 심의(delib_opts.llm=external)의 과제 주인이다 — MCP 호출자 길이 게이트웨이 헤더를 푼 이름을 준다
-    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다.
-
-    subject 는 서버가 꼴을 보고 SP 과제 key 를 다시 확인한 심의 주제다(delib_subject.confirm — HWAXPortal docs/project-insight-graph M1). 주면
-    잡 기록의 subject 칸에 싣고(제자리 이어하기로 다시 연 잡이면 그 잡에), 안 주면 그 칸을 만들지 않는다 — 주제가 없는 심의의 원장은 종전 그대로다.
-    요청 손잡이(delib_opts)로는 받지 않고 엔진에도 넘기지 않는다 — 부르는 쪽이 확인 상태를 지어내지 못하고, 결정문 · 보고서에 주제가 실리지 않는다."""
-    j = resolve_job(job_kind)
-    spec = JOBS[j]
-    q = (question or "").strip()
-    if not q:
-        raise ValueError("question 이 비어 있다 — 심의할 화두가 필요하다")
-    paused = pause_info()       # 새 심의 멈춤(R1) — 시작 · 이어하기 모두 여기를 지난다
-    if paused:
-        raise DelibPaused(paused)
-    # ⚠ 거절 문구에 **남의 job_id 를 싣지 않는다.** 종전엔 진행 중인 잡 id 를 전부 찍었는데,
-    #   deliberate_cancel·deliberate_result 는 id 만 받으므로 거절당한 사람이 남의 심의를 들여다보고
-    #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
-    #   신원 없는 호출(서비스 계정)끼리도 서로 남이다 — 빈 이름이 같다고 한 사람으로 묶지 않는다.
-    #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
-    # 외부 응답자 잡(delib_opts.llm=external)은 GLM 자리(전역·사용자별) 대신 주인마다 EXTERNAL_PER_OWNER 건이다 — 어느 몫을 셀지 먼저
-    # 가린다. 주인은 과제를 받는 사람이다(owner — 비면 user_email, 엔진과 같게 공백·대소문자만 맞춘다).
+def _admission(delib_opts, user_email: str, owner: str = "") -> tuple:
+    """동시 한도 판정 — (외부 응답자인가, 과제 주인, 도는 GLM 잡 수, 한도, 손잡이 이름, 신원, 그 사람의 도는 잡, 셀 사람, 걸린 상한 글들). start 가 거절 ·
+    줄 세우기를 가르고, 묶음이 띄우기 전에 '지금 받나' 를 묻는다(accepts — 같은 판정을 두 벌 두지 않는다, HWAXPortal docs/request-1117 2차 검토 5)."""
     from deliberation import _wants_external  # noqa: PLC0415 — 아래의 늦은 import 와 같은 까닭(순환 방지)
     external = _wants_external(delib_opts)
     x_owner = str(owner or user_email or "").strip().lower() if external else ""
     total = _glm_running_count()
     lim = limits()          # 판정 때마다 읽는다(R4) — 박스 파일이 env 위에 덮인다
-    _mr, _pu, _qm = lim["max_running"], lim["max_running_per_user"], lim["queue_max"]
+    _mr, _pu = lim["max_running"], lim["max_running_per_user"]
     # 거절 문구가 말하는 손잡이 — 값이 덮개에서 왔으면 덮개다(env 이름을 대면 그 값을 고쳐도 안 바뀐다).
     _knob = {k: ("박스 덮개 POST /limits" if lim["source"][k] == "file" else env)
              for k, env in (("max_running", "DELIB_JOB_MAX_RUNNING"), ("max_running_per_user", "DELIB_JOB_MAX_RUNNING_PER_USER"),
@@ -1468,10 +1450,76 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             _w, _sr = _seats_est(dict(delib_opts or {})), seats_running()
             if _sr + _w > _sc:
                 hit.append(f"좌석 합 {_sc}석(도는 {_sr}석 + 이 심의 {_w}석 어림) — {_knob['max_seats_running']}")
+    return external, x_owner, total, lim, _knob, me, mine, who, hit
+
+
+def accepts(user_email: str, owner: str = "", delib_opts=None) -> bool:
+    """start 가 지금 이 사람의 새 잡을 받나 — 새 심의 멈춤이 아니고, 상한에 안 걸렸거나 걸려도 줄에 자리가 있다(start 의 거절 두 갈래와 같은 판정).
+    줄이 찼어도 상한에 안 걸린 사람은 받는다 — 남이 줄을 채워 이 사람의 묶음이 굶지 않게."""
+    if _paused():
+        return False
+    *_rest, lim, _knob, _me, _mine, _who, hit = _admission(delib_opts, user_email, owner)
+    return not hit or (lim["queue_max"] > 0 and len(_PENDING) < lim["queue_max"])
+
+
+def start(app, job_kind: str, question: str, *, groups: list | None = None,
+          delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
+          owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None,
+          refs: dict | None = None, batch: dict | None = None, dry_run: bool = False) -> dict:
+    """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
+
+    resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
+    **키워드로만** 넘긴다(요청 손잡이 delib_opts 로는 받지 않는다 — 받으면 남의 잡 id 로 그 사람의 재개 자료를 읽는 길이 된다). 주면 새 잡을
+    만들지 않고 끊긴 그 잡(resume.job_id)을 같은 줄 규칙으로 다시 세우고(_reopen), 그 잡의 태스크 문맥에만 재개 상태를 건다 — 엔진이 끝난
+    라운드를 되살린다. 상한 · 멈춤 · 거절 판정은 새 잡과 같다(걸리면 그 잡은 끊긴 채 그대로다).
+
+    돌려주는 잡의 status 는 running(곧바로 시작했다)이거나 queued(자리가 없어 줄을 섰다 — 자리가 나면
+    스스로 시작한다)다. 줄까지 찼으면(또는 QUEUE_MAX 가 0 이면) RuntimeError 로 거절한다.
+
+    job_kind 는 JOBS 의 키(별칭 허용). 진입 함수는 여기서 늦게 import 한다 —
+    deliberation 모듈이 app.py 를 다시 부르는 순환을 피한다.
+
+    ⚠ 웹과 같은 조합을 만든다 — 트리거(어느 run_*)와 chair_template 을 한 곳에서 세운다.
+    호출자가 준 delib_opts 위에 Job 표의 chair/opts 를 **덮어쓴다**(Job 이 정본).
+
+    owner 는 외부 응답자 심의(delib_opts.llm=external)의 과제 주인이다 — MCP 호출자 길이 게이트웨이 헤더를 푼 이름을 준다
+    (external_llm.header_owner). 비우면 user_email 이다. 잡 기록의 주인(user)은 user_email 그대로다.
+
+    subject 는 서버가 꼴을 보고 SP 과제 key 를 다시 확인한 심의 주제다(delib_subject.confirm — HWAXPortal docs/project-insight-graph M1). 주면
+    잡 기록의 subject 칸에 싣고(제자리 이어하기로 다시 연 잡이면 그 잡에), 안 주면 그 칸을 만들지 않는다 — 주제가 없는 심의의 원장은 종전 그대로다.
+    요청 손잡이(delib_opts)로는 받지 않고 엔진에도 넘기지 않는다 — 부르는 쪽이 확인 상태를 지어내지 못하고, 결정문 · 보고서에 주제가 실리지 않는다.
+
+    refs 는 근거 참조를 푼 결과다(delib_refs.resolve — HWAXPortal docs/request-1117 DL-01). delib_opts 의 evidence 는 이미 펼친 목록이고, 주면 풀이
+    기록(refs — 본문 없음)을 잡 원장 evidence_refs 에, 빠진 참조의 까닭(omitted)을 evidence_omitted 맨 앞에 싣는다. 새 잡에만 쓴다(제자리 이어하기는
+    그 잡의 기록 그대로다). 안 주면 원장은 종전 그대로다.
+
+    batch 는 심의 묶음이 띄우는 잡의 표지 {id, key, token} 다(delib_batch — DL-02). 새 잡의 원장 · 목록 색인 batch 칸에 싣는다(요청 손잡이로는 받지
+    않는다 · 엔진에 넘기지 않는다). 안 주면 칸이 없다.
+
+    dry_run 이면 검사만 한다 — 멈춤 · 동시 한도는 보지 않고, 인자를 엔진이 읽는 대로 읽고 거절 규칙(봉인 · 기준일 · 외부 응답자)과 잡 꼴 짓기(좌석 어림 ·
+    역할)까지 돌린 뒤 원장 · 줄 · 파일에 아무것도 남기지 않고 그 꼴을 돌려준다. 묶음이 항목을 받을 때 쓴다(반대 검토 M1 — 띄울 때 터지는 인자를 먼저
+    거절한다)."""
+    j = resolve_job(job_kind)
+    spec = JOBS[j]
+    q = (question or "").strip()
+    if not q:
+        raise ValueError("question 이 비어 있다 — 심의할 화두가 필요하다")
+    paused = None if dry_run else pause_info()       # 새 심의 멈춤(R1) — 시작 · 이어하기 모두 여기를 지난다
+    if paused:
+        raise DelibPaused(paused)
+    # ⚠ 거절 문구에 **남의 job_id 를 싣지 않는다.** 종전엔 진행 중인 잡 id 를 전부 찍었는데,
+    #   deliberate_cancel·deliberate_result 는 id 만 받으므로 거절당한 사람이 남의 심의를 들여다보고
+    #   접을 수 있었다(S26U 피드백 1-9). 제 것만 보여 준다 — 접을 수 있는 것도 그것뿐이다.
+    #   신원 없는 호출(서비스 계정)끼리도 서로 남이다 — 빈 이름이 같다고 한 사람으로 묶지 않는다.
+    #   그래서 사용자별 상한도 신원 있는 호출에만 건다(없는 호출은 전역 상한만 받는다).
+    # 외부 응답자 잡(delib_opts.llm=external)은 GLM 자리(전역·사용자별) 대신 주인마다 EXTERNAL_PER_OWNER 건이다 — 어느 몫을 셀지 먼저
+    # 가린다. 주인은 과제를 받는 사람이다(owner — 비면 user_email, 엔진과 같게 공백·대소문자만 맞춘다).
+    external, x_owner, total, lim, _knob, me, mine, who, hit = _admission(delib_opts, user_email, owner)
+    _mr, _pu, _qm = lim["max_running"], lim["max_running_per_user"], lim["queue_max"]
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
     # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.
-    if hit and _qm <= 0:
+    if hit and _qm <= 0 and not dry_run:
         raise RuntimeError(
             f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if who
@@ -1479,7 +1527,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("" if external else f" · 전체 {total}/{_mr}") + ". "
             + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
                else "진행 중인 심의가 끝난 뒤 다시 하라."))
-    if hit and len(_PENDING) >= _qm:
+    if hit and len(_PENDING) >= _qm and not dry_run:
         waiting = [x["job_id"] for x in queue_state(me)["mine"]]
         raise RuntimeError(
             f"동시 실행 상한에 걸렸고({' · '.join(hit)}) 대기열도 찼다"
@@ -1560,6 +1608,22 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     }
     if subject is not None:
         job["subject"] = subject
+    if dry_run:
+        return job
+    if refs is not None and resume is None:
+        job["evidence_refs"] = list(refs.get("refs") or [])
+        job["evidence_omitted"] = list(refs.get("omitted") or [])[:OMITTED_MAX] + list(job.get("evidence_omitted") or [])
+    if batch is not None and resume is None:
+        job["batch"] = {k: str(batch.get(k) or "") for k in ("id", "key", "token")}
+    if resume is None and isinstance(opts.get("evidence"), list) and opts["evidence"]:
+        # 근거 항목마다 낱말 색인(수 · ID · 부품 번호 · 넷 이름의 지문 — 본문 · 낱말 글자는 남기지 않는다) — 결정문 원천 대조(deliberate_verify,
+        # HWAXPortal docs/request-1117 DL-04)가 끝난 뒤에도 '그 값이 든 근거 항목' 을 말하게. 근거 본문은 시작 인자 파일과 함께 끝나면 지워진다.
+        # 작은 근거만 이 자리에서 짓는다 — 큰 근거는 잡 태스크가 이벤트 루프 밖(스레드)에서 짓는다(_drive — 반대 검토 H1).
+        import delib_verify  # noqa: PLC0415 — 늦은 import(deliberation 을 읽는다 — 위의 늦은 import 와 같다)
+        if delib_verify.scan_chars(opts["evidence"]) <= delib_verify.INDEX_SYNC_CHARS:
+            job["evidence_index"] = delib_verify.index(opts["evidence"])
+        else:
+            job["evidence_index_pending"] = True
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {

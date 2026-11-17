@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 두며, 심의 MCP 의 앱 자리(mcp_server._APP)는 시험 끝에 시험 앞의 것으로 되돌린다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 두며, 심의 MCP 의 앱 자리(mcp_server._APP)는 시험 끝에 시험 앞의 것으로 되돌린다, 심의 기본값 묶음(preset)의 박스 덧씌우기도 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -88,6 +88,17 @@ def _no_core_vocab(monkeypatch, tmp_path):
         # 박스 덧씌우기도 늘 '없음' — 실제 표를 읽는 시험에도 박스의 core_vocab.local.json 이 끼어들지 않게 한다(E-7 ②)
         monkeypatch.setattr(app_mod, "CORE_VOCAB_LOCAL_PATH", tmp_path / "no-core-vocab.local.json")
         monkeypatch.setattr(app_mod, "_CORE_VOCAB", {"mtime": None, "data": None, "error": "없음", "overlay": None})
+
+
+@pytest.fixture(autouse=True)
+def _no_preset_overlay(monkeypatch, tmp_path):
+    """심의 기본값 묶음(preset)의 박스 덧씌우기(delib_presets.local.json — gitignore) 격리 — 기본은 '없음'(추적 표만)이다. 덧씌우기를 보는 시험은
+    본문에서 delib_presets.LOCAL_PATH 를 다시 건다(tests/test_dl05_presets.py · HWAXPortal docs/request-1117 DL-05). 읽은 표는 모듈 상태라 앞 시험의
+    것이 뒤 시험에 남지 않게 비운다. delib_presets 를 import 하지 않는 시험은 건드리지 않는다."""
+    mod = sys.modules.get("delib_presets")
+    if mod is not None and hasattr(mod, "LOCAL_PATH"):
+        monkeypatch.setattr(mod, "LOCAL_PATH", tmp_path / "no-delib-presets.local.json")
+        monkeypatch.setattr(mod, "_CACHE", {"key": None, "presets": {}, "errors": [], "overlay": {"present": False}})
 
 
 @pytest.fixture(autouse=True)

@@ -9838,6 +9838,195 @@ async def deliberate_subject_confirm(body: SubjectConfirmRequest):
     return {"subject": await _subject.confirm(app, parsed, groups=list(body.groups), user=body.user_email, user_pat=body.user_pat)}
 
 
+# ── 심의 HTTP 창구(HWAXPortal docs/request-1117 DL-01 ~ DL-04) ─────────────────────────────────────────────────────────────
+# MCP 도구(deliberate_*)와 **같은 함수**를 부른다 — 쪽 나누기만 없다(MCP 결과 상한은 MCP 의 사정이다). 공유 비밀(_seat_auth — 게이트웨이 연결의
+# Authorization, 결정문 · 화두 · 근거 크기를 낸다)을 지난 뒤 신원은 게이트웨이가 MCP 호출에 싣는 머리 그대로다(mcp_server.http_caller —
+# x-hwax-user · x-hwax-groups · x-hwax-affiliation). 새 신원 길이 없다 — 머리가 없으면 신원 없는 호출(MCP 서비스 계정과 같은 운영의 길)이다.
+# 본문은 JSON 객체 · 모르는 칸은 422(/limits 와 같다). 잡이 없으면 404, 볼 수 없으면 403, 그 밖의 거절은 422 {code, message}.
+def _dl_error(code: str, message: str, status: int) -> JSONResponse:
+    return JSONResponse({"code": code, "message": str(message)[:600]}, status_code=status)
+
+
+async def _dl_open(request: Request, fields: tuple):
+    """(본문, 호출자 (신원, 그룹, 소속, 관리자), 거절 답) — 거절이 있으면 앞 둘은 None."""
+    denied = _seat_auth(request)
+    if denied:
+        return None, None, denied
+    if _delib_mcp_module is None:
+        return None, None, _dl_error("delib_mcp_unavailable", "심의 MCP 모듈이 비활성이다(기동 로그를 본다)", 503)
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return None, None, _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return None, None, _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(fields))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return None, None, JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 "
+                                         "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
+    return body, _delib_mcp_module.http_caller(request.headers), None
+
+
+def _dl_job(body: dict, who: tuple):
+    """본문의 job_id → (잡, 거절 답) — 없으면 404, 볼 수 없으면 403(MCP 의 _need_read 와 같은 규칙 — delib_jobs.can_read)."""
+    import delib_jobs  # noqa: PLC0415
+    jid = body.get("job_id")
+    if not isinstance(jid, str) or not jid.strip() or len(jid) > 128:
+        return None, _dl_error("bad_request", "job_id 는 1~128자 글이다", 422)
+    job = delib_jobs.get(jid.strip())
+    if not job:
+        return None, _dl_error("job_not_found", f"그런 심의 잡이 없다: {_echo(jid)}", 404)
+    user, _groups, aff, admin = who
+    if not delib_jobs.can_read(job, user, aff, admin):
+        return None, _dl_error("forbidden", "이 심의는 볼 수 없다 — 시작한 사람과 같은 소속, 관리자만 본다", 403)
+    return job, None
+
+
+# POST /deliberate/result/decision {job_id} — deliberate_result(view="decision_json") 와 같은 답(DL-03 · contracts §3).
+@app.post("/deliberate/result/decision")
+async def deliberate_result_decision(request: Request):
+    import delib_decision  # noqa: PLC0415
+    body, who, denied = await _dl_open(request, ("job_id",))
+    if denied:
+        return denied
+    job, denied = _dl_job(body, who)
+    if denied:
+        return denied
+    return delib_decision.build(job)
+
+
+# POST /deliberate/verify {job_id, scope?, forbidden?} — deliberate_verify 와 같은 답(DL-04 — 쪽 나누기 없이 한 번에).
+@app.post("/deliberate/verify")
+async def deliberate_verify_http(request: Request):
+    body, who, denied = await _dl_open(request, ("job_id", "scope", "forbidden"))
+    if denied:
+        return denied
+    job, denied = _dl_job(body, who)
+    if denied:
+        return denied
+    try:
+        return _delib_mcp_module.verify_job(job, scope=body.get("scope") or "num,id,part,net", forbidden=body.get("forbidden"))
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+# POST /deliberate/evidence/resolve {evidence, user_email, user_pat, groups?} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음).
+# 사람의 참조를 푸는 창구라 /deliberate/subject/confirm 과 같은 규칙이다 — 루프백 신뢰에 **그 사람의 PAT** 를 요구하고 그 PAT 로 푼다(공유 비밀 + 신원
+# 머리만으로 이름 붙은 사람의 참조를 풀지 않는다 — 반대 검토 M5). 모르는 칸은 422.
+_RESOLVE_FIELDS = ("evidence", "user_email", "user_pat", "groups")
+
+
+@app.post("/deliberate/evidence/resolve")
+async def deliberate_evidence_resolve(request: Request):
+    if _delib_mcp_module is None:
+        return _dl_error("delib_mcp_unavailable", "심의 MCP 모듈이 비활성이다(기동 로그를 본다)", 503)
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(_RESOLVE_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    user, pat, groups = body.get("user_email"), body.get("user_pat"), body.get("groups") or []
+    if not (isinstance(user, str) and user.strip() and isinstance(pat, str) and pat.strip()):
+        return _dl_error("bad_request", "user_email 과 user_pat(그 사람의 PAT)이 있어야 참조를 푼다", 422)
+    if not isinstance(groups, list) or not all(isinstance(g, str) for g in groups):
+        return _dl_error("bad_request", "groups 는 글 목록이다", 422)
+    try:
+        return await _delib_mcp_module.resolve_preview(body.get("evidence"), user=user.strip(), groups=groups, user_pat=pat.strip())
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+# POST /deliberate/batch/start {name, items, concurrency?, retries?, stall_s?} · /status {batch_id} · /stop {batch_id} — deliberate_batch_* 와 같은 답(DL-02).
+# 시작은 신원 머리가 있어야 한다(묶음의 잡은 그 사람 이름으로 돈다). 끝남은 바깥으로 알리지 않는다 — status 의 finished · notice 를 읽는다.
+# **왜 사람 PAT 가 아니라 공유 비밀 + 신원 머리인가(2차 검토 8 — 사용자가 열어 둔 설계 판단).** 같은 신뢰가 MCP 길이다 — 게이트웨이는 사람의 PAT 를
+# 검증한 뒤 그 신원을 머리(x-hwax-user · x-hwax-groups)에 박고 이 공유 비밀로 에이전트 서버를 부른다. 이 창구는 그 길을 HTTP 로 연 것뿐이다. 묶음은
+# 수 시간 ~ 며칠 돌고 MCP 잡처럼 토큰을 쥐지 않으므로(원장 · 시작 인자 파일에 토큰을 남기지 않는다 — delib_jobs) PAT 를 받아도 시작 때 한 번 보는 것이
+# 전부다. 대신 이 비밀을 쥔 쪽이 곧 신원을 말할 수 있는 쪽이다 — 비밀은 게이트웨이 연결의 Authorization(Bearer GW_TOKEN — seat_box.secret)이고 같은
+# 값을 쥐는 것은 게이트웨이(GW_TOKEN)와 포털(GATEWAY_SHARED_TOKEN)뿐이다(다른 곳에 나눠 주지 않는다). 근거 참조를 사람 이름으로 미리 푸는
+# /deliberate/evidence/resolve 만은 그 사람의 PAT 를 요구한다(/deliberate/subject/confirm 과 같다 — 결과를 그 자리에서 돌려주는 창구다).
+@app.post("/deliberate/batch/start")
+async def deliberate_batch_start_http(request: Request):
+    body, who, denied = await _dl_open(request, ("name", "items", "concurrency", "retries", "stall_s"))
+    if denied:
+        return denied
+    user, groups, aff, _admin = who
+    try:
+        return await _delib_mcp_module.batch_start(name=body.get("name"), items=body.get("items"), concurrency=body.get("concurrency"),
+                                                   retries=body.get("retries"), stall_s=body.get("stall_s"), user=user, groups=groups, aff=aff)
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+@app.post("/deliberate/batch/status")
+async def deliberate_batch_status_http(request: Request):
+    body, who, denied = await _dl_open(request, ("batch_id",))
+    if denied:
+        return denied
+    user, groups, aff, admin = who
+    try:
+        return _delib_mcp_module.batch_read(body.get("batch_id"), user=user, aff=aff, admin=admin, groups=groups)
+    except PermissionError as exc:
+        return _dl_error("forbidden", str(exc), 403)
+    except ValueError as exc:
+        return _dl_error("batch_not_found", str(exc), 404)
+
+
+# POST /deliberate/batch/finished {since, limit?} — 끝난 묶음 창구(HWAXPortal docs/request-1117 contracts §7 · 사용자 결정 R-12 ②). 포털 서비스가 주기로 읽어
+# 묶음마다 주인에게 알림을 남긴다. **공유 비밀만** — 모든 사람의 끝난 묶음(주인 이메일 · 이름 · 알림 글)을 내므로 사람 PAT 는 받지 않고(비밀과 다르면 401),
+# 신원 머리(x-hwax-user)를 실은 호출도 받지 않는다(403 — 사람의 길이 아니다). 답은 delib_batch.finished_since 그대로다.
+_FINISHED_FIELDS = ("since", "limit")
+
+
+@app.post("/deliberate/batch/finished")
+async def deliberate_batch_finished(request: Request):
+    import math  # noqa: PLC0415
+
+    import delib_batch  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "끝난 묶음 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다(제 묶음은 "
+                         "deliberate_batch_status 로 본다)", 403)
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(_FINISHED_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    since, limit = body.get("since"), body.get("limit", delib_batch.FINISHED_LIMIT_DEFAULT)
+    if isinstance(since, bool) or not isinstance(since, (int, float)) or not math.isfinite(since) or not since >= 0:
+        return _dl_error("bad_request", "since 는 0 이상의 epoch 초다", 422)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= delib_batch.FINISHED_LIMIT_MAX:
+        return _dl_error("bad_request", f"limit 은 1~{delib_batch.FINISHED_LIMIT_MAX} 의 정수다", 422)
+    return delib_batch.finished_since(float(since), limit)
+
+
+@app.post("/deliberate/batch/stop")
+async def deliberate_batch_stop_http(request: Request):
+    body, who, denied = await _dl_open(request, ("batch_id",))
+    if denied:
+        return denied
+    try:
+        return _delib_mcp_module.batch_stop(body.get("batch_id"), user=who[0], groups=who[1])
+    except PermissionError as exc:
+        return _dl_error("forbidden", str(exc), 403)
+    except ValueError as exc:
+        return _dl_error("batch_not_found", str(exc), 404)
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.
