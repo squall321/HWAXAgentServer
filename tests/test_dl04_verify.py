@@ -62,8 +62,12 @@ def test_색인은_엔진처럼_본문_있는_항목만_번호를_매긴다(monk
     ev = [{"source": "빈", "result": ""}, {"source": "가", "key": "K-1", "result": "R12 는 3.5"}, {"source": "나", "result": "VDD_1V8 와 7"}]
     idx = V.index(ev)
     assert [(e["n"], e["key"], e["source"]) for e in idx] == [(1, "K-1", "가"), (2, "", "나")]
-    assert idx[0]["t"] == {"num": ["3.5"], "part": ["R12"]} and idx[1]["t"] == {"num": ["7"], "net": ["VDD_1V8"]}
-    assert "result" not in json.dumps(idx, ensure_ascii=False) and "R12 는" not in json.dumps(idx, ensure_ascii=False)
+    h = V.token_hash
+    assert idx[0]["t"] == {"num": [h("num", "3.5")], "part": [h("part", "R12")]}
+    assert idx[1]["t"] == {"num": [h("num", "7")], "net": [h("net", "VDD_1V8")]}
+    dumped = json.dumps(idx, ensure_ascii=False)
+    for plain in ("R12", "VDD_1V8", "3.5", "result"):
+        assert plain not in dumped, f"색인에 낱말 글자 {plain} 가 남았다 — 지문만 남긴다"
     monkeypatch.setattr(V, "INDEX_ITEM_MAX", 1)
     assert V.index(ev)[0].get("cut") is True
 
@@ -131,7 +135,9 @@ def test_잡을_열면_근거_색인을_원장에_남긴다(eng, monkeypatch):
     async def scenario():
         out = await m.deliberate_start("색인", evidence=[{"source": "s", "key": "K-1", "result": "R12 와 3.5"}], ctx=_ctx(ME))
         job = delib_jobs.get(out["job_id"])
-        assert job["evidence_index"] == [{"n": 1, "key": "K-1", "source": "s", "chars": 9, "t": {"num": ["3.5"], "part": ["R12"]}}]
+        assert job["evidence_index"] == [{"n": 1, "key": "K-1", "source": "s", "chars": 9,
+                                          "t": {"num": [V.token_hash("num", "3.5")], "part": [V.token_hash("part", "R12")]}}]
+        assert "R12" not in json.dumps(job["evidence_index"]) and "evidence_index_pending" not in job
         on_disk = json.loads(delib_jobs._path(job["id"]).read_text(encoding="utf-8"))
         assert on_disk["evidence_index"] == job["evidence_index"] and "evidence_index" not in delib_jobs.summary(job)
         out2 = await m.deliberate_start("근거 없음", ctx=_ctx(ME))
@@ -139,6 +145,50 @@ def test_잡을_열면_근거_색인을_원장에_남긴다(eng, monkeypatch):
         await _tick()
 
     _play(scenario)
+
+
+def test_큰_근거의_색인은_잡_태스크가_스레드에서_짓는다(eng, monkeypatch):
+    _caps(monkeypatch, 2)
+    monkeypatch.setattr(V, "INDEX_SYNC_CHARS", 5)
+    threads = []
+    real = asyncio.to_thread
+
+    async def spy(fn, *a, **kw):
+        threads.append(getattr(fn, "__name__", fn))
+        return await real(fn, *a, **kw)
+    monkeypatch.setattr(delib_jobs.asyncio, "to_thread", spy)
+
+    async def scenario():
+        out = await m.deliberate_start("큰 근거", evidence=[{"source": "s", "key": "K-1", "result": "R12 와 3.5 · 길다"}], ctx=_ctx(ME))
+        job = delib_jobs.get(out["job_id"])
+        assert job.get("evidence_index_pending") is True and "evidence_index" not in job, "시작 자리에서 짓지 않는다"
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if "evidence_index" in job:
+                break
+        assert threads == ["index"] and job["evidence_index"][0]["t"]["part"] == [V.token_hash("part", "R12")]
+        assert "evidence_index_pending" not in job and eng.started == ["큰 근거"]
+        await _end(eng, job)
+
+    _play(scenario)
+
+
+@pytest.mark.parametrize("name,text", [
+    ("dashes", "-" * 1_000_000), ("dots", "." * 1_000_000), ("a.", "a." * 500_000), ("a-", "a-" * 500_000),
+    ("A_", "A_" * 500_000), ("upper", "A" * 1_000_000), ("digits", "1" * 1_000_000), ("a.-1", "a.-" * 333_333 + "1"),
+])
+def test_낱말_뽑기는_1MB_의_악성_글에도_1초_안이다(name, text):
+    import time
+    t = time.perf_counter()
+    V.tokens(text)
+    assert time.perf_counter() - t < 1.0, f"{name} — 정규식이 제곱으로 느려졌다(반대 검토 H1)"
+    t = time.perf_counter()
+    V.index([{"result": text}])
+    assert time.perf_counter() - t < 1.0, f"{name} — 색인(항목마다 앞 {V.SCAN_ITEM_MAX:,}자)"
+
+
+def test_숫자_없는_점_하이픈_이음은_id_가_아니다():
+    assert _kinds("risk-review 와 e.g 와 org.example.svc 그리고 a.b.c1") == [("id", "a.b.c1")]
 
 
 # ── 쪽 이음 ─────────────────────────────────────────────────────────────────────────────────────────────────

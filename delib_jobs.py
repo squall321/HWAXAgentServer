@@ -1316,7 +1316,19 @@ def _apply(job: dict, event: str, data: dict) -> None:
         job["warnings_total"] = int(job.get("warnings_total") or 0) + 1
 
 
-async def _drive(job: dict, gen) -> None:
+async def _index_off_loop(job: dict, evidence) -> None:
+    """큰 근거의 낱말 색인을 스레드에서 짓는다(delib_verify.index — CPU 를 쓰는 정규식이 이벤트 루프를 붙잡지 않게, 반대 검토 H1). 못 지으면 색인
+    없이 간다(대조가 '근거 항목 출처는 모른다' 로 말한다)."""
+    import delib_verify  # noqa: PLC0415
+    try:
+        job["evidence_index"] = await asyncio.to_thread(delib_verify.index, evidence)
+    except Exception:  # noqa: BLE001 — 색인이 심의를 막지 않는다
+        log.exception("[delib-job %s] 근거 색인을 짓지 못했다 — 색인 없이 간다", job["id"])
+    finally:
+        job.pop("evidence_index_pending", None)
+
+
+async def _drive(job: dict, gen, index_ev=None) -> None:
     """생성기를 끝까지 소비한다. 구독자가 없어도 완주해야 저장(대화·보고서)까지 간다.
 
     반영한 사건은 진행 일지에도 한 줄씩 적는다(HA-09 S0) — 원장은 끝날 때 쓰는데, 프로세스가 죽으면 그 finally 가 돌지 않는다. 엔진은 같은
@@ -1329,6 +1341,8 @@ async def _drive(job: dict, gen) -> None:
     _JOURNALS[job["id"]] = jr
     tok = delib_resume.journal.set(jr)
     try:
+        if index_ev is not None:
+            await _index_off_loop(job, index_ev)
         async for chunk in gen:
             ev, data = _parse_sse(chunk)
             if jr.again(ev, data):
@@ -1399,7 +1413,9 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         ctx.run(call_trace.tag, job=job["id"])   # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
-        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"delib-job-{job['id']}")
+        # 큰 근거의 낱말 색인(start 가 미룬 것 — evidence_index_pending)은 이 잡 태스크가 스레드에서 짓는다
+        index_ev = (opts or {}).get("evidence") if job.get("evidence_index_pending") else None
+        return ctx.run(asyncio.create_task, _drive(job, gen, index_ev=index_ev), name=f"delib-job-{job['id']}")
     return spawn
 
 
@@ -1577,10 +1593,14 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     if batch is not None and resume is None:
         job["batch"] = {k: str(batch.get(k) or "") for k in ("id", "key", "token")}
     if resume is None and isinstance(opts.get("evidence"), list) and opts["evidence"]:
-        # 근거 항목마다 낱말 색인(수 · ID · 부품 번호 · 넷 이름 — 본문은 남기지 않는다) — 결정문 원천 대조(deliberate_verify, HWAXPortal docs/request-1117
-        # DL-04)가 끝난 뒤에도 '그 값이 든 근거 항목' 을 말하게. 근거 본문은 시작 인자 파일과 함께 끝나면 지워진다.
+        # 근거 항목마다 낱말 색인(수 · ID · 부품 번호 · 넷 이름의 지문 — 본문 · 낱말 글자는 남기지 않는다) — 결정문 원천 대조(deliberate_verify,
+        # HWAXPortal docs/request-1117 DL-04)가 끝난 뒤에도 '그 값이 든 근거 항목' 을 말하게. 근거 본문은 시작 인자 파일과 함께 끝나면 지워진다.
+        # 작은 근거만 이 자리에서 짓는다 — 큰 근거는 잡 태스크가 이벤트 루프 밖(스레드)에서 짓는다(_drive — 반대 검토 H1).
         import delib_verify  # noqa: PLC0415 — 늦은 import(deliberation 을 읽는다 — 위의 늦은 import 와 같다)
-        job["evidence_index"] = delib_verify.index(opts["evidence"])
+        if delib_verify.scan_chars(opts["evidence"]) <= delib_verify.INDEX_SYNC_CHARS:
+            job["evidence_index"] = delib_verify.index(opts["evidence"])
+        else:
+            job["evidence_index_pending"] = True
     _JOBS[job_id] = job
     # 시작 인자 파일(R2 · R3) — 줄이 재기동을 넘기고 끊긴 잡이 이어 돈다. 토큰을 쥔 잡은 적지 않는다(MCP 잡은 애초에 토큰이 없다).
     job["durable"] = (not user_pat) and _write_args(job_id, {

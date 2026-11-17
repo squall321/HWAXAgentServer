@@ -13,7 +13,8 @@
 뺀 것 — 근거 표지([e:N|KEY]) · 줄 머리의 순번(1. · 2) — 값이 아니다) · 엔진이 결정문 끝에 붙이는 안내(수치 대조 경고 · 보고서 · 위키 안내 —
 tail_from 부터)는 보지 않는다.
 
-**근거.** 잡을 열 때 근거 항목마다 낱말 색인을 원장(evidence_index)에 남긴다(index — 본문은 남기지 않는다 · 엔진이 고르는 본문과 번호 [e:N] 그대로).
+**근거.** 잡을 열 때 근거 항목마다 낱말 색인을 원장(evidence_index)에 남긴다(index — 본문도 낱말 글자도 남기지 않고 낱말 지문(token_hash)만 ·
+엔진이 고르는 본문과 번호 [e:N] 그대로 · 항목마다 앞 SCAN_ITEM_MAX 자). 근거가 크면(INDEX_SYNC_CHARS 넘음) 잡 태스크가 스레드에서 짓는다.
 화두(question)와 사람 의견(human_note)도 출처로 센다. 좌석 자유 조회 · 지식카드 · 사전 조회 결과는 색인에 없다 — 그 수는 결정문 수치 대조(numcheck,
 그대로 둔다)가 본다. 색인 이전에 돈 잡은 출처를 모른다고 말한다.
 
@@ -22,6 +23,7 @@ tail_from 부터)는 보지 않는다.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 import deliberation as _engine   # 근거 본문 고르기(_ev_bodies) · 건수 상한 — 엔진이 [e:N] 을 매기는 대로 센다
@@ -32,16 +34,25 @@ _A = r"(?<![A-Za-z0-9_])"
 _Z = r"(?![A-Za-z0-9_])"
 PATTERNS = (
     ("net", re.compile(_A + r"(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|(?:[ADP]?GND|V(?:CC|DD|SS|BAT|BUS|SYS))[A-Z0-9]*)" + _Z)),
-    ("id", re.compile(_A + r"(?:(?=[A-Za-z0-9.-]*\d)[A-Za-z][A-Za-z0-9]*(?:[-.][A-Za-z0-9]+)+|[A-Z]{4,}\d+[A-Z0-9]*)" + _Z)),
+    # 숫자가 든 것만 id 다 — 그 조건은 맞은 뒤에 본다(_DIGIT). 앞보기로 적으면(?=[A-Za-z0-9.-]*\d) 자리마다 남은 줄기를 다시 훑어 '-' · '.' 이
+    # 긴 글에서 제곱으로 느려졌다(4만 자 4.4초 — 반대 검토 H1). 이 꼴은 줄기 하나를 한 번만 지난다.
+    ("id", re.compile(_A + r"(?:[A-Za-z][A-Za-z0-9]*(?:[-.][A-Za-z0-9]+)+|[A-Z]{4,}\d+[A-Z0-9]*)" + _Z)),
     ("part", re.compile(_A + r"(?:[A-Z]{1,3}\d{1,4}[A-Z]?|(?=(?:[A-Z0-9]*[A-Z]){2})(?=(?:[A-Z0-9]*\d){3})[A-Z0-9]{8,})" + _Z)),
     ("num", re.compile(r"(?<![A-Za-z0-9_.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?!\d|\.\d)")),
 )
+_DIGIT = re.compile(r"\d")
 _MASK = re.compile(r"\[e:\d+(?:\|[A-Za-z0-9_.-]*)?\]|^[ \t]*(?:#+[ \t]*)?\d{1,3}[.)](?=[ \t])", re.M)
 # 엔진이 결정문 끝에 붙이는 안내의 머리 — 처음 나온 자리부터는 의장이 쓴 글이 아니다(deliberation.py 의 수치 대조 경고 · 보고서 · 위키 안내).
 TAIL_MARKS = ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확인되지 않았습니다", "\n\n📄 Report Archive", "\n\n⚠ Report Archive",
               "\n\n⚠ 의장이 결정문을 내지 못해 MX 백서", "\n\n⚠ 신원 없는 호출이라 MX 백서")
 INDEX_ITEM_MAX = 5000            # 항목 하나의 낱말 수 상한(종류 합) — 넘으면 cut(그 항목의 'no source' 는 틀릴 수 있다)
 INDEX_TOTAL_MAX = 50000          # 잡 하나의 낱말 수 상한
+# 항목 하나에서 훑는 글자 수 — 엔진이 항목 하나에 싣는 천장(_EVID_ITEM_MAX)까지만(넘는 꼬리는 좌석도 다 보지 못한다 — cut)
+SCAN_ITEM_MAX = _engine._EVID_ITEM_MAX
+# 이 글자 수(근거 전체에서 훑을 몫의 합) 안이면 잡을 열 때 그 자리에서 색인을 짓는다. 넘으면 잡 태스크가 이벤트 루프 밖(스레드)에서 짓는다
+# (delib_jobs — 큰 근거 하나가 서버 전체를 멈추지 않게, 반대 검토 H1).
+INDEX_SYNC_CHARS = 200_000
+HASH_HEX = 16                    # 색인에 남기는 낱말 지문의 길이(sha256 앞 16자) — 낱말 글자 그대로는 원장에 남기지 않는다(반대 검토 L7)
 FORBIDDEN_MAX, FORBIDDEN_LEN = 200, 200
 
 
@@ -59,6 +70,8 @@ def tokens(text: str, kinds=KINDS) -> list[tuple[str, str, int]]:
     for kind, pat in PATTERNS:
         for m in pat.finditer(text):
             a, b = m.start(), m.end()
+            if kind == "id" and not _DIGIT.search(m.group(0)):
+                continue                   # 숫자 없는 점 · 하이픈 이음(e.g · risk-review)은 id 가 아니다 — 자리를 차지하지 않는다
             if not any(taken[a:b]):
                 taken[a:b] = b"\x01" * (b - a)
                 if kind in kinds:
@@ -66,24 +79,42 @@ def tokens(text: str, kinds=KINDS) -> list[tuple[str, str, int]]:
     return sorted(out, key=lambda t: t[2])
 
 
-def index(evidence) -> list[dict]:
-    """근거 목록 → 항목마다 낱말 색인 [{n, key, source, chars, t{종류: [값]}, cut?}] — 엔진처럼 본문 있는 항목만 [e:N] 차례로(건수 상한까지)."""
-    out, total = [], 0
+def token_hash(kind: str, value: str) -> str:
+    """낱말 지문 — sha256('종류\\0값') 앞 HASH_HEX 자. 색인은 이것만 남기고(낱말 글자는 남기지 않는다), 대조할 때 결정문의 낱말도 같은 식으로 잰다."""
+    return hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()[:HASH_HEX]
+
+
+def _bodies(evidence) -> list:
+    """엔진처럼 본문 있는 항목만 [e:N] 차례로(건수 상한까지) — [(항목, 본문)]."""
+    out = []
     for it in evidence or []:
         b = _engine._ev_bodies(it) if isinstance(it, dict) else []
         if not b:
             continue
         if len(out) >= _engine._EVID_ITEMS:
             break
-        body = b[0][1]
+        out.append((it, b[0][1]))
+    return out
+
+
+def scan_chars(evidence) -> int:
+    """색인이 훑을 글자 수의 합(항목마다 SCAN_ITEM_MAX 까지) — INDEX_SYNC_CHARS 와 견줘 그 자리에서 지을지 가른다."""
+    return sum(min(len(body), SCAN_ITEM_MAX) for _it, body in _bodies(evidence))
+
+
+def index(evidence) -> list[dict]:
+    """근거 목록 → 항목마다 낱말 색인 [{n, key, source, chars, t{종류: [낱말 지문]}, cut?}] — 엔진처럼 본문 있는 항목만 [e:N] 차례로. 낱말 글자는
+    남기지 않는다(token_hash). 항목 하나는 앞 SCAN_ITEM_MAX 자만 훑는다(넘으면 cut)."""
+    out, total = [], 0
+    for it, body in _bodies(evidence):
         seen: dict[str, dict] = {k: {} for k in KINDS}
-        for kind, val, _pos in tokens(body):
-            seen[kind][val] = None
+        for kind, val, _pos in tokens(body[:SCAN_ITEM_MAX]):
+            seen[kind][token_hash(kind, val)] = None
         t = {k: list(v) for k, v in seen.items() if v}
         n = sum(len(v) for v in t.values())
         room = max(0, min(INDEX_ITEM_MAX, INDEX_TOTAL_MAX - total))
-        cut = n > room
-        if cut:
+        cut = n > room or len(body) > SCAN_ITEM_MAX
+        if n > room:
             left, kept = room, {}
             for k, v in t.items():
                 kept[k], left = v[:left], max(0, left - len(v))
@@ -148,13 +179,14 @@ def verify(job: dict, *, scope="num,id,part,net", forbidden=None, pages: dict | 
     hn = (job.get("opts") or {}).get("human_note")
     if isinstance(hn, str) and hn.strip():
         pseudo.append(("human_note", hn))
-    pseudo_sets = [(name, {(k, v) for k, v, _p in tokens(src)}) for name, src in pseudo]
-    idx_sets = [(_label(e), {(k, v) for k, vs in (e.get("t") or {}).items() for v in vs}) for e in (idx or []) if isinstance(e, dict)]
+    pseudo_sets = [(name, {token_hash(k, v) for k, v, _p in tokens(src)}) for name, src in pseudo]
+    idx_sets = [(_label(e), {h for vs in (e.get("t") or {}).values() for h in vs}) for e in (idx or []) if isinstance(e, dict)]
     rows: dict[tuple[str, str], dict] = {}
     for kind, val, pos in tokens(body, kinds):
         r = rows.get((kind, val))
         if r is None:
-            src = [name for name, s in idx_sets + pseudo_sets if (kind, val) in s]
+            h = token_hash(kind, val)
+            src = [name for name, s in idx_sets + pseudo_sets if h in s]
             r = rows[(kind, val)] = {"kind": kind, "value": val, "pos": [], "src": src or NO_SOURCE}
         r["pos"].append(pos)
     toks = sorted(rows.values(), key=lambda r: r["pos"][0])
