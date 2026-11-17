@@ -29,6 +29,7 @@ from pydantic import Field
 import delib_batch
 import delib_decision
 import delib_jobs
+import delib_presets
 import delib_refs
 import delib_resume
 import delib_subject
@@ -393,6 +394,8 @@ _START_DESC = (
     "넘으면 머리만 싣고 question_chars(전체 길이)와 note 로 전문 받는 곳을 말한다(받은 화두는 전부 쓰인다).\n\n"
     "**과제 심의면 subject 에 과제 · 차수를 싣는다** — 사용자에게 과제(SP 허브 과제 key)와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다"
     "(자세한 것은 subject 인자 설명).\n\n"
+    "**기본값 묶음** — preset 에 이름을 주면(목록은 deliberate_jobs 의 presets — 예 risk-review-batch) 그 묶음의 값을 깔고 직접 준 인자가 "
+    "이긴다. 응답의 preset.applied 가 최종 값과 출처다.\n\n"
     "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
 
@@ -491,6 +494,9 @@ _A_WIKI = ("참이면 결정문을 MX 백서 LLM 위키에도 원천으로 남�
 _A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 이름과 뜻(timeout_s 는 LLM 호출 1회 한도 초 · 엔진의 최소~최대 범위로 죈다)은 도구 "
                "설명의 advanced 절이다.")
 _A_JOB_ID = "심의 잡 id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
+_A_PRESET = ("기본값 묶음 이름(선택 — 목록과 값은 deliberate_jobs 의 presets). 묶음의 job · rounds · modifiers · save_report · advanced 를 깔고, "
+             "여기서 직접 준 인자가 이긴다(도구 기본값과 같은 값 — job='default' · rounds=0 — 은 준 것으로 보지 않는다. advanced 는 손잡이마다). "
+             "응답의 preset.applied 가 칸마다 최종 값과 출처(preset · caller)다.")
 _A_PART = "응답이 쪽으로 나뉘었을 때 받을 쪽(1부터 — page.next 가 다음 쪽을 알려 준다)."
 
 # 진행 조회 기다림(deliberate_status wait_s — HWAXPortal docs/token-saving P3 · TS-5 사용자 결정 11-02) — 부르는 쪽이 고리로 거듭 묻지 않게 서버가 잡
@@ -598,6 +604,7 @@ async def deliberate_start(
     wiki: Annotated[bool, Field(description=_A_WIKI)] = False,
     advanced: Annotated[dict | None, Field(description=_A_ADVANCED)] = None,
     subject: Annotated[dict | None, Field(description=_A_SUBJECT)] = None,
+    preset: Annotated[str | None, Field(description=_A_PRESET)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """심의를 연다.
@@ -651,6 +658,13 @@ async def deliberate_start(
                else type(personas[0]).__name__)
             + ". 이대로 시작하면 지정한 패널이 아니라 서버가 발굴한 좌석으로 돈다 — 고쳐서 다시 불러라"
               "(좌석을 서버에 맡기려면 personas 를 비운다).")
+    preset_echo = None
+    if preset:
+        # 기본값 묶음(DL-05) — 부른 쪽이 직접 준 인자가 이긴다(delib_presets.apply). 이 뒤로는 최종 값으로만 돈다.
+        final, preset_echo = delib_presets.apply(preset, {"job": job, "rounds": rounds, "modifiers": modifiers,
+                                                          "save_report": save_report, "advanced": advanced})
+        job, rounds, modifiers = final["job"], final["rounds"], final["modifiers"]
+        save_report, advanced = final["save_report"], final["advanced"]
     user, groups = _caller(ctx)
     adv = advanced if isinstance(advanced, dict) else {}
     subj = await _subject_for(subject, chair=delib_jobs.JOBS[delib_jobs.resolve_job(job)].get("chair") or adv.get("chair_template"),
@@ -686,6 +700,8 @@ async def deliberate_start(
     if subj is not None:
         out["note"] += " " + delib_subject.say(subj) + "."
     _say_refs(out, refs)
+    if preset_echo is not None:
+        out["preset"] = preset_echo
     return mcp_pages.echo_head(out, "question", _Q_ECHO_WHERE)
 
 
@@ -1566,6 +1582,9 @@ async def deliberate_jobs(ctx: Context | None = None) -> dict:
         # 줄 — 길이와 **호출자 자신의** 순번만. 남의 잡은 길이에 수로만 들어간다(id·화두를 싣지 않는다).
         "queue": delib_jobs.queue_state(user),
         "states": _STATE_DESC,
+        # 기본값 묶음(DL-05) — deliberate_start(preset=name). 버린 묶음 · 박스 덧씌우기 사정은 문제가 있을 때만 싣는다.
+        "presets": delib_presets.listing(),
+        **({"presets_state": st} if (st := delib_presets.state())["errors"] or st["overlay"].get("error") else {}),
         "note": "meeting_* 도구는 발표자료 제작용 디자인 회의체다 — 공학 심의가 아니다.",
     }
 

@@ -18,3 +18,6 @@ artifacts/
 # 전문가 고르기 기준선 박스 자리(seat_probe.box_dir — 평가셋 · 평가 기록 · 실사용 질문 · 그림자 기록) — 잡 원장의 형제라 ARTIFACT_DIR 이 /data 로 가지
 # 않은 박스에서는 리포 안에 생긴다. 질문 원문이 든다 — 추적하지 않는다(HWAXPortal docs/request-1029 design-e5 · 결정 D-E5-8)
 /seat-eval
+
+# 심의 기본값 묶음(preset)의 박스 덧씌우기 — 박스마다 커밋 없이 고친다(HWAXPortal docs/request-1117 DL-05 · delib_presets)
+/delib_presets.local.json
