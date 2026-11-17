@@ -9963,9 +9963,9 @@ async def deliberate_batch_status_http(request: Request):
     body, who, denied = await _dl_open(request, ("batch_id",))
     if denied:
         return denied
-    user, _groups, aff, admin = who
+    user, groups, aff, admin = who
     try:
-        return _delib_mcp_module.batch_read(body.get("batch_id"), user=user, aff=aff, admin=admin)
+        return _delib_mcp_module.batch_read(body.get("batch_id"), user=user, aff=aff, admin=admin, groups=groups)
     except PermissionError as exc:
         return _dl_error("forbidden", str(exc), 403)
     except ValueError as exc:

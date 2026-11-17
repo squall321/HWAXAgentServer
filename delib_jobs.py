@@ -1422,7 +1422,7 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
 def start(app, job_kind: str, question: str, *, groups: list | None = None,
           delib_opts: dict | None = None, user_email: str = "", user_pat: str = "", owner: str = "",
           owner_aff: str = "", resume: "delib_resume.Resume | None" = None, subject: dict | None = None,
-          refs: dict | None = None, batch: dict | None = None) -> dict:
+          refs: dict | None = None, batch: dict | None = None, dry_run: bool = False) -> dict:
     """심의를 백그라운드로 시작하고 잡 레코드를 즉시 돌려준다.
 
     resume 은 제자리 이어하기(HA-09 S1 · 사용자 결정 10-31 A-2 (가))의 재개 상태다 — MCP 입구(mcp_server._resume)가 주인의 일지에서 만들어
@@ -1451,13 +1451,17 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     그 잡의 기록 그대로다). 안 주면 원장은 종전 그대로다.
 
     batch 는 심의 묶음이 띄우는 잡의 표지 {id, key, token} 다(delib_batch — DL-02). 새 잡의 원장 · 목록 색인 batch 칸에 싣는다(요청 손잡이로는 받지
-    않는다 · 엔진에 넘기지 않는다). 안 주면 칸이 없다."""
+    않는다 · 엔진에 넘기지 않는다). 안 주면 칸이 없다.
+
+    dry_run 이면 검사만 한다 — 멈춤 · 동시 한도는 보지 않고, 인자를 엔진이 읽는 대로 읽고 거절 규칙(봉인 · 기준일 · 외부 응답자)과 잡 꼴 짓기(좌석 어림 ·
+    역할)까지 돌린 뒤 원장 · 줄 · 파일에 아무것도 남기지 않고 그 꼴을 돌려준다. 묶음이 항목을 받을 때 쓴다(반대 검토 M1 — 띄울 때 터지는 인자를 먼저
+    거절한다)."""
     j = resolve_job(job_kind)
     spec = JOBS[j]
     q = (question or "").strip()
     if not q:
         raise ValueError("question 이 비어 있다 — 심의할 화두가 필요하다")
-    paused = pause_info()       # 새 심의 멈춤(R1) — 시작 · 이어하기 모두 여기를 지난다
+    paused = None if dry_run else pause_info()       # 새 심의 멈춤(R1) — 시작 · 이어하기 모두 여기를 지난다
     if paused:
         raise DelibPaused(paused)
     # ⚠ 거절 문구에 **남의 job_id 를 싣지 않는다.** 종전엔 진행 중인 잡 id 를 전부 찍었는데,
@@ -1498,7 +1502,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     # 상한에 걸려도 줄에 자리가 있으면 거절하지 않는다(아래에서 줄을 세운다). 거절은 줄을 끈 박스
     # (QUEUE_MAX=0 — 종전 문구 그대로)와 줄까지 찬 때뿐이다. 줄이 찼어도 상한에 안 걸린 사람은 막지 않는다.
     # '전체 n/상한' 은 GLM 자리의 수다 — 외부 응답자 잡의 거절 문구에는 싣지 않는다.
-    if hit and _qm <= 0:
+    if hit and _qm <= 0 and not dry_run:
         raise RuntimeError(
             f"동시 실행 상한에 걸렸다({' · '.join(hit)}) — "
             + (f"내 진행 중 {len(mine)}건{' ' + ', '.join(mine) if mine else ''}" if who
@@ -1506,7 +1510,7 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
             + ("" if external else f" · 전체 {total}/{_mr}") + ". "
             + ("내 심의가 끝난 뒤 다시 하거나 deliberate_cancel 로 내 것 하나를 접어라." if mine
                else "진행 중인 심의가 끝난 뒤 다시 하라."))
-    if hit and len(_PENDING) >= _qm:
+    if hit and len(_PENDING) >= _qm and not dry_run:
         waiting = [x["job_id"] for x in queue_state(me)["mine"]]
         raise RuntimeError(
             f"동시 실행 상한에 걸렸고({' · '.join(hit)}) 대기열도 찼다"
@@ -1587,6 +1591,8 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     }
     if subject is not None:
         job["subject"] = subject
+    if dry_run:
+        return job
     if refs is not None and resume is None:
         job["evidence_refs"] = list(refs.get("refs") or [])
         job["evidence_omitted"] = list(refs.get("omitted") or [])[:OMITTED_MAX] + list(job.get("evidence_omitted") or [])

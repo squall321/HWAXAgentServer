@@ -30,6 +30,7 @@ ME, MATE, OUT = "me@example.com", "mate@example.com", "out@example.com"
 @pytest.fixture
 def bt(eng, monkeypatch):
     monkeypatch.setattr(B, "_BATCHES", {})
+    monkeypatch.setattr(B, "_INDEX", None)          # 묶음 색인도 시험마다 새 원장 폴더에서 다시 읽는다
     monkeypatch.setattr(B, "_FEEDING", set())
     monkeypatch.setattr(B, "_APP", m._APP)
     _caps(monkeypatch, 6, per_user=6)
@@ -442,3 +443,169 @@ def test_HTTP_창구(bt, monkeypatch):
     assert c.post("/deliberate/batch/stop", json={"batch_id": b["id"]}, headers={**auth, "x-hwax-user": OUT}).status_code == 403
     r = c.post("/deliberate/batch/stop", json={"batch_id": b["id"]}, headers={**auth, "x-hwax-user": ME})
     assert r.status_code == 200 and r.json()["status"] == "stopped"
+
+
+# ── 반대 검토 고침(M1 · M2 · M6 · M7 · L1 ~ L4 · L6) ───────────────────────────────────────────────────────────
+def test_엔진이_받지_못하는_항목은_묶음을_만들기_전에_거절한다(bt):
+    with pytest.raises(ValueError, match="엔진이 이 항목을 받지 못한다"):
+        _new(items=[{"key": "A", "question": "q", "advanced": {"personas": 1}}, {"key": "B", "question": "r"}])
+    assert B._BATCHES == {}
+    assert not B._dir().exists() or not list(B._dir().glob("*.json")), "아무것도 남기지 않는다"
+
+
+def test_띄우다_뜻밖의_오류는_실패한_시도이고_묶음을_막지_않는다(bt, monkeypatch):
+    real = delib_jobs.start
+
+    def boom(app, job_kind, question, **kw):
+        if question == "가" and not kw.get("dry_run"):
+            raise TypeError("'int' object is not iterable")
+        return real(app, job_kind, question, **kw)
+    monkeypatch.setattr(delib_jobs, "start", boom)
+
+    async def scenario():
+        out = await m.batch_start(name="묶음-오류", items=_items("가", "나"), concurrency=1, retries=0, stall_s=0, user=ME, groups=[], aff="")
+        b = B.get(out["batch_id"])
+        await _tick()
+        assert b["items"][0]["state"] == "failed" and "TypeError" in b["items"][0]["error"], b["items"][0]
+        assert b["items"][1]["state"] == "running" and bt.started == ["나"], "다음 항목은 그대로 띄운다"
+
+    _play(scenario)
+
+
+def test_다_건너뛴_묶음은_원장에도_끝으로_남고_이름을_잠그지_않는다(bt):
+    async def scenario():
+        b1 = _new(items=_items("가"))
+        await B.feed(b1)
+        await _tick()
+        await _end(bt, _job_of(b1, "K-1"))
+        await B.feed(b1)
+        b2 = _new(items=_items("가"))
+        assert b2["status"] == "done" and _on_disk(b2)["status"] == "done" and B._index()[b2["id"]]["status"] == "done"
+        b3 = _new(items=_items("가"))
+        assert b3["status"] == "done", "같은 이름이 잠기지 않는다"
+
+    _play(scenario)
+
+
+def test_멈추면_엔진_줄에_서_있기만_한_잡은_빼고_도는_잡은_둔다(bt, monkeypatch):
+    _caps(monkeypatch, 1, per_user=1)
+
+    async def scenario():
+        other = delib_jobs.start(m._APP, "default", "앞서 도는 내 심의", user_email=ME)
+        await _tick()
+        b = _new(items=_items("가", "나"), concurrency=1)
+        _caps(monkeypatch, 1, per_user=1)
+        await B.feed(b)
+        it = b["items"][0]
+        job = delib_jobs.get(it["job_id"])
+        assert job["status"] == "queued" and job["id"] in delib_jobs._PENDING
+        m.batch_stop(b["id"], user=ME)
+        assert it["state"] == "stopped" and job["status"] == "cancelled" and job["id"] not in delib_jobs._PENDING
+        assert b["status"] == "stopped" and other["status"] == "running", "멈춤은 내 묶음의 줄 선 잡만 뺀다"
+        await _end(bt, other)
+        assert "가" not in bt.started, "멈춘 뒤 줄 선 잡이 돌기 시작하지 않는다"
+
+    _play(scenario)
+
+
+def test_참조를_다_풀지_못한_항목은_띄우지_않고_실패한_시도로_센다(bt, monkeypatch):
+    async def call(_app, *, groups, user, user_pat, alias, args):
+        return True, "forbidden: 권한이 없다"
+    monkeypatch.setattr(delib_refs, "call_alias", call)
+
+    async def scenario():
+        b = _new(items=[{"key": "K-1", "question": "가", "evidence": [{"ref": {"kind": "risk_bundle", "id": "BND-1"}}]}], retries=1)
+        await B.feed(b)
+        await B.feed(b)
+        (it,) = b["items"]
+        assert it["state"] == "failed" and it["tries"] == 2 and bt.started == [], "근거 없이 돌지 않는다"
+        assert all(a["status"] == "failed" and "근거 참조를 다 풀지 못했다" in a["why"] for a in it["attempts"])
+
+    _play(scenario)
+
+
+def test_멈춘_묶음의_띄우는_중_항목은_멈춤으로_닫힌다(bt):
+    b = _new(items=_items("가"))
+    b["items"][0].update(state="starting", token="tok-gone")
+    b["status"] = "stopping"
+    B._reconcile(b)
+    B._finish_if_done(b)
+    assert b["items"][0]["state"] == "stopped" and b["status"] == "stopped"
+
+
+def test_멈춤_줄_참이면_참조를_풀지_않고_기다린다(bt, monkeypatch):
+    calls = []
+
+    async def call(*a, **kw):
+        calls.append(1)
+        return False, "{}"
+    monkeypatch.setattr(delib_refs, "call_alias", call)
+    monkeypatch.setattr(delib_jobs, "pause_info", lambda: {"on": True, "retry_after_s": 120})
+
+    async def scenario():
+        b = _new(items=[{"key": "K-1", "question": "가", "evidence": [{"ref": {"kind": "risk_bundle", "id": "BND-1"}}]}])
+        for _ in range(3):
+            await B.feed(b)
+        assert calls == [] and b["items"][0]["state"] == "pending" and b["items"][0]["tries"] == 0
+
+    _play(scenario)
+
+
+def test_끝난_key_는_같은_이름의_앞_묶음_전부에서_모은다(bt):
+    async def scenario():
+        b1 = _new(items=_items("가", "나"))
+        await B.feed(b1)
+        await _tick()
+        await _end(bt, _job_of(b1, "K-1"))
+        m.batch_stop(b1["id"], user=ME)          # K-2 가 뜨기 전에 멈춘다
+        await B.feed(b1)
+        assert b1["status"] == "stopped" and _state(b1) == ["done", "stopped"]
+        b2 = _new(items=_items("가", "나"))
+        await B.feed(b2)
+        await _tick()
+        await _end(bt, _job_of(b2, "K-2"))
+        await B.feed(b2)
+        assert b2["status"] == "done"
+        b3 = _new(items=_items("가", "나", "다"))
+        assert _state(b3) == ["skipped", "skipped", "pending"], "K-1 은 첫 묶음 · K-2 는 둘째 묶음에서 끝났다"
+        assert b3["items"][0]["done_in"]["batch_id"] == b1["id"] and b3["items"][1]["done_in"]["batch_id"] == b2["id"]
+
+    _play(scenario)
+
+
+def test_묶음은_관리자_표지를_적지_않고_주인이_부를_때_그룹을_고친다(bt):
+    b = B.create(m._APP, name="묶음-그룹", items=_items("가"), user=ME, groups=["CAEG", "portal-admin"], owner_aff="TEAM-A")
+    assert b["groups"] == ["CAEG"] and B.ADMIN_GROUP == m._ADMIN_GROUP
+    m.batch_read(b["id"], user=MATE, aff="TEAM-A", admin=False, groups=["OTHER"])
+    assert b["groups"] == ["CAEG"], "주인이 아니면 고치지 않는다"
+    m.batch_read(b["id"], user=ME, aff="TEAM-A", admin=False, groups=["TEAM-ONLY", "portal-admin"])
+    assert b["groups"] == ["TEAM-ONLY"] and _on_disk(b)["groups"] == ["TEAM-ONLY"]
+
+
+def test_묶음_id_꼴이_아니면_파일을_보지_않는다(bt):
+    for bad in ("../x", "batch-1", "batch-20261117-000000-ZZZZZZ", ""):
+        assert B.get(bad) is None
+        with pytest.raises(ValueError):
+            B.stop(bad, by=ME)
+
+
+def test_보존_기한이_지난_끝난_묶음은_지운다_만들기는_원장을_다시_읽지_않는다(bt, monkeypatch):
+    old = _new(name="묶음-옛")
+    m.batch_stop(old["id"], user=ME)
+    assert old["status"] == "stopped"
+    old["finished_at"] = delib_jobs._now() - B.KEEP_S - 10
+    B._persist(old)
+    loads = []
+    real = B._load
+    monkeypatch.setattr(B, "_load", lambda bid: loads.append(bid) or real(bid))
+    _new(name="묶음-새")
+    assert loads == [], "만들기는 메모리 색인만 본다"
+    B.bind(m._APP)
+    assert not B._path(old["id"]).exists() and old["id"] not in B._index()
+
+
+def test_본문_근거_합이_상한을_넘으면_받지_않는다(bt, monkeypatch):
+    monkeypatch.setattr(B, "INLINE_MAX", 10)
+    with pytest.raises(ValueError, match="참조"):
+        _new(items=[{"key": "A", "question": "q", "evidence": [{"source": "s", "result": "x" * 11}]}])
+    _new(name="묶음-참조", items=[{"key": "A", "question": "q", "evidence": [{"ref": {"kind": "risk_bundle", "id": "B-1"}}]}])

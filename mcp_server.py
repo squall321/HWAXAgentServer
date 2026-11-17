@@ -1609,8 +1609,11 @@ _BATCH_DESC = (
     "돌지 않는다(같은 이름으로 다시 시작하면 앞 묶음에서 끝난 key 는 건너뛴다) · 멈춘 뒤에는 새로 띄우지 않는다 · 실패한 항목은 retries 번까지만 다시 "
     "띄운다 · 엔진의 사람별 · 전역 · 좌석 합 한도와 줄은 그대로 걸린다(줄이 차거나 새 심의 멈춤이면 기다렸다 띄운다) · 서버 재기동을 넘긴다(끊긴 잡은 같은 "
     "잡에서 잇는다). 끝난 항목의 좌석 가운데 하나라도 어느 라운드에 발언하지 못했으면(좌석 유실 — 시간 초과 · 응답 없음) 그 결정은 "
-    "trust='not_trustworthy' 다(하나라도 빠지면 늘 — 비율로 가르지 않는다). **끝남은 바깥으로 알리지 않는다** — deliberate_batch_status 의 "
-    "finished · notice 로 본다(몇 분 간격으로 한 번씩). 신원(사람 PAT)이 있는 호출만 시작한다 — 묶음의 잡은 그 사람 이름으로 돈다.")
+    "trust='not_trustworthy' 다(하나라도 빠지면 늘 — 비율로 가르지 않는다). 항목의 근거 참조가 하나라도 풀리지 않으면 그 항목은 띄우지 않고 실패한 "
+    "시도로 센다(근거 없이 돌지 않는다). 항목 인자는 받을 때 엔진 검사로 먼저 거른다(틀리면 묶음을 만들지 않는다). 본문 근거 합은 "
+    f"{delib_batch.INLINE_MAX:,}자까지다(큰 근거는 참조로). 끝난 묶음 원장은 {delib_batch.KEEP_S // 86400}일 보존한다. **끝남은 바깥으로 알리지 "
+    "않는다** — deliberate_batch_status 의 finished · notice 로 본다(몇 분 간격으로 한 번씩). 신원(사람 PAT)이 있는 호출만 시작한다 — 묶음의 잡은 그 "
+    "사람 이름으로 돈다(묶음에 적힌 그룹으로 — 관리자 표지는 적지 않고, 주인이 진행 조회 · 멈춤을 부를 때 그때의 그룹으로 고친다).")
 
 
 def _batch_brief(b: dict) -> dict:
@@ -1624,7 +1627,10 @@ async def batch_start(*, name, items, concurrency, retries, stall_s, user: str, 
     """deliberate_batch_start · POST /deliberate/batch/start — 묶음을 만들고 곧바로 한 번 먹인다(띄울 수 있는 만큼)."""
     b = delib_batch.create(_need_app(), name=name, items=items, concurrency=concurrency, retries=retries, stall_s=stall_s,
                            user=user, groups=groups, owner_aff=aff)
-    await delib_batch.feed(b)
+    try:
+        await delib_batch.feed(b)
+    except Exception:  # noqa: BLE001 — 묶음은 이미 원장에 있다 — 오류로 답하면 같은 이름이 잠긴 줄 모른다(주기 먹이기가 다시 본다)
+        log.exception("[batch %s] 첫 먹이기 실패 — 주기 먹이기가 다시 본다", b["id"])
     out = _batch_brief(b)
     if not out["finished"]:
         paused = delib_jobs.pause_info()
@@ -1650,13 +1656,16 @@ async def deliberate_batch_start(
                              user=user, groups=groups, aff=_caller_view(ctx)[1])
 
 
-def batch_read(batch_id: str, *, user: str, aff: str, admin: bool) -> dict:
-    """deliberate_batch_status · POST /deliberate/batch/status — 볼 수 없는 묶음이면 PermissionError, 없으면 ValueError."""
+def batch_read(batch_id: str, *, user: str, aff: str, admin: bool, groups=None) -> dict:
+    """deliberate_batch_status · POST /deliberate/batch/status — 볼 수 없는 묶음이면 PermissionError, 없으면 ValueError. 주인이 부르면 그때의 그룹으로
+    묶음의 그룹을 고쳐 적는다(delib_batch.touch)."""
     b = delib_batch.get(str(batch_id or "").strip())
     if b is None:
         raise ValueError(f"그런 묶음이 없다: {str(batch_id)[:80]}")
     if not delib_batch.can_read(b, user, aff, admin):
         raise PermissionError(f"이 묶음({b['id']})은 볼 수 없다 — 시작한 사람과 같은 소속, 관리자만 본다")
+    if groups is not None:
+        delib_batch.touch(b, user=user, groups=groups)
     return delib_batch.view(b)
 
 
@@ -1671,16 +1680,16 @@ async def deliberate_batch_status(batch_id: Annotated[str, Field(description=_A_
                                   ctx: Context | None = None) -> dict:
     """심의 묶음 진행(batch_read)."""
     user, aff, admin = _caller_view(ctx)
-    out = batch_read(batch_id, user=user, aff=aff, admin=admin)
+    out = batch_read(batch_id, user=user, aff=aff, admin=admin, groups=_caller(ctx)[1])
     return mcp_pages.paged(out, part=part, ids=("batch_id", "status"), again={"batch_id": out["batch_id"]})
 
 
 def batch_stop(batch_id: str, *, user: str) -> dict:
-    """deliberate_batch_stop · POST /deliberate/batch/stop — 주인만(남의 것이면 PermissionError)."""
+    """deliberate_batch_stop · POST /deliberate/batch/stop — 주인만(남의 것이면 PermissionError). 엔진 줄에 서 있기만 한 잡은 빼고, 도는 잡은 둔다."""
     b = delib_batch.stop(str(batch_id or "").strip(), by=user)
     out = _batch_brief(b)
     running = [x["job_id"] for x in out["in_engine"] if x.get("job_id")]
-    out["note"] = ("멈췄다 — 새 항목을 띄우지 않고 줄 선 항목은 stopped 로 닫았다. "
+    out["note"] = ("멈췄다 — 새 항목을 띄우지 않고 줄 선 항목과 엔진 줄에 서 있기만 한 잡은 stopped 로 닫았다. "
                    + (f"엔진에 있는 잡 {len(running)}건({', '.join(running)})은 끝까지 지켜본다 — 접으려면 그 job_id 로 deliberate_cancel. "
                       if running else "")
                    + "같은 이름으로 다시 시작하면 끝난 key 는 건너뛰고 남은 것만 돈다.") if out["status"] in ("stopping", "stopped") else (
@@ -1689,7 +1698,8 @@ def batch_stop(batch_id: str, *, user: str) -> dict:
 
 
 @mcp.tool(title="심의 묶음 멈춤",
-          description=("심의 묶음을 멈춘다 — 이 뒤로 새 항목을 띄우지 않고, 줄 선(pending) 항목은 stopped 로 닫는다. 엔진에 이미 있는 잡은 끝까지 지켜보고"
+          description=("심의 묶음을 멈춘다 — 이 뒤로 새 항목을 띄우지 않고, 줄 선(pending) 항목과 엔진 줄에 서 있기만 한(아직 돌지 않은) 잡은 stopped 로 "
+                       "닫는다. 이미 도는 잡은 끝까지 지켜보고"
                        "(그 결정 · 좌석 유실도 적는다) 응답의 in_engine 에 job_id 를 준다 — 접으려면 그 job_id 로 deliberate_cancel. 내가 시작한 묶음만 "
                        "멈춘다. 같은 이름으로 다시 시작하면 끝난 key 는 건너뛰고 남은 것만 돈다."))
 async def deliberate_batch_stop(batch_id: Annotated[str, Field(description=_A_BATCH_ID)], ctx: Context | None = None) -> dict:
