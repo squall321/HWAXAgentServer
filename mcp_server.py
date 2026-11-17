@@ -395,7 +395,9 @@ _START_DESC = (
     "**과제 심의면 subject 에 과제 · 차수를 싣는다** — 사용자에게 과제(SP 허브 과제 key)와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다"
     "(자세한 것은 subject 인자 설명).\n\n"
     "**기본값 묶음** — preset 에 이름을 주면(목록은 deliberate_jobs 의 presets — 예 risk-review-batch) 그 묶음의 값을 깔고 직접 준 인자가 "
-    "이긴다. 응답의 preset.applied 가 최종 값과 출처다.\n\n"
+    "이긴다. 단 도구 기본값과 같은 값(job='default' · rounds=0 · save_report=true · modifiers 비움)은 준 것으로 보지 않는다 — 묶음 값을 끄려면 "
+    "기본값이 아닌 값으로 준다(층을 끄려면 modifiers=[]). advanced 의 rounds · modifiers · save_report 는 위 인자와 묶음을 다 이긴다. 응답의 "
+    "preset.applied 가 칸마다 최종 값과 출처다.\n\n"
     "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
 )
 

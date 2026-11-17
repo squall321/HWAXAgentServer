@@ -89,6 +89,25 @@ def test_직접_준_인자가_이기고_칸마다_출처를_말한다():
         P.apply("nope", {})
 
 
+def test_advanced_의_rounds_가_이기면_메아리도_그렇게_말한다(eng, monkeypatch):
+    """반대 검토 L7a — advanced.rounds 는 엔진에 가는 손잡이에서 위 인자를 덮는다. 메아리가 preset 의 2 라고 말하면 거짓이다."""
+    final, echo = P.apply(NAME, {"job": "default", "rounds": 0, "modifiers": None, "save_report": True, "advanced": {"rounds": 4}})
+    assert echo["applied"]["rounds"] == {"value": 4, "from": "caller", "via": "advanced"}
+    _caps(monkeypatch, 2)
+
+    async def scenario():
+        out = await m.deliberate_start("메아리", preset=NAME, advanced={"rounds": 4}, ctx=_ctx(ME))
+        await _tick()
+        assert eng.seen["메아리"].opts["rounds"] == 4 and out["preset"]["applied"]["rounds"]["value"] == 4
+
+    _play(scenario)
+
+
+def test_묶음의_advanced_에는_위_인자_이름을_두지_않는다(overlay):
+    overlay({"presets": {"twice": {"args": {"rounds": 2, "advanced": {"rounds": 3}}}}})
+    assert "twice" not in P.presets() and "위 인자로 준다" in P.state()["errors"][0]
+
+
 def test_시작은_묶음을_깔아_엔진에_넘기고_응답에_되돌린다(eng, monkeypatch):
     _caps(monkeypatch, 2)
 
@@ -138,3 +157,4 @@ def test_시작_설명이_묶음을_가리킨다():
     t = next(x for x in asyncio.run(m.mcp.list_tools()) if x.name == "deliberate_start")
     assert "preset" in t.inputSchema["properties"] and t.inputSchema["properties"]["preset"].get("default") is None
     assert "preset" in t.description and NAME in t.description
+    assert "준 것으로 보지 않는다" in t.description, "기본값과 같은 인자는 묶음을 이기지 않는다는 규칙을 도구 설명에 적는다"

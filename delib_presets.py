@@ -10,7 +10,9 @@
 보낸 호출이 말없이 자유 심의로 돌았다 — 심의 종류는 job 이다.
 
 **이기는 쪽.** 부른 쪽이 직접 준 인자가 preset 을 이긴다. '직접 줬다' 는 도구 기본값(DEFAULTS)과 다른 값이다 — job='default' · rounds=0 처럼 기본값과 같은
-값을 주면 준 것으로 보지 않는다(preset 이 채운다). advanced 는 손잡이마다 가린다. 응답의 preset.applied 가 칸마다 최종 값과 출처(preset · caller)다.
+값을 주면 준 것으로 보지 않는다(preset 이 채운다). advanced 는 손잡이마다 가린다. 부른 쪽 advanced 에 rounds · modifiers · save_report 가 있으면 그것이
+위 인자 · preset 을 다 이긴다(엔진에 가는 손잡이는 advanced 가 맨 뒤에 덮는다 — mcp_server._build_opts) — 메아리는 from caller · via advanced 다. preset 의
+advanced 에는 그 셋을 두지 않는다(위 인자로 둔다). 응답의 preset.applied 가 칸마다 최종 값과 출처(preset · caller)다.
 """
 from __future__ import annotations
 
@@ -81,6 +83,9 @@ def _check(name: str, spec) -> dict:
         if not isinstance(adv, dict) or not adv:
             raise ValueError("advanced 는 비지 않은 객체다")
         known = set(vars(_engine._DEFAULT_OPTS))
+        top = sorted(k for k in adv if k in ARGS)
+        if top:
+            raise ValueError(f"advanced 의 {top} 는 위 인자로 준다(같은 값이 두 자리에 있으면 어느 쪽이 걸렸는지 메아리가 틀린다)")
         unknown = sorted(k for k in adv if k not in known)
         if unknown:
             raise ValueError(f"advanced 의 {unknown[:5]} 는 엔진이 같은 이름으로 읽는 손잡이가 아니다")
@@ -161,6 +166,7 @@ def apply(name: str, given: dict) -> tuple[dict, dict]:
     if spec is None:
         raise ValueError(f"그런 심의 기본값(preset)이 없다: {str(name)[:60]!r} — 있는 것: {', '.join(presets()) or '없음'}(deliberate_jobs 의 presets)")
     final, applied = dict(given), {}
+    adv_given = dict(given.get("advanced") or {})
     for k, v in spec["args"].items():
         if k == "advanced":
             cur = dict(given.get("advanced") or {})
@@ -171,6 +177,9 @@ def apply(name: str, given: dict) -> tuple[dict, dict]:
                     cur[ak] = av
                     applied[f"advanced.{ak}"] = {"value": av, "from": "preset"}
             final["advanced"] = cur
+        elif adv_given.get(k) is not None:
+            # 부른 쪽 advanced 의 같은 이름 손잡이가 위 인자를 이긴다(mcp_server._build_opts 가 advanced 를 맨 뒤에 덮는다) — 메아리도 그것을 말한다
+            applied[k] = {"value": adv_given[k], "from": "caller", "via": "advanced"}
         elif given.get(k) != DEFAULTS[k]:
             applied[k] = {"value": given[k], "from": "caller"}
         else:
