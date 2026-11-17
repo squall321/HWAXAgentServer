@@ -123,11 +123,14 @@ CONSENSUS_PHRASES = (
     "반대 없이", "반대 의견 없이", "한목소리",
     "unanimous", "unanimously", "full consensus",
 )
-# 낱말 바로 뒤(이 글자 수 안)에 부정이 오면 주장이 아니다 — '전원 합의에 이르지 못했다' · '만장일치는 아니다' · '만장일치가 아닌' · '만장일치 아님' ·
-# '전원 합의는 없다(없었다 · 없고 · 없음 · 없는)'. 낱말 바로 앞의 부정도 같다 — 'not unanimous' · 'no full consensus' · '비만장일치'(한글 앞붙이는
-# 띄우지 않은 것만 — '준비 만장일치' 의 '비' 는 아니다). 부정 낱말은 이 두 정규식 한 곳이다(반대 검토 M4).
+# 부정이면 주장이 아니다 — 부정 낱말은 아래 세 정규식 한 곳이다(반대 검토 M4 · 2차 검토 3).
+#  · 낱말에 **붙은** 없 · 아니 · 아닌 · 아님(조사 하나까지) — '만장일치는 아니다' · '만장일치가 아닌' · '만장일치 아님' · '전원 합의는 없다(없었다)'.
+#    떨어져 있으면 다른 것을 부정한다 — '만장일치(반대 없음)' · '전원 찬성, 반대 없음' · '전원 합의 — 이견 없다' · '만장일치로 문제없다고' 는 주장이다.
+#  · 낱말 뒤 _NEG_WINDOW 자 안의 않 · 못 · 실패 · not — '전원 합의에 이르지 못했다'.
+#  · 낱말 바로 앞 — 'not unanimous' · 'no full consensus' · '비만장일치'(한글 앞붙이는 띄우지 않은 것만 — '준비 만장일치' 의 '비' 는 아니다).
 _NEG_WINDOW = 8
-_NEG_RE = re.compile(r"아니|아닌|아님|않|못|없었|없다|없고|없음|없는|실패|not\b|n't\b", re.IGNORECASE)
+_NEG_ATTACHED_RE = re.compile(r"^\s*(?:은|는|이|가|도|을|를)?\s*(?:없|아니|아닌|아님)")
+_NEG_RE = re.compile(r"않|못|실패|not\b|n't\b", re.IGNORECASE)
 _NEG_BEFORE_RE = re.compile(r"(?:\b(?:not|no|never|without)\s+(?:a\s+|an\s+)?|\bnon-?|비|非)$", re.IGNORECASE)
 _PHRASE_RE = re.compile("|".join(re.escape(p) for p in sorted(CONSENSUS_PHRASES, key=len, reverse=True)), re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
@@ -168,12 +171,14 @@ def votes(job: dict) -> dict | None:
 
 
 def consensus_claim(text: str) -> str | None:
-    """결정문(코드 펜스 밖)에서 만장일치 · 전원 합의를 말하는 첫 문장(앞뒤 공백을 걷고 _CLAIM_MAX 자까지) — 없으면 None. 낱말 바로 뒤(_NEG_RE)나
-    바로 앞(_NEG_BEFORE_RE)에 부정이 오면 세지 않는다(_NEG_WINDOW 자 안)."""
+    """결정문(코드 펜스 밖)에서 만장일치 · 전원 합의를 말하는 첫 문장(앞뒤 공백을 걷고 _CLAIM_MAX 자까지) — 없으면 None. 낱말에 붙은 부정
+    (_NEG_ATTACHED_RE) · 뒤 _NEG_WINDOW 자 안의 부정(_NEG_RE) · 바로 앞의 부정(_NEG_BEFORE_RE)이 있으면 세지 않는다."""
     prose = _CODE_FENCE_RE.sub(" ", text or "")
     for sent in _SENT_SPLIT_RE.split(prose):
         for m in _PHRASE_RE.finditer(sent):
-            if _NEG_RE.search(sent[m.end():m.end() + _NEG_WINDOW]) or _NEG_BEFORE_RE.search(sent[max(0, m.start() - _NEG_WINDOW):m.start()]):
+            after = sent[m.end():m.end() + _NEG_WINDOW]
+            if (_NEG_ATTACHED_RE.match(after) or _NEG_RE.search(after)
+                    or _NEG_BEFORE_RE.search(sent[max(0, m.start() - _NEG_WINDOW):m.start()])):
                 continue
             s = " ".join(sent.split())
             return s if len(s) <= _CLAIM_MAX else s[:_CLAIM_MAX] + "…"
