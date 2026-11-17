@@ -9838,6 +9838,64 @@ async def deliberate_subject_confirm(body: SubjectConfirmRequest):
     return {"subject": await _subject.confirm(app, parsed, groups=list(body.groups), user=body.user_email, user_pat=body.user_pat)}
 
 
+# ── 심의 HTTP 창구(HWAXPortal docs/request-1117 DL-01 ~ DL-04) ─────────────────────────────────────────────────────────────
+# MCP 도구(deliberate_*)와 **같은 함수**를 부른다 — 쪽 나누기만 없다(MCP 결과 상한은 MCP 의 사정이다). 공유 비밀(_seat_auth — 게이트웨이 연결의
+# Authorization, 결정문 · 화두 · 근거 크기를 낸다)을 지난 뒤 신원은 게이트웨이가 MCP 호출에 싣는 머리 그대로다(mcp_server.http_caller —
+# x-hwax-user · x-hwax-groups · x-hwax-affiliation). 새 신원 길이 없다 — 머리가 없으면 신원 없는 호출(MCP 서비스 계정과 같은 운영의 길)이다.
+# 본문은 JSON 객체 · 모르는 칸은 422(/limits 와 같다). 잡이 없으면 404, 볼 수 없으면 403, 그 밖의 거절은 422 {code, message}.
+def _dl_error(code: str, message: str, status: int) -> JSONResponse:
+    return JSONResponse({"code": code, "message": str(message)[:600]}, status_code=status)
+
+
+async def _dl_open(request: Request, fields: tuple):
+    """(본문, 호출자 (신원, 그룹, 소속, 관리자), 거절 답) — 거절이 있으면 앞 둘은 None."""
+    denied = _seat_auth(request)
+    if denied:
+        return None, None, denied
+    if _delib_mcp_module is None:
+        return None, None, _dl_error("delib_mcp_unavailable", "심의 MCP 모듈이 비활성이다(기동 로그를 본다)", 503)
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return None, None, _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return None, None, _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(fields))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return None, None, JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 "
+                                         "않고 거절한다", "fields": shown, "fields_n": len(extra)}, status_code=422)
+    return body, _delib_mcp_module.http_caller(request.headers), None
+
+
+def _dl_job(body: dict, who: tuple):
+    """본문의 job_id → (잡, 거절 답) — 없으면 404, 볼 수 없으면 403(MCP 의 _need_read 와 같은 규칙 — delib_jobs.can_read)."""
+    import delib_jobs  # noqa: PLC0415
+    jid = body.get("job_id")
+    if not isinstance(jid, str) or not jid.strip() or len(jid) > 128:
+        return None, _dl_error("bad_request", "job_id 는 1~128자 글이다", 422)
+    job = delib_jobs.get(jid.strip())
+    if not job:
+        return None, _dl_error("job_not_found", f"그런 심의 잡이 없다: {_echo(jid)}", 404)
+    user, _groups, aff, admin = who
+    if not delib_jobs.can_read(job, user, aff, admin):
+        return None, _dl_error("forbidden", "이 심의는 볼 수 없다 — 시작한 사람과 같은 소속, 관리자만 본다", 403)
+    return job, None
+
+
+# POST /deliberate/result/decision {job_id} — deliberate_result(view="decision_json") 와 같은 답(DL-03 · contracts §3).
+@app.post("/deliberate/result/decision")
+async def deliberate_result_decision(request: Request):
+    import delib_decision  # noqa: PLC0415
+    body, who, denied = await _dl_open(request, ("job_id",))
+    if denied:
+        return denied
+    job, denied = _dl_job(body, who)
+    if denied:
+        return denied
+    return delib_decision.build(job)
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.

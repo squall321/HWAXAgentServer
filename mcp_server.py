@@ -26,6 +26,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+import delib_decision
 import delib_jobs
 import delib_resume
 import delib_subject
@@ -116,16 +117,30 @@ def _caller(ctx: Context | None) -> tuple[str, list[str]]:
         hdr = getattr(req, "headers", None)
         if hdr is None:
             return "", []
-        user = (hdr.get("x-hwax-user") or "").strip()
-        raw = (hdr.get("x-hwax-groups") or "").strip()
-        # 퍼센트 인코딩을 되돌린다 — 게이트웨이는 한글 그룹명 때문에 인코딩해 보내고, 권한 키의
-        # `:` 까지 인코딩되면(feat%3Achat) 그대로 쓰는 순간 전 키가 무효가 된다(실측: 심의 좌석 0명).
-        raw = unquote(raw)
-        groups = [g.strip() for g in raw.replace(";", ",").split(",") if g.strip()]
-        return user, groups
+        return _identity(hdr)
     except Exception:  # noqa: BLE001 — 신원 확보 실패가 심의를 막으면 안 된다
         log.debug("호출자 신원 헤더를 못 읽었다 — 서비스 계정으로 진행", exc_info=True)
         return "", []
+
+
+def _identity(hdr) -> tuple[str, list[str]]:
+    """신원 헤더(x-hwax-user · x-hwax-groups) → (신원, 그룹). MCP 호출(_caller)과 HTTP 창구(http_caller)가 같은 셈을 쓴다."""
+    user = (hdr.get("x-hwax-user") or "").strip()
+    raw = (hdr.get("x-hwax-groups") or "").strip()
+    # 퍼센트 인코딩을 되돌린다 — 게이트웨이는 한글 그룹명 때문에 인코딩해 보내고, 권한 키의
+    # `:` 까지 인코딩되면(feat%3Achat) 그대로 쓰는 순간 전 키가 무효가 된다(실측: 심의 좌석 0명).
+    raw = unquote(raw)
+    groups = [g.strip() for g in raw.replace(";", ",").split(",") if g.strip()]
+    return user, groups
+
+
+def http_caller(hdr) -> tuple[str, list[str], str, bool]:
+    """HTTP 창구(app 의 /deliberate/… — 공유 비밀을 지난 뒤)의 호출자 — (신원, 그룹, 소속, 관리자인가). 게이트웨이가 MCP 호출에 싣는 것과 같은
+    머리(x-hwax-user · x-hwax-groups · x-hwax-affiliation)를 같은 셈으로 읽는다 — 새 신원 길을 만들지 않는다. 머리가 없으면 신원 없는 호출이다
+    (MCP 의 서비스 계정 호출과 같다 — 운영의 길)."""
+    user, groups = _identity(hdr)
+    aff = unquote(hdr.get("x-hwax-affiliation") or "").strip()
+    return user, groups, aff, _ADMIN_GROUP in groups
 
 
 # 관리자 표지 — 게이트웨이가 포털이 **지금** 관리자라고 답할 때만 그룹에 싣는다(HWAXMcpGateway ADMIN_GROUP).
@@ -494,8 +509,10 @@ _A_WAIT = (f"초 — 주면 상태 · 단계 · 라운드가 바뀌거나 끝날
 _A_BRIEF = ("참이면 부를 때마다 같은 큰 칸을 뺀다 — 화두는 앞 80자(question_head · question_chars), 좌석 키는 seat_count, 경고 · 빠진 근거는 "
             "수(warnings_total · evidence_omitted_total)만. 다음 걸음을 정할 칸(상태 · 단계 · 라운드 · 줄 · 오류 · 재개)은 그대로다.")
 _A_VIEW = ("full(기본 — 결정문 전문에 쉬운 설명 · 좌석 상세 · 상태줄 · 손잡이 · 경고 · 빠진 근거 · 화두) | summary(결정문 · 표결 votes · 소수 의견 "
-           "minority · 수치 대조 numcheck · 보고서 번호와 주소 · full 의 쪽 수 full_parts 만 — 없는 칸은 null 이고 까닭은 missing). summary 를 먼저 "
-           "받고 모자랄 때만 full.")
+           "minority · 수치 대조 numcheck · 보고서 번호와 주소 · full 의 쪽 수 full_parts 만 — 없는 칸은 null 이고 까닭은 missing) | decision_json(구조화 "
+           "결정 — 리스크 심사는 결정문의 risk_spec 에 표결 votes · 근거 인용 수 cites 를 붙인 decision_json, 그 밖의 심의는 risk_spec 이 null 인 같은 꼴. "
+           "consistency 는 결정문의 만장일치 · 전원 합의 문장과 표결의 대조다 — 반대 · 조건부 · 미표명 표가 있는데 그런 문장이 있으면 match 가 거짓). "
+           "summary 를 먼저 받고 모자랄 때만 full.")
 _A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
 _A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
 _A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
@@ -1193,7 +1210,7 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                            again={"job_id": job_id, **({"brief": True} if brief else {})})
 
 
-_VIEWS = ("full", "summary")
+_VIEWS = ("full", "summary", "decision_json")
 
 
 def _result_full(job: dict) -> dict:
@@ -1223,20 +1240,24 @@ def _result_summary(job_id: str, job: dict, full: dict) -> dict:
 @mcp.tool(title="심의 결과(결정 문서) 회수",
           description="끝난 HWAX 심의의 결정 문서를 받는다. **먼저 view=\"summary\"** — 결정문 · 표결 · 소수 의견 · 수치 대조 · 보고서만 준다"
                       "(화두 되풀이 · 상태줄 · 좌석 상세 · 손잡이가 없다). full 은 그 밖이 필요할 때만. 아직 진행 중(running)이면 현재 단계만, "
-                      "줄을 선 채(queued)면 순번만 돌려준다. " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
+                      "줄을 선 채(queued)면 순번만 돌려준다. 리스크 심사 결정을 원장 칸에 옮길 때는 view=\"decision_json\"(risk_spec · 표결 · "
+                      "인용 · 만장일치 문장 대조). " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
                       "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
 async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
                             part: Annotated[int, Field(description=_A_PART)] = 1,
-                            view: Annotated[Literal["full", "summary"], Field(description=_A_VIEW)] = "full",
+                            view: Annotated[Literal["full", "summary", "decision_json"], Field(description=_A_VIEW)] = "full",
                             ctx: Context | None = None) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
-    루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다)."""
+    루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다) |
+    decision_json(delib_decision.build — HWAXPortal docs/request-1117 contracts §3 · DL-03)."""
     if view not in _VIEWS:
         raise ValueError(f"view 는 {' · '.join(_VIEWS)} 가운데 하나다 — 받은 값: {view!r}")
     job = delib_jobs.get(job_id)
     if not job:
         raise ValueError(f"그런 심의 잡이 없다: {job_id} — deliberate_list 로 확인하라")
     _need_read(job, ctx)
+    if view == "decision_json":
+        return mcp_pages.paged(delib_decision.build(job), part=part, ids=_JOB_IDS, again={"job_id": job_id, "view": "decision_json"})
     out = _result_full(job)
     if view == "summary":
         return mcp_pages.paged(_result_summary(job_id, job, out), part=part, ids=_JOB_IDS, tail=("decision",),
