@@ -245,3 +245,21 @@ def test_HTTP_대조(ledger, monkeypatch):
     assert r.status_code == 200 and r.json()["forbidden"][0]["count"] == 2 and "page" not in r.json()
     assert c.post("/deliberate/verify", json={"job_id": job["id"], "scope": "x"}, headers=auth).status_code == 422
     assert c.post("/deliberate/verify", json={"job_id": job["id"]}).status_code == 401
+
+
+def test_색인은_엔진이_좌석에_싣는_글을_본다_낱장_문서의_결론():
+    """2차 검토 2 — 엔진은 낱장 표지가 있는 긴 문서를 앞뒤를 남기고 가운데를 덜어 싣는다(_fit_ev). 색인이 앞만 훑으면 결론 값이 'no source' 였다."""
+    import deliberation as d
+    slides, i = [], 1
+    while sum(len(x) for x in slides) < max(400_000, 2 * d._EVID_ITEM_MAX):
+        slides.append(f"## [s.{i}] slide {i}\n" + "lorem ipsum dolor sit amet " * 40 + "\n")
+        i += 1
+    slides.append(f"## [s.{i}] 결론\n최종 변형량 7391.25 mm 로 판정한다.\n")
+    body = "".join(slides)
+    sent, cut = d._fit_ev(body)
+    assert cut and "7391.25" in sent, "시험 전제 — 엔진은 줄이되 끝 낱장을 싣는다"
+    idx = V.index([{"source": "deck", "result": body}])
+    assert idx[0].get("engine_cut") is True
+    job = {"id": "x", "status": "done", "decision": "결론: 최종 변형량 7391.25 mm.", "question": "q", "evidence_index": idx, "opts": {}}
+    (tok,) = [t for t in V.verify(job, scope="num")["tokens"] if t["value"] == "7391.25"]
+    assert tok["src"] == ["e:1"], tok

@@ -14,7 +14,8 @@
 tail_from 부터)는 보지 않는다.
 
 **근거.** 잡을 열 때 근거 항목마다 낱말 색인을 원장(evidence_index)에 남긴다(index — 본문도 낱말 글자도 남기지 않고 낱말 지문(token_hash)만 ·
-엔진이 고르는 본문과 번호 [e:N] 그대로 · 항목마다 앞 SCAN_ITEM_MAX 자). 근거가 크면(INDEX_SYNC_CHARS 넘음) 잡 태스크가 스레드에서 짓는다.
+엔진이 고르는 본문과 번호 [e:N] 그대로 · 항목마다 **엔진이 좌석에 싣는 글**(_fit_ev — 넘치면 낱장 표지 경계에서 가운데를 덜어 앞뒤를 남긴다, 항목 천장
+_EVID_ITEM_MAX 안)). 근거가 크면(INDEX_SYNC_CHARS 넘음) 잡 태스크가 스레드에서 짓는다.
 화두(question)와 사람 의견(human_note)도 출처로 센다. 좌석 자유 조회 · 지식카드 · 사전 조회 결과는 색인에 없다 — 그 수는 결정문 수치 대조(numcheck,
 그대로 둔다)가 본다. 색인 이전에 돈 잡은 출처를 모른다고 말한다.
 
@@ -47,7 +48,7 @@ TAIL_MARKS = ("\n\n> ⚠ 다음 수치는 심의에 제시된 근거에서 확�
               "\n\n⚠ 의장이 결정문을 내지 못해 MX 백서", "\n\n⚠ 신원 없는 호출이라 MX 백서")
 INDEX_ITEM_MAX = 5000            # 항목 하나의 낱말 수 상한(종류 합) — 넘으면 cut(그 항목의 'no source' 는 틀릴 수 있다)
 INDEX_TOTAL_MAX = 50000          # 잡 하나의 낱말 수 상한
-# 항목 하나에서 훑는 글자 수 — 엔진이 항목 하나에 싣는 천장(_EVID_ITEM_MAX)까지만(넘는 꼬리는 좌석도 다 보지 못한다 — cut)
+# 항목 하나에서 훑는 글자 수의 위 — 엔진이 항목 하나에 싣는 천장(_EVID_ITEM_MAX). 훑는 글은 엔진이 싣는 그 글이다(_fit_ev — 앞만 자르지 않는다)
 SCAN_ITEM_MAX = _engine._EVID_ITEM_MAX
 # 이 글자 수(근거 전체에서 훑을 몫의 합) 안이면 잡을 열 때 그 자리에서 색인을 짓는다. 넘으면 잡 태스크가 이벤트 루프 밖(스레드)에서 짓는다
 # (delib_jobs — 큰 근거 하나가 서버 전체를 멈추지 않게, 반대 검토 H1).
@@ -104,16 +105,18 @@ def scan_chars(evidence) -> int:
 
 def index(evidence) -> list[dict]:
     """근거 목록 → 항목마다 낱말 색인 [{n, key, source, chars, t{종류: [낱말 지문]}, cut?}] — 엔진처럼 본문 있는 항목만 [e:N] 차례로. 낱말 글자는
-    남기지 않는다(token_hash). 항목 하나는 앞 SCAN_ITEM_MAX 자만 훑는다(넘으면 cut)."""
+    남기지 않는다(token_hash). 항목 하나는 엔진이 좌석에 싣는 글을 훑는다(_fit_ev — 그 글이 줄었으면 engine_cut · 2차 검토 2: 앞 SCAN_ITEM_MAX 자만
+    훑던 때는 낱장 문서의 결론(뒤쪽 — 엔진은 실었다)이 'no source' 였다). cut 은 낱말 수 상한에 걸려 색인이 덜 담겼다는 표지다."""
     out, total = [], 0
     for it, body in _bodies(evidence):
         seen: dict[str, dict] = {k: {} for k in KINDS}
-        for kind, val, _pos in tokens(body[:SCAN_ITEM_MAX]):
+        sent, cut_info = _engine._fit_ev(body)
+        for kind, val, _pos in tokens(sent[:SCAN_ITEM_MAX + 400]):     # 줄였다는 꼬리 표식 몫만큼 — 그래도 위가 있다(선형)
             seen[kind][token_hash(kind, val)] = None
         t = {k: list(v) for k, v in seen.items() if v}
         n = sum(len(v) for v in t.values())
         room = max(0, min(INDEX_ITEM_MAX, INDEX_TOTAL_MAX - total))
-        cut = n > room or len(body) > SCAN_ITEM_MAX
+        cut = n > room
         if n > room:
             left, kept = room, {}
             for k, v in t.items():
@@ -122,7 +125,7 @@ def index(evidence) -> list[dict]:
         total += min(n, room)
         key = it.get("key") if isinstance(it.get("key"), str) and _engine._EVID_KEY_RE.fullmatch(it.get("key") or "") else ""
         out.append({"n": len(out) + 1, "key": key, "source": str(it.get("source") or "")[:120], "chars": len(body), "t": t,
-                    **({"cut": True} if cut else {})})
+                    **({"cut": True} if cut else {}), **({"engine_cut": True} if cut_info else {})})
     return out
 
 
