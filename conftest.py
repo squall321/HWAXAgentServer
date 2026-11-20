@@ -32,7 +32,8 @@ atexit.register(shutil.rmtree, _DRAIN_DIR, ignore_errors=True)
 _SEAT_DIR = tempfile.mkdtemp(prefix="hwax-seat-eval-test-")
 os.environ["SEAT_EVAL_DIR"] = _SEAT_DIR
 atexit.register(shutil.rmtree, _SEAT_DIR, ignore_errors=True)
-for _k in ("SEAT_QUESTIONS_COLLECT", "SEAT_QUESTIONS_DAYS", "SEAT_QUESTIONS_LABELERS", "PERSONA_SHADOW_LOG"):
+# SEAT_ONTO(좌석 추천의 온톨로지 신호 — HWAXPortal docs/expert-ontology 6.4)도 같다 — 켠 셸에서 돌리면 추천 인자가 달라진다.
+for _k in ("SEAT_QUESTIONS_COLLECT", "SEAT_QUESTIONS_DAYS", "SEAT_QUESTIONS_LABELERS", "PERSONA_SHADOW_LOG", "SEAT_ONTO"):
     os.environ.pop(_k, None)
 
 # 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_ENABLED 와 그 손잡이)을 지운다 — 스위치를 켠 셸에서 돌리면 import 때 과제 도구가 등록되고 꺼진

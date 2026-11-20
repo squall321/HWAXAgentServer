@@ -22,6 +22,7 @@ import os
 
 import call_trace
 import external_llm
+import persona_links
 import vision
 from deliberation import (
     _KN_CONC,
@@ -138,18 +139,20 @@ def _as_dict(raw) -> dict:
 
 
 # ── (0) 소집 ──────────────────────────────────────────────────────────────────
-async def _summon(tools: dict, q: str, top_k: int, exclude: set) -> list[dict]:
+async def _summon(tools: dict, q: str, top_k: int, exclude: set, onto: str = "") -> list[dict]:
     """recommend_agents 로 후보를 모은다. score 를 임계값으로 쓰지 않고 순위로만 쓴다.
 
     `_discover`(deliberation) 를 재사용하지 않는 이유 — 그 함수는 key/role/origin 만 남기고
     `desc_match`·`matched_sections` 를 버린다. 이 모드는 그 둘이 예심의 재료다.
     """
     try:
-        recd = _as_dict(await _call(tools, "recommend_agents", {"q": q, "top_k": top_k}))
+        recd = _as_dict(await _call(tools, "recommend_agents", persona_links.reco_args(tools, q, top_k, onto=onto)))
     except Exception as exc:  # noqa: BLE001 — 소집 실패는 빈 목록(호출부가 그 사실을 말한다)
         print(f"[thinking] recommend_agents 실패: {exc!r}")
         return []
     items = recd.get("agents") or recd.get("recommendations") or recd.get("data") or []
+    if onto == "shadow":
+        persona_links.shadow_onto("think", items, top_k)            # 적기만 한다 — 순위는 도구가 준 그대로다
     out: list[dict] = []
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)
@@ -669,7 +672,7 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
                     t.cancel()
 
     try:
-        first = await _summon(tools, sq, CANDIDATES, seen_keys)
+        first = await _summon(tools, sq, CANDIDATES, seen_keys, onto=persona_links.reco_onto(tools))   # 첫 소집에만(SEAT_ONTO)
         _persona_shadow("think", sq, [s["key"] for s in first], CANDIDATES)   # 연결 표가 덮었을 도메인을 적기만 한다(E5-4)
         if not first:
             msg = ("이 질문에 맞는 전문가를 풀에서 찾지 못했습니다. "
