@@ -43,6 +43,29 @@ def test_switch_is_off_by_default_and_needs_a_tool_that_knows_the_argument(monke
     assert persona_links.reco_onto({}) == "" and persona_links.reco_onto(None) == ""
 
 
+def test_switch_on_but_not_sent_is_said_once_in_the_log_and_in_health(monkeypatch, capsys):
+    """켰는데 도구가 인자를 몰라 조용히 꺼진 채 도는 일이 없게 — 까닭을 로그에 한 번, /health seat_onto 에 수와 함께."""
+    import app
+
+    monkeypatch.setitem(persona_links._ONTO, "sent", 0)
+    monkeypatch.setitem(persona_links._ONTO, "skipped", 0)
+    monkeypatch.setitem(persona_links._ONTO, "why", None)
+    monkeypatch.delenv("SEAT_ONTO", raising=False)
+    old = {"recommend_agents": _Tool(_REPLY, knows_onto=False)}
+    assert persona_links.reco_onto(old) == "" and persona_links.onto_health() == {"mode": "off", "sent": 0, "skipped": 0, "why": None}
+    assert capsys.readouterr().out == ""                                                 # 꺼져 있으면 세지도 찍지도 않는다
+    monkeypatch.setenv("SEAT_ONTO", "rank")
+    assert persona_links.reco_onto(old, risk=True) == "" and persona_links.onto_health()["skipped"] == 0      # 리스크 심사는 세지 않는다
+    assert persona_links.reco_onto(old) == "" and persona_links.reco_onto(old) == ""
+    out = capsys.readouterr().out
+    assert out.count("[seat-onto]") == 1 and "onto 인자를 모른다" in out                   # 같은 까닭은 한 번만
+    assert persona_links.reco_onto({}) == "" and "도구가 없다" in capsys.readouterr().out
+    h = app._seat_onto_health()
+    assert h["mode"] == "rank" and h["sent"] == 0 and h["skipped"] == 3 and "도구가 없다" in h["why"]
+    assert persona_links.reco_onto({"recommend_agents": _Tool(_REPLY)}) == "rank"
+    assert app._seat_onto_health() == {"mode": "rank", "sent": 1, "skipped": 3, "why": None}
+
+
 def test_tool_schema_as_json_schema_dict_is_read_too():
     class _SchemaOnly:
         args_schema = {"properties": {"q": {}, "onto": {}}}

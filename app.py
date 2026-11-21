@@ -510,6 +510,15 @@ def _persona_shadow_tools(key: str, persona: dict, sel_q: str, names: list, pref
         print(f"[persona-links] 그림자(챗 도구)를 적지 못했다: {exc!r}"[:300])
 
 
+def _seat_onto_health() -> dict:
+    """/health seat_onto — 좌석 추천의 온톨로지 신호 스위치(SEAT_ONTO)와 넘긴 · 넘기지 못한 수(HWAXPortal docs/expert-ontology 6.4)."""
+    try:
+        import persona_links as _pl  # noqa: PLC0415
+        return _pl.onto_health()
+    except Exception as exc:  # noqa: BLE001 — /health 를 막지 않는다
+        return {"mode": "off", "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _persona_shadow_seats(site: str, question: str, keys: list, want: int) -> None:
     """심의 첫 좌석 · 띵킹 소집 — 연결 표가 덮었을 도메인을 적기만 한다(deliberation._persona_shadow 가 부른다). 좌석은 그대로다."""
     v = _persona_links()
@@ -10188,6 +10197,8 @@ def health() -> dict:
         # 다른 허브 id 막이 — 손잡이(CHAT_XHUB_ID_GATE)와 기동 뒤 막은 호출 수(HWAXPortal docs/request-1030 HA-30 · design-integration C-8). 재시험
         # OT-07 은 이 수와 로그의 '[gate] … 다른 허브 id' 줄을 함께 본다.
         "xhub_gate": _xhub_gate_health(),
+        # 좌석 추천의 온톨로지 신호 — 스위치(SEAT_ONTO) · 넘긴 수 · 켰는데 넘기지 못한 수와 까닭(HWAXPortal docs/expert-ontology 6.4)
+        "seat_onto": _seat_onto_health(),
         # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
         "core_vocab": _core_vocab_health(),
         # 실사용 질문 모으기(기본 꺼짐) — 켜졌나 · 창 · 적은 수(HWAXPortal docs/request-1029 design-e5 E5-2)
