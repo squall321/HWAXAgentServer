@@ -269,8 +269,9 @@ _EVID_DESC = (
     "'{\"id\": \"<카드 id>\"}', result: 주장 · 출처(누가 · 언제 · 어느 심의) · 상태(확인 · 반박) · 판}. 넘기는 것은 범위(scope)가 내 소속(aff:) · "
     "조직(org)뿐인 확인 · 반박 카드다 — plat: 가 붙은 카드와 내 초안은 넘기지 않는다(이 심의의 잡 기록 · 보고서를 읽는 사람은 플랫폼 권한으로 "
     "걸러지지 않는다). 다른 차수 · 차수 모름 칸의 카드도 넘기지 않는다. tool · args 를 이 꼴로 지켜야 이 심의가 낳는 인사이트 카드가 원래 "
-    "카드들의 보이는 범위를 이어받는다(아니면 확인해도 주인만 본다). 리스크 심사(risk-review · risk-review-sealed)에는 넘기지 않는다 — 엔진이 그 "
-    "항목을 뺀다(evidence_omitted 의 '과제 인사이트 근거 거름')."
+    "카드들의 보이는 범위를 이어받는다(아니면 확인해도 주인만 본다 — invoke_tool 로 읽었으면 그 호출의 name · arguments 를 그대로 적어도 "
+    "엔진이 안쪽 도구로 푼다). 리스크 심사(risk-review · risk-review-sealed)에는 넘기지 않는다 — 엔진이 그 항목을 뺀다(evidence_omitted 의 "
+    "'과제 인사이트 근거 거름' — invoke_tool 로 부른 것도 같다)."
 )
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
