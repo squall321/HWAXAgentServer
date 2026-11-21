@@ -17,6 +17,7 @@ from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤
 import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
+import persona_links                                    # 좌석 추천의 온톨로지 신호(SEAT_ONTO — 기본 끔, HWAXPortal docs/expert-ontology 6.4)
 import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
 import report_figures                                   # 보고서 글의 도구 그림을 그 사람 명의로 RA 그림 칸으로(HWAXPortal docs/report-figures)
 from evidence import fit_document, sig_numbers, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
@@ -5422,13 +5423,14 @@ async def _restore_role(tools: dict, key: str, fallback: str = "", why: dict | N
     return fallback
 
 
-async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | None = None) -> list:
+async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | None = None, onto: str = "") -> list:
     """recommend_agents 의 순위 그대로 좌석 키만 — 도구 운영자(he)와 겹친 키는 뺀다. 도구 실패·빈 결과는 빈 목록이다.
+    onto 가 비지 않으면(persona_links.reco_onto — 박스 스위치 SEAT_ONTO) 그 값을 도구에 넘긴다 — rank 면 도구가 덧점을 얹은 순위를 준다.
     top_k 를 주면 그만큼 받는다(안 주면 도구 기본 5명 — AIDataHub mcp_runtime.recommend_agents).
     why 를 주면 도구가 없거나 **실패해** 빈 목록인 질의의 까닭을 {질의: 까닭} 으로 적는다 — 도구 실패는 예외가 아니라 실패 문구로
     와서(_call) 빈 추천과 같은 빈 목록이 된다(_restore_role 의 why 와 같다)."""
     try:
-        raw = await _call(tools, "recommend_agents", {"q": q} if top_k is None else {"q": q, "top_k": top_k})
+        raw = await _call(tools, "recommend_agents", persona_links.reco_args(tools, q, top_k, onto=onto))
         if why is not None and raw is None:
             why[q] = "recommend_agents 도구가 없다"
         elif why is not None and isinstance(raw, str) and _RA_FAIL_WRAP.match(raw.lstrip()):
@@ -5445,6 +5447,8 @@ async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | 
         items = recd.get("recommendations") or recd.get("agents") or recd.get("data") or []
     else:
         items = []
+    if onto == "shadow":
+        persona_links.shadow_onto("delib", items, N_PERSONAS)       # 적기만 한다 — 순위는 도구가 준 그대로다
     out = []
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)
@@ -5455,14 +5459,14 @@ async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | 
 
 
 async def _discover(tools: dict, q: str, limit: int, exclude: set = frozenset(),
-                    origin: str = "primary") -> list:
+                    origin: str = "primary", onto: str = "") -> list:
     """recommend_agents 로 좌석을 발굴해 [{key, role, origin}] 로 돌려준다.
 
     첫 좌석·반대 도메인 좌석(F1)이 같은 코드를 쓴다 — 질의문만 다르다(이어하기 재심사는 _rescreen_seats).
     도구 실패·빈 결과는 비치명적으로 빈 목록을 돌려준다. 좌석이 없어도 심의는 진행하고,
     그 사실은 origin 표시가 없는 것으로 결정문에 남는다."""
     out = []
-    for key in await _rank_keys(tools, q):
+    for key in await _rank_keys(tools, q, onto=onto):
         if len(out) >= limit:
             break
         if key in exclude:
@@ -7068,7 +7072,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                     f"이어하기 재심사 — 신규 좌석 없음(물은 축 {len(_rs['queries'])}개의 후보 {_rs['candidates']}명이 모두 앉은 좌석 · "
                     "앉은 도메인이거나 추천이 비었다)" + _miss), "tool": "recommend_agents"})
     else:
-        personas = await _discover(tools, question, N_PERSONAS, origin="primary")
+        # 온톨로지 신호는 첫 좌석에만 청한다 — 박스 스위치가 켜져 있고 도구가 인자를 알 때만, 리스크 심사에는 넘기지 않는다(D-18).
+        personas = await _discover(tools, question, N_PERSONAS, origin="primary",
+                                   onto=persona_links.reco_onto(tools, risk=opts.chair_template == "risk-review"))
         _persona_shadow("delib", question, [p["key"] for p in personas], N_PERSONAS)   # 적기만 한다 — 좌석은 그대로다
         # 반대 도메인 좌석(F1) — 질문의 어휘가 도메인을 고정하면 그 밖의 가설은 발생 경로가 없다.
         # 착석 좌석이 못 보는 원인 축을 명명하게 하고 그 축으로 발굴한다(_counter_seats 주석에

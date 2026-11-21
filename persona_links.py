@@ -308,3 +308,63 @@ def shadow_seats(v: dict, *, site: str, question: str, seats: list, want: int) -
     rec = {"site": site, **seat_cover(v, question=question, seats=seats, want=want), "n": len(seats)}
     _write(rec)
     return rec
+
+
+# ── 온톨로지 좌석 신호(HWAXPortal docs/expert-ontology 6.4 · EO-9) ──────────────────────────────────────────────
+# AIDataHub recommend_agents 의 고르는 인자 onto 를 넘길지 정한다 — 신호의 재료(카드 ↔ 객체 연결)는 AIDataHub 에 있고, 이 서버는 청하기만 한다.
+def seat_onto_mode() -> str:
+    """박스 스위치 SEAT_ONTO — off(기본) · shadow(줄마다 신호만 받고 순위는 그대로) · rank(덧점을 얹은 순위)."""
+    v = os.environ.get("SEAT_ONTO", "").strip().lower()
+    return v if v in ("shadow", "rank") else "off"
+
+
+def _tool_knows(tool, arg: str) -> bool:
+    """도구가 그 인자를 받는가 — 옛 AIDataHub 에 모르는 인자를 넘기면 추천 자체가 실패한다(빈 좌석)."""
+    try:
+        props = getattr(tool, "args", None)
+        if isinstance(props, dict):
+            return arg in props
+    except Exception:  # noqa: BLE001
+        pass
+    schema = getattr(tool, "args_schema", None)
+    return isinstance(schema, dict) and arg in (schema.get("properties") or {})
+
+
+def reco_onto(tools: dict, *, risk: bool = False) -> str:
+    """recommend_agents 에 넘길 onto 값 — 넘기지 않을 때는 빈 글. 리스크 심사에는 넘기지 않는다(D-18 — 새 길을 열지 않는다)."""
+    mode = seat_onto_mode()
+    if mode == "off" or risk:
+        return ""
+    tool = (tools or {}).get("recommend_agents")
+    return mode if tool is not None and _tool_knows(tool, "onto") else ""
+
+
+def reco_args(tools: dict, q: str, top_k: int | None = None, *, onto: str = "") -> dict:
+    """recommend_agents 인자 — onto 가 비면 종전 그대로({q} 또는 {q, top_k})."""
+    args: dict = {"q": q} if top_k is None else {"q": q, "top_k": top_k}
+    if onto:
+        args["onto"] = onto
+    return args
+
+
+def shadow_onto(site: str, items, want: int) -> dict:
+    """shadow 로 받은 추천 줄에서 덧점을 얹었다면 위 want 명이 어떻게 달라졌을지 적기만 한다(PERSONA_SHADOW_LOG). 돌려준 값은 시험만 본다."""
+    rows = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        key = it.get("agent_type") or it.get("id")
+        if not isinstance(key, str) or not key:
+            continue
+        sig = it.get("onto") if isinstance(it.get("onto"), dict) else {}
+        try:
+            score, bonus = float(it.get("score") or 0.0), float(sig.get("bonus") or 0.0)
+        except (TypeError, ValueError):
+            score, bonus = 0.0, 0.0
+        rows.append((key, score, bonus))
+    now = [k for k, _, _ in rows[:want]]
+    would = [k for k, _, _ in sorted(rows, key=lambda r: -(r[1] + r[2]))[:want]]      # 안정 정렬 — 덧점이 없으면 순서가 그대로다
+    rec = {"u": "onto", "site": site, "want": want, "rows": len(rows), "signal": sum(1 for r in rows if r[2] > 0),
+           "enter": [k for k in would if k not in now], "leave": [k for k in now if k not in would]}
+    _write(rec)
+    return rec

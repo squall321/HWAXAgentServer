@@ -8377,7 +8377,10 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
     async def _rank(q: str, top_k: int) -> list[dict]:
         """한 질의의 추천 결과를 정규화해 돌려준다. 실패는 빈 목록(호출부가 계속 진행)."""
         try:
-            recd = _parse_json(await _call(tools, "recommend_agents", {"q": q, "top_k": top_k}))
+            # 온톨로지 신호(SEAT_ONTO — 기본 끔)는 엔진의 첫 좌석과 같은 규칙으로 청한다 — 화면이 고른 좌석이 그대로 심의에 앉는다.
+            import persona_links as _pl  # noqa: PLC0415
+            recd = _parse_json(await _call(tools, "recommend_agents",
+                                           _pl.reco_args(tools, q, top_k, onto=_pl.reco_onto(tools))))
         except Exception as exc:  # noqa: BLE001 — 추천 실패해도 풀로 수동 선택 가능
             print(f"[experts] recommend failed (q={q[:40]!r}): {exc!r}")
             return []
