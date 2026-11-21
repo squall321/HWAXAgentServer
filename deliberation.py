@@ -3335,8 +3335,12 @@ def _item_text(x, quote_max: int = 80) -> str:
 
 
 # ── T7 판정 불가 과반 → 측정 계획(DELIB_UNDECIDED) ─────────────────────────────────────────────
-# '판정 불가' 는 stance 또는 vote 의 **머리**에 올 때만 센다 — '판정 불가는 아니다' · '…라서 판정 불가였으나 지금은 A 안' 같은 글을 과반에 넣지 않는다.
-_UNDECIDED_RE = re.compile(r"^\W*(?:(?:판정|판단)\s*불가|undecided\b|cannot\s+(?:be\s+)?(?:decided?|judged?)\b)", re.IGNORECASE)
+# '판정 불가' 는 stance 또는 vote 의 **머리**에 올 때만 센다 — '…라서 판정 불가였으나 지금은 A 안' 같은 글을 과반에 넣지 않는다. 머리에 와도
+# 부정('판정 불가는 아니다' · '판정 불가가 아님' · '판정 불가능하지 않다') · 지난 일('판정 불가였으나' · '판정 불가했지만') · 다른 낱말
+# ('판정 불가피')은 세지 않는다(반대 검토 — 머리 조건만으로는 이것들이 과반에 들어갔다).
+_UNDECIDED_RE = re.compile(
+    r"^\W*(?:(?:판정|판단)\s*불가(?!피|결|능하지|\s*(?:는|은|가|도)?\s*아니|\s*(?:는|은|가|도)?\s*아님|였|했)"
+    r"|undecided\b|cannot\s+(?:be\s+)?(?:decided?|judged?)\b)", re.IGNORECASE)
 # 계획서를 내는 틀(해석 · 시험 · 구축)은 판정문이 아니고, 리스크 심사는 제 보고서 꼴과 '판정 불가는 그대로 두라' 는 계약이 따로 있다 — 넣지 않는다.
 _UNDECIDED_TEMPLATES_OFF = frozenset({"risk-review", "sim-plan", "test-plan", "build-plan"})
 
@@ -3353,10 +3357,24 @@ def _undecided_ask(opts) -> str:
             "무엇을 어떻게 재면 판정할 수 있는지(대상 · 방법 · 어느 값이면 어느 쪽인지)를 적어라.")
 
 
+def _is_undecided(o) -> bool:
+    """이 발언이 판정 불가를 밝혔는가 — stance 또는 vote 가 '판정 불가' 로 시작한다."""
+    return isinstance(o, dict) and any(_UNDECIDED_RE.search(str(o.get(k) or "")) for k in ("stance", "vote"))
+
+
 def _undecided_seats(last) -> list:
-    """마지막 라운드 발언 가운데 판정 불가를 밝힌 것 — stance 또는 vote 가 '판정 불가' 로 시작한다."""
-    return [o for o in (last or []) if isinstance(o, dict)
-            and any(_UNDECIDED_RE.search(str(o.get(k) or "")) for k in ("stance", "vote"))]
+    """마지막 라운드 발언 가운데 판정 불가를 밝힌 것."""
+    return [o for o in (last or []) if _is_undecided(o)]
+
+
+def _stance_label(o, undecided: bool = False) -> str:
+    """집계 · 좌석별 표 · 턴에 싣는 입장 딱지. undecided(이 심의에 T7 이 켜졌다)일 때 판정 불가를 밝힌 좌석은 '미표명' 이다 —
+    _norm_stance 는 판별이 안 되는 글을 '조건부 동의' 로 떨어뜨려, 과반이 판정하지 않은 심의의 집계가 '조건부 동의 N' 으로 나가고 결정문 머리의
+    표지(판정 불가 과반)와 어긋났다(반대 검토). 과반을 세는 것과 같은 판정(_is_undecided)이라 표지 · 집계 · 표가 같은 좌석을 가리킨다.
+    꺼져 있으면 종전 정규화 그대로다."""
+    if undecided and _is_undecided(o):
+        return "미표명"
+    return _norm_stance(o.get("stance"))
 
 
 def _undecided_majority(opts, last, seated: int):
@@ -3366,6 +3384,14 @@ def _undecided_majority(opts, last, seated: int):
         return None
     n = len(_undecided_seats(last))
     return (n, int(seated)) if seated and n * 2 > seated else None
+
+
+def _undecided_restored(rdec):
+    """재개 자료(e:decision)의 um 칸 → (판정 불가 좌석 수, 앉은 좌석 수) 또는 None. 칸이 없는 줄(이 칸이 생기기 전의 엔진이 적었다)은 None —
+    그 결정문은 T7 전제 없이 쓰였다."""
+    u = rdec.get("um") if isinstance(rdec, dict) else None
+    ok = isinstance(u, (list, tuple)) and len(u) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in u)
+    return (u[0], u[1]) if ok else None
 
 
 def _undecided_chair_note(um) -> str:
@@ -3460,6 +3486,11 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
             body = clip(joined(d.get("non_negotiable")), 0)     # 스탠스는 턴에 따로 실린다(stance)
             if body:
                 say = (say + f"\n\n양보 불가 — {body}").strip()
+            # T7 을 켠 심의에서만 좌석이 내는 칸이다(_ser_kind 와 같은 칸) — 종전엔 의장에게만 가고 회의록 · 전사에는 없어, 측정 계획이
+            # 어느 좌석의 무엇에서 나왔는지 기록으로 되짚을 수 없었다(반대 검토).
+            nm = clip(joined(d.get("next_measurement")), 0)
+            if nm:
+                say = (say + f"\n\n다음에 잴 것 — {nm}").strip()
     return say or clip(d.get("say"), 400) or "(발언 파싱 실패)"
 
 
@@ -3978,14 +4009,14 @@ def _wiki_bind(affiliation: str, job_id: str) -> None:
 
 
 def _wiki_envelope(*, question: str, decision: str, stage: str, personas: list, last_list: list, rid,
-                   evidence: list, pool: list, owner: str, affiliation: str, ref: str, now) -> dict:
+                   evidence: list, pool: list, owner: str, affiliation: str, ref: str, now, undecided: bool = False) -> dict:
     """원천 봉투(mxwp-source/1 · deliberation). 표는 착석 전원이다 — 마지막 라운드에 답하지 못한 좌석도 미표명으로 싣는다(집계와 같다).
     소수 의견은 동의가 아닌 좌석의 마지막 입장 전문이다. 근거는 보고서 · 호출자가 준 근거 · 좌석 조회(같은 것은 한 번)."""
     by_seat = {o.get("persona"): o for o in last_list}
     votes, minority = [], []
     for p in personas:
         o = by_seat.get(p["key"])
-        stance = _norm_stance(o.get("stance")) if o else "미표명"
+        stance = _stance_label(o, undecided) if o else "미표명"
         votes.append({"seat": p["key"], "stance": stance if o else "미표명(응답 없음)"})
         if stance != "동의":
             minority.append(f"[{p['key']}] {stance} — "
@@ -6099,6 +6130,9 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
             opts_a = _resolve_opts(req_opts)
             opts_a.chair_template = "mechanism"
+            # T7 은 계획서 틀(_UNDECIDED_TEMPLATES_OFF)에 붙지 않는다 — 그 1단도 같다. 1단의 결정문은 2단이 메커니즘으로 이어받는 글이라
+            # 측정 계획으로 바뀌면 2단이 메커니즘 없이 해석을 설계한다(반대 검토 — 틀 이름이 mechanism 이라 꺼짐 목록을 비켜 갔다).
+            opts_a.undecided = 0
             async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
                                                     history, out=out_a, sk=delib_resume.SIM1):
                 yield chunk
@@ -8079,7 +8113,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _nn_full = _nn_text(o)
                 _nn_cap = _summary_max() if _wide() else _NN_ITEM_MAX
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
-                         "stance": _norm_stance(o.get("stance")),
+                         "stance": _stance_label(o, _undecided_on(opts)),
                          "non_negotiable": _nn_full[:_nn_cap]}
                 if len(_nn_full) > _nn_cap:
                     extra["non_negotiable_chars"] = len(_nn_full)
@@ -8222,7 +8256,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                    "쓰였을 수 있다). 이 줄은 결정문 머리에 셈과 함께 따로 찍힌다. 그런 카드에만 기댄 판단이 있으면 그렇다고 적어라]\n"
                    if _as_of else "")
     # T7 — 앉은 좌석의 과반이 '판정 불가' 면 결론부를 측정 계획으로(DELIB_UNDECIDED — 꺼져 있으면 None 이고 아래 글이 비어 종전과 같다).
-    _um = _undecided_majority(opts, last_list, len(personas))
+    # 결정문을 되살렸으면(S3) 다시 세지 않고 그때 적어 둔 것을 쓴다 — 그 사이 스위치가 바뀐 박스에서 되살린 결정문과 표지가 어긋나지 않게.
+    _um = _undecided_majority(opts, last_list, len(personas)) if _rdec is None else _undecided_restored(_rdec)
     if _um and _rdec is None:           # 결정문을 되살렸으면(S3) 이 알림은 의장을 부르기 전에 이미 원장에 실렸다
         yield _sse("warning", {"code": "undecided_majority", "message": (
             f"수렴 라운드에서 앉은 {_um[1]}석 가운데 {_um[0]}석이 근거 부족으로 '판정 불가' 를 밝혔다 — 결정문의 결론부는 판정이 아니라 "
@@ -8383,7 +8418,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                    "근거·발언 원문에서 확인", "tool": None})
     if _rdec is None and _jon:
         # 재개 자료(HA-09 S3 — e:decision) — 의장 결정문(못 냈으면 회의록 보존 글)과 실패 표지. 이으면 의장을 다시 부르지 않는다.
-        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause)
+        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause,
+                           **({"um": list(_um)} if _um else {}))
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
@@ -8409,7 +8445,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 기준일 줄도 코드가 찍는다(아래 봉인 표지와 같은 까닭) — 봉인 줄 아래에 온다. 셈은 사전 검색 · 자유 조회에서 모은 것이다.
     # 판정 불가 과반 표지도 코드가 찍는다(같은 까닭 — 의장이 빠뜨리면 판정을 낸 결정문과 똑같이 생긴다).
-    if _um:
+    # 의장이 결정문을 못 냈으면 찍지 않는다 — 그 글은 회의록 보존 글이라 '결론부는 측정 계획이다' 가 거짓이 된다(반대 검토).
+    if _um and not _chair_failed:
         decision = f"{_undecided_mark(_um)}\n\n{decision}"
     if _as_of:
         decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free, _ao_des)}\n\n{decision}"
@@ -8671,15 +8708,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _seated = len(personas)
     tally = {"agree": 0, "conditional": 0, "oppose": 0, "abstain": 0,
              "responded": len(last_list), "total": _seated}
+    _und = _undecided_on(opts)          # T7 이 켜진 심의 — 판정 불가를 밝힌 좌석은 미표명으로 센다(_stance_label)
     for o in last_list:
-        tally[_KEY[_norm_stance(o.get("stance"))]] += 1
+        tally[_KEY[_stance_label(o, _und)]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
     # 좌석별 표 — 집계와 같은 좌석 · 같은 정규화(착석 전원, 응답 못 한 좌석은 미표명 · responded 거짓). 결과 사건에 싣는다(잡 원장 →
     # deliberate_result(view="summary") 의 표결 · 소수 의견, HWAXPortal docs/token-saving P4a — 원장의 전사로 다시 셈하면 전사 상한에 걸린 좌석을
     # '응답 못 함' 으로 잘못 센다).
     _last_by = {o.get("persona"): o for o in last_list}
-    votes = [{"seat": p["key"], "stance": _norm_stance(_last_by[p["key"]].get("stance")) if p["key"] in _last_by else "미표명",
+    votes = [{"seat": p["key"], "stance": _stance_label(_last_by[p["key"]], _und) if p["key"] in _last_by else "미표명",
               "responded": p["key"] in _last_by} for p in personas]
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
@@ -8693,7 +8731,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
         wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
                                        stage=opts.chair_template, personas=personas, last_list=last_list, rid=rid,
-                                       evidence=opts.evidence, pool=gather_pool)
+                                       evidence=opts.evidence, pool=gather_pool, undecided=_und)
         yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
         if _jon:
             # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내와 그 뒤의 꺼짐 상태. 이으면 다시 보내지 않고 꺼짐도 되돌린다.

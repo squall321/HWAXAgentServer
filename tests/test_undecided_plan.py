@@ -52,8 +52,8 @@ class _Tools(dict):
         return []
 
 
-def _run(monkeypatch, tmp_path, *, stances, job="default", advanced=None, personas=_SEATS):
-    """deliberate_start 로 열어 엔진을 끝까지 돌린다. stances — 좌석 역할 낱말 → 수렴 라운드에서 낼 stance."""
+def _run(monkeypatch, tmp_path, *, stances, job="default", advanced=None, personas=_SEATS, chair_fails=False, status="done"):
+    """deliberate_start 로 열어 엔진을 끝까지 돌린다. stances — 좌석 역할 낱말 → 수렴 라운드에서 낼 stance. chair_fails — 의장 호출이 늘 실패한다."""
     import langgraph.prebuilt
 
     seen = []
@@ -64,6 +64,8 @@ def _run(monkeypatch, tmp_path, *, stances, job="default", advanced=None, person
     async def _fake_llm(_llm, system, human):
         seen.append((system, human))
         if "엔지니어링 톤" in system:
+            if chair_fails:
+                raise RuntimeError("의장 호출 실패(시험)")
             return "결정문 본문"
         for word, st in stances.items():
             if word in system or word in human[:4000]:
@@ -92,7 +94,7 @@ def _run(monkeypatch, tmp_path, *, stances, job="default", advanced=None, person
         return delib_jobs._JOBS[out["job_id"]]
 
     rec = asyncio.run(go())
-    assert rec["status"] == "done", f"심의가 끝까지 못 갔다 — {rec.get('error')}"
+    assert rec["status"] == status, f"심의가 기대한 상태({status})로 끝나지 않았다 — {rec['status']} · {rec.get('error')}"
     chair = next((h for s, h in seen if "엔지니어링 톤" in s), "")
     seats = [h for s, h in seen if "엔지니어링 톤" not in s]
     return SimpleNamespace(job=rec, chair=chair, seats=seats, decision=str(rec.get("decision") or rec.get("result") or ""))
@@ -126,10 +128,17 @@ def test_리스크_심사와_계획서_틀에는_켜도_붙지_않는다(tpl):
 def test_판정_불가는_머리에_올_때만_센다():
     yes = [{"stance": "판정 불가"}, {"stance": "판정불가"}, {"stance": "「판정 불가」 — 측정 필요"}, {"vote": "판정 불가 — 다음에 측정할 것: 접촉각"},
            {"stance": "판단 불가"}, {"stance": "Undecided"}, {"stance": "cannot be decided yet"}]
-    no = [{"stance": "판정 불가는 아니다"[::-1]}, {"stance": "동의"}, {"stance": "조건부 동의 — 판정 불가였으나 근거가 생겼다"}, {"vote": "A 안"},
-          {"stance": None}, {}, "글", None]
-    assert len(d._undecided_seats(yes)) == len(yes)
-    assert d._undecided_seats(no) == []
+    yes += [{"stance": "판정 불가능"}, {"stance": "판정 불가(근거 부족)"}, {"stance": "판정 불가. 접촉각 자료가 없다"}, {"stance": "판정 불가입니다"}]
+    # 머리에 와도 세지 않는 것 — 부정 · 지난 일 · 다른 낱말(반대 검토: 종전 시험은 첫 항목의 글자를 뒤집어 넣어 이 틈을 가렸다).
+    no = [{"stance": "판정 불가는 아니다"}, {"stance": "판정 불가가 아님 — A 안"}, {"stance": "판정 불가도 아니고 반대도 아니다"},
+          {"stance": "판정 불가능하지 않다"}, {"stance": "판정 불가였으나 근거가 생겨 A 안"}, {"stance": "판정 불가했지만 지금은 동의"},
+          {"stance": "판정 불가피 — A 안으로 간다"}, {"stance": "판단 불가결한 자료는 다 있다"},
+          {"stance": "동의"}, {"stance": "조건부 동의 — 판정 불가였으나 근거가 생겼다"}, {"vote": "A 안"}, {"stance": None}, {}, "글", None]
+    for o in yes:
+        assert d._is_undecided(o), o
+    for o in no:
+        assert not d._is_undecided(o), o
+    assert len(d._undecided_seats(yes)) == len(yes) and d._undecided_seats(no) == []
 
 
 def test_과반의_분모는_앉은_좌석이다():
@@ -180,6 +189,73 @@ def test_리스크_심사는_켜도_수렴_지시가_그대로다(monkeypatch, t
     r = _run(monkeypatch, tmp_path, stances=_TWO_OF_THREE, job="risk-review-sealed", advanced={"undecided": 1})
     assert not any("next_measurement" in h for h in r.seats) and "판정 불가 과반" not in r.chair
     assert "■ 판정 불가 과반" not in r.decision
+
+
+# ── 반대 검토가 짚은 것(2026-11-22) ────────────────────────────────────────────
+def test_켠_심의의_집계와_표는_판정_불가_좌석을_미표명으로_센다(monkeypatch, tmp_path):
+    """종전 정규화는 '판정 불가' 를 판별 안 되는 글로 보고 '조건부 동의' 로 떨어뜨렸다 — 머리에는 '판정 불가 과반' 인데 집계는 '조건부 동의 2' 였다."""
+    r = _run(monkeypatch, tmp_path, stances=_TWO_OF_THREE, advanced={"undecided": 1})
+    t = r.job["tally"]
+    assert (t["agree"], t["conditional"], t["oppose"], t["abstain"], t["total"]) == (1, 0, 0, 2, 3), t
+    assert {v["seat"]: v["stance"] for v in r.job["votes"]} == {"mech-a": "미표명", "rel-b": "미표명", "mat-c": "동의"}
+    assert all(v["responded"] for v in r.job["votes"]), "답은 했다 — 응답 못 한 좌석과 다르다"
+    assert r.job.get("unanimous") is not True
+
+
+def test_꺼진_심의의_집계는_종전_그대로다(monkeypatch, tmp_path):
+    r = _run(monkeypatch, tmp_path, stances=_TWO_OF_THREE)
+    t = r.job["tally"]
+    assert (t["agree"], t["conditional"], t["abstain"]) == (1, 2, 0), t
+    assert d._stance_label({"stance": "판정 불가"}) == "조건부 동의" and d._stance_label({"stance": "판정 불가"}, True) == "미표명"
+    assert d._stance_label({"stance": "조건부 동의", "vote": "판정 불가 — 측정 뒤"}, True) == "미표명", "과반을 세는 판정과 같아야 한다(vote 머리)"
+    assert d._stance_label({"stance": "반대"}, True) == "반대"
+
+
+def test_기록용_회의록에_다음_측정이_실린다():
+    o = {"final_position": "근거가 없다", "vote": "판정 불가", "stance": "판정 불가", "next_measurement": "접촉각을 재서 30도 이하면 A 안"}
+    full, bubble = d._say_of(3, o, full=True), d._say_of(3, o)
+    assert "다음에 잴 것 — 접촉각을 재서 30도 이하면 A 안" in full
+    assert "다음에 잴 것" not in bubble, "버블은 종전 그대로다"
+    assert "다음에 잴 것" not in d._say_of(3, {"final_position": "가", "vote": "나"}, full=True)
+    assert "- " not in d._say_of(3, {**o, "next_measurement": ["접촉각", "표면 에너지"]}, full=True).split("다음에 잴 것 — ")[1][:2]
+
+
+def test_다단_심의의_1단에는_켜도_붙지_않는다():
+    """sim-plan · build-plan 은 꺼짐 목록인데 그 1단은 틀 이름이 mechanism 이라 비켜 갔다 — 1단 결정문이 측정 계획이 되면 2단이 메커니즘 없이 돈다."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(d)
+    tree = ast.parse(src)
+    hits = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Attribute)]
+        mech = [n for n in body if n.targets[0].attr == "chair_template" and isinstance(n.value, ast.Constant) and n.value.value == "mechanism"]
+        for n in mech:
+            owner = ast.unparse(n.targets[0].value)
+            off = [x for x in body if x.targets[0].attr == "undecided" and ast.unparse(x.targets[0].value) == owner
+                   and isinstance(x.value, ast.Constant) and x.value.value == 0]
+            hits.append((owner, bool(off)))
+    assert hits, "1단 틀을 세우는 자리를 못 찾았다 — 엔진이 바뀌었다"
+    assert all(ok for _o, ok in hits), f"1단 틀(mechanism)을 세우면서 undecided 를 끄지 않는 자리가 있다 — {hits}"
+    assert "mechanism" not in d._UNDECIDED_TEMPLATES_OFF, "틀 이름으로 끄면 단독 mechanism 심의가 생길 때 같이 꺼진다 — 1단에서 끈다"
+
+
+def test_의장이_못_낸_결정문에는_표지를_찍지_않는다(monkeypatch, tmp_path):
+    r = _run(monkeypatch, tmp_path, stances=_TWO_OF_THREE, advanced={"undecided": 1}, chair_fails=True, status="error")
+    assert "의장 결정문 없음" in r.decision, r.decision[:200]
+    assert "■ 판정 불가 과반" not in r.decision, "회의록 보존 글 위에 '결론부는 측정 계획이다' 가 찍혔다"
+
+
+def test_되살린_결정문은_그때_적어_둔_판정을_쓴다():
+    assert d._undecided_restored({"text": "가", "um": [2, 3]}) == (2, 3)
+    for bad in ({"text": "가"}, {"um": None}, {"um": [2]}, {"um": [True, 3]}, {"um": "2,3"}, {"um": [2, "3"]}, None, "글"):
+        assert d._undecided_restored(bad) is None, bad
+    src = Path(d.__file__).read_text(encoding="utf-8")
+    assert '**({"um": list(_um)} if _um else {})' in src, "e:decision 줄에 그때의 판정을 적지 않는다"
+    assert "if _rdec is None else _undecided_restored(_rdec)" in src, "되살릴 때 다시 센다 — 스위치가 바뀐 박스에서 결정문과 표지가 어긋난다"
 
 
 def test_러너가_이_손잡이를_안다():
