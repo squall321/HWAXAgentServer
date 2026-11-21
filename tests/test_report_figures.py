@@ -406,3 +406,78 @@ def test_사람_토큰_없는_심의는_본문에_없던_그림을_한_줄로_�
     assert portal.got == [] and "extra_blocks" not in args
     f = view["report_figures"]
     assert (f["found"], f["attached"], f["failed"]) == (4, 0, 4) and sorted(f["failed_refs"]) == sorted(urls)
+
+
+# ── AIDataHub 첨부 그림(사용자 결정 2026-11-22 — HWAXPortal docs/leftovers-1121 L21-10 ④, RF-13 의 미룸을 뒤집음) ─────────────────────
+ATT = "/ai-data-hub/attachments/rec/1201/fig-a.png"
+ATT2 = "/ai-data-hub/attachments/rec/1201/fig-b.webp"
+
+
+def _aidh(monkeypatch, files: dict):
+    """AIDataHub 첨부 길의 대역 — vision.load 가 받는 것처럼 (바이트, mime) 또는 None. 물은 주소를 적는다."""
+    asked = []
+
+    def load(url, artifact_dir, aidh_http=""):
+        if not url.startswith("/ai-data-hub/attachments/"):
+            raise AssertionError(f"도구 그림은 이 길로 받지 않는다 — {url}")
+        asked.append((url, aidh_http))
+        raw = files.get(url)
+        return (raw, "image/" + url.rsplit(".", 1)[-1]) if raw else None
+    monkeypatch.setattr(RF.vision, "load", load)
+    monkeypatch.setattr(app, "AIDH_HTTP", "http://aidh.test")
+    return asked
+
+
+def test_첨부_그림도_올려_그림_칸으로_바꾸고_출처를_적는다(figs, monkeypatch):
+    portal, _d = figs
+    asked = _aidh(monkeypatch, {ATT: PNG, ATT2: PNG2})
+    out = _attach({"background": [f"카드의 단면 ![균열 단면]({ATT})을 본다", f"다른 그림은 {ATT2}에 있다"]})
+    assert out.blocks["background"] == ["카드의 단면 [그림 1 — 균열 단면]을 본다", "다른 그림은 [그림 2]에 있다"]
+    assert [a for a, _b in asked] == [ATT, ATT2] and {b for _a, b in asked} == {"http://aidh.test"}
+    assert [(g["meta"]["filename"], g["meta"]["ref"], g["meta"]["mime"]) for g in portal.got] == [
+        ("fig-a.png", ATT, "image/png"), ("fig-b.webp", ATT2, "image/webp")]
+    assert portal.got[0]["raw"] == PNG and all(g["auth"] == "Bearer pat-kim" for g in portal.got)
+    assert len(out.extra_blocks) == 2 and out.summary() == {"found": 2, "attached": 2, "failed": 0, "reasons": [], "failed_refs": []}
+
+
+def test_못_받은_첨부_그림은_그_자리에_까닭이_남고_다음_그림은_올린다(figs, monkeypatch):
+    portal, _d = figs
+    _aidh(monkeypatch, {ATT2: PNG2})
+    out = _attach({"background": [f"![없는 그림]({ATT})", f"![있는 그림]({ATT2})"]})
+    assert out.blocks["background"][0].startswith("[그림 — 올리지 못함: 첨부 그림을 받지 못했다") and out.blocks["background"][0].endswith("· 없는 그림]")
+    assert out.blocks["background"][1] == "[그림 1 — 있는 그림]"
+    assert out.summary()["failed_refs"] == [ATT] and len(portal.got) == 1
+
+
+def test_도구_그림과_첨부_그림이_같은_내용이면_한_장이다(figs, monkeypatch):
+    portal, _d = figs
+    _aidh(monkeypatch, {ATT: PNG})
+    art = f"/agent/artifacts/{_name(PNG, 'png')}"
+    out = _attach({"results": [f"![도구 그림]({art})", f"![카드 그림]({ATT})"]})
+    assert out.blocks["results"] == ["[그림 1 — 도구 그림]", "[그림 1 — 도구 그림]"], "같은 그림은 어디서나 같은 표지다"
+    assert len(portal.got) == 1 and len(out.extra_blocks) == 1 and out.summary()["found"] == 1
+
+
+def test_위로_벗어나는_경로와_SVG_첨부는_건드리지_않는다(figs, monkeypatch):
+    portal, _d = figs
+    asked = _aidh(monkeypatch, {})
+    text = "![x](/ai-data-hub/attachments/../../etc/a.png) 와 /ai-data-hub/attachments/rec/1/v.svg"
+    out = _attach({"background": [text]})
+    assert out.blocks["background"] == [text] and asked == [] and portal.got == [] and RF.count({"background": [text]}) == 0
+
+
+def test_끄면_첨부_주소는_글자_그대로_남고_도구_그림만_싣는다(figs, monkeypatch):
+    portal, _d = figs
+    asked = _aidh(monkeypatch, {ATT: PNG2})
+    monkeypatch.setattr(RF, "ATTACHMENTS", False)
+    art = f"/agent/artifacts/{_name(PNG, 'png')}"
+    out = _attach({"results": [f"![도구]({art}) 그리고 ![카드]({ATT})"]})
+    assert out.blocks["results"] == [f"[그림 1 — 도구] 그리고 ![카드]({ATT})"]
+    assert asked == [] and [g["meta"]["ref"] for g in portal.got] == [art] and out.summary()["found"] == 1
+
+
+def test_본문_밖_그림_줄은_도구_그림만_든다(figs):
+    """심의가 좌석 조회에서 모은 그림 주소(본문에 없는 것)를 한 항목으로 더할 때 — 첨부 주소가 섞여 와도 줄로 만들지 않는다(도구가 낸 그림이 아니다)."""
+    art = f"/agent/artifacts/{_name(PNG, 'png')}"
+    line, refs = RF.uncited({"background": ["글"]}, [art, ATT])
+    assert refs == [art] and ATT not in line
