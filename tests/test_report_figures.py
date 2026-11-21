@@ -461,7 +461,9 @@ def test_도구_그림과_첨부_그림이_같은_내용이면_한_장이다(fig
 def test_위로_벗어나는_경로와_SVG_첨부는_건드리지_않는다(figs, monkeypatch):
     portal, _d = figs
     asked = _aidh(monkeypatch, {})
-    text = "![x](/ai-data-hub/attachments/../../etc/a.png) 와 /ai-data-hub/attachments/rec/1/v.svg"
+    # 경로 가운데의 '..' 도 본다 — 맨 앞의 '..' 는 정규식이 애초에 안 잡지만 가운데 것은 잡힌다(그때는 건드리지 않기로 한 주소다).
+    text = ("![x](/ai-data-hub/attachments/../../etc/a.png) 와 ![y](/ai-data-hub/attachments/rec/../../secret/a.png) 와 "
+            "/ai-data-hub/attachments/rec/1/v.svg")
     out = _attach({"background": [text]})
     assert out.blocks["background"] == [text] and asked == [] and portal.got == [] and RF.count({"background": [text]}) == 0
 
