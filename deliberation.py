@@ -18,6 +18,7 @@ import call_trace                                       # 호출 추적(CALL_TRA
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 import persona_links                                    # 좌석 추천의 온톨로지 신호(SEAT_ONTO — 기본 끔, HWAXPortal docs/expert-ontology 6.4)
+import ra_formats                                       # RA 초안의 템플릿 id · 판(박스 파일이 없으면 종전 'deliberation' v1 그대로)
 import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
 import report_figures                                   # 보고서 글의 도구 그림을 그 사람 명의로 RA 그림 칸으로(HWAXPortal docs/report-figures)
 from evidence import fit_document, sig_numbers, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
@@ -8549,7 +8550,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 "blocks": _ra_blocks(blocks), **_fig_kw})
         else:
             _raw_made = await _call(tools, "create_report_draft", {
-                "template_id": "deliberation", "template_version": 1,
+                **ra_formats.draft_args("deliberation"),
                 "title": _ra_report_title(question), "blocks": _ra_blocks(blocks), **_fig_kw,
                 "tags": ["심의", "chat-deliberation"]})
         # _call 은 도구 예외를 "(tool … error: …)" 로, app._cap_tool 은 ✖ 로 싸서 **정상 반환**한다(감사 C29).
@@ -8882,7 +8883,7 @@ async def run_report_save(app, note: str, history: list, groups: list, user: str
     try:
         tools = await _tools_by_name(app, groups, user=user, user_pat=user_pat)
         raw = await _call(tools, "create_report_draft", {
-            "template_id": "deliberation", "template_version": 1,
+            **ra_formats.draft_args("deliberation"),
             "title": title, "blocks": _ra_blocks(blocks),
             **({"extra_blocks": figs.extra_blocks} if figs is not None and figs.extra_blocks else {}),
             "tags": ["심의", "conversation-report"]})

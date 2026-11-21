@@ -519,6 +519,15 @@ def _seat_onto_health() -> dict:
         return {"mode": "off", "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
+def _ra_formats_health() -> dict:
+    """/health ra_formats — RA 초안의 템플릿 id · 판이 기본인지 박스 파일(스스로 등록한 형식)인지(HWAXPortal docs/leftovers-1121 L21-6 ①)."""
+    try:
+        import ra_formats as _rf  # noqa: PLC0415
+        return _rf.health()
+    except Exception as exc:  # noqa: BLE001 — /health 를 막지 않는다
+        return {"file": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def _persona_shadow_seats(site: str, question: str, keys: list, want: int) -> None:
     """심의 첫 좌석 · 띵킹 소집 — 연결 표가 덮었을 도메인을 적기만 한다(deliberation._persona_shadow 가 부른다). 좌석은 그대로다."""
     v = _persona_links()
@@ -10199,6 +10208,7 @@ def health() -> dict:
         "xhub_gate": _xhub_gate_health(),
         # 좌석 추천의 온톨로지 신호 — 스위치(SEAT_ONTO) · 넘긴 수 · 켰는데 넘기지 못한 수와 까닭(HWAXPortal docs/expert-ontology 6.4)
         "seat_onto": _seat_onto_health(),
+        "ra_formats": _ra_formats_health(),
         # 코어 어휘표를 읽었나 — 못 읽으면 챗 코어 규칙이 기본 글로 돈다(HWAXPortal docs/request-1029 C-11)
         "core_vocab": _core_vocab_health(),
         # 실사용 질문 모으기(기본 꺼짐) — 켜졌나 · 창 · 적은 수(HWAXPortal docs/request-1029 design-e5 E5-2)
