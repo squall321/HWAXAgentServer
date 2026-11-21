@@ -275,7 +275,7 @@ _EVID_DESC = (
 # 이 글만 낡는다(근거 상한 '12,000자' 가 그렇게 낡았다).
 _ADV_DESC = (
     "advanced(품질 손잡이 dict, 보통 비운다) — free_tools·tool_budget·chair_bestof·chair_cite·"
-    "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·parse_retries · "
+    "rebut_quote·cross_exam·anchor·evidence_prepass·prose_first·undecided·reasoning_effort·parse_retries · "
     # 종전엔 이름만 있었다 — '심의 타임아웃' 으로 읽고 심의 전체 시간을 넣거나, 엔진이 받는 최대값을 몰라
     # 넘겨 보내고 말없이 죄였다. 범위는 엔진 상수에서 읽어 적는다.
     f"timeout_s(**LLM 호출 1회**의 한도(초) — 심의 전체 시간이 아니다. 심의에는 전체 시간 한도가 없다. "
@@ -643,7 +643,7 @@ async def deliberate_start(
                      않으려 할 때. 기본 True.
         wiki: True 면 결정문을 MX 백서 LLM 위키에도 남긴다(기본 False — 뜻은 _A_WIKI).
         advanced: 품질 손잡이 그대로 전달 — free_tools · tool_budget · chair_bestof · chair_cite ·
-                  rebut_quote · cross_exam · anchor · evidence_prepass · prose_first ·
+                  rebut_quote · cross_exam · anchor · evidence_prepass · prose_first · undecided ·
                   parse_retries · timeout_s · voc · persona_knowledge · chair_template · sealed.
                   보통 비운다(뜻은 _ADV_DESC).
         subject: 과제 주제 {sp_task, round, text, artifacts} — 꼴을 보고 SP 과제 key 를 서버가 다시 풀어 확인한 뒤 잡 기록에 싣는다

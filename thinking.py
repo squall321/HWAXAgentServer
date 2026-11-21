@@ -152,7 +152,7 @@ async def _summon(tools: dict, q: str, top_k: int, exclude: set, onto: str = "")
         return []
     items = recd.get("agents") or recd.get("recommendations") or recd.get("data") or []
     if onto == "shadow":
-        persona_links.shadow_onto("think", items, top_k)            # 적기만 한다 — 순위는 도구가 준 그대로다
+        persona_links.shadow_onto("think", items, top_k, recd.get("onto"))    # 적기만 한다 — 순위는 도구가 준 그대로다
     out: list[dict] = []
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)

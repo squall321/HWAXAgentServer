@@ -17,6 +17,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import delib_jobs  # noqa: E402
 import deliberation as d  # noqa: E402
 import mcp_server as m  # noqa: E402
@@ -169,3 +171,64 @@ def test_안내가_호출_1회_기준임과_받는_범위를_엔진_값으로_�
     assert menu["limits"]["timeout_s_max"] == d.DELIB_TIMEOUT_MAX_S
     monkeypatch.setattr(m, "_APP", SimpleNamespace(state=SimpleNamespace(delib_timeout_s=1800.0)))
     assert asyncio.run(m.deliberate_jobs())["limits"]["timeout_s_default"] == 1800.0
+
+
+# ── T4 생각 강도를 요청마다(HWAXPortal docs/deliberation-quality T4 · docs/leftovers-1121 L21-8 #14) ─────────────────────
+def _effort_run(monkeypatch, req, default_to=1800.0):
+    """요청 한 번으로 엔진을 1라운드까지 돌려, 심의 LLM 을 다시 만든 호출의 인자(위치 · 이름)를 적는다."""
+    made = []
+
+    async def _fake_tools(*_a, **_k):
+        return {"agent_search": _Tool("agent_search")}
+
+    def mk(*a, **kw):
+        made.append((a, kw))
+        return object()
+
+    monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
+    state = SimpleNamespace(llm=object(), delib_llm=object(), delib_timeout_s=default_to, mk_delib_llm=mk)
+
+    async def go():
+        gen = d.run_deliberation(SimpleNamespace(state=state), "힌지 크랙 원인", [],
+                                 {"personas": [{"key": "mech-a", "role": "기구"}, {"key": "rel-b", "role": "신뢰성"}],
+                                  "free_tools": 0, "voc": "off", "rescreen": 0, "persona_knowledge": 0, **req})
+        try:
+            async for chunk in gen:
+                ev, data = delib_jobs._parse_sse(chunk)
+                assert ev != "error", data
+                if ev == "delib" and data.get("stage") == "r1":
+                    break
+        finally:
+            await gen.aclose()
+    asyncio.run(go())
+    return made
+
+
+def test_생각_강도를_주면_그_심의만_그_강도의_LLM_으로_돈다(monkeypatch):
+    assert _effort_run(monkeypatch, {"reasoning_effort": "high"}) == [((1800.0, "high"), {})], "시간 한도는 서버 값 그대로 · 강도만 바꾼다"
+    assert _effort_run(monkeypatch, {"reasoning_effort": " LOW ", "timeout_s": 7200}) == [((7200.0, "low"), {})]
+
+
+def test_생각_강도를_안_주면_종전_그대로다(monkeypatch):
+    assert _effort_run(monkeypatch, {}) == [], "아무것도 안 주면 서버의 심의 LLM 을 그대로 쓴다"
+    assert _effort_run(monkeypatch, {"timeout_s": 7200}) == [((7200.0,), {})], "시간 한도만 주면 종전 호출 꼴(인자 하나)이다"
+    assert d._resolve_opts({}).reasoning_effort is None
+
+
+@pytest.mark.parametrize("bad", ["extreme", 3, True, ["high"], "hi gh"])
+def test_모르는_생각_강도는_버리고_그렇게_말한다(monkeypatch, bad):
+    o = d._resolve_opts({"reasoning_effort": bad})
+    assert o.reasoning_effort is None and "reasoning_effort" in o.req_unread and "low|medium|high|xhigh" in o.req_unread["reasoning_effort"]
+    assert _effort_run(monkeypatch, {"reasoning_effort": bad}) == []
+
+
+def test_빈_값은_안_준_것이다():
+    for empty in (None, ""):
+        o = d._resolve_opts({"reasoning_effort": empty})
+        assert o.reasoning_effort is None and "reasoning_effort" not in o.req_unread
+
+
+def test_러너가_생각_강도를_낮음_대_높음으로_잰다():
+    from tools import delib_ab
+
+    assert "reasoning_effort" in delib_ab.KNOB_ORDER and delib_ab.levels_of("reasoning_effort") == ("low", "high")

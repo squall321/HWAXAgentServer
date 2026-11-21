@@ -1075,7 +1075,9 @@ async def lifespan(app: FastAPI):
     # 요청 단위 타임아웃 오버라이드(웹 토글)용 — 같은 temperature/max_tokens/effort/재시도로 timeout 만
     # 바꿔 재구성하는 팩토리(구성만·연결 없음). 기본 타임아웃도 노출해 오버라이드 필요 판정에 쓴다.
     app.state.delib_timeout_s = d_to
-    app.state.mk_delib_llm = (lambda ts, _t=d_t, _m=d_mt, _e=d_eff, _r=d_rt: _mk_llm(_t, _m, _e, ts, _r))
+    # effort — 요청이 생각 강도를 주면 그것으로(T4 A/B — HWAXPortal docs/deliberation-quality), 안 주면(None) 서버 값 그대로다.
+    app.state.mk_delib_llm = (lambda ts, effort=None, _t=d_t, _m=d_mt, _e=d_eff, _r=d_rt:
+                              _mk_llm(_t, _m, _e if effort is None else effort, ts, _r))
     # 챗 전용 LLM(CHAT_LLM_*) — 비면 챗도 위 llm 을 쓴다(HWAXPortal docs/chat-llm-stcx). llm_nostream 은 챗 경로만 읽으므로
     # (_timed_events · _agent_stream) 챗 클라이언트의 값이다.
     app.state.chat_llm, app.state.chat_llm_info, app.state.chat_llm_cfg = _build_chat_llm(

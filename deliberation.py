@@ -450,6 +450,14 @@ _CROSS_TARGETS = _env_int("DELIB_CROSS_TARGETS", 2)
 _ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주입(동조 붕괴 방어)
 _CHAIR_BESTOF = _env_int("DELIB_CHAIR_BESTOF", 1)    # 의장 후보 n개→심판 선택(1=끔, temp>0 필요)
 _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라운드·페르소나] 출처 태깅
+# T7 판정 불가 허용(HWAXPortal docs/deliberation-quality plan F6 ② — 사용자 결정 2026-11-21 로 다시 엶). 켜면 수렴 라운드의 좌석이 근거가
+# 모자랄 때 '판정 불가' 와 다음에 잴 것을 낼 수 있고, 앉은 좌석의 과반이 그러면 의장이 결론부를 판정이 아니라 측정 계획으로 쓴다(그 표지는
+# 코드가 결정문 머리에 찍는다). 수렴 · 의장 프롬프트를 함께 바꾸는 손잡이라 위와 같이 하나씩 A/B 한다. 기본 0 — 꺼져 있으면 프롬프트가 종전과
+# 글자까지 같다.
+_UNDECIDED = _env_int("DELIB_UNDECIDED", 0)
+# T4 생각 강도 — 요청(delib_opts.reasoning_effort · MCP advanced)이 주면 그 심의만 그 강도로 돈다. 서버 값(DELIB_REASONING_EFFORT)은 그대로다.
+# 종전엔 서버 환경 하나뿐이라 A/B 를 하려면 서버를 둘 띄워야 했다. 받는 낱말은 서버가 chat_template_kwargs 로 넘기는 것과 같다.
+_EFFORTS = ("low", "medium", "high", "xhigh")
 
 # 좌석 구성 손잡이 — 위 '깊이 회복 손잡이'와 달리 프롬프트 제약을 늘리지 않고 참가자 집합만
 # 바꾸므로, GLM 의 지시 추종 예산과 무관하다(단일 변수 A/B 원칙의 적용 대상이 아님).
@@ -1695,7 +1703,7 @@ def _cut_note(what: str, items: list, cap: int, item_cap: int = 0, *, unit: str 
 # 정수로 읽는 요청 손잡이 — _resolve_opts 가 읽고, 잡 원장(delib_jobs.start)이 '실제로 걸린 값' 을 적을 때
 # 같은 목록을 본다.
 _INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-             "chair_bestof", "chair_cite", "parse_retries", "rounds",
+             "chair_bestof", "chair_cite", "undecided", "parse_retries", "rounds",
              "free_tools", "tool_budget", "stop_after_round", "build_plan",
              "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
              "persona_knowledge", "sealed", "wiki")
@@ -1704,7 +1712,7 @@ _INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "an
 # 기본값(켜짐)이 말없이 남았고 오늘의 지식카드가 실렸다. 개수(rounds·tool_budget 등)는 낱말을 안 받는다.
 # sealed 는 여기 없다 — 못 읽는 값을 닫힌 쪽으로 읽어야 해서 _seal 이 먼저 0/1 로 맞춘다.
 _ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-                         "chair_cite", "free_tools", "stop_after_round", "build_plan", "save_report",
+                         "chair_cite", "undecided", "free_tools", "stop_after_round", "build_plan", "save_report",
                          "rescreen", "persona_knowledge", "wiki"))
 _ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
 
@@ -1804,7 +1812,8 @@ def _resolve_opts(req_opts):
     o = SimpleNamespace(
         evidence_prepass=_EVIDENCE_PREPASS, rebut_quote=_REBUT_QUOTE, prose_first=_PROSE_FIRST,
         cross_exam=_CROSS_EXAM, anchor=_ANCHOR, chair_bestof=_CHAIR_BESTOF, chair_cite=_CHAIR_CITE,
-        parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
+        undecided=_UNDECIDED,
+        parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None, reasoning_effort=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
         # 사람 의견이 상한(HUMAN_NOTE_MAX)에서 잘렸으면 (원문 길이, 실은 글) — 스트림이 카드로 알린다.
@@ -1933,6 +1942,13 @@ def _resolve_opts(req_opts):
                 o.timeout_s = float(ts)
             except (ValueError, TypeError):
                 o.req_unread["timeout_s"] = f"timeout_s={_delib_preview(ts, 40)}(대신 서버 기본값으로 돈다)"
+        _eff = req_opts.get("reasoning_effort")
+        if _eff is not None and _eff != "":
+            if isinstance(_eff, str) and _eff.strip().lower() in _EFFORTS:
+                o.reasoning_effort = _eff.strip().lower()
+            else:
+                o.req_unread["reasoning_effort"] = (f"reasoning_effort={_delib_preview(_eff, 40)}(대신 서버 기본값으로 돈다 — "
+                                                    f"{'|'.join(_EFFORTS)})")
         _voc = req_opts.get("voc")
         vm = str("" if _voc is None else _voc).strip().lower()
         if vm in ("auto", "off", "always"):
@@ -3318,6 +3334,81 @@ def _item_text(x, quote_max: int = 80) -> str:
     return "; ".join(f"{k}: {v}" for k, v in x.items() if v)
 
 
+# ── T7 판정 불가 과반 → 측정 계획(DELIB_UNDECIDED) ─────────────────────────────────────────────
+# '판정 불가' 는 stance 또는 vote 의 **머리**에 올 때만 센다 — '…라서 판정 불가였으나 지금은 A 안' 같은 글을 과반에 넣지 않는다. 머리에 와도
+# 부정('판정 불가는 아니다' · '판정 불가가 아님' · '판정 불가능하지 않다') · 지난 일('판정 불가였으나' · '판정 불가했지만') · 다른 낱말
+# ('판정 불가피')은 세지 않는다(반대 검토 — 머리 조건만으로는 이것들이 과반에 들어갔다).
+_UNDECIDED_RE = re.compile(
+    r"^\W*(?:(?:판정|판단)\s*불가(?!피|결|능하지|\s*(?:는|은|가|도)?\s*아니|\s*(?:는|은|가|도)?\s*아님|였|했)"
+    r"|undecided\b|cannot\s+(?:be\s+)?(?:decided?|judged?)\b)", re.IGNORECASE)
+# 계획서를 내는 틀(해석 · 시험 · 구축)은 판정문이 아니고, 리스크 심사는 제 보고서 꼴과 '판정 불가는 그대로 두라' 는 계약이 따로 있다 — 넣지 않는다.
+_UNDECIDED_TEMPLATES_OFF = frozenset({"risk-review", "sim-plan", "test-plan", "build-plan"})
+
+
+def _undecided_on(opts) -> bool:
+    return bool(getattr(opts, "undecided", 0)) and getattr(opts, "chair_template", "default") not in _UNDECIDED_TEMPLATES_OFF
+
+
+def _undecided_ask(opts) -> str:
+    """수렴 라운드의 좌석 지시에 덧붙이는 글 — 꺼져 있으면 빈 글(프롬프트가 종전과 같다)."""
+    if not _undecided_on(opts):
+        return ""
+    return (" 근거가 부족해 어느 쪽으로도 판정할 수 없으면 억지로 고르지 말고 stance 를 '판정 불가' 로 적고, next_measurement 에 "
+            "무엇을 어떻게 재면 판정할 수 있는지(대상 · 방법 · 어느 값이면 어느 쪽인지)를 적어라.")
+
+
+def _is_undecided(o) -> bool:
+    """이 발언이 판정 불가를 밝혔는가 — stance 또는 vote 가 '판정 불가' 로 시작한다."""
+    return isinstance(o, dict) and any(_UNDECIDED_RE.search(str(o.get(k) or "")) for k in ("stance", "vote"))
+
+
+def _undecided_seats(last) -> list:
+    """마지막 라운드 발언 가운데 판정 불가를 밝힌 것."""
+    return [o for o in (last or []) if _is_undecided(o)]
+
+
+def _stance_label(o, undecided: bool = False) -> str:
+    """집계 · 좌석별 표 · 턴에 싣는 입장 딱지. undecided(이 심의에 T7 이 켜졌다)일 때 판정 불가를 밝힌 좌석은 '미표명' 이다 —
+    _norm_stance 는 판별이 안 되는 글을 '조건부 동의' 로 떨어뜨려, 과반이 판정하지 않은 심의의 집계가 '조건부 동의 N' 으로 나가고 결정문 머리의
+    표지(판정 불가 과반)와 어긋났다(반대 검토). 과반을 세는 것과 같은 판정(_is_undecided)이라 표지 · 집계 · 표가 같은 좌석을 가리킨다.
+    꺼져 있으면 종전 정규화 그대로다."""
+    if undecided and _is_undecided(o):
+        return "미표명"
+    return _norm_stance(o.get("stance"))
+
+
+def _undecided_majority(opts, last, seated: int):
+    """(판정 불가 좌석 수, 앉은 좌석 수) — 켜져 있고 **앉은 좌석**의 과반일 때만, 아니면 None. 분모는 응답자가 아니라 앉은 좌석이다 —
+    좌석 유실이 과반을 만들지 않게(집계의 분모와 같은 까닭)."""
+    if not _undecided_on(opts):
+        return None
+    n = len(_undecided_seats(last))
+    return (n, int(seated)) if seated and n * 2 > seated else None
+
+
+def _undecided_restored(rdec):
+    """재개 자료(e:decision)의 um 칸 → (판정 불가 좌석 수, 앉은 좌석 수) 또는 None. 칸이 없는 줄(이 칸이 생기기 전의 엔진이 적었다)은 None —
+    그 결정문은 T7 전제 없이 쓰였다."""
+    u = rdec.get("um") if isinstance(rdec, dict) else None
+    ok = isinstance(u, (list, tuple)) and len(u) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in u)
+    return (u[0], u[1]) if ok else None
+
+
+def _undecided_chair_note(um) -> str:
+    """의장에게 주는 전제 — 과반이 아니면(None) 빈 글. 표지 줄은 코드가 결정문 머리에 따로 찍는다(_undecided_mark)."""
+    if not um:
+        return ""
+    return (f"[판정 불가 과반 — 수렴 라운드에서 앉은 {um[1]}석 가운데 {um[0]}석이 근거 부족으로 '판정 불가' 를 밝혔다. 결론부(결정 · 권고에 "
+            "해당하는 항목)는 판정이 아니라 **측정 계획**으로 쓴다 — 무엇을 재는지 · 어떤 방법 · 도구로 재는지 · 어느 값이면 어느 쪽으로 "
+            "판정하는지 · 어느 도메인이 맡는지 · 순서. 좌석이 적은 next_measurement 를 합치고 겹치는 것은 묶어라. 판정을 지어내지 말고, "
+            "판정을 낸 소수 좌석의 입장은 소수의견으로 남겨라. 이 줄은 결정문 머리에 따로 찍힌다]\n")
+
+
+def _undecided_mark(um) -> str:
+    return (f"■ 판정 불가 과반 — 앉은 {um[1]}석 가운데 {um[0]}석이 근거 부족으로 판정하지 않았다. 이 결정문의 결론부는 판정이 아니라 "
+            "다음에 잴 것(측정 계획)이다.")
+
+
 def _norm_stance(s) -> str:
     """스탠스를 canonical 라벨로 — 부정 표현('동의하지 않습니다' 등)이 동의로 집계되지 않게
     부정 패턴을 먼저 매칭한다.
@@ -3395,6 +3486,11 @@ def _say_of(rnd: int, d: dict, full: bool = False) -> str:
             body = clip(joined(d.get("non_negotiable")), 0)     # 스탠스는 턴에 따로 실린다(stance)
             if body:
                 say = (say + f"\n\n양보 불가 — {body}").strip()
+            # T7 을 켠 심의에서만 좌석이 내는 칸이다(_ser_kind 와 같은 칸) — 종전엔 의장에게만 가고 회의록 · 전사에는 없어, 측정 계획이
+            # 어느 좌석의 무엇에서 나왔는지 기록으로 되짚을 수 없었다(반대 검토).
+            nm = clip(joined(d.get("next_measurement")), 0)
+            if nm:
+                say = (say + f"\n\n다음에 잴 것 — {nm}").strip()
     return say or clip(d.get("say"), 400) or "(발언 파싱 실패)"
 
 
@@ -3913,14 +4009,14 @@ def _wiki_bind(affiliation: str, job_id: str) -> None:
 
 
 def _wiki_envelope(*, question: str, decision: str, stage: str, personas: list, last_list: list, rid,
-                   evidence: list, pool: list, owner: str, affiliation: str, ref: str, now) -> dict:
+                   evidence: list, pool: list, owner: str, affiliation: str, ref: str, now, undecided: bool = False) -> dict:
     """원천 봉투(mxwp-source/1 · deliberation). 표는 착석 전원이다 — 마지막 라운드에 답하지 못한 좌석도 미표명으로 싣는다(집계와 같다).
     소수 의견은 동의가 아닌 좌석의 마지막 입장 전문이다. 근거는 보고서 · 호출자가 준 근거 · 좌석 조회(같은 것은 한 번)."""
     by_seat = {o.get("persona"): o for o in last_list}
     votes, minority = [], []
     for p in personas:
         o = by_seat.get(p["key"])
-        stance = _norm_stance(o.get("stance")) if o else "미표명"
+        stance = _stance_label(o, undecided) if o else "미표명"
         votes.append({"seat": p["key"], "stance": stance if o else "미표명(응답 없음)"})
         if stance != "동의":
             minority.append(f"[{p['key']}] {stance} — "
@@ -5449,7 +5545,8 @@ async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | 
     else:
         items = []
     if onto == "shadow":
-        persona_links.shadow_onto("delib", items, N_PERSONAS)       # 적기만 한다 — 순위는 도구가 준 그대로다
+        persona_links.shadow_onto("delib", items, N_PERSONAS,       # 적기만 한다 — 순위는 도구가 준 그대로다
+                                  recd.get("onto") if isinstance(recd, dict) else None)
     out = []
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)
@@ -6033,6 +6130,9 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
             yield _sse("status", {"step": "1단 — 메커니즘 심의", "tool": None})
             opts_a = _resolve_opts(req_opts)
             opts_a.chair_template = "mechanism"
+            # T7 은 계획서 틀(_UNDECIDED_TEMPLATES_OFF)에 붙지 않는다 — 그 1단도 같다. 1단의 결정문은 2단이 메커니즘으로 이어받는 글이라
+            # 측정 계획으로 바뀌면 2단이 메커니즘 없이 해석을 설계한다(반대 검토 — 틀 이름이 mechanism 이라 꺼짐 목록을 비켜 갔다).
+            opts_a.undecided = 0
             async for chunk in _deliberation_stream(app, question, groups, opts_a, user, user_pat,
                                                     history, out=out_a, sk=delib_resume.SIM1):
                 yield chunk
@@ -6426,14 +6526,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("done", {}); return
     # 요청 단위 타임아웃 오버라이드(웹 토글) — 기동값과 다르면 같은 파라미터로 새 인스턴스(구성만, 저렴).
     # 외부 응답자에는 걸리지 않는다(HTTP 호출이 아니다 — 한도는 EXTERNAL_LLM_WAIT_S·EXTERNAL_LLM_ANSWER_S).
-    if opts.timeout_s is not None and not _ext:
+    if (opts.timeout_s is not None or opts.reasoning_effort) and not _ext:
         cur_to = getattr(app.state, "delib_timeout_s", 0.0) or 0.0
         mk = getattr(app.state, "mk_delib_llm", None)
-        if mk and opts.timeout_s != cur_to:
+        _want_to = opts.timeout_s if opts.timeout_s is not None else cur_to
+        if mk and (_want_to != cur_to or opts.reasoning_effort):
             try:
-                llm = mk(opts.timeout_s)
+                # 생각 강도를 안 줬으면 종전 호출 꼴 그대로다(인자 하나) — 강도는 줬을 때만 넘긴다.
+                llm = mk(_want_to, opts.reasoning_effort) if opts.reasoning_effort else mk(_want_to)
             except Exception as exc:  # noqa: BLE001 — 팩토리 실패 시 기본 delib_llm 유지
-                print(f"[deliberation] timeout override failed: {exc!r}")
+                print(f"[deliberation] timeout · effort override failed: {exc!r}")
     # 요청 단위 강등 표식 초기화 — 이 태스크가 재사용되는 경우에도 이전 요청의 값이 새지 않게.
     _pat_degraded.set(None)
     # 실행 중 자격 강등 — 도구 래퍼가 이 칸을 채우면(_svc_fallback) 아래 _cred_notice 가 한 번 알린다.
@@ -7498,8 +7600,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             return _ser(o, ("lens", "reads", "recommendation", "concerns"), primary="lens", clip=clip)
         if kind == "deepen":
             return _ser(o, ("concede", "rebut", "deepen"), primary="deepen", clip=clip)
-        return _ser(o, ("final_position", "non_negotiable", "vote", "stance"), primary="final_position",
-                    clip=clip)
+        return _ser(o, ("final_position", "non_negotiable", "vote", "stance")
+                    + (("next_measurement",) if _undecided_on(opts) else ()), primary="final_position", clip=clip)
 
     rebut_spec = ("반박(rebut)은 객체 배열 — 각 항목 {target: 상대 키, quote: 상대 발언에서 "
                   "20자 이상 그대로 복사한 문구, counter: 반박 논지, basis: 수치·표준·실패모드}. "
@@ -7627,8 +7729,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 return (base + f"\n[{_dr(_pno)}라운드 전원]\n{_pt}\n" + anchor +
                         "\n직전 라운드를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
                         "제약(non_negotiable)·" + _vote_ask +
-                        "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
-                        "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
+                        "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라."
+                        + _undecided_ask(opts) +
+                        " JSON {final_position,non_negotiable,vote,stance,position_short"
+                        + (",next_measurement" if _undecided_on(opts) else "") + "} 로.")
             required = ("final_position", "vote") if _has_choices else ("final_position",)
             validator_fn, render = None, 3
 
@@ -8009,7 +8113,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 _nn_full = _nn_text(o)
                 _nn_cap = _summary_max() if _wide() else _NN_ITEM_MAX
                 extra = {"position": _clip_sent(o.get("position_short"), 90),
-                         "stance": _norm_stance(o.get("stance")),
+                         "stance": _stance_label(o, _undecided_on(opts)),
                          "non_negotiable": _nn_full[:_nn_cap]}
                 if len(_nn_full) > _nn_cap:
                     extra["non_negotiable_chars"] = len(_nn_full)
@@ -8151,8 +8255,15 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _as_of_note = (f"[기준일 {_as_of} — 좌석 지식카드는 이 날까지의 카드만 실렸다('{_AS_OF_UNDATED}' 카드는 날짜가 없어 그 날 뒤에 "
                    "쓰였을 수 있다). 이 줄은 결정문 머리에 셈과 함께 따로 찍힌다. 그런 카드에만 기댄 판단이 있으면 그렇다고 적어라]\n"
                    if _as_of else "")
+    # T7 — 앉은 좌석의 과반이 '판정 불가' 면 결론부를 측정 계획으로(DELIB_UNDECIDED — 꺼져 있으면 None 이고 아래 글이 비어 종전과 같다).
+    # 결정문을 되살렸으면(S3) 다시 세지 않고 그때 적어 둔 것을 쓴다 — 그 사이 스위치가 바뀐 박스에서 되살린 결정문과 표지가 어긋나지 않게.
+    _um = _undecided_majority(opts, last_list, len(personas)) if _rdec is None else _undecided_restored(_rdec)
+    if _um and _rdec is None:           # 결정문을 되살렸으면(S3) 이 알림은 의장을 부르기 전에 이미 원장에 실렸다
+        yield _sse("warning", {"code": "undecided_majority", "message": (
+            f"수렴 라운드에서 앉은 {_um[1]}석 가운데 {_um[0]}석이 근거 부족으로 '판정 불가' 를 밝혔다 — 결정문의 결론부는 판정이 아니라 "
+            "측정 계획으로 쓴다.")})
     chair_tail = (
-        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}{_as_of_note}"
+        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}{_as_of_note}{_undecided_chair_note(_um)}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
@@ -8307,7 +8418,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                    "근거·발언 원문에서 확인", "tool": None})
     if _rdec is None and _jon:
         # 재개 자료(HA-09 S3 — e:decision) — 의장 결정문(못 냈으면 회의록 보존 글)과 실패 표지. 이으면 의장을 다시 부르지 않는다.
-        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause)
+        delib_resume.write(sk, "e:decision", sync=True, text=decision, failed=_chair_failed, knob=_chair_knob, cause=_chair_cause,
+                           **({"um": list(_um)} if _um else {}))
 
     # 4b) 핵심 요약(TL;DR) — 의사결정문을 3~5줄로 증류해 맨 앞에 붙인다. 권고 섹션·챗 답변·이어하기
     #     요약이 모두 결론 요지로 시작하게(보고서를 열자마자 결론이 보이도록).
@@ -8332,6 +8444,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 기준일 줄도 코드가 찍는다(아래 봉인 표지와 같은 까닭) — 봉인 줄 아래에 온다. 셈은 사전 검색 · 자유 조회에서 모은 것이다.
+    # 판정 불가 과반 표지도 코드가 찍는다(같은 까닭 — 의장이 빠뜨리면 판정을 낸 결정문과 똑같이 생긴다).
+    # 의장이 결정문을 못 냈으면 찍지 않는다 — 그 글은 회의록 보존 글이라 '결론부는 측정 계획이다' 가 거짓이 된다(반대 검토).
+    if _um and not _chair_failed:
+        decision = f"{_undecided_mark(_um)}\n\n{decision}"
     if _as_of:
         decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free, _ao_des)}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
@@ -8592,15 +8708,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _seated = len(personas)
     tally = {"agree": 0, "conditional": 0, "oppose": 0, "abstain": 0,
              "responded": len(last_list), "total": _seated}
+    _und = _undecided_on(opts)          # T7 이 켜진 심의 — 판정 불가를 밝힌 좌석은 미표명으로 센다(_stance_label)
     for o in last_list:
-        tally[_KEY[_norm_stance(o.get("stance"))]] += 1
+        tally[_KEY[_stance_label(o, _und)]] += 1
     # 응답조차 못 한 좌석(오류·시간초과)도 미표명이다 — 분모에 있으니 어딘가에는 세어야 한다.
     tally["abstain"] += max(0, _seated - len(last_list))
     # 좌석별 표 — 집계와 같은 좌석 · 같은 정규화(착석 전원, 응답 못 한 좌석은 미표명 · responded 거짓). 결과 사건에 싣는다(잡 원장 →
     # deliberate_result(view="summary") 의 표결 · 소수 의견, HWAXPortal docs/token-saving P4a — 원장의 전사로 다시 셈하면 전사 상한에 걸린 좌석을
     # '응답 못 함' 으로 잘못 센다).
     _last_by = {o.get("persona"): o for o in last_list}
-    votes = [{"seat": p["key"], "stance": _norm_stance(_last_by[p["key"]].get("stance")) if p["key"] in _last_by else "미표명",
+    votes = [{"seat": p["key"], "stance": _stance_label(_last_by[p["key"]], _und) if p["key"] in _last_by else "미표명",
               "responded": p["key"] in _last_by} for p in personas]
     # MX 백서 위키(P8) — 켠 심의만. 보고서 저장(번호를 근거로 싣는다) · 집계(표) 뒤, 결정문을 내리기 전이다 — 안내가 결정문 끝(보고서
     # 안내 뒤)에 붙는다. 보고서는 먼저 저장했으므로 보고서 본문에는 이 안내가 없다.
@@ -8614,7 +8731,7 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
         yield _sse("status", {"step": "MX 백서 위키에 결정문 남기는 중", "tool": _WIKI_TOOL})
         wiki_note = await _wiki_submit(tools, user=user, chair_failed=_chair_failed, question=question, decision=decision,
                                        stage=opts.chair_template, personas=personas, last_list=last_list, rid=rid,
-                                       evidence=opts.evidence, pool=gather_pool)
+                                       evidence=opts.evidence, pool=gather_pool, undecided=_und)
         yield _sse("status", {"step": wiki_note.strip()[:300], "tool": None})
         if _jon:
             # 재개 자료(HA-09 S3 — e:wiki_sent) — 결정문 끝에 붙는 안내와 그 뒤의 꺼짐 상태. 이으면 다시 보내지 않고 꺼짐도 되돌린다.

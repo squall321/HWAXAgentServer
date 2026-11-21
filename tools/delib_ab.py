@@ -34,9 +34,9 @@ DEFAULT_URL = "http://127.0.0.1:9009/chat"
 
 # T-서열 순서(GLM-DELIB-TUNING-REVIEW §실행 순서). 이 순서대로 하나씩 A/B 한다.
 KNOB_ORDER = ("evidence_prepass", "rebut_quote", "prose_first",
-              "chair_bestof", "chair_cite", "cross_exam", "anchor")
-# best-of 는 0/1 이 아니라 1/3 이 대조군이다(1=끔).
-KNOB_LEVELS = {"chair_bestof": (1, 3)}
+              "chair_bestof", "chair_cite", "cross_exam", "anchor", "undecided", "reasoning_effort")
+# best-of 는 0/1 이 아니라 1/3 이 대조군이다(1=끔). 생각 강도는 낱말이다 — 낮음 대 높음(T4).
+KNOB_LEVELS = {"chair_bestof": (1, 3), "reasoning_effort": ("low", "high")}
 
 
 def levels_of(knob: str) -> tuple:

@@ -35,9 +35,12 @@ _RETRY_S = 60.0
 PROBE_TIMEOUT_S = float(os.environ.get("VISION_PROBE_TIMEOUT_S", "120"))  # 탐침 한 번 — 기동 직후 첫 그림 요청 · 바쁜 서버는 15초를 넘긴다
 #   (dev 실측 10-18 — 막 뜬 vLLM 의 첫 다중모달 요청이 15초를 넘겨 '모름' 이 됐고 그 턴은 그림 없이 갔다). 판정은 서버마다 한 번이라 첫 그림 턴만 기다린다
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
+# 이름 끝은 영숫자 · _ 가 아니면 된다 — \b 는 한글을 낱말 글자로 봐서 조사가 붙은 주소('…png에')를 놓쳤다(report_figures._NAME 과 같은 고침).
+# 앞쪽 이름은 탐욕으로 읽는다 — 게으르면 'shot.jpg.png' 를 'shot.jpg' 에서 끊어 없는 파일을 가리킨다(반대 검토). '.pngx' 같은 꼴은 뒤의
+# 부정 선읽기가 막는다.
 IMG_URL_RE = re.compile(
-    r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\.(?:png|jpe?g|gif|webp)\b"
-    r"|/ai-data-hub/attachments/[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}\.(?:png|jpe?g|gif|webp)\b", re.I)
+    r"/agent/artifacts/[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9_])"
+    r"|/ai-data-hub/attachments/[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9_])", re.I)
 
 
 def image_urls(*texts) -> list[str]:
