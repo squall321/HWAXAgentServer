@@ -367,8 +367,13 @@ def reco_args(tools: dict, q: str, top_k: int | None = None, *, onto: str = "") 
     return args
 
 
-def shadow_onto(site: str, items, want: int) -> dict:
-    """shadow 로 받은 추천 줄에서 덧점을 얹었다면 위 want 명이 어떻게 달라졌을지 적기만 한다(PERSONA_SHADOW_LOG). 돌려준 값은 시험만 본다."""
+_VERDICTS = ("core_question", "no_owner")
+
+
+def shadow_onto(site: str, items, want: int, stats=None) -> dict:
+    """shadow 로 받은 추천 줄에서 덧점을 얹었다면 위 want 명이 어떻게 달라졌을지 적기만 한다(PERSONA_SHADOW_LOG). 돌려준 값은 시험만 본다.
+    stats — 추천 응답의 온톨로지 통계(``onto``). 판정 후보(``verdict`` — 코어 데이터 질문 · 맡은 사람 없음, AIDataHub onto_svc.verdict)와 질문에서
+    풀린 객체 수를 함께 적는다 — 그 판정의 정밀도를 재는 재료다(HWAXPortal docs/expert-ontology EO-12). 사람에게 보이거나 좌석을 바꾸지 않는다."""
     rows = []
     for it in items if isinstance(items, list) else []:
         if not isinstance(it, dict):
@@ -386,5 +391,12 @@ def shadow_onto(site: str, items, want: int) -> dict:
     would = [k for k, _, _ in sorted(rows, key=lambda r: -(r[1] + r[2]))[:want]]      # 안정 정렬 — 덧점이 없으면 순서가 그대로다
     rec = {"u": "onto", "site": site, "want": want, "rows": len(rows), "signal": sum(1 for r in rows if r[2] > 0),
            "enter": [k for k in would if k not in now], "leave": [k for k in now if k not in would]}
+    if isinstance(stats, dict):
+        try:
+            rec["entities"] = int(stats.get("entities") or 0)
+        except (TypeError, ValueError):
+            rec["entities"] = 0
+        if stats.get("verdict") in _VERDICTS:
+            rec["verdict"] = stats["verdict"]
     _write(rec)
     return rec

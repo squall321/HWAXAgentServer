@@ -132,7 +132,7 @@ def test_shadow_record_says_who_would_enter_and_writes_only_when_logging_is_on(m
 
 def test_shadow_mode_does_not_change_the_order_the_tool_gave(monkeypatch):
     seen = []
-    monkeypatch.setattr(persona_links, "shadow_onto", lambda site, items, want: seen.append((site, len(items), want)))
+    monkeypatch.setattr(persona_links, "shadow_onto", lambda site, items, want, stats=None: seen.append((site, len(items), want)))
     tools = {"recommend_agents": _Tool(_REPLY)}
     assert asyncio.run(deliberation._rank_keys(tools, "q", onto="shadow")) == ["rel-a", "rel-b", "pcb-c"]
     asyncio.run(thinking._summon(tools, "q", 7, set(), onto="shadow"))
@@ -152,3 +152,20 @@ def test_call_sites_ask_through_the_switch_and_risk_review_is_excluded():
     assert src.count("persona_links.reco_onto(") == 1
     assert inspect.getsource(thinking).count("persona_links.reco_onto(tools)") == 1
     assert inspect.getsource(app.deliberate_experts).count("_pl.reco_onto(tools)") == 1
+
+
+def test_shadow_record_carries_the_verdict_candidate_and_entity_count():
+    """추천 응답의 온톨로지 통계에 판정 후보가 있으면 그림자 줄에 함께 적는다 — 그 판정의 정밀도를 재는 재료다(EO-12). 모르는 낱말 · 꼴이
+    틀린 통계는 적지 않는다. 통계를 안 주면 줄이 종전 그대로다."""
+    rows = _REPLY["agents"]
+    base = persona_links.shadow_onto("delib", rows, 1)
+    assert "verdict" not in base and "entities" not in base
+    got = persona_links.shadow_onto("delib", rows, 1, {"mode": "shadow", "entities": 2, "agents": 0, "applied": False, "verdict": "no_owner"})
+    assert (got["verdict"], got["entities"]) == ("no_owner", 2)
+    assert {k: v for k, v in got.items() if k not in ("verdict", "entities")} == base, "나머지 칸은 그대로다"
+    core = persona_links.shadow_onto("think", rows, 1, {"entities": 1, "verdict": "core_question"})
+    assert core["verdict"] == "core_question"
+    for stats in ({"entities": 1, "verdict": None}, {"entities": "x", "verdict": "모르는 낱말"}, {"verdict": ["no_owner"]}):
+        rec = persona_links.shadow_onto("delib", rows, 1, stats)
+        assert "verdict" not in rec and isinstance(rec["entities"], int), stats
+    assert "verdict" not in persona_links.shadow_onto("delib", rows, 1, "글") and "entities" not in persona_links.shadow_onto("delib", rows, 1, "글")

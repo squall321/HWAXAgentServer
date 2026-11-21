@@ -5514,7 +5514,8 @@ async def _rank_keys(tools: dict, q: str, top_k: int | None = None, why: dict | 
     else:
         items = []
     if onto == "shadow":
-        persona_links.shadow_onto("delib", items, N_PERSONAS)       # 적기만 한다 — 순위는 도구가 준 그대로다
+        persona_links.shadow_onto("delib", items, N_PERSONAS,       # 적기만 한다 — 순위는 도구가 준 그대로다
+                                  recd.get("onto") if isinstance(recd, dict) else None)
     out = []
     for it in (items if isinstance(items, list) else []):
         it = _first_dict(it)
