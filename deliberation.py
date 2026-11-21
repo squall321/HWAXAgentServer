@@ -8899,8 +8899,9 @@ async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
     if note:
         body += f"\n\n[사용자가 직접 끌어낸 결론] {note}"
     try:
-        from app import _agent_for  # noqa: PLC0415 — 순환 import 회피(모듈 로드 시점 아님)
-        agent = await _agent_for(app, groups, user=user, user_pat=user_pat)
+        # 도구를 묶지 않는다(app._plain_agent) — 이 호출은 챗 턴 밖이라 확인 카드가 서지 않는다. 종전엔 챗 도구 전부를 묶은 에이전트였다.
+        from app import _plain_agent  # noqa: PLC0415 — 순환 import 회피(모듈 로드 시점 아님)
+        agent = _plain_agent(app)
         out = await agent.ainvoke({"messages": [("user", _TIDY_PROMPT + body)]})
         msgs = out.get("messages") or []
         return str(getattr(msgs[-1], "content", "") if msgs else "").strip()

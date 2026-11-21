@@ -4865,6 +4865,16 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
     raise last
 
 
+def _plain_agent(app: FastAPI):
+    """도구를 하나도 묶지 않은 챗 모델 — 글만 다시 쓰는 일(`/보고서 정리`)에 쓴다.
+
+    챗 턴 밖에서는 확인 카드가 서지 않는다(_turn_confirm 이 없다). 거기서 챗 도구를 묶은 에이전트(_agent_for)를 돌리면 G5(확인 카드) ·
+    G2b(REST 다리 쓰기) · G2c(절차 실행 시작)가 모두 서지 않아, 모델이 대화 이력의 글에 끌려 잡 · 쓰기 도구를 부르면 그대로 나간다
+    (반대 검토 2026-11-22 — 정리 프롬프트에는 대화 이력 전문이 실린다). 정리는 대화에 나온 것만으로 쓰는 일이라 도구가 필요 없다 —
+    묶지 않는 것이 가장 단순한 닫힘이다. 창 맞춤(_loop_fit_prompt)과 챗 전용 모델(넘김 포함)은 _agent_for 와 같다."""
+    return create_react_agent(_chat_llm_of(app), [], prompt=_loop_fit_prompt)
+
+
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
                      query: str = "", sources: list[str] | None = None, user: str = "",
                      user_pat: str = "", first: list[str] | None = None,
