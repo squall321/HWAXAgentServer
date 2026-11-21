@@ -103,6 +103,17 @@ def _no_preset_overlay(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_ra_formats(monkeypatch, tmp_path):
+    """RA 템플릿 박스 파일(형제 포털 리포 infra/ra-formats.local.json) 격리 — 기본은 '없음'(종전 'deliberation' v1)이다. 안 걸면 등록을 마친
+    박스에서 시험을 돌릴 때 초안 인자의 템플릿 id 가 달라져 종전 인자를 단언하는 시험이 박스마다 갈린다. 파일을 보는 시험은 ra_formats.PATH 를
+    다시 건다(tests/test_ra_formats.py)."""
+    import ra_formats as _rf
+
+    monkeypatch.setattr(_rf, "PATH", tmp_path / "no-ra-formats.local.json")
+    monkeypatch.setattr(_rf, "_STATE", {"key": "아직 읽지 않음", "map": {}, "error": None})
+
+
+@pytest.fixture(autouse=True)
 def _no_confirm_lists(monkeypatch, tmp_path):
     """확인 관문의 운영자 정의(형제 포털 리포 infra/personas/he-team.json) 격리 — 기본은 '없음'(잡 시작 바닥 목록만)이다. 목록을 보는 시험은 본문에서
     app.CONFIRM_LISTS_PATH 를 다시 건다(tests/test_confirm_gate.py). 안 걸면 포털 리포의 목록이 관문 판정을 바꾸고, 읽은 목록 · 카드 저장분은 모듈
