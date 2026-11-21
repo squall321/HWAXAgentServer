@@ -4216,8 +4216,12 @@ def insight_card(*, stage: str, decision: str, summary: str, plain: str, tally: 
         flags.add("summary")
     if images:
         flags.add("images")
+    # 도구 이름은 표지 상한(_INSIGHT_CALLS_MAX)과 상관없이 전부다 — 표지가 끊겨도 이름은 남아야 그 앱의 plat 토큰이 범위에 붙고, 앞선
+    # 인사이트(insight_*)를 근거로 쓴 카드가 그렇게 읽힌다(contracts §1 · PLAN §6.2 최소 범위).
+    named = ({x[2] for x in pool or () if isinstance(x, (list, tuple)) and len(x) >= 5}
+             | {e.get("tool") for e in evidence or () if isinstance(e, dict)} | set(pre_tools or ()))
     tools = sorted({c["tool"] for c in calls}
-                   | {str(t).strip() for t in (pre_tools or ()) if str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
+                   | {str(t).strip() for t in named if t and str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
     apps = sorted({amap[t] for t in tools if amap.get(t)})
     for c in calls:
         c["app"] = amap.get(c["tool"]) or None

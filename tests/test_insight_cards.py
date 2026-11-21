@@ -129,6 +129,20 @@ def test_되살린_단의_지정_도구_표지는_재개_자료에서_다시_싣
     assert [x["tool"] for x in _card(pre_calls=pre)["calls"]].count("get_spec") == 1, "이번 실행에도 있으면 하나다"
 
 
+def test_근거_도구_이름은_표지_상한을_넘어도_전부_싣는다():
+    """표지(calls)는 상한(_INSIGHT_CALLS_MAX)에서 앞부터 끊긴다(좌석 자유 조회 → 호출자 근거 → 지정 도구). 도구 이름(tools)까지 따라 끊기면 뒤에 선
+    호출자 근거의 도구가 카드에서 사라진다 — 그 앱의 plat 토큰이 범위에 안 붙고, 앞선 인사이트(insight_*)를 근거로 쓴 카드가 그렇지 않은 카드로
+    읽힌다(HWAXPortal docs/project-insight-graph contracts §1 'tools — 이 단의 근거에 든 도구 이름 전부' · PLAN §6.2 최소 범위)."""
+    n = d._INSIGHT_CALLS_MAX
+    pool = [(1, "s", f"tool_{i}", "{}", f"r{i}") for i in range(n + 5)]
+    c = _card(pool=pool, evidence=[{"tool": "insight_get", "args": '{"id": "ins:web:c:r:default"}', "result": "앞선 인사이트"}],
+              designated=[], pre_tools=[], amap={"insight_get": "_gateway"})
+    assert len(c["calls"]) == n and "insight_get" not in {x["tool"] for x in c["calls"]}, "시험 전제 — 표지는 상한에서 끊긴다"
+    assert "insight_get" in c["tools"] and f"tool_{n + 4}" in c["tools"], "도구 이름은 전부 남는다"
+    assert c["apps"] == ["_gateway"] and f"tool_{n + 4}" in c["apps_unknown"]
+    assert "vision_transcribe" not in _card()["tools"], "판독문은 여전히 도구가 아니다"
+
+
 def test_인자는_엔진의_인자_표기_상한까지다():
     c = _card(pool=[(1, "s", "find_part", "가" * 5000, "x")], evidence=[], designated=[])
     assert len(c["calls"][0]["args"]) == d._EVID_ARGS_MAX
