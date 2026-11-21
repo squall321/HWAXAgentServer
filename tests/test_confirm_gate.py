@@ -245,7 +245,7 @@ def test_A9_목록_파일이_없으면_바닥_목록만_돈다(turn_ctx, monkeyp
     assert _run(_gw("insert_block", reached), {"doc_id": "D1"}) == "gateway called insert_block", "운영자 정의가 없으면 쓰기 목록도 없다"
     assert [c["kind"] for c in ctx.pending] == ["job", "job", "job"]
     lists = a._confirm_health()["lists"]
-    assert lists["loaded"] is False and lists["error"] == "없음" and lists["jobs"] == len(a._CONFIRM_JOB_TOOLS) == 25
+    assert lists["loaded"] is False and lists["error"] == "없음" and lists["jobs"] == len(a._CONFIRM_JOB_TOOLS) == 26
     assert (lists["writes"], lists["confirm"]) == (0, 0)
 
 
@@ -885,7 +885,7 @@ def test_health_에_confirm_gate_가_실린다(gate, monkeypatch, tmp_path):
     # overlay — 박스 덧씌우기(포털 docs/he-team-overlay)가 없는 꼴: 지문은 운영자 정의의 지문이다
     no_ov = {"state": "none", "error": None, "changed": [], "added": [], "removed": [], "missing": [],
              "fingerprint": a._json_fp(json.loads(gate.read_text(encoding="utf-8")))}
-    assert h == {"on": True, "lists": {"loaded": True, "error": None, "jobs": 25, "writes": len(a._confirm_lists()["writes"]),
+    assert h == {"on": True, "lists": {"loaded": True, "error": None, "jobs": 26, "writes": len(a._confirm_lists()["writes"]),
                                        "confirm": len(a._confirm_lists()["confirm"]), "overlay": no_ov},
                  "pending": 1, "counts": {"cards": 1, "held_calls": 1, "approved": 0, "executed": 0, "declined": 0,
                                           "unknown_reply": 0, "ordered": 0}}

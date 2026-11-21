@@ -2543,7 +2543,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     async def capped(*a, _hwax_rc: RunnableConfig = _NO_RC, **kw):
         # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
         # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G2b 챗 턴 밖 REST 다리 쓰기 거부 →
-        # G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
+        # G2c 챗 턴 밖 절차 실행 시작 거부 → G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
         # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
@@ -2597,6 +2597,19 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                     msg = (f"{_TOOL_FAIL_MARK} 도구 {_tn} 호출 실패: REST 다리 쓰기(rest_call {_rw}) — 사람의 확인 카드가 서지 않는 곳"
                            "(심의 · 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다. 조회(GET · HEAD)만 보낸다. 쓰기는 사람이 "
                            "챗에서 확인 카드로 승인한다. 인자 문제가 아니다 — 쓰기 메서드로 다시 부르지 마라")
+                    return _refuse(tool, msg)
+        # ── G2c 절차 실행 시작(HWAXPortal docs/procedures W-116) — 같은 자리다. 게이트웨이의 procedure_run_start 는 그 사람 이름으로 포털 절차(도구
+        # 연쇄)를 돌린다. 챗 턴이면 G5 가 잡 부류로 확인 카드를 세우지만, 챗 턴 밖(심의의 지정 도구 · 좌석 자유 조회 · 외부 응답자의 CALL 줄 ·
+        # 띵킹 · 카드 대조)에는 카드가 없어 좌석 · 계획자가 사람이 고르지 않은 연쇄를 돌린다 — 보내지 않는다(invoke_tool 의 안쪽도, 계획 모드도).
+        # 목록 · 계약 · 상태는 읽기라 그대로 간다.
+        if not chat and _turn_confirm.get() is None:
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _target = _args.get("name") if _via_inv else getattr(tool, "name", "")
+                if _named(_target, _PROCEDURE_START):
+                    print(f"[gate] {str(_target)[:80]} 차단 — 챗 턴 밖이라 확인 카드가 서지 않는다(절차 실행 시작)")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {str(_target)[:80]} 호출 실패: 절차 실행 시작(procedure_run_start) — 사람의 확인 카드가 서지 "
+                           "않는 곳(심의 · 띵킹 · 카드 대조)에서는 절차를 시작하지 않는다. 절차는 사람이 챗이나 포털 절차 화면에서 시작한다. "
+                           "목록 · 계약 · 상태(procedure_list · procedure_get · procedure_run_status)는 읽을 수 있다. 인자 문제가 아니다 — 다시 부르지 마라")
                     return _refuse(tool, msg)
         # ── G3 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
@@ -3927,7 +3940,12 @@ _CONFIRM_JOB_TOOLS = (
     "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job",
     # StepForge 의 다섯째 잡 넣기 — 덱(.k)에서 STEP 을 짓는 deck_step 잡을 단일 러너에 넣고 run(기본 detect)까지 이어 건다(StepForge b2c70f1
     # app/mcp_server.py — jobs.enqueue 를 부르는 다섯 곳). 운영자 정의에도 게이트웨이 write 표지에도 없어 어떤 말에서도 카드 없이 나갔다(반대 검토 2차).
-    "extract_surface_to_cad")
+    "extract_surface_to_cad",
+    # 포털 절차의 실행 시작(게이트웨이 로컬 도구 — HWAXPortal docs/procedures W-116). 그 사람 이름으로 도구 연쇄를 돌린다. 계획 모드가 기본이지만
+    # 이름으로 선다 — 인자로 가르면 모드를 못 읽은 호출이 새고, 계획 실행도 실행 원장에 쓴다. 챗 턴 밖에서는 아예 보내지 않는다(_PROCEDURE_START · G2c).
+    "procedure_run_start")
+# 절차 실행 시작 — 사람의 확인 카드가 서지 않는 곳(챗 턴 밖)에서는 보내지 않는다(capped 의 G2c). 이름 규칙은 위와 같다(_named).
+_PROCEDURE_START = ("procedure_run_start",)
 # '이번 말이 시켰다' 판정 — 주문 동사 · 질문 · 부정. 질문 · 부정은 주문을 지운다(어긋나면 카드 쪽으로 간다 — 엄한 쪽이 틀려도 카드가 하나 더 뜰 뿐이다).
 _ORDER_RE = re.compile(
     r"(?:실행|재실행|제출|시작|변환|등록|생성|저장|업로드|추가|수정|변경|삭제|취소|적용|반입|게시)\s*(?:을|를)?\s*"

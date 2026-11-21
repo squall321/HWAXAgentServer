@@ -84,12 +84,12 @@ DROP = {"kind": "measure", "params": {"tool": "drop_check"}}
 FINAL = "잡을 걸었습니다 J-1"
 HELD = "[확인 대기]"
 # 설계 2.2 의 바닥 목록(24개) + StepForge 의 다섯째 잡 넣기 extract_surface_to_cad(반대 검토 2차 — deck_step 잡을 단일 러너에 넣는다) — 운영자
-# 목록 파일이 없어도 막힌다
+# 목록 파일이 없어도 막힌다. 끝의 procedure_run_start 는 포털 절차의 실행 시작(게이트웨이 로컬 도구 — HWAXPortal docs/procedures W-116, 11-22)
 _FLOOR = ("run_job", "run_checklist", "run_analysis", "run_compare", "run_curvature", "docforge_convert",
           "submit_job", "slurm_submit_job", "smarttwin_submit", "submit_lsdyna_job", "fullangle_drop_simulation",
           "single_drop_simulation", "job_rerun", "catalog_run", "recipe_run", "run_recipe", "run_operation",
           "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job",
-          "extract_surface_to_cad")
+          "extract_surface_to_cad", "procedure_run_start")
 # StepForge 도구 → 앱 — 작업량 묻기는 앱이 heax-step_forge 이거나 접두가 heaxstep_forge_ 인 run_job 에만 선다(설계 6절 (가))
 _SF_MAP = {n: "heax-step_forge" for n in ("run_job", "heaxstep_forge_run_job", "estimate_cost", "heaxstep_forge_estimate_cost",
                                             "list_projects", "heaxstep_forge_job_status")}
