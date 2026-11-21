@@ -107,4 +107,27 @@ def test_절차_도구는_좌석_자유_조회_후보에_들지_않는다():
     for name in ("procedure_list", "procedure_get", "procedure_run_start", "procedure_run_status"):
         assert d._free_tool_ok(name) is False, f"{name} — 심의 · 리스크 심사 좌석의 자유 조회에 저절로 열린다"
         assert not name.startswith(d._FREE_ALLOW)
-    assert d._risk_designated_refusal("procedure_run_start") == "", "리스크 심사의 지정 도구 거절 갈래가 아니다 — 챗 턴 밖 관문(G2c)이 막는다"
+
+
+_PROC = ("procedure_list", "procedure_get", "procedure_run_start", "procedure_run_status")
+
+
+def test_절차_도구는_리스크_심사의_지정_도구로도_닫힌다():
+    """절차 실행의 단계 결과에는 어떤 도구의 답이든 실린다(등록부 · 앞 패널 기록 · RA 보고서 · 과제 인사이트) — procedure_run_status(step=…) 로
+    그대로 읽으면 D-18 의 이름 거절을 전부 비켜 간다. 범용 실행기(proxy)와 같은 까닭으로 넷 다 닫는다(사용자 결정 11-21 「지정 도구 좁히기」)."""
+    for name in _PROC:
+        assert d._risk_designated_refusal(name) == "procedure", name
+    assert "procedure" in d._RISK_DESIGNATED_REFUSE and "단계 결과" in d._RISK_DESIGNATED_REFUSE["procedure"]
+    # 다른 게이트웨이 자체 도구 · 이름에 procedure 가 든 다른 앱의 도구는 이 갈래가 아니다
+    assert d._risk_designated_refusal("search_tools") == "" and d._risk_designated_refusal("get_procedure_doc") == ""
+
+
+def test_리스크_심사는_절차_도구를_지정해도_부르지_않고_다른_심의는_읽기_셋을_부른다(monkeypatch):
+    from test_risk_registry_closed import _designate, _refused
+
+    reads = ("procedure_list", "procedure_get", "procedure_run_status")
+    runs, tools = _designate(monkeypatch, "risk-review", reads)
+    assert not [n for n in reads if tools[n].calls]
+    _refused(runs, reads)
+    _runs, tools = _designate(monkeypatch, "default", reads)
+    assert all(tools[n].calls for n in reads), {n: tools[n].calls for n in reads}

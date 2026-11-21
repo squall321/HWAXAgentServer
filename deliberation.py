@@ -1028,6 +1028,11 @@ _RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_re
 # 내주므로 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 11-02 'D-18 범위 그대로 · 새 길을 열지 않는다' — 지정 도구 · 자유 조회 ·
 # CALL 줄). 이름을 insight_ 로 시작해 자유 조회 접두(_FREE_ALLOW)에 걸리지 않게 했고, 리스크 심사에서는 접두와 상관없이 이 머리로 한 번 더 뺀다.
 _INSIGHT_TOOL_HEAD = "insight_"
+# 절차 도구(게이트웨이 procedure_list · procedure_get · procedure_run_start · procedure_run_status — HWAXPortal docs/procedures W-116)의 이름 머리.
+# 절차 실행의 단계 결과에는 **어떤 도구의 답이든** 실릴 수 있다(등록부 · 앞 패널 기록 · RA 보고서 · 과제 인사이트 — 그 사람이 전에 돌린 절차가 읽은 것).
+# procedure_run_status(step=…) 로 그것을 그대로 읽으면 위의 이름 거절을 전부 비켜 간다 — 범용 실행기(proxy)와 같은 까닭으로 리스크 심사에는 열지
+# 않는다(사용자 결정 11-21 「손수 심사의 지정 도구 좁히기」 · 11-02 「새 길을 열지 않는다」). 다른 심의의 지정 도구로는 종전대로 읽는다.
+_PROCEDURE_TOOL_HEAD = "procedure_"
 # 호출자 근거(opts.evidence)의 도구 칸이 과제 인사이트인가 — 호출자가 적는 꼴이 여럿이다(맨 이름 · Claude Code 의 mcp__<서버>__<도구> · <앱>.<도구> ·
 # <앱>:<도구>). 이름 머리가 insight_ 인 것만 본다 — 다른 앱의 get_insight_… 같은 이름은 아니다.
 _INSIGHT_EV_TOOL_RE = re.compile(r"(?:^|__|[.:/])" + _INSIGHT_TOOL_HEAD)
@@ -1041,6 +1046,8 @@ _RISK_DESIGNATED_REFUSE = {
               f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
     "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
     "insight": "리스크 심사 좌석은 과제 인사이트(같은 과제의 앞선 심의 결론)를 보지 않는다",
+    "procedure": ("리스크 심사 좌석은 절차 실행 기록을 보지 않는다 — 실행의 단계 결과에는 어떤 도구의 답이든 실릴 수 있어(등록부 · 앞 패널 기록 · "
+                  "RA 보고서 · 과제 인사이트) 이 거절을 비켜 간다"),
 }
 
 
@@ -1062,12 +1069,15 @@ def _risk_designated_refusal(name: str) -> str:
     그대로 본다 — 맨 이름과 겹침 접두 꼴(heaxhwax_risk_<도구> · reportarchive_<도구> · hwaxdeliberation_<도구>). 맨 이름 risk_* 는
     다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱 매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 —
     틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다. 과제 인사이트 도구(insight_*)도 닫는다
-    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD)."""
+    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD). 절차 도구(procedure_*)도 닫는다 — 실행의 단계 결과로 위의 것들에
+    닿는다(_PROCEDURE_TOOL_HEAD)."""
     n = str(name or "").strip()
     if n == "invoke_tool":
         return "proxy"
     if n.startswith(_INSIGHT_TOOL_HEAD):
         return "insight"
+    if n.startswith(_PROCEDURE_TOOL_HEAD):
+        return "procedure"
     if n.removeprefix(_DELIB_APP_HEAD) in _RISK_DELIB_READ_TOOLS:
         return "delib"
     if n.startswith(_RISK_APP_HEAD):
@@ -6736,7 +6746,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY and _orig.get(n, n).lower() not in _FREE_DENY
-                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
+                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS
+                                            or n.startswith((_INSIGHT_TOOL_HEAD, _PROCEDURE_TOOL_HEAD)))) and (
                       _free_tool_ok(_orig.get(n, n))
                       or n in _conn_ok
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
