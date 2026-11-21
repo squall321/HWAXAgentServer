@@ -450,6 +450,11 @@ _CROSS_TARGETS = _env_int("DELIB_CROSS_TARGETS", 2)
 _ANCHOR = _env_int("DELIB_ANCHOR", 0)                # 3R 입장 앵커 재주입(동조 붕괴 방어)
 _CHAIR_BESTOF = _env_int("DELIB_CHAIR_BESTOF", 1)    # 의장 후보 n개→심판 선택(1=끔, temp>0 필요)
 _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라운드·페르소나] 출처 태깅
+# T7 판정 불가 허용(HWAXPortal docs/deliberation-quality plan F6 ② — 사용자 결정 2026-11-21 로 다시 엶). 켜면 수렴 라운드의 좌석이 근거가
+# 모자랄 때 '판정 불가' 와 다음에 잴 것을 낼 수 있고, 앉은 좌석의 과반이 그러면 의장이 결론부를 판정이 아니라 측정 계획으로 쓴다(그 표지는
+# 코드가 결정문 머리에 찍는다). 수렴 · 의장 프롬프트를 함께 바꾸는 손잡이라 위와 같이 하나씩 A/B 한다. 기본 0 — 꺼져 있으면 프롬프트가 종전과
+# 글자까지 같다.
+_UNDECIDED = _env_int("DELIB_UNDECIDED", 0)
 
 # 좌석 구성 손잡이 — 위 '깊이 회복 손잡이'와 달리 프롬프트 제약을 늘리지 않고 참가자 집합만
 # 바꾸므로, GLM 의 지시 추종 예산과 무관하다(단일 변수 A/B 원칙의 적용 대상이 아님).
@@ -1695,7 +1700,7 @@ def _cut_note(what: str, items: list, cap: int, item_cap: int = 0, *, unit: str 
 # 정수로 읽는 요청 손잡이 — _resolve_opts 가 읽고, 잡 원장(delib_jobs.start)이 '실제로 걸린 값' 을 적을 때
 # 같은 목록을 본다.
 _INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-             "chair_bestof", "chair_cite", "parse_retries", "rounds",
+             "chair_bestof", "chair_cite", "undecided", "parse_retries", "rounds",
              "free_tools", "tool_budget", "stop_after_round", "build_plan",
              "rounds_so_far", "save_report", "append_to_report_id", "rescreen",
              "persona_knowledge", "sealed", "wiki")
@@ -1704,7 +1709,7 @@ _INT_KEYS = ("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "an
 # 기본값(켜짐)이 말없이 남았고 오늘의 지식카드가 실렸다. 개수(rounds·tool_budget 등)는 낱말을 안 받는다.
 # sealed 는 여기 없다 — 못 읽는 값을 닫힌 쪽으로 읽어야 해서 _seal 이 먼저 0/1 로 맞춘다.
 _ONOFF_KEYS = frozenset(("evidence_prepass", "rebut_quote", "prose_first", "cross_exam", "anchor",
-                         "chair_cite", "free_tools", "stop_after_round", "build_plan", "save_report",
+                         "chair_cite", "undecided", "free_tools", "stop_after_round", "build_plan", "save_report",
                          "rescreen", "persona_knowledge", "wiki"))
 _ONOFF_WORDS = {"off": 0, "false": 0, "no": 0, "on": 1, "true": 1, "yes": 1}
 
@@ -1804,6 +1809,7 @@ def _resolve_opts(req_opts):
     o = SimpleNamespace(
         evidence_prepass=_EVIDENCE_PREPASS, rebut_quote=_REBUT_QUOTE, prose_first=_PROSE_FIRST,
         cross_exam=_CROSS_EXAM, anchor=_ANCHOR, chair_bestof=_CHAIR_BESTOF, chair_cite=_CHAIR_CITE,
+        undecided=_UNDECIDED,
         parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
@@ -3316,6 +3322,55 @@ def _item_text(x, quote_max: int = 80) -> str:
         parts = [p for p in (head.strip(), c, f"(근거: {b})" if b else "") if p]
         return " ".join(parts)
     return "; ".join(f"{k}: {v}" for k, v in x.items() if v)
+
+
+# ── T7 판정 불가 과반 → 측정 계획(DELIB_UNDECIDED) ─────────────────────────────────────────────
+# '판정 불가' 는 stance 또는 vote 의 **머리**에 올 때만 센다 — '판정 불가는 아니다' · '…라서 판정 불가였으나 지금은 A 안' 같은 글을 과반에 넣지 않는다.
+_UNDECIDED_RE = re.compile(r"^\W*(?:(?:판정|판단)\s*불가|undecided\b|cannot\s+(?:be\s+)?(?:decided?|judged?)\b)", re.IGNORECASE)
+# 계획서를 내는 틀(해석 · 시험 · 구축)은 판정문이 아니고, 리스크 심사는 제 보고서 꼴과 '판정 불가는 그대로 두라' 는 계약이 따로 있다 — 넣지 않는다.
+_UNDECIDED_TEMPLATES_OFF = frozenset({"risk-review", "sim-plan", "test-plan", "build-plan"})
+
+
+def _undecided_on(opts) -> bool:
+    return bool(getattr(opts, "undecided", 0)) and getattr(opts, "chair_template", "default") not in _UNDECIDED_TEMPLATES_OFF
+
+
+def _undecided_ask(opts) -> str:
+    """수렴 라운드의 좌석 지시에 덧붙이는 글 — 꺼져 있으면 빈 글(프롬프트가 종전과 같다)."""
+    if not _undecided_on(opts):
+        return ""
+    return (" 근거가 부족해 어느 쪽으로도 판정할 수 없으면 억지로 고르지 말고 stance 를 '판정 불가' 로 적고, next_measurement 에 "
+            "무엇을 어떻게 재면 판정할 수 있는지(대상 · 방법 · 어느 값이면 어느 쪽인지)를 적어라.")
+
+
+def _undecided_seats(last) -> list:
+    """마지막 라운드 발언 가운데 판정 불가를 밝힌 것 — stance 또는 vote 가 '판정 불가' 로 시작한다."""
+    return [o for o in (last or []) if isinstance(o, dict)
+            and any(_UNDECIDED_RE.search(str(o.get(k) or "")) for k in ("stance", "vote"))]
+
+
+def _undecided_majority(opts, last, seated: int):
+    """(판정 불가 좌석 수, 앉은 좌석 수) — 켜져 있고 **앉은 좌석**의 과반일 때만, 아니면 None. 분모는 응답자가 아니라 앉은 좌석이다 —
+    좌석 유실이 과반을 만들지 않게(집계의 분모와 같은 까닭)."""
+    if not _undecided_on(opts):
+        return None
+    n = len(_undecided_seats(last))
+    return (n, int(seated)) if seated and n * 2 > seated else None
+
+
+def _undecided_chair_note(um) -> str:
+    """의장에게 주는 전제 — 과반이 아니면(None) 빈 글. 표지 줄은 코드가 결정문 머리에 따로 찍는다(_undecided_mark)."""
+    if not um:
+        return ""
+    return (f"[판정 불가 과반 — 수렴 라운드에서 앉은 {um[1]}석 가운데 {um[0]}석이 근거 부족으로 '판정 불가' 를 밝혔다. 결론부(결정 · 권고에 "
+            "해당하는 항목)는 판정이 아니라 **측정 계획**으로 쓴다 — 무엇을 재는지 · 어떤 방법 · 도구로 재는지 · 어느 값이면 어느 쪽으로 "
+            "판정하는지 · 어느 도메인이 맡는지 · 순서. 좌석이 적은 next_measurement 를 합치고 겹치는 것은 묶어라. 판정을 지어내지 말고, "
+            "판정을 낸 소수 좌석의 입장은 소수의견으로 남겨라. 이 줄은 결정문 머리에 따로 찍힌다]\n")
+
+
+def _undecided_mark(um) -> str:
+    return (f"■ 판정 불가 과반 — 앉은 {um[1]}석 가운데 {um[0]}석이 근거 부족으로 판정하지 않았다. 이 결정문의 결론부는 판정이 아니라 "
+            "다음에 잴 것(측정 계획)이다.")
 
 
 def _norm_stance(s) -> str:
@@ -7498,8 +7553,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             return _ser(o, ("lens", "reads", "recommendation", "concerns"), primary="lens", clip=clip)
         if kind == "deepen":
             return _ser(o, ("concede", "rebut", "deepen"), primary="deepen", clip=clip)
-        return _ser(o, ("final_position", "non_negotiable", "vote", "stance"), primary="final_position",
-                    clip=clip)
+        return _ser(o, ("final_position", "non_negotiable", "vote", "stance")
+                    + (("next_measurement",) if _undecided_on(opts) else ()), primary="final_position", clip=clip)
 
     rebut_spec = ("반박(rebut)은 객체 배열 — 각 항목 {target: 상대 키, quote: 상대 발언에서 "
                   "20자 이상 그대로 복사한 문구, counter: 반박 논지, basis: 수치·표준·실패모드}. "
@@ -7627,8 +7682,10 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                 return (base + f"\n[{_dr(_pno)}라운드 전원]\n{_pt}\n" + anchor +
                         "\n직전 라운드를 반영해 최종 입장(final_position — 2~4문장)·절대 양보 못 하는 "
                         "제약(non_negotiable)·" + _vote_ask +
-                        "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라. "
-                        "JSON {final_position,non_negotiable,vote,stance,position_short} 로.")
+                        "형성된 다수 의견에 대한 당신의 스탠스(동의/조건부 동의/반대)와 최종 입장 한 줄 요약을 밝혀라."
+                        + _undecided_ask(opts) +
+                        " JSON {final_position,non_negotiable,vote,stance,position_short"
+                        + (",next_measurement" if _undecided_on(opts) else "") + "} 로.")
             required = ("final_position", "vote") if _has_choices else ("final_position",)
             validator_fn, render = None, 3
 
@@ -8151,8 +8208,14 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     _as_of_note = (f"[기준일 {_as_of} — 좌석 지식카드는 이 날까지의 카드만 실렸다('{_AS_OF_UNDATED}' 카드는 날짜가 없어 그 날 뒤에 "
                    "쓰였을 수 있다). 이 줄은 결정문 머리에 셈과 함께 따로 찍힌다. 그런 카드에만 기댄 판단이 있으면 그렇다고 적어라]\n"
                    if _as_of else "")
+    # T7 — 앉은 좌석의 과반이 '판정 불가' 면 결론부를 측정 계획으로(DELIB_UNDECIDED — 꺼져 있으면 None 이고 아래 글이 비어 종전과 같다).
+    _um = _undecided_majority(opts, last_list, len(personas))
+    if _um and _rdec is None:           # 결정문을 되살렸으면(S3) 이 알림은 의장을 부르기 전에 이미 원장에 실렸다
+        yield _sse("warning", {"code": "undecided_majority", "message": (
+            f"수렴 라운드에서 앉은 {_um[1]}석 가운데 {_um[0]}석이 근거 부족으로 '판정 불가' 를 밝혔다 — 결정문의 결론부는 판정이 아니라 "
+            "측정 계획으로 쓴다.")})
     chair_tail = (
-        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}{_as_of_note}"
+        f"[{seat_note}]\n[{ev_note}]\n{_loss_note}{_seal_note}{_as_of_note}{_undecided_chair_note(_um)}"
         f"## {doc_title} — 맨 위에 위 [근거 프로파일] 줄을 그대로 한 줄로 옮겨 적고, "
         + ("제목 앞에 [가설 단계] 를 붙이고 첫 문단에 '본 결정은 측정이 아니라 관측 패턴 추론이다'를 "
            "명시하라. " if ev_count["tool"] == 0 else "") +
@@ -8332,6 +8395,9 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
     if _summary:
         decision = f"■ 핵심 요약\n{_summary}\n\n{decision}"
     # 기준일 줄도 코드가 찍는다(아래 봉인 표지와 같은 까닭) — 봉인 줄 아래에 온다. 셈은 사전 검색 · 자유 조회에서 모은 것이다.
+    # 판정 불가 과반 표지도 코드가 찍는다(같은 까닭 — 의장이 빠뜨리면 판정을 낸 결정문과 똑같이 생긴다).
+    if _um:
+        decision = f"{_undecided_mark(_um)}\n\n{decision}"
     if _as_of:
         decision = f"■ 기준일 — {_as_of_line(_as_of, _ao_pre, _ao_free, _ao_des)}\n\n{decision}"
     # 봉인 표식은 **코드가** 찍는다 — 의장에게 적으라고만 하면, 빠뜨린 결정문이 봉인 없이 돈 것과
