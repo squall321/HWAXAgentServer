@@ -197,3 +197,14 @@ def test_인자_설명을_더해도_필수_인자와_기본값은_그대로다()
     assert s["deliberate_start"]["properties"]["job"]["default"] == "default"
     assert s["deliberate_start"]["properties"]["save_report"]["default"] is True
     assert s["deliberate_transcript"]["properties"]["limit"]["default"] == 40
+
+
+def test_앞선_과제_인사이트를_근거로_넘기는_법이_설명에_있다():
+    """M3 다시 쓰기(HWAXPortal docs/project-insight-graph PLAN §7.1) — MCP 는 엔진이 포털을 사람 대신 읽지 않고 호출자가 insight_find 결과를
+    evidence 로 넘긴다(PG-8). 그 꼴(카드마다 한 항목 · tool=insight_get · args 의 id) · 넘겨도 되는 범위(소속 · 조직 — plat 이 붙은 카드와 초안은
+    아니다) · 같은 (과제, 차수)만 · 리스크 심사에는 엔진이 뺀다는 것을 클라이언트가 받는 글이 말한다. 도구 이름 머리는 엔진의 거름과 같다."""
+    desc = _listed("deliberate_start")
+    for want in ("insight_find", "insight_get", "검증 대상, 독립 근거 아님", "plat:", "같은 (과제, 차수)", "evidence_omitted"):
+        assert want in desc, f"{want!r} 이 설명에 없다"
+    assert "리스크 심사" in desc and "뺀다" in desc
+    assert "insight_get".startswith(d._INSIGHT_TOOL_HEAD) and d._insight_evidence_tool("insight_get")
