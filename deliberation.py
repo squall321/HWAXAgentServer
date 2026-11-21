@@ -455,6 +455,9 @@ _CHAIR_CITE = _env_int("DELIB_CHAIR_CITE", 0)        # 의장 결정문에 [라�
 # 코드가 결정문 머리에 찍는다). 수렴 · 의장 프롬프트를 함께 바꾸는 손잡이라 위와 같이 하나씩 A/B 한다. 기본 0 — 꺼져 있으면 프롬프트가 종전과
 # 글자까지 같다.
 _UNDECIDED = _env_int("DELIB_UNDECIDED", 0)
+# T4 생각 강도 — 요청(delib_opts.reasoning_effort · MCP advanced)이 주면 그 심의만 그 강도로 돈다. 서버 값(DELIB_REASONING_EFFORT)은 그대로다.
+# 종전엔 서버 환경 하나뿐이라 A/B 를 하려면 서버를 둘 띄워야 했다. 받는 낱말은 서버가 chat_template_kwargs 로 넘기는 것과 같다.
+_EFFORTS = ("low", "medium", "high", "xhigh")
 
 # 좌석 구성 손잡이 — 위 '깊이 회복 손잡이'와 달리 프롬프트 제약을 늘리지 않고 참가자 집합만
 # 바꾸므로, GLM 의 지시 추종 예산과 무관하다(단일 변수 A/B 원칙의 적용 대상이 아님).
@@ -1810,7 +1813,7 @@ def _resolve_opts(req_opts):
         evidence_prepass=_EVIDENCE_PREPASS, rebut_quote=_REBUT_QUOTE, prose_first=_PROSE_FIRST,
         cross_exam=_CROSS_EXAM, anchor=_ANCHOR, chair_bestof=_CHAIR_BESTOF, chair_cite=_CHAIR_CITE,
         undecided=_UNDECIDED,
-        parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None,
+        parse_retries=_PARSE_RETRIES, rounds=3, timeout_s=None, reasoning_effort=None,
         # 이어하기(사람 개입 스티어링) — 사람 의견 주입 + 이전 심의 요약 + 전문가 재사용(발굴 생략)
         human_note="", continue_summary="", continue_personas=[],
         # 사람 의견이 상한(HUMAN_NOTE_MAX)에서 잘렸으면 (원문 길이, 실은 글) — 스트림이 카드로 알린다.
@@ -1939,6 +1942,13 @@ def _resolve_opts(req_opts):
                 o.timeout_s = float(ts)
             except (ValueError, TypeError):
                 o.req_unread["timeout_s"] = f"timeout_s={_delib_preview(ts, 40)}(대신 서버 기본값으로 돈다)"
+        _eff = req_opts.get("reasoning_effort")
+        if _eff is not None and _eff != "":
+            if isinstance(_eff, str) and _eff.strip().lower() in _EFFORTS:
+                o.reasoning_effort = _eff.strip().lower()
+            else:
+                o.req_unread["reasoning_effort"] = (f"reasoning_effort={_delib_preview(_eff, 40)}(대신 서버 기본값으로 돈다 — "
+                                                    f"{'|'.join(_EFFORTS)})")
         _voc = req_opts.get("voc")
         vm = str("" if _voc is None else _voc).strip().lower()
         if vm in ("auto", "off", "always"):
@@ -6481,14 +6491,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             yield _sse("done", {}); return
     # 요청 단위 타임아웃 오버라이드(웹 토글) — 기동값과 다르면 같은 파라미터로 새 인스턴스(구성만, 저렴).
     # 외부 응답자에는 걸리지 않는다(HTTP 호출이 아니다 — 한도는 EXTERNAL_LLM_WAIT_S·EXTERNAL_LLM_ANSWER_S).
-    if opts.timeout_s is not None and not _ext:
+    if (opts.timeout_s is not None or opts.reasoning_effort) and not _ext:
         cur_to = getattr(app.state, "delib_timeout_s", 0.0) or 0.0
         mk = getattr(app.state, "mk_delib_llm", None)
-        if mk and opts.timeout_s != cur_to:
+        _want_to = opts.timeout_s if opts.timeout_s is not None else cur_to
+        if mk and (_want_to != cur_to or opts.reasoning_effort):
             try:
-                llm = mk(opts.timeout_s)
+                # 생각 강도를 안 줬으면 종전 호출 꼴 그대로다(인자 하나) — 강도는 줬을 때만 넘긴다.
+                llm = mk(_want_to, opts.reasoning_effort) if opts.reasoning_effort else mk(_want_to)
             except Exception as exc:  # noqa: BLE001 — 팩토리 실패 시 기본 delib_llm 유지
-                print(f"[deliberation] timeout override failed: {exc!r}")
+                print(f"[deliberation] timeout · effort override failed: {exc!r}")
     # 요청 단위 강등 표식 초기화 — 이 태스크가 재사용되는 경우에도 이전 요청의 값이 새지 않게.
     _pat_degraded.set(None)
     # 실행 중 자격 강등 — 도구 래퍼가 이 칸을 채우면(_svc_fallback) 아래 _cred_notice 가 한 번 알린다.

@@ -126,6 +126,17 @@ def test_요청_단위_한도는_read_만_바꾸고_연결과_재시도는_그�
     assert seen == [{"connect": 7.0, "read": 7200.0, "write": 7200.0, "pool": 7200.0}], seen
 
 
+def test_요청_단위_생각_강도는_그_LLM_만_바꾸고_서버_값은_그대로다(monkeypatch):
+    """T4 — 팩토리에 강도를 주면 그 인스턴스만 그 강도로 요청을 보낸다(chat_template_kwargs). 안 주면 서버 값(DELIB_REASONING_EFFORT)이다."""
+    st = _boot(monkeypatch, DELIB_REASONING_EFFORT="medium")
+    def effort_of(llm):
+        return ((getattr(llm, "extra_body", None) or {}).get("chat_template_kwargs") or {}).get("reasoning_effort")
+    assert effort_of(st.delib_llm) == "medium"
+    assert effort_of(st.mk_delib_llm(7200.0)) == "medium", "강도를 안 주면 서버 값 그대로다"
+    assert effort_of(st.mk_delib_llm(1800.0, "high")) == "high"
+    assert effort_of(st.delib_llm) == "medium", "서버의 심의 LLM 은 바뀌지 않는다"
+
+
 @pytest.mark.parametrize("knob,which", [("DELIB_TIMEOUT_S", "delib_llm"), ("LLM_TIMEOUT_S", "llm")])
 def test_0_은_무제한이고_기동_로그가_그_손잡이를_말한다(monkeypatch, capsys, knob, which):
     """끄는 길은 남긴다(명시한 0). 다만 연결 한도는 그대로 걸리고, 기동 로그가 무엇이 꺼졌는지 말한다."""
