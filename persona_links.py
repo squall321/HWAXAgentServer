@@ -330,13 +330,33 @@ def _tool_knows(tool, arg: str) -> bool:
     return isinstance(schema, dict) and arg in (schema.get("properties") or {})
 
 
+_ONTO = {"sent": 0, "skipped": 0, "why": None}
+
+
 def reco_onto(tools: dict, *, risk: bool = False) -> str:
-    """recommend_agents 에 넘길 onto 값 — 넘기지 않을 때는 빈 글. 리스크 심사에는 넘기지 않는다(D-18 — 새 길을 열지 않는다)."""
+    """recommend_agents 에 넘길 onto 값 — 넘기지 않을 때는 빈 글. 리스크 심사에는 넘기지 않는다(D-18 — 새 길을 열지 않는다).
+
+    스위치를 켰는데 도구가 인자를 몰라 넘기지 못하면 조용히 꺼진 채 돌지 않게 까닭을 로그에 한 번 찍고 /health seat_onto 에 싣는다."""
     mode = seat_onto_mode()
     if mode == "off" or risk:
         return ""
     tool = (tools or {}).get("recommend_agents")
-    return mode if tool is not None and _tool_knows(tool, "onto") else ""
+    if tool is not None and _tool_knows(tool, "onto"):
+        _ONTO["sent"] += 1
+        _ONTO["why"] = None
+        return mode
+    why = ("recommend_agents 도구가 없다" if tool is None else
+           "recommend_agents 가 onto 인자를 모른다 — AIDataHub 와 게이트웨이를 새 판으로 받아 다시 띄운다")
+    _ONTO["skipped"] += 1
+    if _ONTO["why"] != why:
+        _ONTO["why"] = why
+        print(f"[seat-onto] SEAT_ONTO={mode} 이지만 넘기지 않는다 — {why}")
+    return ""
+
+
+def onto_health() -> dict:
+    """/health seat_onto — 스위치 값 · 넘긴 횟수 · 넘기지 못한 횟수와 그 까닭(마지막으로 넘긴 뒤에는 비운다)."""
+    return {"mode": seat_onto_mode(), "sent": _ONTO["sent"], "skipped": _ONTO["skipped"], "why": _ONTO["why"]}
 
 
 def reco_args(tools: dict, q: str, top_k: int | None = None, *, onto: str = "") -> dict:
