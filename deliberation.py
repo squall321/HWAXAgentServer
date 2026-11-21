@@ -1019,6 +1019,9 @@ _RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_re
 # 내주므로 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 11-02 'D-18 범위 그대로 · 새 길을 열지 않는다' — 지정 도구 · 자유 조회 ·
 # CALL 줄). 이름을 insight_ 로 시작해 자유 조회 접두(_FREE_ALLOW)에 걸리지 않게 했고, 리스크 심사에서는 접두와 상관없이 이 머리로 한 번 더 뺀다.
 _INSIGHT_TOOL_HEAD = "insight_"
+# 호출자 근거(opts.evidence)의 도구 칸이 과제 인사이트인가 — 호출자가 적는 꼴이 여럿이다(맨 이름 · Claude Code 의 mcp__<서버>__<도구> · <앱>.<도구> ·
+# <앱>:<도구>). 이름 머리가 insight_ 인 것만 본다 — 다른 앱의 get_insight_… 같은 이름은 아니다.
+_INSIGHT_EV_TOOL_RE = re.compile(r"(?:^|__|[.:/])" + _INSIGHT_TOOL_HEAD)
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1030,6 +1033,12 @@ _RISK_DESIGNATED_REFUSE = {
     "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
     "insight": "리스크 심사 좌석은 과제 인사이트(같은 과제의 앞선 심의 결론)를 보지 않는다",
 }
+
+
+def _insight_evidence_tool(name) -> bool:
+    """호출자 근거 항목의 도구 칸이 과제 인사이트 도구(insight_find · insight_get …)인가. 리스크 심사는 그 항목을 좌석에 주지 않는다(_resolve_opts —
+    HWAXPortal docs/project-insight-graph PLAN §7.1 의 받침, D-18 '새 길을 열지 않는다'). 글만 베껴 넣은 근거(도구 칸 없음)는 가리지 못한다."""
+    return isinstance(name, str) and bool(_INSIGHT_EV_TOOL_RE.search(name.strip().lower()))
 
 
 def _risk_designated_refusal(name: str) -> str:
@@ -1825,6 +1834,8 @@ def _resolve_opts(req_opts):
         evidence_dropped_empty=0,
         # 건수 상한(_EVID_ITEMS)을 넘겨 버린 근거 수 — 같은 이유로 센다. 41번째부터 말없이 사라졌다.
         evidence_over=0,
+        # 리스크 심사에서 뺀 과제 인사이트 근거 수(도구 칸이 insight_* 인 항목 — _insight_evidence_tool) — 스트림이 카드로 알린다.
+        evidence_insight_dropped=0,
         # 본문 후보가 둘 이상이던 항목 — [(근거 번호, 실은 키, 그 길이, [(뺀 키, 길이)])]. 실리는 것은 맨 앞
         # 키 하나라 나머지는 좌석에 안 간다. 스트림이 카드로 알린다.
         evidence_shadowed=[],
@@ -2081,7 +2092,13 @@ def _resolve_opts(req_opts):
             _bad_keys: list = []      # 형식 밖이라 버린 근거 키 — 표지에 못 찍는다(호출자가 제 원장과 못 맞춘다)
             # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
             # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
+            # 리스크 심사는 과제 인사이트(같은 과제의 앞선 심의 결론)를 호출자 근거로도 받지 않는다(D-18 — 도구 · 자유 조회 · CALL 줄은 따로 닫혀 있다).
+            # 의장 틀은 위에서 이미 읽었다. 포털은 리스크 심사에 깔지 않는다 — 여기는 그 받침이고 MCP 호출자가 넘긴 것도 걸린다.
+            _no_insight = o.chair_template == "risk-review"
             for it in ev:
+                if _no_insight and isinstance(it, dict) and _insight_evidence_tool(it.get("tool")):
+                    o.evidence_insight_dropped += 1
+                    continue
                 _cands = _ev_bodies(it) if isinstance(it, dict) else []
                 if not _cands:
                     o.evidence_dropped_empty += 1
@@ -7422,6 +7439,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                        for _n, _k, _ln, _rest in _shadow[:3])
                           + (f" 외 {len(_shadow) - 3}건" if len(_shadow) > 3 else "")
                           + f". 본문은 'result' 하나에 넣는다(찾는 순서 {'·'.join(_EVID_BODY_KEYS)}).")
+    if opts.evidence_insight_dropped and _pre is None:
+        # 글은 싣지 않는다 — 뺀 수와 까닭만(이 카드는 잡 원장 evidence_omitted 에도 남는다).
+        yield _delib("evidence", source="과제 인사이트 근거 거름", included=False,
+                     text=f"호출자 근거 가운데 과제 인사이트(insight_find · insight_get) {opts.evidence_insight_dropped}건을 좌석에 주지 "
+                          "않았다 — 리스크 심사 좌석은 같은 과제의 앞선 심의 결론을 보지 않는다(D-18).")
     if opts.evidence_over and _pre is None:
         yield _delib("evidence", source="사전 근거 건수 초과", included=False,
                      text=f"본문이 있는 근거 {_ev_valid}건 중 뒤쪽 {opts.evidence_over}건은 건수 상한"
