@@ -341,3 +341,8 @@ def test_조사가_바로_붙은_그림_주소도_찾는다():
     assert found("/agent/artifacts/a.png") == ["/agent/artifacts/a.png"] and found("(/agent/artifacts/a.PNG)") == ["/agent/artifacts/a.PNG"]
     assert found("/agent/artifacts/a.pngx /agent/artifacts/b.png_old /agent/artifacts/c.png2") == [], "이름이 이어지면 그림이 아니다"
     assert vision.IMG_URL_RE.fullmatch("/agent/artifacts/a.png") and not vision.IMG_URL_RE.fullmatch("/agent/artifacts/a.png에")
+    # 확장자가 겹친 이름은 끝까지 읽는다 — 게으른 반복이면 'shot.jpg.png' 를 'shot.jpg' 에서 끊어 없는 파일을 가리켰다(반대 검토 11-22).
+    assert found("그림 /agent/artifacts/shot.jpg.png과 /ai-data-hub/attachments/rec/7/scan.png.jpeg를 본다") == [
+        "/agent/artifacts/shot.jpg.png", "/ai-data-hub/attachments/rec/7/scan.png.jpeg"]
+    assert found("/agent/artifacts/a.png, /agent/artifacts/b.png.") == ["/agent/artifacts/a.png", "/agent/artifacts/b.png"]
+    assert found("/agent/artifacts/a.pngx /agent/artifacts/b.png_old") == [], "뒤에 낱말 글자가 붙은 것은 그림 주소가 아니다"

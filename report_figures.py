@@ -33,17 +33,22 @@ FIGURES_MAX = 40          # 한 보고서의 그림 칸 — RA 한 쪽 블록 �
 UPLOAD_TIMEOUT = httpx.Timeout(330.0, connect=10.0)
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
          "svg": "image/svg+xml"}
-# 이름 끝은 영숫자 · _ 가 아니면 된다 — \b 는 한글을 낱말 글자로 봐서 '…png에' 를 놓쳤다(반대 검토 F1).
-_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}?\.(?:png|jpe?g|gif|webp|svg)(?![A-Za-z0-9_])"
+# 이름 끝은 영숫자 · _ 가 아니면 된다 — \b 는 한글을 낱말 글자로 봐서 '…png에' 를 놓쳤다(반대 검토 F1). 이름은 탐욕으로 읽는다 —
+# 게으르면 'shot.jpg.png' 를 'shot.jpg' 에서 끊어 없는 파일을 찾는다(vision.IMG_URL_RE 와 같다).
+_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\.(?:png|jpe?g|gif|webp|svg)(?![A-Za-z0-9_])"
 # 그림의 자리 둘 — 에이전트가 저장한 도구 그림 · AIDataHub 첨부(래스터만 — RA 는 SVG 를 그림으로 받지 않는다).
 _ART_HEAD, _ATT_HEAD = "/agent/artifacts/", "/ai-data-hub/attachments/"
 _PATH = (r"(" + re.escape(_ART_HEAD) + _NAME + r"|" + re.escape(_ATT_HEAD)
-         + r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}?\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9_]))")
+         + r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9_]))")
 # 마크다운 그림(1: 설명 · 2: 주소 — 꺾쇠 <주소> · 제목 "…" 도) 또는 맨 주소(3: 주소). 앞에 붙은 절대 주소(https://포털/agent/artifacts/…)도 함께 바꾼다.
 _REF_RE = re.compile(r"!\[([^\]\n]{0,300})\]\(\s*<?\s*(?:https?://[^\s/()<>]+)?" + _PATH + r"\s*>?"
                      r"(?:\s+(?:\"[^\"\n]{0,300}\"|'[^'\n]{0,300}'))?\s*\)"
                      r"|(?:https?://[^\s/()\]<>]+)?" + _PATH, re.I)
 ATTACHMENTS = os.environ.get("REPORT_FIG_ATTACHMENTS", "1").strip() != "0"     # AIDataHub 첨부 그림도 싣는다(기본 켬 — 사용자 결정 11-22)
+# 첨부 받기가 이만큼 걸려 실패한 것이 잇달아 _ATT_SLOW_MAX 번이면 남은 첨부는 받지 않는다 — AIDataHub 가 답을 안 하면 받기 한 번이 한도(10초)를
+# 다 쓰고, 그림 40장이면 보고서 저장이 그만큼 선다. 곧바로 오는 실패(없는 첨부 404)는 세지 않는다 — 지워진 첨부 몇 장이 남은 그림을 막지 않게.
+_ATT_SLOW_S, _ATT_SLOW_MAX = 8.0, 2
+_ATT_STOPPED = "첨부 그림을 받지 않았다 — 앞의 첨부를 잇달아 제때 받지 못했다(AIDataHub 가 답하지 않는다)"
 
 
 def _vision():
@@ -57,9 +62,19 @@ def _is_art(ref: str) -> bool:
     return ref.lower().startswith(_ART_HEAD)
 
 
-def _wanted(ref: str) -> bool:
-    """이 주소를 그림 칸으로 바꿀 것인가 — 도구 그림은 늘, 첨부는 켜져 있고 경로가 위로 벗어나지 않을 때만."""
-    return _is_art(ref) or (ATTACHMENTS and ".." not in ref)
+def _ref_of(m: re.Match) -> str | None:
+    """_REF_RE 가 찾은 자리의 그림 주소(포털 상대 경로) — 그림 칸으로 바꾸지 않을 자리면 None(글자 그대로 둔다).
+    도구 그림은 늘 바꾼다. 첨부는 켜져 있고 · 머리가 글자 그대로(소문자 — 대소문자가 다른 머리는 그 길이 아니다)이고 · 경로가 위로 벗어나지 않고 ·
+    **앞에 호스트가 붙지 않은** 자리만이다. 호스트가 붙은 첨부 주소는 다른 박스 · 다른 사이트의 것일 수 있는데, 경로만 떼어 이 박스의 AIDataHub 에서
+    받으면 글이 가리킨 것과 다른 그림이 그 자리에 실린다(반대 검토). 에이전트가 도구 결과에서 보는 첨부 주소는 늘 상대 경로다(app._rewrite_local_urls)."""
+    md = m.group(2) is not None
+    ref = m.group(2) if md else m.group(3)
+    if _is_art(ref):
+        return ref
+    if not (ATTACHMENTS and ref.startswith(_ATT_HEAD) and ".." not in ref):
+        return None
+    lead = m.string[m.end(1):m.start(2)] if md else m.string[m.start(0):m.start(3)]      # 주소 앞에 붙은 것 — "](" · 꺾쇠 · 호스트
+    return None if "://" in lead else ref
 _CAPTION_MAX, _ALT_MAX = 500, 200          # RA image 위젯 files[].caption · alt 상한
 NO_PAT = "그 사람의 토큰이 없는 길(MCP 로 연 심의 등)이라 올리지 않았다 — 서비스 자격으로는 그림을 올리지 않는다"
 # 그림 하나만의 문제인 포털 답(꼴 · 크기 · 해시 · RA 가 그 파일만 거절) — 그 밖(자격 · 연결 · RA 오류)은 남은 그림도 같으니 더 부르지 않는다
@@ -78,8 +93,8 @@ def _scan(blocks: dict) -> list[tuple[str, str]]:
     out: dict[str, str] = {}
     for text in _items(blocks):
         for m in _REF_RE.finditer(text):
-            ref = m.group(2) or m.group(3)
-            if _wanted(ref) and not out.get(ref):
+            ref = _ref_of(m)
+            if ref and not out.get(ref):
                 out[ref] = (m.group(1) or "").strip()
     return list(out.items())
 
@@ -200,6 +215,7 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
     by_sha: dict[str, str] = {}     # 내용 해시 → 먼저 올린 주소(이름이 달라도 같은 그림은 칸 하나 · 한 장으로 센다)
     out = Figures(blocks=blocks, found=len(found))
     n, stop = 0, NO_PAT if not user_pat else ""
+    slow, loop = 0, asyncio.get_running_loop()      # 잇달아 느리게 실패한 첨부 받기 수(_ATT_SLOW_MAX 면 남은 첨부는 받지 않는다)
     async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT, transport=PORTAL_TRANSPORT) as cli:
         for ref, alt in found:
             name = ref.rsplit("/", 1)[-1]
@@ -223,12 +239,18 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
                         raw = f.read()
                 else:
                     # AIDataHub 첨부 — 챗의 그림 읽기와 같은 자리에서 받는다(vision.load — 8 MB 를 넘거나 없으면 None). 막는 I/O 라 스레드로 뺀다.
+                    if slow >= _ATT_SLOW_MAX:
+                        res[ref] = ("fail", _ATT_STOPPED, alt)
+                        continue
                     _v = _vision()
+                    t0 = loop.time()
                     got = await asyncio.to_thread(_v.load, ref, artifact_dir, aidh_http or "")
                     if got is None:
+                        slow = slow + 1 if loop.time() - t0 >= _ATT_SLOW_S else 0
                         res[ref] = ("fail", "첨부 그림을 받지 못했다 — AIDataHub 에 없거나 "
                                             f"{_v.MAX_BYTES // (1024 * 1024)} MB 를 넘는다", alt)
                         continue
+                    slow = 0
                     raw, up_name, up_ref = got[0], name, ref
                 sha = hashlib.sha256(raw).hexdigest()
                 if sha in by_sha:
@@ -257,8 +279,9 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
     def mark(m: re.Match) -> str:
         # 같은 정규식으로 찾은 이름이라 늘 있다. 설명은 그 그림의 것 하나(처음 나온 설명 — 캡션과 같다)라 같은 그림은 어디서나 같은 표지다.
         # 못 올린 그림도 설명을 남긴다 — 어느 그림이었는지 읽는 사람이 안다(반대 검토 F2 · F5).
-        r = res.get(m.group(2) or m.group(3))
-        if r is None:                       # 바꾸지 않기로 한 주소(첨부 그림을 끈 박스 · 위로 벗어나는 경로) — 글자 그대로 둔다
+        ref = _ref_of(m)
+        r = res.get(ref) if ref else None
+        if r is None:                       # 바꾸지 않기로 한 자리(첨부 그림을 끈 박스 · 위로 벗어나는 경로 · 호스트가 붙은 첨부) — 글자 그대로 둔다
             return m.group(0)
         if r[0] == "fail":
             return f"[그림 — 올리지 못함: {r[1]} · {r[2]}]" if r[2] else f"[그림 — 올리지 못함: {r[1]}]"
