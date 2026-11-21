@@ -326,3 +326,18 @@ def test_턴이_모르면_도구가_그림을_낸_호출에서_묻는다(monkeyp
                        ToolMessage(content="/agent/artifacts/plot3.png", tool_call_id="c")]}
     out = asyncio.run(a._loop_fit_prompt(st, {"configurable": {"hwax_vision": None}}))
     assert asked == [1] and out[-1].content[1]["type"] == "image_url"
+
+
+# ── 그림 주소 끝의 경계(HWAXPortal docs/report-figures 체크리스트 68행 · RF-13) ─────────────────────────────
+def test_조사가_바로_붙은_그림_주소도_찾는다():
+    """`\\b` 는 한글을 낱말 글자로 봐서 '…png에' · '…png를' 처럼 조사가 붙은 주소를 놓쳤다 — 모델이 그 그림을 못 읽었다. 보고서 그림 쪽
+    (report_figures._NAME)은 같은 까닭으로 이미 '뒤가 영숫자 · _ 가 아니면 된다' 로 고쳤다. 이름이 이어지는 꼴은 여전히 잡지 않는다."""
+    import vision
+
+    found = vision.IMG_URL_RE.findall
+    assert found("단면은 /agent/artifacts/sec-01.png에 있고 /agent/artifacts/atlas.jpg를 본다") == [
+        "/agent/artifacts/sec-01.png", "/agent/artifacts/atlas.jpg"]
+    assert found("카드 그림 /ai-data-hub/attachments/rec/12/fig.webp이다.") == ["/ai-data-hub/attachments/rec/12/fig.webp"]
+    assert found("/agent/artifacts/a.png") == ["/agent/artifacts/a.png"] and found("(/agent/artifacts/a.PNG)") == ["/agent/artifacts/a.PNG"]
+    assert found("/agent/artifacts/a.pngx /agent/artifacts/b.png_old /agent/artifacts/c.png2") == [], "이름이 이어지면 그림이 아니다"
+    assert vision.IMG_URL_RE.fullmatch("/agent/artifacts/a.png") and not vision.IMG_URL_RE.fullmatch("/agent/artifacts/a.png에")
