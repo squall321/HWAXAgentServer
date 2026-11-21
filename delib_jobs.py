@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import threading
 import time
@@ -2406,3 +2407,45 @@ def insight_items(since: float = 0.0, limit: int = 200) -> dict:
     page = items[:lim]
     return {"contract": INSIGHT_CONTRACT, "items": page,
             "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}
+
+
+# ── 이용 통계 — 잡의 머리(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────
+# 포털이 공유 비밀 창구(app /usage-rollup)로 날마다 읽어 간다. 셈은 usage_rollup.py 가 하고, 여기서는 원장에서 머리(목록 색인의 칸)만 모은다.
+_USAGE_MTIME_SLACK_S = 86400.0   # 잡은 생긴 뒤에만 고쳐진다 — 원장 파일 mtime 이 창의 첫날보다 하루 넘게 앞서면 그 창에 든 잡이 아니다
+_USAGE_ID_DAY = re.compile(r"-(\d{4})(\d{2})(\d{2})-\d{6}-[0-9a-f]{6}$")
+
+
+def usage_heads(since: float) -> list[dict]:
+    """since(epoch 초) 뒤에 고쳐진 잡의 머리 — 메모리의 잡이 먼저(도는 잡은 메모리가 가장 새것이다), 나머지는 원장 파일을 mtime 으로 거른 뒤
+    목록 색인으로 읽는다(_list_load — 발언 · 결정문이 든 원장 전부를 열지 않는다). 훑는 사이 사라진 파일은 건너뛴다."""
+    found: dict = dict(_JOBS)
+    try:
+        files = list(JOB_DIR.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        if f.stem in found:
+            continue
+        try:
+            if f.stat().st_mtime < since - _USAGE_MTIME_SLACK_S:
+                continue
+        except OSError:
+            continue
+        head = _list_load(f)
+        if head:
+            found[f.stem] = head
+    return list(found.values())
+
+
+def usage_first_day() -> str | None:
+    """원장에서 가장 이른 잡의 날(YYYY-MM-DD) — 잡 id 에 박힌 날짜로 읽는다(파일을 열지 않는다 · 서버 시각). 그런 id 가 없으면 None."""
+    days = []
+    try:
+        names = [f.stem for f in JOB_DIR.glob("*.json")]
+    except OSError:
+        names = []
+    for n in [*names, *_JOBS]:
+        m = _USAGE_ID_DAY.search(n)
+        if m:
+            days.append("-".join(m.groups()))
+    return min(days) if days else None

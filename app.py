@@ -9823,6 +9823,44 @@ def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
     return delib_jobs.insight_items(since, limit)
 
 
+# ── 이용 통계 창구(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────────────────
+# GET /usage-rollup?since&until · POST /usage-rollup {since, until, exclude} — MCP 심의 잡 원장을 KST 날마다 센 수(usage_rollup.py). 포털 서비스가 날마다
+# 읽어 관리자 '이용 통계' 에 접어 둔다. **공유 비밀만**(/seat-questions 와 같은 값) — 모든 사람의 잡 수(이메일 · 소속)를 내므로 사람 신원 머리
+# (x-hwax-user)를 실은 호출은 받지 않는다(403 — 끝난 묶음 창구와 같다). 읽기만 한다. 뺄 계정의 이메일을 주소에 싣지 않게 POST 본문으로도 받는다.
+def _usage_rollup_reply(request: Request, raw):
+    import usage_rollup as _ur  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "이용 통계 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다", 403)
+    if not isinstance(raw, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(raw) - set(_ur.FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    try:
+        return _ur.view(raw)
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+@app.get("/usage-rollup")
+def usage_rollup_get(request: Request, since: str | None = None, until: str | None = None):
+    return _usage_rollup_reply(request, {k: v for k, v in (("since", since), ("until", until)) if v is not None})
+
+
+@app.post("/usage-rollup")
+async def usage_rollup_post(request: Request):
+    try:
+        raw = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raw = None      # 아래에서 422 — 비밀을 먼저 본다(꼴이 틀린 본문으로 창구가 있는지 떠볼 수 없게)
+    return await asyncio.to_thread(_usage_rollup_reply, request, raw)
+
+
 class SubjectConfirmRequest(BaseModel):
     """포털이 주제를 다시 풀 때(워크플로 대화 들이기 · 기다림 줄의 주제 확인) — 그 사람의 PAT 가 반드시 있다(PLAN §4.3 · contracts §3.2)."""
     subject: dict | None = None
