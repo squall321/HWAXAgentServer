@@ -455,6 +455,16 @@ has — no new LLM call. The engine still does not see the subject; the card car
 - `POST /deliberate/subject/confirm {subject, groups, user_email, user_pat, chair_template?, started_by?}` resolves a subject
   with the M1 rule for the portal (workflow conversations, the owner's waiting queue). A person's PAT is required.
 
+### Usage roll-up (portal admin usage statistics)
+
+- `GET /usage-rollup?since=YYYY-MM-DD&until=YYYY-MM-DD` · `POST /usage-rollup {since, until, exclude?: [email]}` (gateway
+  secret only — a call carrying `x-hwax-user` gets 403) counts the MCP deliberation job ledger per KST day for the portal's
+  daily fold (HWAXPortal docs/ops-dashboard M2). `{contract: 1, jobs: [{day, kind, status, llm, n, with_report, seats, seated,
+  rounds, dur_s, dur_n}], actors: [{day, user, aff, n}], anon: [{day, n}], ledger: {first_day, scanned}, note}`. A job
+  belongs to the day it was queued or started. Read-only; it reads the list index only (`delib_jobs.usage_heads`), never the
+  question or the decision. Web-chat deliberations, routines and card review leave no durable ledger here, so they are not
+  in it — the `note` says so. An empty range defaults to the last three days; more than 400 days is refused (422).
+
 ### Card review
 
 `card_review.py` — one expert checks their own knowledge cards against one review unit (risk-review
