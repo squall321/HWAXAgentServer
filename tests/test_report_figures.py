@@ -423,7 +423,9 @@ def _aidh(monkeypatch, files: dict):
         asked.append((url, aidh_http))
         raw = files.get(url)
         return (raw, "image/" + url.rsplit(".", 1)[-1]) if raw else None
-    monkeypatch.setattr(RF.vision, "load", load)
+    import vision
+
+    monkeypatch.setattr(vision, "load", load)
     monkeypatch.setattr(app, "AIDH_HTTP", "http://aidh.test")
     return asked
 
@@ -483,3 +485,19 @@ def test_본문_밖_그림_줄은_도구_그림만_든다(figs):
     art = f"/agent/artifacts/{_name(PNG, 'png')}"
     line, refs = RF.uncited({"background": ["글"]}, [art, ATT])
     assert refs == [art] and ATT not in line
+
+
+def test_이_모듈은_머리에서_형제_모듈을_들이지_않는다():
+    """포털의 계약 시험이 이 파일을 경로로 따로 읽는다(표준 라이브러리 + httpx 만 있는 환경). 머리에서 `vision` · `app` 같은 이 리포의 모듈을
+    들이면 거기서 ModuleNotFoundError 다 — 11-22 첨부 그림을 넣으며 한 번 깨뜨렸다. 필요한 자리에서 늦게 들인다."""
+    import ast
+
+    tree = ast.parse((ROOT / "report_figures.py").read_text(encoding="utf-8"))
+    local = {p.stem for p in ROOT.glob("*.py")}
+    top = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            top.add((node.module or "").split(".")[0])
+    assert not (top & local), f"머리에서 들인 이 리포의 모듈 — {sorted(top & local)}"

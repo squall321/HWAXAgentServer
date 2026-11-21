@@ -25,8 +25,6 @@ from dataclasses import dataclass, field
 
 import httpx
 
-import vision
-
 # 포털 — 모든 박스에서 같은 자리(HWAXPortal infra/scripts/_common.sh PORTAL_PORT). 게이트웨이 주소 GATEWAY_HTTP_BASE 와 같은 꼴의 손잡이.
 PORTAL_HTTP_BASE = os.environ.get("PORTAL_HTTP_BASE", "http://127.0.0.1:8723")
 PORTAL_TRANSPORT: httpx.AsyncBaseTransport | None = None   # 시험 이음매 — None 이 아니면 포털로 가는 요청이 전부 이 전송을 탄다
@@ -46,6 +44,13 @@ _REF_RE = re.compile(r"!\[([^\]\n]{0,300})\]\(\s*<?\s*(?:https?://[^\s/()<>]+)?"
                      r"(?:\s+(?:\"[^\"\n]{0,300}\"|'[^'\n]{0,300}'))?\s*\)"
                      r"|(?:https?://[^\s/()\]<>]+)?" + _PATH, re.I)
 ATTACHMENTS = os.environ.get("REPORT_FIG_ATTACHMENTS", "1").strip() != "0"     # AIDataHub 첨부 그림도 싣는다(기본 켬 — 사용자 결정 11-22)
+
+
+def _vision():
+    """챗의 그림 읽기 모듈 — 첨부 그림이 있을 때만 들인다. 이 모듈은 형제 리포(포털)의 계약 시험이 파일 경로로 따로 읽는데(표준 라이브러리 +
+    httpx 만 있는 환경) 머리에서 들이면 거기서 깨진다(포털 tests/test_report_figures.py 의 「포털이 그대로 받는다」 시험이 잡았다)."""
+    import vision  # noqa: PLC0415
+    return vision
 
 
 def _is_art(ref: str) -> bool:
@@ -218,10 +223,11 @@ async def attach(blocks: dict, *, user_pat: str, artifact_dir: str | None = None
                         raw = f.read()
                 else:
                     # AIDataHub 첨부 — 챗의 그림 읽기와 같은 자리에서 받는다(vision.load — 8 MB 를 넘거나 없으면 None). 막는 I/O 라 스레드로 뺀다.
-                    got = await asyncio.to_thread(vision.load, ref, artifact_dir, aidh_http or "")
+                    _v = _vision()
+                    got = await asyncio.to_thread(_v.load, ref, artifact_dir, aidh_http or "")
                     if got is None:
                         res[ref] = ("fail", "첨부 그림을 받지 못했다 — AIDataHub 에 없거나 "
-                                            f"{vision.MAX_BYTES // (1024 * 1024)} MB 를 넘는다", alt)
+                                            f"{_v.MAX_BYTES // (1024 * 1024)} MB 를 넘는다", alt)
                         continue
                     raw, up_name, up_ref = got[0], name, ref
                 sha = hashlib.sha256(raw).hexdigest()
