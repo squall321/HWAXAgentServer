@@ -210,10 +210,9 @@ def test_보조로_고른_StepForge_운영자도_입구_도구로_빌려준다(m
         return _FakeAgent(sink)
 
     async def no_knowledge(*_a, **_k):
-        return ""
+        return "", ""
     monkeypatch.setattr(a, "_agent_for", fake_agent_for)
-    monkeypatch.setattr(a, "_persona_knowledge", no_knowledge)
-    a._persona_knowledge.last_note = ""
+    monkeypatch.setattr(a, "_knowledge_excerpt", no_knowledge)
     req = a.ChatRequest(message="SED 예측해줘", groups=[], pinned_agents=["he-calc-thermalshock", "he-cad-stepforge"])
 
     async def consume():

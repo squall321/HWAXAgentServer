@@ -6167,7 +6167,7 @@ async def _persona_meta(app: FastAPI, groups: list[str], agent_type: str) -> dic
         return hit[1]
     # note 는 '역할이 비었다' 의 **사유**다. 비어 있으면 '역할 문서가 원래 없다', 차 있으면
     # '못 물어봤다' — 그 둘은 다른 사실이고, 호출부가 사용자에게 갈라서 말해야 한다
-    # (지식카드 경로가 이미 _persona_knowledge.last_note 로 같은 일을 한다).
+    # (지식카드 경로가 이미 _knowledge_excerpt 의 사유로 같은 일을 한다).
     # key·name 도 담는다. 도구 점수(_seat_tool_rank)가 역할뿐 아니라 **키와 이름**의 낱말을
     # 쓰는데, 챗은 이 둘을 안 넘겨 심의와 다른 순위가 나오고 있었다 — 같은 기준을 쓴다는
     # 주장이 실제로는 절반만 참이었다(실측: pcb_warpage_surrogate 가 챗에서만 빠졌다).
@@ -6245,48 +6245,75 @@ async def _knowledge_tools(app: FastAPI, groups: list[str]) -> dict:
 _knowledge_line = knowledge_line
 
 
-async def _persona_knowledge(app: FastAPI, groups: list[str], agent_type: str, query: str) -> str:
-    """지정 전문가의 주제 연관 지식카드를 코드가 미리 조회해 발췌한다(결정적 RAG).
+async def _knowledge_excerpt(app: FastAPI, groups: list[str], agent_type: str, query: str,
+                             budget: int) -> tuple[str, str | None]:
+    """(발췌, 강등 사유) — 지정 전문가 한 명의 주제 연관 지식카드를 코드가 미리 조회해 budget(자) 안의 줄들로 잇는다(결정적 RAG).
+    사유는 ""(정상) · 글(강등 · 실패 — '없다' 가 아니라 '못 물어봤다') · None(지식 검색 도구 agent_search 를 받지 못해 묻지 않았다)이다.
 
     모델에게 'agent_search 를 써라'고 지시만 하면 안 부르면 그만이고, 사용자에게는 그 전문가가
     아는 것이 없는 것처럼 보인다. 심의 경로가 이미 같은 이유로 결정적 조회를 하고 있어
     (deliberation.DELIB_PERSONA_KNOWLEDGE) 그 형태를 따른다.
 
     캐시하지 않는다 — 질의가 발화마다 달라 적중률이 낮고, 낡은 발췌를 주면 방금 물은 것과
-    무관한 지식이 붙는다. 실패는 비치명이다(지식 없이 페르소나만으로 답한다)."""
+    무관한 지식이 붙는다. 실패는 비치명이다(지식 없이 페르소나만으로 답한다).
+
+    사유를 **돌려준다** — 종전엔 함수 속성(_persona_knowledge.last_note)에 두어 프로세스 전체가 한 칸을 나눠 썼다. 지식 검색 도구가
+    없는 턴은 그 칸을 비우지 않아 앞 턴 · 다른 사람 턴의 강등 사유가 이 턴의 경고로 나갔고, 보조 전문가를 동시에 찾으면 서로 덮었다."""
     try:
         tools = await _knowledge_tools(app, groups)
         if "agent_search" not in tools:
-            return ""
+            return "", None
         # 타임아웃·강등 판정은 공용 헬퍼에 맡긴다 — _call 은 예외를 문자열로 삼켜서
         # '지식이 없다' 와 '못 물어봤다' 가 같은 빈 결과로 보인다(그 둘은 다른 사실이다).
         hits, note = await _agent_search_hits(tools, agent_type, query)
         if note:
             print(f"[agent] 지식카드 강등({agent_type}): {note}")
-            _persona_knowledge.last_note = note   # 호출부가 사용자에게 사유를 보이게
-        else:
-            _persona_knowledge.last_note = ""
         if not hits:
-            return ""
+            return "", note
         lines, total, seen = [], 0, set()
         for h in hits:
             ln = _knowledge_line(h)
             if ln in seen:  # 같은 레코드의 유사 섹션 반복 방지
                 continue
-            if total + len(ln) > CHAT_KNOWLEDGE_BUDGET:
+            if total + len(ln) > budget:
                 break
             seen.add(ln)
             lines.append(ln)
             total += len(ln)
-        return "\n".join(lines)
+        return "\n".join(lines), note
     except Exception as exc:  # noqa: BLE001 — 지식 검색 실패는 비치명(페르소나만으로 계속)
         print(f"[agent] 지식카드 검색 실패({agent_type}): {exc!r}")
-        _persona_knowledge.last_note = f"조회 실패({type(exc).__name__})"
-        return ""
+        return "", f"조회 실패({type(exc).__name__})"
 
 
-# 직전 호출의 강등 사유. 챗 스트림이 읽어 사용자에게 보인다 — 무음 강등을 만들지 않는다.
-_persona_knowledge.last_note = ""
+# 보조 전문가(도메인)의 지식카드 — 주 전문가처럼 턴 시작에 코드가 찾아 싣는다(사용자 결정 2026-11-22 「보조의 지식카드도 근거로」,
+# HWAXPortal docs/persona-chat). 종전엔 agent_search 를 부르라는 지시뿐이라 모델이 안 부르면 보조의 지식은 안 쓰였다.
+# 0 이면 종전 그대로다(프롬프트가 종전과 바이트까지 같다).
+PERSONA_HELPER_KNOWLEDGE = os.environ.get("PERSONA_HELPER_KNOWLEDGE", "1").strip() != "0"
+# 보조 전원의 지식카드 합 몫(자) — 지식을 찾는 보조 수로 나눈다. 비우거나 음수면 창에서 정하고(_helper_knowledge_share), 0 이면 끈다.
+PERSONA_HELPER_KNOWLEDGE_BUDGET = _env_int("PERSONA_HELPER_KNOWLEDGE_BUDGET", -1)
+# 지식카드 한 줄의 최대(자) — knowledge_line 의 기본 상한 700자 + 줄임 표식 몫 32자(deliberation._KN_MARK).
+_HELPER_KB_LINE = 700 + 32
+# 지식 검색 도구를 받지 못해 묻지 않았을 때 보이는 사유(주 전문가 · 보조) — '없다' 가 아니라 '못 물어봤다' 다.
+_HELPER_KB_NO_TOOL = "지식 검색 도구(agent_search)를 받지 못함"
+
+
+def _helper_knowledge_share(n: int) -> int:
+    """보조 한 명의 지식카드 몫(자) — 0 이면 찾지 않는다(끔 · 찾을 보조 없음). n 은 지식을 찾는 보조(도메인 전문가) 수다.
+
+    합 몫을 n 으로 나눈다. 비우면 창에서 정한다 — 좁은 창(_wide() 거짓 — 약 30만 토큰 아래)은 주 전문가 몫(CHAT_KNOWLEDGE_BUDGET)의
+    **절반**, 넓은 창은 주 전문가 몫과 **같다**. 좁은 창에서는 턴 안내가 이력 · 도구 스키마 예산에서 따로 빠지지 않아(보조 역할도 같은 까닭으로
+    PERSONA_HELPER_ROLE_MAX 로 줄인다) 보조 전원이 주 전문가의 절반을 넘지 않게 한다. 주 전문가 몫을 따라가므로 그 몫을 낮춘 작은 박스
+    (dev 16K — CHAT_KNOWLEDGE_BUDGET 3,500)는 저절로 같이 낮아진다. 한 명 몫이 카드 한 줄보다 작으면 한 줄로 올린다 — 찾고도 한 줄도 못
+    실으면 '연관 없음' 으로 읽힌다."""
+    if not PERSONA_HELPER_KNOWLEDGE or n <= 0:
+        return 0
+    total = PERSONA_HELPER_KNOWLEDGE_BUDGET
+    if total < 0:
+        total = CHAT_KNOWLEDGE_BUDGET if _wide() else CHAT_KNOWLEDGE_BUDGET // 2
+    if total <= 0:
+        return 0
+    return max(total // n, _HELPER_KB_LINE)
 
 
 # 모델마다 호출 JSON 모양이 다르다. qwen/hermes 는 {"name":…,"arguments":…}, Anthropic 계열은
@@ -7591,7 +7618,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             # _sel_q(최근 히스토리 + 현재 발화) 를 쓴다 — 현재 발화만 넣으면 '그럼 더 자세히' 같은
             # 후속 질의에서 관련도가 무너지는 문제가 도구 선별에서 이미 실측됐다.
             yield _sse("status", {"step": f"{agent_key} 지식카드 검색", "tool": "agent_search"})
-            know = await _sc_raw_off(_persona_knowledge(app, req.groups, agent_key, _sel_q))
+            # 강등 사유는 이 턴의 호출 결과로 받는다 — 프로세스 전체가 나눠 쓰던 칸(last_note)을 읽으면 앞 턴 · 다른 사람 턴의 사유가 샜다.
+            know, _note = await _sc_raw_off(_knowledge_excerpt(app, req.groups, agent_key, _sel_q, CHAT_KNOWLEDGE_BUDGET))
             if know:
                 _sc_keep_raw(know)       # 모델이 본 발췌는 근거다 — 자기검증 관문이 그 수를 지우는 고침을 버린다(검색 원문은 넣지 않는다)
                 turn_notes += (f"\n\n[{agent_key} 지식카드 — 이번 질문 연관 발췌]\n{know}\n"
@@ -7602,7 +7630,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             else:
                 # '없다' 와 '못 물어봤다' 를 구분해 말한다. 검색이 늦거나 죽어서 못 받은 것을
                 # '보유 지식 없음' 으로 말하면, 그 전문가가 아는 게 없다는 거짓이 사용자에게 간다.
-                _note = getattr(_persona_knowledge, "last_note", "")
+                # 사유 None(지식 검색 도구를 받지 못함 — 권한 · 게이트웨이 목록 빔)도 '못 물어봤다' 다. '연관 없음' 으로 말하면 없다는 거짓이
+                # 된다(보조와 같은 사유 글).
+                if _note is None:
+                    _note = _HELPER_KB_NO_TOOL
                 if _note:
                     turn_notes += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
                                    f"이번 답변에는 사내 발췌가 없다. 일반 지식으로 답하되 "
@@ -7643,6 +7674,41 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                   "agent_search(\"<그 전문가 키>\", 질의) 로 직접 조회하라.\n"
                   "⚠ 관점이 실제로 갈리면 숨기지 마라 — 답 끝에 '이견: <무엇이 갈리는지>' 한 줄을 붙이고, "
                   "판단이 갈려 결론을 못 내면 '/심의 <질문>' 으로 정식 심의를 권하라.")
+            # 보조(도메인 전문가)의 지식카드도 코드가 미리 찾아 싣는다(사용자 결정 2026-11-22) — 위 지시만으로는 모델이 안 부르면
+            # 보조의 지식은 안 쓰였다. 운영자는 지식카드가 없어 찾지 않는다(주 전문가 운영자와 같은 까닭). 끄면 위 글까지가 전부다.
+            _dom = [_k for _k, _m in helpers if not _m.get("operator")]
+            _hshare = _helper_knowledge_share(len(_dom))
+            if _hshare:
+                for _k in _dom:
+                    yield _sse("status", {"step": f"보조 {_k} 지식카드 검색", "tool": "agent_search"})
+                # 동시에 찾는다 — 차례로 찾으면 보조 수만큼 턴 시작이 늦는다. 강등 사유는 검색마다 결과로 돌려받는다(주 전문가와
+                # 같다 — 한 칸을 나눠 쓰면 동시 검색이 서로 덮는다). 원문 그릇 끄기(_sc_raw_off)는 검색마다 씌운다 — gather 가 태스크를 지을 때 문맥을 베끼므로
+                # gather 를 통째로 감싸면 태스크는 그릇이 걸린 문맥으로 돈다.
+                _hk = await asyncio.gather(*(_sc_raw_off(_knowledge_excerpt(app, req.groups, _k, _sel_q, _hshare))
+                                             for _k in _dom))
+                _kb: list[str] = []
+                for _k, (_ex, _hn) in zip(_dom, _hk):
+                    if _ex:
+                        _sc_keep_raw(_ex)       # 모델이 본 발췌는 근거다(주 전문가 발췌와 같다)
+                        _kb.append(f"[보조 {_k} 지식카드 — 이번 질문 연관 발췌]\n{_ex}")
+                        yield _sse("status", {"step": f"보조 {_k} 지식카드 {len(_ex):,}자 주입", "tool": None})
+                    elif _hn != "":
+                        # '없다' 와 '못 물어봤다' 를 가른다(주 전문가 경로와 같은 까닭) — 못 물어본 것을 '보유 지식 없음' 으로 말하지 않는다.
+                        _why = _hn or _HELPER_KB_NO_TOOL
+                        _kb.append(f"[보조 {_k} 지식카드]\n지식 조회를 마치지 못해 이번 답변에는 이 보조의 사내 발췌가 없다"
+                                   "(없다는 뜻이 아니다).")
+                        yield _sse("warning", {"code": "knowledge_degraded",
+                                               "message": f"보조 {_k} 지식카드를 조회하지 못했습니다 — {_why}. "
+                                                          "보유 지식이 없다는 뜻이 아닙니다."})
+                        yield _sse("status", {"step": f"보조 {_k} 지식카드 조회 실패 — {_why}", "tool": None})
+                    else:
+                        _kb.append(f"[보조 {_k} 지식카드]\n이번 질문과 연관된 보유 지식을 찾지 못했다(사내 지식카드에 관련 내용이 없다).")
+                        yield _sse("status", {"step": f"보조 {_k} 연관 지식카드 없음", "tool": None})
+                turn_notes += ("\n\n" + "\n\n".join(_kb)
+                               + f"\n보조 전문가의 지식카드 발췌는 그 전문가가 실제로 보유한 사내 지식이다. 답은 그대로 '{agent_key}' "
+                                 "한 사람의 목소리로 쓰되, 보조의 발췌를 근거로 쓰면 어느 전문가의 지식카드인지(예: '<보조 키> 지식카드') "
+                                 "밝혀라. 발췌에 없는 것을 있는 것처럼 말하지 마라 — 찾지 못했거나 조회하지 못한 보조의 사내 지식을 "
+                                 "근거로 든 것처럼 쓰지 마라.")
             yield _sse("status", {"step": f"주 전문가 {agent_key} + 보조 {len(helpers)}명으로 답합니다",
                                   "tool": None})
         # 붙인 문서는 **turn_notes 에** 싣는다 — 아래 세 갈래(첫 호출·오류 재시도·강제 도구호출)가
