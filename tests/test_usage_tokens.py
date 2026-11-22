@@ -106,6 +106,24 @@ def test_기록기는_끝난_결과의_사용량을_자리의_사람_종류로_�
                           (day, ME, "think", "qwen-chat", 1, 0, 50, 5, 0)]
 
 
+def test_기록기는_시작할_때의_자리를_붙잡는다(store):
+    """끝 콜백이 다른 문맥(다른 요청의 자리)에서 불려도 그 호출은 시작한 자리의 사람 · 종류로 센다."""
+    rec = ut._recorder_class()()
+    rid = object()
+
+    async def start():
+        ut.tag(user=ME, kind="chat")
+        rec.on_chat_model_start({}, [[]], run_id=rid, invocation_params={"model": "glm-5"})
+
+    async def end():
+        ut.tag(user="other@example.com", kind="delib")
+        rec.on_llm_end(_result((7, 3)), run_id=rid)
+    asyncio.run(start())
+    asyncio.run(end())
+    ut.flush()
+    assert [r[1:3] for r in _db(store)] == [(ME, "chat")]
+
+
 def test_자리가_없으면_이름_없는_줄이고_이상한_모델_이름은_한_칸으로_접는다(store):
     ut.record("<script>", {"prompt": 3, "completion": 4}, now=NOW)
     ut.record("ok-model", {"prompt": True, "completion": -1}, now=NOW)       # 수가 아닌 칸은 모름이다
