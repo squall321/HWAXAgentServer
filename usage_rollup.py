@@ -7,6 +7,8 @@
   · 원장은 목록 색인(delib_jobs.usage_heads)으로 읽는다 — 원장 전부(발언 · 결정문)를 열지 않고, 창 앞에서 멈춘 원장은 색인도 열지 않는다.
   · 사람은 소문자 메일(퍼센트로 적힌 주인은 푼다)이고 그때의 소속(잡을 연 때 게이트웨이가 실은 값)을 함께 낸다. 주인이 없는 잡은 수만 센다.
   · 뺄 계정(exclude)은 잡 수 · 사람 줄 모두에서 뺀다. 화두 · 결정문 · 라벨 · 좌석 이름은 싣지 않는다.
+  · 사람별 LLM 토큰(usage_tokens — 사용자 결정 2026-11-22 · OD-53)도 함께 낸다 — 날 × 사람 × 종류 × 모델마다 호출 · 모름(사용량이 없던 호출) · 입력 ·
+    출력 · 캐시 읽기와 적기 시작한 날(llm_since — 그 전 날은 기록 전이다). 뺄 계정은 사람 칸으로 뺀다.
 """
 from __future__ import annotations
 
@@ -115,6 +117,9 @@ def fold(heads, p: dict) -> dict:
 def view(raw: dict, today: str | None = None) -> dict:
     """창구 한 번 — 물음을 읽고(틀리면 ValueError) 잡 원장의 머리를 세어 낸다. 이벤트 루프 밖에서 부른다(파일을 읽는다)."""
     import delib_jobs  # noqa: PLC0415 — /health · /insights/cards 와 같다(심의 MCP 가 비활성이어도 답한다)
+    import usage_tokens  # noqa: PLC0415
     p = params(raw, today)
     heads = delib_jobs.usage_heads(since_ts(p))
-    return {**fold(heads, p), "ledger": {"first_day": delib_jobs.usage_first_day(), "scanned": len(heads)}}
+    llm, llm_since = usage_tokens.rows(p["since"], p["until"], p["exclude"])
+    return {**fold(heads, p), "ledger": {"first_day": delib_jobs.usage_first_day(), "scanned": len(heads)},
+            "llm": llm, "llm_since": llm_since}

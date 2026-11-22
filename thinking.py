@@ -21,6 +21,7 @@ import json
 import os
 
 import call_trace
+import usage_tokens
 import external_llm
 import persona_links
 import vision
@@ -526,6 +527,7 @@ async def _run_thinking(app, llm, question: str, groups: list, user: str, user_p
                         history: list | None, documents: list | None):
     """run_thinking 의 본체 — llm 은 좌석 본심 LLM 이다."""
     call_trace.tag(kind="thinking")
+    usage_tokens.tag(kind="think")      # 사람별 LLM 토큰의 종류(HWAXPortal docs/ops-dashboard OD-53)
     q = str(question or "").strip()
     if not q:
         yield _sse("token", {"delta": "질문을 함께 적어 주세요."})
