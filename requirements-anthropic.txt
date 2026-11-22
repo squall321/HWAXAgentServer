@@ -1,0 +1,6 @@
+# 웹 챗의 Claude(CLAUDE_CHAT_MODEL)를 켜는 박스만 설치하는 꾸러미 — requirements.txt 에 넣지 않는다(update-all 이 모든 박스에서 받으려다 실패하지 않게).
+# langchain-core 1.4.7(requirements.txt 판)을 올리지 않는 판으로 고정했다 — 더 새 langchain-anthropic 은 langchain-core 를 올린다.
+# 설치: .venv/bin/pip install -r requirements-anthropic.txt
+langchain-anthropic==1.4.8
+anthropic==0.125.0
+docstring-parser==0.18.0

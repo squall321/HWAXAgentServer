@@ -880,6 +880,72 @@ thinking text streams as `reasoning` events and each turn ends with a `meta` eve
 fallback). Tests: `tests/test_chat_llm.py` (real lifespan, fake servers — closed port, 5xx,
 400, a streaming chat server falling back to a non-streaming GLM through a real chat turn, the window override).
 
+#### Claude chat (per person — off by default)
+
+User instruction 2026-11-22: on dev Claude is the chat model; on cae00 only the people an operator names get Claude and
+everyone else keeps the path above (Qwen → GLM). Claude is an **extra** chat model chosen per request, not a replacement
+for `CHAT_LLM_*`. It goes through the official Anthropic SDK (`langchain-anthropic` → `anthropic`), module `chat_claude.py`.
+
+| var | default | meaning |
+|---|---|---|
+| `CLAUDE_CHAT_MODEL` | _(unset)_ | unset = off, nothing changes and the package is not imported. The box `.env` writes `claude-opus-5-5` |
+| `CLAUDE_CHAT_API_KEY_FILE` | _(unset)_ | path of a `0600` file that holds the API key, read once at start. Missing, unreadable or empty = off, with the reason in `/health` and the log. The key value and the path are never logged or shown |
+| `CLAUDE_CHAT_FOR` | `feat:chat-claude` | who gets Claude: `all`, or only people whose portal entitlements carry `feat:chat-claude` (granted one by one — not part of `"*"`). Any other value = off |
+| `CLAUDE_CHAT_EFFORT` | `medium` | `output_config.effort` (`low` · `medium` · `high` · `xhigh` · `max`). Thinking cannot be turned off on Opus 5.5; effort is the only control |
+| `CLAUDE_CHAT_MAX_TOKENS` | `64000` | output cap (thinking + answer); the same amount is kept free in the turn's window |
+| `CLAUDE_CHAT_CONTEXT_TOKENS` | `1000000` | the Claude turn's window (no `/v1/models` probe) |
+| `CLAUDE_CHAT_SERVER_FALLBACK` | `1` | on a refusal Anthropic retries on another Claude model (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). `0` = off |
+
+**Who.** A chat turn uses Claude only when Claude is on, the request carries the portal's entitlements and a user
+email, and `CLAUDE_CHAT_FOR` is `all` or the entitlements contain `feat:chat-claude`. Calls without entitlements (the
+portal's report builder, older callers) stay on the box's default path. Only the web chat turn moves — the ReAct agent,
+the in-turn tool planners and that turn's self-check. Thinking mode, deliberation, card review and the routine executor
+keep `_chat_llm_of`. The agent cache key carries the choice, so a Qwen-built agent is never reused for a Claude turn.
+**Request.** No `temperature` / `top_p` / `top_k` (400 on these models); `thinking: {type: adaptive, display: summarized}`
+so the summary streams into the "thinking" pane; top-level `cache_control: {type: ephemeral}` (automatic prompt caching
+— within a turn the tool loop only appends, so each call reads the previous prefix) plus a marker on the system block
+(tools + system are the same every turn, so the next turn reads them too); `thinking.block_binding.
+prefix_mismatch_behavior: drop_block` (beta `thinking-binding-controls-2026-08-01`) so an edit of earlier turns by the
+loop fitter or the tool-image re-plan drops the stale thinking blocks instead of failing with 400; no
+`X-Session-Affinity`. OpenAI-only call arguments (`extra_body`, `chat_template_kwargs`, `reasoning_effort`,
+`max_completion_tokens`) are not sent to Anthropic; the self-check's "thinking off" becomes `effort: low`; a forced
+`tool_choice` (`any` / `tool`) becomes `auto`. **Thinking blocks** come back unchanged: the adapter keeps the received
+block pieces (index, signature) in `additional_kwargs["hwax_claude_blocks"]` and puts them back as the assistant content
+of the next request, while the rest of the app sees text in `content` and the summary in `reasoning_content`. Tool calls
+are released at the end of each response — a `refusal` drops them, and blocks before a server-side `fallback` boundary
+are not replayed (the boundary block stays where it was). A refusal becomes a visible line at the end of the answer
+(category and explanation). Images ride as base64 image blocks without a probe. **Fallback** per call to the box's
+default chat path (the chat LLM chain if `CHAT_LLM_*` is on, otherwise a `VLLM_*` client with the image guard): a
+connection error, timeout, 429, 401/403 or 5xx (incl. 529). 400 is not retried elsewhere. The Claude turn budgets with
+`CLAUDE_CHAT_CONTEXT_TOKENS − CLAUDE_CHAT_MAX_TOKENS` (not the smaller of both windows — the fallback is for outages, and
+on dev it would shrink Claude to the 128K base); a fallback request larger than the default path's window fails there
+with its own 400. **`/health` `claude_chat`:** model, `for`, effort, max_tokens, ctx_tokens, cache, server_fallback,
+`key_file {present, read, mode}`, last error, fallback `{enabled, to, count, last_at}`.
+
+**Install (only on a box that turns it on)** — kept out of `requirements.txt` so `update-all` never tries to fetch it
+elsewhere; the pinned versions keep `langchain-core` 1.4.7:
+
+```bash
+.venv/bin/pip install -r requirements-anthropic.txt
+install -m 600 /dev/null ~/.config/hwax/anthropic.key   # then put the key in it (one line)
+```
+
+dev `.env`:
+
+```bash
+CLAUDE_CHAT_MODEL=claude-opus-5-5
+CLAUDE_CHAT_API_KEY_FILE=/home/<user>/.config/hwax/anthropic.key
+CLAUDE_CHAT_FOR=all
+# CLAUDE_CHAT_EFFORT=medium   CLAUDE_CHAT_MAX_TOKENS=64000   CLAUDE_CHAT_CONTEXT_TOKENS=1000000   CLAUDE_CHAT_SERVER_FALLBACK=1
+```
+
+**Cost.** Claude Opus 5.5 is $4 per 1M input tokens and $20 per 1M output tokens (thinking counts as output); cache reads
+are $0.20 per 1M (cache writes cost more than plain input). A chat turn re-sends the whole prompt — tools, system,
+history, documents, tool results — on every tool round trip, and a 1M window lets the history budget grow with it, so a
+long tool-heavy turn can cost dollars. Caching makes the repeats cheap within a turn; across turns only the stable front
+(tools · system) is shared. Watch the Anthropic console usage after turning it on for many people. Tests:
+`tests/test_chat_claude.py` (real SSE event shapes through `httpx.MockTransport`; no API call).
+
 ### Core vocabulary (portal docs/request-1029)
 
 The chat's core-data rules (`[코어 데이터 규칙]` in the system prompt) are built from the portal's canonical vocabulary,
