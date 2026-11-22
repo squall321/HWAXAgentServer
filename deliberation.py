@@ -2,6 +2,7 @@
 # 스텝별 추론을 담당한다. 코어 로직은 재사용 워크플로 hwax-deliberate.js 와 동형 — 오케스트레이션은
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
+import ast
 import hashlib
 import json
 import math
@@ -1034,8 +1035,15 @@ _INSIGHT_TOOL_HEAD = "insight_"
 # 않는다(사용자 결정 11-21 「손수 심사의 지정 도구 좁히기」 · 11-02 「새 길을 열지 않는다」). 다른 심의의 지정 도구로는 종전대로 읽는다.
 _PROCEDURE_TOOL_HEAD = "procedure_"
 # 호출자 근거(opts.evidence)의 도구 칸이 과제 인사이트인가 — 호출자가 적는 꼴이 여럿이다(맨 이름 · Claude Code 의 mcp__<서버>__<도구> · <앱>.<도구> ·
-# <앱>:<도구>). 이름 머리가 insight_ 인 것만 본다 — 다른 앱의 get_insight_… 같은 이름은 아니다.
-_INSIGHT_EV_TOOL_RE = re.compile(r"(?:^|__|[.:/])" + _INSIGHT_TOOL_HEAD)
+# <앱>:<도구> · <앱>-<도구> · <앱>_<도구> · 괄호 · 띄어쓰기 · 머리의 BOM 같은 글자). 낱말 경계로 본다 — insight_ 앞이 영숫자가 아니면 과제
+# 인사이트다(반대 검토 11-22 M3 — 종전의 머리 · __ · .:/ 만 보는 규칙은 hwax-insight_get · hwax_insight_get 을 놓쳤다). 밑줄 뒤도 받는다 —
+# 다른 앱의 get_insight_… 가 생기면 리스크 심사에서만 빠지는 닫힌 쪽이다. 영문자는 ASCII 로만 대소문자를 접는다(re.A — 'ſ' · 'ı' 는 아니다).
+# ⚠ 같은 규칙이 세 곳에 있다 — 여기 · HWAXPortal backend/app/insights/cards.py · infra/pipeline/hwax-deliberate.js. 포털 시험
+#   (tests/test_insight_reuse.py)이 같은 입력에 세 곳이 같은 답을 내는지 맞댄다. 고치면 셋을 같이 고친다.
+_INSIGHT_EV_TOOL_RE = re.compile(r"(?<![A-Za-z0-9])" + _INSIGHT_TOOL_HEAD, re.I | re.A)
+# 게이트웨이의 범용 실행기 — 부를 도구를 인자의 name 으로 정한다(가벼운 보기의 Claude 는 도구를 이 이름으로 부른다). 껍데기면 인자의 name 을 본다.
+_INVOKE_TOOL_RE = re.compile(r"(?<![A-Za-z0-9])invoke_tool(?![A-Za-z0-9])", re.I | re.A)
+_INVOKE_NAME_RE = re.compile(r"""["']name["']\s*:\s*["']([^"']*)["']""")
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1051,10 +1059,40 @@ _RISK_DESIGNATED_REFUSE = {
 }
 
 
-def _insight_evidence_tool(name) -> bool:
-    """호출자 근거 항목의 도구 칸이 과제 인사이트 도구(insight_find · insight_get …)인가. 리스크 심사는 그 항목을 좌석에 주지 않는다(_resolve_opts —
-    HWAXPortal docs/project-insight-graph PLAN §7.1 의 받침, D-18 '새 길을 열지 않는다'). 글만 베껴 넣은 근거(도구 칸 없음)는 가리지 못한다."""
-    return isinstance(name, str) and bool(_INSIGHT_EV_TOOL_RE.search(name.strip().lower()))
+def _insight_evidence_tool(name, args=None) -> bool:
+    """호출자 근거 항목이 과제 인사이트 도구(insight_find · insight_get …)를 부른 것인가 — 도구 칸의 이름, 그리고 그 이름이 범용 실행기
+    (invoke_tool)면 인자 글에 든 name 값(어느 깊이든 — 닫힌 쪽)으로 가린다. 리스크 심사는 그 항목을 좌석에 주지 않는다(_resolve_opts — HWAXPortal
+    docs/project-insight-graph PLAN §7.1 의 받침, D-18 '새 길을 열지 않는다'). 글만 베껴 넣은 근거(도구 칸 없음)는 가리지 못한다."""
+    if not isinstance(name, str):
+        return False
+    if _INSIGHT_EV_TOOL_RE.search(name):
+        return True
+    if not _INVOKE_TOOL_RE.search(name):
+        return False
+    text = args if isinstance(args, str) else "" if args is None else json.dumps(args, ensure_ascii=False, default=str)
+    return any(_INSIGHT_EV_TOOL_RE.search(m) for m in _INVOKE_NAME_RE.findall(text))
+
+
+def _ev_unwrap(tool, args) -> tuple:
+    """범용 실행기(invoke_tool)로 부른 근거 항목 → (안쪽 도구 이름, 안쪽 인자). 껍데기가 아니거나 인자를 풀지 못하면 받은 그대로다. 인자는 사전이거나
+    정규화로 글이 된 꼴(JSON · 사전을 글로 옮긴 꼴)이다. 과제 인사이트 카드의 표지 · 도구 이름에 쓴다(_insight_calls) — 껍데기 이름으로 적으면 그 앱의
+    plat 토큰이 범위에 안 붙는다."""
+    if not (isinstance(tool, str) and _INVOKE_TOOL_RE.search(tool)):
+        return tool, args
+    d = args
+    if isinstance(args, str):
+        d = None
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                d = parse(args)
+                break
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                continue
+    name = d.get("name") if isinstance(d, dict) else None
+    if not (isinstance(name, str) and name.strip()):
+        return tool, args
+    inner = d.get("arguments")
+    return name.strip(), inner if inner is not None else {}
 
 
 def _risk_designated_refusal(name: str) -> str:
@@ -2123,7 +2161,7 @@ def _resolve_opts(req_opts):
             # 의장 틀은 위에서 이미 읽었다. 포털은 리스크 심사에 깔지 않는다 — 여기는 그 받침이고 MCP 호출자가 넘긴 것도 걸린다.
             _no_insight = o.chair_template == "risk-review"
             for it in ev:
-                if _no_insight and isinstance(it, dict) and _insight_evidence_tool(it.get("tool")):
+                if _no_insight and isinstance(it, dict) and _insight_evidence_tool(it.get("tool"), it.get("args")):
                     o.evidence_insight_dropped += 1
                     continue
                 _cands = _ev_bodies(it) if isinstance(it, dict) else []
@@ -4294,7 +4332,7 @@ def _insight_calls(pool: list, evidence: list, designated: list) -> list:
     for e in evidence or ():
         if isinstance(e, dict) and e.get("tool"):
             bodies = _ev_bodies(e)
-            add(e.get("tool"), e.get("args"), bodies[0][1] if bodies else "")
+            add(*_ev_unwrap(e.get("tool"), e.get("args")), bodies[0][1] if bodies else "")
     for x in designated or ():
         add(*x)
     return out
@@ -4326,7 +4364,7 @@ def insight_card(*, stage: str, decision: str, summary: str, plain: str, tally: 
     # 도구 이름은 표지 상한(_INSIGHT_CALLS_MAX)과 상관없이 전부다 — 표지가 끊겨도 이름은 남아야 그 앱의 plat 토큰이 범위에 붙고, 앞선
     # 인사이트(insight_*)를 근거로 쓴 카드가 그렇게 읽힌다(contracts §1 · PLAN §6.2 최소 범위).
     named = ({x[2] for x in pool or () if isinstance(x, (list, tuple)) and len(x) >= 5}
-             | {e.get("tool") for e in evidence or () if isinstance(e, dict)} | set(pre_tools or ()))
+             | {_ev_unwrap(e.get("tool"), e.get("args"))[0] for e in evidence or () if isinstance(e, dict)} | set(pre_tools or ()))
     tools = sorted({c["tool"] for c in calls}
                    | {str(t).strip() for t in named if t and str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
     apps = sorted({amap[t] for t in tools if amap.get(t)})

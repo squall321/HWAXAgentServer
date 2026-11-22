@@ -102,9 +102,38 @@ _EV = [{"source": "앞선 인사이트 — 검증 대상, 독립 근거 아님",
 @pytest.mark.parametrize("name, want", [
     ("insight_get", True), ("insight_find", True), (" Insight_Get ", True), ("mcp__hwax__insight_find", True),
     ("gateway.insight_get", True), ("hwax:insight_find", True), ("insight_future_tool", True),
-    ("find_part", False), ("get_insight_summary", False), ("my_insight_tool", False), ("", False), (None, False), (7, False)])
+    # 낱말 경계로 넓힘(반대 검토 11-22 M3) — 접두 · 띄어쓰기 · 괄호 · 머리의 BOM · 정보 분리 문자가 붙어도 과제 인사이트다
+    ("hwax-insight_get", True), ("hwax insight_get", True), ("hwax_insight_get", True), ("(insight_get)", True),
+    ("\ufeffinsight_get", True), ("\x1cinsight_get", True), ("INSIGHT_FIND", True),
+    # 밑줄 뒤의 insight_ 도 닫힌 쪽으로 읽는다(다른 앱의 get_insight_… 가 생기면 리스크 심사에서만 빠진다)
+    ("get_insight_summary", True), ("my_insight_tool", True),
+    ("find_part", False), ("myinsight_get", False), ("insights_get", False), ("in\u017fight_get", False), ("\u0131nsight_get", False),
+    ("invoke_tool", False), ("", False), (None, False), (7, False)])
 def test_근거_항목의_도구_이름이_과제_인사이트인지_가린다(name, want):
     assert d._insight_evidence_tool(name) is want, name
+
+
+@pytest.mark.parametrize("tool, args, want", [
+    # 게이트웨이의 범용 실행기 — 가벼운 보기의 Claude 가 실제로 부르는 이름이다. 껍데기면 인자의 name 으로 가린다
+    ("mcp__hwax__invoke_tool", {"name": "insight_get", "arguments": {"id": "ins:web:c1:r1:default"}}, True),
+    ("invoke_tool", '{"name": "insight_find", "arguments": {"sp_task": "알파"}}', True),
+    ("hwax.invoke_tool", "{'name': 'insight_get', 'arguments': {'id': 'ins:wf:z'}}", True),      # 사전을 글로 옮긴 꼴
+    ("invoke_tool", {"arguments": {"name": "insight_x"}}, True),                                  # 어느 깊이의 name 이든(닫힌 쪽)
+    ("invoke_tool", {"name": "find_part", "arguments": {"q": "insight_get"}}, False),
+    ("invoke_tool", None, False), ("invoke_tool", "", False), ("invoke_tools", {"name": "insight_get"}, False),
+    ("find_part", {"name": "insight_get"}, False),                                                # 껍데기가 아니면 인자를 보지 않는다
+    ("insight_get", None, True)])
+def test_범용_실행기로_부른_근거는_인자의_도구_이름으로_가린다(tool, args, want):
+    assert d._insight_evidence_tool(tool, args) is want, (tool, args)
+
+
+def test_리스크_심사는_범용_실행기로_부른_과제_인사이트_근거도_뺀다():
+    ev = [{"source": "개인 Claude", "tool": "mcp__hwax__invoke_tool", "args": {"name": "insight_get", "arguments": {"id": "ins:wf:z"}},
+           "result": _INS_TEXT}, {"source": "개인 Claude", "tool": "hwax_insight_get", "args": "{}", "result": _INS_TEXT},
+          {"source": "StepForge", "tool": "mcp__hwax__invoke_tool", "args": {"name": "find_part", "arguments": {}}, "result": "힌지 2종"}]
+    o = d._resolve_opts({"chair_template": "risk-review", "evidence": ev})
+    assert [e["result"] for e in o.evidence] == ["힌지 2종"] and o.evidence_insight_dropped == 2
+    assert len(d._resolve_opts({"evidence": ev}).evidence) == 3
 
 
 def test_리스크_심사는_호출자_근거의_과제_인사이트_항목을_빼고_센다():
