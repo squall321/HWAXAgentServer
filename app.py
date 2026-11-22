@@ -1099,9 +1099,6 @@ class _ClaudePicker:
             got = self._built[key] = self._make(model, effort, self.http_client)
         return got
 
-    def built(self) -> list[str]:
-        return [f"{m}:{e}" for m, e in self._built]
-
 
 def _claude_eligible(app_, req) -> bool:
     """이 챗 요청이 Claude 를 쓰는가 — 켜져 있고, 포털이 실은 요청 시점 권한(entitlements)과 사람 신원(user_email)이 있고, 대상이 all 이거나
@@ -9761,7 +9758,7 @@ def _model_label(model: str) -> str:
     return f"Claude {parts[1].capitalize()} {'.'.join(parts[2:])}"
 
 
-@app.get("/chat-models")
+@app.get("/claude-models")
 def chat_models() -> dict:
     """웹 챗에서 사람이 고를 수 있는 Claude 모델 · 생각 깊이(HWAXPortal docs/chat-llm-claude CC-8). 포털이 읽어 그 사람이 Claude 대상이면
     (FOR=all 또는 feat:chat-claude) 입력창에 고르는 칸을 그린다. 꺼져 있으면 {"claude": {"enabled": false}}. 키 · 실패 같은 운영 값은 싣지 않는다."""

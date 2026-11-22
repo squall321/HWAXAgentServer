@@ -915,7 +915,7 @@ email, and `CLAUDE_CHAT_FOR` is `all` or the entitlements contain `feat:chat-cla
 portal's report builder, older callers) stay on the box's default path. Only the web chat turn moves — the ReAct agent,
 the in-turn tool planners and that turn's self-check. Thinking mode, deliberation, card review and the routine executor
 keep `_chat_llm_of`. The agent cache key carries the choice, so a Qwen-built agent is never reused for a Claude turn.
-**Picking a model and effort.** The portal reads `GET /chat-models` (the box lists — model ids with labels, efforts,
+**Picking a model and effort.** The portal reads `GET /claude-models` (the box lists — model ids with labels, efforts,
 defaults; no key or error fields) and shows a picker in the composer to people who get Claude. The chat request carries
 `claude_model` · `claude_effort`; a value outside the box lists is not guessed — the turn runs on the box default and the
 turn `meta` carries `claude_note`. Each (model, effort) pair is built on first use and kept (at most models × 5); the
