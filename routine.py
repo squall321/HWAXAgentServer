@@ -15,6 +15,10 @@ procedures/runner.GatewaySession 과 같은 꼴)으로 말한다(R3-D2). 어댑�
 같은 프로세스에 살아 있는 실행에 '이어서' 가 오면 지금 원장 모양의 plan · 지금까지 낸 프레임을 다시 보내고 이어 붙는다(작업은 하나). 재기동
 뒤에는 사람이 '이어서' 를 누른다 — 사람 PAT 는 재기동 때 사라지므로 저절로 다시 돌지 않는다.
 
+전문가 팀(HWAXPortal docs/expert-teams PLAN 2-2 · 3-2) — 실행 보기의 팀 사본을 단계마다 읽는다(단계 team → 실행 보기 team). LLM 단계는 시스템
+글 끝에 팀 블록(주 · 보조의 역할과 지식카드 발췌)을, 심의 단계는 좌석(deliberate_start 의 personas)을 싣는다. 도구는 단계 울타리 그대로이고
+(ET-4) 리스크 심사 계열에는 앉히지 않는다(ET-5). 팀이 없으면 요청 · 프롬프트 · 프레임이 팀 전과 바이트까지 같다.
+
 시험 이음매(블랙박스 시험이 쓴다 — 이름을 바꾸지 않는다): GW_TRANSPORT · _gateway_url · _routine_llm · _user_tools · _tool_backends ·
 run_routine · active_count · _RUNS · ROUTINE_MAX_RUNNING. 이음매 셋(_routine_llm · _user_tools · _tool_backends)은 비동기 함수이되 부르는 쪽이
 돌려받은 값이 기다릴 것일 때만 기다린다 — 시험이 동기 함수로 바꿔 끼워도 된다.
@@ -835,6 +839,9 @@ async def _drive(ctx: _Ctx) -> None:
     ctx.routine("plan", **_drop_kind(_plan_frame(view, resumed)))
     print(f"[routine] {'이어서' if resumed else '시작'} — 실행 {ctx.run_id} · {(view.get('run') or {}).get('title')} · "
           f"단계 {len(view.get('steps') or [])}개 · {ctx.user or '(신원 없음)'}")
+    if str(view.get("team_why") or "").strip():
+        # 루틴 팀을 못 풀었다(지워짐 · 안 보임 — 그 단계들은 팀 없이 돈다) 또는 일부 보조를 뺐다 — 포털이 실행을 만들 때 적은 까닭(팀 칸을 쓰는 루틴만)
+        _team_say(ctx, "", f"전문가 팀 — {str(view['team_why']).strip()}")
     tried: set = set()
     while True:
         run = view.get("run") or {}
@@ -1115,6 +1122,194 @@ def _page_tool(ctx: _Ctx, sid: str):
             "page": {"type": "integer", "minimum": 2, "description": "읽을 쪽 번호(2부터)"}}, "required": ["call_id", "page"]})
 
 
+# ── 전문가 팀(HWAXPortal docs/expert-teams PLAN 2-2 · 3-2 · ET-2 · ET-4 · ET-5) ──────────────────────────────────────────────
+# 포털이 실행을 만들 때 그 사람의 시야로 푼 팀 사본을 실행 보기에 싣는다 — 루틴 기본 view["team"](사본 · null)과 덮은 단계의 step["team"](사본 ·
+# false = 이 단계는 팀 없이). 사본은 {id, name, version, lead: {key, name}, helpers: [{key, name}], apps, tools, resolved_at} 이다. 단계에 팀 칸이
+# 없으면 루틴 기본을 따른다. 팀은 목소리 · 판단 기준 · 지식카드만 보탠다 — 도구는 단계 울타리 그대로라 사본의 apps · tools 는 읽지 않는다(ET-4).
+# 팀이 없으면 이 절은 아무것도 하지 않는다 — 요청 · 프롬프트 · 프레임이 팀 전과 바이트까지 같다.
+_TEAM_D18 = "리스크 심사에는 팀을 앉히지 않는다(D-18)"
+
+
+def _step_team(ctx: _Ctx, step: dict) -> dict | None:
+    """이 단계의 팀 사본 — step.team 이 사본이면 그것, false 면 없음, 그 밖(칸 없음)이면 실행 보기의 team. 주 전문가 키가 없는 사본은 없는 것이다."""
+    t = step.get("team")
+    if t is False:
+        return None
+    if not isinstance(t, dict):
+        t = ctx.view.get("team")
+    lead = t.get("lead") if isinstance(t, dict) else None
+    return t if isinstance(lead, dict) and isinstance(lead.get("key"), str) and lead["key"].strip() else None
+
+
+def _team_name(team: dict) -> str:
+    return str(team.get("name") or team.get("id") or "이름 없음").strip()[:60]
+
+
+def _team_who(p: dict) -> str:
+    """보이기용 — '이름(키)', 이름이 없으면 키(포털 teams._who 와 같은 꼴)."""
+    return f"{p['name']}({p['key']})" if p.get("name") else p["key"]
+
+
+def _team_line(people: list) -> str:
+    """'주 이름(키) · 보조 이름(키), …' — 단계 칩 · 상태줄 · 생각 칸이 함께 쓴다."""
+    return f"주 {_team_who(people[0])}" + (f" · 보조 {', '.join(_team_who(p) for p in people[1:])}" if len(people) > 1 else "")
+
+
+def _team_say(ctx: _Ctx, sid: str, line: str, code: str = "") -> None:
+    """팀 한 줄 — 생각 칸과 상태 프레임(활동)에 남긴다. code 가 있으면 경고 프레임도(챗과 같은 갈래 — 못 물어본 것을 '없다' 로 읽지 않게)."""
+    ctx.reason(f"({line})\n")
+    ctx.emit("status", {"step": line, "tool": None, **({"routine_step": sid} if sid else {})})
+    if code:
+        ctx.emit("warning", {"code": code, "message": line})
+
+
+async def _team_people(ctx: _Ctx, step: dict, team: dict) -> list:
+    """그 사람의 시야로 다시 본 팀 — [{key, name, meta}](주 전문가가 맨 앞) 또는 빈 목록(팀 없이 돈다). 키는 챗과 같은 규칙으로 고른다
+    (app._persona_keys — 주 1 + 보조, 겹침 · 공백을 걷고 상한 PERSONA_MAX). 역할은 이 사람의 그룹으로 한꺼번에 읽는다(app._persona_meta). 읽지
+    못했거나(note) 빈 값(역할 · 이름이 다 비었다)이면 그 사람은 빼고 그렇다고 남긴다(ET-2 — 닫힌 쪽). 주 전문가를 못 보면 팀을 쓰지 않는다 —
+    목소리가 없다(포털 resolve 와 같은 규칙)."""
+    A = _app()
+    sid, tname = str(step.get("id")), _team_name(team)
+    names: dict = {}
+    raw = []
+    for m in [team.get("lead"), *_as_list(team.get("helpers"))]:
+        if isinstance(m, dict) and isinstance(m.get("key"), str):
+            raw.append(m["key"])
+            names.setdefault(m["key"].strip()[:120], str(m.get("name") or "").strip()[:120])
+    keys = A._persona_keys(raw, None)
+    metas = await asyncio.gather(*(A._persona_meta(ctx.app, ctx.groups, k) for k in keys))
+    out = []
+    for i, (k, m) in enumerate(zip(keys, metas)):
+        m = m if isinstance(m, dict) else {}
+        p = {"key": k, "name": names.get(k) or str(m.get("name") or "").strip()[:120], "meta": m}
+        note = str(m.get("note") or "").strip()
+        if note or not (str(m.get("role") or "").strip() or str(m.get("name") or "").strip()):
+            why = (f"역할 문서를 불러오지 못했다({note[:160]}) — 못 본 것이지 없다는 뜻이 아니다" if note
+                   else "이 사람의 시야에서 보이지 않는다(역할 · 이름이 비어 왔다)")
+            if i == 0:
+                _team_say(ctx, sid, f"전문가 팀 「{tname}」 의 주 전문가 {_team_who(p)} 를 쓰지 못해 이 단계는 팀 없이 돈다 — {why}",
+                          "team_member_dropped")
+                return []
+            _team_say(ctx, sid, f"전문가 팀 「{tname}」 의 보조 {_team_who(p)} 는 뺐다 — {why}", "team_member_dropped")
+            continue
+        out.append(p)
+    return out
+
+
+def _team_query(ctx: _Ctx, step: dict) -> str:
+    """지식카드 질의 — 이 단계의 할 일(실행 보기가 참조를 푼 글) + 루틴 입력 값 + 사용자가 덧붙인 말. 다 비면 단계 제목."""
+    inputs = ctx.view.get("inputs")
+    vals = [str(v).strip() for v in (inputs.values() if isinstance(inputs, dict) else []) if v not in (None, "")]
+    q = " ".join(x for x in (str(step.get("goal") or "").strip(), " ".join(v for v in vals if v), ctx.note) if x)
+    return q or str(step.get("title") or step.get("id") or "")
+
+
+async def _team_block(ctx: _Ctx, step: dict) -> str:
+    """LLM 단계(platform · cite)의 팀 블록 — 단계 시스템 글 끝에 붙인다(빈 글이면 팀 없음). 주 전문가의 역할(PERSONA_ROLE_MAX) · 지식카드 발췌
+    (질의 _team_query, 몫 CHAT_KNOWLEDGE_BUDGET)와 보조의 역할(PERSONA_HELPER_ROLE_MAX) · 도메인 보조의 지식카드 발췌(몫 _helper_knowledge_share)를
+    챗의 주 · 보조 블록(app._agent_stream_turn)과 같은 말투 · 같은 규칙으로 싣는다. 지식은 한꺼번에 찾는다. 운영자는 지식카드가 없어 찾지 않는다
+    (챗과 같다). 0건과 못 물어봄(사유 글 · None — 지식 검색 도구를 받지 못함)은 갈라서 한 줄씩 밝히고 상태 프레임에 남긴다. 도구는 바꾸지
+    않는다(ET-4) — 운영자의 앱 도구라도 단계 울타리 밖이면 묶지 않고, 그렇다고 글에 적는다."""
+    sid = str(step.get("id"))
+    why = str(step.get("team_why") or "").strip()
+    if why:
+        _team_say(ctx, sid, f"전문가 팀 — {why}")
+    team = _step_team(ctx, step)
+    if team is None:
+        return ""
+    people = await _team_people(ctx, step, team)
+    if not people:
+        return ""
+    A = _app()
+    tname, lead, helpers = _team_name(team), people[0], people[1:]
+    lk, l_op = lead["key"], bool(lead["meta"].get("operator"))
+    ctx.routine("step", step=sid, title=step.get("title") or sid, state="running", detail=f"전문가 팀 「{tname}」 — {_team_line(people)}")
+    ctx.reason(f"(이 단계는 전문가 팀 「{tname}」 — {_team_line(people)} 의 판단으로 돈다. 도구는 단계 울타리 그대로다)\n")
+    dom = [h for h in helpers if not h["meta"].get("operator")]
+    share = A._helper_knowledge_share(len(dom))
+    asks = ([] if l_op else [(lead, A.CHAT_KNOWLEDGE_BUDGET)]) + ([(h, share) for h in dom] if share else [])
+    found: dict = {}
+    if asks:
+        q = _team_query(ctx, step)
+        ctx.emit("status", {"step": f"전문가 팀 「{tname}」 지식카드 검색 — {len(asks)}명", "tool": None, "routine_step": sid})
+        got = await asyncio.gather(*(A._knowledge_excerpt(ctx.app, ctx.groups, p["key"], q, b) for p, b in asks))
+        found = {p["key"]: r for (p, _b), r in zip(asks, got)}
+
+    def kb(p: dict, helper: bool) -> str:
+        ex, note = found[p["key"]]
+        tag, who = ("보조 " if helper else "") + p["key"], ("보조 " if helper else "주 전문가 ") + _team_who(p)
+        if ex:
+            ctx.emit("status", {"step": f"{who} 지식카드 {len(ex):,}자", "tool": None, "routine_step": sid})
+            return f"[{tag} 지식카드 — 이 단계 할 일 연관 발췌]\n{ex}"
+        if note != "":
+            # 못 물어봤다(강등 · 실패 글, 또는 None — 지식 검색 도구를 받지 못함) — '보유 지식 없음' 으로 말하지 않는다
+            _team_say(ctx, sid, f"{who} 지식카드를 조회하지 못했다 — {note or A._HELPER_KB_NO_TOOL}. 보유 지식이 없다는 뜻이 아니다",
+                      "knowledge_degraded")
+            return f"[{tag} 지식카드]\n지식 조회를 마치지 못해 이 단계에는 이 전문가의 사내 발췌가 없다(없다는 뜻이 아니다)."
+        _team_say(ctx, sid, f"{who} — 이 단계 할 일과 연관된 지식카드 없음")
+        return f"[{tag} 지식카드]\n이 단계 할 일과 연관된 보유 지식을 찾지 못했다(사내 지식카드에 관련 내용이 없다)."
+
+    role = A._cut_mark(str(lead["meta"].get("role") or "").strip(), A.PERSONA_ROLE_MAX)
+    parts = [f"\n\n[전문가 팀 — 「{tname}」 · 이 단계는 이 팀의 판단으로 돈다]\n너는 '{lk}' 전문가로서 이 단계를 맡는다. 아래 역할과 범위를 "
+             "지켜 그 전문가의 판단 기준으로 조회하고 정리하라." + (f"\n{role}" if role else "")]
+    parts.append(f"'{lk}' 는 HE팀 MCP 운영자다 — 이 단계에서는 그 운영자가 모는 앱의 도구를 더 묶지 않는다(단계 울타리). 역할의 판단 기준만 "
+                 "쓴다." if l_op else kb(lead, False))
+    if helpers:
+        rows = []
+        for h in helpers:
+            r = A._cut_mark(str(h["meta"].get("role") or "").strip(), A.PERSONA_HELPER_ROLE_MAX)
+            tag = "MCP 운영자(이 단계에서는 그 앱 도구를 묶지 않는다)" if h["meta"].get("operator") else "도메인 전문가"
+            rows.append(f"- {h['key']} · {tag}" + (f"\n{r}" if r else ""))
+        parts.append("[함께 선택된 보조 전문가 — 판단 기준만 빌려준다]\n" + "\n".join(rows))
+        if share:
+            parts += [kb(h, True) for h in dom]
+    rules = ["[팀 규칙]"]
+    if helpers:
+        rules.append(f"- 정리는 '{lk}' 한 사람의 목소리로 쓴다. 보조 전문가의 이름으로 따로 말하지 말고 그들의 판단 기준을 네 판단에 녹여라.")
+    if asks:
+        rules.append("- 지식카드 발췌는 그 전문가가 실제로 보유한 사내 지식이다. 할 일에 해당하는 내용이 있으면 근거로 인용하되 어느 전문가의 "
+                     "지식카드인지(예: '<전문가 키> 지식카드') 밝혀라. 발췌에 없는 것을 있는 것처럼 말하지 마라 — 찾지 못했거나 조회하지 못한 "
+                     "사내 지식을 근거로 든 것처럼 쓰지 마라.\n"
+                     "- 지식카드는 도구 결과가 아니다 — 다음 단계에 넘길 키는 여전히 이 단계 도구 결과에 글자 그대로 있는 값만이다.")
+    rules.append("- 도구는 위 울타리 그대로다 — 팀 전문가의 역할에 적힌 도구라도 이 단계에 묶이지 않았으면 부르지 않고, 부르겠다고 말하지도 않는다.")
+    if helpers:
+        rules.append("- 관점이 실제로 갈리면 숨기지 마라 — 정리 끝에 '이견: <무엇이 갈리는지>' 한 줄을 붙인다.")
+    parts.append("\n".join(rules))
+    return "\n\n".join(parts)
+
+
+def _risk_delib(d: dict) -> bool:
+    """리스크 심사 계열 심의인가 — 일(job — 엔진의 옛 이름 sealed · risk-sealed 포함) · 그 일의 의장 틀 · 손잡이의 의장 틀(chair_template) 가운데
+    하나라도 risk-review*(봉인 포함)면. 포털 routines.delib_is_risk 와 같은 머리에 엔진 별칭을 더한 닫힌 쪽이다(D-18 · ET-5)."""
+    import delib_jobs  # noqa: PLC0415 — 표만 읽는다
+    job = str(d.get("job") or "").strip().lower()
+    job = delib_jobs.JOB_ALIASES.get(job, job)
+    chair = (delib_jobs.JOBS.get(job) or {}).get("chair")
+    return any(str(x or "").strip().lower().startswith("risk-review") for x in (job, chair, d.get("chair_template")))
+
+
+async def _delib_team(ctx: _Ctx, step: dict, d: dict) -> list:
+    """심의 단계의 좌석 — 팀(주 + 보조, 그 사람의 시야로 다시 본 사람만)을 deliberate_start 의 personas [{key}] 로 넘긴다(역할은 엔진이 원본으로
+    채우고 — mcp_server._SEAT_DESC, 틀이 정하는 지정석(반증 · red-team 등)은 엔진이 그대로 더한다). 리스크 심사 계열이면 넘기지 않고 그렇다고
+    남긴다(D-18 · ET-5). 팀이 없으면 빈 목록 — 시작 인자가 팀 전과 같다."""
+    sid = str(step.get("id"))
+    why = str(step.get("team_why") or "").strip()
+    if why:
+        _team_say(ctx, sid, f"전문가 팀 — {why}")
+    team = _step_team(ctx, step)
+    if team is None:
+        return []
+    tname = _team_name(team)
+    if _risk_delib(d):
+        _team_say(ctx, sid, f"{_TEAM_D18} — 전문가 팀 「{tname}」 을 좌석으로 넘기지 않았다")
+        return []
+    people = await _team_people(ctx, step, team)
+    if not people:
+        return []
+    _team_say(ctx, sid, f"전문가 팀 「{tname}」 {len(people)}명을 심의 좌석으로 넘긴다 — {_team_line(people)}. 틀이 정하는 지정석은 엔진이 더한다")
+    return [{"key": p["key"]} for p in people]
+
+
 # ── platform · cite 단계 ──────────────────────────────────────────────────────────────────────────────────────
 def _budget(step: dict) -> tuple[int, float]:
     b = step.get("budget") or {}
@@ -1295,6 +1490,7 @@ async def _platform_step(ctx: _Ctx, step: dict) -> dict:
             return await _envelope(ctx, step, "", why)     # 앞 프로세스가 부른 것이 있다 — 그것으로 닫는다(버리면 원장의 근거가 봉투에서 빠진다)
         return {"status": "skipped", "reason": why[:_REASON_MAX], "summary": "", "keys": {}, "findings": [], "candidates": []}
     sysmsg, human = _step_prompt(ctx, step, calls_b, secs)
+    sysmsg += await _team_block(ctx, step)   # 전문가 팀(사본이 있을 때만 — 없으면 빈 글이라 시스템 글이 팀 전과 같다)
     memo, note = await _gather(ctx, step, tools, sysmsg, human, calls_b, secs)
     return await _envelope(ctx, step, memo, note)
 
@@ -1754,6 +1950,9 @@ async def _delib_step(ctx: _Ctx, step: dict) -> dict | None:
         args: dict = {"question": _delib_question(ctx, step), "job": str(d.get("job") or "mechanism")}
         if d.get("chair_template"):
             args["advanced"] = {"chair_template": str(d["chair_template"])}
+        seats = await _delib_team(ctx, step, d)
+        if seats:
+            args["personas"] = seats         # 전문가 팀(게이트웨이 _RT_DELIB_START_KEYS 가 넘기는 칸) — 없으면 칸도 없다(서버가 발굴한다)
         start, env = await _delib_start(ctx, step, args, renew)
         if start is None:
             return env                       # 닫을 봉투(시작 실패 · 실행 상한) 또는 None(실행이 도는 상태가 아니다 — 맨 위가 그 상태로 끝낸다)
