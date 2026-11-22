@@ -262,7 +262,16 @@ _EVID_DESC = (
     "불통 · 글이 아님 · 끝나지 않음으로 못 푼 참조는 빼고 evidence_omitted 에 'ref:<kind>:<id> — 까닭' 으로, 풀이 기록(항목 수 · 자수 · 지문 · "
     "시각 · 인용 cite{source_platform, source_kind, source_id, source_version, scope})은 잡의 evidence_refs 에 남는다. 꼴이 틀린 참조와 아직 "
     f"열지 않은 kind({' · '.join(f'{k} — {v}' for k, v in delib_refs.NOT_OPENED.items())})는 시작 전에 거절한다. 크기 · 지문만 미리 보려면 "
-    "deliberate_resolve_evidence."
+    "deliberate_resolve_evidence. "
+    # 앞선 과제 인사이트(HWAXPortal docs/project-insight-graph PLAN §7.1 · M3) — 엔진은 포털을 사람 대신 읽지 않는다(PG-8). 호출자가 넘긴다.
+    "**앞선 과제 인사이트** — 과제 심의(subject 를 단 심의)면 게이트웨이 insight_find(sp_task, round)로 같은 (과제, 차수)의 앞선 결정 카드를 "
+    "찾아 근거로 넘길 수 있다. 카드마다 한 항목 — {source: '앞선 인사이트 — 검증 대상, 독립 근거 아님', tool: 'insight_get', args: "
+    "'{\"id\": \"<카드 id>\"}', result: 주장 · 출처(누가 · 언제 · 어느 심의) · 상태(확인 · 반박) · 판}. 넘기는 것은 범위(scope)가 내 소속(aff:) · "
+    "조직(org)뿐인 확인 · 반박 카드다 — plat: 가 붙은 카드와 내 초안은 넘기지 않는다(이 심의의 잡 기록 · 보고서를 읽는 사람은 플랫폼 권한으로 "
+    "걸러지지 않는다). 다른 차수 · 차수 모름 칸의 카드도 넘기지 않는다. tool · args 를 이 꼴로 지켜야 이 심의가 낳는 인사이트 카드가 원래 "
+    "카드들의 보이는 범위를 이어받는다(아니면 확인해도 주인만 본다 — invoke_tool 로 읽었으면 그 호출의 name · arguments 를 그대로 적어도 "
+    "엔진이 안쪽 도구로 푼다). 리스크 심사(risk-review · risk-review-sealed)에는 넘기지 않는다 — 엔진이 그 항목을 뺀다(evidence_omitted 의 "
+    "'과제 인사이트 근거 거름' — invoke_tool 로 부른 것도 같다)."
 )
 
 # advanced 로 넘기는 손잡이 — 도구 설명과 deliberate_jobs 가 같은 글을 쓴다. voc·chair_template 은
@@ -624,6 +633,7 @@ async def deliberate_start(
         evidence: 원천 근거 주입. [{source, tool, args, result}] — 이미 도구로 뽑아 둔 결과를 좌석에
                   '검증 대상'으로 깐다. 상한·본문 키·표식 규칙은 _EVID_DESC 가 정본이다(엔진 상수에서
                   읽어 만든다) — 여기 숫자를 다시 적지 마라, 적어 둔 값이 낡아 호출자가 근거를 버렸다.
+                  앞선 과제 인사이트(insight_find 결과)를 넘기는 꼴 · 범위도 _EVID_DESC 끝 절이 정본이다.
         personas: 좌석 지정. [{key, role}] — 비우면 서버가 recommend_agents 로 발굴한다. 항목 모양·상한·
                   다단 심의에서 어디에 앉는지는 _SEAT_DESC 가 정본이다(클라이언트가 받는 글은 그쪽이다 —
                   이 독스트링은 가지 않는다).

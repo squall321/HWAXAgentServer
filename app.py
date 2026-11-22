@@ -2543,7 +2543,7 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
     async def capped(*a, _hwax_rc: RunnableConfig = _NO_RC, **kw):
         # 걸음 차례(HWAXPortal docs/request-1030/design-integration.md 2절) — G 는 부르기 전에 막으면 글을 돌려주고,
         # R 은 성공한 호출에만 돈다. G1 invoke_tool 안쪽 거부 → G2 외부 응답자 · 반출 동의 거부 → G2b 챗 턴 밖 REST 다리 쓰기 거부 →
-        # G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
+        # G2c 챗 턴 밖 절차 실행 시작 거부 → G3 유령 ID → G4 다른 허브 id → G5 확인 카드 → G6 챗 인자 기본값 → C 호출 → R1 ~ R8.
         # ── G1 외부 응답자 과제 도구는 invoke_tool 로도 부르지 않는다(_AGENT_DENY_TOOLS — 목록에서 뺀 것을 이름으로 우회하지 못하게).
         # 게이트웨이는 별칭(<앱키>_<도구>)으로도 부르게 하므로 그 꼴도 막는다. 게이트웨이에 닿기 전에 여기서 끝낸다.
         if getattr(tool, "name", "") == "invoke_tool":
@@ -2597,6 +2597,19 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                     msg = (f"{_TOOL_FAIL_MARK} 도구 {_tn} 호출 실패: REST 다리 쓰기(rest_call {_rw}) — 사람의 확인 카드가 서지 않는 곳"
                            "(심의 · 띵킹 · 카드 대조)에서는 rest_call 의 쓰기 메서드를 보내지 않는다. 조회(GET · HEAD)만 보낸다. 쓰기는 사람이 "
                            "챗에서 확인 카드로 승인한다. 인자 문제가 아니다 — 쓰기 메서드로 다시 부르지 마라")
+                    return _refuse(tool, msg)
+        # ── G2c 절차 실행 시작(HWAXPortal docs/procedures W-116) — 같은 자리다. 게이트웨이의 procedure_run_start 는 그 사람 이름으로 포털 절차(도구
+        # 연쇄)를 돌린다. 챗 턴이면 G5 가 잡 부류로 확인 카드를 세우지만, 챗 턴 밖(심의의 지정 도구 · 좌석 자유 조회 · 외부 응답자의 CALL 줄 ·
+        # 띵킹 · 카드 대조)에는 카드가 없어 좌석 · 계획자가 사람이 고르지 않은 연쇄를 돌린다 — 보내지 않는다(invoke_tool 의 안쪽도, 계획 모드도).
+        # 목록 · 계약 · 상태는 읽기라 그대로 간다.
+        if not chat and _turn_confirm.get() is None:
+            for _args in (kw, *(x for x in a if isinstance(x, dict))):
+                _target = _args.get("name") if _via_inv else getattr(tool, "name", "")
+                if _named(_target, _PROCEDURE_START):
+                    print(f"[gate] {str(_target)[:80]} 차단 — 챗 턴 밖이라 확인 카드가 서지 않는다(절차 실행 시작)")
+                    msg = (f"{_TOOL_FAIL_MARK} 도구 {str(_target)[:80]} 호출 실패: 절차 실행 시작(procedure_run_start) — 사람의 확인 카드가 서지 "
+                           "않는 곳(심의 · 띵킹 · 카드 대조)에서는 절차를 시작하지 않는다. 절차는 사람이 챗이나 포털 절차 화면에서 시작한다. "
+                           "목록 · 계약 · 상태(procedure_list · procedure_get · procedure_run_status)는 읽을 수 있다. 인자 문제가 아니다 — 다시 부르지 마라")
                     return _refuse(tool, msg)
         # ── G3 유령 ID 게이트 — 이번 턴 어디에도 없던 정수를 식별자 인자에 넣은 호출은 실행하지 않는다.
         # src 가 None 이면 챗 밖 경로(심의·카탈로그·테스트)이므로 fail-open 으로 통과시킨다.
@@ -3927,7 +3940,12 @@ _CONFIRM_JOB_TOOLS = (
     "remesh_parts", "export_step", "build_cavity", "intake", "deliberate_start", "deliberate_continue", "risk_start_job",
     # StepForge 의 다섯째 잡 넣기 — 덱(.k)에서 STEP 을 짓는 deck_step 잡을 단일 러너에 넣고 run(기본 detect)까지 이어 건다(StepForge b2c70f1
     # app/mcp_server.py — jobs.enqueue 를 부르는 다섯 곳). 운영자 정의에도 게이트웨이 write 표지에도 없어 어떤 말에서도 카드 없이 나갔다(반대 검토 2차).
-    "extract_surface_to_cad")
+    "extract_surface_to_cad",
+    # 포털 절차의 실행 시작(게이트웨이 로컬 도구 — HWAXPortal docs/procedures W-116). 그 사람 이름으로 도구 연쇄를 돌린다. 계획 모드가 기본이지만
+    # 이름으로 선다 — 인자로 가르면 모드를 못 읽은 호출이 새고, 계획 실행도 실행 원장에 쓴다. 챗 턴 밖에서는 아예 보내지 않는다(_PROCEDURE_START · G2c).
+    "procedure_run_start")
+# 절차 실행 시작 — 사람의 확인 카드가 서지 않는 곳(챗 턴 밖)에서는 보내지 않는다(capped 의 G2c). 이름 규칙은 위와 같다(_named).
+_PROCEDURE_START = ("procedure_run_start",)
 # '이번 말이 시켰다' 판정 — 주문 동사 · 질문 · 부정. 질문 · 부정은 주문을 지운다(어긋나면 카드 쪽으로 간다 — 엄한 쪽이 틀려도 카드가 하나 더 뜰 뿐이다).
 _ORDER_RE = re.compile(
     r"(?:실행|재실행|제출|시작|변환|등록|생성|저장|업로드|추가|수정|변경|삭제|취소|적용|반입|게시)\s*(?:을|를)?\s*"
@@ -4845,6 +4863,16 @@ async def _get_tools_retry(scoped: dict, *, tries: int = 3, base_delay: float = 
                 print(f"[agent] get_tools 일시 실패({i + 1}/{tries}) — {d:.1f}s 후 재시도: {type(e).__name__}")
                 await _aio.sleep(d)
     raise last
+
+
+def _plain_agent(app: FastAPI):
+    """도구를 하나도 묶지 않은 챗 모델 — 글만 다시 쓰는 일(`/보고서 정리`)에 쓴다.
+
+    챗 턴 밖에서는 확인 카드가 서지 않는다(_turn_confirm 이 없다). 거기서 챗 도구를 묶은 에이전트(_agent_for)를 돌리면 G5(확인 카드) ·
+    G2b(REST 다리 쓰기) · G2c(절차 실행 시작)가 모두 서지 않아, 모델이 대화 이력의 글에 끌려 잡 · 쓰기 도구를 부르면 그대로 나간다
+    (반대 검토 2026-11-22 — 정리 프롬프트에는 대화 이력 전문이 실린다). 정리는 대화에 나온 것만으로 쓰는 일이라 도구가 필요 없다 —
+    묶지 않는 것이 가장 단순한 닫힘이다. 창 맞춤(_loop_fit_prompt)과 챗 전용 모델(넘김 포함)은 _agent_for 와 같다."""
+    return create_react_agent(_chat_llm_of(app), [], prompt=_loop_fit_prompt)
 
 
 async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None = None,
@@ -9832,6 +9860,44 @@ def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
     if not (since >= 0.0) or limit < 1:
         return JSONResponse({"error": "since 는 0 이상의 epoch 초, limit 은 1 이상이다"}, status_code=422)
     return delib_jobs.insight_items(since, limit)
+
+
+# ── 이용 통계 창구(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────────────────
+# GET /usage-rollup?since&until · POST /usage-rollup {since, until, exclude} — MCP 심의 잡 원장을 KST 날마다 센 수(usage_rollup.py). 포털 서비스가 날마다
+# 읽어 관리자 '이용 통계' 에 접어 둔다. **공유 비밀만**(/seat-questions 와 같은 값) — 모든 사람의 잡 수(이메일 · 소속)를 내므로 사람 신원 머리
+# (x-hwax-user)를 실은 호출은 받지 않는다(403 — 끝난 묶음 창구와 같다). 읽기만 한다. 뺄 계정의 이메일을 주소에 싣지 않게 POST 본문으로도 받는다.
+def _usage_rollup_reply(request: Request, raw):
+    import usage_rollup as _ur  # noqa: PLC0415
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "이용 통계 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다", 403)
+    if not isinstance(raw, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(raw) - set(_ur.FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    try:
+        return _ur.view(raw)
+    except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+@app.get("/usage-rollup")
+def usage_rollup_get(request: Request, since: str | None = None, until: str | None = None):
+    return _usage_rollup_reply(request, {k: v for k, v in (("since", since), ("until", until)) if v is not None})
+
+
+@app.post("/usage-rollup")
+async def usage_rollup_post(request: Request):
+    try:
+        raw = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raw = None      # 아래에서 422 — 비밀을 먼저 본다(꼴이 틀린 본문으로 창구가 있는지 떠볼 수 없게)
+    return await asyncio.to_thread(_usage_rollup_reply, request, raw)
 
 
 class SubjectConfirmRequest(BaseModel):

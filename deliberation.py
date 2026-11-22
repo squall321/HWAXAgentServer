@@ -2,6 +2,7 @@
 # 스텝별 추론을 담당한다. 코어 로직은 재사용 워크플로 hwax-deliberate.js 와 동형 — 오케스트레이션은
 # 코드가, 각 페르소나 발언·라운드·의사결정은 LLM 이. 정본은 역량 있는 Claude(개인 Claude via MCP)이고,
 # 이 모듈은 GLM 연결 시 포털 챗으로도 되게 하는 진입점이다.
+import ast
 import hashlib
 import json
 import math
@@ -1028,6 +1029,21 @@ _RISK_DELIB_READ_TOOLS = ("deliberate_list", "deliberate_status", "deliberate_re
 # 내주므로 리스크 심사 좌석에게는 어떤 길로도 열지 않는다(사용자 결정 11-02 'D-18 범위 그대로 · 새 길을 열지 않는다' — 지정 도구 · 자유 조회 ·
 # CALL 줄). 이름을 insight_ 로 시작해 자유 조회 접두(_FREE_ALLOW)에 걸리지 않게 했고, 리스크 심사에서는 접두와 상관없이 이 머리로 한 번 더 뺀다.
 _INSIGHT_TOOL_HEAD = "insight_"
+# 절차 도구(게이트웨이 procedure_list · procedure_get · procedure_run_start · procedure_run_status — HWAXPortal docs/procedures W-116)의 이름 머리.
+# 절차 실행의 단계 결과에는 **어떤 도구의 답이든** 실릴 수 있다(등록부 · 앞 패널 기록 · RA 보고서 · 과제 인사이트 — 그 사람이 전에 돌린 절차가 읽은 것).
+# procedure_run_status(step=…) 로 그것을 그대로 읽으면 위의 이름 거절을 전부 비켜 간다 — 범용 실행기(proxy)와 같은 까닭으로 리스크 심사에는 열지
+# 않는다(사용자 결정 11-21 「손수 심사의 지정 도구 좁히기」 · 11-02 「새 길을 열지 않는다」). 다른 심의의 지정 도구로는 종전대로 읽는다.
+_PROCEDURE_TOOL_HEAD = "procedure_"
+# 호출자 근거(opts.evidence)의 도구 칸이 과제 인사이트인가 — 호출자가 적는 꼴이 여럿이다(맨 이름 · Claude Code 의 mcp__<서버>__<도구> · <앱>.<도구> ·
+# <앱>:<도구> · <앱>-<도구> · <앱>_<도구> · 괄호 · 띄어쓰기 · 머리의 BOM 같은 글자). 낱말 경계로 본다 — insight_ 앞이 영숫자가 아니면 과제
+# 인사이트다(반대 검토 11-22 M3 — 종전의 머리 · __ · .:/ 만 보는 규칙은 hwax-insight_get · hwax_insight_get 을 놓쳤다). 밑줄 뒤도 받는다 —
+# 다른 앱의 get_insight_… 가 생기면 리스크 심사에서만 빠지는 닫힌 쪽이다. 영문자는 ASCII 로만 대소문자를 접는다(re.A — 'ſ' · 'ı' 는 아니다).
+# ⚠ 같은 규칙이 세 곳에 있다 — 여기 · HWAXPortal backend/app/insights/cards.py · infra/pipeline/hwax-deliberate.js. 포털 시험
+#   (tests/test_insight_reuse.py)이 같은 입력에 세 곳이 같은 답을 내는지 맞댄다. 고치면 셋을 같이 고친다.
+_INSIGHT_EV_TOOL_RE = re.compile(r"(?<![A-Za-z0-9])" + _INSIGHT_TOOL_HEAD, re.I | re.A)
+# 게이트웨이의 범용 실행기 — 부를 도구를 인자의 name 으로 정한다(가벼운 보기의 Claude 는 도구를 이 이름으로 부른다). 껍데기면 인자의 name 을 본다.
+_INVOKE_TOOL_RE = re.compile(r"(?<![A-Za-z0-9])invoke_tool(?![A-Za-z0-9])", re.I | re.A)
+_INVOKE_NAME_RE = re.compile(r"""["']name["']\s*:\s*["']([^"']*)["']""")
 # 리스크 심사의 지정 도구 거절 까닭(상태줄) — 갈래는 _risk_designated_refusal 이 고른다.
 _RISK_DESIGNATED_REFUSE = {
     "prior": "리스크 심사 좌석은 같은 과제의 등록부·앞 패널 기록(앞 패널 판정)을 보지 않는다",
@@ -1038,7 +1054,45 @@ _RISK_DESIGNATED_REFUSE = {
               f"{_RISK_APP_HEAD}<도구> 에도 닿는다)"),
     "delib": "리스크 심사 좌석은 심의 엔진의 잡 기록(앞 패널의 화두 · 결정문 · 좌석 발언)을 보지 않는다",
     "insight": "리스크 심사 좌석은 과제 인사이트(같은 과제의 앞선 심의 결론)를 보지 않는다",
+    "procedure": ("리스크 심사 좌석은 절차 실행 기록을 보지 않는다 — 실행의 단계 결과에는 어떤 도구의 답이든 실릴 수 있어(등록부 · 앞 패널 기록 · "
+                  "RA 보고서 · 과제 인사이트) 이 거절을 비켜 간다"),
 }
+
+
+def _insight_evidence_tool(name, args=None) -> bool:
+    """호출자 근거 항목이 과제 인사이트 도구(insight_find · insight_get …)를 부른 것인가 — 도구 칸의 이름, 그리고 그 이름이 범용 실행기
+    (invoke_tool)면 인자 글에 든 name 값(어느 깊이든 — 닫힌 쪽)으로 가린다. 리스크 심사는 그 항목을 좌석에 주지 않는다(_resolve_opts — HWAXPortal
+    docs/project-insight-graph PLAN §7.1 의 받침, D-18 '새 길을 열지 않는다'). 글만 베껴 넣은 근거(도구 칸 없음)는 가리지 못한다."""
+    if not isinstance(name, str):
+        return False
+    if _INSIGHT_EV_TOOL_RE.search(name):
+        return True
+    if not _INVOKE_TOOL_RE.search(name):
+        return False
+    text = args if isinstance(args, str) else "" if args is None else json.dumps(args, ensure_ascii=False, default=str)
+    return any(_INSIGHT_EV_TOOL_RE.search(m) for m in _INVOKE_NAME_RE.findall(text))
+
+
+def _ev_unwrap(tool, args) -> tuple:
+    """범용 실행기(invoke_tool)로 부른 근거 항목 → (안쪽 도구 이름, 안쪽 인자). 껍데기가 아니거나 인자를 풀지 못하면 받은 그대로다. 인자는 사전이거나
+    정규화로 글이 된 꼴(JSON · 사전을 글로 옮긴 꼴)이다. 과제 인사이트 카드의 표지 · 도구 이름에 쓴다(_insight_calls) — 껍데기 이름으로 적으면 그 앱의
+    plat 토큰이 범위에 안 붙는다."""
+    if not (isinstance(tool, str) and _INVOKE_TOOL_RE.search(tool)):
+        return tool, args
+    d = args
+    if isinstance(args, str):
+        d = None
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                d = parse(args)
+                break
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                continue
+    name = d.get("name") if isinstance(d, dict) else None
+    if not (isinstance(name, str) and name.strip()):
+        return tool, args
+    inner = d.get("arguments")
+    return name.strip(), inner if inner is not None else {}
 
 
 def _risk_designated_refusal(name: str) -> str:
@@ -1053,12 +1107,15 @@ def _risk_designated_refusal(name: str) -> str:
     그대로 본다 — 맨 이름과 겹침 접두 꼴(heaxhwax_risk_<도구> · reportarchive_<도구> · hwaxdeliberation_<도구>). 맨 이름 risk_* 는
     다른 앱에도 있어(StepForge 의 읽기 도구 risk_screen) 도구-앱 매핑으로 가리고, 매핑이 그 이름을 모르면(못 받았으면) 닫는다 —
     틀릴 거면 닫힌 쪽으로 틀린다. 등록부 · 앞 패널 기록과 변경 · 스냅샷은 이름만으로 정해 매핑을 묻지 않는다. 과제 인사이트 도구(insight_*)도 닫는다
-    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD)."""
+    — 게이트웨이 자체 도구라 겹침 접두가 붙지 않는다(_INSIGHT_TOOL_HEAD). 절차 도구(procedure_*)도 닫는다 — 실행의 단계 결과로 위의 것들에
+    닿는다(_PROCEDURE_TOOL_HEAD)."""
     n = str(name or "").strip()
     if n == "invoke_tool":
         return "proxy"
     if n.startswith(_INSIGHT_TOOL_HEAD):
         return "insight"
+    if n.startswith(_PROCEDURE_TOOL_HEAD):
+        return "procedure"
     if n.removeprefix(_DELIB_APP_HEAD) in _RISK_DELIB_READ_TOOLS:
         return "delib"
     if n.startswith(_RISK_APP_HEAD):
@@ -1835,6 +1892,8 @@ def _resolve_opts(req_opts):
         evidence_dropped_empty=0,
         # 건수 상한(_EVID_ITEMS)을 넘겨 버린 근거 수 — 같은 이유로 센다. 41번째부터 말없이 사라졌다.
         evidence_over=0,
+        # 리스크 심사에서 뺀 과제 인사이트 근거 수(도구 칸이 insight_* 인 항목 — _insight_evidence_tool) — 스트림이 카드로 알린다.
+        evidence_insight_dropped=0,
         # 본문 후보가 둘 이상이던 항목 — [(근거 번호, 실은 키, 그 길이, [(뺀 키, 길이)])]. 실리는 것은 맨 앞
         # 키 하나라 나머지는 좌석에 안 간다. 스트림이 카드로 알린다.
         evidence_shadowed=[],
@@ -2098,7 +2157,13 @@ def _resolve_opts(req_opts):
             _bad_keys: list = []      # 형식 밖이라 버린 근거 키 — 표지에 못 찍는다(호출자가 제 원장과 못 맞춘다)
             # 상한은 **본문 있는 것**에 건다(걸러 낸 뒤에 센다 — JS 파이프라인과 같은 순서).
             # 먼저 자르면 빈 항목이 앞자리를 먹고 뒤의 멀쩡한 근거가 밀려난다.
+            # 리스크 심사는 과제 인사이트(같은 과제의 앞선 심의 결론)를 호출자 근거로도 받지 않는다(D-18 — 도구 · 자유 조회 · CALL 줄은 따로 닫혀 있다).
+            # 의장 틀은 위에서 이미 읽었다. 포털은 리스크 심사에 깔지 않는다 — 여기는 그 받침이고 MCP 호출자가 넘긴 것도 걸린다.
+            _no_insight = o.chair_template == "risk-review"
             for it in ev:
+                if _no_insight and isinstance(it, dict) and _insight_evidence_tool(it.get("tool"), it.get("args")):
+                    o.evidence_insight_dropped += 1
+                    continue
                 _cands = _ev_bodies(it) if isinstance(it, dict) else []
                 if not _cands:
                     o.evidence_dropped_empty += 1
@@ -4267,7 +4332,7 @@ def _insight_calls(pool: list, evidence: list, designated: list) -> list:
     for e in evidence or ():
         if isinstance(e, dict) and e.get("tool"):
             bodies = _ev_bodies(e)
-            add(e.get("tool"), e.get("args"), bodies[0][1] if bodies else "")
+            add(*_ev_unwrap(e.get("tool"), e.get("args")), bodies[0][1] if bodies else "")
     for x in designated or ():
         add(*x)
     return out
@@ -4296,8 +4361,12 @@ def insight_card(*, stage: str, decision: str, summary: str, plain: str, tally: 
         flags.add("summary")
     if images:
         flags.add("images")
+    # 도구 이름은 표지 상한(_INSIGHT_CALLS_MAX)과 상관없이 전부다 — 표지가 끊겨도 이름은 남아야 그 앱의 plat 토큰이 범위에 붙고, 앞선
+    # 인사이트(insight_*)를 근거로 쓴 카드가 그렇게 읽힌다(contracts §1 · PLAN §6.2 최소 범위).
+    named = ({x[2] for x in pool or () if isinstance(x, (list, tuple)) and len(x) >= 5}
+             | {_ev_unwrap(e.get("tool"), e.get("args"))[0] for e in evidence or () if isinstance(e, dict)} | set(pre_tools or ()))
     tools = sorted({c["tool"] for c in calls}
-                   | {str(t).strip() for t in (pre_tools or ()) if str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
+                   | {str(t).strip() for t in named if t and str(t).strip() and str(t).strip() not in _INSIGHT_NOT_TOOLS})
     apps = sorted({amap[t] for t in tools if amap.get(t)})
     for c in calls:
         c["app"] = amap.get(c["tool"]) or None
@@ -6715,7 +6784,8 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                   for n, t in (await _tools_by_name(app, groups, _rmax,
                                                     user=user, user_pat=user_pat, as_of=_as_of)).items()
                   if n.lower() not in _FREE_DENY and _orig.get(n, n).lower() not in _FREE_DENY
-                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS or n.startswith(_INSIGHT_TOOL_HEAD))) and (
+                  and not (_risk_chair and (n in _RISK_RA_REPORT_TOOLS
+                                            or n.startswith((_INSIGHT_TOOL_HEAD, _PROCEDURE_TOOL_HEAD)))) and (
                       _free_tool_ok(_orig.get(n, n))
                       or n in _conn_ok
                       or (_amap.get(n) in _apps and n in _RISK_READ_TOOLS.get(_amap.get(n), ()))
@@ -7525,6 +7595,11 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
                                        for _n, _k, _ln, _rest in _shadow[:3])
                           + (f" 외 {len(_shadow) - 3}건" if len(_shadow) > 3 else "")
                           + f". 본문은 'result' 하나에 넣는다(찾는 순서 {'·'.join(_EVID_BODY_KEYS)}).")
+    if opts.evidence_insight_dropped and _pre is None:
+        # 글은 싣지 않는다 — 뺀 수와 까닭만(이 카드는 잡 원장 evidence_omitted 에도 남는다).
+        yield _delib("evidence", source="과제 인사이트 근거 거름", included=False,
+                     text=f"호출자 근거 가운데 과제 인사이트(insight_find · insight_get) {opts.evidence_insight_dropped}건을 좌석에 주지 "
+                          "않았다 — 리스크 심사 좌석은 같은 과제의 앞선 심의 결론을 보지 않는다(D-18).")
     if opts.evidence_over and _pre is None:
         yield _delib("evidence", source="사전 근거 건수 초과", included=False,
                      text=f"본문이 있는 근거 {_ev_valid}건 중 뒤쪽 {opts.evidence_over}건은 건수 상한"
@@ -8862,8 +8937,9 @@ async def _tidy_markdown(app, groups: list, history: list, note: str, user: str,
     if note:
         body += f"\n\n[사용자가 직접 끌어낸 결론] {note}"
     try:
-        from app import _agent_for  # noqa: PLC0415 — 순환 import 회피(모듈 로드 시점 아님)
-        agent = await _agent_for(app, groups, user=user, user_pat=user_pat)
+        # 도구를 묶지 않는다(app._plain_agent) — 이 호출은 챗 턴 밖이라 확인 카드가 서지 않는다. 종전엔 챗 도구 전부를 묶은 에이전트였다.
+        from app import _plain_agent  # noqa: PLC0415 — 순환 import 회피(모듈 로드 시점 아님)
+        agent = _plain_agent(app)
         out = await agent.ainvoke({"messages": [("user", _TIDY_PROMPT + body)]})
         msgs = out.get("messages") or []
         return str(getattr(msgs[-1], "content", "") if msgs else "").strip()

@@ -154,10 +154,8 @@ def test_보고서로_남기는_대화에는_토큰이_없다(monkeypatch, note)
             md = "# 게시 정리\n## 요약\n보고서 41 을 게시했다.\n## 결론과 근거\n볼 사람 120명.\n## 미결·확인 필요\n없음"
             return {"messages": [type("M", (), {"content": md})()]}
 
-    async def agent_for(*_a, **_k):
-        return _Agent()
     monkeypatch.setattr(d, "_tools_by_name", tools)
-    monkeypatch.setattr(a, "_agent_for", agent_for)
+    monkeypatch.setattr(a, "_plain_agent", lambda *_a, **_k: _Agent())     # 보고서 정리는 도구 없는 챗 모델로 돈다
     hist = copy.deepcopy(HIST)
 
     async def go():

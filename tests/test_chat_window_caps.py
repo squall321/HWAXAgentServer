@@ -423,9 +423,7 @@ def test_보고서_정리본은_영문_머리_대화에서도_창을_넘기지_�
             seen.append(inp["messages"][0][1])
             return {"messages": []}
 
-    async def _agent_for(*_a, **_k):
-        return _Agent()
-    monkeypatch.setattr(app, "_agent_for", _agent_for)
+    monkeypatch.setattr(app, "_plain_agent", lambda *_a, **_k: _Agent())
     hist = [{"role": "user", "content": "log " + "x" * 30000}] + [
         {"role": "assistant" if k % 2 else "user", "content": "가" * 300000} for k in range(10)]
     cut: list = []
