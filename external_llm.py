@@ -42,6 +42,7 @@ from typing import Any
 from urllib.parse import unquote
 
 import call_trace
+import usage_tokens
 
 
 log = logging.getLogger("agent.external_llm")
@@ -658,9 +659,11 @@ def model_for(app, *, owner: str, kind: str, run_id: str = "", target_key: str =
     if b is None:
         return None
     # 호출 추적(CALL_TRACE_URL)이 켜져 있으면 과제 하나의 기다림을 'external' 서버의 호출로 남긴다(꺼져 있으면 그대로).
-    return call_trace.instrument_llm(_model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
-                                                    run_id=run_id, target_key=target_key, label=label, job_id=job_id),
-                                 "external")
+    # 사람별 LLM 토큰 — 외부 응답자는 사용량을 주지 않아 '모름' 으로 센다(모델 칸 external, HWAXPortal docs/ops-dashboard OD-53)
+    return usage_tokens.instrument(
+        call_trace.instrument_llm(_model_class()(board=b, max_tokens=b.settings.max_tokens, owner=_norm_owner(owner), kind=kind,
+                                                 run_id=run_id, target_key=target_key, label=label, job_id=job_id),
+                                  "external"), "external")
 
 
 def health_fields(board: Board) -> dict:

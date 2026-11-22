@@ -464,6 +464,18 @@ has — no new LLM call. The engine still does not see the subject; the card car
   belongs to the day it was queued or started. Read-only; it reads the list index only (`delib_jobs.usage_heads`), never the
   question or the decision. Web-chat deliberations, routines and card review leave no durable ledger here, so they are not
   in it — the `note` says so. An empty range defaults to the last three days; more than 400 days is refused (422).
+- The same answer carries per-person LLM tokens (`llm: [{day, user, kind, model, calls, unknown, tokens_in, tokens_out, cache_read}]`,
+  `llm_since`) — `usage_tokens.py` (user decision 2026-11-22, admin-only on the portal, 400 days). Every LLM built by the app's
+  factory (`_mk_llm`) and the external responder carries a non-streaming callback that reads only the usage and model name of a
+  finished call; the person and kind come from a context scope (`usage_tokens.tag(user=…, kind=…)` — the chat turn, MCP
+  deliberation jobs, deliberation prep and catalog endpoints set the person from the portal's `user_email`; thinking,
+  deliberation, routines and card review set the kind). Calls without usage (streamed calls unless `LLM_STREAM_USAGE=1`, the
+  external responder) count as `unknown` — never guessed. Counts are buffered in memory and added to
+  `USAGE_TOKENS_DIR` (default: the job ledger's sibling `usage/`, 0700/0600) every 30 s, on a roll-up request and at exit.
+- When a tool load goes out with service credentials (no `X-HWAX-User`) inside a person's scope, `_tools_by_name` adds the
+  audit-only header `X-HWAX-Audit-For: <email>` (`_with_groups(audit_for=…)`). The gateway writes it only into the audit line's
+  `audit_for` field; it is an unverified claim and changes no permission, identity, cache key or masking. The cached chat agent
+  (`_agent_for`) never gets it.
 
 ### Card review
 

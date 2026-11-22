@@ -187,7 +187,8 @@ def test_기동_절차가_꺼진_서버에서는_LLM_에_아무것도_붙이지_
     ct._reset_for_tests()
     st = _boot(monkeypatch)
     for llm in (st.llm, st.delib_llm, st.mk_delib_llm(7200.0)):
-        assert llm.callbacks is None
+        # 사람별 토큰 기록기(usage_tokens — HWAXPortal docs/ops-dashboard OD-53)는 늘 붙는다 — 호출 추적의 것만 없어야 한다
+        assert [type(c).__name__ for c in llm.callbacks or []] == ["UsageTokensRecorder"]
         assert llm.root_async_client._client.event_hooks == {"request": [], "response": []}
     assert "호출 추적" not in capsys.readouterr().out and ct._EXP is None
 
@@ -215,7 +216,7 @@ def test_켜도_LLM_요청은_한_바이트도_바뀌지_않는다(monkeypatch, 
     trace_on(f"http://127.0.0.1:{_free_port()}")       # 닫힌 포트 — 보내기는 실패해도 된다
     st = _boot(monkeypatch)
     assert "호출 추적(CALL_TRACE_URL) 켜짐" in capsys.readouterr().out
-    assert [type(c).__name__ for c in st.delib_llm.callbacks] == ["CallTraceRecorder"]
+    assert [type(c).__name__ for c in st.delib_llm.callbacks] == ["CallTraceRecorder", "UsageTokensRecorder"]
     on = sent(st.delib_llm)
     assert on == off and json.loads(off[0][2]).get("stream") in (None, False), (off, on)
 
@@ -526,10 +527,11 @@ def test_외부_응답자_모델도_켜져_있을_때만_기록기를_단다(tra
     app = SimpleNamespace(state=SimpleNamespace())
     monkeypatch.delenv(ct.URL_ENV, raising=False)
     ct._reset_for_tests()
-    assert external_llm.model_for(app, owner="me@example.com", kind="verdict").callbacks is None
+    off = external_llm.model_for(app, owner="me@example.com", kind="verdict").callbacks
+    assert [type(c).__name__ for c in off or []] == ["UsageTokensRecorder"], "사람별 토큰 기록기만(OD-53)"
     trace_on(f"http://127.0.0.1:{_free_port()}")
     m = external_llm.model_for(app, owner="me@example.com", kind="verdict")
-    assert [c.server for c in m.callbacks] == ["external"]
+    assert [getattr(c, "server", None) for c in m.callbacks if type(c).__name__ == "CallTraceRecorder"] == ["external"]
 
 
 # ── 반대 검토(10-16) 뒤 — 취소된 호출 · 알림 되풀이 · 싸인 오류 · 고정 바이트 ─────────────────────────────────────────
