@@ -348,9 +348,7 @@ def _report(monkeypatch, history, note="", tokens=_BIG, agent=None):
 
     monkeypatch.setattr(d, "_tools_by_name", _fake_tools)
     if agent is not None:
-        async def _agent_for(*_a, **_k):
-            return agent
-        monkeypatch.setattr(app, "_agent_for", _agent_for)
+        monkeypatch.setattr(app, "_plain_agent", lambda *_a, **_k: agent)   # 보고서 정리는 도구 없는 챗 모델로 돈다
 
     async def go():
         return [delib_jobs._parse_sse(c) async for c in d.run_report_save(None, note, history, [], user="u@x.com")]
