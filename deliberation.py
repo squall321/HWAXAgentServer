@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from urllib.parse import quote, unquote        # 신원 헤더 인코딩 — 헤더는 latin-1 만 담는다(풀기는 위키 원천의 주인 이메일)
 
 import call_trace                                       # 호출 추적(CALL_TRACE_URL) — 라운드·좌석 id 를 단다(꺼져 있으면 아무것도 안 한다)
+import usage_tokens                                     # 사람별 LLM 토큰 · 누구의 일 자리(HWAXPortal docs/ops-dashboard OD-52 · OD-53)
 import delib_resume                                     # 재개 자료(HA-09 S1) — 잡 태스크만 일지에 쓰고, 제자리 이어하기만 되살린다
 import external_llm                                     # 외부 응답자(llm=external) — 판단 호출의 LLM 자리에 꽂는 과제 줄
 import persona_links                                    # 좌석 추천의 온톨로지 신호(SEAT_ONTO — 기본 끔, HWAXPortal docs/expert-ontology 6.4)
@@ -2310,14 +2311,14 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _with_groups(connections: dict, groups: list, user: str = "", user_pat: str = "") -> dict:
+def _with_groups(connections: dict, groups: list, user: str = "", user_pat: str = "", audit_for: str = "") -> dict:
     """챗과 **같은 구현**을 쓴다(app._with_groups). 여기 사본을 두었더니 한쪽만 고쳐졌다 —
     ① 빈 그룹 헤더를 게이트웨이가 '권한 0인 사람'으로 읽어 도구가 465→8개가 되는 문제를
        app 만 고쳐서 MCP 심의는 계속 좌석 0명으로 죽었다(실측 2026-09-12).
     ② 한글 그룹명 퍼센트 인코딩도 이 사본에는 없었다(UnicodeEncodeError → 그 사용자 도구 0개).
     순환 임포트를 피하려고 호출 시점에 가져온다(이 파일의 다른 app 참조와 같은 방식)."""
     from app import _with_groups as _impl  # noqa: PLC0415 — 순환 방지용 늦은 import
-    return _impl(connections, list(groups), user, user_pat)
+    return _impl(connections, list(groups), user, user_pat, audit_for)
 
 
 # 게이트웨이에서 도구 목록을 받을 때의 시도 횟수(자격 하나당). 챗과 같은 수다(app._get_tools_retry 의 기본값).
@@ -2356,7 +2357,10 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
     conns = app.state.connections
     if not conns:
         return {}
-    scoped = _with_groups(conns, sorted(groups), user, user_pat)
+    # 신원 없이(서비스 자격으로) 받는 도구면 그 호출이 누구의 일에서 나왔는지 감사 머리로 싣는다 — 게이트웨이가 감사 줄에만 적는다(OD-52). 이 함수는
+    # 부를 때마다 새로 짓는다(캐시하지 않는다) — 머리가 다른 사람의 일로 새지 않는다.
+    _af = "" if (user or "").strip() else usage_tokens.work_user()
+    scoped = _with_groups(conns, sorted(groups), user, user_pat, _af)
     via_pat = bool(user_pat)        # 이 도구들이 사용자 토큰으로 붙는가 — 아래 로드 폴백을 타면 거짓이 된다
     try:
         tools = await _load_tools(scoped)
@@ -2372,7 +2376,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         #   세운다. _evidence_note(결정문)와 심의 스트림(라이브 배너)이 이 표식을 읽어
         #   '이 심의는 서비스 계정으로 근거를 모았다'를 사용자에게 보인다. 무음 강등을 막는다.
         _pat_degraded.set("사용자 자격증명이 게이트웨이에 거절돼 서비스 계정으로 조회함")
-        scoped = _with_groups(conns, sorted(groups), user, "")
+        scoped = _with_groups(conns, sorted(groups), user, "", _af)
         tools = await _load_tools(scoped)
         via_pat = False
     # 기준일은 상한 래퍼보다 안쪽에 박는다 — 메아리(applied_config)는 응답 끝에 있어 잘린 글로는 확인할 수 없다(_as_of_guard). agent_search 인지는
@@ -2399,7 +2403,7 @@ async def _tools_by_name(app, groups: list, result_max=None, desc_max=None, user
         async def _svc_tools() -> dict:
             async with _svc_lock:
                 if not _svc:
-                    got = [_as_of_guard(t, as_of, _on) for t in await _load_tools(_with_groups(conns, sorted(groups), user, ""))]
+                    got = [_as_of_guard(t, as_of, _on) for t in await _load_tools(_with_groups(conns, sorted(groups), user, "", _af))]
                     try:
                         from app import _prep_tool  # noqa: PLC0415
                         got = [_prep_tool(t, result_max, desc_max) for t in got]
@@ -5972,6 +5976,7 @@ async def _sim_stages(app, question: str, groups: list, req_opts=None, user: str
                       history: list | None = None, *, owner: str = "", job_id: str = "", affiliation: str = ""):
     """run_sim_deliberation 의 본체 — 단 스트림을 차례로 흘린다(단마다의 done 은 바깥 _one_done 이 걷는다)."""
     call_trace.tag(kind="sim-delib")
+    usage_tokens.tag(kind="delib")
     _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄 — 1 · 2 · 3단이 같이 쓴다(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 단 셋 모두 외부 창으로 돈다
@@ -6286,6 +6291,7 @@ async def run_deliberation(app, question: str, groups: list, req_opts=None, user
     (done 없이 끊기면 프론트가 '응답 생성 중'에 갇히고, error 계약이 어긋나면 '(응답이 없습니다)'로 보인다.)
     req_opts: 요청 단위 손잡이 오버라이드(웹 토글) — None 이면 env 기본값."""
     call_trace.tag(kind="delib")      # 호출 추적의 자리 — 이 제너레이터를 돌리는 태스크(웹 _detach_stream · MCP 잡)에 붙는다
+    usage_tokens.tag(kind="delib")    # 사람별 LLM 토큰의 종류(OD-53)
     _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다
@@ -6319,6 +6325,7 @@ async def run_test_plan(app, question: str, groups: list, req_opts=None, user: s
     최우선으로 올리며, 일정이 빠지면 전부 1순위인 목록이 나온다.
     """
     call_trace.tag(kind="test-plan")
+    usage_tokens.tag(kind="delib")
     _CONN_GATE.set(_ConnGate(_CONN_CONC))    # 이 실행의 외부 연결 줄(HA-36)
     # 기준일이 틀린 꼴이면 먼저 거절한다(_as_of_refusal — 외부 응답자의 창 · 과제 주인을 세우기 전에)
     _refused = _as_of_refusal(req_opts) or _external_entry(app, req_opts, user, owner, job_id)   # 외부 응답자 — 거절이면 여기서 끝, 받으면 외부 창으로 돈다

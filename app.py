@@ -104,6 +104,7 @@ from deliberation import (
 )
 from thinking import is_thinking, run_thinking, strip_thinking_trigger
 import call_trace as _call_trace
+import usage_tokens as _usage_tokens   # 사람별 LLM 토큰 · 누구의 일 자리(HWAXPortal docs/ops-dashboard OD-52 · OD-53)
 import external_llm as _external_llm
 import vision as _vision
 import sc_gate as _sc_gate   # 자기검증 관문 — 바꿀 곳을 이번 턴 도구 결과 원문과 다시 대조한다(HWAXPortal docs/request-1030 HA-27)
@@ -141,6 +142,12 @@ from urllib.parse import quote  # 그룹 헤더 안전 인코딩
 
 GROUPS_HEADER = "X-HWAX-Groups"  # gateway reads this to filter tools by the caller's groups
 USER_HEADER = "X-HWAX-User"      # 호출자 이메일 — 게이트웨이가 사용자별 백엔드 자격증명으로 갈아탄다
+# 이 호출이 누구의 일에서 나왔나 — 감사 전용(게이트웨이는 GW_TOKEN 분기에서만 받아 감사 줄의 audit_for 칸에만 적는다 · 권한 · 신원 · 캐시에 쓰지 않는다).
+# 신원 머리(USER_HEADER)가 없는 서비스 자격 호출에만 싣는다(HWAXPortal docs/ops-dashboard OD-52 · HWAXMcpGateway AUDIT_FOR_HEADER).
+AUDIT_FOR_HEADER = "X-HWAX-Audit-For"
+# 흘려 받는 LLM 호출에도 사용량을 달라고 할까(stream_options.include_usage — langchain-openai stream_usage). 기본 꺼짐 — 켜면 요청 꼴이 바뀐다.
+# 꺼져 있으면 흘려 받는 호출의 토큰은 '모름' 으로 센다(비스트리밍 호출은 늘 사용량이 온다, HWAXPortal docs/ops-dashboard OD-53).
+LLM_STREAM_USAGE = os.environ.get("LLM_STREAM_USAGE", "0").strip() == "1"
 # 확인 관문(HWAXPortal docs/request-1030 HA-29) — 사람이 이번 말로 시키지 않은 잡 · 쓰기는 코드가 확인 카드로 멈춘다(아래 _confirm_gate). 기동 때
 # 한 번 읽는다(CHAT_STABLE_PREFIX 와 같은 꼴). 0 이면 관문이 아무것도 막지 않고 시스템 프롬프트 넷째 규칙도 종전 글이다 — 박스에서 관문이
 # 오작동하면 코드 되돌림 없이 끄는 길이다.
@@ -547,7 +554,7 @@ def _load_mcp_config() -> dict:
 
 
 def _with_groups(connections: dict, groups: list[str], user: str = "",
-                 user_pat: str = "") -> dict:
+                 user_pat: str = "", audit_for: str = "") -> dict:
     """Clone the MCP connection config, injecting the caller's groups header so the gateway
     can filter the tool list (and guard tool calls). Does not mutate the input.
 
@@ -560,6 +567,11 @@ def _with_groups(connections: dict, groups: list[str], user: str = "",
     # 보내고 게이트웨이가 디코드한다 — ASCII 그룹명은 인코딩해도 그대로라 하위호환된다.
     hdr = quote(",".join(groups), safe=",")
     extra = {USER_HEADER: quote(user.strip().lower(), safe="@.")} if (user or "").strip() else {}
+    # 신원 머리가 없는 서비스 자격 호출이면 '누구의 일' 감사 머리 — 게이트웨이가 감사 줄에만 적는다(권한 · 신원에 쓰지 않는다, OD-52).
+    # ⚠ 캐시되는 묶음(_agent_for)에는 주지 않는다 — 만든 때의 머리를 물고 다른 사람의 턴에서 다시 쓰인다. 부르는 자리마다 새로 짓는 길만 준다.
+    _af = _usage_tokens.norm_user(audit_for) if not extra else ""
+    if _af:
+        extra = {AUDIT_FOR_HEADER: quote(_af, safe="@.")}
     # ⚠ 그룹이 없으면 헤더를 **아예 안 보낸다.** 게이트웨이는 '빈 헤더' 를 권한 0인 **사람**으로
     # 읽고(fail-closed), '헤더 없음' 만 내부 서비스로 본다. 신원이 없는 호출(MCP 심의처럼 게이트웨이가
     # 신원 헤더를 안 실어 준 경우)에 빈 문자열을 보내면 도구가 465개 → 8개로 줄어 좌석 발굴이
@@ -1033,8 +1045,11 @@ async def lifespan(app: FastAPI):
             # 챗 전용 LLM 만 — 요청마다 대화 머리를 싣는다(_affinity_hook · W-1). SDK 의 기본 클라이언트 설정(제한 · 따라가기)은 그대로다.
             import openai  # noqa: PLC0415
             kw["http_async_client"] = openai.DefaultAsyncHttpxClient(event_hooks={"request": [_affinity_hook]})
-        # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py).
-        return _call_trace.instrument_llm(cls(**kw), _call_trace.server_label(url))
+        if LLM_STREAM_USAGE:
+            # 흘려 받는 호출에도 사용량을 달라고 한다(stream_options.include_usage) — 기본 꺼짐: 요청 꼴이 바뀐다(HWAXPortal docs/ops-dashboard OD-53).
+            kw["stream_usage"] = True
+        # 호출 추적(CALL_TRACE_URL)이 켜져 있을 때만 기록기를 붙인다 — 꺼져 있으면 그대로 돌려준다(call_trace.py). 사람별 토큰 기록기는 늘 붙는다(요청은 그대로다).
+        return _usage_tokens.instrument(_call_trace.instrument_llm(cls(**kw), _call_trace.server_label(url)))
 
     base_t = _env_float("LLM_TEMPERATURE", 0.0)
     base_mt = _env_int("LLM_MAX_TOKENS", 0)
@@ -8180,6 +8195,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         return StreamingResponse(_deny_stream(denied), media_type="text/event-stream", headers=SSE_HEADERS)
     # 호출 추적의 자리 id — 이 턴의 LLM·도구 호출이 한 묶음이 된다(심의·띵킹은 엔진이 kind 를 고쳐 단다). 꺼져 있으면 아무것도 안 한다.
     _call_trace.tag(kind="chat", turn=_call_trace.new_id())
+    # 사람별 LLM 토큰 · 누구의 일 자리 — 이 턴의 호출이 그 사람의 챗이다(띵킹 · 심의 · 루틴은 엔진이 종류를 고쳐 단다, OD-52 · OD-53)
+    _usage_tokens.tag(user=req.user_email, kind="chat")
     if req.routine is not None:
         # 분석 루틴(HWAXPortal docs/analysis-routines R3-design §4) — 코드가 단계를 도는 떼어 낸 작업이다. 심의 멈춤 · 슬래시 · 띵킹보다 먼저
         # 가른다(슬래시가 이기면 루틴 요청이 일반 턴이 된다). _pinged_stream 으로 감싸지 않는다 — 그 감싸개는 구독이 끊기면 턴을 취소한다(챗 중지).
@@ -8241,6 +8258,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
 
 class ExpertsRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     message: str
     groups: list[str] = []
     # 대화 전체 — 좌석 추천을 화두 한 줄이 아니라 오간 맥락 위에서 하기 위한 것.
@@ -8346,6 +8364,7 @@ async def _seat_axes(llm, tools: dict, message: str, history: list) -> list[dict
 async def deliberate_experts(req: ExpertsRequest) -> dict:
     """심의 전 전문가 선정 미리보기 — 자동 추천(recommend_agents) + 전체 풀(list_agents compact).
     프론트가 추천을 미리 보여주고, 사용자가 확인·수동추가한 personas 로 심의를 실행한다."""
+    _usage_tokens.tag(user=req.user_email, kind="delib")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 결과를 코드가 파싱 — 절단 금지
     if not tools:
         return {"recommended": [], "pool": [], "error": "gateway_unavailable"}
@@ -8528,6 +8547,7 @@ async def deliberate_experts(req: ExpertsRequest) -> dict:
 # 보고 고를 틈이 없다. 여기서는 화두로 **검색**해 목록을 주고 고르는 것은 사람이 한다. 고른 것은
 # delib_opts.evidence(원천 근거 — 결론 아님)로, 보강 문장은 human_note 로 간다(포털 프론트).
 class VocPreviewRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     message: str
     groups: list[str] = []
     # 사람이 고친 검색어 — 주면 추출을 건너뛴다. 보강의 첫 단계는 검색어를 바로잡는 일이다.
@@ -8585,6 +8605,7 @@ async def deliberate_voc_preview(req: VocPreviewRequest) -> dict:
       · unavailable — 이 사용자에게 search_voc 가 없다(권한·미연결)
       · degraded    — 물어봤는데 도구가 실패했다(결과를 읽지 못한 것도 — HA-33)
       · items=[]    — 물어봤고 보일 것이 없다(SignalForge 가 준 까닭 · 본문 없이 받은 수는 note 에)"""
+    _usage_tokens.tag(user=req.user_email, kind="delib")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     if "search_voc" not in tools:
         return {"items": [], "keywords": [], "unavailable": True,
@@ -8776,6 +8797,7 @@ def _slot_objects(raw: str, keys: list[str]) -> dict:
 
 
 class ClarifyRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     message: str
     job: str = "default"
     history: list[dict] = []
@@ -8783,6 +8805,7 @@ class ClarifyRequest(BaseModel):
 
 class TopicRequest(BaseModel):
     """챗 대화에서 심의 화두를 뽑는다 — 첫 발화가 아니라 **오간 내용 전체**에서."""
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
 
     history: list[dict] = []
     fallback: str = ""          # 실패하면 돌려줄 것(대개 첫 발화) — 브리프가 못 열리면 안 된다
@@ -9055,6 +9078,7 @@ async def deliberate_topic(req: TopicRequest) -> dict:
 
     P1(브리프에 결론 금지)도 지킨다 — 답이 아니라 **판단을 요구하는 물음**을 쓰게 한다.
     """
+    _usage_tokens.tag(user=req.user_email, kind="delib")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     return await _derive_topic(req.history, req.fallback)
 
 
@@ -9065,6 +9089,7 @@ async def deliberate_clarify(req: ClarifyRequest) -> dict:
     ⚠ 되묻기는 **절대 심의를 막지 않는다.** LLM 이 실패하거나 응답이 이상하면 ask=[] 로 돌려
     묻지 않고 진행한다(묻지 못한 것을 '다 있다'로 꾸미지는 않는다 — error 로 알린다).
     칸이 응답에서 빠지면 그 칸은 묻지 않는다(괴롭히지 않는 쪽으로 틀린다)."""
+    _usage_tokens.tag(user=req.user_email, kind="delib")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     slots = _CLARIFY_SLOTS[_JOB_SLOTSET.get(req.job, "mechanism")]
     # 최근 20건을 최근부터 담는다(_recent_lines — 화두 뽑기와 같은 결함이 있었다). 좁은 창 종전 예산 3,000자.
     _st: dict = {}
@@ -9121,6 +9146,7 @@ async def deliberate_clarify(req: ClarifyRequest) -> dict:
 
 
 class AgentDetailRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     key: str
     groups: list[str] = []
 
@@ -9165,6 +9191,7 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
     records 는 미리보기 20건이고 records_total 이 전체 수다 — 전체는 /catalog/agent/records 로 넘긴다.
     상세를 못 받으면 error="session_failed", 목록을 못 받으면 records_error="records_failed"(records_total 은 None) —
     실패를 빈 전문가·0건으로 주지 않는다."""
+    _usage_tokens.tag(user=req.user_email, kind="other")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)  # 상세·레코드를 JSON 으로 읽는다
     if not tools:
         return {"error": "gateway_unavailable"}
@@ -9224,6 +9251,7 @@ async def catalog_agent(req: AgentDetailRequest) -> dict:
 
 
 class AgentRecordsRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     key: str
     q: str = ""
     offset: int = 0
@@ -9251,6 +9279,7 @@ def _record_row(r) -> dict:
 async def catalog_agent_records(req: AgentRecordsRequest) -> dict:
     """전문가 한 명의 지식카드 목록 — 낱말 검색(q — 공백으로 나눈 낱말을 모두 담은 카드. 제목·요약, AIDataHub 에서 본문 검색을
     켜면 본문까지)·쪽(offset·limit)·총수. 심층 보기 용(LLM 미경유). q 는 그대로 넘긴다 — 나누고 거는 것은 AIDataHub 다."""
+    _usage_tokens.tag(user=req.user_email, kind="other")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     offset = max(0, int(req.offset or 0))
     if not tools or "list_records" not in tools:
@@ -9269,6 +9298,7 @@ async def catalog_agent_records(req: AgentRecordsRequest) -> dict:
 
 
 class RecordRequest(BaseModel):
+    user_email: str = ""     # 누구의 일인가 — 포털이 검증된 주체로 채운다(이용 통계의 누구의 일 · 토큰 — HWAXPortal docs/ops-dashboard OD-52 · OD-53). 권한에 쓰지 않는다
     id: str
     groups: list[str] = []
     # 다음 부분 보기 — 앞 응답의 next 를 그대로 돌려받는다(절 번호 · 그 절 안 글자 위치).
@@ -9416,6 +9446,7 @@ def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> di
 @app.post("/catalog/record")
 async def catalog_record(req: RecordRequest) -> dict:
     """지식카드 한 장 — 제목·요약·태그·본문 섹션·표·출처. 심층 보기의 읽기 칸 용(LLM 미경유)."""
+    _usage_tokens.tag(user=req.user_email, kind="other")   # 이 창구의 LLM 토큰 · 서비스 자격 게이트웨이 호출이 누구의 일인가(OD-52 · OD-53)
     tools = await _tools_by_name(app, req.groups, CATALOG_RESULT_MAX)
     rid = req.id.strip()[:120]
     if not tools or "get_record" not in tools:
@@ -10241,6 +10272,8 @@ def health() -> dict:
         "core_vocab": _core_vocab_health(),
         # 실사용 질문 모으기(기본 꺼짐) — 켜졌나 · 창 · 적은 수(HWAXPortal docs/request-1029 design-e5 E5-2)
         "seat_questions": _seat_questions_health(),
+        # 사람별 LLM 토큰 — 이번 기동에 센 호출 · 더한 줄 · 실패와 흘려 받는 호출의 사용량 요청(LLM_STREAM_USAGE — HWAXPortal docs/ops-dashboard OD-53)
+        "usage_tokens": {**_usage_tokens.health(), "stream_usage": LLM_STREAM_USAGE},
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,

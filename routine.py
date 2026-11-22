@@ -36,6 +36,7 @@ from urllib.parse import quote
 import httpx
 
 import call_trace
+import usage_tokens
 import external_llm
 from deliberation import _env_float, _env_int, _parse_json, _sse
 from evidence import unsourced_numbers
@@ -763,6 +764,7 @@ async def _drive_task(app, req, live: _Live) -> None:
         toks.append((A._chat_affinity, A._chat_affinity.set(A._affinity_key(req))))   # 챗 LLM 호출의 대화 머리(W-1 — 같은 GPU 복제본)
         toks.append((A._turn_ids, A._turn_ids.set(_seed_ids(ctx))))
         call_trace.tag(kind="routine", unit=None)
+        usage_tokens.tag(kind="routine")    # 사람별 LLM 토큰의 종류(OD-53)
         ctx.gw = _GwSession(_gateway_url(app), ctx.pat, ctx.groups, ctx.user)
         await _drive(ctx)
     except asyncio.CancelledError:

@@ -31,6 +31,7 @@ from urllib.parse import unquote
 from pathlib import Path
 
 import call_trace
+import usage_tokens
 import delib_resume
 import review_gate
 
@@ -1414,6 +1415,8 @@ def _make_spawn(app, job: dict, entry, q: str, groups: list, opts: dict, user_em
     def spawn() -> asyncio.Task:
         gen = entry(app, q, groups, opts or None, user_email, user_pat, None, **ext_kw)
         ctx.run(call_trace.tag, job=job["id"])   # 호출 추적 — 이 잡의 LLM·도구 호출에 잡 id(꺼져 있으면 아무것도 안 한다)
+        # 사람별 LLM 토큰 · 누구의 일 — 이 잡의 호출은 잡 주인의 심의다(HWAXPortal docs/ops-dashboard OD-52 · OD-53)
+        ctx.run(usage_tokens.tag, user=user_email or "", kind="delib")
         # 큰 근거의 낱말 색인(start 가 미룬 것 — evidence_index_pending)은 이 잡 태스크가 스레드에서 짓는다
         index_ev = (opts or {}).get("evidence") if job.get("evidence_index_pending") else None
         return ctx.run(asyncio.create_task, _drive(job, gen, index_ev=index_ev), name=f"delib-job-{job['id']}")

@@ -32,6 +32,12 @@ atexit.register(shutil.rmtree, _DRAIN_DIR, ignore_errors=True)
 _SEAT_DIR = tempfile.mkdtemp(prefix="hwax-seat-eval-test-")
 os.environ["SEAT_EVAL_DIR"] = _SEAT_DIR
 atexit.register(shutil.rmtree, _SEAT_DIR, ignore_errors=True)
+# 사람별 LLM 토큰의 자리(usage_tokens — HWAXPortal docs/ops-dashboard OD-53)도 같은 까닭으로 돌린다. 기본은 잡 원장의 형제 usage/ 라, 위 임시 원장의
+# 형제(/tmp/usage)가 되어 시험 세션끼리 섞인다 — 시험의 LLM 호출 셈이 이 박스의 실 자리에 쌓이지 않게. 흘려 받는 호출의 사용량 요청 손잡이도 지운다.
+_USAGE_DIR = tempfile.mkdtemp(prefix="hwax-usage-tokens-test-")
+os.environ["USAGE_TOKENS_DIR"] = _USAGE_DIR
+atexit.register(shutil.rmtree, _USAGE_DIR, ignore_errors=True)
+os.environ.pop("LLM_STREAM_USAGE", None)
 # SEAT_ONTO(좌석 추천의 온톨로지 신호 — HWAXPortal docs/expert-ontology 6.4)도 같다 — 켠 셸에서 돌리면 추천 인자가 달라진다.
 for _k in ("SEAT_QUESTIONS_COLLECT", "SEAT_QUESTIONS_DAYS", "SEAT_QUESTIONS_LABELERS", "PERSONA_SHADOW_LOG", "SEAT_ONTO"):
     os.environ.pop(_k, None)
