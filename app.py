@@ -971,6 +971,105 @@ def _chat_llm_of(app_) -> object:
     return getattr(app_.state, "chat_llm", None) or app_.state.llm
 
 
+# ── 웹 챗의 Claude(선택 · 사람마다) — 사용자 지시 2026-11-22 ─────────────────────────────────────────────────────────────
+# dev 는 Claude 가 정본, cae00 은 운영자가 지정한 사람만 Claude 이고 나머지는 지금 길(Qwen → GLM) 그대로다. 챗 LLM 을 통째로 바꾸지 않고
+# Claude 를 덧붙인 챗 모델로 두어 요청마다 고른다(_claude_for). CLAUDE_CHAT_MODEL 이 비면 아무것도 바뀌지 않는다(꾸러미도 들이지 않는다).
+# 고르는 범위는 웹 챗 턴(ReAct · 챗 안 도구 계획 · 그 턴의 자기검증)뿐이다 — 띵킹 · 심의 · 카드 대조 · 루틴 실행기는 _chat_llm_of 그대로다.
+# 넘김은 호출 단위로 그 박스의 기본 챗 길(챗 전용 LLM 이 있으면 그것 — Qwen → GLM, 없으면 VLLM_*)이다 — 연결 실패 · 시간 초과 · 429 ·
+# 401/403 · 5xx(chat_claude.FALLBACK_ERRORS). 400 은 넘기지 않는다(설정 오류를 숨기지 않는다).
+#   CLAUDE_CHAT_MODEL            비면 꺼짐. 켤 때의 값(claude-opus-5-5)은 박스 .env 가 적는다
+#   CLAUDE_CHAT_API_KEY_FILE     0600 키 파일 경로 — 기동 때 한 번 읽는다(못 읽으면 끄고 까닭을 /health · 로그에 — 키 값은 어디에도 찍지 않는다)
+#   CLAUDE_CHAT_FOR              all | feat:chat-claude(기본) — 모르는 값이면 끈다
+#   CLAUDE_CHAT_EFFORT           low · medium(기본) · high · xhigh · max — 생각 깊이(Opus 5.5 는 생각을 끌 수 없다)
+#   CLAUDE_CHAT_MAX_TOKENS       기본 64000 — 출력 상한(생각 + 답). 챗 턴 창에서 같은 몫을 비운다
+#   CLAUDE_CHAT_CONTEXT_TOKENS   기본 1,000,000 — Claude 턴의 창(/v1/models 탐침은 부르지 않는다)
+#   CLAUDE_CHAT_SERVER_FALLBACK  기본 1 — 거절(refusal)이면 Anthropic 서버가 다른 Claude 로 다시 돈다(fallbacks: default). 0 이면 끈다
+_turn_claude: contextvars.ContextVar = contextvars.ContextVar("turn_claude", default=None)
+
+
+class _ClaudeWatch(BaseCallbackHandler):
+    """Claude 호출의 마지막 실패와 넘김 수 — 넘기는 예외로 끝난 호출 하나가 넘김 한 번이다(넘겨받는 쪽이 챗 전용 LLM 사슬이면 그 사슬의
+    시작을 세면 Qwen → GLM 넘김과 겹친다 — 그래서 앞에서 센다). /health 의 claude_chat 이 읽는다."""
+
+    run_inline = True
+
+    def __init__(self, info: dict, falls: tuple) -> None:
+        self.info, self.falls, self._said = info, falls, 0.0
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        self.info["last_error"] = f"{type(error).__name__}: {str(error)[:160]}"
+        self.info["last_error_at"] = _now_iso()
+        if not isinstance(error, self.falls):
+            return
+        fb = self.info["fallback"]
+        fb["count"] += 1
+        fb["last_at"] = _now_iso()
+        now = time.monotonic()
+        if now - self._said >= 60:
+            self._said = now
+            print(f"[agent] Claude 챗 넘김 — {self.info['last_error']} → {fb['to']} · 지금까지 {fb['count']}회")
+
+
+def _build_claude_chat(base_chat, mk, *, temperature: float, max_tokens: int, timeout_s: float, base_effort: str,
+                       base_retries: int, conn_to: float, base_label: str):
+    """(Claude 챗 LLM — 넘김 포함 · 꺼져 있으면 None, /health 에 실을 상태). base_chat 은 켜져 있는 챗 전용 LLM(없으면 None — 그때는 VLLM_*
+    를 그림 막이(_VisionGuardLLM)로 새로 짓는다: Claude 턴은 그림을 싣고 넘어가므로)."""
+    model = (os.environ.get("CLAUDE_CHAT_MODEL") or "").strip()
+    if not model:
+        return None, {"enabled": False}
+
+    def off(why: str, **more) -> tuple:
+        info = {"enabled": False, "model": model, "error": why, **more}
+        print(f"[agent] ⚠ Claude 챗을 켜지 못했다 — {why} (그 사람들도 기본 챗 길로 간다)")
+        return None, info
+    try:
+        import chat_claude as _cc  # noqa: PLC0415 — 켰을 때만 들인다(requirements-anthropic.txt)
+    except ImportError as exc:
+        return off(f"langchain-anthropic 을 들이지 못했다({getattr(exc, 'name', None) or type(exc).__name__}) — "
+                   "requirements-anthropic.txt 를 설치한다")
+    cfg, why = _cc.settings()
+    if why:
+        return off(why)
+    key, key_info, why = _cc.read_key(os.environ.get("CLAUDE_CHAT_API_KEY_FILE") or "")
+    if why:
+        return off(why, key_file=key_info)
+    if key_info.get("warning"):
+        print(f"[agent] ⚠ Claude 키 파일 — {key_info['warning']}")
+    import httpx  # noqa: PLC0415
+
+    info: dict = {"enabled": True, "model": model, "for": cfg["for"], "effort": cfg["effort"], "max_tokens": cfg["max_tokens"],
+                  "ctx_tokens": cfg["ctx_tokens"], "thinking": "adaptive · summarized", "cache": "auto(ephemeral)",
+                  "server_fallback": "default" if cfg["server_fallback"] else None, "key_file": key_info,
+                  "last_error": None, "last_error_at": None,
+                  "fallback": {"enabled": True, "to": base_label, "count": 0, "last_at": None}}
+    tmo = httpx.Timeout(timeout_s if timeout_s > 0 else None, connect=conn_to if conn_to > 0 else None)
+    primary = _cc.build(model=model, key=key, cfg=cfg, timeout=tmo, read_s=timeout_s,
+                        callbacks=[_ClaudeWatch(info, _cc.FALLBACK_ERRORS)])
+    primary = _call_trace.instrument_llm(primary, _call_trace.server_label(primary.anthropic_api_url))
+    fb = base_chat if base_chat is not None else mk(temperature, max_tokens, base_effort, timeout_s, base_retries,
+                                                     cls=_VisionGuardLLM)
+    chat = primary.with_fallbacks([fb], exceptions_to_handle=_cc.FALLBACK_ERRORS)
+    print(f"[agent] Claude 챗 — {model} · 대상 {cfg['for']} · 생각 adaptive(effort {cfg['effort']}) · 출력 상한 {cfg['max_tokens']:,} · "
+          f"창 {cfg['ctx_tokens']:,} · 서버 대체 모델 {'켬' if cfg['server_fallback'] else '끔'} · 넘김 → {base_label}"
+          " (띵킹 · 심의 · 카드 대조 · 루틴은 그대로)")
+    return chat, info
+
+
+def _claude_for(app_, req) -> object | None:
+    """이 챗 요청이 Claude 를 쓰는가 — 켜져 있고, 포털이 실은 요청 시점 권한(entitlements)과 사람 신원(user_email)이 있고, 대상이 all 이거나
+    그 사람이 feat:chat-claude 를 가졌을 때만. 권한 칸이 없는 옛 호출(포털이 싣지 않은 길 — 보고서 만들기 등)은 주지 않는다(닫힌 쪽)."""
+    claude = getattr(app_.state, "claude_chat", None)
+    if claude is None or req.entitlements is None or not (req.user_email or "").strip():
+        return None
+    who = (getattr(app_.state, "claude_chat_info", None) or {}).get("for")
+    return claude if who == "all" or "feat:chat-claude" in req.entitlements else None
+
+
+def _turn_chat_llm(app_) -> object:
+    """이 챗 턴이 쓸 LLM — 고른 턴이면 Claude(넘김 포함), 아니면 _chat_llm_of. 턴 태스크의 문맥 변수(_agent_stream 이 건다)를 읽는다."""
+    return _turn_claude.get() or _chat_llm_of(app_)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Build the LLM once. Tools are loaded per request (they depend on the caller's groups),
@@ -1086,6 +1185,12 @@ async def lifespan(app: FastAPI):
     _chat_ctx_cache.clear()
     app.state.llm_nostream = ((not app.state.chat_llm_info["streaming"]) if app.state.chat_llm_info.get("enabled")
                               else disable_stream)
+    # 웹 챗의 Claude(CLAUDE_CHAT_*) — 비면 None(바뀌는 것 없음). 넘겨받는 쪽은 이 박스의 기본 챗 길이다.
+    _chat_on = bool(app.state.chat_llm_info.get("enabled"))
+    app.state.claude_chat, app.state.claude_chat_info = _build_claude_chat(
+        app.state.chat_llm if _chat_on else None, _mk_llm, temperature=base_t, max_tokens=base_mt, timeout_s=base_to,
+        base_effort=base_eff, base_retries=base_rt, conn_to=conn_to,
+        base_label=app.state.chat_llm_info["model"] if _chat_on else VLLM_MODEL)
     if _card_review is not None:
         _card_review.gate_of(app)    # 카드 대조 관문 — 평소 CARD_REVIEW_CONCURRENCY, 심의가 돌면 _WITH_DELIB(수만 센다)
     # 외부 응답자(EXTERNAL_LLM_ENABLED=1) — 과제 줄을 기동 때 만들고(설정을 한 번 읽는다) 시간 한도 사슬을 적는다. 꺼져 있으면 없다.
@@ -4880,11 +4985,14 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     #   자격증명 해시 **앞에** 둔다 — 강등 저장(key[:-1] + 빈 해시)이 마지막 칸을 갈아 끼운다.
     # 어휘표의 입구 쌍(온톨로지 먼저 — HWAXPortal docs/ontology-first)도 키에 든다 — 입구 표지는 묶을 때 도구 설명에 달려(_prep_tool(chat=True)), 덧씌우기로
     # 입구를 켜고 끄면 묶음을 새로 지어야 규칙 ⑧(턴마다 짓는 시스템 프롬프트)과 표지가 어긋나지 않는다. 입구가 없는 박스(기본)는 늘 빈 것이다.
+    # ⚠ 고른 챗 모델(Claude 턴 — _turn_claude)도 키에 든다 — 빼면 기본 챗 길로 지은 에이전트를 Claude 사람이 재사용하거나 그 반대가 된다.
+    #   Claude 턴에만 칸이 하나 붙고(자격증명 해시 앞) 기본 턴의 키는 종전 그대로다.
     key = (frozenset(groups), pin_key, q_key,
            tuple(sorted(sources)) if sources is not None else None,
            (user or "").strip().lower(),
            _onto_entries(),
            bool(allow_panels),
+           *(("claude",) if _turn_claude.get() is not None else ()),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
     # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다. 입구 쌍도 든다 — 없으면 입구를 켠 뒤 게이트웨이가 불통일 때 켜기 전에 지은(표지 없는) 묶음이
     # 규칙 ⑧ 과 함께 돌았다(반대 검토 11-02 — HWAXPortal docs/ontology-first OF-24). 입구가 다를 때 지은 스냅샷은 쓰지 않는다(그 턴은 도구 없이 돈다).
@@ -4903,7 +5011,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
         tools = await _aio.to_thread(_select_tools, list(hit._hwax_raw), query, pinned, first, core_names, prefer)
         names = tuple(getattr(t, "name", "") for t in tools)
         if names != hit._hwax_tools:
-            agent = create_react_agent(_chat_llm_of(app), tools, prompt=_loop_fit_prompt)
+            agent = create_react_agent(_turn_chat_llm(app), tools, prompt=_loop_fit_prompt)
             agent._hwax_tools, agent._hwax_raw = names, hit._hwax_raw
             agent._hwax_at = getattr(hit, "_hwax_at", time.time())     # 원본 목록을 받은 때 — 수명은 그때부터 센다
             cache.pop(key)
@@ -4999,7 +5107,7 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
             app.state.tool_load_error.pop(frozenset(groups), None)
         # 모델 호출마다 쌓인 메시지를 재어 창을 넘으면 오래된 도구 결과부터 줄인다(_loop_fit_prompt — 넓은 창). agent 노드
         # 안에서 줄인다 — pre_model_hook 은 별도 노드라 왕복마다 그래프 단계를 하나 더 쓴다(AGENT_RECURSION_LIMIT 주석).
-        agent = create_react_agent(_chat_llm_of(app), tools, prompt=_loop_fit_prompt)   # 챗 전용 LLM(있으면)
+        agent = create_react_agent(_turn_chat_llm(app), tools, prompt=_loop_fit_prompt)   # 챗 전용 LLM(있으면) · Claude 턴은 Claude
         # 실제로 묶인 도구 이름을 달아 둔다. 호출부가 "N종 우선 바인딩" 같은 말을 하려면
         # **묶인 것**을 알아야 하는데, prefer 는 그룹 필터 없는 /tools-map(465종)에서 뽑은
         # 이름이라 그 사용자에게 없는 도구가 섞일 수 있다(CAEG 헤더로는 8종만 온다).
@@ -6837,7 +6945,7 @@ async def _self_check_stream(app: FastAPI, req: ChatRequest, draft: str, calls: 
     """검토자를 부른다 — 글은 '생각 중' 칸으로 흘리고, 끝나면 res 에 final · check 를 둔다. 실패해도 초안이 나간다. raw 는 이번 턴의 원문
     그릇(HA-27) — 관문이 켜져 있고 도구를 부른 턴이면 검토자 입력과 같은 스레드에서 원문 색인을 짓고, 검토자의 바꿀 곳을 넣기 전에 그 색인과
     다시 대조한다(관문 계산은 스레드 두 번 — 이벤트 루프 · 15초 ping 을 막지 않는다)."""
-    llm = _chat_llm_of(app)
+    llm = _turn_chat_llm(app)       # 같은 챗 모델(SC-D1) — Claude 턴이면 Claude(그 어댑터가 '생각 끔' 을 effort low 로 바꾼다)
     acc, cut = "", False
     model = getattr(llm, "model_name", None) or getattr(llm, "model", None)
     kw = {"max_tokens": _SC_OUT_CAP}
@@ -6982,23 +7090,33 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     잘린다(HWAXPortal docs/chat-depth-context CD-D4 · CD-D6). 창의 절반보다 크게는 떼지 않는다.
     외부 응답자와 같은 문맥 변수(_external_llm.ctx_override)를 이 턴의 태스크에만 건다(HWAXPortal docs/chat-llm-stcx)."""
     tok = None
+    # Claude 를 고른 턴(_claude_for)은 그 창(CLAUDE_CHAT_CONTEXT_TOKENS)에서 출력 상한만큼 뗀다(창의 절반까지). 넘김(기본 챗 길)은 장애 때만이라
+    # CL-D5 의 '두 서버 중 작은 값' 을 걸지 않는다 — 걸면 dev(기본 128K)에서 Claude 의 이력 · 도구 예산이 그 몫으로 준다. 넘겨받는 쪽 창을 넘는 요청은
+    # 그쪽의 400 으로 보인다(숨기지 않는다). 고르지 않은 턴은 아래 종전 그대로다.
+    claude = _claude_for(app, req)
     # 챗 전용 LLM 이 없는 박스(dev 등)는 스레드를 오가지 않는다 — 종전 턴과 똑같다.
-    chat_cfg = getattr(app.state, "chat_llm_cfg", None)
+    chat_cfg = getattr(app.state, "chat_llm_cfg", None) if claude is None else None
     chat_ctx = await asyncio.to_thread(_chat_context_tokens) if chat_cfg else None
     if chat_ctx:
         base_ctx = await asyncio.to_thread(_model_context_tokens)
         win = min(chat_ctx, base_ctx)
         out = max(0, int(chat_cfg.get("output_reserve") or chat_cfg.get("max_tokens") or 0))
         tok = _external_llm.ctx_override.set(win - min(out, win // 2))
+    if claude is not None:
+        _ci = app.state.claude_chat_info
+        tok = _external_llm.ctx_override.set(_ci["ctx_tokens"] - min(_ci["max_tokens"], _ci["ctx_tokens"] // 2))
     # 자기검증(HWAXPortal docs/chat-self-check) — 켜져 있으면 초안을 근거와 대조해 한 번 고친 뒤 본문으로 낸다
     turn = _self_checked_turn(app, req) if _self_check_on() else _agent_stream_turn(app, req)
     atok = _chat_affinity.set(_affinity_key(req))      # 이 턴의 챗 LLM 호출 대화 머리(W-1) — 턴의 태스크에만
+    ctok = _turn_claude.set(claude) if claude is not None else None     # 이 턴의 챗 모델(Claude) — 턴의 태스크에만
     try:
         async for chunk in turn:
             yield chunk
     finally:
         await turn.aclose()      # 연결이 끊겨 이 생성기가 닫혀도 턴의 finally 가 지금 돈다(종전과 같은 때)
         _chat_affinity.reset(atok)
+        if ctok is not None:
+            _turn_claude.reset(ctok)
         if tok is not None:
             try:
                 _external_llm.ctx_override.reset(tok)
@@ -7447,7 +7565,8 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 그림 — 올린 그림은 아티팩트로 저장해 주소를 화면에 돌려준다(이력에 다시 실린다). 챗 모델이 그림을 받으면 이 발화의 그림 조각으로,
         # 앞 대화의 그림(사람이 올린 것 · 도구가 낸 것)은 최근 VISION_HISTORY_IMAGES 장을 '앞 대화의 그림' 으로 다시 싣는다. 못 받으면
         # 판독문(그림을 받는 다른 모델)으로, 그것도 없으면 못 실었다고 말한다(HWAXPortal docs/chat-depth-context T5).
-        _turn_vision = (await asyncio.to_thread(_chat_vision, app)
+        _turn_vision = (True if _turn_claude.get() is not None       # Claude 는 그림을 받는다(탐침 없이 — image_url data URL 을 이미지 블록으로 바꾼다)
+                        else await asyncio.to_thread(_chat_vision, app)
                         if (req.images or _vision.history_images(req.history)) else _chat_vision_known(app))
         _user_msg, _recap = await _turn_image_messages(app, req, _turn_vision)
         async for _ev in _drain_image_events(_turn_image_events):
@@ -7509,7 +7628,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                                            "message": "답이 모델 출력 상한에서 끊겼습니다 — 뒷부분이 빠졌을 수 "
                                                       "있습니다. 범위를 나눠 다시 물어 주세요.",
                                            "knob": "LLM_MAX_TOKENS(미설정이면 엔드포인트 기본 출력 상한)"})
-                if getattr(app.state, "llm_nostream", False) or event.get("run_id") not in _streamed_runs:
+                # Claude 턴은 늘 스트리밍이다 — 서버 전체 값(llm_nostream)이 비스트리밍이어도 이 호출의 조각을 봤으면 다시 내지 않는다(겹침 방지).
+                if ((getattr(app.state, "llm_nostream", False) and _turn_claude.get() is None)
+                        or event.get("run_id") not in _streamed_runs):
                     # 비스트리밍 모드(또는 이 호출만 조각 없이 끝났다) — stream 이벤트가 없으므로 완결 응답에서 텍스트를 회수해
                     # 모델 턴 단위로 방출한다(도구 호출만 한 턴은 content 가 비어 자연히 skip). 생각 글도 그 호출이 끝난 뒤 한 번에.
                     _rc = (getattr(out_msg, "additional_kwargs", None) or {}).get("reasoning_content")
@@ -7894,7 +8015,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             _brief = _tool_schema_brief(_tmap[_tn])
             try:
                 _argd = _parse_json(await _llm_text(
-                    _chat_llm_of(app), "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
+                    _turn_chat_llm(app), "당신은 도구 호출 계획자입니다. 반드시 유효한 JSON 하나만 출력하세요.",
                     f"[사용자 질문]\n{req.message}\n\n[도구]\n{_tn}: "
                     f"{(getattr(_tmap[_tn], 'description', '') or '')[:300]}\n"
                     + (f"[인자 스키마]\n{_brief}\n" if _brief else "")
@@ -7934,7 +8055,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 if not _held3:
                     try:
                         _final = (await _llm_text(
-                            _chat_llm_of(app),
+                            _turn_chat_llm(app),
                             "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
                             "호출하겠다고 말하지 말고, 아래 결과만으로 답하라. 결과가 오류라면 오류라고 "
                             "명확히 알리고 다음 행동을 제안하라.",
@@ -8022,7 +8143,7 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                     joined = "\n\n".join(f"[{n} 결과]\n{v}" for n, v in results)
                     try:
                         final = (await _llm_text(
-                            _chat_llm_of(app),
+                            _turn_chat_llm(app),
                             "너는 도구 결과를 사용자에게 한국어로 정리해 주는 조수다. 도구를 다시 "
                             "호출하겠다고 말하지 말고, 아래 결과만으로 답하라.",
                             f"[사용자 질문]\n{req.message}\n\n{joined}")).strip()
@@ -9553,6 +9674,14 @@ def _chat_llm_health() -> dict:
             "ctx_probe_error": _chat_ctx_cache.get("probe_error"), "tool_cut": dict(_TOOL_CUT) or None}
 
 
+def _claude_chat_health() -> dict:
+    """/health 의 claude_chat — 꺼져 있으면 {"enabled": false}(켜려다 못 켰으면 까닭 · 키 파일 있음/읽음). 켜져 있으면 모델 · 대상(FOR) · effort ·
+    출력 상한 · 창 · 캐시 · 서버 대체 모델 · 키 파일(있음 · 읽음 · 권한) · 마지막 실패 · 넘김(대상 · 횟수 · 마지막 시각). 키 값 · 경로는 싣지 않는다."""
+    info = getattr(app.state, "claude_chat_info", None) or {"enabled": False}
+    return {**info, **({"fallback": dict(info["fallback"])} if "fallback" in info else {}),
+            **({"key_file": dict(info["key_file"])} if "key_file" in info else {})}
+
+
 def _external_llm_health() -> dict:
     """/health 의 외부 응답자 칸 — 꺼져 있으면 {}(종전 응답 그대로). 켜져 있으면 external_llm{ctx_tokens, max_tokens, wait_s,
     answer_s, call_worst_s, queued, claimed, evid_budget}. 수와 설정만 싣는다(과제 글·주인은 싣지 않는다 — /health 는 인증이
@@ -10199,6 +10328,8 @@ def health() -> dict:
         "sampling": getattr(app.state, "delib_sampling", None),
         # 챗 전용 LLM(CHAT_LLM_*) — 꺼져 있으면 {"enabled": false}(챗도 위 model · vllm). 켜져 있으면 넘김 횟수까지(docs/chat-llm-stcx).
         "chat_llm": _chat_llm_health(),
+        # 웹 챗의 Claude(CLAUDE_CHAT_*) — 꺼져 있으면 {"enabled": false}. 고른 사람의 챗 턴만 Claude 다(넘김은 위 기본 챗 길로).
+        "claude_chat": _claude_chat_health(),
         # 챗 자기검증 — 켜짐 · 상태별 수 · 걸린 ms · 마지막 실패(HA-13 — 포털 update-all §7 스모크가 읽는다)
         "self_check": _sc_health(),
         # 챗 상태 기다림 — 켜짐 · 간격 · 턴 합 상한 · 기동 뒤 시작한 기다림 · 끝 · 상한 · 실패(꼴 바뀜 포함) 수(HWAXPortal docs/request-1030 HA-28)
