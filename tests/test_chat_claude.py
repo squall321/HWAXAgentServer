@@ -170,6 +170,7 @@ def _boot(monkeypatch, tmp_path, claude=None, glm=None, **env):
     if st.claude_chat is not None:
         if claude is not None:
             st.claude_chat.runnable.hwax_http_client = httpx.AsyncClient(transport=httpx.MockTransport(claude))
+            st.claude_chat_pick.http_client = st.claude_chat.runnable.hwax_http_client     # 사람이 고른 쌍도 같은 가짜(CC-8)
         if glm is not None:
             _mock_openai(st.claude_chat.fallbacks[0], glm)
     return st
@@ -213,6 +214,7 @@ def _turn(monkeypatch, tmp_path, st, **req_kw) -> list:
     monkeypatch.setattr(a, "_model_context_tokens", ctx)
     for k, v in dict(llm=st.llm, chat_llm=st.chat_llm, chat_llm_info=st.chat_llm_info, chat_llm_cfg=st.chat_llm_cfg,
                      claude_chat=st.claude_chat, claude_chat_info=st.claude_chat_info, llm_nostream=st.llm_nostream,
+                     claude_chat_pick=getattr(st, "claude_chat_pick", None),
                      connections={"gateway": {"url": "http://gw/mcp", "headers": {"Authorization": "Bearer x"}}},
                      agent_cache={}, tool_degraded={}, tool_load_error={}, tool_snapshot={}, review_gate=None).items():
         monkeypatch.setattr(a.app.state, k, v, raising=False)
@@ -632,3 +634,117 @@ def test_Claude_턴의_토큰을_사람_종류_모델로_센다(monkeypatch, tmp
     # 입력은 캐시 읽기를 포함한 합이다(langchain usage_metadata 의 관례 — OpenAI prompt_tokens 와 같은 셈) — 12 + 5. 캐시 읽기는 따로 5.
     assert kind == "chat" and calls >= 1 and unknown == 0 and (tin, tout) == (17, 30) and _tc == 5, mine
 
+
+
+# ── 사람이 고르는 모델 · 생각 깊이(CC-8 — 사용자 요청 11-22) ──────────────────────────────────────────────────────────────
+
+HAIKU, SONNET = "claude-haiku-5-5", "claude-sonnet-5-5"
+
+
+@needs_anthropic
+@pytest.mark.parametrize("env,models,efforts,why", [
+    ({}, (MODEL,), ("low", "medium", "high", "xhigh", "max"), None),
+    ({"CLAUDE_CHAT_MODELS": f"{SONNET}, {HAIKU}"}, (MODEL, SONNET, HAIKU), None, None),
+    ({"CLAUDE_CHAT_MODELS": f"{HAIKU},{MODEL},{HAIKU}"}, (HAIKU, MODEL), None, None),
+    ({"CLAUDE_CHAT_EFFORTS": "high,medium"}, (MODEL,), ("medium", "high"), None),
+    ({"CLAUDE_CHAT_MODELS": "gpt-5"}, (), (), "모델 이름 꼴"),
+    ({"CLAUDE_CHAT_EFFORTS": "medium,ultra"}, (), (), "CLAUDE_CHAT_EFFORTS"),
+    ({"CLAUDE_CHAT_EFFORTS": "high,max"}, (), (), "CLAUDE_CHAT_EFFORTS 에 없다"),
+])
+def test_고를_수_있는_목록은_설정에서_닫힌_쪽으로_읽는다(monkeypatch, env, models, efforts, why):
+    import chat_claude as cc
+
+    for k in ("CLAUDE_CHAT_MODELS", "CLAUDE_CHAT_EFFORTS"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    got_m, got_e, got_why = cc.choices(MODEL, "medium")
+    assert (got_why is None) == (why is None) and (why is None or why in got_why), got_why
+    assert got_m == models, "적은 차례 · 기본이 없으면 맨 앞 · 겹침은 한 번"
+    if efforts is not None:
+        assert got_e == efforts, "effort 는 낮은 쪽부터 · 비면 다섯 다"
+
+
+@needs_anthropic
+def test_모르는_목록이면_끄고_까닭을_남긴다(monkeypatch, tmp_path):
+    st = _boot(monkeypatch, tmp_path, CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_MODELS="opus")
+    assert st.claude_chat is None and st.claude_chat_pick is None and "CLAUDE_CHAT_MODELS" in st.claude_chat_info["error"]
+
+
+@needs_anthropic
+def test_Haiku_에는_서버_대체_모델을_싣지_않는다(monkeypatch, tmp_path):
+    st = _boot(monkeypatch, tmp_path, CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_MODELS=f"{MODEL},{SONNET},{HAIKU}")
+    assert st.claude_chat_info["models"] == [MODEL, SONNET, HAIKU] and st.claude_chat_info["no_server_fallback"] == [HAIKU]
+    h = st.claude_chat_pick.get(HAIKU, "low").runnable
+    assert h.model == HAIKU and h.output_config == {"effort": "low"}
+    assert h.betas == ["thinking-binding-controls-2026-08-01"] and "fallbacks" not in h.model_kwargs, \
+        "Haiku 5.5 는 fallbacks 를 400 으로 거절한다 — 칸도 beta 머리도 싣지 않는다"
+    so = st.claude_chat_pick.get(SONNET, "high").runnable
+    assert so.model_kwargs.get("fallbacks") == "default" and "server-side-fallback-2026-07-01" in so.betas
+    assert st.claude_chat_pick.get(MODEL, "medium") is st.claude_chat, "기본 쌍은 기동 때 지은 그것"
+    assert st.claude_chat_pick.get(HAIKU, "low") is st.claude_chat_pick.get(HAIKU, "low"), "한 번 지은 쌍은 다시 쓴다"
+    assert st.claude_chat_pick.get(HAIKU, "low").fallbacks == st.claude_chat.fallbacks, "넘김 대상은 같은 기본 챗 길"
+
+
+@needs_anthropic
+def test_고른_모델과_생각_깊이로_묻고_답_아래에_그_값이_보인다(monkeypatch, tmp_path):
+    claude = _Claude([_message(_text(0, "짧은 답."), model=HAIKU)])
+    st = _boot(monkeypatch, tmp_path, claude, _OpenAI([]), CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_MODELS=f"{MODEL},{HAIKU}",
+               CLAUDE_CHAT_FOR="all", CHAT_SELF_CHECK="0")
+    evs = _turn(monkeypatch, tmp_path, st, claude_model=HAIKU, claude_effort="low")
+    (h, b), = claude.seen
+    assert b["model"] == HAIKU and b["output_config"] == {"effort": "low"} and "fallbacks" not in b
+    assert "server-side-fallback" not in h["anthropic-beta"]
+    meta = [d for e, d in evs if e == "meta"][-1]
+    assert meta["chat_model"] == HAIKU and meta["effort"] == "low" and meta["thinking"] is True and "claude_note" not in meta, \
+        "답 옆의 생각 깊이는 Claude 가 고른 값이다(종전에는 Qwen 의 값이 실렸다)"
+
+
+@needs_anthropic
+def test_목록_밖의_값은_기본으로_돌고_알린다(monkeypatch, tmp_path):
+    claude = _Claude([_message(_text(0, "답."))])
+    st = _boot(monkeypatch, tmp_path, claude, _OpenAI([]), CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_EFFORTS="low,medium",
+               CLAUDE_CHAT_FOR="all", CHAT_SELF_CHECK="0")
+    evs = _turn(monkeypatch, tmp_path, st, claude_model="claude-fable-5-2", claude_effort="max")
+    (_h, b), = claude.seen
+    assert b["model"] == MODEL and b["output_config"] == {"effort": "medium"}, "목록 밖은 짐작하지 않고 박스 기본"
+    meta = [d for e, d in evs if e == "meta"][-1]
+    assert meta["chat_model"] == MODEL and meta["effort"] == "medium"
+    assert "claude-fable-5-2" in meta["claude_note"] and "max" in meta["claude_note"], meta
+
+
+@needs_anthropic
+def test_고르지_않으면_기본이고_고르는_사람이_아니면_고른_값을_읽지_않는다(monkeypatch, tmp_path):
+    claude = _Claude([_message(_text(0, "답."))])
+    st = _boot(monkeypatch, tmp_path, claude, _OpenAI([]), CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_MODELS=f"{MODEL},{HAIKU}",
+               CHAT_SELF_CHECK="0")
+    _turn(monkeypatch, tmp_path, st)
+    assert claude.bodies[0]["model"] == MODEL and claude.bodies[0]["output_config"] == {"effort": "medium"}
+    app_ = types.SimpleNamespace(state=st)
+    req = a.ChatRequest(message="q", user_email="kim@corp.test", entitlements=["feat:thinking"], claude_model=HAIKU)
+    assert a._claude_choice(app_, req) is None and a._claude_for(app_, req) is None, "권한 없는 사람의 고른 값은 Claude 를 열지 않는다"
+
+
+def test_캐시_열쇠의_Claude_칸은_고른_쌍마다_다르다():
+    tok = a._turn_claude_pick.set((HAIKU, "low", None))
+    try:
+        assert a._claude_key_slot() == f"claude:{HAIKU}:low"
+    finally:
+        a._turn_claude_pick.reset(tok)
+    assert a._claude_key_slot() == "claude", "고른 쌍이 없는 턴(시험의 가짜 턴)은 종전 칸"
+
+
+@needs_anthropic
+def test_chat_models_는_고를_목록만_싣고_키는_없다(monkeypatch, tmp_path):
+    st = _boot(monkeypatch, tmp_path)
+    monkeypatch.setattr(a.app.state, "claude_chat_info", st.claude_chat_info, raising=False)
+    assert a.chat_models() == {"claude": {"enabled": False}}
+    st = _boot(monkeypatch, tmp_path, CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_MODELS=f"claude-fable-5-2,{MODEL},{HAIKU}",
+               CLAUDE_CHAT_EFFORT="high")
+    monkeypatch.setattr(a.app.state, "claude_chat_info", st.claude_chat_info, raising=False)
+    got = a.chat_models()
+    assert got == {"claude": {"enabled": True, "for": "feat:chat-claude",
+                              "models": [{"id": "claude-fable-5-2", "label": "Claude Fable 5.2"},
+                                         {"id": MODEL, "label": "Claude Opus 5.5"}, {"id": HAIKU, "label": "Claude Haiku 5.5"}],
+                              "efforts": ["low", "medium", "high", "xhigh", "max"], "default_model": MODEL, "default_effort": "high"}}
+    assert FAKE_KEY not in json.dumps(got) and "key_file" not in json.dumps(got)

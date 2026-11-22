@@ -900,19 +900,29 @@ for `CHAT_LLM_*`. It goes through the official Anthropic SDK (`langchain-anthrop
 
 | var | default | meaning |
 |---|---|---|
-| `CLAUDE_CHAT_MODEL` | _(unset)_ | unset = off, nothing changes and the package is not imported. The box `.env` writes `claude-opus-5-5` |
+| `CLAUDE_CHAT_MODEL` | _(unset)_ | unset = off, nothing changes and the package is not imported. The box `.env` writes `claude-opus-5-5`. The model used when the person did not pick one |
+| `CLAUDE_CHAT_MODELS` | _(unset)_ | models a person may pick in the web chat composer (comma-separated, shown in this order). Unset = only `CLAUDE_CHAT_MODEL`. The default model is put first when it is missing. A value that is not shaped `claude-…` = off |
 | `CLAUDE_CHAT_API_KEY_FILE` | _(unset)_ | path of a `0600` file that holds the API key, read once at start. Missing, unreadable or empty = off, with the reason in `/health` and the log. The key value and the path are never logged or shown |
 | `CLAUDE_CHAT_FOR` | `feat:chat-claude` | who gets Claude: `all`, or only people whose portal entitlements carry `feat:chat-claude` (granted one by one — not part of `"*"`). Any other value = off |
-| `CLAUDE_CHAT_EFFORT` | `medium` | `output_config.effort` (`low` · `medium` · `high` · `xhigh` · `max`). Thinking cannot be turned off on Opus 5.5; effort is the only control |
+| `CLAUDE_CHAT_EFFORT` | `medium` | `output_config.effort` (`low` · `medium` · `high` · `xhigh` · `max`). Thinking cannot be turned off on Opus 5.5; effort is the only control. The effort used when the person did not pick one |
+| `CLAUDE_CHAT_EFFORTS` | _(all five)_ | efforts a person may pick (comma-separated). Must contain `CLAUDE_CHAT_EFFORT`; an unknown value = off |
 | `CLAUDE_CHAT_MAX_TOKENS` | `64000` | output cap (thinking + answer); the same amount is kept free in the turn's window |
 | `CLAUDE_CHAT_CONTEXT_TOKENS` | `1000000` | the Claude turn's window (no `/v1/models` probe) |
-| `CLAUDE_CHAT_SERVER_FALLBACK` | `1` | on a refusal Anthropic retries on another Claude model (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). `0` = off |
+| `CLAUDE_CHAT_SERVER_FALLBACK` | `1` | on a refusal Anthropic retries on another Claude model (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`). `0` = off. Never sent to Haiku models (Haiku 5.5 has no server-side fallback and answers a `fallbacks` field with 400) |
 
 **Who.** A chat turn uses Claude only when Claude is on, the request carries the portal's entitlements and a user
 email, and `CLAUDE_CHAT_FOR` is `all` or the entitlements contain `feat:chat-claude`. Calls without entitlements (the
 portal's report builder, older callers) stay on the box's default path. Only the web chat turn moves — the ReAct agent,
 the in-turn tool planners and that turn's self-check. Thinking mode, deliberation, card review and the routine executor
 keep `_chat_llm_of`. The agent cache key carries the choice, so a Qwen-built agent is never reused for a Claude turn.
+**Picking a model and effort.** The portal reads `GET /chat-models` (the box lists — model ids with labels, efforts,
+defaults; no key or error fields) and shows a picker in the composer to people who get Claude. The chat request carries
+`claude_model` · `claude_effort`; a value outside the box lists is not guessed — the turn runs on the box default and the
+turn `meta` carries `claude_note`. Each (model, effort) pair is built on first use and kept (at most models × 5); the
+agent cache key slot is `claude:<model>:<effort>`. The turn `meta` reports the picked model and effort (it used to carry
+the chat LLM's effort even on a Claude turn). All Claude 5.x models that can be picked today have a 1M window and 128K
+output, so one `CLAUDE_CHAT_CONTEXT_TOKENS` serves them all. `claude-fable-5-2` requires 30-day retention — an org with
+zero data retention gets a 400 there.
 **Request.** No `temperature` / `top_p` / `top_k` (400 on these models); `thinking: {type: adaptive, display: summarized}`
 so the summary streams into the "thinking" pane; top-level `cache_control: {type: ephemeral}` (automatic prompt caching
 — within a turn the tool loop only appends, so each call reads the previous prefix) plus a marker on the system block
@@ -932,7 +942,8 @@ connection error, timeout, 429, 401/403 or 5xx (incl. 529). 400 is not retried e
 `CLAUDE_CHAT_CONTEXT_TOKENS − CLAUDE_CHAT_MAX_TOKENS` (not the smaller of both windows — the fallback is for outages, and
 on dev it would shrink Claude to the 128K base); a fallback request larger than the default path's window fails there
 with its own 400. **`/health` `claude_chat`:** model, `for`, effort, max_tokens, ctx_tokens, cache, server_fallback,
-`key_file {present, read, mode}`, last error, fallback `{enabled, to, count, last_at}`.
+`key_file {present, read, mode}`, last error, fallback `{enabled, to, count, last_at}`, `models`, `efforts`,
+`no_server_fallback` (picked models that get no `fallbacks` field).
 
 **Install (only on a box that turns it on)** — kept out of `requirements.txt` so `update-all` never tries to fetch it
 elsewhere; the pinned versions keep `langchain-core` 1.4.7:
@@ -948,11 +959,14 @@ dev `.env`:
 CLAUDE_CHAT_MODEL=claude-opus-5-5
 CLAUDE_CHAT_API_KEY_FILE=/home/<user>/.config/hwax/anthropic.key
 CLAUDE_CHAT_FOR=all
+CLAUDE_CHAT_MODELS=claude-opus-5-5,claude-fable-5-2,claude-sonnet-5-5,claude-haiku-5-5
+# CLAUDE_CHAT_EFFORTS=low,medium,high,xhigh,max
 # CLAUDE_CHAT_EFFORT=medium   CLAUDE_CHAT_MAX_TOKENS=64000   CLAUDE_CHAT_CONTEXT_TOKENS=1000000   CLAUDE_CHAT_SERVER_FALLBACK=1
 ```
 
 **Cost.** Claude Opus 5.5 is $4 per 1M input tokens and $20 per 1M output tokens (thinking counts as output); cache reads
-are $0.20 per 1M (cache writes cost more than plain input). A chat turn re-sends the whole prompt — tools, system,
+are $0.20 per 1M (cache writes cost more than plain input). Per 1M input / output: Fable 5.2 $8 / $40, Sonnet 5.5 $2 / $10,
+Haiku 5.5 $0.10 / $0.50 (prompts of 100K tokens or less). Higher effort means more thinking tokens. A chat turn re-sends the whole prompt — tools, system,
 history, documents, tool results — on every tool round trip, and a 1M window lets the history budget grow with it, so a
 long tool-heavy turn can cost dollars. Caching makes the repeats cheap within a turn; across turns only the stable front
 (tools · system) is shared. Watch the Anthropic console usage after turning it on for many people. Tests:

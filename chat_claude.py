@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections.abc import AsyncIterator, Iterator
 from functools import cached_property
 from pathlib import Path
@@ -80,6 +81,40 @@ def settings() -> tuple[dict, str | None]:
     if max_tokens * 2 > ctx:
         return cfg, f"CLAUDE_CHAT_MAX_TOKENS({max_tokens:,})가 창(CLAUDE_CHAT_CONTEXT_TOKENS {ctx:,})의 절반보다 크다"
     return cfg, None
+
+
+_MODEL_RE = re.compile(r"claude-[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def _split(raw: str) -> list[str]:
+    return [x for x in (p.strip() for p in raw.replace(";", ",").split(",")) if x]
+
+
+def choices(default_model: str, default_effort: str) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    """사람이 웹 챗에서 고를 수 있는 (모델들, effort 들, 켜지 못하는 까닭 또는 None) — CLAUDE_CHAT_MODELS · CLAUDE_CHAT_EFFORTS(쉼표).
+    모델은 적은 차례대로이고 기본 모델(CLAUDE_CHAT_MODEL)이 없으면 맨 앞에 둔다 — 비면 기본 하나뿐이다(운영 박스는 운영자가 적어야 넓어진다).
+    effort 는 비면 다섯 다(low ~ max — 지금 고를 수 있는 Claude 5.x 모델은 모두 다섯을 받는다). 모르는 값은 짐작하지 않고 끈다(닫힌 쪽)."""
+    listed = [m.lower() for m in _split(os.environ.get("CLAUDE_CHAT_MODELS") or "")]
+    for m in listed:
+        if len(m) > 64 or not _MODEL_RE.fullmatch(m):
+            return (), (), f"CLAUDE_CHAT_MODELS 의 {m!r} 는 모델 이름 꼴(claude-…)이 아니다"
+    models = tuple(dict.fromkeys(listed if default_model in listed else [default_model, *listed]))
+    raw_e = [e.lower() for e in _split(os.environ.get("CLAUDE_CHAT_EFFORTS") or "")]
+    for e in raw_e:
+        if e not in EFFORTS:
+            return (), (), f"CLAUDE_CHAT_EFFORTS 의 {e!r} 를 모른다 — {' · '.join(EFFORTS)}"
+    efforts = tuple(e for e in EFFORTS if e in raw_e) if raw_e else EFFORTS
+    if default_effort not in efforts:
+        return (), (), f"CLAUDE_CHAT_EFFORT={default_effort!r} 가 CLAUDE_CHAT_EFFORTS 에 없다"
+    return models, efforts, None
+
+
+def server_fallback_ok(model: str) -> bool:
+    """그 모델이 서버 쪽 대체 모델(fallbacks)을 받는가 — Haiku 는 받지 않는다(Haiku 5.5 — 'no server-side fallback', fallbacks 를 실으면 400).
+    Opus 5.5 · Sonnet 5.5 · Fable 5.2 는 받는다. 받지 않는 모델에는 그 칸과 beta 머리를 싣지 않는다(거절은 종전처럼 본문에 까닭을 남긴다)."""
+    return not model.startswith("claude-haiku-")
+
+
 
 
 def read_key(path: str) -> tuple[str | None, dict, str | None]:
@@ -273,17 +308,19 @@ class ClaudeChatLLM(ChatAnthropic):
 
 
 def build(*, model: str, key: str, cfg: dict, timeout, read_s: float, callbacks: list | None = None,
-          http_client: Any = None) -> ClaudeChatLLM:
+          http_client: Any = None, effort: str | None = None) -> ClaudeChatLLM:
     """설정으로 Claude 챗 모델을 짓는다. temperature · top_p · top_k 는 싣지 않는다(이 모델들에서 400). 생각은 끌 수 없어(Opus 5.5) 늘 adaptive 이고
-    깊이는 effort 하나다. 생각 요약을 받아 화면의 '생각 중' 칸에 낸다(display summarized — 기본은 빈 생각 글). 생각 블록이 묶인 대화가 앱의
-    루프 맞추기 · 도구 그림 재배치로 바뀌면 400 대신 그 블록만 버리게 한다(block_binding drop_block — beta 머리가 함께 가야 한다)."""
-    betas = [THINKING_BETA] + ([FALLBACK_BETA] if cfg["server_fallback"] else [])
+    깊이는 effort 하나다(effort 를 주면 그 값 — 사람이 고른 것, 없으면 박스 기본 CLAUDE_CHAT_EFFORT). 생각 요약을 받아 화면의 '생각 중' 칸에
+    낸다(display summarized — 기본은 빈 생각 글). 생각 블록이 묶인 대화가 앱의 루프 맞추기 · 도구 그림 재배치로 바뀌면 400 대신 그 블록만 버리게
+    한다(block_binding drop_block — beta 머리가 함께 가야 한다). 서버 대체 모델은 받는 모델에만 싣는다(server_fallback_ok)."""
+    sfb = cfg["server_fallback"] and server_fallback_ok(model)
+    betas = [THINKING_BETA] + ([FALLBACK_BETA] if sfb else [])
     extra: dict = {"cache_control": dict(CACHE)}
-    if cfg["server_fallback"]:
+    if sfb:
         extra["fallbacks"] = "default"
     return ClaudeChatLLM(
         model=model, api_key=key, max_tokens=cfg["max_tokens"], streaming=True, stream_usage=True, max_retries=1,
         default_request_timeout=read_s if read_s > 0 else None,
         thinking={"type": "adaptive", "display": "summarized", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
-        output_config={"effort": cfg["effort"]}, betas=betas, model_kwargs=extra,
+        output_config={"effort": effort or cfg["effort"]}, betas=betas, model_kwargs=extra,
         hwax_timeout=timeout, hwax_http_client=http_client, callbacks=list(callbacks or []) or None)

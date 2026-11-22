@@ -989,14 +989,19 @@ def _chat_llm_of(app_) -> object:
 # 고르는 범위는 웹 챗 턴(ReAct · 챗 안 도구 계획 · 그 턴의 자기검증)뿐이다 — 띵킹 · 심의 · 카드 대조 · 루틴 실행기는 _chat_llm_of 그대로다.
 # 넘김은 호출 단위로 그 박스의 기본 챗 길(챗 전용 LLM 이 있으면 그것 — Qwen → GLM, 없으면 VLLM_*)이다 — 연결 실패 · 시간 초과 · 429 ·
 # 401/403 · 5xx(chat_claude.FALLBACK_ERRORS). 400 은 넘기지 않는다(설정 오류를 숨기지 않는다).
-#   CLAUDE_CHAT_MODEL            비면 꺼짐. 켤 때의 값(claude-opus-5-5)은 박스 .env 가 적는다
+#   CLAUDE_CHAT_MODEL            비면 꺼짐. 켤 때의 값(claude-opus-5-5)은 박스 .env 가 적는다 — 사람이 고르지 않으면 이 모델
+#   CLAUDE_CHAT_MODELS           사람이 웹 챗에서 고를 수 있는 모델(쉼표) — 비면 CLAUDE_CHAT_MODEL 하나뿐(운영 박스는 운영자가 적어야 넓어진다)
 #   CLAUDE_CHAT_API_KEY_FILE     0600 키 파일 경로 — 기동 때 한 번 읽는다(못 읽으면 끄고 까닭을 /health · 로그에 — 키 값은 어디에도 찍지 않는다)
 #   CLAUDE_CHAT_FOR              all | feat:chat-claude(기본) — 모르는 값이면 끈다
-#   CLAUDE_CHAT_EFFORT           low · medium(기본) · high · xhigh · max — 생각 깊이(Opus 5.5 는 생각을 끌 수 없다)
+#   CLAUDE_CHAT_EFFORT           low · medium(기본) · high · xhigh · max — 생각 깊이(Opus 5.5 는 생각을 끌 수 없다) — 사람이 고르지 않으면 이 값
+#   CLAUDE_CHAT_EFFORTS          사람이 고를 수 있는 effort(쉼표) — 비면 다섯 다
 #   CLAUDE_CHAT_MAX_TOKENS       기본 64000 — 출력 상한(생각 + 답). 챗 턴 창에서 같은 몫을 비운다
-#   CLAUDE_CHAT_CONTEXT_TOKENS   기본 1,000,000 — Claude 턴의 창(/v1/models 탐침은 부르지 않는다)
-#   CLAUDE_CHAT_SERVER_FALLBACK  기본 1 — 거절(refusal)이면 Anthropic 서버가 다른 Claude 로 다시 돈다(fallbacks: default). 0 이면 끈다
+#   CLAUDE_CHAT_CONTEXT_TOKENS   기본 1,000,000 — Claude 턴의 창(/v1/models 탐침은 부르지 않는다 — 고를 수 있는 5.x 모델은 모두 1M · 출력 128K)
+#   CLAUDE_CHAT_SERVER_FALLBACK  기본 1 — 거절(refusal)이면 Anthropic 서버가 다른 Claude 로 다시 돈다(fallbacks: default). 0 이면 끈다.
+#                                받지 않는 모델(Haiku)에는 싣지 않는다(chat_claude.server_fallback_ok)
 _turn_claude: contextvars.ContextVar = contextvars.ContextVar("turn_claude", default=None)
+# 이 턴이 고른 (모델, effort, 알림 또는 None) — 에이전트 캐시 열쇠 · 턴 끝 meta(답한 모델 옆 생각 깊이)가 읽는다. Claude 턴이 아니면 None.
+_turn_claude_pick: contextvars.ContextVar = contextvars.ContextVar("turn_claude_pick", default=None)
 
 
 class _ClaudeWatch(BaseCallbackHandler):
@@ -1024,22 +1029,25 @@ class _ClaudeWatch(BaseCallbackHandler):
 
 def _build_claude_chat(base_chat, mk, *, temperature: float, max_tokens: int, timeout_s: float, base_effort: str,
                        base_retries: int, conn_to: float, base_label: str):
-    """(Claude 챗 LLM — 넘김 포함 · 꺼져 있으면 None, /health 에 실을 상태). base_chat 은 켜져 있는 챗 전용 LLM(없으면 None — 그때는 VLLM_*
+    """(Claude 챗 LLM — 넘김 포함 · 꺼져 있으면 None, /health 에 실을 상태, 사람이 고른 쌍의 LLM 을 내는 _ClaudePicker 또는 None). base_chat 은 켜져 있는 챗 전용 LLM(없으면 None — 그때는 VLLM_*
     를 그림 막이(_VisionGuardLLM)로 새로 짓는다: Claude 턴은 그림을 싣고 넘어가므로)."""
     model = (os.environ.get("CLAUDE_CHAT_MODEL") or "").strip()
     if not model:
-        return None, {"enabled": False}
+        return None, {"enabled": False}, None
 
     def off(why: str, **more) -> tuple:
         info = {"enabled": False, "model": model, "error": why, **more}
         print(f"[agent] ⚠ Claude 챗을 켜지 못했다 — {why} (그 사람들도 기본 챗 길로 간다)")
-        return None, info
+        return None, info, None
     try:
         import chat_claude as _cc  # noqa: PLC0415 — 켰을 때만 들인다(requirements-anthropic.txt)
     except ImportError as exc:
         return off(f"langchain-anthropic 을 들이지 못했다({getattr(exc, 'name', None) or type(exc).__name__}) — "
                    "requirements-anthropic.txt 를 설치한다")
     cfg, why = _cc.settings()
+    if why:
+        return off(why)
+    models, efforts, why = _cc.choices(model, cfg["effort"])
     if why:
         return off(why)
     key, key_info, why = _cc.read_key(os.environ.get("CLAUDE_CHAT_API_KEY_FILE") or "")
@@ -1052,31 +1060,93 @@ def _build_claude_chat(base_chat, mk, *, temperature: float, max_tokens: int, ti
     info: dict = {"enabled": True, "model": model, "for": cfg["for"], "effort": cfg["effort"], "max_tokens": cfg["max_tokens"],
                   "ctx_tokens": cfg["ctx_tokens"], "thinking": "adaptive · summarized", "cache": "auto(ephemeral)",
                   "server_fallback": "default" if cfg["server_fallback"] else None, "key_file": key_info,
+                  "models": list(models), "efforts": list(efforts),
+                  "no_server_fallback": [m for m in models if not _cc.server_fallback_ok(m)] if cfg["server_fallback"] else [],
                   "last_error": None, "last_error_at": None,
                   "fallback": {"enabled": True, "to": base_label, "count": 0, "last_at": None}}
     tmo = httpx.Timeout(timeout_s if timeout_s > 0 else None, connect=conn_to if conn_to > 0 else None)
-    primary = _cc.build(model=model, key=key, cfg=cfg, timeout=tmo, read_s=timeout_s,
-                        callbacks=[_ClaudeWatch(info, _cc.FALLBACK_ERRORS)])
-    # 사람별 LLM 토큰 기록기(usage_tokens — OD-52 ~ 57)도 단다. 두 갈래가 나란히 지어져 기록기는 OpenAI 꼴 LLM 을 짓는 _mk_llm 에만 붙었고,
-    # Claude 턴의 토큰은 세지 않았다(dev 11-22 — Claude 로 두 턴을 돌렸는데 recorded 0). 응답의 usage_metadata 를 call_trace._usage 가 읽는다.
-    primary = _usage_tokens.instrument(_call_trace.instrument_llm(primary, _call_trace.server_label(primary.anthropic_api_url)), model)
     fb = base_chat if base_chat is not None else mk(temperature, max_tokens, base_effort, timeout_s, base_retries,
                                                      cls=_VisionGuardLLM)
-    chat = primary.with_fallbacks([fb], exceptions_to_handle=_cc.FALLBACK_ERRORS)
+
+    def make(m: str, eff: str, http_client=None):
+        primary = _cc.build(model=m, key=key, cfg=cfg, effort=eff, timeout=tmo, read_s=timeout_s,
+                            callbacks=[_ClaudeWatch(info, _cc.FALLBACK_ERRORS)], http_client=http_client)
+        # 사람별 LLM 토큰 기록기(usage_tokens — OD-52 ~ 57)도 단다. 두 갈래가 나란히 지어져 기록기는 OpenAI 꼴 LLM 을 짓는 _mk_llm 에만 붙었고,
+        # Claude 턴의 토큰은 세지 않았다(dev 11-22 — Claude 로 두 턴을 돌렸는데 recorded 0). 응답의 usage_metadata 를 call_trace._usage 가 읽는다.
+        primary = _usage_tokens.instrument(_call_trace.instrument_llm(primary, _call_trace.server_label(primary.anthropic_api_url)), m)
+        return primary.with_fallbacks([fb], exceptions_to_handle=_cc.FALLBACK_ERRORS)
+
+    chat = make(model, cfg["effort"])
+    picker = _ClaudePicker(make, (model, cfg["effort"]), chat)
     print(f"[agent] Claude 챗 — {model} · 대상 {cfg['for']} · 생각 adaptive(effort {cfg['effort']}) · 출력 상한 {cfg['max_tokens']:,} · "
-          f"창 {cfg['ctx_tokens']:,} · 서버 대체 모델 {'켬' if cfg['server_fallback'] else '끔'} · 넘김 → {base_label}"
-          " (띵킹 · 심의 · 카드 대조 · 루틴은 그대로)")
-    return chat, info
+          f"창 {cfg['ctx_tokens']:,} · 서버 대체 모델 {'켬' if cfg['server_fallback'] else '끔'} · 넘김 → {base_label} · "
+          f"고를 수 있는 모델 {', '.join(models)} · effort {', '.join(efforts)} (띵킹 · 심의 · 카드 대조 · 루틴은 그대로)")
+    return chat, info, picker
+
+
+class _ClaudePicker:
+    """사람이 고른 (모델, effort) → 넘김을 단 Claude 챗 LLM. 처음 고를 때 짓고 둔다 — 박스 목록 안의 쌍만 오므로 많아야 모델 수 × 다섯이다.
+    기본 쌍은 기동 때 지은 app.state.claude_chat 그대로다. http_client 는 시험 이음매(가짜 전송) — None 이면 각자 만든다."""
+
+    def __init__(self, make, default: tuple[str, str], chat) -> None:
+        self._make, self.default, self.http_client = make, default, None
+        self._built: dict[tuple[str, str], object] = {default: chat}
+
+    def get(self, model: str, effort: str):
+        key = (model, effort)
+        got = self._built.get(key)
+        if got is None:
+            got = self._built[key] = self._make(model, effort, self.http_client)
+        return got
+
+    def built(self) -> list[str]:
+        return [f"{m}:{e}" for m, e in self._built]
+
+
+def _claude_eligible(app_, req) -> bool:
+    """이 챗 요청이 Claude 를 쓰는가 — 켜져 있고, 포털이 실은 요청 시점 권한(entitlements)과 사람 신원(user_email)이 있고, 대상이 all 이거나
+    그 사람이 feat:chat-claude 를 가졌을 때만. 권한 칸이 없는 옛 호출(포털이 싣지 않은 길 — 보고서 만들기 등)은 주지 않는다(닫힌 쪽)."""
+    if getattr(app_.state, "claude_chat", None) is None or req.entitlements is None or not (req.user_email or "").strip():
+        return False
+    who = (getattr(app_.state, "claude_chat_info", None) or {}).get("for")
+    return who == "all" or "feat:chat-claude" in req.entitlements
+
+
+def _claude_choice(app_, req) -> tuple[str, str, str | None] | None:
+    """이 턴의 (모델, effort, 알림 또는 None) — Claude 턴이 아니면 None. 사람이 고른 값(claude_model · claude_effort)이 박스 목록
+    (CLAUDE_CHAT_MODELS · CLAUDE_CHAT_EFFORTS)에 없으면 짐작하지 않고 박스 기본으로 돌고 알림을 단다(답 아래 모델 표시에 보인다). 비면 기본이다."""
+    if not _claude_eligible(app_, req):
+        return None
+    info = getattr(app_.state, "claude_chat_info", None) or {}
+    dm, de = info.get("model"), info.get("effort")
+    models, efforts = info.get("models") or [dm], info.get("efforts") or [de]
+    m = (req.claude_model or "").strip().lower() or dm
+    e = (req.claude_effort or "").strip().lower() or de
+    notes = []
+    if m not in models:
+        notes.append(f"고른 모델({m[:64]})은 이 박스에서 고를 수 없어 기본 모델({dm})로 답했다")
+        m = dm
+    if e not in efforts:
+        notes.append(f"고른 생각 깊이({e[:16]})는 이 박스에서 고를 수 없어 기본({de})으로 답했다")
+        e = de
+    return m, e, " · ".join(notes) or None
 
 
 def _claude_for(app_, req) -> object | None:
-    """이 챗 요청이 Claude 를 쓰는가 — 켜져 있고, 포털이 실은 요청 시점 권한(entitlements)과 사람 신원(user_email)이 있고, 대상이 all 이거나
-    그 사람이 feat:chat-claude 를 가졌을 때만. 권한 칸이 없는 옛 호출(포털이 싣지 않은 길 — 보고서 만들기 등)은 주지 않는다(닫힌 쪽)."""
-    claude = getattr(app_.state, "claude_chat", None)
-    if claude is None or req.entitlements is None or not (req.user_email or "").strip():
+    """이 챗 턴의 Claude LLM(넘김 포함) — 고르는 사람이 아니면 None(_claude_eligible). 고른 쌍(_claude_choice)의 LLM 을 낸다 — 고르는 틀
+    (_ClaudePicker)이 없는 상태(시험의 가짜 상태)면 기동 때 지은 기본 LLM 이다."""
+    if not _claude_eligible(app_, req):
         return None
-    who = (getattr(app_.state, "claude_chat_info", None) or {}).get("for")
-    return claude if who == "all" or "feat:chat-claude" in req.entitlements else None
+    claude = app_.state.claude_chat
+    picker = getattr(app_.state, "claude_chat_pick", None)
+    pick = _claude_choice(app_, req)
+    return picker.get(pick[0], pick[1]) if picker is not None and pick is not None else claude
+
+
+def _claude_key_slot() -> str:
+    """에이전트 캐시 열쇠의 Claude 칸 — 고른 쌍이 있으면 'claude:<모델>:<effort>', 없으면(시험의 가짜 턴) 'claude'."""
+    pick = _turn_claude_pick.get()
+    return f"claude:{pick[0]}:{pick[1]}" if pick else "claude"
 
 
 def _turn_chat_llm(app_) -> object:
@@ -1204,7 +1274,7 @@ async def lifespan(app: FastAPI):
                               else disable_stream)
     # 웹 챗의 Claude(CLAUDE_CHAT_*) — 비면 None(바뀌는 것 없음). 넘겨받는 쪽은 이 박스의 기본 챗 길이다.
     _chat_on = bool(app.state.chat_llm_info.get("enabled"))
-    app.state.claude_chat, app.state.claude_chat_info = _build_claude_chat(
+    app.state.claude_chat, app.state.claude_chat_info, app.state.claude_chat_pick = _build_claude_chat(
         app.state.chat_llm if _chat_on else None, _mk_llm, temperature=base_t, max_tokens=base_mt, timeout_s=base_to,
         base_effort=base_eff, base_retries=base_rt, conn_to=conn_to,
         base_label=app.state.chat_llm_info["model"] if _chat_on else VLLM_MODEL)
@@ -1370,6 +1440,10 @@ class ChatRequest(BaseModel):
     # MCP Apps 패널을 그릴 수 있다는 표지(HWAXPortal docs/request-1027 HA-20) — 포털이 박스 손잡이(MCP_APPS_HOST) · feat:panels · 화면의 표지가
     # 다 있을 때만 "mcp-apps/1" 을 싣는다. 그 턴만 패널 도구를 묶고 ui_resource 를 낸다(_ui_host). 비거나 다른 값이면 HA-05 그대로다.
     ui_host: str = ""
+    # 웹 챗 Claude 의 모델 · 생각 깊이(사람이 입력창에서 고른 것 — HWAXPortal docs/chat-llm-claude CC-8). Claude 턴에서만 읽고 박스 목록
+    # (CLAUDE_CHAT_MODELS · CLAUDE_CHAT_EFFORTS) 밖이면 기본으로 돈다(_claude_choice). 비면 박스 기본이다. Claude 턴이 아니면 읽지 않는다.
+    claude_model: str = ""
+    claude_effort: str = ""
 
 
 # 기능 권한 이름(사람용) — 포털 access.yaml 의 label 과 같다.
@@ -5031,13 +5105,14 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # 어휘표의 입구 쌍(온톨로지 먼저 — HWAXPortal docs/ontology-first)도 키에 든다 — 입구 표지는 묶을 때 도구 설명에 달려(_prep_tool(chat=True)), 덧씌우기로
     # 입구를 켜고 끄면 묶음을 새로 지어야 규칙 ⑧(턴마다 짓는 시스템 프롬프트)과 표지가 어긋나지 않는다. 입구가 없는 박스(기본)는 늘 빈 것이다.
     # ⚠ 고른 챗 모델(Claude 턴 — _turn_claude)도 키에 든다 — 빼면 기본 챗 길로 지은 에이전트를 Claude 사람이 재사용하거나 그 반대가 된다.
-    #   Claude 턴에만 칸이 하나 붙고(자격증명 해시 앞) 기본 턴의 키는 종전 그대로다.
+    #   Claude 턴에만 칸이 하나 붙고(자격증명 해시 앞) 기본 턴의 키는 종전 그대로다. 사람이 고른 쌍(_turn_claude_pick)이 있으면 그 칸이
+    #   'claude:<모델>:<effort>' 다 — 에이전트는 지을 때의 LLM 을 묶으므로 쌍마다 따로다(CC-8).
     key = (frozenset(groups), pin_key, q_key,
            tuple(sorted(sources)) if sources is not None else None,
            (user or "").strip().lower(),
            _onto_entries(),
            bool(allow_panels),
-           *(("claude",) if _turn_claude.get() is not None else ()),
+           *((_claude_key_slot(),) if _turn_claude.get() is not None else ()),
            hashlib.sha256((user_pat or "").encode()).hexdigest()[:16])
     # 스냅샷 폴백도 표지별로 — 섞이면 같은 구멍이다. 입구 쌍도 든다 — 없으면 입구를 켠 뒤 게이트웨이가 불통일 때 켜기 전에 지은(표지 없는) 묶음이
     # 규칙 ⑧ 과 함께 돌았다(반대 검토 11-02 — HWAXPortal docs/ontology-first OF-24). 입구가 다를 때 지은 스냅샷은 쓰지 않는다(그 턴은 도구 없이 돈다).
@@ -7154,6 +7229,7 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
     turn = _self_checked_turn(app, req) if _self_check_on() else _agent_stream_turn(app, req)
     atok = _chat_affinity.set(_affinity_key(req))      # 이 턴의 챗 LLM 호출 대화 머리(W-1) — 턴의 태스크에만
     ctok = _turn_claude.set(claude) if claude is not None else None     # 이 턴의 챗 모델(Claude) — 턴의 태스크에만
+    ptok = _turn_claude_pick.set(_claude_choice(app, req)) if claude is not None else None   # 고른 (모델, effort, 알림) — 캐시 열쇠 · meta
     try:
         async for chunk in turn:
             yield chunk
@@ -7162,6 +7238,8 @@ async def _agent_stream(app: FastAPI, req: ChatRequest) -> AsyncIterator[bytes]:
         _chat_affinity.reset(atok)
         if ctok is not None:
             _turn_claude.reset(ctok)
+        if ptok is not None:
+            _turn_claude_pick.reset(ptok)
         if tok is not None:
             try:
                 _external_llm.ctx_override.reset(tok)
@@ -8300,9 +8378,18 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         yield _sse(_embeds.EVENT, _emb)
     if _turn_models:
         # 답한 모델 · 생각 설정 — 화면이 메시지 아래에 보인다(C3). 챗 서버가 아닌 모델이 섞였으면 넘김이 일어났다.
-        _ci = getattr(app.state, "chat_llm_info", None) or {}
-        yield _sse("meta", {"models": dict(_turn_models), "chat_model": _ci.get("model"), "thinking": _ci.get("thinking"),
-                            "effort": _ci.get("effort"), "fallback_to": (_ci.get("fallback") or {}).get("to")})
+        _pick = _turn_claude_pick.get()
+        if _pick is not None:
+            # Claude 턴 — 고른 모델 · 생각 깊이를 싣는다(종전에는 챗 전용 LLM(Qwen)의 effort 가 실려 Claude 답 옆에 Qwen 의 값이 보였다, CC-8).
+            # 생각은 늘 켜져 있다(adaptive — 끌 수 없다). 고른 값이 박스 목록 밖이라 기본으로 돌았으면 그 알림을 함께 싣는다.
+            _cc_info = getattr(app.state, "claude_chat_info", None) or {}
+            yield _sse("meta", {"models": dict(_turn_models), "chat_model": _pick[0], "thinking": True, "effort": _pick[1],
+                                "fallback_to": (_cc_info.get("fallback") or {}).get("to"),
+                                **({"claude_note": _pick[2]} if _pick[2] else {})})
+        else:
+            _ci = getattr(app.state, "chat_llm_info", None) or {}
+            yield _sse("meta", {"models": dict(_turn_models), "chat_model": _ci.get("model"), "thinking": _ci.get("thinking"),
+                                "effort": _ci.get("effort"), "fallback_to": (_ci.get("fallback") or {}).get("to")})
     yield _sse("result", {"type": "text", "content": text})
     yield _sse("done", {})
 
@@ -9664,6 +9751,28 @@ def _search_capability() -> dict:
 @app.get("/search-capability")
 def search_capability() -> dict:
     return _search_capability()
+
+
+def _model_label(model: str) -> str:
+    """claude-opus-5-5 → Claude Opus 5.5(꺼진 박스는 chat_claude 를 들이지 않으므로 여기 둔다)."""
+    parts = model.split("-")
+    if len(parts) < 3 or parts[0] != "claude" or not all(p.isdigit() for p in parts[2:]):
+        return model
+    return f"Claude {parts[1].capitalize()} {'.'.join(parts[2:])}"
+
+
+@app.get("/chat-models")
+def chat_models() -> dict:
+    """웹 챗에서 사람이 고를 수 있는 Claude 모델 · 생각 깊이(HWAXPortal docs/chat-llm-claude CC-8). 포털이 읽어 그 사람이 Claude 대상이면
+    (FOR=all 또는 feat:chat-claude) 입력창에 고르는 칸을 그린다. 꺼져 있으면 {"claude": {"enabled": false}}. 키 · 실패 같은 운영 값은 싣지 않는다."""
+    info = getattr(app.state, "claude_chat_info", None) or {}
+    if not info.get("enabled"):
+        return {"claude": {"enabled": False}}
+    models = info.get("models") or [info["model"]]
+    return {"claude": {"enabled": True, "for": info.get("for"),
+                       "models": [{"id": m, "label": _model_label(m)} for m in models],
+                       "efforts": list(info.get("efforts") or [info["effort"]]),
+                       "default_model": info["model"], "default_effort": info["effort"]}}
 
 
 def _routine_health() -> dict:
