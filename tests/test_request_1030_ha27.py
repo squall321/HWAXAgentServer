@@ -487,11 +487,11 @@ def test_rv2_지정_전문가의_카탈로그_조회는_원문_그릇에_넣지_
         await cat.ainvoke({})       # get_agent_session 대역 — 심의 · 카탈로그와 같은 chat=False 래퍼
         return {"key": key, "name": "응력 전문가", "role": "응력을 본다", "operator": False, "apps": [], "key_tools": [], "note": ""}
 
-    async def know(_app, _groups, _key, _q):
+    async def know(_app, _groups, _key, _q, _budget):
         await cat.ainvoke({})
-        return "- K-1 허용 응력 41.5 MPa"
+        return "- K-1 허용 응력 41.5 MPa", ""
     monkeypatch.setattr(a, "_persona_meta", meta)
-    monkeypatch.setattr(a, "_persona_knowledge", know)
+    monkeypatch.setattr(a, "_knowledge_excerpt", know)
     _with_agent(monkeypatch, _CallAgent(_tool_of("list_models", '{"total": 34}'), "허용 응력은 41.5 MPa 이고 모델은 34개입니다."))
     box: dict = {}
 

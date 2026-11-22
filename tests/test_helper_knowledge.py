@@ -1,4 +1,4 @@
-# 보조 전문가의 지식카드도 근거로 — 도메인 보조만 · 동시에 찾고 사유를 돌려받는다 · 예산 · 끄면 종전 프롬프트 그대로(사용자 결정 2026-11-22)
+# 보조 전문가의 지식카드도 근거로 — 도메인 보조만 · 동시에 찾고 사유를 돌려받는다 · 예산 · 끄면 종전 프롬프트 그대로 · 주 전문가 사유도 턴마다(사용자 결정 2026-11-22)
 #
 #   실행:  .venv/bin/python -m pytest tests/test_helper_knowledge.py -q
 import asyncio
@@ -14,6 +14,7 @@ import app as a  # noqa: E402
 Q = "PCB 휨 허용 기준이 뭐야?"
 HEAD = "[보조 {k} 지식카드 — 이번 질문 연관 발췌]"
 DEGRADE = "hybrid 검색 180초 초과; 폴백도 실패(semantic 검색 180초 초과)"
+MAIN_DEGRADED = "사내 지식카드를 조회하지 못했다(없다는 뜻이 아니다)"      # 주 전문가 강등 블록에만 있는 글(시스템 프롬프트에도 '조회하지 못했다' 가 있다)
 
 
 def _hit(rid: str, body: str = "본문") -> dict:
@@ -135,7 +136,7 @@ def test_보조가_모두_운영자면_종전_프롬프트와_바이트까지_�
 def test_보조_넷을_동시에_찾고_순서와_강등_사유가_섞이지_않는다(monkeypatch):
     helpers = ["h1", "h2", "h3", "h4"]
     state: dict = {"started": set(), "done": []}
-    # 끝나는 차례(h3 · h4 · h1 · h2)가 고른 차례와 다르고, 강등된 h2 가 마지막이다 — 보조 검색이 함수 속성에 쓰면 그 사유가 남는다.
+    # 끝나는 차례(h3 · h4 · h1 · h2)가 고른 차례와 다르고, 강등된 h2 가 마지막이다 — 사유를 한 칸에 나눠 쓰면 그 사유가 남는다.
     delays = {"h1": 0.02, "h2": 0.05, "h3": 0.0, "h4": 0.01}
 
     async def on_search(k):
@@ -150,7 +151,6 @@ def test_보조_넷을_동시에_찾고_순서와_강등_사유가_섞이지_않
         await asyncio.sleep(delays[k])
         state["done"].append(k)
 
-    a._persona_knowledge.last_note = "이전 턴의 사유"
     hits = {"main": ([_hit("R-MAIN")], ""), "h1": ([_hit("R-H1", "h1 카드")], ""), "h2": ([], DEGRADE),
             "h3": ([_hit("R-H3", "h3 카드")], ""), "h4": ([], "")}
     text, evs, calls = _turn(monkeypatch, ["main", *helpers], hits, on_search=on_search)
@@ -165,9 +165,8 @@ def test_보조_넷을_동시에_찾고_순서와_강등_사유가_섞이지_않
     assert warns[0]["message"].startswith("보조 h2 지식카드를 조회하지 못했습니다 — ") and DEGRADE in warns[0]["message"]
     steps = _steps(evs)
     assert f"보조 h2 지식카드 조회 실패 — {DEGRADE}" in steps and "보조 h4 연관 지식카드 없음" in steps
-    assert not any(DEGRADE in s for s in steps if not s.startswith("보조 h2")), "h2 의 사유가 다른 보조로 새지 않는다"
-    assert a._persona_knowledge.last_note == "", "보조 검색은 주 전문가의 last_note 를 덮지 않는다(주 전문가가 쓴 값 그대로)"
-    assert DEGRADE not in a._persona_knowledge.last_note
+    assert not any(DEGRADE in s for s in steps if not s.startswith("보조 h2")), "h2 의 사유가 다른 보조 · 주 전문가로 새지 않는다"
+    assert "[main 지식카드 — 이번 질문 연관 발췌]" in text and not any(s.startswith("지식카드 조회 실패") for s in steps)
 
 
 def test_지식_검색_도구를_못_받으면_없다가_아니라_못_물어봤다고_말한다(monkeypatch):
@@ -253,8 +252,8 @@ def test_보조가_없으면_켜든_끄든_종전과_바이트까지_같다(monk
     assert "[보조 " not in on
 
 
-# ── 주 전문가 경로의 last_note 동작은 그대로다 ─────────────────────────────────────
-def _pk(monkeypatch, *, tools=None, hits=([], ""), raises=None):
+# ── 주 전문가의 강등 사유도 턴마다 돌려받는다 — 앞 턴 · 다른 사람 턴의 사유가 새지 않는다 ───────────────────────
+def _ke(monkeypatch, *, tools=None, hits=([], ""), raises=None, budget=5000):
     async def ktools(_app, _groups):
         if raises:
             raise raises
@@ -264,36 +263,97 @@ def _pk(monkeypatch, *, tools=None, hits=([], ""), raises=None):
         return hits
     monkeypatch.setattr(a, "_knowledge_tools", ktools)
     monkeypatch.setattr(a, "_agent_search_hits", search)
-    return asyncio.run(a._persona_knowledge(NS(state=NS()), [], "main", "q"))
+    return asyncio.run(a._knowledge_excerpt(NS(state=NS()), [], "main", "q", budget))
 
 
-def test_주_전문가_last_note_는_종전대로_적힌다(monkeypatch):
-    a._persona_knowledge.last_note = "앞 값"
-    assert _pk(monkeypatch, hits=([], DEGRADE)) == "" and a._persona_knowledge.last_note == DEGRADE
-    assert _pk(monkeypatch, hits=([_hit("R-1")], "")) and a._persona_knowledge.last_note == ""
-    a._persona_knowledge.last_note = "앞 값"
-    assert _pk(monkeypatch, hits=([_hit("R-1")], "hybrid 검색 180초 초과 → semantic 로 되물음"))
-    assert a._persona_knowledge.last_note == "hybrid 검색 180초 초과 → semantic 로 되물음", "결과가 있어도 사유는 적는다(종전)"
-    assert _pk(monkeypatch, raises=RuntimeError("x")) == "" and a._persona_knowledge.last_note == "조회 실패(RuntimeError)"
-    a._persona_knowledge.last_note = "앞 값"
-    assert _pk(monkeypatch, tools={}) == "" and a._persona_knowledge.last_note == "앞 값", \
-        "지식 검색 도구가 없으면 last_note 를 건드리지 않는다(종전 그대로)"
+def test_안쪽_함수는_발췌와_사유를_돌려준다(monkeypatch):
+    assert _ke(monkeypatch, hits=([], DEGRADE)) == ("", DEGRADE)
+    text, note = _ke(monkeypatch, hits=([_hit("R-1")], ""))
+    assert "R-1" in text and note == ""
+    fb = "hybrid 검색 180초 초과 → semantic 로 되물음"
+    text, note = _ke(monkeypatch, hits=([_hit("R-1")], fb))
+    assert "R-1" in text and note == fb, "결과가 있어도 사유는 돌려준다(쓰는 쪽이 고른다)"
+    assert _ke(monkeypatch, raises=RuntimeError("x")) == ("", "조회 실패(RuntimeError)")
+    assert _ke(monkeypatch, tools={}) == ("", None), "지식 검색 도구를 못 받았으면 None — '없다' 도 '강등' 도 아니다"
+    lines = _ke(monkeypatch, hits=([_hit(f"R-{i}", "다" * 400) for i in range(10)], ""), budget=1000)[0].split("\n")
+    assert sum(len(ln) for ln in lines) <= 1000 and len(lines) == 2, lines
+    assert not hasattr(a, "_persona_knowledge"), "프로세스 전체가 나눠 쓰던 칸(_persona_knowledge.last_note)은 없다"
 
 
-def test_주_전문가_발췌는_종전_예산으로_잘린다(monkeypatch):
+def test_주_전문가_발췌는_CHAT_KNOWLEDGE_BUDGET_으로_잘린다(monkeypatch):
     monkeypatch.setattr(a, "CHAT_KNOWLEDGE_BUDGET", 1000)
-    got = _pk(monkeypatch, hits=([_hit(f"R-{i}", "다" * 400) for i in range(10)], ""))
-    lines = got.split("\n")
+    text, _evs, _ = _turn(monkeypatch, ["main"], {"main": ([_hit(f"R-{i}", "다" * 400) for i in range(10)], "")})
+    block = text.split("[main 지식카드 — 이번 질문 연관 발췌]\\n", 1)[1].split("\\n이 발췌는", 1)[0]
+    lines = block.split("\\n")
     assert sum(len(ln) for ln in lines) <= 1000 and len(lines) == 2, lines
 
 
-def test_안쪽_함수는_사유를_돌려준다(monkeypatch):
-    async def ktools(_app, _groups):
-        return {}
+def test_앞_턴의_강등_사유가_다음_턴에_안_보인다(monkeypatch):
+    _text, evs, _ = _turn(monkeypatch, ["main"], {"main": ([], DEGRADE)})
+    w = _warns(evs)
+    assert [x["code"] for x in w] == ["knowledge_degraded"] and DEGRADE in w[0]["message"], w
+    assert f"지식카드 조회 실패 — {DEGRADE}" in _steps(evs)
+    # 다음 턴은 지식 검색 도구를 못 받았다(권한 · 게이트웨이 목록 빔) — 종전엔 앞 턴의 사유가 이 턴의 경고로 나갔다.
+    text, evs, _ = _turn(monkeypatch, ["main"], {}, tools={})
+    assert not _warns(evs), _warns(evs)
+    assert "연관 지식카드 없음 — 일반 지식으로 답변" in _steps(evs) and not any(DEGRADE in s for s in _steps(evs))
+    assert "이번 질문과 연관된 보유 지식을 찾지 못했다" in text and MAIN_DEGRADED not in text, \
+        "도구를 못 받은 주 전문가는 종전처럼 '연관 없음' 갈래다"
+
+
+def test_두_턴을_동시에_돌려도_사유가_섞이지_않는다(monkeypatch):
+    """A 턴(강등)과 B 턴(지식 검색 도구 없음)이 한 프로세스에서 겹친다 — B 는 A 가 강등된 **뒤에** 묻는다. 한 칸을 나눠 쓰면 B 가 A 의 사유를
+    자기 경고로 낸다(다른 사람의 사유가 새는 길)."""
+    ev: dict = {}
+    sinks: dict = {}
+
+    async def meta(_app, _groups, key):
+        return {"key": key, "name": key, "role": f"{key} 역할", "operator": False, "apps": [], "key_tools": [], "note": ""}
+
+    async def ktools(_app, groups):
+        if "gb" in groups:
+            await asyncio.wait_for(ev["a"].wait(), 2.0)
+            return {}
+        return {"agent_search": object()}
+
+    async def search(_tools, agent_type, _q, **_k):
+        if agent_type == "pa":
+            ev["a"].set()
+            return [], DEGRADE
+        return [], ""
+
+    class Agent:
+        def __init__(self, g):
+            self.g = g
+
+        async def astream_events(self, inputs, version=None, config=None):
+            sinks[self.g] = inputs["messages"]
+            yield {"event": "on_chat_model_stream", "data": {"chunk": NS(content="답변")}}
+
+    async def agent_for(_app, groups, *_a, **_k):
+        return Agent(groups[0])
+
+    monkeypatch.setattr(a, "_persona_meta", meta)
     monkeypatch.setattr(a, "_knowledge_tools", ktools)
-    a._persona_knowledge.last_note = "앞 값"
-    assert asyncio.run(a._knowledge_excerpt(NS(state=NS()), [], "h1", "q", 5000)) == ("", None)
-    assert a._persona_knowledge.last_note == "앞 값", "안쪽 함수는 함수 속성을 건드리지 않는다"
+    monkeypatch.setattr(a, "_agent_search_hits", search)
+    monkeypatch.setattr(a, "_agent_for", agent_for)
+    monkeypatch.setattr(a, "_tools_map", lambda: {})
+    monkeypatch.setattr(a, "_ctx_cache", {"n": 128_000, "src": "server"})
+    monkeypatch.setenv("CHAT_AUTO_RETRY", "0")
+
+    async def run(g, key):
+        req = a.ChatRequest(message=Q, groups=[g], pinned_agents=[key])
+        return b"".join([c async for c in a._agent_stream_turn(a.app, req, None)]).decode("utf-8")
+
+    async def both():
+        ev["a"] = asyncio.Event()
+        return await asyncio.gather(run("ga", "pa"), run("gb", "pb"))
+    out_a, out_b = asyncio.run(both())
+    wa, wb = _warns(_events(out_a)), _warns(_events(out_b))
+    assert len(wa) == 1 and wa[0]["message"].startswith("pa 지식카드를 조회하지 못했습니다") and DEGRADE in wa[0]["message"], wa
+    assert not wb, f"B 턴에 A 턴의 사유가 샜다: {wb}"
+    assert "연관 지식카드 없음 — 일반 지식으로 답변" in _steps(_events(out_b))
+    assert MAIN_DEGRADED in _flat(sinks["ga"]) and MAIN_DEGRADED not in _flat(sinks["gb"])
 
 
 # ── 자기검증 — 보조 발췌도 근거로 남는다 ──────────────────────────────────────────

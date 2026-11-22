@@ -183,11 +183,10 @@ def _run_stream(monkeypatch, session, mapping):
 
     async def fake_knowledge(*args, **kw):
         knowledge_calls.append(args)
-        return ""
+        return "", ""
 
     monkeypatch.setattr(a, "_agent_for", fake_agent_for)
-    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
-    a._persona_knowledge.last_note = ""
+    monkeypatch.setattr(a, "_knowledge_excerpt", fake_knowledge)
     fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
     req = a.ChatRequest(message="SED 예측해줘", groups=[], pinned_agent=session["agent_type"])
 
@@ -449,12 +448,11 @@ def _stream_with_persona(monkeypatch, meta):
         return _FakeAgent(sink)
 
     async def fake_knowledge(*_a, **_k):
-        return ""
+        return "", ""
 
     monkeypatch.setattr(a, "_persona_meta", fake_meta)
     monkeypatch.setattr(a, "_agent_for", fake_agent_for)
-    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
-    a._persona_knowledge.last_note = ""
+    monkeypatch.setattr(a, "_knowledge_excerpt", fake_knowledge)
     fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
     req = a.ChatRequest(message="휨 봐줘", groups=[], pinned_agent="sim-pcb-warpage")
 
@@ -568,11 +566,10 @@ def test_안_묶인_도구를_우선_바인딩이라_말하지_않는다(monkeyp
         return ag
 
     async def fake_knowledge(*_a, **_k):
-        return ""
+        return "", ""
 
     monkeypatch.setattr(a, "_agent_for", fake_agent_for)
-    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
-    a._persona_knowledge.last_note = ""
+    monkeypatch.setattr(a, "_knowledge_excerpt", fake_knowledge)
     fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
     req = a.ChatRequest(message="SED 예측", groups=[], pinned_agent=sess["agent_type"])
 
@@ -597,11 +594,10 @@ def test_하나도_안_묶이면_그렇다고_말한다(monkeypatch):
         return ag
 
     async def fake_knowledge(*_a, **_k):
-        return ""
+        return "", ""
 
     monkeypatch.setattr(a, "_agent_for", fake_agent_for)
-    monkeypatch.setattr(a, "_persona_knowledge", fake_knowledge)
-    a._persona_knowledge.last_note = ""
+    monkeypatch.setattr(a, "_knowledge_excerpt", fake_knowledge)
     fake_app = NS(state=NS(tool_load_error={}, tool_degraded={}, llm_nostream=False))
     req = a.ChatRequest(message="SED 예측", groups=[], pinned_agent=sess["agent_type"])
 
