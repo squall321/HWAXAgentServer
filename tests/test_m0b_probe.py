@@ -524,8 +524,9 @@ def test_kill_로_끝내도_거기까지의_요약을_쓴다(fake_llm_server, tm
     out_file = tmp_path / "killed.jsonl"
     (tmp_path / "probe.env").write_text(f"VLLM_BASE_URL={fake_llm_server}/v1\nVLLM_MODEL=fake-glm\n"
                                         f"AGENT_PORT={_free_port()}\n", encoding="utf-8")
+    # 사람별 LLM 토큰의 자리를 임시로 — 이 .env 에는 잡 원장이 없어 기본 자리(ARTIFACT_DIR 의 형제 usage/ — 리포 곁 · 실 자리)에 쓴다(OD-53)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
-           "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+           "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", "USAGE_TOKENS_DIR": str(tmp_path / "usage")}
     proc = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "m0b_probe.py"), "--pack-file", str(PACK_OK),
                              "--env-file", str(tmp_path / "probe.env"), "--reps", "6", "--out", str(out_file)],
                             cwd=str(tmp_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
