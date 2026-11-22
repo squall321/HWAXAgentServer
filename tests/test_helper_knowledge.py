@@ -293,12 +293,16 @@ def test_앞_턴의_강등_사유가_다음_턴에_안_보인다(monkeypatch):
     w = _warns(evs)
     assert [x["code"] for x in w] == ["knowledge_degraded"] and DEGRADE in w[0]["message"], w
     assert f"지식카드 조회 실패 — {DEGRADE}" in _steps(evs)
-    # 다음 턴은 지식 검색 도구를 못 받았다(권한 · 게이트웨이 목록 빔) — 종전엔 앞 턴의 사유가 이 턴의 경고로 나갔다.
+    # 다음 턴은 지식 검색 도구를 못 받았다(권한 · 게이트웨이 목록 빔) — 종전엔 앞 턴의 사유가 이 턴의 경고로 나갔다. 이제 그 턴의 사유로
+    # '못 물어봤다' 를 말한다('연관 없음' 이 아니다 — 없다는 거짓이 된다).
     text, evs, _ = _turn(monkeypatch, ["main"], {}, tools={})
-    assert not _warns(evs), _warns(evs)
-    assert "연관 지식카드 없음 — 일반 지식으로 답변" in _steps(evs) and not any(DEGRADE in s for s in _steps(evs))
-    assert "이번 질문과 연관된 보유 지식을 찾지 못했다" in text and MAIN_DEGRADED not in text, \
-        "도구를 못 받은 주 전문가는 종전처럼 '연관 없음' 갈래다"
+    w = _warns(evs)
+    assert [x["code"] for x in w] == ["knowledge_degraded"], w
+    assert w[0]["message"] == (f"main 지식카드를 조회하지 못했습니다 — {a._HELPER_KB_NO_TOOL}. "
+                               "보유 지식이 없다는 뜻이 아닙니다."), "앞 턴의 사유가 아니라 이 턴의 사유다"
+    assert f"지식카드 조회 실패 — {a._HELPER_KB_NO_TOOL}" in _steps(evs) and not any(DEGRADE in s for s in _steps(evs))
+    assert MAIN_DEGRADED in text and "이번 질문과 연관된 보유 지식을 찾지 못했다" not in text, \
+        "도구를 못 받은 주 전문가는 '못 물어봤다' 갈래다"
 
 
 def test_두_턴을_동시에_돌려도_사유가_섞이지_않는다(monkeypatch):
@@ -351,9 +355,10 @@ def test_두_턴을_동시에_돌려도_사유가_섞이지_않는다(monkeypatc
     out_a, out_b = asyncio.run(both())
     wa, wb = _warns(_events(out_a)), _warns(_events(out_b))
     assert len(wa) == 1 and wa[0]["message"].startswith("pa 지식카드를 조회하지 못했습니다") and DEGRADE in wa[0]["message"], wa
-    assert not wb, f"B 턴에 A 턴의 사유가 샜다: {wb}"
-    assert "연관 지식카드 없음 — 일반 지식으로 답변" in _steps(_events(out_b))
-    assert MAIN_DEGRADED in _flat(sinks["ga"]) and MAIN_DEGRADED not in _flat(sinks["gb"])
+    assert len(wb) == 1 and DEGRADE not in wb[0]["message"], f"B 턴에 A 턴의 사유가 샜다: {wb}"
+    assert wb[0]["message"].startswith(f"pb 지식카드를 조회하지 못했습니다 — {a._HELPER_KB_NO_TOOL}."), wb
+    assert f"지식카드 조회 실패 — {a._HELPER_KB_NO_TOOL}" in _steps(_events(out_b))
+    assert MAIN_DEGRADED in _flat(sinks["ga"]) and MAIN_DEGRADED in _flat(sinks["gb"]), "둘 다 '못 물어봤다' 갈래 — 사유만 각자의 것"
 
 
 # ── 자기검증 — 보조 발췌도 근거로 남는다 ──────────────────────────────────────────

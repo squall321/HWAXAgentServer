@@ -6294,7 +6294,7 @@ PERSONA_HELPER_KNOWLEDGE = os.environ.get("PERSONA_HELPER_KNOWLEDGE", "1").strip
 PERSONA_HELPER_KNOWLEDGE_BUDGET = _env_int("PERSONA_HELPER_KNOWLEDGE_BUDGET", -1)
 # 지식카드 한 줄의 최대(자) — knowledge_line 의 기본 상한 700자 + 줄임 표식 몫 32자(deliberation._KN_MARK).
 _HELPER_KB_LINE = 700 + 32
-# 지식 검색 도구를 받지 못해 묻지 않았을 때 보조에게 보이는 사유 — '없다' 가 아니라 '못 물어봤다' 다.
+# 지식 검색 도구를 받지 못해 묻지 않았을 때 보이는 사유(주 전문가 · 보조) — '없다' 가 아니라 '못 물어봤다' 다.
 _HELPER_KB_NO_TOOL = "지식 검색 도구(agent_search)를 받지 못함"
 
 
@@ -7630,7 +7630,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             else:
                 # '없다' 와 '못 물어봤다' 를 구분해 말한다. 검색이 늦거나 죽어서 못 받은 것을
                 # '보유 지식 없음' 으로 말하면, 그 전문가가 아는 게 없다는 거짓이 사용자에게 간다.
-                # 사유 None(지식 검색 도구를 받지 못함)은 종전처럼 아래 '연관 없음' 갈래다.
+                # 사유 None(지식 검색 도구를 받지 못함 — 권한 · 게이트웨이 목록 빔)도 '못 물어봤다' 다. '연관 없음' 으로 말하면 없다는 거짓이
+                # 된다(보조와 같은 사유 글).
+                if _note is None:
+                    _note = _HELPER_KB_NO_TOOL
                 if _note:
                     turn_notes += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
                                    f"이번 답변에는 사내 발췌가 없다. 일반 지식으로 답하되 "
