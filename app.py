@@ -7635,7 +7635,9 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                 if _note is None:
                     _note = _HELPER_KB_NO_TOOL
                 if _note:
-                    turn_notes += (f"\n\n[{agent_key} 지식카드]\n지식 조회가 시간 안에 끝나지 않아 "
+                    # 첫머리는 까닭을 가리지 않는 말이다 — 시간 초과만이 아니라 도구 없음 · 예외도 이 갈래라, '시간 안에 끝나지 않아' 로 쓰면
+                    # 모델이 없는 시간 초과를 말한다(실제 까닭은 위 경고 · 상태줄이 싣는다).
+                    turn_notes += (f"\n\n[{agent_key} 지식카드]\n지식 조회를 마치지 못해 "
                                    f"이번 답변에는 사내 발췌가 없다. 일반 지식으로 답하되 "
                                    f"'사내 지식카드를 조회하지 못했다(없다는 뜻이 아니다)'고 먼저 밝혀라.")
                     yield _sse("warning", {"code": "knowledge_degraded",
