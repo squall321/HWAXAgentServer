@@ -602,3 +602,33 @@ def test_호출_인자는_Anthropic_꼴로_바꾼다():
                                                                                "disable_parallel_tool_use": True}}) == \
         {"max_tokens": 10, "tool_choice": {"type": "auto", "disable_parallel_tool_use": True}}
     assert cc._anthropic_kwargs({"chat_template_kwargs": {"enable_thinking": True}}) == {}, "생각 켬은 손대지 않는다"
+
+
+# ── 사람별 LLM 토큰 — Claude 턴도 센다(dev 11-22 — 두 갈래가 나란히 지어져 기록기가 Claude LLM 에 안 붙었다) ──────────────────────────
+def test_Claude_턴의_토큰을_사람_종류_모델로_센다(monkeypatch, tmp_path):
+    import usage_tokens as ut
+
+    monkeypatch.setenv("USAGE_TOKENS_DIR", str(tmp_path / "usage"))
+    ut._reset_for_tests()
+    # 진짜 꼴 — message_delta 의 usage 는 누적 입력 · 캐시 읽기를 함께 싣고(SDK MessageDeltaUsage), langchain-anthropic 은 message_start 의 usage 를
+    # 버리고 이것을 쓴다. 이 파일의 _message 는 끝 사건에 출력만 실어(옛 꼴) 입력이 0 으로 보였다 — 이 시험만 진짜 꼴로 둔다.
+    evs = _message(_text(0, "답이다."))
+    evs[-2] = {**evs[-2], "usage": {"input_tokens": 12, "cache_read_input_tokens": 5, "output_tokens": 30}}
+    st = _boot(monkeypatch, tmp_path, claude=_Claude([evs]), CLAUDE_CHAT_MODEL=MODEL, CLAUDE_CHAT_FOR="all")
+    cbs = [type(c).__name__ for c in (st.claude_chat.runnable.callbacks or [])]
+    assert "UsageTokensRecorder" in cbs, f"Claude LLM 에 사용량 기록기가 없다 — {cbs}"
+    import contextvars
+
+    def run():
+        ut.tag(user="kim@corp.test", kind="chat")     # /chat 창구가 거는 표지 — 복사한 문맥 안에서만(다른 시험으로 새지 않게)
+        return _turn(monkeypatch, tmp_path, st)
+    evs = contextvars.copy_context().run(run)
+    assert _deltas(evs, "token").strip() == "답이다.", evs
+    with ut._LOCK:
+        rows = {k: list(v) for k, v in ut._ACC.items()}
+    mine = {k: v for k, v in rows.items() if k[1] == "kim@corp.test" and k[3] == MODEL}
+    assert mine, f"Claude 턴이 기록되지 않았다 — {rows}"
+    (_day, _u, kind, _m), (calls, unknown, tin, tout, _tc) = next(iter(mine.items()))
+    # 입력은 캐시 읽기를 포함한 합이다(langchain usage_metadata 의 관례 — OpenAI prompt_tokens 와 같은 셈) — 12 + 5. 캐시 읽기는 따로 5.
+    assert kind == "chat" and calls >= 1 and unknown == 0 and (tin, tout) == (17, 30) and _tc == 5, mine
+

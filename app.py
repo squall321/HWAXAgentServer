@@ -1057,7 +1057,9 @@ def _build_claude_chat(base_chat, mk, *, temperature: float, max_tokens: int, ti
     tmo = httpx.Timeout(timeout_s if timeout_s > 0 else None, connect=conn_to if conn_to > 0 else None)
     primary = _cc.build(model=model, key=key, cfg=cfg, timeout=tmo, read_s=timeout_s,
                         callbacks=[_ClaudeWatch(info, _cc.FALLBACK_ERRORS)])
-    primary = _call_trace.instrument_llm(primary, _call_trace.server_label(primary.anthropic_api_url))
+    # 사람별 LLM 토큰 기록기(usage_tokens — OD-52 ~ 57)도 단다. 두 갈래가 나란히 지어져 기록기는 OpenAI 꼴 LLM 을 짓는 _mk_llm 에만 붙었고,
+    # Claude 턴의 토큰은 세지 않았다(dev 11-22 — Claude 로 두 턴을 돌렸는데 recorded 0). 응답의 usage_metadata 를 call_trace._usage 가 읽는다.
+    primary = _usage_tokens.instrument(_call_trace.instrument_llm(primary, _call_trace.server_label(primary.anthropic_api_url)), model)
     fb = base_chat if base_chat is not None else mk(temperature, max_tokens, base_effort, timeout_s, base_retries,
                                                      cls=_VisionGuardLLM)
     chat = primary.with_fallbacks([fb], exceptions_to_handle=_cc.FALLBACK_ERRORS)
