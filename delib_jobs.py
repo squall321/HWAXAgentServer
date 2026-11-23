@@ -242,6 +242,36 @@ def resolve_job(name: str) -> str:
         raise ValueError(f"알 수 없는 심의 종류 '{name}' — 가능한 값: {', '.join(JOBS)}")
     return j
 
+
+# ── 심의가 아닌 잡 종류(HWAXPortal docs/token-saving offload-v2 3-1 — 위임 delegate) ─────────────────────────────────────────
+# 같은 원장 · 줄 · 취소 · 재기동 넘김(줄 선 잡)을 쓰되 심의 메뉴(JOBS)에는 넣지 않는다 — 넣으면 심의 도구의 안내 글(job 목록)이 바뀌고,
+# deliberate_continue 가 그 잡을 심의로 이어 돌린다. 이름은 늘 안다(원장에 남은 옛 잡을 가려야 한다 — 스위치를 끈 뒤에도). 띄울 것과 자리는
+# 그 종류의 모듈이 켜졌을 때만 올린다(register_kind) — 꺼진 박스에는 이 종류의 잡이 새로 서지 않고, 재기동 뒤 줄에 남은 것은 닫힌다.
+# 심의 자리(GLM — 전역 · 사용자별 · 좌석 합)에는 세지 않는다 — 챗 LLM 을 쓰고 제 상한(caps)이 따로 있다. 도는 수(running_count — /health 의
+# delib_active · 재기동 미룸)에는 든다(재기동하면 끊긴다). 읽기는 주인만이다(can_read — 그 사람 시야로 읽은 원문 발췌다).
+TASK_KINDS = ("delegate",)
+_KINDS: dict[str, dict] = {}
+_TASK_INTERRUPTED = "서버 재기동으로 중단됨 — 다시 맡기려면 같은 일을 다시 시작한다"
+
+
+def register_kind(kind: str, *, label: str, entry, caps, interrupted: str = "") -> None:
+    """심의가 아닌 잡 종류를 올린다 — entry(app, text, groups, opts, user_email) 는 SSE 조각(_parse_sse 꼴 — status · delib stage · warning ·
+    error · result)을 내는 비동기 생성기이고, caps() 는 (전체 상한, 사람마다 상한)이다. interrupted 는 재기동으로 끊긴 잡의 안내다."""
+    if kind not in TASK_KINDS:
+        raise ValueError(f"모르는 잡 종류 {kind!r} — TASK_KINDS 에 먼저 적는다")
+    _KINDS[kind] = {"label": label, "entry": entry, "caps": caps, "interrupted": interrupted or _TASK_INTERRUPTED}
+
+
+def is_task(job: dict) -> bool:
+    """심의가 아닌 잡(TASK_KINDS)인가 — 원장 · 목록 색인의 kind 로 본다."""
+    return str((job or {}).get("kind") or "") in TASK_KINDS
+
+
+def _kind_running(kind: str, owner: str = "") -> list[str]:
+    """그 종류의 도는 잡 id — owner 를 주면 그 사람의 것만."""
+    return [j["id"] for j in _JOBS.values() if j.get("status") == "running" and j.get("kind") == kind
+            and (not owner or _owner(j) == owner)]
+
 _JOBS: dict[str, dict] = {}
 _TASKS: dict[str, asyncio.Task] = {}
 # 줄 선 잡 — job_id → (잡 기록, 그 잡의 태스크를 만드는 함수). **넣은 순서가 순번이다.** 상태가 queued 인
@@ -694,6 +724,11 @@ def _stop_after(job: dict) -> int:
 def _mark_interrupted(job: dict, track=None) -> None:
     """도는 잡을 재기동으로 끊긴 것으로 적는다 — 상태 · 안내 · 좌석 단위 재개 요약(seat_resume — HA-09 S1 A5.4). track 은 그 잡의 일지가 받은
     e:* 줄의 셈이다(없으면 일지 파일을 읽는다). 재개 자료가 있으면 안내가 '같은 잡에서 끊긴 라운드부터' 를 말한다."""
+    if is_task(job):
+        # 심의가 아닌 잡 — 라운드 · 좌석 재개 자료가 없다. 이어 돌리지 않고 다시 맡기라고 적는다(읽기만 하는 일이라 다시 해도 바뀌는 것이 없다).
+        job["status"] = "interrupted"
+        job["error"] = (_KINDS.get(job["kind"]) or {}).get("interrupted") or _TASK_INTERRUPTED
+        return
     if track is None:
         track = _journal_track(job["id"])
     sr = track.summary(stages=_stages(job), stop_after_round=_stop_after(job), done_sk=_done_sk(job))
@@ -942,8 +977,9 @@ def running_count() -> int:
 
 
 def running_human_count() -> int:
-    """도는 잡 가운데 사람이 띄운 것(started_by ≠ app) — 카드 대조 관문의 절반 판정만 이 수를 본다(M3.md #26)."""
-    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and j.get("started_by") != "app")
+    """도는 잡 가운데 사람이 띄운 것(started_by ≠ app) — 카드 대조 관문의 절반 판정만 이 수를 본다(M3.md #26). 심의가 아닌 잡(TASK_KINDS)은
+    세지 않는다 — 챗 LLM 을 쓴다(루틴과 같다)."""
+    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and j.get("started_by") != "app" and not is_task(j))
 
 
 def _norm(who: str) -> str:
@@ -969,8 +1005,11 @@ def can_read(job: dict, viewer: str, viewer_aff: str = "", viewer_admin: bool = 
     · 신원 없는 호출(서비스 계정 — 운영 · 워크플로가 쓰는 길) · 관리자 — 다 본다
     · 주인 — 본다
     · 같은 소속 — 잡을 열 때 적은 소속(owner_aff)과 지금 호출자의 소속이 같고 둘 다 비지 않았을 때(빈 소속끼리는 묶지 않는다)
-    · 주인이 안 적힌 옛 잡 — 신원 없는 호출과 관리자만(누구 것인지 알 수 없다)"""
+    · 주인이 안 적힌 옛 잡 — 신원 없는 호출과 관리자만(누구 것인지 알 수 없다)
+    심의가 아닌 잡(TASK_KINDS — 위임)은 주인만 본다 — 그 사람 시야로 읽은 원문 발췌라 같은 소속 · 관리자 · 신원 없는 호출에도 열지 않는다."""
     me = _norm(viewer)
+    if is_task(job):
+        return bool(me) and _owner(job) == me
     if not me or viewer_admin:
         return True
     owner = _owner(job)
@@ -983,8 +1022,9 @@ def can_read(job: dict, viewer: str, viewer_aff: str = "", viewer_admin: bool = 
 
 
 def _glm_running_count() -> int:
-    """GLM 자리를 쓰는 도는 잡 수 — 전역 상한(MAX_RUNNING)이 이것을 본다. 외부 응답자 잡은 세지 않는다(EXTERNAL_PER_OWNER)."""
-    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and not _external(j))
+    """GLM 자리를 쓰는 도는 잡 수 — 전역 상한(MAX_RUNNING)이 이것을 본다. 외부 응답자 잡 · 심의가 아닌 잡은 세지 않는다(EXTERNAL_PER_OWNER ·
+    그 종류의 caps)."""
+    return sum(1 for j in _JOBS.values() if j.get("status") == "running" and not _external(j) and not is_task(j))
 
 
 def _seats_of(job: dict) -> int:
@@ -994,8 +1034,8 @@ def _seats_of(job: dict) -> int:
 
 
 def seats_running() -> int:
-    """도는 GLM 잡의 좌석 합 — 좌석 합 상한(max_seats_running)이 이것을 본다. 외부 응답자 잡은 GLM 을 물지 않아 세지 않는다."""
-    return sum(_seats_of(j) for j in _JOBS.values() if j.get("status") == "running" and not _external(j))
+    """도는 GLM 잡의 좌석 합 — 좌석 합 상한(max_seats_running)이 이것을 본다. 외부 응답자 잡 · 심의가 아닌 잡은 세지 않는다."""
+    return sum(_seats_of(j) for j in _JOBS.values() if j.get("status") == "running" and not _external(j) and not is_task(j))
 
 
 def _seats_est(opts: dict) -> int:
@@ -1008,9 +1048,9 @@ def _seats_est(opts: dict) -> int:
 
 def _running_of(owner: str) -> list[str]:
     """그 사람이 돌리고 있는 GLM 잡 id — 사용자별 상한(GLM 몫)이 본다. 신원 없는 호출은 누구의 것으로도 세지 않는다(start 의 주석).
-    외부 응답자 잡은 따로 센다(_external_running_of)."""
+    외부 응답자 잡 · 심의가 아닌 잡은 따로 센다(_external_running_of · _kind_running)."""
     return [j["id"] for j in _JOBS.values()
-            if owner and j.get("status") == "running" and not _external(j) and _owner(j) == owner]
+            if owner and j.get("status") == "running" and not _external(j) and not is_task(j) and _owner(j) == owner]
 
 
 def _external_running_of(task_owner: str) -> list[str]:
@@ -1045,7 +1085,15 @@ def _pump() -> None:
     seats = seats_running() if seat_cap > 0 else 0
     seat_hold = False       # 먼저 선 GLM 잡이 좌석을 기다리는 중 — 뒤의 GLM 잡이 그 좌석을 가로채지 않는다(큰 심의가 굶지 않게)
     for jid, (job, spawn) in list(_PENDING.items()):
-        if _external(job):
+        if is_task(job):
+            # 심의가 아닌 잡 — 그 종류의 상한(전체 · 사람마다)만 본다(GLM 심의 자리와 따로다). 종류가 꺼졌으면 띄우지 않는다(줄에 남긴다).
+            spec = _KINDS.get(job["kind"])
+            if spec is None:
+                continue
+            k_all, k_user = spec["caps"]()
+            if len(_kind_running(job["kind"])) >= k_all or len(_kind_running(job["kind"], _owner(job))) >= k_user:
+                continue
+        elif _external(job):
             if len(_external_running_of(job.get("task_owner") or "")) >= EXTERNAL_PER_OWNER:
                 continue
         else:
@@ -1095,7 +1143,16 @@ def queue_info(job: dict) -> dict | None:
     pos = list(_PENDING).index(job["id"]) + 1
     # 무엇을 기다리는가 — 제 몫을 다 쓴 것이면 제 심의가 끝나야(또는 접어야) 차례가 오고, 그 사이
     # 뒤에 선 다른 사람이 먼저 갈 수 있다.
-    if _external(job):
+    if is_task(job):
+        spec = _KINDS.get(job["kind"])
+        if spec is None:
+            why = f"이 서버에서 {job['kind']} 가 꺼져 있다 — 띄우지 않는다(접으려면 취소)"
+        else:
+            k_all, k_user = spec["caps"]()
+            mine = len(_kind_running(job["kind"], _owner(job)))
+            why = (f"{spec['label']}은 사람마다 {k_user}건씩 돈다 — 내 {spec['label']} {mine}건이 끝나야 차례가 온다" if mine >= k_user
+                   else f"{spec['label']} 전체 상한 {k_all}건 — 도는 것이 끝나야 차례가 온다(심의 자리와는 따로다)")
+    elif _external(job):
         mine = len(_external_running_of(job.get("task_owner") or ""))
         why = (f"외부 응답자 심의는 주인마다 {EXTERNAL_PER_OWNER}건씩 돈다 — 내 외부 응답자 심의 {mine}건이 끝나야 차례가 "
                "온다(GLM 심의 자리와는 따로다)")
@@ -1307,6 +1364,8 @@ def _apply(job: dict, event: str, data: dict) -> None:
             job["result_text"] = content
         if data.get("tool_mode") in ("tools", "evidence_only"):      # 외부 응답자 심의만 싣는다 — 실제로 돈 길
             job["tool_mode"] = data["tool_mode"]
+        if isinstance(data.get("task"), dict):                       # 심의가 아닌 잡(TASK_KINDS)의 구조화된 결과 — 심의 엔진은 이 칸을 내지 않는다
+            job["task_result"] = data["task"]
     elif event == "error":
         # 설정 이름(knob)은 여기서 붙인다(상태줄·카드·경고와 같다).
         job["error"] = (str(data.get("message") or "알 수 없는 오류")
@@ -1656,6 +1715,63 @@ def start(app, job_kind: str, question: str, *, groups: list | None = None,
     return job
 
 
+def _task_spawn(app, job: dict, spec: dict, text: str, groups: list, opts: dict, user_email: str):
+    """심의가 아닌 잡을 띄울 때 부를 것 — start_task 와 재기동 뒤 다시 세우기(_requeue)가 같은 것을 만든다. 태스크는 그 요청의 문맥 사본에서
+    만든다(start 와 같은 까닭 — 줄 선 잡이 앞 잡의 뒷정리 안에서 뜰 때 그 잡의 표식을 물려받지 않게)."""
+    ctx = contextvars.copy_context()
+
+    def spawn() -> asyncio.Task:
+        gen = spec["entry"](app, text, list(groups or []), dict(opts or {}), user_email)
+        ctx.run(call_trace.tag, job=job["id"])
+        ctx.run(usage_tokens.tag, user=user_email or "", kind="other")
+        return ctx.run(asyncio.create_task, _drive(job, gen), name=f"task-job-{job['id']}")
+    return spawn
+
+
+def start_task(app, kind: str, text: str, *, groups: list | None = None, opts: dict | None = None, user_email: str = "",
+               owner_aff: str = "") -> dict:
+    """심의가 아닌 잡(TASK_KINDS — 위임)을 백그라운드로 시작하고 잡 기록을 곧바로 돌려준다 — status 는 running 이거나 queued(그 종류의 상한이 차서
+    줄을 섰다 — 자리가 나면 스스로 시작한다). 심의와 같은 원장 · 줄 · 새 심의 멈춤 · 시작 인자 파일(줄이 재기동을 넘긴다)을 쓴다. 줄까지 찼으면
+    RuntimeError, 멈춤이면 DelibPaused, 꺼진 종류면 ValueError."""
+    spec = _KINDS.get(kind)
+    if spec is None:
+        raise ValueError(f"이 서버에서 {kind} 가 꺼져 있다")
+    q = (text or "").strip()
+    if not q:
+        raise ValueError("맡길 일이 비어 있다")
+    paused = pause_info()
+    if paused:
+        raise DelibPaused(paused)
+    me = _norm(user_email)
+    k_all, k_user = spec["caps"]()
+    mine = _kind_running(kind, me)
+    hit = ([f"사람마다 {k_user}건"] if me and len(mine) >= k_user else []) + (
+        [f"전체 {k_all}건"] if len(_kind_running(kind)) >= k_all else [])
+    lim = limits()
+    if hit and (lim["queue_max"] <= 0 or len(_PENDING) >= lim["queue_max"]):
+        # 거절 문구에는 내 잡만 싣는다(start 와 같은 까닭 — 남의 job_id 로 남의 일을 들여다보지 못하게)
+        waiting = [jid for jid, (j, _s) in _PENDING.items() if me and _owner(j) == me]
+        raise RuntimeError(f"{spec['label']} 상한에 걸렸고({' · '.join(hit)}) 줄도 찼다({len(_PENDING)}/{lim['queue_max']}건) — 내 진행 중 "
+                           f"{len(mine)}건{' ' + ', '.join(mine) if mine else ''} · 내 대기 {len(waiting)}건. 끝난 뒤 다시 하거나 내 것을 접어라.")
+    job_id = f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    job = {"id": job_id, "job": kind, "kind": kind, "label": spec["label"], "question": q, "chair_template": None,
+           "opts": _opts_echo(dict(opts or {})), "status": "queued", "stage": "queued", "step": "", "steps": [],
+           "seats": [], "round": 0, "total_rounds": None, "decision": None, "result_text": None, "report_id": None, "plain": None,
+           "turns": [], "checkpoint": None, "error": None, "warnings": [], "evidence_omitted": [],
+           "started_at": None, "updated_at": _now(), "finished_at": None, "user": user_email or "",
+           "owner_aff": str(owner_aff or "").strip(), "started_by": "user"}
+    _JOBS[job_id] = job
+    job["durable"] = _write_args(job_id, {"job_kind": kind, "question": q, "groups": list(groups or []), "opts": dict(opts or {}),
+                                          "user_email": user_email or "", "owner": "", "owner_aff": owner_aff or ""})
+    _PENDING[job_id] = (job, _task_spawn(app, job, spec, q, list(groups or []), dict(opts or {}), user_email or ""))
+    _pump()
+    if job["status"] == "queued":
+        job["queued_at"] = job["updated_at"]
+        _persist(job)
+        log.info("[task-job %s] 대기 %d번째 kind=%s q=%.60s", job_id, len(_PENDING), kind, q)
+    return job
+
+
 def _rewrite_journal(job_id: str, carry: list) -> None:
     """제자리 이어하기 — 끊긴 잡의 일지를 머리와 되살릴 재개 자료(carry)만으로 고쳐 쓴다(원자적 · 0600). 앞 시도의 공개 사건은 이미 원장에
     접혔다 — 남겨 두면, 줄에 다시 선 잡이 새 일지를 열기 전에 프로세스가 죽을 때 재기동 정리가 그것을 한 번 더 접는다(턴이 두 번). 못 쓰면
@@ -1876,7 +1992,7 @@ def reap_orphans(app=None) -> int:
                 n += 1          # 제자리 이어하기로 줄 섰던 잡인데 재개 자료를 다시 못 읽었다 — 끊긴 채로 되돌렸다(_requeue)
         except Exception as exc:  # noqa: BLE001 — 한 잡이 깨져도 나머지는 다시 세운다
             log.warning("[delib-job %s] 줄에 다시 세우지 못했다 — 닫는다: %r", j.get("id"), exc)
-            _close_orphan(j, why=f"{type(exc).__name__}")
+            _close_orphan(j, why=(str(exc)[:160] if is_task(j) else f"{type(exc).__name__}"))
             n += 1
     _REQUEUED = requeued
     _sweep_args()
@@ -1888,7 +2004,10 @@ def reap_orphans(app=None) -> int:
 
 
 def _close_orphan(j: dict, *, why: str = "", track=None) -> None:
-    if j["status"] == "queued":
+    if j["status"] == "queued" and is_task(j):
+        j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 일은 시작하지 못했다" + (f"({why})" if why else "") + ". 다시 맡기려면 다시 시작한다")
+        _drop_args(j["id"])
+    elif j["status"] == "queued":
         j["error"] = ("서버 재기동으로 대기열이 사라졌다 — 이 심의는 시작하지 못했다"
                       + (f"(시작 인자를 다시 읽지 못했다 — {why})" if why else "") + ". deliberate_start 로 다시 시작해야 한다")
         _drop_args(j["id"])
@@ -1905,7 +2024,20 @@ def _requeue(app, job: dict, args: dict) -> bool:
 
     제자리 이어하기로 줄 섰던 잡(attempts)은 재개 자료를 일지에서 다시 읽어 그 태스크 문맥에 건다(HA-09 S1) — 없이 띄우면 같은 잡이 처음부터
     돌아 원장에 남은 끝난 라운드의 턴과 겹친다. 못 읽으면(판이 바뀌어 꼴이 다르다 등) 띄우지 않고 끊긴 채로 되돌린다(거짓) — 주인이 다시 이으면
-    요약으로 잇는다."""
+    요약으로 잇는다.
+
+    심의가 아닌 잡(TASK_KINDS)은 그 종류가 지금 켜져 있을 때만 같은 차례로 다시 세운다 — 꺼졌으면 ValueError(부르는 쪽이 닫는다)."""
+    if is_task(job):
+        tspec = _KINDS.get(job["kind"])
+        if tspec is None:
+            raise ValueError(f"이 서버에서 {job['kind']} 가 꺼져 있다")
+        spawn = _task_spawn(app, job, tspec, args["question"], list(args.get("groups") or []), dict(args.get("opts") or {}),
+                            str(args.get("user_email") or ""))
+        job.update(status="queued", stage="queued", durable=True, requeued=int(job.get("requeued") or 0) + 1, requeued_at=_now())
+        _JOBS[job["id"]] = job
+        _PENDING[job["id"]] = (job, spawn)
+        _persist(job)
+        return True
     spec = JOBS[resolve_job(str(args.get("job_kind") or job.get("job") or "default"))]
     ext_kw = ({"owner": args.get("owner") or args.get("user_email"), "job_id": job["id"]} if _external(job) else {})
     if (job.get("opts") or {}).get("wiki"):
@@ -1952,7 +2084,8 @@ def _sweep_args() -> None:
         status = (rec or {}).get("status")
         if status in ("running", "queued"):
             continue
-        if status == "interrupted" and not rec.get("resumed_by") and now - float(rec.get("finished_at") or now) < ARGS_KEEP_S:
+        if (status == "interrupted" and not rec.get("resumed_by") and not is_task(rec)        # 심의가 아닌 잡은 잇지 않는다 — 곧바로 치운다
+                and now - float(rec.get("finished_at") or now) < ARGS_KEEP_S):
             continue
         _drop_args(jid)
     _sweep_tmp()
@@ -2323,7 +2456,8 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
-        return can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
+        # 심의가 아닌 잡(TASK_KINDS — 위임)은 심의 목록에 싣지 않는다 — 그 종류의 도구로 본다
+        return not is_task(j) and can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
     seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
     window = max(limit * 3, LIST_SCAN_MAX)
     scanned = total = 0
