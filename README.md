@@ -29,7 +29,10 @@ ChatDock (portal frontend)
   `start.sh` reads them before it replaces a running instance, and any unattended restart
   (the portal's update-all) should do the same. `delib_as_of: true` says this build takes the deliberation reference
   date (`delib_opts.as_of`, portal `docs/request-1027` HA-11); the portal refuses a dated web deliberation when the
-  running instance does not say so (an older build drops the key silently and filters nothing).
+  running instance does not say so (an older build drops the key silently and filters nothing). `offload{delegate,
+  draft, transform, result_ask}` are the token-saving v2 switches (see Offload below).
+- `POST /llm/ask_over_text` — ask a question over a long text (the gateway's `result_ask`); mounted only with
+  `RESULT_ASK_ENABLED=1` (see Offload below).
 - `GET /limits` · `POST /limits` — the deliberation job limits without a restart (portal `docs/delib-ops` R4).
   A box file `<DELIB_JOB_DIR>/state/limits.json` overlays `DELIB_JOB_MAX_RUNNING` · `DELIB_JOB_MAX_RUNNING_PER_USER` ·
   `DELIB_JOB_QUEUE_MAX` and is read at every start and queue decision (a person may edit it by hand too).
@@ -819,6 +822,83 @@ GLM byte-identity with the switch on/off and `llm: "glm"`) are `tests/test_exter
 second (the agent's forged consent, values too large to compute with, the shell's exported switch — the suite's
 `conftest.py` drops every `EXTERNAL_LLM_*` but `EXTERNAL_LLM_CONTRACT_UPDATE` — unknown `llm` values, and the external
 job slots) are `tests/test_external_llm_review2_fixes.py`.
+
+### Offload to the server's Qwen · GLM (token saving v2 — every switch off by default)
+
+`offload.py` — the agent-server share of portal `docs/token-saving/offload-v2.md` (contract §3-1 delegation, §3-3 draft ·
+transform, the §3-2 ask endpoint; decision TS-6). A personal Claude hands reading/searching/writing work to this server so
+tool results stop piling up in its own context. Four switches, each read once at startup (`offload.ON`); only the exact
+value `1` turns one on. **Off means absent:** the MCP tools are not registered and the HTTP route is not mounted, so
+`tools/list`, the server instructions, the routes and every other response are byte-identical to a box without this code
+(checked against `origin/main` when it was added; `tests/test_offload.py` asserts nothing is added while off).
+
+| var | default | opens |
+|---|---|---|
+| `DELEGATE_ENABLED` | off | `delegate_start` · `delegate_status` · `delegate_result` · `delegate_cancel` (A) |
+| `DRAFT_ENABLED` | off | `draft_section` (C) |
+| `TRANSFORM_ENABLED` | off | `llm_transform` (D) |
+| `RESULT_ASK_ENABLED` | off | `POST /llm/ask_over_text` (the gateway's `result_ask` calls it) — off is a plain 404 (route not mounted) |
+| `DELEGATE_MAX_RUNNING` | `2` | delegation jobs running at once on the box (below 1 reads as 2); one per person is fixed. Queued beyond that. |
+
+`/health.offload` is `{delegate, draft, transform, result_ask}` — the four switches (the portal's setup kit shows a
+disabled option as "off on this box").
+
+**Identity and fence.** Every call needs the gateway identity header (`x-hwax-user`); a call without one is refused (a
+service-account view is not "that person's view"). Tools are loaded on the same path as an MCP deliberation job — gateway
+shared secret plus the person's identity headers (`deliberation._tools_by_name`, no PAT) — and then fenced exactly like a
+routine step: only names the gateway confirmed as reads (`/tools-map` `routine_read` — annotations, read list, box
+overlay; unknown means closed), minus this server's own backend (`hwax-deliberation` — deliberation and delegation
+themselves) and gateway-local tools (`invoke_tool` …). A gateway that does not send `routine_read` gives an empty fence.
+Writes, job submissions, deletions and deliberations are never bound. This server's own agent (web chat, deliberation
+seats including risk review, routines, thinking) neither binds nor `invoke_tool`s the six tools (`app._OFFLOAD_TOOLS` —
+exact names and the `hwaxdeliberation_` collision prefix only), so no risk-review path can open a delegation (D-18).
+
+**Numbers.** Every answer's numbers are checked by code against the source text (`evidence.unsourced_numbers` — the chat
+and decision check: decimals or ≥ 100, substring) → `numbers{checked, mismatched[≤30], mismatched_total?}`. Mismatches are
+reported, never rewritten.
+
+| tool | args | returns |
+|---|---|---|
+| `delegate_start` | `task` (≤ 8,000 chars), `apps?` (backend keys, ≤ 10), `max_steps` (12, 1–30), `max_minutes` (10, 1–30) | `{job_id, status (running · queued), max_steps, max_minutes, queue?, clamped?, note}` — a job on the deliberation ledger, kind `delegate` |
+| `delegate_status` | `job_id`, `wait_s` (as `deliberate_status`, ≤ `DELIB_STATUS_WAIT_MAX_S`) | `{job_id, status, stage (tools · gather · answer), step, task_head, elapsed_s, steps_recent, steps_total, idle_s?, last_step?, queue?, warnings?, error?, wait?}` |
+| `delegate_result` | `job_id`, `view` (`full` default · `summary`) | done: `{answer (≤ 10,000 chars, cites [eN]), evidence[{id, tool, args (≤ 300 chars), chars, ok}] (summary: evidence_n · evidence_tools), numbers, model, steps, tokens{input, output} or null, notes?}`; otherwise status · error · note |
+| `delegate_cancel` | `job_id` | `delib_jobs.cancel` — the owner's own only |
+| `draft_section` | `outline` (≤ 8,000), `refs?` (≤ 10 — result-handle `ref` strings and/or `{tool, args}`), `style` (report · memo · minutes · plain), `target_chars` (3,000, 200–20,000) | `{draft (≤ 20,000), numbers, sources[{n, kind (ref · tool), ref · tool+args, chars, ok, error?}], model, notes?}` — GLM (`delib_llm`); sources not returned |
+| `llm_transform` | `instruction` (≤ 4,000), `text` or `ref` (exactly one) | `{text (≤ 20,000), numbers, model, cut?}` — chat LLM |
+
+*Delegation (A).* The executor is a routine step's small ReAct used once (`create_react_agent` streamed by values, calls
+× 2 + 5 round trips, results shown to the LLM up to `routine._result_cap`, the full text kept for the number check),
+on the chat LLM with GLM fallback (`routine._routine_llm(app, "chat")` — the chat window override is set inside the job
+task), the phantom-id gate seeded from the task's integers. Over the call budget a tool answers "stop and summarise"
+without calling; at the time box the ReAct is cancelled; either way a tool-less wrap-up turn answers from the results
+received. The job uses the deliberation ledger (`delib_jobs.start_task` — kind in `delib_jobs.TASK_KINDS`, registered by
+`offload.arm()` only when the switch is on): same queue (`DELIB_JOB_QUEUE_MAX`), pause (`POST /drain {scope: delib}`
+holds it), cancel, start-args file and restart hand-off for **queued** jobs (re-queued in order; closed if the switch is
+now off). A delegation running at a restart ends `interrupted` and is not resumed — it only read, so starting it again
+changes nothing; its args file is swept at once. It does not take a deliberation (GLM) slot — `_glm_running_count`,
+per-user, seat-sum and the card-review human count leave it out — but it counts in `delib_active` (a restart cuts it).
+Only the owner reads it (`can_read` — not the same affiliation, not admins, not identity-less calls); deliberation tools
+refuse a delegation id (so `deliberate_continue` cannot run it as a deliberation) and `deliberate_list` leaves it out.
+LLM tokens are tagged `other` in the per-person usage (no new kind yet).
+
+*Result handles (C · D).* A `ref` is read from the gateway's internal endpoint `GET <gateway connection url without
+/mcp>/internal/result/{ref}` (dev `http://127.0.0.1:9110`; `GATEWAY_HTTP_BASE` only when no connection is configured) with
+the gateway connection's `Authorization` once (`Bearer <GW_TOKEN>` — `seat_box.secret`) and the person header
+`X-HWAX-User` (%-encoded), no `X-Forwarded-*`. The answer is `{ref, tool, chars, sha256, pages, created, expires, text,
+structured}` and `text` is the whole original (`pages` counts `result_get` pages — not fetched here); 404 is missing,
+expired or someone else's (one answer), 401 a secret mismatch, 400 no person header.
+Both tools are synchronous: sources over the model window, or the wall clock `offload.SYNC_LIMIT_S` (540 s, under the
+gateway's 600 s call limit), are refused with "split it" — never turned into a job.
+
+*`POST /llm/ask_over_text`* `{text, question (≤ 2,000), max_answer_chars? (4,000, 200–20,000)}` → `{answer, quotes[{page,
+start, end, text}], numbers, model}`. Auth as the deliberation HTTP endpoints: shared secret (`Authorization: Bearer
+<GW_TOKEN>` — 401/503 otherwise), then `x-hwax-user` (400 `identity_required` without it — the gateway reads 401 · 403 ·
+503 as a secret mismatch and 404 as off or an old build); `x-hwax-corr` is accepted and unused; unknown fields 422. Chat LLM.
+Text that fits the window is asked once; otherwise each window-sized page is read (≤ `offload.ASK_PAGES_MAX` = 6 pages,
+2 at a time — more is 413 `too_large`) and the page notes are merged in one more call. Quotes are placed by code:
+an exact substring of the text (surrounding quote marks stripped, ≥ 8 chars) or dropped; `start`/`end` are code-point
+offsets in the whole text (end exclusive) and `page` counts 20,000-char pages (the gateway `result_get` default). LLM
+failure 502 `llm_failed`, wall clock 504 `timeout`.
 
 ### Call trace (Phoenix — off by default)
 

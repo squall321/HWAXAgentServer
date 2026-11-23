@@ -336,11 +336,12 @@ def _gateway_url(app) -> str:
     return url
 
 
-async def _routine_llm(app):
+async def _routine_llm(app, which: str | None = None):
     """(실행기 LLM, 창 덮어쓰기 토큰 또는 None) — thinking._think_llm 과 같은 셈. ROUTINE_LLM=chat 이고 챗 전용 LLM 이 켜져 있으면 그것(Qwen —
     GLM 넘김 포함)이고, 예산은 그 창으로 잡는다(두 서버 중 작은 창 − 출력 몫). 아니면 VLLM_*(GLM). 떼어 낸 작업 **안에서** 부른다 — 창 덮어쓰기는
-    문맥 변수라 작업 밖에서 걸면 작업이 모른다(그러면 예산이 GLM 1M 창으로 잡혀 Qwen 이 넘치고 조용히 GLM 으로 넘어간다)."""
-    if ROUTINE_LLM != "chat" or not getattr(app.state, "chat_llm_cfg", None):
+    문맥 변수라 작업 밖에서 걸면 작업이 모른다(그러면 예산이 GLM 1M 창으로 잡혀 Qwen 이 넘치고 조용히 GLM 으로 넘어간다).
+    which 를 주면 ROUTINE_LLM 대신 그 값이다 — 위임 · 변환(offload — 늘 챗 LLM)이 같은 셈을 빌린다."""
+    if (which or ROUTINE_LLM) != "chat" or not getattr(app.state, "chat_llm_cfg", None):
         return app.state.llm, None
     A = _app()
     llm, tok = A._chat_llm_of(app), None
