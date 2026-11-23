@@ -37,6 +37,7 @@ import delib_verify
 import deliberation as _engine   # 근거 상한·본문 키를 **읽어서** 설명을 만든다(_EVID_DESC)
 import external_llm
 import mcp_pages
+import offload
 
 log = logging.getLogger("agent.mcp")
 
@@ -172,7 +173,10 @@ def _caller_view(ctx: Context | None) -> tuple[str, str, bool]:
 
 
 def _need_read(job: dict, ctx: Context | None) -> None:
-    """볼 수 없는 심의면 거절한다(주인 · 같은 소속 · 관리자 · 신원 없는 내부 호출만 — delib_jobs.can_read)."""
+    """볼 수 없는 심의면 거절한다(주인 · 같은 소속 · 관리자 · 신원 없는 내부 호출만 — delib_jobs.can_read). 심의가 아닌 잡(위임 — TASK_KINDS)은
+    심의 도구로 보지 않는다 — 이어하기(deliberate_continue)가 그 일을 심의로 돌리지 않게, 그 종류의 도구(delegate_*)로 본다."""
+    if delib_jobs.is_task(job):
+        raise ValueError(f"{job.get('id')} 는 심의가 아니다({job.get('kind')}) — delegate_status · delegate_result 로 본다")
     user, aff, admin = _caller_view(ctx)
     if not delib_jobs.can_read(job, user, aff, admin):
         raise ValueError(f"이 심의({job.get('id')})는 볼 수 없다 — 시작한 사람과 같은 소속, 관리자만 본다"
@@ -1846,5 +1850,187 @@ def _register_external(m: FastMCP, env=os.environ) -> bool:
 
 
 _EXTERNAL_TOOLS = _register_external(mcp)
+
+
+# ── 토큰 절감 2판 — 서버 Qwen · GLM 에 일 맡기기(HWAXPortal docs/token-saving offload-v2 3-1 · 3-3) ────────────────────────────────────
+# 스위치(offload.ON — DELEGATE_ENABLED · DRAFT_ENABLED · TRANSFORM_ENABLED)가 켜진 것만 올린다 — 꺼지면 도구 목록에 없다(_register_external 과
+# 같은 꼴). 이 서버의 에이전트(웹 챗 · 심의 좌석 · 루틴 · 리스크 심사)는 묶지도 부르지도 않는다(app._OFFLOAD_TOOLS — D-18). 신원 없는 호출은
+# 받지 않는다 — 서비스 계정 시야로 돌면 '그 사람의 시야' 가 아니다.
+_OFF_IDENT = ("신원 없는 호출이다 — 게이트웨이가 신원 머리(x-hwax-user)를 싣지 않았다. 사람의 PAT 로 게이트웨이를 거쳐 부른다(서버는 그 사람의 "
+              "시야로만 읽는다)")
+_A_DG_TASK = (f"맡길 일 한 줄(최대 {offload.TASK_MAX:,}자) — 무엇을 알아내 답할지. 근거 본문을 싣지 말고 찾을 대상(과제 · 모델 · 부품 · 기간 "
+              "등)을 적는다 — 서버가 그 사람의 읽기 도구로 찾는다.")
+_A_DG_APPS = f"조회를 이 앱들(게이트웨이 백엔드 키 — list_tool_apps 의 app)로 좁힌다(최대 {offload.APPS_MAX}개). 비우면 내 읽기 도구 전부."
+_A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다."
+_A_DG_MIN = f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다."
+_A_DG_JOB = "위임 잡 id(delegate_start 응답의 job_id)."
+_A_DG_WAIT = (f"초 — 주면 상태 · 단계가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초). 깬 까닭은 wait.woke — "
+              "ended · changed · timeout · closing · paused. 기본 0(기다리지 않는다).")
+_A_DG_VIEW = ("full(기본 — 답 · 근거 표 evidence[{id, tool, args, chars, ok}] · 숫자 대조 · 모델 · 호출 수 · 토큰) | summary(근거 표 대신 "
+              "evidence_n · evidence_tools). 답을 읽는 데는 summary 로 충분하다.")
+_DG_START_DESC = (
+    "조사 위임 — 한 줄 일을 서버의 실행기(챗 LLM — stcx Qwen, 넘김 GLM)에 맡긴다. 서버가 **부른 사람의 권한 · 시야로** 읽기 도구를 여러 번 불러 "
+    "풀고 답 · 근거 표 · 숫자 대조만 돌려준다 — 도구 결과가 이 대화(Claude 문맥)에 쌓이지 않아 토큰이 준다. 판단과 지휘는 Claude 가, 찾기 · "
+    "읽기의 노동은 서버가. **조사만 한다** — 묶이는 것은 게이트웨이가 읽기로 확인한 도구뿐이고(루틴 단계와 같은 울타리) 쓰기 · 잡 제출 · 지우기 · "
+    "심의는 묶이지 않는다. 즉시 job_id 를 돌려주고 뒤에서 돈다 — delegate_status(job_id, wait_s) 를 **한 번** 부르고(고리로 거듭 묻지 마라) "
+    "끝나면 delegate_result(job_id, view=\"summary\"). 동시에 서버 전체 " + f"{offload.DELEGATE_MAX_RUNNING}건 · 사람마다 "
+    f"{offload.DELEGATE_PER_USER}건 돈다 — 넘치면 줄을 선다(status=queued · queue 에 순번, 자리가 나면 스스로 시작한다 — 다시 시작하지 마라). "
+    "답의 숫자는 서버 코드가 근거 원문과 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다 — 어긋난 수는 쓰기 전에 확인한다). 서버가 재기동하면 "
+    "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다.")
+_DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · running · done · error · cancelled · interrupted) · 단계(tools · gather · answer) · "
+                   "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. **wait_s 로 한 번** 부르면 바뀌거나 끝날 때까지 서버가 기다린다 — 고리로 거듭 묻지 마라. "
+                   "done 이면 delegate_result.")
+_DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched}, model, steps, tokens{input, output}}. answer 의 [eN] 은 "
+                   "evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수)다. 끝나지 않았으면 상태와 "
+                   "안내만 준다. 내가 맡긴 위임만 보인다.")
+_DG_CANCEL_DESC = "도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만. 줄 선 것은 시작하지 않고 빠진다."
+_A_DR_OUTLINE = (f"절 개요(최대 {offload.OUTLINE_MAX:,}자) — 무엇을 어떤 차례로 쓸지. 근거 본문은 refs 로 준다.")
+_A_DR_REFS = (f"근거(최대 {offload.DRAFT_REFS_MAX}건) — 결과 손잡이 ref 글(게이트웨이 결과 머리의 ref) 또는 {{tool, args}}(서버가 그 사람의 읽기 "
+              "도구로 부른다 — 위임과 같은 울타리, 밖이면 부르지 않고 sources 에 까닭)를 섞어 준다. 서버가 읽어 GLM 에 싣는다 — 원문이 이 대화로 오지 않는다.")
+_A_DR_STYLE = "꼴 — " + " · ".join(f"{k}({v})" for k, v in offload.STYLES.items()) + "."
+_A_DR_TARGET = f"길이(자) — 기본 {offload.DRAFT_TARGET_DEFAULT:,} · 200~{offload.DRAFT_TARGET_MAX:,} 로 죈다."
+_DR_DESC = (
+    "긴 글 서버 작성 — 개요 + 근거 손잡이로 서버의 GLM 이 보고서 절 초안을 쓴다 → {draft, numbers{checked, mismatched}, sources, model}. 근거 원문은 "
+    "서버가 읽어 GLM 에 싣고 이 대화로 오지 않는다. 숫자는 서버 코드가 근거와 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다). 동기 호출이다 — "
+    "근거 · 개요가 GLM 창을 넘거나 시간 상한에 걸리면 잡으로 돌리지 않고 거절하며 줄이라고 알린다(refs 를 줄이거나 절을 나눈다).")
+_A_TF_INSTRUCTION = f"지시(최대 {offload.INSTRUCTION_MAX:,}자) — 예 '영어로 번역' · '세 줄 요약' · '표를 마크다운 표로' · '용어를 사내 표기로 통일'."
+_A_TF_TEXT = "바꿀 글 — ref 와 둘 가운데 하나만."
+_A_TF_REF = "바꿀 글의 결과 손잡이 ref — 서버가 원문을 읽는다(이 대화로 오지 않는다). text 와 둘 가운데 하나만."
+_TF_DESC = (
+    "단순 변환 — 번역 · 요약 · 표 바꾸기 · 용어 통일을 서버의 챗 LLM 이 한다 → {text, numbers, model}(넘치면 cut). 원문에 없는 사실 · 수치를 더하지 "
+    f"않게 시키고, 숫자는 서버 코드가 원문과 대조한다. 결과는 {offload.TRANSFORM_OUT_MAX:,}자에서 자른다. 동기 호출이다 — 원문이 창을 넘으면 거절한다"
+    "(나눠 부르거나 result_ask 로 묻는다).")
+
+
+def _offload_caller(ctx: Context | None) -> tuple[str, list[str], str]:
+    """(신원, 그룹, 소속) — 게이트웨이 머리(_caller · _caller_view 와 같은 셈). 신원이 없으면 거절한다."""
+    user, groups = _caller(ctx)
+    if not user.strip():
+        raise ValueError(_OFF_IDENT)
+    return user, groups, _caller_view(ctx)[1]
+
+
+def _delegate_job(job_id: str, ctx: Context | None) -> tuple[dict, str]:
+    """(위임 잡, 신원) — 없거나 위임이 아니거나 내 것이 아니면 같은 글로 거절한다(남의 잡이 있는지도 말하지 않는다)."""
+    user, _groups, _aff = _offload_caller(ctx)
+    job = delib_jobs.get(str(job_id or "").strip())
+    if not job or job.get("kind") != "delegate" or not delib_jobs.can_read(job, user):
+        raise ValueError(f"그런 위임이 없다: {str(job_id)[:80]} — 내가 맡긴 위임의 job_id 를 준다")
+    return job, user
+
+
+async def delegate_start(task: Annotated[str, Field(description=_A_DG_TASK)],
+                         apps: Annotated[list[str] | None, Field(description=_A_DG_APPS)] = None,
+                         max_steps: Annotated[int, Field(description=_A_DG_STEPS)] = offload.STEPS_DEFAULT,
+                         max_minutes: Annotated[int, Field(description=_A_DG_MIN)] = offload.MINUTES_DEFAULT,
+                         ctx: Context | None = None) -> dict:
+    """조사를 위임 잡으로 연다(delib_jobs.start_task — 심의와 같은 원장 · 줄 · 멈춤 · 재기동 넘김)."""
+    user, groups, aff = _offload_caller(ctx)
+    task = str(task or "").strip()
+    if not task:
+        raise ValueError("task 가 비었다 — 맡길 일을 한 줄로 적는다")
+    if len(task) > offload.TASK_MAX:
+        raise ValueError(f"task 가 {len(task):,}자다 — {offload.TASK_MAX:,}자 안으로 줄인다(근거 본문은 싣지 말고 찾을 대상을 적는다)")
+    steps, c1 = offload._clamp(max_steps, offload.STEPS_DEFAULT, 1, offload.STEPS_MAX)
+    minutes, c2 = offload._clamp(max_minutes, offload.MINUTES_DEFAULT, 1, offload.MINUTES_MAX)
+    got = [str(a).strip() for a in (apps or []) if str(a).strip()]
+    if len(got) > offload.APPS_MAX:
+        raise ValueError(f"apps 가 {len(got)}개다 — {offload.APPS_MAX}개까지")
+    job = delib_jobs.start_task(_need_app(), "delegate", task, groups=groups, user_email=user, owner_aff=aff,
+                                opts={"apps": got, "max_steps": steps, "max_minutes": minutes})
+    out = {"job_id": job["id"], "status": job["status"], "max_steps": steps, "max_minutes": minutes}
+    q = delib_jobs.queue_info(job)
+    if q:
+        out["queue"] = q
+    clamped = [x for x in (c1 and f"max_steps {c1}", c2 and f"max_minutes {c2}") if x]
+    if clamped:
+        out["clamped"] = clamped
+    out["note"] = ((f"줄을 섰다 — 내 순번 {q['position']}번째({q['why']}). 자리가 나면 스스로 시작한다 — 다시 시작하지 마라. " if q else "맡겼다 — ")
+                   + "delegate_status(job_id, wait_s) 를 한 번 부르고, 끝나면 delegate_result(job_id, view=\"summary\").")
+    return out
+
+
+async def delegate_status(job_id: Annotated[str, Field(description=_A_DG_JOB)],
+                          wait_s: Annotated[float, Field(description=_A_DG_WAIT)] = 0,
+                          ctx: Context | None = None) -> dict:
+    """위임 진행 — wait_s 를 주면 심의 진행 조회와 같은 기다림(_status_wait — 상태 · 단계가 바뀌거나 끝날 때까지)."""
+    job, _user = _delegate_job(job_id, ctx)
+    waited = None
+    if wait_s:
+        job, waited = await _status_wait(job["id"], job, wait_s)
+    out = offload.status_view(job)
+    if waited is not None:
+        out["wait"] = waited
+    return out
+
+
+async def delegate_result(job_id: Annotated[str, Field(description=_A_DG_JOB)],
+                          view: Annotated[Literal["full", "summary"], Field(description=_A_DG_VIEW)] = "full",
+                          ctx: Context | None = None) -> dict:
+    """끝난 위임의 답 — offload.result_view."""
+    if view not in ("full", "summary"):
+        raise ValueError(f"view 는 full · summary 가운데 하나다 — 받은 값: {view!r}")
+    job, _user = _delegate_job(job_id, ctx)
+    return offload.result_view(job, view)
+
+
+async def delegate_cancel(job_id: Annotated[str, Field(description=_A_DG_JOB)], ctx: Context | None = None) -> dict:
+    """위임을 접는다 — 내 것만(delib_jobs.cancel 의 주인 판정과 같은 신원)."""
+    job, user = _delegate_job(job_id, ctx)
+    out = delib_jobs.cancel(job["id"], by=user)
+    if out.get("status") == "cancelling":
+        out["note"] = "접기를 청했다 — 잠시 뒤 delegate_status 로 확인한다."
+    return out
+
+
+async def draft_section(outline: Annotated[str, Field(description=_A_DR_OUTLINE)],
+                        refs: Annotated[list[str | dict] | None, Field(description=_A_DR_REFS)] = None,
+                        style: Annotated[Literal["report", "memo", "minutes", "plain"], Field(description=_A_DR_STYLE)] = "report",
+                        target_chars: Annotated[int, Field(description=_A_DR_TARGET)] = offload.DRAFT_TARGET_DEFAULT,
+                        ctx: Context | None = None) -> dict:
+    """절 초안 — offload.draft_section(GLM · 근거는 그 사람의 시야로 읽는다)."""
+    user, groups, _aff = _offload_caller(ctx)
+    try:
+        return await offload.draft_section(_need_app(), outline=outline, refs=refs, style=style, target_chars=target_chars,
+                                           user=user, groups=groups)
+    except asyncio.TimeoutError:
+        raise ValueError(f"시간 상한 {offload.SYNC_LIMIT_S:g}초에 걸렸다 — refs 를 줄이거나 절을 나눠 다시 부른다") from None
+
+
+async def llm_transform(instruction: Annotated[str, Field(description=_A_TF_INSTRUCTION)],
+                        text: Annotated[str, Field(description=_A_TF_TEXT)] = "",
+                        ref: Annotated[str, Field(description=_A_TF_REF)] = "",
+                        ctx: Context | None = None) -> dict:
+    """단순 변환 — offload.transform(챗 LLM)."""
+    user, _groups, _aff = _offload_caller(ctx)
+    try:
+        return await offload.transform(_need_app(), instruction=instruction, text=text, ref=ref, user=user)
+    except asyncio.TimeoutError:
+        raise ValueError(f"시간 상한 {offload.SYNC_LIMIT_S:g}초에 걸렸다 — 원문을 나눠 다시 부른다") from None
+
+
+OFFLOAD_TOOLS = {"delegate": ("delegate_start", "delegate_status", "delegate_result", "delegate_cancel"),
+                 "draft": ("draft_section",), "transform": ("llm_transform",)}
+
+
+def _register_offload(m: FastMCP, on: dict | None = None) -> dict:
+    """켜진 스위치의 도구만 m 에 올린다 — {delegate, draft, transform}: 올렸나. on 을 주지 않으면 offload.ON(import 때 읽은 스위치)."""
+    on = offload.ON if on is None else on
+    got = {k: bool(on.get(k)) for k in OFFLOAD_TOOLS}
+    if got["delegate"]:
+        m.add_tool(delegate_start, name="delegate_start", title="조사 위임 — 서버에 맡기기", description=_DG_START_DESC)
+        m.add_tool(delegate_status, name="delegate_status", title="조사 위임 — 진행", description=_DG_STATUS_DESC)
+        m.add_tool(delegate_result, name="delegate_result", title="조사 위임 — 답 받기", description=_DG_RESULT_DESC)
+        m.add_tool(delegate_cancel, name="delegate_cancel", title="조사 위임 — 접기", description=_DG_CANCEL_DESC)
+    if got["draft"]:
+        m.add_tool(draft_section, name="draft_section", title="긴 글 서버 작성 — 절 초안", description=_DR_DESC)
+    if got["transform"]:
+        m.add_tool(llm_transform, name="llm_transform", title="단순 변환 — 번역 · 요약 · 표", description=_TF_DESC)
+    return got
+
+
+_OFFLOAD = _register_offload(mcp)
+if _OFFLOAD["delegate"]:
+    offload.arm()       # 위임 잡 종류를 원장에 올린다 — bind(재기동 정리)보다 먼저라 줄 선 위임이 같은 차례로 다시 선다
 
 app = mcp.streamable_http_app()

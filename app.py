@@ -113,6 +113,7 @@ import review_gate as _review_gate
 import status_wait as _status_wait_mod   # 챗 턴의 잡 상태 조회를 코드가 기다린다(HWAXPortal docs/request-1030 HA-28)
 import ui_panels as _ui   # 포털 챗의 MCP Apps 패널 — 표지가 있는 턴만 패널 도구를 묶고 ui_resource 를 낸다(HWAXPortal docs/request-1027 HA-20)
 import embeds as _embeds   # 챗 뷰어 카드 — 도구 결과의 같은 출처 /apps/ 뷰어 주소를 모아 result 앞에 SSE embeds 로 낸다(HWAXPortal docs/chat-embeds)
+import offload as _offload   # 토큰 절감 2판 — 위임 · 절 초안 · 변환 · 결과에 묻기(스위치 넷, 기본 꺼짐 — HWAXPortal docs/token-saving offload-v2)
 import publish_token as _publish_token   # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(확인 카드 — 사용자 결정 10-31 '내보내는 곳만 가린다')
 import onto_links as _onto   # 코어 어휘표 ontology 칸 — 챗 고정 몫 · 규칙 ⑧ · 입구 표지(HWAXPortal docs/ontology-first)
 from langgraph.errors import GraphRecursionError
@@ -2758,6 +2759,10 @@ def _cap_tool(tool, result_max=None, arg_defaults=None, chat=False):
                         msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 패널을 그리는 클라이언트 전용 도구라 이 대화에서는 "
                                "쓰지 않는다(패널이 그려지지 않는다). 같은 일을 하는 일반 도구(예: 실행 준비 prepare_run · 업로드 도구)로 한다. "
                                "인자 문제가 아니다 — 다시 부르지 마라")
+                    elif _offload_tool(_inner):
+                        print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 위임 · 작성 · 변환 도구는 이 서버의 에이전트가 부르지 않는다")
+                        msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 서버에 일 맡기기(위임 · 절 초안 · 변환)는 사용자의 Claude 가 "
+                               "쓰는 입구다 — 이 대화의 에이전트는 부를 수 없다(직접 도구로 한다). 인자 문제가 아니다 — 다시 부르지 마라")
                     else:
                         print(f"[gate] invoke_tool({_inner[:80]}) 차단 — 외부 응답자 과제 도구는 이 서버의 에이전트가 부르지 않는다")
                         msg = (f"{_TOOL_FAIL_MARK} 도구 {_inner[:80]} 호출 실패: 외부 응답자 과제 도구는 사용자의 Claude Code "
@@ -3962,11 +3967,23 @@ _ROUTINE_TOOLS = frozenset({"routine_list", "routine_get", "routine_run_start", 
 _UNBOUND_TOOLS = frozenset({"ontology_lookup", "gateway_readonly_allowlist"})
 
 
+# 토큰 절감 2판의 도구(위임 · 절 초안 · 변환 — HWAXPortal docs/token-saving offload-v2) — 개인 Claude 의 입구다. 이 서버의 에이전트(웹 챗 · 심의 좌석 ·
+# 루틴 · 리스크 심사 · 띵킹)는 묶지 않고 invoke_tool 로도 부르지 않는다 — 리스크 잡 경로가 위임을 열지 못하게(D-18), 위임이 저를 다시 부르지 않게,
+# 챗 Qwen 이 Qwen 에 일을 넘기지 않게. 이름 그대로이거나 이 서버 백엔드의 충돌 접두(hwaxdeliberation_<도구>)만 본다 — 끝말 무늬로 넓히면 다른 앱의
+# 같은 끝말 도구(…_draft_section)까지 막힌다. 스위치가 꺼진 서버에는 이 이름의 도구가 없다(목록에서 뺄 것이 없다 — 바이트까지 같다).
+_OFFLOAD_TOOLS = frozenset({"delegate_start", "delegate_status", "delegate_result", "delegate_cancel", "draft_section", "llm_transform"})
+
+
+def _offload_tool(name: str) -> bool:
+    n = str(name or "").strip().lower()
+    return n in _OFFLOAD_TOOLS or (n.startswith("hwaxdeliberation_") and n[len("hwaxdeliberation_"):] in _OFFLOAD_TOOLS)
+
+
 def _agent_denied(name: str) -> bool:
     """이 서버의 에이전트가 묶지도 부르지도 않는 도구인가 — 이름 그대로이거나 게이트웨이 별칭·충돌 접두(<앱키>_<도구>)를 단 꼴."""
     n = str(name or "").strip().lower()
     return (any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or _chat_panel_tool(n)
-            or n in _ROUTINE_TOOLS)
+            or n in _ROUTINE_TOOLS or _offload_tool(n))
 
 
 def _ui_host(req: "ChatRequest") -> bool:
@@ -3985,7 +4002,7 @@ def _bindable(tool, allow_panels: bool = False) -> bool:
         return False
     if not allow_panels:
         return not _agent_denied(n)
-    if any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or n in _ROUTINE_TOOLS:
+    if any(n == t or n.endswith("_" + t) for t in _AGENT_DENY_TOOLS) or n in _ROUTINE_TOOLS or _offload_tool(n):
         return False
     uri = _ui.resource_uri(tool)
     if uri or _chat_panel_tool(n):
@@ -10454,6 +10471,55 @@ async def deliberate_batch_stop_http(request: Request):
         return _dl_error("batch_not_found", str(exc), 404)
 
 
+# ── 결과에 묻기 창구(HWAXPortal docs/token-saving offload-v2 3-2) ─────────────────────────────────────────────────────────────
+# POST /llm/ask_over_text {text, question, max_answer_chars?} → {answer, quotes:[{page, start, end, text}], numbers, model} — 게이트웨이 result_ask 가
+# 결과 손잡이의 원문을 실어 부른다. 자격은 심의 HTTP 창구와 같다 — 공유 비밀(Authorization: Bearer <GW_TOKEN> — _seat_auth, 어긋나면 401 · 없으면 503)을
+# 지난 뒤 사람은 게이트웨이가 싣는 신원 머리 x-hwax-user(없으면 400 — 이 창구는 사람의 일만 한다. 게이트웨이는 401 · 403 · 503 을 '공유 비밀 어긋남',
+# 404 를 '꺼짐 또는 낡은 판' 으로 사람에게 말한다 — 그 뜻에 맞춘다). x-hwax-corr 은 받되 쓰지 않는다. 스위치(RESULT_ASK_ENABLED)가 꺼진 서버에는 이
+# 경로가 아예 없다(404 — 등록하지 않는다, 스위치 전과 바이트까지 같다). 창이 모자라면 쪽마다 읽고 모으고(offload.ASK_PAGES_MAX 를 넘으면 413), 원문에 없는
+# 인용은 코드가 버린다.
+_ASK_FIELDS = ("text", "question", "max_answer_chars")
+
+
+async def llm_ask_over_text(request: Request):
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return _dl_error("bad_request", "본문이 JSON 이 아니다", 422)
+    if not isinstance(body, dict):
+        return _dl_error("bad_request", "본문은 JSON 객체여야 한다", 422)
+    extra = sorted(set(body) - set(_ASK_FIELDS))
+    if extra:
+        shown = [_echo(x) for x in extra[:20]]
+        return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
+                             "fields": shown, "fields_n": len(extra)}, status_code=422)
+    if not _offload.header_user(request.headers):
+        return _dl_error("identity_required", "사람 신원 머리(x-hwax-user)가 없다 — 이 창구는 그 사람의 결과에만 묻는다", 400)
+    text, question, mac = body.get("text"), body.get("question"), body.get("max_answer_chars")
+    if not isinstance(text, str) or not isinstance(question, str):
+        return _dl_error("bad_request", "text · question 은 글이다", 422)
+    if mac is not None and (isinstance(mac, bool) or not isinstance(mac, int)):
+        return _dl_error("bad_request", "max_answer_chars 는 정수다", 422)
+    try:
+        return await _offload.ask_over_text(app, text=text, question=question, max_answer_chars=mac)
+    except _offload.TooLarge as exc:
+        return _dl_error("too_large", str(exc), 413)
+    except _offload.OffloadError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+    except asyncio.TimeoutError:
+        return _dl_error("timeout", f"시간 상한 {_offload.SYNC_LIMIT_S:g}초에 걸렸다 — 질문을 좁히거나 result_get 으로 쪽을 받아 묻는다", 504)
+    except Exception as exc:  # noqa: BLE001 — LLM 불통 · 넘김 실패는 까닭을 붙여 돌려준다(게이트웨이가 그대로 사람에게 보인다)
+        logging.getLogger("agent").exception("[offload] 결과에 묻기 실패")
+        return _dl_error("llm_failed", f"LLM 이 답하지 못했다 — {type(exc).__name__}: {str(exc)[:300]}", 502)
+
+
+if _offload.ON["result_ask"]:
+    app.add_api_route("/llm/ask_over_text", llm_ask_over_text, methods=["POST"])
+
+
 # ── 전문가 고르기 기준선 창구(HWAXPortal docs/request-1029 design-e5 E5-1) ─────────────────────────────────────────────────
 # POST /seat-eval — 엔진 함수 그대로 고른 결과와 신호(읽기 도구만 · 한 번에 하나 · LLM 겹은 심의가 없을 때만, seat_probe). 공유 비밀은 위와 같다 —
 # AIDataHub 를 수백 번 부른다.
@@ -10653,4 +10719,6 @@ def health() -> dict:
                              for g, v in (getattr(app.state, "tool_load_error", None) or {}).items()},
         # 전문가 고르기 기준선 창구 — 비밀이 있나 · 평가가 도나(HWAXPortal docs/request-1029 design-e5 E5-1)
         "seat_eval": _seat_eval_health(),
+        # 토큰 절감 2판 — 위임 · 절 초안 · 변환 · 결과에 묻기 스위치의 켜짐(포털 E 의 설정 배치가 '이 박스에서 꺼져 있음' 을 가른다, offload-v2 3-4)
+        "offload": _offload.health(),
     }
