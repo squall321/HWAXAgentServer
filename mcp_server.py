@@ -1890,14 +1890,16 @@ _A_DR_REFS = (f"근거(최대 {offload.DRAFT_REFS_MAX}건) — 결과 손잡이 
 _A_DR_STYLE = "꼴 — " + " · ".join(f"{k}({v})" for k, v in offload.STYLES.items()) + "."
 _A_DR_TARGET = f"길이(자) — 기본 {offload.DRAFT_TARGET_DEFAULT:,} · 200~{offload.DRAFT_TARGET_MAX:,} 로 죈다."
 _DR_DESC = (
-    "긴 글 서버 작성 — 개요 + 근거 손잡이로 서버의 GLM 이 보고서 절 초안을 쓴다 → {draft, numbers{checked, mismatched}, sources, model}. 근거 원문은 "
+    "긴 글 서버 작성 — 개요 + 근거 손잡이로 서버의 GLM 이 보고서 절 초안을 쓴다 → {draft, numbers{checked, mismatched}, sources, model, "
+    "tokens{input, output}(서버 LLM 토큰 — 모르면 null)}. 근거 원문은 "
     "서버가 읽어 GLM 에 싣고 이 대화로 오지 않는다. 숫자는 서버 코드가 근거와 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다). 동기 호출이다 — "
     "근거 · 개요가 GLM 창을 넘거나 시간 상한에 걸리면 잡으로 돌리지 않고 거절하며 줄이라고 알린다(refs 를 줄이거나 절을 나눈다).")
 _A_TF_INSTRUCTION = f"지시(최대 {offload.INSTRUCTION_MAX:,}자) — 예 '영어로 번역' · '세 줄 요약' · '표를 마크다운 표로' · '용어를 사내 표기로 통일'."
 _A_TF_TEXT = "바꿀 글 — ref 와 둘 가운데 하나만."
 _A_TF_REF = "바꿀 글의 결과 손잡이 ref — 서버가 원문을 읽는다(이 대화로 오지 않는다). text 와 둘 가운데 하나만."
 _TF_DESC = (
-    "단순 변환 — 번역 · 요약 · 표 바꾸기 · 용어 통일을 서버의 챗 LLM 이 한다 → {text, numbers, model}(넘치면 cut). 원문에 없는 사실 · 수치를 더하지 "
+    "단순 변환 — 번역 · 요약 · 표 바꾸기 · 용어 통일을 서버의 챗 LLM 이 한다 → {text, numbers, model, tokens{input, output}(서버 LLM 토큰 — 모르면 "
+    "null)}(넘치면 cut). 원문에 없는 사실 · 수치를 더하지 "
     f"않게 시키고, 숫자는 서버 코드가 원문과 대조한다. 결과는 {offload.TRANSFORM_OUT_MAX:,}자에서 자른다. 동기 호출이다 — 원문이 창을 넘으면 거절한다"
     "(나눠 부르거나 result_ask 로 묻는다).")
 

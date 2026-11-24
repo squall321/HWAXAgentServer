@@ -31,6 +31,7 @@ import deliberation as d  # noqa: E402
 import mcp_server as m  # noqa: E402
 import offload  # noqa: E402
 import routine  # noqa: E402
+import usage_tokens  # noqa: E402
 
 from test_delib_job_queue import _Engine, _tick  # noqa: E402
 from test_delib_silent_drops import _pin_context  # noqa: E402, F401
@@ -522,6 +523,7 @@ def test_절_초안은_ref_와_울타리_안_도구로_근거를_읽고_숫자�
                                                                     {"tool": "voc_write_note", "args": {"q": "x"}}],
                                       style="memo", ctx=_ctx()))
     assert out["model"] == "glm-5.3" and out["draft"].startswith("## 결과")
+    assert out["tokens"] == {"input": 10, "output": 5}, "이 일이 쓴 서버 LLM 토큰(위임 delegate_result 와 같은 셈)"
     assert out["numbers"] == {"checked": 4, "mismatched": ["88.8"]}, "PLM-7781 의 7781 은 울타리 안 도구 결과에 있다"
     src = out["sources"]
     assert [s["ok"] for s in src] == [True, True, False] and "읽기 울타리 밖" in src[2]["error"]
@@ -552,7 +554,8 @@ def test_남의_ref_는_읽지_못하고_근거가_창을_넘으면_거절한다
 def test_변환은_글_하나만_받아_챗_LLM_으로_바꾸고_숫자를_대조한다(kit, _pin_context):
     kit.llm.script = [_ai("Defects: 1,234 · ratio 12.5% · new 4321.0", model="qwen-x")]
     out = asyncio.run(m.llm_transform(instruction="영어로", text=VOC_OUT, ctx=_ctx()))
-    assert out == {"text": "Defects: 1,234 · ratio 12.5% · new 4321.0", "numbers": {"checked": 3, "mismatched": ["4321.0"]}, "model": "qwen-x"}
+    assert out == {"text": "Defects: 1,234 · ratio 12.5% · new 4321.0", "numbers": {"checked": 3, "mismatched": ["4321.0"]}, "model": "qwen-x",
+                   "tokens": {"input": 10, "output": 5}}
     for kw in ({}, {"text": "a", "ref": "r-1"}):
         with pytest.raises(ValueError, match="하나만"):
             asyncio.run(m.llm_transform(instruction="영어로", ctx=_ctx(), **kw))
@@ -612,6 +615,7 @@ def test_한_쪽이면_한_번_묻고_원문에_없는_인용은_버리고_자�
     assert out["quotes"] == [{"page": 1, "start": s1, "end": s1 + len("불량 원인은 커넥터 접촉 저항 증가다."), "text": "불량 원인은 커넥터 접촉 저항 증가다."},
                              {"page": 1, "start": s2, "end": s2 + len("수율은 97.5% 였다."), "text": "수율은 97.5% 였다."}]
     assert out["numbers"] == {"checked": 2, "mismatched": ["99.9"]} and out["model"] == "qwen-ask"
+    assert out["tokens"] == {"input": 10, "output": 5}
     assert len(ask.llm.seen) == 1 and TEXT in ask.llm.seen[0][1].content
 
 
@@ -639,9 +643,53 @@ def test_창이_모자라면_쪽마다_읽고_모으며_쪽_번호는_원문_전
     assert out["answer"] == "커넥터 접촉 저항 증가 · 수율 97.5%"
     assert out["quotes"] == [{"page": s2 // 40 + 1, "start": s2, "end": s2 + len("수율은 97.5% 였다."), "text": "수율은 97.5% 였다."}]
     assert len(ask.llm.seen) == pages + 1
+    assert out["tokens"] == {"input": 10 * (pages + 1), "output": 5 * (pages + 1)}, "쪽마다 부른 것과 모으기를 더한 합"
 
 
 def test_쪽이_상한을_넘으면_413_으로_좁히라고_한다(ask, _pin_context):
     ask.mp.setattr(offload, "ASK_PAGE_CHARS", 10)
     r = _post(ask, {"text": TEXT, "question": "무엇?"})
     assert r.status_code == 413 and r.json()["code"] == "too_large" and ask.llm.seen == []
+
+
+# ── 서버 LLM 토큰 · 사람별 사용량 종류(TS-16) ───────────────────────────────────────────────────────────────────────
+def test_사용량이_없는_답뿐이면_tokens_는_null_이다_지어내지_않는다(ask, _pin_context):
+    bare = AIMessage(content=json.dumps({"answer": "수율은 97.5%", "quotes": []}, ensure_ascii=False), response_metadata={"model_name": "q"})
+    ask.llm.script = [bare]
+    out = _post(ask, {"text": TEXT, "question": "수율?"}).json()
+    assert "tokens" in out and out["tokens"] is None
+    ask.llm.script = [AIMessage(content="Yield 97.5%")]
+    assert asyncio.run(m.llm_transform(instruction="영어로", text=TEXT, ctx=_ctx()))["tokens"] is None
+
+
+@pytest.fixture
+def usage(monkeypatch, tmp_path):
+    """사람별 LLM 사용량 기록기 — 임시 자리 · 더하는 스레드 없이. 가짜 LLM 에 진짜 기록기를 단다(앱의 LLM 공장과 같은 instrument)."""
+    monkeypatch.setattr(usage_tokens, "STORE_DIR", tmp_path / "usage")
+    monkeypatch.setattr(usage_tokens, "_ensure_thread", lambda: None)
+    usage_tokens._reset_for_tests()
+    yield lambda: sorted({(u, k) for (_d, u, k, _m), row in usage_tokens._ACC.items() for _ in range(row[0])})
+    usage_tokens._reset_for_tests()
+
+
+def test_넷의_LLM_사용량은_종류_offload_로_그_사람에게_단다(kit, ask, usage, _pin_context):
+    assert "offload" in usage_tokens.KINDS and usage_tokens.KINDS[-1] == "other"
+    usage_tokens.instrument(kit.llm)
+    glm = usage_tokens.instrument(FakeChat(script=[_ai("## 초안 — 불량 1,234건 [s1]", model="glm-5.3")]))
+    kit.app.state.delib_llm = glm
+    # 위임 — 잡 태스크(사람은 잡 원장이, 종류는 실행기가 단다)
+    kit.llm.script = [_ai("", _call("voc_search", q="S26")), _ai("불량 1,234건 [e1]")]
+
+    async def scenario():
+        out = await m.delegate_start(task="S26 불량 수", ctx=_ctx(ME))
+        await _done(out["job_id"])
+    _run(scenario)
+    assert usage() == [(ME, "offload")], "위임의 LLM 은 offload — 잡 원장의 other 가 아니다"
+    usage_tokens._reset_for_tests()
+    asyncio.run(m.draft_section(outline="불량 정리", refs=[{"tool": "voc_search", "args": {"q": "S26"}}], ctx=_ctx(YOU)))
+    kit.llm.script = [_ai("Defects 1,234")]
+    asyncio.run(m.llm_transform(instruction="영어로", text=VOC_OUT, ctx=_ctx(ME)))
+    ask.llm.script = [_ai(json.dumps({"answer": "97.5%", "quotes": []}))]
+    assert _post(ask, {"text": TEXT, "question": "수율?"}, user="third%40example.com").status_code == 200
+    assert usage() == sorted([(YOU, "offload"), (ME, "offload"), ("third@example.com", "offload")]), \
+        "작성 · 변환 · 묻기도 그 사람(묻기는 신원 머리를 풀어) · offload 로"
