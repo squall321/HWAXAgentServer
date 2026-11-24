@@ -34,6 +34,7 @@ from fakes.llm import Act, FakeLLM, default_oracle  # noqa: E402
 from test_card_review_chunk import _long_card, _split_oracle  # noqa: E402
 from test_card_review_pack import KEY, Hub, _tools  # noqa: E402
 from test_card_review_prompts import _digest, _pack, _req, _unit  # noqa: E402
+from test_card_review_unit_page import _big_unit  # noqa: E402
 
 OUT = ROOT / "tests" / "fixtures" / "card_review" / "contract"
 _UPDATE = os.environ.get("CARD_REVIEW_CONTRACT_UPDATE") == "1"
@@ -109,13 +110,17 @@ def _summary_req():
 
 
 def _near_window_req():
-    """16K 창에서 조립 길이가 창 한도 바로 밑에 닿는 verdict — 한글 본문이라 추정 토큰이 창의 85% 를 넘는다."""
+    """16K 창에서 조립 길이가 창 한도 바로 밑에 닿는 verdict — 한글 본문이라 추정 토큰이 창의 85% 를 넘는다. 창은 카드 한 장으로
+    채운다(조립이 창 안이라 조각 내지 않는다). 단위로 채우면 그 단위가 홀로 자리를 넘어 보충 시도가 넘치므로 run 이 단위를 쪽으로
+    나눈다(W-D22) — 이 장면의 뜻(창에 거의 찬 프롬프트의 400)이 바뀐다."""
     lim = cr.limits(W16K, "server", 0, model=MODEL)
     base = cr.prepare(_verdict_req(n=1), lim)
     room = lim["p_hard"] - base["ctx"]["prompt_chars"] - 200
-    unit = _unit(0)
-    unit["lines"].append({"ref": "c:big", "text": "가" * room})
-    return _verdict_req(n=1, unit=unit)
+    card = copy.deepcopy(CHECK[0])
+    card["sections"][-1]["text"] += "가" * room
+    card["text_sha"] = cr._text_sha(card["sections"])
+    card["chars"] = len(cr.render_card(card, card["alias"]))
+    return _req("verdict", [card], _digest(PACK, [card["alias"]]), unit=_unit(0), variant="fwd")
 
 
 def _chunk_card(*, mark=False) -> dict:
@@ -160,6 +165,16 @@ def _sweep_chunked_req():
     return _req("sweep", [_chunk_card()], [], manifest=manifest, extra={"domains": DOMAINS})
 
 
+def _unit_paged_req(kind: str) -> dict:
+    """창 32,768 에서 단위가 홀로 자리(1.4만 자 남짓)를 넘고 통째로는 안 든다 — run 이 단위를 쪽 둘로 나눈다(W-D22). 판정은 점검형 셋과
+    2.1만 자 단위(1.9만 자까지는 실제 조립이 창 안이라 나누지 않는다), 입력 결손은 팩 카드 전부에 반드시 전문 둘과 1.6만 자 단위(반드시
+    전문인 카드가 단위 옆에 들 자리가 없다)."""
+    if kind == "verdict":
+        return _req("verdict", CHECK[:3], _digest(PACK, [c["alias"] for c in CHECK[:3]]), unit=_big_unit(21_000), variant="fwd")
+    return _req("noinput", PACK, [], unit=_big_unit(16_000),
+                extra={"mechanisms": MECHS, "must_full": [c["alias"] for c in PACK[:2]]})
+
+
 REQUESTS = {
     "verdict_fwd": _verdict_req("fwd"), "verdict_rev": _verdict_req("rev"), "verdict_solo": _verdict_req("solo"),
     "verdict_one": _verdict_req(n=1), "sweep": _sweep_req(), "offcard": _offcard_req(),
@@ -172,6 +187,8 @@ REQUESTS = {
     "sweep_chunked": _sweep_chunked_req(),
     # W2-B 반드시 전문인 카드의 쪽 — 카드 밖 · 입력 결손
     "offcard_paged": _paged_req("offcard"), "noinput_paged": _paged_req("noinput"),
+    # W-D22 단위 쪽 — 홀로 창을 넘는 단위의 판정 · 입력 결손
+    "verdict_unit_paged": _unit_paged_req("verdict"), "noinput_unit_paged": _unit_paged_req("noinput"),
 }
 # 포털 중계가 덮어쓰는 신원 칸 넷 — 예제 요청 파일에는 싣지 않고 보낼 때만 더한다(긴 문서 검색은 사용자 PAT 로만 돈다).
 IDENT = {"groups": ["g"], "user_email": "u@x.com", "user_pat": "user-pat", "entitlements": ["feat:deliberation"]}
@@ -232,6 +249,9 @@ SCENES = {
     # W2-B(docs/risk-200k W-D15) — 반드시 전문인 카드가 창 한 번에 안 들어 쪽마다 부르고 한 결과로 합친다.
     "offcard_paged": ("offcard_paged", ["oracle"], W32K),
     "noinput_paged": ("noinput_paged", ["oracle"], W32K),
+    # W-D22(docs/risk-200k) — 단위가 홀로 창을 넘어 쪽마다 부르고 카드 × 단위 한 결과로 합친다.
+    "verdict_unit_paged": ("verdict_unit_paged", ["oracle"], W32K),
+    "noinput_unit_paged": ("noinput_unit_paged", ["oracle"], W32K),
 }
 # 장면마다의 정답 — 없으면 프롬프트에서 만든 기본 정답(default_oracle).
 ORACLES = {"verdict_chunked_split": _split_oracle}
@@ -365,6 +385,15 @@ def produce(monkeypatch) -> dict:
     assert r.status_code == 200 and r.json()["oversize"]["cards"] == [], r.json()
     files["plan_chunked_req.json"] = _dump(ch_req)
     files["plan_chunked.json"] = _dump(r.json())
+    # plan — 창 200,000 에서 홀로 창을 넘는 단위(u-big — 단위 홀로 자리 + 1)는 멈추지 않고 unit_paged 다(W-D22).
+    l200 = c.get("/card-review/limits").json()
+    up_req = {"cards": ch_req["cards"][:1],
+              "units": [{"unit_id": "u-big", "manifest_chars": 300, "body_chars": cr.unit_room(l200) + 1},
+                        {"unit_id": "u-small", "manifest_chars": 300, "body_chars": 2_000}]}
+    r = c.post("/card-review/plan", json=up_req)
+    assert r.status_code == 200 and r.json()["oversize"]["units"] == [] and r.json()["unit_paged"] == ["u-big"], r.json()
+    files["plan_unit_paged_req.json"] = _dump(up_req)
+    files["plan_unit_paged.json"] = _dump(r.json())
 
     # run — 장면마다 요청·프레임 전부·마지막 프레임·대본 원문.
     for name, req in REQUESTS.items():
@@ -432,7 +461,7 @@ def produce(monkeypatch) -> dict:
     lim = c.get("/card-review/limits").json()
     one = REQUESTS["verdict_one"]
     big = copy.deepcopy(one)
-    big["unit"]["lines"].append({"ref": "c:big", "text": "가" * (lim["p_hard"] + 10)})
+    big["unit"]["summary"] = "가" * (lim["p_hard"] + 10)      # 줄이 긴 단위는 쪽으로 돈다(W-D22) — 머리가 넘치는 단위만 over_budget
     rejects_in = {
         "unknown_fields": {**one, "extras": {}},
         "bad_request": {k: v for k, v in one.items() if k != "expert"},
@@ -512,7 +541,8 @@ def produce(monkeypatch) -> dict:
     files["drain_get.json"] = _dump(c.get("/drain").json())
     gate.drain.set_off(by="human:운영자", force=True)
     # over_budget 의 본문에는 요청이 없다(크기만) — 요청은 싣지 않고 어떻게 만들었는지만 적는다.
-    files["rejects.json"] = _dump({"_how": {"over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
+    files["rejects.json"] = _dump({"_how": {"over_budget": "req_verdict_one 의 unit.summary 를 p_hard+10 자로 — 단위 머리는 쪽으로 "
+                                                           "나눌 수 없다(줄이 긴 단위는 run 이 쪽으로 나눠 돈다 — W-D22)",
                                             "ctx_too_small": "창 4,096 에서 req_verdict_one",
                                             "ctx_unknown": "창 조회가 실패해 다시 묻는 중(기본값 128,000 가정)에 limits_1m 의 "
                                                            "판을 expect 로 실은 req_verdict_one",
@@ -577,7 +607,7 @@ def test_결과_예제는_계약의_칸을_다_싣는다():
               "aliases", "clipped"}
     index = _load("index.json")
     results = [v["final"] for v in index.values() if v["final"].startswith("result_")]
-    assert len(results) == 32
+    assert len(results) == 34
     for name in results:
         res = _load(name)
         assert {"kind", "variant", "rows", "missing", "extras", "quality", "meta"} <= set(res), name
@@ -612,7 +642,8 @@ def test_limits_예제의_판이_팩_결과와_같다():
                                   "req_sweep_gaps.json", "req_verdict_mech.json", "req_noinput.json",
                                   "req_offcard_search.json", "req_summary_domain.json", "req_verdict_chunked.json",
                                   "req_verdict_chunked_split.json", "req_sweep_chunked.json",
-                                  "req_offcard_paged.json", "req_noinput_paged.json"])
+                                  "req_offcard_paged.json", "req_noinput_paged.json",
+                                  "req_verdict_unit_paged.json", "req_noinput_unit_paged.json"])
 def test_요청_예제는_app_없는_검증기를_지난다(name):
     lim = _load("limits_1m.json")
     assert cr.validate_run_request(_load(name), lim) == []
@@ -803,3 +834,32 @@ def test_W2_쪽_실행_예제():
     assert [r["t"] for r in off["rows"]].count("m") == 1 and off["quality"]["maybe_more"] is False
     ni = _load("result_noinput_paged.json")
     assert {r["k"] for r in ni["rows"] if r["t"] == "q1"} >= {p[0] for p in ni["meta"]["paged"]["pages"]}
+
+
+# ── W-D22 단위 쪽 예제(HWAXPortal docs/risk-200k) ─────────────────────────────────────────────────────────
+def test_W22_단위_쪽_예제():
+    """홀로 창을 넘는 단위 — 계획은 oversize 대신 unit_paged 로 내고(빈 칸은 싣지 않는다), run 은 쪽마다 status{unit_page, unit_pages}
+    를 내며 부르고 카드 × 단위 한 결과로 합친다. 줄 별칭은 원래 단위의 것이고, 전문 노출은 모든 쪽에 전문으로 실린 카드만이다."""
+    pl = _load("plan_unit_paged.json")
+    assert pl["oversize"]["units"] == [] and pl["unit_paged"] == ["u-big"] and pl["pair_over"] == []
+    assert all("unit_paged" not in _load(n) for n in ("plan_ok.json", "plan_pair_over.json", "plan_chunked.json"))
+    index = _load("index.json")
+    for kind in ("verdict", "noinput"):
+        res = _load(f"result_{kind}_unit_paged.json")
+        up = res["meta"]["unit_paged"]
+        req = _load(f"req_{kind}_unit_paged.json")
+        assert up["n"] >= 2 and index[f"{kind}_unit_paged"]["llm_calls"] == up["n"] and res["missing"] == [], up
+        frames = [delib_jobs._parse_sse(x.encode()) for x in (OUT / f"run_{kind}_unit_paged.sse").read_text(encoding="utf-8")
+                  .split("\n\n") if x.strip()]
+        assert [(d["unit_page"], d["unit_pages"]) for e, d in frames if e == "status"] == [
+            (i, up["n"]) for i in range(1, up["n"] + 1)]
+        n_lines = sum(len(req["unit"][k]) for k in ("lines", "context", "evidence"))
+        assert len(res["meta"]["aliases"]["lines"]) == n_lines, "줄 별칭 표는 원래 단위 전체다"
+        assert all(set(r.get("l") or []) <= set(res["meta"]["aliases"]["lines"]) for r in res["rows"])
+    v = _load("result_verdict_unit_paged.json")
+    assert sorted(r["k"] for r in v["rows"] if r["t"] == "v") == sorted(c["alias"] for c in CHECK[:3])
+    assert all(len(r["checks"]["pages"]) == v["meta"]["unit_paged"]["n"] for r in v["rows"] if r["t"] == "v")
+    ni = _load("result_noinput_unit_paged.json")
+    must = _load("req_noinput_unit_paged.json")["extra"]["must_full"]
+    assert set(ni["meta"]["aliases"]["cards"]) >= set(must) and ni["meta"]["must_dropped"] == 0
+    assert [r["t"] for r in ni["rows"]].count("more") == 1

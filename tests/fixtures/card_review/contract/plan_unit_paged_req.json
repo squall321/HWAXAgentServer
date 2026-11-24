@@ -1,0 +1,22 @@
+{
+ "cards": [
+  {
+   "alias": "K01",
+   "record_id": "DOC-T-0001",
+   "checkable": true,
+   "chars": 3000
+  }
+ ],
+ "units": [
+  {
+   "unit_id": "u-big",
+   "manifest_chars": 300,
+   "body_chars": 155916
+  },
+  {
+   "unit_id": "u-small",
+   "manifest_chars": 300,
+   "body_chars": 2000
+  }
+ ]
+}

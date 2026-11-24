@@ -393,7 +393,8 @@ def test_자리가_좁으면_조각_틀에서_목차를_빼고_카드_밖은_홀
     units = [{"unit_id": "u-ok", "manifest_chars": 200, "body_chars": tight},
              {"unit_id": "u-over", "manifest_chars": 200, "body_chars": tight + 1}]
     plan = cr.plan([{"alias": "K04", "record_id": card["record_id"], "checkable": True, "chars": card["chars"]}], units, lim)
-    assert "u-ok" not in plan["oversize"]["units"] and "u-over" in plan["oversize"]["units"]
+    # 한 글자 더 큰 단위는 홀로 창을 넘는다 — 멈추지 않고 run 이 단위를 쪽으로 나눈다(W-D22 — 예전에는 oversize 였다).
+    assert plan["oversize"]["units"] == [] and plan["unit_paged"] == ["u-over"]
     unit = _unit(tight)
     solo = cr.prepare(_req("verdict", [card], [], unit=unit, variant="solo"), lim)
     assert len(solo["chunked"]["subs"]) >= 2, "판정은 카드를 단위에 맞게 조각 낸다"
@@ -406,11 +407,13 @@ def test_자리가_좁으면_조각_틀에서_목차를_빼고_카드_밖은_홀
 def test_단위에_맞춘_조각은_보충_지적_블록_몫을_남기고_돌릴_바닥_밑이면_나누지_않는다():
     """넘친 셈은 지적 블록 없는 첫 시도의 것이다 — 역할 · 배경 제목 · 메커니즘 블록을 몫 끝까지 채운 요청에서 조각에 보충 지적 블록
     (hint_max) 몫을 남기지 않으면 자리가 좁을 때 보충 시도가 창을 넘는다. 조각 자리가 돌릴 바닥(RUN_FLOOR) 밑이면 아주 작은 조각
-    수십 개로 부르지 않고 over_budget 그대로 둔다."""
+    수십 개로 부르지 않고 over_budget 그대로 둔다. 단위는 홀로 자리(unit_room)에 딱 닿는 가장 큰 단위다 — 그보다 크면 카드를 잘게
+    조각 내지 않고 단위를 쪽으로 나눈다(W-D22)."""
     lim = LIM_200K
     v = lim["verdict"]
     card = _long_card("K05", secs=(10_000, 10_000), seed=51)
-    unit = _unit(lim["p_hard"] - v["fixed"] - 2_500)
+    unit = _unit(cr.unit_room(lim))
+    assert cr.unit_size(unit) == cr.unit_page_at(lim, env={})
     digest = [{"alias": f"K{i:02d}", "type": "design-rule", "title": "가" * 300, "record_id": f"D-{i}", "card_id": f"C-{i}"}
               for i in range(10, 99)]
     mechs = [{"code": f"thermal.code_{i}", "label": "나" * 200} for i in range(200)]

@@ -495,5 +495,27 @@
   "final": "result_noinput_paged.json",
   "llm_calls": 2,
   "transcript": "llm_transcript_noinput_paged.txt"
+ },
+ "verdict_unit_paged": {
+  "request": "req_verdict_unit_paged.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_verdict_unit_paged.sse",
+  "final": "result_verdict_unit_paged.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_verdict_unit_paged.txt"
+ },
+ "noinput_unit_paged": {
+  "request": "req_noinput_unit_paged.json",
+  "script": [
+   "oracle"
+  ],
+  "ctx_tokens": 32768,
+  "frames": "run_noinput_unit_paged.sse",
+  "final": "result_noinput_unit_paged.json",
+  "llm_calls": 2,
+  "transcript": "llm_transcript_noinput_unit_paged.txt"
  }
 }

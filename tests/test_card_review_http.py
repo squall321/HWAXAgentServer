@@ -171,9 +171,10 @@ def test_JSON_이_아니면_422(client):
 
 
 def test_창을_넘는_요청은_LLM_을_부르지_않고_over_budget(client, env):
+    """줄이 긴 단위는 run 이 쪽으로 나눠 돈다(W-D22) — 쪽으로도 못 나누는 것(단위 머리가 창을 넘는다)만 over_budget 이다."""
     body = _verdict(1)
     lim = cr.limits(1_048_576, "server", 0)
-    body["unit"]["lines"].append({"ref": "c:big", "text": "가" * (lim["p_hard"] + 10)})
+    body["unit"]["summary"] = "가" * (lim["p_hard"] + 10)
     r = client.post("/card-review/run", json=body)
     j = r.json()
     assert r.status_code == 422 and j["code"] == "over_budget" and j["need"] > j["have"] == lim["p_hard"]
