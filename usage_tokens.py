@@ -5,7 +5,8 @@
 자리(scope)
   · 이 문맥(태스크)과 여기서 새로 만드는 태스크의 일이 누구의 무엇인지 — tag(user=…, kind=…). 챗 턴 입구 · MCP 심의 잡 · 심의 준비 · 카탈로그 창구가
     사람을, 엔진(띵킹 · 심의 · 루틴 · 카드 대조)이 종류를 단다. 호출 추적(call_trace.tag)과 같은 꼴이지만 늘 켜져 있다(그쪽은 꺼지면 아무것도 안 한다).
-  · 종류는 chat · think · delib · routine · card_review · other 다. 사람은 소문자 이메일(퍼센트로 적힌 값은 푼다) — 꼴이 아니면 빈 값이다.
+  · 종류는 chat · think · delib · routine · card_review · offload · other 다(offload 는 토큰 절감 2판 — 위임 · 절 초안 · 변환 · 결과에 묻기,
+    HWAXPortal docs/token-saving TS-16. 그 전 기록의 그 몫은 other 로 남는다). 사람은 소문자 이메일(퍼센트로 적힌 값은 푼다) — 꼴이 아니면 빈 값이다.
 
 세기
   · LLM 마다 콜백 하나(instrument — 앱의 LLM 공장 _mk_llm · 외부 응답자가 붙인다). 시작 콜백에서 그 자리(사람 · 종류)를 붙잡고, 끝 콜백에서 서버가 준
@@ -31,7 +32,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 KST = timezone(timedelta(hours=9))
-KINDS = ("chat", "think", "delib", "routine", "card_review", "other")
+KINDS = ("chat", "think", "delib", "routine", "card_review", "offload", "other")
 RETAIN_DAYS = 400               # 사람별 줄의 보존(사용자 결정 — 포털 usage_actor_daily 와 같다)
 FLUSH_S = 30.0                  # 메모리의 셈을 sqlite 에 더하는 간격
 OPEN_MAX = 4096                 # 끝을 못 본 호출 기록의 상한 — 넘치면 가장 오래된 것을 버린다

@@ -10472,7 +10472,7 @@ async def deliberate_batch_stop_http(request: Request):
 
 
 # ── 결과에 묻기 창구(HWAXPortal docs/token-saving offload-v2 3-2) ─────────────────────────────────────────────────────────────
-# POST /llm/ask_over_text {text, question, max_answer_chars?} → {answer, quotes:[{page, start, end, text}], numbers, model} — 게이트웨이 result_ask 가
+# POST /llm/ask_over_text {text, question, max_answer_chars?} → {answer, quotes:[{page, start, end, text}], numbers, model, tokens} — 게이트웨이 result_ask 가
 # 결과 손잡이의 원문을 실어 부른다. 자격은 심의 HTTP 창구와 같다 — 공유 비밀(Authorization: Bearer <GW_TOKEN> — _seat_auth, 어긋나면 401 · 없으면 503)을
 # 지난 뒤 사람은 게이트웨이가 싣는 신원 머리 x-hwax-user(없으면 400 — 이 창구는 사람의 일만 한다. 게이트웨이는 401 · 403 · 503 을 '공유 비밀 어긋남',
 # 404 를 '꺼짐 또는 낡은 판' 으로 사람에게 말한다 — 그 뜻에 맞춘다). x-hwax-corr 은 받되 쓰지 않는다. 스위치(RESULT_ASK_ENABLED)가 꺼진 서버에는 이
@@ -10496,7 +10496,8 @@ async def llm_ask_over_text(request: Request):
         shown = [_echo(x) for x in extra[:20]]
         return JSONResponse({"code": "unknown_fields", "message": f"선언하지 않은 칸 {len(extra)}개 {shown} — 조용히 버리지 않고 거절한다",
                              "fields": shown, "fields_n": len(extra)}, status_code=422)
-    if not _offload.header_user(request.headers):
+    who = _offload.header_user(request.headers)
+    if not who:
         return _dl_error("identity_required", "사람 신원 머리(x-hwax-user)가 없다 — 이 창구는 그 사람의 결과에만 묻는다", 400)
     text, question, mac = body.get("text"), body.get("question"), body.get("max_answer_chars")
     if not isinstance(text, str) or not isinstance(question, str):
@@ -10504,7 +10505,7 @@ async def llm_ask_over_text(request: Request):
     if mac is not None and (isinstance(mac, bool) or not isinstance(mac, int)):
         return _dl_error("bad_request", "max_answer_chars 는 정수다", 422)
     try:
-        return await _offload.ask_over_text(app, text=text, question=question, max_answer_chars=mac)
+        return await _offload.ask_over_text(app, text=text, question=question, max_answer_chars=mac, user=who)
     except _offload.TooLarge as exc:
         return _dl_error("too_large", str(exc), 413)
     except _offload.OffloadError as exc:

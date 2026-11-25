@@ -14,6 +14,9 @@
 게이트웨이 · 못 읽은 때는 빈 울타리다(닫힌 쪽). 쓰기 · 잡 제출 · 지우기는 묶이지 않는다 — 위임은 조사만 한다.
 
 **숫자.** 답의 수를 근거 원문과 코드로 대조한다(evidence.unsourced_numbers — 챗 · 결정문과 같은 판정). 어긋나면 표시만 하고 고쳐 쓰지 않는다.
+
+**토큰.** 넷 모두 결과에 이 일이 쓴 서버 LLM 토큰 tokens {input, output} 을 싣는다(서버가 사용량을 주지 않은 호출뿐이면 null — 지어내지 않는다, _usage).
+사람별 LLM 사용량(usage_tokens)에는 종류 offload 로 단다 — 작성 · 변환 · 묻기는 사람도 단다(위임은 잡 원장이 단다). 결정 HWAXPortal TS-16.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from urllib.parse import quote, unquote
 import httpx
 
 import external_llm
+import usage_tokens
 from evidence import sig_numbers, unsourced_numbers
 
 log = logging.getLogger("agent.offload")
@@ -44,6 +48,7 @@ def switches(env=os.environ) -> dict:
 
 
 ON = switches()
+USAGE_KIND = "offload"      # 사람별 LLM 사용량(usage_tokens.KINDS)의 종류 — 이 모듈의 LLM 호출은 모두 이것으로 단다(TS-16)
 
 
 def health() -> dict:
@@ -401,6 +406,7 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
     toks: list = []
     react = getter = None
     try:
+        usage_tokens.tag(kind=USAGE_KIND)   # 이 잡 태스크의 LLM 토큰 종류(루틴 · 띵킹과 같은 자리 — 사람은 잡 원장이 이미 달았다)
         yield _sse("delib", {"kind": "stage", "stage": "tools"})
         try:
             allowed, why = await read_fence(app, groups, user_email, apps)
@@ -575,7 +581,9 @@ def _window_chars(reserve_tokens: int) -> int:
 
 
 async def draft_section(app, *, outline: str, refs, style: str, target_chars, user: str, groups: list) -> dict:
-    """C — 개요 + 근거로 GLM 이 절 초안을 쓴다 → {draft, numbers, sources, model}. 근거가 창을 넘으면 거절한다(줄이라 알린다 — 잡으로 돌리지 않는다)."""
+    """C — 개요 + 근거로 GLM 이 절 초안을 쓴다 → {draft, numbers, sources, model, tokens}. 근거가 창을 넘으면 거절한다(줄이라 알린다 — 잡으로
+    돌리지 않는다)."""
+    usage_tokens.tag(user=user, kind=USAGE_KIND)
     outline = str(outline or "").strip()
     if not outline:
         raise OffloadError("outline 이 비었다")
@@ -608,7 +616,7 @@ async def draft_section(app, *, outline: str, refs, style: str, target_chars, us
         raise OffloadError("LLM 이 빈 초안을 냈다")
     shown, cut = _cut(draft, DRAFT_OUT_MAX)
     out = {"draft": shown, "numbers": numbers(draft, "\n".join(s["text"] for s in src) + "\n" + outline),
-           "sources": [{k: v for k, v in s.items() if k != "text"} for s in src], "model": _model_of(msg, llm)}
+           "sources": [{k: v for k, v in s.items() if k != "text"} for s in src], "model": _model_of(msg, llm), "tokens": _usage([msg])}
     notes = [x for x in (cut and f"초안을 {cut}에서 잘랐다", _c and f"target_chars {_c}") if x]
     if notes:
         out["notes"] = notes
@@ -617,8 +625,9 @@ async def draft_section(app, *, outline: str, refs, style: str, target_chars, us
 
 # ── D 변환 ─────────────────────────────────────────────────────────────────────────────────────────────────────
 async def transform(app, *, instruction: str, text: str, ref: str, user: str) -> dict:
-    """D — 번역 · 요약 · 표 바꾸기 · 용어 통일을 챗 LLM 으로 → {text, numbers, model}. 결과가 길면 TRANSFORM_OUT_MAX 에서 자르고 그렇다고 적는다
-    (긴 결과를 B 저장소에 두는 일은 게이트웨이 몫이다). 원문이 창을 넘으면 거절한다."""
+    """D — 번역 · 요약 · 표 바꾸기 · 용어 통일을 챗 LLM 으로 → {text, numbers, model, tokens}. 결과가 길면 TRANSFORM_OUT_MAX 에서 자르고 그렇다고
+    적는다(긴 결과를 B 저장소에 두는 일은 게이트웨이 몫이다). 원문이 창을 넘으면 거절한다."""
+    usage_tokens.tag(user=user, kind=USAGE_KIND)
     instruction = str(instruction or "").strip()
     if not instruction:
         raise OffloadError("instruction 이 비었다")
@@ -648,7 +657,7 @@ async def transform(app, *, instruction: str, text: str, ref: str, user: str) ->
     if not out_text:
         raise OffloadError("LLM 이 빈 글을 냈다")
     shown, cut = _cut(out_text, TRANSFORM_OUT_MAX)
-    out = {"text": shown, "numbers": numbers(out_text, src + "\n" + instruction), "model": _model_of(msg, llm)}
+    out = {"text": shown, "numbers": numbers(out_text, src + "\n" + instruction), "model": _model_of(msg, llm), "tokens": _usage([msg])}
     if cut:
         out["cut"] = f"결과를 {cut}에서 잘랐다 — 원문을 나눠 다시 부른다"
     return out
@@ -715,10 +724,12 @@ def _place(quotes, text: str, base: int, full: str) -> tuple[list, int]:
     return out[:QUOTES_MAX], dropped
 
 
-async def ask_over_text(app, *, text: str, question: str, max_answer_chars=None) -> dict:
-    """원문에 묻는다 → {answer, quotes: [{page, start, end, text}], numbers, model}. 창 안이면 한 번, 넘으면 쪽마다 읽고 모은다. 인용은 코드가 원문과
-    대조해 자리를 단다(원문에 없는 것은 버린다). page 는 RESULT_PAGE_CHARS(게이트웨이 result_get 기본 20,000자) 쪽 번호, start · end 는 원문
-    전체의 글자 자리(코드 포인트 · end 미포함)."""
+async def ask_over_text(app, *, text: str, question: str, max_answer_chars=None, user: str = "") -> dict:
+    """원문에 묻는다 → {answer, quotes: [{page, start, end, text}], numbers, model, tokens}. 창 안이면 한 번, 넘으면 쪽마다 읽고 모은다. 인용은 코드가
+    원문과 대조해 자리를 단다(원문에 없는 것은 버린다). page 는 RESULT_PAGE_CHARS(게이트웨이 result_get 기본 20,000자) 쪽 번호, start · end 는
+    원문 전체의 글자 자리(코드 포인트 · end 미포함). tokens 는 쪽마다 부른 것과 모으기를 더한 합이다. user 는 사람별 LLM 사용량의 사람(창구가 신원
+    머리로 준다)."""
+    usage_tokens.tag(user=user, kind=USAGE_KIND)
     from deliberation import _parse_json  # noqa: PLC0415 — LLM 출력의 JSON 을 관대하게 읽는다(산문 앞섬 · 펜스)
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
     text, question = str(text or ""), str(question or "").strip()
@@ -730,6 +741,7 @@ async def ask_over_text(app, *, text: str, question: str, max_answer_chars=None)
         raise TooLarge(f"question 이 {len(question):,}자다 — {QUESTION_MAX:,}자 안으로")
     cap, _c = _clamp(max_answer_chars, ASK_ANSWER_DEFAULT, ASK_ANSWER_MIN, ASK_ANSWER_MAX)
     llm, tok = await _maybe(_chat_llm(app))
+    used: list = []             # 이 물음이 부른 LLM 답 전부(쪽마다 + 모으기) — tokens 의 합
     try:
         size = ASK_PAGE_CHARS or _window_chars(_RESERVE_TOKENS + cap)
         pages = _pages(text, size)
@@ -739,6 +751,7 @@ async def ask_over_text(app, *, text: str, question: str, max_answer_chars=None)
 
         async def call(sysmsg: str, human: str):
             msg = await llm.ainvoke([SystemMessage(content=sysmsg), HumanMessage(content=human)])
+            used.append(msg)
             raw = _text(getattr(msg, "content", "")).strip()
             try:
                 d = _parse_json(raw)
@@ -792,7 +805,8 @@ async def ask_over_text(app, *, text: str, question: str, max_answer_chars=None)
     if not answer:
         raise OffloadError("LLM 이 답을 내지 않았다")
     shown, _cut_note = _cut(answer, cap)
-    out = {"answer": shown, "quotes": quotes, "numbers": numbers(answer, text + "\n" + question), "model": _model_of(msg, llm)}
+    out = {"answer": shown, "quotes": quotes, "numbers": numbers(answer, text + "\n" + question), "model": _model_of(msg, llm),
+           "tokens": _usage(used)}
     if dropped:
         log.info("[offload] 묻기 — 원문에 없는 인용 %d개를 버렸다", dropped)
     return out
