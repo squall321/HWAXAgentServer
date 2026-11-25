@@ -485,8 +485,8 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     건수 천장을 두지 않는다(verdict 의 K 만 장수로 닫는다). 창(P_hard)을 넘는 것만 oversize 이고, 몫을 넘지만 창 안이면
     soft_over 다. 같은 입력이면 deck_id 가 같다(묶음 별칭과 record_id 의 해시).
     낸 (verdict 묶음, 단위)·(sweep 묶음, 목록 쪽) 쌍은 run 이 over_budget 으로 거절하지 않는다 — 묶음째로는 넘는 쌍은
-    pair_over[{deck_id, unit_id, need, have}] 로 따로 알린다(그 묶음의 카드를 그 단위에 solo 로 돌린다. 카드 한 장과도 넘는
-    단위는 oversize.units 에 있다)."""
+    pair_over[{deck_id, unit_id, need, have}] 로 따로 알린다(그 묶음의 카드를 그 단위에 solo 로 돌린다). 홀로 넘는 단위는 조각을 켠
+    창이면 unit_paged(run 이 단위를 쪽으로 나눈다 — W-D22), 아니면 oversize.units 에 있다."""
     v, s = lim["verdict"], lim["sweep"]
     p_hard, unit_max = lim["p_hard"], lim["unit_body_max"]
     # 묶음 한 장이 창 한도 안에 드는 자리 — 그 종류의 고정 몫과 단위(또는 목록 한 쪽)를 상한까지 실은 나머지다.
@@ -518,11 +518,15 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     # 조각을 켠 창(chunk_room > 0)에서는 카드가 그 단위와 함께 들 만큼 조각 난다(run 의 _chunk_prep — 단위가 커서 넘는 카드도) — 단위가
     # 돌릴 바닥(RUN_FLOOR)만큼의 카드 자리도 못 남길 때만 oversize 다(HWAXPortal docs/risk-200k W-D16). 카드 밖 호출은 종전대로 홀로만
     # 들면 된다 — 반드시 전문인 카드를 실을 자리가 없으면 제목으로 내리고 meta.must_dropped 로 센다(build_prompt).
+    # 그런 단위(단위 홀로 자리 unit_room 을 넘는다)도 조각을 켠 창에서는 멈추지 않는다 — unit_paged 로 내고 run 이 단위를 쪽으로 나눠
+    # 부른다(W-D22). 쪽은 그 호출의 카드에 맞춰 지으므로 짝 넘침(pair_over)을 내지 않는다. 계획은 단위 머리의 크기를 모른다 — 머리(제목 ·
+    # 요약 · 읽는 법 · 결측)가 쪽 자리를 넘는 단위만 run 이 over_budget 으로 거절한다.
     card_need = RUN_FLOOR if chunk_room > 0 else card_max
+    u_paged: list = []
     for u in units:
         n = int(u.get("body_chars") or 0)
         if o_fixed + n > p_hard or (verdict_decks and v["fixed"] + n + card_need > p_hard):
-            u_over.append(u["unit_id"])
+            (u_paged if chunk_room > 0 else u_over).append(u["unit_id"])
             continue
         if n > unit_max:
             u_soft.append(u["unit_id"])
@@ -556,7 +560,7 @@ def plan(cards: list, units: list, lim: dict) -> dict:
     if cur:
         pages.append(cur)
 
-    return {
+    out = {
         "limits_rev": lim["limits_rev"],
         # 계획과 같은 때의 종류별 판(읽기 전용 — expect 의 limits_rev_kind 는 run 만 받는다). 앱이 셀 지문에 쓸 판을 limits 를
         # 따로 다시 받지 않고 계획과 함께 받는다.
@@ -568,6 +572,9 @@ def plan(cards: list, units: list, lim: dict) -> dict:
         "soft_over": {"units": u_soft, "manifest": m_soft},
         "pair_over": pair_over,
     }
+    if u_paged:
+        out["unit_paged"] = u_paged     # run 이 쪽으로 나눌 단위(W-D22) — 빈 목록이면 칸을 싣지 않는다(기존 계획 예제가 바이트 그대로)
+    return out
 
 
 # ── 카드 정규화·렌더(순수) ────────────────────────────────────────────────────
@@ -762,12 +769,64 @@ CHUNK_BUSY_WAIT_MAX_S = 900.0   # 조각 사이에 관문 자리를 다시 기�
 RECONCILE_CONTEXT = 3_000        # 재판정에 싣는 인용 앞뒤 글(자) — 절 전체가 아니라 인용 둘레
 _SENT_END = r"(?<=[.!?。…])"
 
+# ── 단위 쪽 — 단위가 홀로 창을 넘을 때(HWAXPortal docs/risk-200k W-D22) ─────────────────────────────────────────────────
+# 계획은 그런 단위를 oversize 대신 unit_paged 로 낸다. 앱은 단위를 그대로 보내고, run 이 단위를 쪽(머리는 쪽마다 · 줄은 차례로)으로 나눠
+# 쪽마다 보통 준비물을 만들고(쪽 안의 카드 조각 · 반드시 전문인 카드의 쪽은 종전대로) 카드 × 단위 한 결과로 합친다(_run_unit_paged — 앱에는
+# 한 호출의 한 결과 그대로라 원장 · 불변식이 바뀌지 않는다). 실제로 넘칠 때만 나눈다 — 선언한 틀 몫으로 셈한 문턱을 넘어도 통째로 들면
+# 그대로다. 1M 창에서는 단위 홀로 자리가 89만 자 남짓이다(그보다 큰 단위만 쪽으로 돈다 — 종전에는 보류였다).
+UNIT_PAGE_KINDS = ("verdict", "offcard", "noinput")
+# 문턱 손잡이 — 단위 홀로 자리(unit_room)의 몫, (0, 1], 기본 1(단위가 홀로 넘을 때만). 낮추면 카드와 함께 넘치는 중간 크기 단위도 카드를
+# 잘게 조각 내는 대신 단위를 나눈다. run 에서만 읽고 판(limits_rev)에 넣지 않는다 — 계획이 읽지 않고, 넣으면 1M 박스의 셀 지문까지 바뀐다
+# (CHUNK_SHARE 와 같은 까닭 — W-D12).
+UNIT_PAGE_SHARE_ENV = "CARD_REVIEW_UNIT_PAGE_SHARE"
+UNIT_PAGE_SHARE_DEFAULT = 1.0
+UNIT_PAGE_WHOLE_SHARE = 0.5     # 쪽 자리의 이 몫 안에 함께 드는 무리(변경 · 문맥 · 근거)는 모든 쪽에 다 싣는다
+UNIT_PAGE_ITEM_FLOOR = 200      # 쪽에 줄을 실을 자리의 바닥(자) — 머리가 커서 이보다 좁으면 나누지 않는다(over_budget 그대로)
+UNIT_PAGE_SHRINK_TRIES = 3      # 쪽이 별칭 폭 · 실제 틀과 함께 넘치면 줄 자리를 줄여 다시 짓는 횟수
+_UNIT_PARTS = (("line", "lines"), ("context", "context"), ("evidence", "evidence"))
+_PART_SAY = {"line": "변경 줄", "context": "문맥 줄", "evidence": "근거 줄"}
+# 쪽 단위의 줄 머리 — 그 부분이 이 쪽에 다 있지 않을 때만 쓴다(다 있으면 종전 머리 _UNIT_HEADS 그대로). 틀 잠금(template_sha ·
+# PROMPT_REV)에 넣지 않는다 — 종전 프롬프트에는 없던 길의 글이라 지난 셀을 무르지 않는다(조각 틀 줄과 같다).
+_UNIT_PAGE_HEADS = {
+    "line": "변경 줄 {n}줄(이 쪽 몫 — 단위 전체 {total}줄, 나머지는 다른 쪽에 있다)\n",
+    "context": "문맥 줄 {n}줄(다른 단위가 맡은 변경 — 인용할 수 있다 · 이 쪽 몫, 단위 전체 {total}줄)\n",
+    "evidence": "근거 줄 {n}줄(도구 조회 결과 — 검증 대상이지 결론이 아니다 · 이 쪽 몫, 단위 전체 {total}줄)\n",
+}
+
 
 def card_room(lim: dict) -> int:
     """카드 한 장이 혼자 들 수 있는 자리(자) — plan() 의 판정 · 훑기 '한 장 자리' 가운데 작은 것. 넘으면 계획이 조각 묶음(chunked)으로
     내고 run 이 조각 낸다. 0 이하(카드 한 장도 못 싣는 창)면 조각도 없다 — 계획이 종전처럼 oversize 로 돌려준다."""
     v, s = lim["verdict"], lim["sweep"]
     return min(lim["p_hard"] - v["fixed"] - lim["unit_body_max"], lim["p_hard"] - s["fixed"] - s["manifest_page_max"])
+
+
+def unit_room(lim: dict) -> int:
+    """단위 홀로 자리(자) — 창 한도에서 단위를 싣는 세 종류(판정 · 카드 밖 · 입력 결손) 가운데 가장 큰 틀 몫을 뺀 것(판정은 돌릴 바닥만큼
+    카드 자리를 더 남긴다). 넘는 단위는 계획이 unit_paged 로 내고 run 이 쪽으로 나눈다(W-D22) — 계획의 옛 oversize.units 의 선과 같다.
+    20만 · 출력 32K 에서 140,291자, 1M 에서 89만 자 남짓이다."""
+    return lim["p_hard"] - max(lim["offcard"]["fixed"], lim["noinput"]["fixed"], lim["verdict"]["fixed"] + RUN_FLOOR)
+
+
+def _knob_unit_page_share(env) -> float:
+    raw = str(env.get(UNIT_PAGE_SHARE_ENV) or "").strip()
+    if not raw:
+        return UNIT_PAGE_SHARE_DEFAULT
+    try:
+        v = float(raw)
+    except ValueError:
+        print(f"[card_review] env {UNIT_PAGE_SHARE_ENV}='{raw[:40]}' 숫자 파싱 실패 — 기본값 {UNIT_PAGE_SHARE_DEFAULT:g} 사용")
+        return UNIT_PAGE_SHARE_DEFAULT
+    if not 0 < v <= 1:
+        print(f"[card_review] env {UNIT_PAGE_SHARE_ENV}={raw[:40]} 는 (0, 1] 밖이다 — 기본값 {UNIT_PAGE_SHARE_DEFAULT:g} 사용")
+        return UNIT_PAGE_SHARE_DEFAULT
+    return v
+
+
+def unit_page_at(lim: dict, env=os.environ) -> int:
+    """단위 쪽 문턱(자) — 단위 홀로 자리 × 손잡이(CARD_REVIEW_UNIT_PAGE_SHARE, 기본 1), 바닥은 단위 몫(unit_body_max). 단위가 이보다 크고
+    통째로는 안 들 때 run 이 쪽으로 나눈다. 쪽 하나의 자리도 이것을 넘지 않는다."""
+    return max(int(lim["unit_body_max"]), int(_knob_unit_page_share(env) * unit_room(lim)))
 
 
 def _toc(card: dict) -> str:
@@ -1011,7 +1070,8 @@ def build_ctx(req: dict, lim: dict) -> dict:
                 if not isinstance(x, dict):
                     raise RequestError("bad_request", f"unit.{key} 의 항목은 {{ref, text}} 이다")
                 parts.append((part, x))
-        if not any(p in ("line", "context") for p, _ in parts):
+        # 단위 쪽(W-D22)은 근거 줄만 실린 쪽이 있을 수 있다 — 변경 줄은 다른 쪽에 있고 쪽 머리가 그렇다고 말한다.
+        if not any(p in ("line", "context") for p, _ in parts) and not (isinstance(unit.get("page"), dict) and parts):
             raise RequestError("empty_unit", "unit 에 변경 줄도 문맥 줄도 없다 — 대조할 것이 없다")
         for i, (part, x) in enumerate(parts, 1):
             lines[_alias("L", i, len(parts))] = {"ref": _str(x.get("ref")), "text": _str(x.get("text")), "part": part,
@@ -2528,7 +2588,62 @@ def unit_size(unit: dict) -> int:
     n += sum(len(_str(m.get("kind"))) + len(_str(m.get("note"))) + per
              for m in unit.get("missing") or [] if isinstance(m, dict))
     n += len(_str(unit.get("title"))) + len(_str(unit.get("summary"))) + len(_str(unit.get("notes"))) + base
+    if isinstance(unit.get("page"), dict):
+        n += _page_extra(unit["page"])     # 쪽 단위(W-D22 — 엔진이 지은 것) — 쪽 머리 한 줄과 줄 머리 셋
     return n + len(rows) * max(0, 1 + alias_width(len(rows)) - 4)
+
+
+def _page_heads(page: dict) -> dict:
+    """쪽 단위의 줄 머리 셋(부분 → 글) — 모든 쪽에 다 실렸거나 그 부분이 이 쪽에 다 있으면(나눈 긴 줄 없이) 종전 머리, 아니면 이 쪽의
+    몫과 단위 전체 줄 수. 줄이 없는 부분은 종전처럼 머리도 없다(변경 줄만 0줄이어도 싣는다)."""
+    out = {}
+    for part, key in _UNIT_PARTS:
+        info = page.get(part) if isinstance(page.get(part), dict) else {}
+        n, total = int(info.get("here") or 0), int(info.get("total") or 0)
+        if info.get("whole") or (n == total and not info.get("cut")):
+            out[part] = _UNIT_HEADS[key].format(n=n) if (n or part == "line") else ""
+        else:
+            out[part] = _UNIT_PAGE_HEADS[part].format(n=n, total=total)
+    return out
+
+
+def _page_frame(page: dict) -> str:
+    """쪽 머리 한 줄 — 수와 고정 낱말만 싣는다(요청에서 온 글이 틀 밖에 서지 않는다). 모든 쪽에 다 실린 부분과 이 쪽에 나눠 실린 긴
+    줄(L 번호 · 나눔 j/m)을 말한다."""
+    i, n, rows = int(page.get("index") or 0), int(page.get("of") or 0), int(page.get("rows") or 0)
+    whole = [_PART_SAY[p] for p, _k in _UNIT_PARTS if isinstance(page.get(p), dict) and page[p].get("whole")]
+    cuts = [f"{_alias('L', int(c[0]), max(rows, 1))} 은 긴 줄의 나눔 {int(c[1])}/{int(c[2])}"
+            for c in page.get("cut") or [] if isinstance(c, (list, tuple)) and len(c) == 3]
+    text = f"[쪽 {i}/{n} — 이 단위는 창보다 길어 쪽으로 나눠 묻는다. 줄 머리마다 이 쪽에 실린 몫을 적었다"
+    if whole:
+        text += f" · 모든 쪽에 다 실린 것은 {' · '.join(whole)}"
+    if cuts:
+        text += " · " + ", ".join(cuts)
+    return text + ". 다른 쪽의 줄은 따로 묻고 코드가 합친다 — 이 쪽에 실린 것만 보고 답한다]\n"
+
+
+def _page_extra(page: dict) -> int:
+    """쪽 단위가 프롬프트에 더 차지하는 글자의 상계 — 쪽 머리 한 줄과 줄 머리 셋(종전 머리의 몫은 단위 크기 식의 머리 160 에도 있어
+    겹쳐 센다 — 상계라 넉넉한 쪽으로 틀린다)."""
+    return len(_page_frame(page)) + sum(len(h) for h in _page_heads(page).values())
+
+
+def _page_extra_max(rows: int) -> int:
+    """쪽 머리 몫의 상계 — 쪽 번호 · 줄 수를 크게 잡고, 세 부분을 다 '모든 쪽' 으로 적고, 나눈 긴 줄 둘(쪽의 첫 줄과 끝 줄)을 단 머리 한
+    줄에 쪽 꼴 줄 머리 셋을 더한다. 쪽을 짓기 전에 줄 자리를 셈하는 데 쓴다."""
+    big = 10 ** 6
+    part = {"total": big, "here": big, "whole": True, "cut": True}
+    frame = _page_frame({"index": big, "of": big, "rows": max(rows, 1), "line": part, "context": part, "evidence": part,
+                         "cut": [[max(rows, 1), big, big]] * 2})
+    return len(frame) + sum(len(_UNIT_PAGE_HEADS[p].format(n=big, total=big)) for p, _k in _UNIT_PARTS)
+
+
+def unit_page_base(unit: dict) -> int:
+    """쪽 하나가 줄 말고 차지하는 글자의 상계(자) — 단위 머리(제목 · 요약 · 읽는 법 · 결측과 머리 160) + 쪽 머리 몫. 쪽 자리에서 이것과
+    줄 자리 바닥(UNIT_PAGE_ITEM_FLOOR)을 못 남기면 그 단위는 쪽으로 나눌 수 없다(over_budget). 리스크 앱 단위 측정 스크립트도 읽는다."""
+    head = {k: v for k, v in unit.items() if k not in ("lines", "context", "evidence", "page")}
+    rows = sum(1 for _p, k in _UNIT_PARTS for x in unit.get(k) or [] if isinstance(x, dict))
+    return unit_size(head) + _page_extra_max(rows)
 
 
 def _missing_lines(items) -> list:
@@ -2550,9 +2665,15 @@ def _render_unit(unit: dict, ctx: dict) -> str:
         out.append(f"요약 «{_unquote_marks(unit.get('summary'))}»\n")
     if _str(unit.get("notes")):
         out.append(f"읽는 법 «{_unquote_marks(unit.get('notes'))}»\n")
+    page = unit.get("page") if isinstance(unit.get("page"), dict) else None
+    if page:
+        out.append(_page_frame(page))          # 쪽 단위(W-D22) — 쪽 머리 한 줄과 쪽 꼴 줄 머리
+        heads = _page_heads(page)
     for part, key in (("line", "lines"), ("context", "context"), ("evidence", "evidence")):
         rows = [(a, x) for a, x in ctx["lines"].items() if x["part"] == part]
-        if rows or part == "line":
+        if page:
+            out.append(heads[part])
+        elif rows or part == "line":
             out.append(_UNIT_HEADS[key].format(n=len(rows)))
         # 참조는 틀 밖 [ ] 안에 선다 — 한 줄로 위생해 괄호를 닫거나 블록을 열지 못하게 한다(결과의 refs 는 원래 값이다).
         out += [f"{a} [{_frame_safe(x['ref'])}] «{_unquote_marks(x['text'])}»\n" for a, x in rows]
@@ -3269,6 +3390,11 @@ def prepare(req: dict, lim: dict) -> dict:
                            **({"reason": reason} if reason else {}),
                            **({"need_max_tokens": small["need_max_tokens"]} if small.get("need_max_tokens")
                               and cell else {}))
+    # 단위가 문턱(unit_page_at)을 넘고 통째로는 안 든다 — 단위를 쪽으로 나눠 쪽마다 준비한다(W-D22). 쪽 안에서는 아래 길(반드시 전문인
+    # 카드의 쪽 · 카드 조각)이 그대로 돈다.
+    unit_paged = _unit_page_prep(req, lim)
+    if unit_paged is not None:
+        return unit_paged
     paged = _page_prep(req, lim)
     if paged is not None:
         return paged
@@ -3876,6 +4002,277 @@ async def _run_paged(app, prep: dict):
     yield _sse("done", {})
 
 
+# ── 단위 쪽 실행 — 단위가 홀로 창을 넘을 때(HWAXPortal docs/risk-200k W-D22) ───────────────────────────────────────────
+def _unit_pages(unit: dict, room: int) -> tuple[list, list] | None:
+    """홀로 창을 넘는 단위 → (쪽 단위들 — 각 unit_size ≤ room, 쪽마다 줄의 출처 [(부분, 그 부분 안 차례)]). 결정적이다.
+
+    머리(제목 · 요약 · 읽는 법 · 결측)는 쪽마다 그대로다. 쪽 자리의 반(UNIT_PAGE_WHOLE_SHARE) 안에 함께 드는 무리는 변경 → 문맥 → 근거
+    차례로 골라 모든 쪽에 다 싣고, 나머지 줄은 원래 차례로 채운다. 쪽 자리보다 긴 줄은 그 글을 문단 → 문장 경계로 나눠(_split_text —
+    앞 조각 끝 문장을 겹친다) 같은 참조로 싣고 쪽 머리에 '나눔 j/m' 을 적는다. 쪽에는 엔진 안쪽 칸 page(수만)를 단다. 머리가 커서 줄
+    자리가 바닥(UNIT_PAGE_ITEM_FLOOR) 밑이면 None — 나눌 수 없다(부르는 쪽이 over_budget 그대로 둔다)."""
+    per = UNIT_SIZE["per_line"]
+    groups = {part: [x for x in unit.get(key) or [] if isinstance(x, dict)] for part, key in _UNIT_PARTS}
+    head = {k: v for k, v in unit.items() if k not in ("lines", "context", "evidence", "page")}
+
+    def cost(x: dict) -> int:
+        return len(_str(x.get("text"))) + len(_str(x.get("ref"))) + per
+
+    base = unit_page_base(unit)
+    whole: list = []
+    rep = 0
+    for part, _k in _UNIT_PARTS:
+        g = sum(cost(x) for x in groups[part])
+        if groups[part] and base + rep + g <= room * UNIT_PAGE_WHOLE_SHARE:
+            whole.append(part)
+            rep += g
+    avail = room - base - rep
+    for _ in range(UNIT_PAGE_SHRINK_TRIES):
+        if avail < UNIT_PAGE_ITEM_FLOOR:
+            return None
+        items: list = []                 # (부분, 그 부분 안 차례, 줄, 나눔(j, m) 또는 None)
+        for part, _k in _UNIT_PARTS:
+            if part in whole:
+                continue
+            for idx, x in enumerate(groups[part]):
+                if cost(x) <= avail:
+                    items.append((part, idx, x, None))
+                    continue
+                text_room = avail - per - len(_str(x.get("ref")))
+                if text_room < UNIT_PAGE_ITEM_FLOOR:
+                    return None          # 참조만으로 자리가 거의 없다
+                pieces = _split_text(_str(x.get("text")), text_room)
+                items += [(part, idx, {**x, "text": p}, (j, len(pieces))) for j, p in enumerate(pieces, 1)]
+        chunks: list = []
+        cur: list = []
+        used = 0
+        for it in items:
+            c = cost(it[2])
+            if cur and used + c > avail:
+                chunks.append(cur)
+                cur, used = [], 0
+            cur.append(it)
+            used += c
+        if cur:
+            chunks.append(cur)
+        if len(chunks) < 2:
+            return None                  # 한 쪽에 다 든다 — 나눌 것이 아니다
+        pages, srcs = [], []
+        for i, chunk in enumerate(chunks, 1):
+            pu = dict(head)
+            sel_all: list = []
+            for part, key in _UNIT_PARTS:
+                sel = ([(part, idx, x, None) for idx, x in enumerate(groups[part])] if part in whole
+                       else [it for it in chunk if it[0] == part])
+                pu[key] = [it[2] for it in sel]
+                sel_all += sel
+            pu["page"] = {"index": i, "of": len(chunks), "rows": len(sel_all),
+                          **{part: {"total": len(groups[part]), "here": sum(1 for it in sel_all if it[0] == part),
+                                    "whole": part in whole, "cut": any(it[3] for it in sel_all if it[0] == part)}
+                             for part, _k in _UNIT_PARTS},
+                          "cut": [[r, it[3][0], it[3][1]] for r, it in enumerate(sel_all, 1) if it[3]]}
+            pages.append(pu)
+            srcs.append([(it[0], it[1]) for it in sel_all])
+        over = max(unit_size(pu) - room for pu in pages)
+        if over <= 0:
+            return pages, srcs
+        avail -= over + 64               # 별칭 폭(줄 1,000개 넘는 쪽) 따위로 넘쳤다 — 줄 자리를 줄여 다시 짓는다
+    return None
+
+
+def _unit_page_need(req: dict, lim: dict) -> int:
+    """쪽 옆에 실어야 할 카드 글자 — 판정은 그 묶음의 카드 전부, 카드 밖 · 입력 결손은 반드시 전문인 카드(카드 밖 검색이면 긴 문서 몫까지).
+    반드시 전문 밖의 카드는 종전대로 남는 몫에 들거나 제목이다(훑기에서 이미 전문으로 맞대어졌다 — W-D10)."""
+    kind = req.get("kind")
+    extra = req.get("extra") if isinstance(req.get("extra"), dict) else {}
+    must = {_str(a) for a in extra.get("must_full") or []}
+    need = sum(len(render_card(c, _str(c.get("alias")))) for c in req.get("cards") or []
+               if isinstance(c, dict) and (kind == "verdict" or _str(c.get("alias")) in must))
+    if kind == "offcard" and extra.get("search"):
+        need += int(lim["offcard"]["longdoc_max"])
+    return need
+
+
+def _fits_whole(req: dict, lim: dict) -> bool:
+    """단위를 나누지 않고 드나 — 종전 길(반드시 전문인 카드의 쪽 · 한 번에 조립)이 보충 시도의 지적 블록(hint_max)까지 실어도 창 안이고
+    반드시 전문인 카드를 제목으로 내리지 않는다. 첫 시도만 들고 보충이 넘치면 빠진 카드를 다시 못 묻는다 — 그런 단위는 나눈다(쪽 자리는
+    선언한 틀 몫 — 지적 몫 포함 — 으로 셈하므로 쪽의 보충은 든다). 카드 조각(W-D16)은 보지 않는다 — 단위가 문턱을 넘었으면 카드를 잘게
+    쪼개기보다 단위를 나눈다."""
+    hint = "가" * int(lim[req["kind"]]["hint_max"])
+    try:
+        paged = _page_prep(req, lim)
+        if paged is not None:
+            for sub in paged["paged"]["subs"]:
+                build_prompt(sub["req"], lim, hint=hint)
+            return True
+        return not build_prompt(req, lim, hint=hint)[2].get("must_dropped")
+    except OverBudget:
+        return False
+
+
+def _unit_page_prep(req: dict, lim: dict) -> dict | None:
+    """단위가 문턱(unit_page_at)을 넘고 통째로는 안 들면 — 단위를 쪽으로 나눠 쪽마다 보통 준비물을 만들어 묶는다(run 이 차례로 돌려 합친다).
+    해당하지 않으면 None. 쪽 단위(page 칸이 있는 단위)는 다시 나누지 않는다.
+
+    쪽 자리 — 그 호출의 카드(_unit_page_need)를 옆에 싣고 남는 자리(창 한도 − 그 종류의 선언한 틀 몫 − 카드)이되 문턱을 넘지 않는다.
+    남는 자리가 단위 몫(unit_body_max)보다 좁으면(카드가 커서 어차피 조각으로 돈다) 자리를 반씩 나눈다 — 쪽 수 × 조각 수가 가장 작다.
+    쪽이 실제 조립에서 넘치면 넘친 만큼 줄여 다시 짓는다(UNIT_PAGE_SHRINK_TRIES)."""
+    kind = req.get("kind")
+    unit = req.get("unit") if isinstance(req.get("unit"), dict) else None
+    if kind not in UNIT_PAGE_KINDS or unit is None or unit.get("page") is not None:
+        return None
+    at = unit_page_at(lim)
+    if unit_size(unit) <= at or _fits_whole(req, lim):
+        return None
+    ubm = int(lim["unit_body_max"])
+    beside = int(lim["p_hard"]) - int(lim[kind]["fixed"])
+    left = beside - _unit_page_need(req, lim)
+    room = min(at, left) if left >= ubm else min(at, max(ubm, beside // 2))
+    for _ in range(UNIT_PAGE_SHRINK_TRIES):
+        built = _unit_pages(unit, room)
+        if built is None:
+            return None
+        pages, srcs = built
+        try:
+            subs = [prepare({**req, "unit": pu}, lim) for pu in pages]
+        except OverBudget as exc:
+            room -= (exc.need - exc.have) + 1_000
+            continue
+        pctx = build_ctx(req, lim)
+        aliases = list(pctx["lines"])
+        offset, at_part = 0, {}
+        for part, key in _UNIT_PARTS:
+            at_part[part] = offset
+            offset += sum(1 for x in unit.get(key) or [] if isinstance(x, dict))
+        maps = [dict(zip(sub["ctx"]["lines"], [aliases[at_part[p] + i] for p, i in src])) for sub, src in zip(subs, srcs)]
+        spans = []
+        for pu, src in zip(pages, srcs):
+            sp = {}
+            for part, _k in _UNIT_PARTS:
+                idx = [i for p, i in src if p == part]
+                sp[part] = "all" if pu["page"][part]["whole"] else ([idx[0] + 1, idx[-1] + 1] if idx else [])
+            spans.append(sp)
+        return {"req": req, "lim": lim, "ctx": subs[0]["ctx"],
+                "unit_paged": {"subs": subs, "maps": maps, "parent_ctx": pctx, "room": room, "at": at,
+                               "whole": [p for p, _k in _UNIT_PARTS if pages[0]["page"][p]["whole"]], "spans": spans}}
+    return None
+
+
+def _merge_unit_verdict(pctx: dict, pages_rows: list, unjudged: dict) -> list:
+    """쪽들의 판정(줄 별칭은 원래 단위의 것으로 고친 뒤) → 카드마다 한 행. 한 쪽이라도 그 카드의 판정 행이 없으면 행을 내지 않는다(빠진
+    카드 — 그 쪽의 줄에 걸림이 있을 수 있다, unjudged 에 쪽 번호). 해당은 어느 쪽이든, 판정은 해당 쪽 가운데 가장 무거운 것이고(쪽마다 다른
+    줄이라 갈림이 모순이 아니다 — 재판정하지 않는다), 변경 줄 · 참조는 그 판정과 같은 판정을 낸 쪽들의 것을 모은다. 참조 표지 · 수치 원천은
+    원래 단위로 다시 셈하고 checks.pages 에 쪽마다의 해당 · 판정을 남긴다. solo 의 조건 줄은 같은 줄을 하나로 모은다."""
+    out = []
+    for a in pctx["judge"]:
+        got = []
+        for i, rows in enumerate(pages_rows, 1):
+            v = next((r for r in rows if r.get("t") == "v" and r.get("k") == a), None)
+            if v is None:
+                unjudged.setdefault(a, []).append(i)
+            else:
+                got.append((i, v))
+        if a in unjudged:
+            continue
+        _i, dec = max(got, key=lambda x: (_APPLIES_RANK.get(x[1].get("applies"), 0),
+                                          _JUDGE_RANK.get(x[1].get("judgement"), 0) if x[1].get("applies") == "yes" else 0,
+                                          -x[0]))
+        same = [r for _j, r in got if (r.get("applies"), r.get("judgement")) == (dec.get("applies"), dec.get("judgement"))]
+        m = copy.deepcopy(dec)
+        m["l"] = _union(x for r in same for x in r.get("l") or [])
+        m["refs"] = [pctx["lines"][x]["ref"] for x in m["l"]]
+        checks = dict(m.get("checks") or {})
+        if m.get("applies") == "yes" and checks.get("refs") != "unknown_alias":
+            checks["refs"] = ("missing" if not m["l"] else "evidence_only"
+                              if all(pctx["lines"][x]["part"] == "evidence" for x in m["l"]) else "ok")
+        card = pctx["cards"][a]
+        checks["nums_unsourced"] = nums_unsourced(m.get("why", ""), "\n".join(
+            [card["header"], card["title"], card["text"], pctx["num_src"]] + [pctx["lines"][x]["text"] for x in m["l"]]))
+        checks["pages"] = [{"page": i, "applies": r.get("applies"), "judgement": r.get("judgement")} for i, r in got]
+        m["checks"] = checks
+        out.append(m)
+    cs, seen = [], set()
+    for rows in pages_rows:
+        for r in rows:
+            if r.get("t") == "c" and _identity(r) not in seen:
+                seen.add(_identity(r))
+                cs.append(r)
+    return out + cs + [r for rows in pages_rows for r in rows if r.get("t") not in ("v", "c")]
+
+
+def merge_unit_paged(prep: dict, results: list) -> dict:
+    """쪽 결과들 → 그 호출 하나의 result(앱이 보는 모양 그대로). 쪽마다의 줄 별칭(L01…)은 원래 단위의 별칭으로 고치고 참조는 원래 참조다.
+    판정은 _merge_unit_verdict, 카드 밖 · 입력 결손은 쪽 줄 합치기(_merge_page_rows — 같은 줄은 하나로, 한 줄짜리는 모은다)다. 정산은
+    원래 요청의 맥락으로 다시 하고 '더 있다'(maybe_more)는 어느 쪽이든 그렇다면 참이다. 전문 노출(meta.aliases.cards)은 모든 쪽에 전문으로
+    실린 카드만이다 — 한 쪽에서라도 제목으로 내려간 카드는 그 단위에 전문으로 맞대어지지 않았다(리스크 앱 W3 커버리지 · G10)."""
+    up = prep["unit_paged"]
+    pctx = up["parent_ctx"]
+    kind = pctx["kind"]
+    pages_rows = []
+    for i, res in enumerate(results):
+        rows = []
+        for r in res.get("rows") or []:
+            r = copy.deepcopy(r)
+            if isinstance(r.get("l"), list):
+                r["l"] = _union(up["maps"][i][x] for x in r["l"] if x in up["maps"][i])
+                r["refs"] = [pctx["lines"][x]["ref"] for x in r["l"]]
+            rows.append(r)
+        pages_rows.append(rows)
+    unjudged: dict = {}
+    rows = (_merge_unit_verdict(pctx, pages_rows, unjudged) if kind == "verdict"
+            else _merge_page_rows(kind, [r for rows in pages_rows for r in rows]))
+    settled = settle(kind, rows, pctx)
+    if kind != "verdict":
+        mores = [(res.get("quality") or {}).get("maybe_more") for res in results]
+        settled["maybe_more"] = True if True in mores else (False if all(x is False for x in mores) else None)
+    metas = [res.get("meta") or {} for res in results]
+    full = set.intersection(*[set((m.get("aliases") or {}).get("cards") or {}) for m in metas])
+    cards = {a: pctx["cards"][a]["record_id"] for a in pctx["card_order"] if a in full}
+    docs = {k: v for m in reversed(metas) for k, v in ((m.get("aliases") or {}).get("docs") or {}).items()}
+    aliases = {**(metas[0].get("aliases") or {}), "cards": cards, "lines": {a: x["ref"] for a, x in pctx["lines"].items()}}
+    if docs:
+        aliases["docs"] = docs
+    return _combine(kind, pctx["variant"], rows, settled, results, {
+        "input_sha": _canon_sha({"unit_paged": up["spans"], "subs": [m.get("input_sha") for m in metas]}),
+        "soft_over": True,
+        "bg_dropped": len(pctx["card_order"]) - len(cards),
+        **({"must_dropped": sum(1 for a in pctx["must_full"] if a not in cards)} if pctx.get("must_full") else {}),
+        "aliases": aliases,
+        "unit_paged": {"n": len(results), "at": up["at"], "room": up["room"], "whole": up["whole"], "spans": up["spans"],
+                       "unjudged": unjudged},
+    })
+
+
+async def _run_unit_paged(app, prep: dict):
+    """단위 쪽 준비물의 SSE — 쪽마다 보통 run 을 차례로 돌리고(_drive — status{unit_page, unit_pages}, 쪽 안의 조각 · 카드 쪽 표지는 그대로
+    흐른다) 한 result 로 합친다(merge_unit_paged). 쪽 하나라도 끝내 실패하면 그 error 로 끝낸다(앱이 그 호출을 종전 규칙으로 다시 낸다 —
+    받은 쪽만 합쳐 다 본 것처럼 두지 않는다)."""
+    from app import _sse  # noqa: PLC0415
+
+    up = prep["unit_paged"]
+    subs, pctx = up["subs"], up["parent_ctx"]
+    t0 = time.monotonic()
+    tag = f"{pctx['kind']}/{pctx['variant'] or '-'} {pctx['expert'].get('key', '')} {pctx['unit_id'] or '-'}"
+    results: list = []
+    for i, sub in enumerate(subs, 1):
+        out: dict = {}
+        async for b in _drive(app, sub, {"unit_page": i, "unit_pages": len(subs)}, out):
+            yield b
+        if out.get("error") is not None or out.get("result") is None:
+            err = out.get("error") or {"code": "internal_error", "message": "단위 쪽 결과가 없다", "infra": False,
+                                       "retryable": False}
+            print(f"[card_review] {tag} 단위 쪽 {i}/{len(subs)} → {err.get('code')}")
+            yield _sse("error", {**err, "unit_page": i, "unit_pages": len(subs)})
+            yield _sse("done", {})
+            return
+        results.append(out["result"])
+    merged = merge_unit_paged(prep, results)
+    gone = merged["meta"]["unit_paged"]["unjudged"]
+    print(f"[card_review] {tag} 단위 쪽 {len(subs)}개(쪽 자리 {up['room']:,}자){f' · 판정 빠짐 {sorted(gone)}' if gone else ''} "
+          f"{time.monotonic() - t0:.1f}s → ok")
+    yield _sse("result", merged)
+    yield _sse("done", {})
+
+
 async def run(app, prep: dict):
     """`POST /card-review/run` 의 SSE 본체 — prepare() 를 지난 요청만 받는다.
 
@@ -3884,10 +4281,12 @@ async def run(app, prep: dict):
     error{review_busy} → done 이고 LLM 을 부르지 않는다. 첫 시도의 LLM 실패는 error 다. 보충(n ≥ 2) 중의 실패는 error 가
     아니라 result 로 끝내고 quality.repair_error 를 싣는다(받은 행을 버리지 않는다 — P-08). 단 그때까지 받은 행이 0 이면
     살릴 것이 없으므로 error 다. 구독이 닫히면(취소·aclose) LLM 태스크를 취소하고 자리를 돌려준다."""
-    if prep.get("chunked") or prep.get("paged"):
-        # 한 장 자리를 넘는 카드 한 장(조각) · 창 한 번에 안 드는 반드시 전문인 카드(쪽) — 조각 · 쪽마다 이 함수를 다시 돌려 합친다
-        # (관문 자리는 조각 · 쪽마다 잡고 놓는다).
-        async for b in (_run_chunked(app, prep) if prep.get("chunked") else _run_paged(app, prep)):
+    if prep.get("chunked") or prep.get("paged") or prep.get("unit_paged"):
+        # 한 장 자리를 넘는 카드 한 장(조각) · 창 한 번에 안 드는 반드시 전문인 카드(쪽) · 홀로 창을 넘는 단위(단위 쪽 — W-D22) — 조각 ·
+        # 쪽마다 이 함수를 다시 돌려 합친다(관문 자리는 조각 · 쪽마다 잡고 놓는다).
+        sub = (_run_chunked(app, prep) if prep.get("chunked") else _run_paged(app, prep) if prep.get("paged")
+               else _run_unit_paged(app, prep))
+        async for b in sub:
             yield b
         return
     from app import DELIB_HEARTBEAT_S, _est_tokens_all, _sse  # noqa: PLC0415 — app 이 이 모듈을 붙이므로 부를 때 가져온다
@@ -4191,8 +4590,29 @@ class MissingItem(_Strict):
     note: str | None = None
 
 
+class UnitPagePart(_Strict):
+    """쪽 단위의 한 부분(변경 · 문맥 · 근거) — 단위 전체 줄 수 · 이 쪽 줄 수 · 모든 쪽에 다 실렸나 · 나눈 긴 줄이 있나."""
+    total: int = 0
+    here: int = 0
+    whole: bool = False
+    cut: bool = False
+
+
+class UnitPage(_Strict):
+    """엔진 안쪽 칸(HWAXPortal docs/risk-200k W-D22) — run 이 홀로 창을 넘는 단위를 쪽으로 나눌 때 쪽 단위에 단다. 앱은 보내지 않는다.
+    수만 싣는다 — 쪽 머리 한 줄은 엔진이 이 수로 쓴다(요청에서 온 글이 틀 밖에 서지 않는다). cut 은 [이 쪽의 L 번호, j, m] 이다."""
+    index: int
+    of: int
+    rows: int = 0
+    line: UnitPagePart = UnitPagePart()
+    context: UnitPagePart = UnitPagePart()
+    evidence: UnitPagePart = UnitPagePart()
+    cut: list[list[int]] = []
+
+
 class RunUnit(_Strict):
-    """리스크 앱 units.review_payload 의 출력 그대로(M2.md 4.3, m2-wp2 걸음 5). 해시·상태 칸은 프롬프트에 쓰지 않고 input_sha 에만 든다."""
+    """리스크 앱 units.review_payload 의 출력 그대로(M2.md 4.3, m2-wp2 걸음 5). 해시·상태 칸은 프롬프트에 쓰지 않고 input_sha 에만 든다.
+    page 는 엔진 안쪽 칸이다(단위 쪽 — W-D22, 앱은 보내지 않는다)."""
     unit_id: str
     kind: str = ""
     title: str = ""
@@ -4207,6 +4627,7 @@ class RunUnit(_Strict):
     evidence_sha: Any = None
     evidence_status: Any = None
     input_gaps: Any = None
+    page: UnitPage | None = None
 
 
 class RunManifestItem(_Strict):

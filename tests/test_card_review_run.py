@@ -261,18 +261,24 @@ def test_LLM_실패의_부류(behavior, code, infra, retryable, status):
     assert app.state.review_gate.active == 0
 
 
-def _near_window_unit(lim, prep_kind="verdict"):
-    """조립 길이가 창 한도(P_hard) 바로 밑에 닿는 단위 — 한글 본문으로 채운다(추정 토큰이 글자 수에 가깝다)."""
+def _near_window(lim):
+    """조립 길이가 창 한도(P_hard) 바로 밑에 닿는 판정 — 카드 한 장을 한글 본문으로 채운다(추정 토큰이 글자 수에 가깝다). 단위로
+    채우면 그 단위가 홀로 자리를 넘고 보충 시도가 넘쳐 run 이 단위를 쪽으로 나눈다(W-D22) — 창에 거의 찬 프롬프트가 아니게 된다."""
     base = _verdict(1, lim=lim)
     room = lim["p_hard"] - base["ctx"]["prompt_chars"] - 200
-    u = _unit(0)
-    u["lines"].append({"ref": "c:big", "text": "가" * room})
-    return u
+    card = json.loads(json.dumps([c for c in PACK if c["checkable"]][0]))
+    card["sections"][-1]["text"] += "가" * room
+    card["text_sha"] = cr._text_sha(card["sections"])
+    card["chars"] = len(cr.render_card(card, card["alias"]))
+    req = _req("verdict", [card], _digest(PACK, [card["alias"]]), unit=_unit(0, canary=CANARY), variant="fwd")
+    prep = cr.prepare(req, lim)
+    assert not prep.get("chunked") and not prep.get("unit_paged") and lim["p_hard"] - prep["ctx"]["prompt_chars"] == 200
+    return prep
 
 
 def test_창_근처의_400_은_context_overflow_이고_다시_쪼개지_않는다():
     lim = cr.limits(16_384, "server", 0, env={}, model="fake-glm")
-    prep = _verdict(1, unit=_near_window_unit(lim), lim=lim)
+    prep = _near_window(lim)
     fr, llm, _ = _go(prep, ["http_400"])
     err = _last(fr)[1]
     assert (err["code"], err["infra"], err["retryable"], err["knob"]) == ("context_overflow", False, False,

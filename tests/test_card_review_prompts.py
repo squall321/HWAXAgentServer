@@ -190,9 +190,16 @@ def _plan_in(pack, units: dict) -> tuple:
     return cards, sizes
 
 
+def _leaves(prep: dict) -> list:
+    """준비물의 잎 — 단위 쪽(W-D22)이면 쪽마다, 조각이면 조각마다(쪽 안의 조각도) 보통 준비물."""
+    if prep.get("unit_paged"):
+        return [x for sub in prep["unit_paged"]["subs"] for x in _leaves(sub)]
+    return (prep.get("chunked") or {}).get("subs") or [prep]
+
+
 def _runs(kind, cards, pack, unit, lim, variant="fwd") -> bool:
-    """run 이 받는가 — prepare 가 지나고(조각이면 조각마다), 역할 · 지적 블록을 몫 끝까지 채워도 창 안이다(W-D16 — 카드가 단위와
-    함께 넘치면 run 이 조각 낸다)."""
+    """run 이 받는가 — prepare 가 지나고(조각이면 조각마다 · 단위 쪽이면 쪽마다), 역할 · 지적 블록을 몫 끝까지 채워도 창 안이다(W-D16 —
+    카드가 단위와 함께 넘치면 run 이 조각 낸다, W-D22 — 단위가 홀로 넘치면 run 이 단위를 쪽으로 나눈다)."""
     kl = lim[kind]
     req = _req(kind, cards, _digest(pack, [c["alias"] for c in cards]), unit=unit, variant=variant,
                role="역할 원문 " * (kl["role_max"] // 3))
@@ -200,7 +207,7 @@ def _runs(kind, cards, pack, unit, lim, variant="fwd") -> bool:
         prep = cr.prepare(req, lim)
     except cr.OverBudget:
         return False
-    for sub in (prep.get("chunked") or {}).get("subs") or [prep]:
+    for sub in _leaves(prep):
         try:
             cr.build_prompt(sub["req"], lim, hint="지적 " * kl["hint_max"])
         except cr.OverBudget:

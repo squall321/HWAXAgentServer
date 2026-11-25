@@ -356,21 +356,27 @@ def test_plan_의_불변식(ctx, env, seed):
     for p in out["manifest_pages"]:
         assert 1 <= len(p) <= s["units_per_page_max"]
     uo, us = set(out["oversize"]["units"]), set(out["soft_over"]["units"])
-    # 단위는 이 계획이 실제로 낸 묶음과 견준다(RB-7) — 가장 큰 카드 한 장과도(또는 offcard 홀로) 넘으면 oversize, 묶음째로만
-    # 넘으면 그 쌍이 pair_over 다.
+    up = set(out.get("unit_paged") or [])
+    assert out.get("unit_paged", None) != [], "빈 unit_paged 칸은 싣지 않는다(기존 계획 예제가 바이트 그대로)"
+    # 단위는 이 계획이 실제로 낸 묶음과 견준다(RB-7) — 가장 큰 카드 한 장과도(또는 offcard 홀로) 넘으면 홀로 넘는 단위, 묶음째로만
+    # 넘으면 그 쌍이 pair_over 다. 홀로 넘는 단위는 조각을 켠 창(room > 0)이면 멈추지 않고 unit_paged(run 이 단위를 쪽으로 — W-D22),
+    # 아니면 oversize 다.
     whole = [a for d in out["verdict_decks"] if not d.get("chunked") for a in d["aliases"]]
     card_max = max((by_alias[a]["chars"] for a in whole), default=0)     # 조각 카드는 run 이 단위에 맞춰 줄인다
     pairs = {(p["deck_id"], p["unit_id"]): p for p in out["pair_over"]}
     for u in units:
         n = u["body_chars"]
-        # 조각을 켠 창에서는 카드가 그 단위에 맞게 조각 난다 — 단위가 돌릴 바닥(RUN_FLOOR)만큼의 카드 자리도 못 남길 때만 oversize(W-D16)
+        # 조각을 켠 창에서는 카드가 그 단위에 맞게 조각 난다 — 단위가 돌릴 바닥(RUN_FLOOR)만큼의 카드 자리도 못 남길 때만 홀로 넘는다(W-D16)
         need = cr.RUN_FLOOR if room > 0 else card_max
-        assert (u["unit_id"] in uo) == (lim["offcard"]["fixed"] + n > lim["p_hard"]
-                                        or (bool(seen_v) and v["fixed"] + n + need > lim["p_hard"]))
-        assert (u["unit_id"] in us) == (u["unit_id"] not in uo and n > lim["unit_body_max"])
+        alone = (lim["offcard"]["fixed"] + n > lim["p_hard"] or (bool(seen_v) and v["fixed"] + n + need > lim["p_hard"]))
+        assert (u["unit_id"] in uo) == (alone and room <= 0)
+        assert (u["unit_id"] in up) == (alone and room > 0)
+        if seen_v and room > 0:
+            assert (u["unit_id"] in up) == (n > cr.unit_room(lim)), "계획의 단위 쪽 선은 단위 홀로 자리다"
+        assert (u["unit_id"] in us) == (not alone and n > lim["unit_body_max"])
         for d in out["verdict_decks"]:
             need = v["fixed"] + n + d["chars"]
-            want = u["unit_id"] not in uo and need > lim["p_hard"] and not d.get("chunked")
+            want = not alone and need > lim["p_hard"] and not d.get("chunked")
             assert ((d["deck_id"], u["unit_id"]) in pairs) == want
     assert all(p["have"] == lim["p_hard"] < p["need"] for p in out["pair_over"])
     s_cards = max((d["chars"] for d in out["sweep_decks"] if not d.get("chunked")), default=len(cr._NO_CARDS))

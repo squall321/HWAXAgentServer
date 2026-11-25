@@ -1,0 +1,50 @@
+{
+ "limits_rev": "36a75c88",
+ "limits_rev_by_kind": {
+  "sweep": "b8130c81",
+  "verdict": "6c2e9f5a",
+  "offcard": "2082ea17",
+  "noinput": "be110147",
+  "summary": "13f2a04e"
+ },
+ "verdict_decks": [
+  {
+   "deck_id": "v-e6861815",
+   "aliases": [
+    "K01"
+   ],
+   "chars": 3000,
+   "soft_over": false
+  }
+ ],
+ "sweep_decks": [
+  {
+   "deck_id": "s-016fb1b9",
+   "aliases": [
+    "K01"
+   ],
+   "chars": 3000,
+   "soft_over": false
+  }
+ ],
+ "manifest_pages": [
+  [
+   "u-big",
+   "u-small"
+  ]
+ ],
+ "oversize": {
+  "cards": [],
+  "kinds": {},
+  "units": [],
+  "manifest": []
+ },
+ "soft_over": {
+  "units": [],
+  "manifest": []
+ },
+ "pair_over": [],
+ "unit_paged": [
+  "u-big"
+ ]
+}

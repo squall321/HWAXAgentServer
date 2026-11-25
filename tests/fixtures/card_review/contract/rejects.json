@@ -1,6 +1,6 @@
 {
  "_how": {
-  "over_budget": "req_verdict_one 의 unit.lines 에 p_hard+10 자 줄 하나를 더했다",
+  "over_budget": "req_verdict_one 의 unit.summary 를 p_hard+10 자로 — 단위 머리는 쪽으로 나눌 수 없다(줄이 긴 단위는 run 이 쪽으로 나눠 돈다 — W-D22)",
   "ctx_too_small": "창 4,096 에서 req_verdict_one",
   "ctx_unknown": "창 조회가 실패해 다시 묻는 중(기본값 128,000 가정)에 limits_1m 의 판을 expect 로 실은 req_verdict_one",
   "_else": "req_verdict_one 을 코드 이름대로 한 칸 바꿨다"
@@ -64,8 +64,8 @@
   "status": 422,
   "body": {
    "code": "over_budget",
-   "message": "프롬프트 1,011,618자가 이 박스의 창 한도 1,008,310자를 넘는다(가장 큰 조각 unit) — 다시 쪼개지 않는다",
-   "need": 1011618,
+   "message": "프롬프트 1,011,585자가 이 박스의 창 한도 1,008,310자를 넘는다(가장 큰 조각 unit) — 다시 쪼개지 않는다",
+   "need": 1011585,
    "have": 1008310,
    "part": "unit"
   }
