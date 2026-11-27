@@ -23,6 +23,7 @@ import persona_links                                    # 좌석 추천의 온�
 import ra_formats                                       # RA 초안의 템플릿 id · 판(박스 파일이 없으면 종전 'deliberation' v1 그대로)
 import publish_token                                    # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(사용자 결정 10-31 '내보내는 곳만 가린다')
 import report_figures                                   # 보고서 글의 도구 그림을 그 사람 명의로 RA 그림 칸으로(HWAXPortal docs/report-figures)
+import purposes as _purposes                            # 게이트웨이 목적 묶음 표 — 좌석 후보 목적 순위 그림자(HWAXPortal docs/mcp-modernize M3)
 from evidence import fit_document, sig_numbers, unsourced_numbers   # 수치 대조·문서 맞춤은 챗과 같은 것을 쓴다
 
 # 이번 요청에서 사용자 PAT 가 게이트웨이에 거절돼 서비스 계정으로 강등됐는지 표식.
@@ -5199,6 +5200,86 @@ def _tools_for_seat(g: dict, persona: dict, question: str, budget: int, pin: tup
     return kept
 
 
+# ── 좌석 목적 순위 그림자(HWAXPortal docs/mcp-modernize M3) ───────────────────────────────────────────────────────────────────
+# 의장 틀 · 화두로 게이트웨이 목적 묶음 표의 목적을 고르고, 그 목적 단계(좌석 후보 안의 것만)를 좌석 순위 맨 앞에 세웠으면(_tools_for_seat 의 pin) 좌석마다
+# 무엇이 바뀌었을지 1라운드에 한 번 셈해 로그 한 줄 · /health purpose.seat 에 적는다. 좌석 도구 · 심의 결과는 바꾸지 않는다. 후보(free_pool)는 그대로라
+# 울타리(_FREE_ALLOW 접두 · 닫기 목록 · 확인된 선언 읽기)가 목적 단계를 거른다 — 그 수(fenced)를 함께 센다(허브 도구처럼 접두 밖이라 좌석이 못 쓰는
+# 목적 단계). 리스크 심사는 셈하지 않는다(D-18 — 좌석에 새 길을 열지 않는다 · 켜도 들지 않을 자리다). 손잡이 DELIB_SEAT_PURPOSE — off · shadow(기본).
+DELIB_SEAT_PURPOSE = _purposes.mode(os.environ.get("DELIB_SEAT_PURPOSE"), ("off", "shadow"), "shadow")
+# 의장 틀의 기본 목적 — 화두의 트리거로 고른 목적 뒤에 붙인다(합쳐 셋까지). 틀이 원래 묻는 일(원인규명 → 품질 원인 · 사내 지식, 해석 계획 → 낙하 준비 ·
+# 물성 …)이다. 표에 없거나 이 박스에 단계가 없는 키는 건너뛴다. default(자유) · risk-review 는 없다.
+_CHAIR_PURPOSES = {
+    "diagnosis": ("quality-root-cause", "knowledge-search"),
+    "sim-plan": ("drop-prep", "material-find"),
+    "test-plan": ("material-find", "knowledge-search"),
+    "build-plan": ("cad-project-status", "knowledge-search"),
+    "credibility": ("knowledge-search",),
+    "option-select": ("knowledge-search",),
+}
+_SEAT_PURPOSE: dict = {"rounds": 0, "matched": 0, "skipped": {}, "errors": 0, "error": None, "last": None}
+
+
+def seat_purpose_health() -> dict:
+    """/health purpose.seat — 손잡이 · 셈한 심의 수 · 목적이 맞은 수 · 건너뛴 까닭별 수 · 마지막 한 번(목적 키 · 수만)."""
+    S = _SEAT_PURPOSE
+    return {"mode": DELIB_SEAT_PURPOSE, "rounds": S["rounds"], "matched": S["matched"], "skipped": dict(S["skipped"]),
+            "errors": S["errors"], "error": S["error"], "last": S["last"]}
+
+
+def _seat_purpose_shadow(free_pool: dict, personas: list, question: str, chair: str | None, budget: int,
+                         pin: tuple, now_sel: dict) -> dict | None:
+    """좌석 목적 순위 그림자 — 기록(없으면 None). now_sel 은 좌석 키 → 지금 고른 도구 이름. 실패는 삼킨다(심의를 막지 않는다)."""
+    if DELIB_SEAT_PURPOSE == "off" or not free_pool or not personas:
+        return None
+    S = _SEAT_PURPOSE
+    try:
+        if chair == "risk-review":
+            S["skipped"]["risk-review"] = S["skipped"].get("risk-review", 0) + 1
+            return None
+        from app import _purpose_table  # noqa: PLC0415 — 순환 방지용 늦은 import
+        table = _purpose_table()
+        if not table:
+            S["skipped"]["no_table"] = S["skipped"].get("no_table", 0) + 1
+            return None
+        hits = [dict(h, src="question") for h in _purposes.match(question, table, None)]
+        seen = {h["key"] for h in hits}
+        hits += [dict(h, src="chair") for h in _purposes.by_keys(_CHAIR_PURPOSES.get(chair or "", ()), table, None)
+                 if h["key"] not in seen]
+        hits = hits[:_purposes.MAX_PURPOSES]
+        S["rounds"] += 1
+        at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if not hits:
+            S["last"] = {"at": at, "chair": chair or "default", "purposes": [], "seats": len(personas)}
+            return S["last"]
+        S["matched"] += 1
+        lead = _purposes.lead(hits)
+        in_pool = [n for n in lead if n in free_pool]
+        ents = _purposes.entries(hits)
+        add = tuple(pin) + tuple(n for n in in_pool if n not in pin)
+        seats = []
+        for p in personas:
+            c = _purposes.compare(list(now_sel.get(p["key"]) or ()),
+                                  list(_tools_for_seat(free_pool, p, question, budget, pin=add)), hits)
+            seats.append({"key": p["key"], **{k: c[k] for k in ("now", "purpose", "overlap", "added", "removed",
+                                                                "entries_now", "entries_purpose", "steps_now", "steps_purpose")}})
+        rec = {"at": at, "chair": chair or "default", "purposes": _purposes.brief(hits), "pool": len(free_pool),
+               "steps": len(lead), "in_pool": len(in_pool), "fenced": len(lead) - len(in_pool),
+               "entries": len(ents), "entries_in_pool": sum(1 for n in ents if n in free_pool), "seats": seats[:20]}
+        S["last"] = rec
+        n = len(seats)
+        print(f"[deliberation] seat purpose shadow: 목적 "
+              + " · ".join(f"{h['key']}({h.get('src')})" for h in hits)
+              + f" — 단계 {len(lead)} 중 좌석 후보 안 {len(in_pool)}(울타리 밖 {len(lead) - len(in_pool)}) · {n}석 입구 지금 "
+              f"{sum(s['entries_now'] for s in seats)}/{len(ents) * n} → 목적 {sum(s['entries_purpose'] for s in seats)}/{len(ents) * n}"
+              f" · 좌석당 바뀐 도구 평균 {sum(s['added'] for s in seats) / max(1, n):.1f}")
+        return rec
+    except Exception as exc:  # noqa: BLE001 — 그림자가 심의를 막지 않는다
+        S["errors"] += 1
+        S["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        print(f"[deliberation] seat purpose shadow 실패(좌석 도구는 그대로): {exc!r}"[:300])
+        return None
+
+
 # 글 왕복 조회의 호출 줄 — 줄 맨 앞 CALL 뒤에 JSON 객체 하나(한 줄). 줄을 백틱 하나로 감싼 것도 받는다(규약 예시를 코드로 적어 옮기는 모델).
 _TEXT_CALL_RE = re.compile(r"^[ \t]*`?CALL[ \t]+(\{.*\})`?[ \t]*$", re.M)
 
@@ -7909,12 +7990,16 @@ async def _deliberation_stream(app, question: str, groups: list, opts=_DEFAULT_O
             # 변경 원장 도구 고정 — 리스크 심사이고 질문에 변경 비교 표식이 있을 때만. 얹지 않고 순위만 올린다.
             _pin = ((_RISK_PIN_TOOLS if _RISK_DIFF_MARK in question else ()) + _RISK_CARD_PIN_TOOLS
                     if opts.chair_template == "risk-review" else ())
+            _seat_sel: dict = {}     # 좌석 키 → 고른 도구 이름(1라운드 목적 순위 그림자만 읽는다)
             for p in personas:
                 _st = _tools_for_seat(free_pool, p, question, _free_tool_tokens(), pin=_pin) if free_pool else {}
                 _seat_agents[p["key"]] = ((_TextReactAgent(llm, list(_st.values()), opts.tool_budget) if _ext
                                            else create_react_agent(llm, list(_st.values()))) if _st else g_agent)
                 _seat_n[p["key"]] = len(_st)
+                _seat_sel[p["key"]] = list(_st)
             if _seat_n and rnd == 1:
+                # 목적 순위 그림자(HWAXPortal docs/mcp-modernize M3) — 좌석 도구는 위에서 이미 정했다. 셈해 적기만 한다(DELIB_SEAT_PURPOSE).
+                _seat_purpose_shadow(free_pool, personas, question, opts.chair_template, _free_tool_tokens(), _pin, _seat_sel)
                 # ⚠ **영역 분류를 못 받았으면 그렇다고 말한다.** `_tools_map` 은 실패를
                 # 한 줄로 삼키고 구 게이트웨이면 areas 가 빈 dict 다 — 그러면 좌석 배정이
                 # 이름 매칭만 남아 좌석끼리 거의 같아지는데(실측 겹침 0.018→0.818),

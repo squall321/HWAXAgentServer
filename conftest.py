@@ -1,4 +1,4 @@
-# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES) · 웹 챗의 Claude 손잡이(CLAUDE_CHAT_*) · 토큰 절감 2판 스위치(DELEGATE_ENABLED · DRAFT_ENABLED · TRANSFORM_ENABLED · RESULT_ASK_ENABLED)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 두며, 심의 MCP 의 앱 자리(mcp_server._APP)는 시험 끝에 시험 앞의 것으로 되돌린다, 심의 기본값 묶음(preset)의 박스 덧씌우기도 시험마다 '없음' 으로 둔다
+# 시험이 실 잡 원장·비우기 깃발에 쓰지 못하게 세 경로(DELIB_JOB_DIR·DRAIN_STATE_PATH·전문가 고르기 기준선 박스 자리 SEAT_EVAL_DIR)를 시험 세션 내내 임시 디렉터리로 돌려 두고, 셸이 내보낸 외부 응답자 값(EXTERNAL_LLM_*) · 호출 추적 스위치(CALL_TRACE_URL) · 프롬프트 앞부분 고정 손잡이(CHAT_STABLE_PREFIX) · 다른 허브 id 막이 · 상태 기다림 손잡이(CHAT_XHUB_ID_GATE · CHAT_STATUS_WAIT_POLL_S · CHAT_STATUS_TOOLS) · 패널 표지 손잡이(CHAT_UI_HOST · UI_RESOURCE_MAX_BYTES) · 웹 챗의 Claude 손잡이(CLAUDE_CHAT_*) · 토큰 절감 2판 스위치(DELEGATE_ENABLED · DRAFT_ENABLED · TRANSFORM_ENABLED · RESULT_ASK_ENABLED) · 목적 묶음 손잡이(CHAT_TOOL_PURPOSE 등)를 지우며, 챗 자기검증(CHAT_SELF_CHECK) · 상태 기다림(CHAT_STATUS_WAIT_MAX_S) · 확인 관문(CHAT_CONFIRM_GATE)을 끈다, 형제 포털 리포의 코어 어휘표 · 운영자 정의(확인 관문 목록)는 시험마다 '없음' 으로 두며, 심의 MCP 의 앱 자리(mcp_server._APP)는 시험 끝에 시험 앞의 것으로 되돌린다, 심의 기본값 묶음(preset)의 박스 덧씌우기도 시험마다 '없음' 으로 둔다
 """시험마다 `delib_jobs.JOB_DIR` 을 임시 경로로 바꿔 끼우지만 그건 **시험이 끝나면 풀린다.**
 
 끝난 뒤에 도는 뒷정리가 하나라도 있으면(버려진 심의 태스크의 finally 가 그렇다) 그 기록은 모듈의 기본
@@ -92,6 +92,12 @@ for _k in [k for k in os.environ if k.startswith("CLAUDE_CHAT_")]:
 # 지운다 — 켠 셸에서 돌리면 도구 · 창구가 등록되어 꺼진 서버를 전제한 시험(목록이 바이트까지 같다)이 흔들린다. 켜는 시험은 제 손으로 켠다
 # (tests/test_offload.py — 새 FastMCP 에 _register_offload(on=…) · 원장에 register_kind).
 for _k in ("DELEGATE_ENABLED", "DRAFT_ENABLED", "TRANSFORM_ENABLED", "RESULT_ASK_ENABLED", "DELEGATE_MAX_RUNNING"):
+    os.environ.pop(_k, None)
+
+# 목적 묶음 손잡이(CHAT_TOOL_PURPOSE · CHAT_PURPOSE_BUDGET · DELIB_SEAT_PURPOSE · OFFLOAD_PURPOSE · ROUTINE_PURPOSE — import 때 한 번 읽는다)도 지운다 —
+# 박스 값(on · 끔 · 다른 예산)을 내보낸 셸에서 돌리면 기본(그림자 — 묶음은 종전 그대로)을 전제한 시험이 흔들린다. 켜는 시험은 모듈 속성으로 고정한다
+# (tests/test_purpose_budget.py · HWAXPortal docs/mcp-modernize M3).
+for _k in ("CHAT_TOOL_PURPOSE", "CHAT_PURPOSE_BUDGET", "DELIB_SEAT_PURPOSE", "OFFLOAD_PURPOSE", "ROUTINE_PURPOSE"):
     os.environ.pop(_k, None)
 
 

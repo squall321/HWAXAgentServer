@@ -32,6 +32,7 @@ from urllib.parse import quote, unquote
 import httpx
 
 import external_llm
+import purposes as _purposes
 import usage_tokens
 from evidence import sig_numbers, unsourced_numbers
 
@@ -54,6 +55,33 @@ USAGE_KIND = "offload"      # 사람별 LLM 사용량(usage_tokens.KINDS)의 종
 def health() -> dict:
     """/health 의 offload — 네 스위치의 켜짐(포털 E 의 설정 배치가 '이 박스에서 꺼져 있음' 을 가른다)."""
     return dict(ON)
+
+
+# ── 목적 예산 그림자(HWAXPortal docs/mcp-modernize M3) ──────────────────────────────────────────────────────────────────
+# 위임은 울타리 안의 읽기 도구를 예산 없이 모두 묶는다(cae00 규모면 호출마다 수십만 토큰 — docs/mcp-modernize/audit/consumers.md 2.3). 맡긴 일 글로
+# 목적을 골라 목적 예산이었으면 몇 개 · 몇 토큰을 묶었을지 잡마다 셈해 로그 한 줄 · /health purpose.offload 에 적는다(app._purpose_bind_count). 묶음은
+# 그대로다. 손잡이 OFFLOAD_PURPOSE — off · shadow(기본). /health 의 offload(스위치 넷)에는 섞지 않는다 — 포털 설정 배치가 그 칸을 스위치로 읽는다.
+PURPOSE_SHADOW = _purposes.mode(os.environ.get("OFFLOAD_PURPOSE"), ("off", "shadow"), "shadow")
+_PURPOSE = _purposes.Tally()
+
+
+def purpose_health() -> dict:
+    return _PURPOSE.health(PURPOSE_SHADOW)
+
+
+def _purpose_shadow(task: str, allowed: dict) -> dict | None:
+    """위임 잡 하나의 목적 예산 그림자 — 기록(꺼졌거나 실패면 None). 실패는 삼킨다(잡을 막지 않는다)."""
+    if PURPOSE_SHADOW == "off" or not allowed:
+        return None
+    try:
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **_app()._purpose_bind_count(list(allowed.values()), task)}
+        _PURPOSE.add(rec)
+        log.info("[offload] purpose shadow: %s", _purposes.line(rec))
+        return rec
+    except Exception as exc:  # noqa: BLE001 — 그림자가 위임을 막지 않는다
+        _PURPOSE.fail(exc)
+        log.warning("[offload] purpose shadow 실패(묶음은 그대로): %r", exc)
+        return None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -416,6 +444,7 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
             yield _sse("error", {"message": f"위임을 시작하지 못했다 — {why}"})
             return
         yield _sse("status", {"step": f"읽기 도구 {len(allowed)}개를 묶었다(그 사람 시야 ∩ 게이트웨이가 읽기로 확인한 것)"})
+        _purpose_shadow(task, allowed)      # 목적 예산이었으면 몇 개 · 몇 토큰이었나 — 셈해 적기만 한다(OFFLOAD_PURPOSE)
         llm, tok = await _maybe(_chat_llm(app))
         if tok is not None:
             toks.append((external_llm.ctx_override, tok))
