@@ -175,7 +175,9 @@ def test_도구_안내가_설정_이름과_지금_적힌_키를_알려_준다():
     """반대석을 등록하고도 지식이 안 실리면 호출자가 볼 곳은 도구 안내뿐이다 — 서버 설정이라고 감추지 않는다."""
     code = ("import asyncio, mcp_server as m\n"
             "t = next(t for t in asyncio.run(m.mcp.list_tools()) if t.name == 'deliberate_start')\n"
-            "at = t.description.index('DELIB_KNOWLEDGE_SYNTHETIC_SEATS')\n"
-            "print(t.description[at:at + 120].replace(chr(10), ' '))\n")
+            # 시작 도구의 손잡이 안내는 advanced 칸 설명(persona_knowledge)에 있다(HWAXPortal docs/mcp-modernize M2)
+            "text = t.inputSchema['properties']['advanced']['properties']['persona_knowledge']['description']\n"
+            "at = text.index('DELIB_KNOWLEDGE_SYNTHETIC_SEATS')\n"
+            "print(text[at:at + 120].replace(chr(10), ' '))\n")
     assert "지금 적힌 키: 없음" in _loaded(None, code)
     assert f"지금 적힌 키: {DEFENDER}, delib-redteam)" in _loaded(f"delib-redteam,{DEFENDER}", code)

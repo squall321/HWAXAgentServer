@@ -510,9 +510,10 @@ def test_메뉴와_도구_설명에서_찾을_수_있다():
     menu = asyncio.run(m.deliberate_jobs())
     row = next(j for j in menu["jobs"] if j["job"] == SEALED)
     assert row["label"] == "리스크 심사(봉인)" and "소급" in row["when"]
+    from test_mcp_start_desc import _listed
     tools = {t.name: t.description for t in asyncio.run(m.mcp.list_tools())}
     assert SEALED in m._INSTRUCTIONS and SEALED in (m.deliberate_start.__doc__ or "")
-    for text in (tools["deliberate_start"], menu["options"]["advanced"]):
+    for text in (_listed("deliberate_start"), menu["options"]["advanced"]):     # 시작 도구는 손잡이 칸 설명(advanced.sealed)에 있다
         assert "sealed" in text and SEALED in text, text[-400:]
         for _closed_value, label in d._SEALED_CLOSE.values():
             assert label in text, f"닫는 경로 '{label}' 이 안내에 없다 — 엔진 표에서 읽어 적는다"

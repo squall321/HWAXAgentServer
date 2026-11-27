@@ -24,6 +24,7 @@ from urllib.parse import unquote
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 import delib_batch
@@ -40,6 +41,24 @@ import mcp_pages
 import offload
 
 log = logging.getLogger("agent.mcp")
+
+
+# 읽기 · 쓰기 표지(HWAXPortal docs/mcp-modernize contract C6) — 도구마다 본체가 실제로 쓰는 것을 코드로 보고 정했다(tests/test_mcp_contract.py 가
+# 고정한다). 읽기는 잡 원장 · 줄 · 묶음 원장을 바꾸지 않는다(목록 색인 캐시 · 사람별 LLM 사용량 셈은 쓴 기록이 아니다). 이름과 달리 쓰기인 것 둘 —
+# 묶음 진행(deliberate_batch_status)은 주인이 부르면 그때의 그룹을 묶음 원장에 고쳐 적고(delib_batch.touch), 과제 프롬프트 읽기(review_task_read)는
+# 일꾼이 살아 있다는 표지와 기한 지난 과제 되돌리기를 줄에 적는다. 바깥(openWorldHint)은 LLM · 게이트웨이 너머 도구 · Report Archive 를 부르거나 그 일을
+# 띄우는 도구다. destructiveHint 는 되돌릴 수 없게 끝내는 것(접기 · 멈춤)이고, idempotentHint 가 거짓인 것은 부를 때마다 새 잡 · 새 집기 · 새 조각이다.
+def _ann(*, read: bool, destructive: bool = False, idempotent: bool = True, world: bool = False) -> ToolAnnotations:
+    return ToolAnnotations(readOnlyHint=read, destructiveHint=destructive, idempotentHint=idempotent, openWorldHint=world)
+
+
+_READ = _ann(read=True)
+_READ_WORLD = _ann(read=True, world=True)
+_OPEN_JOB = _ann(read=False, idempotent=False, world=True)     # 부를 때마다 새 잡(심의 · 이어하기 · 묶음 · 위임)
+_FOLD = _ann(read=False, destructive=True)                      # 접기 · 멈춤 — 되돌릴 수 없고, 이미 끝났으면 그대로 답한다
+# 쪽 번호의 바닥 — mcp_pages.paged 는 음수를 거절하고 0 은 1 로 읽는다(그래서 바닥이 0 이다). 스키마에만 싣는다(거절 글은 종전 그대로 — FastMCP 의
+# 칸 검증 글로 바꾸지 않는다).
+_X_PART = {"minimum": 0}
 
 _JOB_LINES = "\n".join(
     f"  · {k} ({v['group']}·{v['label']}) — {v['what']}" for k, v in delib_jobs.JOBS.items())
@@ -366,6 +385,19 @@ _STATE_DESC = (
             "queued 는 나오지 않는다.")
 )
 
+# 상태 안내의 짧은 꼴 — 시작 · 진행 조회의 도구 설명이 싣는다(설명은 1,500자 안 — HWAXPortal docs/mcp-modernize contract C1, 웹 챗이 2,400자
+# 뒤를 잘라 꼬리의 규칙이 사라졌다). 다음 걸음을 정하는 낱말(줄 · 순번 · 조용함의 셈 · 마무리 중 · 끊김)은 빼지 않는다 — 전문은 _STATE_DESC 다.
+_STATE_BRIEF = (
+    "status 는 queued → running → done 이다 — queued 는 동시 실행 상한이 차서 줄을 선 것이고(순번 queue.position · 앞에 선 수 queue.ahead, "
+    "줄 길이 DELIB_JOB_QUEUE_MAX — 지금 값은 deliberate_jobs 의 queue) 자리가 나면 스스로 시작하니 다시 시작하지 마라. "
+    "running 은 단계 · 라운드 · 좌석이 보이고 좌석이 많은 대형 패널은 수 시간 걸린다 — idle_s(마지막 이벤트 last_step 뒤 경과)가 "
+    "quiet_ok_s(좌석 발언 하나가 조용할 수 있는 최장 — 호출 한도 DELIB_TIMEOUT_S × 시도 × (1 + 파싱 재시도)) 안이면 기다리는 중이고, 넘었다고 "
+    "멈춘 것은 아니다(도는 잡은 스스로 끝난다 — 그만두려면 deliberate_cancel). finishing 이 true 면 의장이 결정문을 이미 냈다 — "
+    "deliberate_cancel 은 거절되고 잡은 결정문 · 보고서까지 끝난다. done 이면 deliberate_result, error · cancelled · interrupted 는 결정문 "
+    "없이 끝난 것이고(까닭은 error) interrupted(서버 재기동)는 deliberate_continue(previous_job_id) 한 번으로 남은 라운드만 잇는다. 상태 "
+    "전문은 deliberate_jobs 의 states 다."
+)
+
 # 좌석 인자 안내 — 항목 모양은 Args 독스트링에만 있었고 그 글은 클라이언트에 가지 않는다(위 _EVID_DESC 의
 # 주석과 같은 까닭). 스키마에는 array<object> 뿐이라, 추천 도구가 돌려준 줄을 그대로 넘긴 호출자는 좌석 키가
 # `key` 라는 것을 알 길이 없었다. 상한 숫자는 적지 않는다 — 부를 때 재는 limits 를 가리킨다.
@@ -395,23 +427,16 @@ _PAGE_DESC = (
 _Q_ECHO_WHERE = "deliberate_status(job_id) 의 question(길면 쪽으로 나눠 준다)"
 
 _START_DESC = (
-    "HWAX 전문가 심의를 시작한다. 사용자가 '심의해줘'·'원인 규명'·'불량 원인'·'안 선택'·"
-    "'트레이드오프'·'신뢰 판정'·'리스크 심사'·'위험 도출'·'해석 설계'·'시뮬레이션 심의'·"
-    "'시험 계획'·'시험 설계'·'구축 계획'·'메커니즘 규명' 을 요청하면 이 도구를 쓴다. "
-    "포털 웹 심의와 같은 엔진이다. 여러 전문가 좌석이 라운드를 돌며 도구 근거 위에서 수렴해 "
-    "결정 문서를 만든다. **즉시 job_id 를 돌려주고 심의는 뒤에서 계속 돈다**(동시 실행 상한이 차 "
-    "있으면 줄을 섰다가 돈다 — 아래 status) — "
-    "결과는 deliberate_status / deliberate_result 로 받는다. 응답을 붙잡고 기다리지 마라. "
-    "어떤 job 을 골라야 할지 모르면 deliberate_jobs 를 먼저 부른다. "
-    f"응답의 question 은 받은 화두를 되돌려 보인 것이다 — 응답이 {mcp_pages.PAGE_CHARS:,}자(Claude Code 의 MCP 결과 상한)를 "
-    "넘으면 머리만 싣고 question_chars(전체 길이)와 note 로 전문 받는 곳을 말한다(받은 화두는 전부 쓰인다).\n\n"
-    "**과제 심의면 subject 에 과제 · 차수를 싣는다** — 사용자에게 과제(SP 허브 과제 key)와 차수를 묻고, 과제 대상이 아닌 질문이면 비운다"
-    "(자세한 것은 subject 인자 설명).\n\n"
-    "**기본값 묶음** — preset 에 이름을 주면(목록은 deliberate_jobs 의 presets — 예 risk-review-batch) 그 묶음의 값을 깔고 직접 준 인자가 "
-    "이긴다. 단 도구 기본값과 같은 값(job='default' · rounds=0 · save_report=true · modifiers 비움)은 준 것으로 보지 않는다 — 묶음 값을 끄려면 "
-    "기본값이 아닌 값으로 준다(층을 끄려면 modifiers=[]). advanced 의 rounds · modifiers · save_report 는 위 인자와 묶음을 다 이긴다. 응답의 "
-    "preset.applied 가 칸마다 최종 값과 출처다.\n\n"
-    "돌아오는 " + _STATE_DESC + "\n\n" + _SEAT_DESC + "\n\n" + _EVID_DESC + "\n\n" + _ADV_DESC
+    "HWAX 전문가 심의를 시작한다 — 여러 전문가 좌석이 라운드를 돌며 도구 근거 위에서 수렴해 결정 문서를 만든다(포털 웹 심의와 같은 엔진). "
+    "'심의해줘' · '원인 규명' · '불량 원인' · '안 선택' · '트레이드오프' · '신뢰 판정' · '리스크 심사' · '위험 도출' · '해석 설계' · "
+    "'시뮬레이션 심의' · '시험 계획' · '시험 설계' · '구축 계획' · '메커니즘 규명' 요청에 쓴다. job · 상한(limits) · 기본값 묶음(presets)을 모르면 "
+    "deliberate_jobs 를 먼저 부른다. 곧바로 {job_id, status, question, note} 를 돌려주고 심의는 뒤에서 돈다 — 붙잡고 기다리지 말고 "
+    "사용자에게 job_id 를 알린 뒤 "
+    "deliberate_status(job_id, wait_s) 를 한 번, 끝나면 deliberate_result(job_id, view='summary'). " + _STATE_BRIEF + " "
+    "사람 의견으로 잇기는 deliberate_continue, 여러 건은 deliberate_batch_start, 근거 참조 미리 보기는 deliberate_resolve_evidence. "
+    "과제 심의면 subject 에 과제 · 차수를 싣는다(사용자에게 묻고, 과제 대상이 아니면 비운다). preset 에 묶음 이름(예 risk-review-batch)을 "
+    "주면 그 값을 깔고 직접 준 인자가 이긴다 — 단 도구 기본값과 같은 값은 준 것으로 보지 않는다. 인자 꼴 · 상한은 "
+    "인자 설명에, 규칙 전문은 deliberate_jobs 의 options 에 있다."
 )
 
 
@@ -484,12 +509,33 @@ _A_JOB = ("심의 종류 — " + " · ".join(delib_jobs.JOBS) + ". 기본은 def
 _A_ROUNDS = "라운드 수 — 0 이면 기본 3, 2~8 로 클램프된다."
 _A_MODIFIERS = ("얹을 층(최대 5개) — voi(교착 정산) · premortem(사전부검) · toulmin(논증 엄밀) · eliminative(완결 기준) · "
                 "anon1r(익명 1R). 언제 쓰나는 deliberate_jobs 의 modifiers.")
-_A_EVIDENCE = (f"원천 근거 [{{source, tool, args, result, key}}](최대 {_engine._EVID_ITEMS}건) — 이미 도구로 뽑아 둔 결과를 좌석에 "
-               "'검증 대상' 으로 깐다. 본문은 result 에 넣는다. 항목을 {ref: {kind, id}} 참조로 주면 서버가 시작 전에 부른 사람의 신원으로 "
-               "풀어 그 자리에 펼친다(도구 설명의 evidence 절). 항목 · 합계 글자 상한은 도구 설명의 evidence 절과 deliberate_jobs 의 "
-               "limits 다.")
-_A_PERSONAS = ("좌석 지정 [{key, role}] — key 는 전문가 키(recommend_agents 의 agent_type), role 은 비워도 된다. 비우면 서버가 "
-               "발굴한다. 상한과 다단 심의에서 앉는 자리는 도구 설명의 personas 절이다.")
+_A_EVIDENCE = (
+    f"원천 근거 [{{source, tool, args, result, key}}](최대 {_engine._EVID_ITEMS}건) — 이미 도구로 뽑아 둔 결과를 좌석에 '검증 대상' 으로 깐다"
+    f"(결론이 아니라 원천만). 본문은 `result` 에 넣는다({'·'.join(_engine._EVID_BODY_KEYS[1:])} 도 차례로 찾지만 정본은 result). "
+    f"**미리 자르지 마라** — 항목당 천장 {_engine._EVID_ITEM_MAX:,}자를 넘으면 엔진이 덜어내고 무엇을 뺐는지 본문에 밝힌다. 먼저 걸리는 것은 "
+    f"**합계 예산**(모델 창에서 유도 — 천장 {_engine._EVID_BUDGET:,}자, 지금 값은 deliberate_jobs 의 limits)이고 넘치면 뒤 항목이 통째로 빠지니 "
+    "중요한 것을 앞에 둔다. 호출자 표식은 `source`(결정문의 [e:N] 옆에 찍힌다), 제 번호는 `key`"
+    f"(영문 · 숫자 · `_.-`, {_engine._EVID_KEY_MAX}자 — 표지가 [e:N|KEY]). 빠지거나 줄인 항목은 deliberate_status 의 evidence_omitted 에 뜬다. "
+    f"참조 — 항목을 {{ref: {{kind, id}}}} 하나로 주면(한 번에 {delib_refs.REFS_MAX}건) 서버가 시작 전에 부른 사람의 신원으로 풀어 그 자리에 "
+    f"펼친다 — kind {' · '.join(delib_refs.KINDS)}(아직 열지 않은 kind {' · '.join(delib_refs.NOT_OPENED)} 와 꼴이 틀린 참조는 시작 전에 거절, 못 "
+    "푼 참조는 evidence_omitted 의 'ref:<kind>:<id> — 까닭'), 크기 · 지문만 미리 보려면 deliberate_resolve_evidence. 앞선 과제 인사이트 — "
+    "과제 심의면 insight_find(sp_task, round)로 찾은 같은 (과제, 차수)의 확인 · 반박 카드를 카드마다 {source: '앞선 인사이트 — 검증 대상, "
+    "독립 근거 아님', tool: 'insight_get', args: '{\"id\": \"<카드 id>\"}', result: 주장 · 출처 · 상태 · 판} 로 넘길 수 있다 — 범위가 내 소속(aff:) · "
+    "조직(org)인 카드만이고 plat: 가 붙은 카드 · 내 초안은 넘기지 않는다. 리스크 심사에는 엔진이 그 항목을 뺀다. 전문은 deliberate_jobs 의 "
+    "options.evidence 다.")
+_X_EVIDENCE_ITEM = {"type": "object", "additionalProperties": True, "properties": {
+    "source": {"type": "string", "description": "호출자 표식 — 결정문의 [e:N] 옆에 그대로 찍힌다(예 E1-CH-015)."},
+    "tool": {"type": "string", "description": "이 근거를 뽑은 도구 이름."},
+    "args": {"description": "그 도구에 준 인자(글 또는 객체)."},
+    "result": {"type": "string", "description": "본문 — 미리 자르지 않는다(항목 · 합계 상한은 evidence 인자 설명)."},
+    "key": {"type": "string", "description": "제 번호(영문 · 숫자 · _.-) — 표지가 [e:N|KEY] 로 찍혀 제 원장과 맞춰 본다."},
+    "ref": {"description": f"참조 {{kind, id}} — 본문 없이 이것만 주면 시작 전에 풀어 펼친다(kind {' · '.join(delib_refs.KINDS)})."}}}
+_X_EVIDENCE = {"items": _X_EVIDENCE_ITEM}
+_A_PERSONAS = _SEAT_DESC
+_X_PERSONAS = {"items": {"type": "object", "additionalProperties": True, "properties": {
+    "key": {"type": "string", "description": "전문가 키 — recommend_agents 의 agent_type 값."},
+    "agent_type": {"type": "string", "description": "key 대신 받는 이름(추천 도구의 줄을 그대로 넘길 때)."},
+    "role": {"type": "string", "description": "역할(비우면 서버가 원본 역할을 채운다)."}}}}
 _A_TOOLS = (f"심의 전에 실제로 불러 정량 근거로 깔 도구 이름(최대 {_engine._TOOLS_MAX}개 — 넘친 것은 빼고 evidence_omitted 로 "
             "알린다).")
 _A_APPS = f"좌석 자유 조회를 이 앱들로 좁힌다(앱 키, 최대 {_engine._APPS_MAX}개)."
@@ -506,11 +552,69 @@ _A_WIKI = ("참이면 결정문을 MX 백서 LLM 위키에도 원천으로 남�
            "범위는 시작한 사람의 소속(aff:<소속>)이다 — 소속이 정해지지 않았으면 후보로 보내 주인만 보고, MX 백서 '내 후보' 에서 범위를 "
            "골라 승인해야 들어간다. 다단 심의(sim-plan · build-plan)는 단마다 결정문 하나씩이다. 이어하기는 이 값을 이어받는다. "
            "결과는 결정문 끝의 안내 한 줄이다(원천 번호 또는 남기지 못한 까닭).")
-_A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 이름과 뜻(timeout_s 는 LLM 호출 1회 한도 초 · 엔진의 최소~최대 범위로 죈다)은 도구 "
-               "설명의 advanced 절이다.")
+_A_ADVANCED = ("품질 손잡이 객체 — 보통 비운다. 칸마다 뜻은 칸 설명(properties)에 있다(전문은 deliberate_jobs 의 options.advanced). 모르는 칸은 "
+               "읽지 않고, 못 읽는 값은 서버 기본값으로 돌며 deliberate_status 의 evidence_omitted 에 알린다. rounds · modifiers · save_report 를 "
+               "여기 주면 위 인자와 preset 을 다 이긴다.")
+
+
+def _adv_props() -> dict:
+    """advanced 의 칸(contract C5) — 엔진 _resolve_opts 가 읽는 이름과 상수에서 읽은 범위 · 허용값. 형과 enum 은 싣지 않는다 — 엔진은 1|0 · on|off ·
+    글자 수를 모두 받고 모르는 값은 기본값으로 돌며 알린다(지금 받는 값을 클라이언트가 막지 않게)."""
+    onoff = "1|0(on|off · true|false 도 받는다)"
+    props = {
+        "free_tools": f"좌석 자유 조회 {onoff} — 라운드 발언 전에 좌석이 읽기 도구를 직접 부른다(0 이면 시작 때 근거로만 — evidence_only).",
+        "tool_budget": "좌석 하나가 한 라운드에 부를 자유 조회 수(정수).",
+        "chair_bestof": "의장 결정문 후보 수(정수, 1 = 끔) — 여럿이면 심판이 하나를 고른다.",
+        "chair_cite": f"의장 결정문에 [라운드 · 좌석] 출처를 다는 인용 계약 {onoff}.",
+        "rebut_quote": f"반박 인용 계약 {onoff}(기본 켜짐) — 반박이 인용한 글이 실재하는지 코드가 본다.",
+        "cross_exam": f"교차 심문 {onoff}(기본 켜짐) — 좌석이 반박 표적의 원문만 받는다(끄면 회의록 전체가 실린다).",
+        "anchor": f"3라운드 입장 앵커 다시 싣기 {onoff} — 동조 붕괴를 막는다.",
+        "evidence_prepass": f"정량 근거 선주입 {onoff} — 시작 전에 도구를 불러 발췌를 깐다.",
+        "prose_first": f"산문 논증 뒤 JSON {onoff} — 형식 강제를 늦춘다.",
+        "undecided": f"판정 불가 허용 {onoff}(기본 꺼짐) — 앉은 좌석의 과반이 판정 불가면 결정문 결론부가 측정 계획이 된다.",
+        "reasoning_effort": f"LLM 생각 깊이 — {'|'.join(_engine._EFFORTS)}(비우면 서버 기본값, 다른 값은 기본값으로 돌고 evidence_omitted 에 알린다).",
+        "parse_retries": "좌석 발언 JSON 을 못 읽을 때 다시 부르는 횟수(정수) — quiet_ok_s 셈에 든다.",
+        "timeout_s": (f"**LLM 호출 1회**의 한도(초) — 심의 전체 시간이 아니다(심의에는 전체 시간 한도가 없다). 좌석 발언 · 자유 조회 스텝 · 의장 · 요약 "
+                      "호출 하나하나에 걸린다. 비우면 서버 기본값(DELIB_TIMEOUT_S — 지금 값은 deliberate_jobs 의 limits.timeout_s_default)이고, "
+                      f"{_engine._TIMEOUT_REQ_MIN_S:.0f}~{_engine.DELIB_TIMEOUT_MAX_S:.0f}초로 받는다(상한은 서버 설정 DELIB_TIMEOUT_MAX_S) — 밖이면 "
+                      "그 끝값으로 돌고 evidence_omitted 에 뜬다. 좌석이 '시간 초과' 로 빠지면 올린다."),
+        "voc": ("불량 환기 auto|off|always — auto 는 화두에 불량 낱말이 있으면 최근 VOC 를 조회해 좌석에 깐다. 리스크 심사 화두에는 '이슈' · '품질' 이 "
+                "거의 항상 들어 있어 사실상 매번 돈다. 그 시점 자료만으로 다시 심사하는 소급 검증에서는 off 로 끈다."),
+        "persona_knowledge": (f"좌석 지식카드 조회 {onoff} — 1 이면 좌석마다 제 지식카드에서 화두 관련 발췌를 깐다. 카드는 지금 시점의 것이라 소급 검증에서는 "
+                              "0 으로 끈다. 지정 반대석 같은 합성 좌석(delib-*)은 전문가 레지스트리에 없어 묻지 않는다 — 등록해 두었으면 서버 설정 "
+                              "DELIB_KNOWLEDGE_SYNTHETIC_SEATS 에 그 키를 적어야 조회한다(지금 적힌 키: "
+                              f"{', '.join(sorted(_engine._KN_SYNTH)) or '없음'})."),
+        "knowledge_query": (f"좌석 지식카드 검색어 — 문자열 하나 또는 {{좌석 키: 검색어, \"*\": 기본}}. 안 주면 화두로 찾는다. 값마다 "
+                            f"{_engine._KNOWLEDGE_Q_MAX}자까지이고 넘으면 앞부분만 쓰고 evidence_omitted 로 알린다."),
+        "as_of": ("기준일 'YYYY-MM-DD' — 주면 이 잡의 좌석 지식카드 검색(agent_search — 엔진의 사전 검색 · 지정 도구 · 좌석 자유 조회)이 그 날까지의 카드만 "
+                  f"찾는다. 날짜 없는 카드는 남기고 '{_engine._AS_OF_UNDATED}' 으로 표시한다. 지식 허브가 거름을 확인해 주지 않으면(옛 판) 그 조회의 카드를 "
+                  "버리고 알린다. 날짜와 셈이 결정문 머리에 남는다. 틀린 꼴은 잡을 만들기 전에 거절한다. 질문에 든 날짜를 대신 쓰지 않는다 — 기준일은 이 "
+                  f"값으로만 준다. {_engine._AS_OF_OPEN}"),
+        "chair_template": (f"의장 산출 틀 — {'·'.join(_engine._CHAIR_ITEMS)}. job 이 'default' 가 아니면 job 이 정한 틀이 이긴다 — job='default' 에서 "
+                           "틀만 바꿀 때 쓴다."),
+        "sealed": ("봉인 1 — 소급 검증용. 엔진이 심의 도중 바깥에서 자료를 가져오는 길을 한꺼번에 닫는다 — "
+                   f"{' · '.join(label for _closed, label in _engine._SEALED_CLOSE.values())}. 같이 보낸 손잡이로 다시 열 수 없고, 열려다 닫힌 것은 "
+                   "deliberate_status 의 evidence_omitted 에 뜬다. 봉인 사실과 닫은 경로가 잡 기록과 결정문 머리에 남는다. 닫지 않는 것: "
+                   f"{_engine._SEALED_OPEN}. job='risk-review-sealed' 가 이것을 켠 리스크 심사다. 단발 심의에만 선다 — sim-plan · test-plan · "
+                   "build-plan 은 거절한다."),
+        "rounds": "라운드 수 — rounds 인자와 preset 을 이긴다.",
+        "modifiers": "얹을 층 목록 — modifiers 인자와 preset 을 이긴다.",
+        "save_report": f"Report Archive 저장 {onoff} — save_report 인자와 preset 을 이긴다.",
+    }
+    if external_llm.is_open():
+        props["llm"] = ("판단 LLM external — 좌석 · 의장의 LLM 호출을 잡 주인의 Claude Code 워크플로가 review_task_next · review_task_read · "
+                        "review_task_submit 로 받아 답한다(좌석 자유 조회는 CALL 줄 글 왕복 — 엔진이 실행한다). 근거 · 카드 글이 외부(Claude)로 나가므로 "
+                        "consent_external 이 든다. 이어하기는 llm 을 이어받지 않는다.")
+        props["consent_external"] = ("llm=external 의 반출 동의 — 사람에게 반출을 알리고 동의를 받은 뒤에만 true 다. 없으면 잡을 만들기 전에 "
+                                     "external_consent_required 로 거절한다(서버가 보는 것은 이 표지뿐이다).")
+    return {"properties": {k: {"description": v} for k, v in props.items()}}
+
+
+_X_ADVANCED = _adv_props()
 _A_JOB_ID = "심의 잡 id(deliberate_start 응답 · deliberate_list 에서 찾는다)."
 _A_PRESET = ("기본값 묶음 이름(선택 — 목록과 값은 deliberate_jobs 의 presets). 묶음의 job · rounds · modifiers · save_report · advanced 를 깔고, "
-             "여기서 직접 준 인자가 이긴다(도구 기본값과 같은 값 — job='default' · rounds=0 — 은 준 것으로 보지 않는다. advanced 는 손잡이마다). "
+             "여기서 직접 준 인자가 이긴다(도구 기본값과 같은 값 — job='default' · rounds=0 · save_report=true · modifiers 비움 — 은 준 것으로 보지 "
+             "않는다. 묶음 값을 끄려면 기본값이 아닌 값으로 준다 — 층을 끄려면 modifiers=[]. advanced 는 손잡이마다). "
              "응답의 preset.applied 가 칸마다 최종 값과 출처(preset · caller)다.")
 _A_PART = "응답이 쪽으로 나뉘었을 때 받을 쪽(1부터 — page.next 가 다음 쪽을 알려 준다)."
 
@@ -591,6 +695,17 @@ _A_SUBJECT = (
     "(CAD content_fp · 보드 revision · 개발 단계). 모르는 칸은 거절한다(확인 상태 · 지문은 서버가 적는다). 리스크 심사(risk-review 계열)는 "
     "받지 않는다 — 리스크 심사의 주제는 리스크 앱 과제다. 주제는 잡 기록(subject)에만 남고 결정문 · Report Archive 보고서에는 싣지 않는다. 같은 "
     "과제의 앞선 심의는 deliberate_list(subject={sp_task, round})로 찾는다.")
+_X_SUBJECT = {"properties": {
+    "sp_task": {"type": "string", "description": "SP 허브 과제 key(운영 허브는 과제명) — 서버가 풀이로 다시 찾아 확인한다."},
+    "round": {"type": "string", "description": f"차수 — {' · '.join(delib_subject.STAGES)} 가운데 하나(전각 · 공백 · 대소문자만 맞춘다)."},
+    "text": {"type": "string", "description": f"사람이 적은 과제 이름 · 코드 · 차수 글({delib_subject.TEXT_MAX}자)."},
+    "artifacts": {"type": "array", "description": f"설계 자료(최대 {delib_subject.ARTIFACTS_MAX}건).", "items": {"type": "object", "properties": {
+        "kind": {"type": "string", "description": "mcad(StepForge project_id) · ecad(ODB 허브 job_id) · cae(DynaForge 리포트 id)."},
+        "app": {"type": "string", "description": "그 자료의 앱 키."},
+        "id": {"type": "string", "description": "자료 열쇠."},
+        "rev": {"type": "string", "description": "그 판 표지(CAD content_fp · 보드 revision · 개발 단계)."}}}}}}
+_X_LIST_SUBJECT = {"properties": {"sp_task": _X_SUBJECT["properties"]["sp_task"],
+                                  "round": {"type": "string", "description": f"차수 — 빼면 모든 차수, '{delib_subject.ROUND_UNKNOWN}' 이면 차수 모름 칸만."}}}
 _A_CONT_SUBJECT = ("이 회차에 달 과제 주제 — 앞 잡에 주제가 없을 때만 받는다(꼴 · 확인은 deliberate_start 의 subject 와 같다). 앞 잡에 주제가 "
                    "있으면 이어하기가 그대로 물려받고, 다른 주제를 주면 거절한다(다른 과제는 새 심의다). 리스크 심사로 잇는 회차는 주제를 물려받지 "
                    "않는다.")
@@ -601,14 +716,14 @@ _A_LIST_SUBJECT = ("주제로 거르기(선택) — {sp_task, round?}. 신원(�
 
 
 @mcp.tool(title="심의 시작 (원인규명·안선택·신뢰판정·해석설계·시험설계·구축계획·자유)",
-          description=_START_DESC)
+          description=_START_DESC, annotations=_OPEN_JOB)
 async def deliberate_start(
     question: Annotated[str, Field(description=_A_QUESTION)],
     job: Annotated[str, Field(description=_A_JOB)] = "default",
     rounds: Annotated[int, Field(description=_A_ROUNDS)] = 0,
     modifiers: Annotated[list[str] | None, Field(description=_A_MODIFIERS)] = None,
-    evidence: Annotated[list[dict] | None, Field(description=_A_EVIDENCE)] = None,
-    personas: Annotated[list[dict] | None, Field(description=_A_PERSONAS)] = None,
+    evidence: Annotated[list[dict] | None, Field(description=_A_EVIDENCE, json_schema_extra=_X_EVIDENCE)] = None,
+    personas: Annotated[list[dict] | None, Field(description=_A_PERSONAS, json_schema_extra=_X_PERSONAS)] = None,
     tools: Annotated[list[str] | None, Field(description=_A_TOOLS)] = None,
     apps: Annotated[list[str] | None, Field(description=_A_APPS)] = None,
     human_note: Annotated[str, Field(description=_A_HUMAN_NOTE)] = "",
@@ -617,8 +732,8 @@ async def deliberate_start(
     stop_after_round: Annotated[int, Field(description=_A_STOP)] = 0,
     save_report: Annotated[bool, Field(description=_A_SAVE)] = True,
     wiki: Annotated[bool, Field(description=_A_WIKI)] = False,
-    advanced: Annotated[dict | None, Field(description=_A_ADVANCED)] = None,
-    subject: Annotated[dict | None, Field(description=_A_SUBJECT)] = None,
+    advanced: Annotated[dict | None, Field(description=_A_ADVANCED, json_schema_extra=_X_ADVANCED)] = None,
+    subject: Annotated[dict | None, Field(description=_A_SUBJECT, json_schema_extra=_X_SUBJECT)] = None,
     preset: Annotated[str | None, Field(description=_A_PRESET)] = None,
     ctx: Context | None = None,
 ) -> dict:
@@ -1034,6 +1149,7 @@ _A_CONT_ADVANCED = ("이번 회차의 품질 손잡이(deliberate_start 의 adva
                  "evidence 로 다시 싣는다(deliberate_start 의 evidence 와 같은 모양·상한). 단 이전 회차가 참조({ref: {kind, id}})로 실은 "
                  "근거는 evidence 를 비우면 그 참조를 다시 풀어 싣는다(응답 evidence_refs — previous.same 이 지문이 같은지). 응답의 question 이 길어 "
                  "Claude Code 의 MCP 결과 상한을 넘으면 deliberate_start 처럼 머리만 싣는다(question_chars·note)."),
+    annotations=_OPEN_JOB,
 )
 async def deliberate_continue(
     previous_job_id: Annotated[str, Field(description=_A_PREV_JOB)],
@@ -1045,9 +1161,9 @@ async def deliberate_continue(
     keep_seats: Annotated[bool, Field(description=_A_KEEP_SEATS)] = True,
     append_report: Annotated[bool, Field(description=_A_APPEND)] = True,
     modifiers: Annotated[list[str] | None, Field(description=_A_CONT_MODIFIERS)] = None,
-    advanced: Annotated[dict | None, Field(description=_A_CONT_ADVANCED)] = None,
-    evidence: Annotated[list[dict] | None, Field(description=_A_CONT_EVIDENCE)] = None,
-    subject: Annotated[dict | None, Field(description=_A_CONT_SUBJECT)] = None,
+    advanced: Annotated[dict | None, Field(description=_A_CONT_ADVANCED, json_schema_extra=_X_ADVANCED)] = None,
+    evidence: Annotated[list[dict] | None, Field(description=_A_CONT_EVIDENCE, json_schema_extra=_X_EVIDENCE)] = None,
+    subject: Annotated[dict | None, Field(description=_A_CONT_SUBJECT, json_schema_extra=_X_SUBJECT)] = None,
     ctx: Context | None = None,
 ) -> dict:
     """이전 심의를 이어 돌린다.
@@ -1279,13 +1395,15 @@ def _brief_status(out: dict, job: dict) -> dict:
 
 
 @mcp.tool(title="심의 진행 상황",
-          description="HWAX 심의가 어디까지 갔는지 본다 — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지. "
+          description="HWAX 심의가 어디까지 갔는지 본다(읽기 전용) — 줄을 섰는지, 몇 번째인지, 어느 단계·라운드인지, 좌석에 못 간 근거"
+                      "(evidence_omitted) · 경고(warnings · warnings_total)와 idle_s · quiet_ok_s. "
                       f"**고리로 거듭 묻지 마라** — wait_s 로 한 번 부르면 바뀌거나 끝날 때까지(최대 {STATUS_WAIT_MAX_S:g}초) 서버가 기다렸다 "
-                      "답한다. 화두 전문 · 목록 칸이 필요 없으면 brief=true. "
-                      + _STATE_DESC + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
-                      "칸이 다 실린다.")
+                      "답한다(깬 까닭 wait.woke). 화두 전문 · 목록 칸이 필요 없으면 brief=true. "
+                      + _STATE_BRIEF + " " + _PAGE_DESC + " 쪽을 나누면 화두(question)는 맨 뒤 쪽으로 가고 첫 쪽에 상태 "
+                      "칸이 다 실린다.",
+          annotations=_READ)
 async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                             wait_s: Annotated[float, Field(description=_A_WAIT)] = 0,
                             brief: Annotated[bool, Field(description=_A_BRIEF)] = False,
                             ctx: Context | None = None) -> dict:
@@ -1353,9 +1471,10 @@ def _result_summary(job_id: str, job: dict, full: dict) -> dict:
                       "(화두 되풀이 · 상태줄 · 좌석 상세 · 손잡이가 없다). full 은 그 밖이 필요할 때만. 아직 진행 중(running)이면 현재 단계만, "
                       "줄을 선 채(queued)면 순번만 돌려준다. 리스크 심사 결정을 원장 칸에 옮길 때는 view=\"decision_json\"(risk_spec · 표결 · "
                       "인용 · 만장일치 문장 대조). " + _PAGE_DESC + " 결정문(decision)을 원장·보고서에 옮길 "
-                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.")
+                      "때는 마지막 쪽까지 이어 붙인 글을 쓴다.",
+          annotations=_READ)
 async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
-                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                             view: Annotated[Literal["full", "summary", "decision_json"], Field(description=_A_VIEW)] = "full",
                             ctx: Context | None = None) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
@@ -1381,10 +1500,11 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                       "심의와 **같은 소속**의 심의가 실린다(행의 mine 이 내 것인지, owner 가 시작한 사람이다 — 주인이 안 적힌 "
                       "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. "
                       "subject={sp_task, round?} 를 주면 그 과제(· 차수)로 확인된 주제를 단 심의만 싣는다 — '이 과제 · 이 차수로 누가 이미 "
-                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). " + _PAGE_DESC)
+                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). limit 보다 더 있으면 truncated 가 참이다. " + _PAGE_DESC,
+          annotations=_READ)
 async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
-                          part: Annotated[int, Field(description=_A_PART)] = 1,
-                          subject: Annotated[dict | None, Field(description=_A_LIST_SUBJECT)] = None,
+                          part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
+                          subject: Annotated[dict | None, Field(description=_A_LIST_SUBJECT, json_schema_extra=_X_LIST_SUBJECT)] = None,
                           ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
@@ -1395,7 +1515,8 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     lim = max(1, min(100, int(limit or 20)))
     if subject is not None:
         return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin)
-    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin)
+    info: dict = {}
+    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin, info=info)
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
     caps = delib_jobs.limits()       # 판정 때와 같은 값(박스 덮개가 env 위에 덮인다 — HWAXPortal docs/delib-ops R4)
     out = {"jobs": rows, "running": delib_jobs.running_count(),
@@ -1403,6 +1524,10 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
            "running_max": caps["max_running"],
            "running_max_per_user": caps["max_running_per_user"],
            "queue_max": caps["queue_max"]}
+    if info.get("more"):
+        # 볼 수 있는 잡이 limit 보다 더 있다 — 조용히 끊지 않는다(HWAXPortal docs/mcp-modernize contract C8). 칸은 그때만 싣는다(종전 답 그대로).
+        out["truncated"] = True
+        out["truncated_note"] = f"최신 {lim}건만 실었다 — 더 보려면 limit 을 올린다(최대 100). 그보다 옛 심의는 최근 원장 창 밖이다."
     # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
     return mcp_pages.paged(out, part=part, again={"limit": lim},
                            ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
@@ -1438,7 +1563,8 @@ def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: b
                       "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다. 접을 수 있는 것은 내가 "
                       "시작한 심의뿐이다. 의장이 결정문을 낸 뒤의 마무리(요약 · 쉬운 설명 · 보고서 저장) 중에는 접지 않고 "
                       "오류(finishing)로 답한다 — 다 만든 결정문을 버리지 않는다. 다단 심의는 그 단의 결정문 뒤 다음 단에서 "
-                      "다시 접을 수 있다.")
+                      "다시 접을 수 있다. 접은 심의는 되돌릴 수 없고(새로 시작한다), 이미 끝난 잡이면 그 상태를 그대로 답한다.",
+          annotations=_FOLD)
 async def deliberate_cancel(job_id: Annotated[str, Field(description=_A_CANCEL_JOB_ID)], ctx: Context | None = None) -> dict:
     """진행 중인 심의를 취소한다. 저장(대화·보고서)도 함께 중단된다. 줄 선 심의는 줄에서 뺀다. 마무리 중(엔진의 finishing 표지부터 그 단의
     결정문까지 — 제자리로 다시 선 잡은 끊기기 전에 결정문이 나왔으면 처음부터)이면 delib_jobs.DelibFinishing 으로 거절한다(웹 멈춤의 409
@@ -1465,6 +1591,7 @@ _TRANSCRIPT_IDS = ("job_id", "total", "offset", "limit", "next_offset", "remaini
                  "결정문만으로 부족할 때 쓰고, 리스크 원장에 패널 결과를 제출할 때는 full=true 로 받는다. "
                  "턴은 offset 부터 limit 턴씩 묶음으로 준다 — 한 묶음을 다 받은 뒤 next_offset 이 null 이 아니면 "
                  "offset=next_offset 으로 다음 묶음을 받는다(remaining 은 그 뒤에 남은 턴 수). " + _PAGE_DESC),
+    annotations=_READ,
 )
 async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_ID)],
                                 round: Annotated[int, Field(description=_A_TR_ROUND)] = 0,
@@ -1472,7 +1599,7 @@ async def deliberate_transcript(job_id: Annotated[str, Field(description=_A_JOB_
                                 offset: Annotated[int, Field(description=_A_TR_OFFSET)] = 0,
                                 limit: Annotated[int, Field(description=_A_TR_LIMIT)] = 40,
                                 full: Annotated[bool, Field(description=_A_TR_FULL)] = False,
-                                part: Annotated[int, Field(description=_A_PART)] = 1, ctx: Context | None = None) -> dict:
+                                part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1, ctx: Context | None = None) -> dict:
     """좌석 발언 전사를 묶음으로. 전량은 컨텍스트를 터뜨리므로 기본 40턴씩 주고, 묶음이 MCP 결과 상한보다 크면 쪽으로 나눈다.
 
     Args:
@@ -1520,11 +1647,12 @@ def verify_job(job: dict, *, scope, forbidden) -> dict:
                        "같은 수가 다른 판 쌍의 비교값일 수 있다('53 → 53'). 출처 없는 낱말을 드러낼 뿐이니 자리를 열어 사람이 읽는다. 출처는 그 잡의 근거 "
                        "항목(시작 때 낱말 색인 — evidence_index) · 화두 · 사람 의견이다(좌석 자유 조회 · 지식카드의 수는 deliberate_result(view=\"summary\") "
                        "의 numcheck 가 본다 — 그 칸은 그대로다). pages 는 deliberate_result 의 full · summary 를 쪽마다 받아 결정문 조각을 이으면 원문과 "
-                       "같은지(ok · gaps · overlaps)다. forbidden 을 주면 그 값들이 결정문 어디에 나오는지 준다. " + _PAGE_DESC))
+                       "같은지(ok · gaps · overlaps)다. forbidden 을 주면 그 값들이 결정문 어디에 나오는지 준다. " + _PAGE_DESC),
+          annotations=_READ)
 async def deliberate_verify(job_id: Annotated[str, Field(description=_A_JOB_ID)],
                             scope: Annotated[str, Field(description=_A_VERIFY_SCOPE)] = ",".join(delib_verify.KINDS),
                             forbidden: Annotated[list[str] | None, Field(description=_A_VERIFY_FORBIDDEN)] = None,
-                            part: Annotated[int, Field(description=_A_PART)] = 1,
+                            part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                             ctx: Context | None = None) -> dict:
     """결정문 원천 대조(HWAXPortal docs/request-1117 DL-04 — verify_job)."""
     job = delib_jobs.get(job_id)
@@ -1546,8 +1674,9 @@ _A_RESOLVE_EVIDENCE = ("미리 볼 근거 — deliberate_start 의 evidence 와 
                        "bundle_fingerprint · at · why), inline(본문 항목 수 · 자수), expanded(펼친 뒤 항목 수 · 자수 · 지문), limits(지금 걸리는 "
                        "근거 상한 — deliberate_jobs 의 limits 와 같다), over(상한을 넘으면 그 까닭), omitted(시작하면 evidence_omitted 에 실릴 줄). "
                        f"받는 kind — {' · '.join(delib_refs.KINDS)}. 꼴이 틀린 참조 · 아직 열지 않은 kind({' · '.join(delib_refs.NOT_OPENED)})는 "
-                       "시작과 같은 글로 거절한다. 미리 본 뒤 묶음이 바뀌면 시작할 때의 지문이 달라진다(시작이 다시 푼다)."))
-async def deliberate_resolve_evidence(evidence: Annotated[list[dict], Field(description=_A_RESOLVE_EVIDENCE)],
+                       "시작과 같은 글로 거절한다. 미리 본 뒤 묶음이 바뀌면 시작할 때의 지문이 달라진다(시작이 다시 푼다)."),
+          annotations=_READ_WORLD)
+async def deliberate_resolve_evidence(evidence: Annotated[list[dict], Field(description=_A_RESOLVE_EVIDENCE, json_schema_extra=_X_EVIDENCE)],
                                       ctx: Context | None = None) -> dict:
     """근거 참조 미리 보기(HWAXPortal docs/request-1117 DL-01) — resolve_preview 와 같다(HTTP 창구 POST /deliberate/evidence/resolve 도)."""
     user, groups = _caller(ctx)
@@ -1555,8 +1684,11 @@ async def deliberate_resolve_evidence(evidence: Annotated[list[dict], Field(desc
 
 
 @mcp.tool(title="심의 메뉴 — 어떤 심의를 고를까",
-          description=f"심의 종류 {len(delib_jobs.JOBS)}가지와 각각 언제 쓰는지, 얹을 수 있는 층 5가지, "
-                      "옵션 목록, 지금 걸리는 근거 상한(limits), 대기열 현황(queue — 길이와 내 순번).")
+          description=f"심의 메뉴(읽기 전용) — 심의 종류 {len(delib_jobs.JOBS)}가지와 각각 언제 쓰는지(jobs — job · group · label · when · input · "
+                      "example), 얹을 수 있는 층 5가지(modifiers), 인자 규칙 전문(options — evidence · personas · tools · human_note · options · "
+                      "advanced), 지금 걸리는 상한(limits — 근거 건수 · 합계 자수 · 좌석 · 도구 · 앱 · timeout_s), 대기열 현황(queue — 길이와 내 순번) · "
+                      "동시 실행 · 좌석 합 상한, 상태 안내 전문(states), 기본값 묶음(presets)을 준다. deliberate_start 전에 job · 상한을 모르면 먼저 부른다.",
+          annotations=_READ)
 async def deliberate_jobs(ctx: Context | None = None) -> dict:
     """포털 웹 심의 메뉴와 같은 택소노미. job 값을 고르는 데 쓴다."""
     user, _groups = _caller(ctx)
@@ -1625,6 +1757,14 @@ _A_BATCH_RETRIES = (f"실패한 항목을 새 잡으로 다시 띄울 횟수(기
 _A_BATCH_STALL = ("멈춤 감지(초, 기본 0 = 끔). 켜면 도는 잡이 마지막 사건 뒤 max(stall_s, 그 잡의 quiet_ok_s) 초 넘게 조용할 때 접고 실패한 시도로 센다"
                   f"(하한 {delib_batch.STALL_FLOOR_S:g}초). 조용한 것이 멈춘 것은 아니다 — 큰 패널 · 긴 호출 한도(timeout_s)면 크게 잡는다.")
 _A_BATCH_ID = "묶음 id(deliberate_batch_start 응답의 batch_id)."
+# 묶음 항목의 칸(contract C5) — 스키마에만 싣고 검사는 delib_batch 가 한다(엔진 검사로 먼저 거른다).
+_X_BATCH_ITEMS = {"items": {"type": "object", "additionalProperties": True, "properties": {
+    "key": {"type": "string", "description": "묶음 안에서 유일한 열쇠(영문 · 숫자 · _.:- 64자)."},
+    "question": {"type": "string", "description": "화두 — deliberate_start 의 question 과 같다."},
+    "job": {"type": "string", "description": "심의 종류 — deliberate_start 의 job 과 같다."},
+    "evidence": {"type": "array", "items": _X_EVIDENCE_ITEM, "description": "원천 근거 — deliberate_start 의 evidence 와 같다(참조도 받는다)."},
+    "advanced": {"type": "object", "description": "품질 손잡이 — deliberate_start 의 advanced 와 같다(라운드 · 층은 rounds · modifiers 로).",
+                 **_X_ADVANCED}}}}
 _BATCH_DESC = (
     "여러 심의를 한 묶음으로 맡긴다 — 서버가 동시 한도 안에서 하나씩 띄우고 끝까지 지켜본다. 규칙 — 같은 key 는 두 번 돌지 않는다 · 끝난 key 는 다시 "
     "돌지 않는다(같은 이름으로 다시 시작하면 앞 묶음에서 끝난 key 는 건너뛴다) · 멈춘 뒤에는 새로 띄우지 않는다 · 실패한 항목은 retries 번까지만 다시 "
@@ -1663,13 +1803,15 @@ async def batch_start(*, name, items, concurrency, retries, stall_s, user: str, 
     return out
 
 
-@mcp.tool(title="심의 묶음 시작", description=_BATCH_DESC)
+@mcp.tool(title="심의 묶음 시작", description=_BATCH_DESC, annotations=_OPEN_JOB)
 async def deliberate_batch_start(
     name: Annotated[str, Field(description=_A_BATCH_NAME)],
-    items: Annotated[list[dict], Field(description=_A_BATCH_ITEMS)],
-    concurrency: Annotated[int, Field(description=_A_BATCH_CONC)] = delib_batch.CONCURRENCY_DEFAULT,
-    retries: Annotated[int, Field(description=_A_BATCH_RETRIES)] = delib_batch.RETRIES_DEFAULT,
-    stall_s: Annotated[float, Field(description=_A_BATCH_STALL)] = 0,
+    items: Annotated[list[dict], Field(description=_A_BATCH_ITEMS, json_schema_extra=_X_BATCH_ITEMS)],
+    concurrency: Annotated[int, Field(description=_A_BATCH_CONC, json_schema_extra={"minimum": 1, "maximum": delib_batch.CONCURRENCY_MAX})]
+    = delib_batch.CONCURRENCY_DEFAULT,
+    retries: Annotated[int, Field(description=_A_BATCH_RETRIES, json_schema_extra={"minimum": 0, "maximum": delib_batch.RETRIES_MAX})]
+    = delib_batch.RETRIES_DEFAULT,
+    stall_s: Annotated[float, Field(description=_A_BATCH_STALL, json_schema_extra={"minimum": 0})] = 0,
     ctx: Context | None = None,
 ) -> dict:
     """심의 묶음을 시작한다(batch_start)."""
@@ -1697,9 +1839,11 @@ def batch_read(batch_id: str, *, user: str, aff: str, admin: bool, groups=None) 
                        "counts(pending · running · done · failed · cancelled · stopped · skipped · not_trustworthy) · 항목마다 state · job_id · tries · "
                        "attempts · trust(trustworthy · not_trustworthy · unknown) · seat_loss(좌석 유실 — lost · by_round · notices · unanswered) · 도는 "
                        "잡의 live(status · stage · round · idle_s · queue). 항목의 결정문은 그 job_id 의 deliberate_result 로 받는다. 고리로 거듭 묻지 "
-                       "말고 몇 분 간격으로 본다. " + _PAGE_DESC))
+                       "말고 몇 분 간격으로 본다. 주인이 부르면 그때의 그룹을 묶음 원장에 고쳐 적는다(이 뒤로 띄우는 잡의 권한 검사가 지금 그룹을 "
+                       "본다 — 그래서 읽기 도구가 아니다). " + _PAGE_DESC),
+          annotations=_ann(read=False))
 async def deliberate_batch_status(batch_id: Annotated[str, Field(description=_A_BATCH_ID)],
-                                  part: Annotated[int, Field(description=_A_PART)] = 1,
+                                  part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                                   ctx: Context | None = None) -> dict:
     """심의 묶음 진행(batch_read)."""
     user, aff, admin = _caller_view(ctx)
@@ -1728,7 +1872,8 @@ def batch_stop(batch_id: str, *, user: str, groups=None) -> dict:
           description=("심의 묶음을 멈춘다 — 이 뒤로 새 항목을 띄우지 않고, 줄 선(pending) 항목과 엔진 줄에 서 있기만 한(아직 돌지 않은) 잡은 stopped 로 "
                        "닫는다. 이미 도는 잡은 끝까지 지켜보고"
                        "(그 결정 · 좌석 유실도 적는다) 응답의 in_engine 에 job_id 를 준다 — 접으려면 그 job_id 로 deliberate_cancel. 내가 시작한 묶음만 "
-                       "멈춘다. 같은 이름으로 다시 시작하면 끝난 key 는 건너뛰고 남은 것만 돈다."))
+                       "멈춘다. 같은 이름으로 다시 시작하면 끝난 key 는 건너뛰고 남은 것만 돈다."),
+          annotations=_FOLD)
 async def deliberate_batch_stop(batch_id: Annotated[str, Field(description=_A_BATCH_ID)], ctx: Context | None = None) -> dict:
     """심의 묶음 멈춤(batch_stop)."""
     user, groups = _caller(ctx)
@@ -1762,20 +1907,17 @@ _TASK_EGRESS = (
     "그 요청을 낸 쪽(리스크 앱·호출자)의 몫이다. 과제 글을 답을 쓰는 일 밖의 곳에 옮기거나 남기지 않는다.")
 _TASK_NEXT_DESC = (
     "리스크 심사 Claude 길(외부 응답자) — 엔진이 LLM 대신 맡긴 판단 과제 하나를 집는다. 내가(호출자 신원) 주인인 과제만 보인다. "
-    "과제가 있으면 머리 {task_id, lease, kind, max_tokens, max_chars, chars, parts[{role, start, chars}], answer_deadline(유닉스 초), "
-    "answer_s, claim, created_at, run_id?, target_key?, label?, job_id?} 를 돌려주고 그 과제는 내 것으로 집힌다(target_key 는 리스크 "
-    "심사 대상, job_id 는 MCP 심의 잡 deliberate_start 의 id — 맡은 대상 · 잡의 과제인지 이것으로 가린다). lease 는 이 집기의 임대다 — "
-    "review_task_read·review_task_submit 에 그대로 싣는다. 없으면 {empty: true, claimed(내가 집고 아직 안 낸 수), waited_s}. "
-    "wait_s(초, 최대 25)만큼 과제가 생기기를 기다렸다 답한다(긴 폴링). 고리 — 집기(review_task_next) → 프롬프트 읽기"
-    "(review_task_read 를 offset 0 부터 next_offset 이 null 이 될 때까지 불러 text 를 이어 붙이면 chars 자다. parts[i].start·chars 로 "
-    "system 글과 human 글을 가른다) → 답 쓰기 → 내기(review_task_submit, 마지막 조각에 final=true). "
-    f"한도 — 과제가 기다리는데 내 워크플로가 EXTERNAL_LLM_WAIT_S(이 서버 {_XS.wait_s:g}초) 동안 아무 과제도 집거나 내지 않으면 "
-    "엔진이 그 호출을 external_worker_absent 로 끝내고, 그 뒤로 내가 이 도구들을 다시 부르거나 같은 시간이 지날 때까지 새 과제도 바로 "
-    "같은 오류로 끝난다(멈춘 잡은 리스크 앱에서 다시 이어 간다). 집은 과제를 answer_deadline(EXTERNAL_LLM_ANSWER_S, 이 서버 "
-    f"{_XS.answer_s:g}초) 안에 final 로 내지 않으면 한 번은 줄로 되돌아가고(claim 2 로 새 lease 와 함께 다시 집힌다 — 앞 lease 로 낸 "
-    "조각은 받지 않는다) 두 번째도 넘기면 external_answer_timeout 이다. 여러 과제를 동시에 집어 써도 된다 — 내가 집은 과제가 하나라도 "
-    "있는 동안에는 기다리는 과제가 '없다' 로 끝나지 않는다. 서버가 재기동하면 줄은 사라진다(엔진 쪽 호출도 끊겨 앱이 다시 낸다)."
-    + _TASK_UNITS + _TASK_FORMAT + _TASK_EGRESS)
+    "과제가 있으면 머리 {task_id, lease, kind, max_tokens, max_chars, chars, parts[{role, start, chars}], answer_deadline, "
+    "answer_s, claim, created_at, run_id?, target_key?, label?, job_id?} 를 돌려주고 그 과제는 내 것으로 집힌다(target_key · job_id 로 맡은 "
+    "과제인지 가린다). lease 는 이 집기의 임대다 — review_task_read · review_task_submit 에 그대로 싣는다. 없으면 {empty: true, "
+    "claimed(내가 집고 아직 안 낸 수), waited_s}. 고리 — 집기 → 프롬프트 읽기(review_task_read 를 offset 0 부터 next_offset 이 null 이 될 때까지 "
+    "불러 이어 붙이면 chars 자 — parts[i].start · chars 로 system · human 글을 가른다) → 답 쓰기 → 내기(review_task_submit, 마지막 조각에 "
+    f"final=true). 한도 — 과제가 기다리는데 EXTERNAL_LLM_WAIT_S(이 서버 {_XS.wait_s:g}초) 동안 아무것도 집거나 내지 않으면 엔진이 그 호출을 "
+    "external_worker_absent 로 끝낸다(그 뒤로 내가 다시 부르거나 같은 시간이 지날 때까지 새 과제도 같다). 집은 과제를 answer_deadline"
+    f"(EXTERNAL_LLM_ANSWER_S, 이 서버 {_XS.answer_s:g}초) 안에 final 로 내지 않으면 한 번은 줄로 되돌아가고(claim 2 · 새 lease — 앞 lease 의 조각은 "
+    "받지 않는다) 두 번째는 external_answer_timeout 이다. 답의 꼴(JSON "
+    "Lines · risk_spec 펜스 · max_tokens · max_chars)은 review_task_submit 의 text 인자 설명이다."
+    + _TASK_UNITS + _TASK_EGRESS)
 _TASK_READ_DESC = (
     "집은 과제의 프롬프트를 쪽으로 받는다 — {task_id, offset, next_offset, chars, text}. lease 는 review_task_next 머리의 그 값이다. "
     "응답 하나는 약 20,000자 안이다(MCP 결과 상한). next_offset 이 null 이 아니면 offset=next_offset 으로 다음 쪽을 받고, 받은 text 를 "
@@ -1790,8 +1932,10 @@ _TASK_SUBMIT_DESC = (
     "붙었는지 이것으로 안다). 마지막 조각에 final=true — 그때 답이 엔진에 넘어가 엔진이 GLM 의 답과 똑같이 읽고 검사·보충한다. 응답은 "
     "{ok: true, done: true, chars, finish_reason(stop · length — max_tokens 를 넘어 잘렸다), cut_chars?} 이고 final 이 아니면 "
     "{ok: true, done: false, received_chars} 다. 그 밖의 실패 — task_not_found · not_claimed(이 lease 로 집혀 있지 않다 — 한도가 지나 "
-    "되돌아갔거나 다시 집혔다. 이 조각은 받지 않았고 지금 집기의 답에도 닿지 않았다) · answer_too_large."
-    + _TASK_UNITS + _TASK_FORMAT + _TASK_EGRESS)
+    "되돌아갔거나 다시 집혔다. 이 조각은 받지 않았고 지금 집기의 답에도 닿지 않았다) · answer_too_large. 답의 꼴은 그 프롬프트를 받은 모델이 낼 "
+    "출력 그대로다 — 카드 대조는 JSON Lines, 리스크 심사 의장 결정문은 산문 뒤 risk_spec 펜스 하나, 좌석 조회 과제는 CALL 줄, 길이는 머리의 "
+    "max_tokens 토큰(max_chars 자) 안 — 전문은 text 인자 설명이다."
+    + _TASK_UNITS + _TASK_EGRESS)
 
 
 def _task_caller(ctx: Context | None) -> tuple[str, external_llm.Board]:
@@ -1807,7 +1951,19 @@ def _task_caller(ctx: Context | None) -> tuple[str, external_llm.Board]:
     return external_llm.header_owner(user), board
 
 
-async def review_task_next(wait_s: float = 0, ctx: Context | None = None) -> dict:
+_A_TASK_WAIT = (f"과제가 생기기를 기다릴 초 — 최대 {external_llm.NEXT_WAIT_MAX:g}초로 죈다(긴 폴링). 기본 0 — 기다리지 않는다. 비면 "
+                "{empty: true, claimed, waited_s}. 여러 과제를 동시에 집어 써도 된다 — 내가 집은 과제가 하나라도 있는 동안에는 기다리는 과제가 "
+                "'없다' 로 끝나지 않는다. 서버가 재기동하면 줄은 사라진다(엔진 쪽 호출도 끊겨 앱이 다시 낸다).")
+_A_TASK_ID = "과제 id — review_task_next 머리의 task_id."
+_A_TASK_LEASE = "이 집기의 임대 — review_task_next 머리의 lease 그대로(답 한도가 지나 다시 집히면 새 lease 다)."
+_A_TASK_OFFSET = ("읽을 자리(코드 포인트, 0부터) — 앞 응답의 next_offset 을 준다. 범위 밖이면 {ok: false, code: bad_offset}." )
+_A_TASK_TEXT = "이번 답 조각(한 번에 20,000자 안쪽)." + _TASK_FORMAT
+_A_TASK_SUB_OFFSET = ("이 조각이 답의 몇 번째 글자부터인지(코드 포인트) — 첫 조각 0, 비우면 받은 끝에 붙이고 0 이면 처음부터 다시 쓴다. 서버가 받은 길이와 "
+                      "다르면 offset_mismatch 와 received_chars 다.")
+_A_TASK_FINAL = "참이면 마지막 조각이다 — 답을 엔진에 넘기고 과제를 끝낸다. 기본 거짓."
+
+
+async def review_task_next(wait_s: Annotated[float, Field(description=_A_TASK_WAIT)] = 0, ctx: Context | None = None) -> dict:
     """내 가장 오래된 기다리는 과제를 집는다(머리 — lease 를 싣는다) — 없으면 {empty: true}. wait_s(최대 25초)만큼 기다렸다 답할 수
     있다."""
     user, board = _task_caller(ctx)
@@ -1824,13 +1980,17 @@ async def review_task_next(wait_s: float = 0, ctx: Context | None = None) -> dic
     return {"empty": True, "claimed": board.mine_claimed(user), "waited_s": round(loop.time() - t0, 1)}
 
 
-async def review_task_read(task_id: str, lease: str, offset: int = 0, ctx: Context | None = None) -> dict:
+async def review_task_read(task_id: Annotated[str, Field(description=_A_TASK_ID)], lease: Annotated[str, Field(description=_A_TASK_LEASE)],
+                           offset: Annotated[int, Field(description=_A_TASK_OFFSET)] = 0, ctx: Context | None = None) -> dict:
     """집은 과제의 프롬프트 한 쪽 — 응답 하나가 약 20,000자(DELIB_MCP_PAGE_CHARS 가 더 작으면 그것) 안이다."""
     user, board = _task_caller(ctx)
     return board.read(user, task_id, lease, offset, page_max=min(external_llm.READ_PAGE_MAX, mcp_pages.PAGE_CHARS))
 
 
-async def review_task_submit(task_id: str, lease: str, text: str, offset: int | None = None, final: bool = False,
+async def review_task_submit(task_id: Annotated[str, Field(description=_A_TASK_ID)], lease: Annotated[str, Field(description=_A_TASK_LEASE)],
+                             text: Annotated[str, Field(description=_A_TASK_TEXT)],
+                             offset: Annotated[int | None, Field(description=_A_TASK_SUB_OFFSET)] = None,
+                             final: Annotated[bool, Field(description=_A_TASK_FINAL)] = False,
                              ctx: Context | None = None) -> dict:
     """집은 과제의 답 조각을 낸다 — final=true 면 답을 엔진에 넘기고 과제를 끝낸다. lease 가 지금 집기의 것이 아니면 not_claimed."""
     user, board = _task_caller(ctx)
@@ -1842,10 +2002,13 @@ def _register_external(m: FastMCP, env=os.environ) -> bool:
     설정 오류로 닫혔으면 도구 목록에 없다."""
     if not external_llm.is_open(env):
         return False
-    m.add_tool(review_task_next, name="review_task_next", title="외부 응답자 — 과제 집기", description=_TASK_NEXT_DESC)
+    # 표지 — 집기는 과제를 내 것으로 잡고(부를 때마다 다른 과제) · 읽기는 일꾼 표지와 기한 지난 과제 되돌리기를 줄에 적고 · 내기는 답 조각을 쌓는다
+    m.add_tool(review_task_next, name="review_task_next", title="외부 응답자 — 과제 집기", description=_TASK_NEXT_DESC,
+               annotations=_ann(read=False, idempotent=False))
     m.add_tool(review_task_read, name="review_task_read", title="외부 응답자 — 과제 프롬프트 읽기",
-               description=_TASK_READ_DESC)
-    m.add_tool(review_task_submit, name="review_task_submit", title="외부 응답자 — 답 내기", description=_TASK_SUBMIT_DESC)
+               description=_TASK_READ_DESC, annotations=_ann(read=False))
+    m.add_tool(review_task_submit, name="review_task_submit", title="외부 응답자 — 답 내기", description=_TASK_SUBMIT_DESC,
+               annotations=_ann(read=False, idempotent=False))
     return True
 
 
@@ -1883,10 +2046,17 @@ _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · runnin
 _DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched}, model, steps, tokens{input, output}}. answer 의 [eN] 은 "
                    "evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수)다. 끝나지 않았으면 상태와 "
                    "안내만 준다. 내가 맡긴 위임만 보인다.")
-_DG_CANCEL_DESC = "도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만. 줄 선 것은 시작하지 않고 빠진다."
+_DG_CANCEL_DESC = ("도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만(남의 위임 · 없는 위임은 '그런 위임이 없다'). 줄 선 것은 시작하지 않고 빠지고, 도는 것은 "
+                   "접기를 청해 status=cancelling 이면 잠시 뒤 delegate_status 로 확인한다. 접은 위임은 이어 돌리지 않는다 — 같은 일은 delegate_start 로 다시 "
+                   "맡긴다.")
 _A_DR_OUTLINE = (f"절 개요(최대 {offload.OUTLINE_MAX:,}자) — 무엇을 어떤 차례로 쓸지. 근거 본문은 refs 로 준다.")
 _A_DR_REFS = (f"근거(최대 {offload.DRAFT_REFS_MAX}건) — 결과 손잡이 ref 글(게이트웨이 결과 머리의 ref) 또는 {{tool, args}}(서버가 그 사람의 읽기 "
               "도구로 부른다 — 위임과 같은 울타리, 밖이면 부르지 않고 sources 에 까닭)를 섞어 준다. 서버가 읽어 GLM 에 싣는다 — 원문이 이 대화로 오지 않는다.")
+_X_DR_REFS = {"items": {"anyOf": [
+    {"type": "string", "description": "결과 손잡이 ref 글(게이트웨이 결과 머리의 ref)."},
+    {"type": "object", "additionalProperties": True, "description": "서버가 그 사람의 읽기 도구로 부를 호출.", "properties": {
+        "tool": {"type": "string", "description": "읽기 도구 이름."},
+        "args": {"type": "object", "description": "그 도구의 인자."}}}]}}
 _A_DR_STYLE = "꼴 — " + " · ".join(f"{k}({v})" for k, v in offload.STYLES.items()) + "."
 _A_DR_TARGET = f"길이(자) — 기본 {offload.DRAFT_TARGET_DEFAULT:,} · 200~{offload.DRAFT_TARGET_MAX:,} 로 죈다."
 _DR_DESC = (
@@ -1986,7 +2156,7 @@ async def delegate_cancel(job_id: Annotated[str, Field(description=_A_DG_JOB)], 
 
 
 async def draft_section(outline: Annotated[str, Field(description=_A_DR_OUTLINE)],
-                        refs: Annotated[list[str | dict] | None, Field(description=_A_DR_REFS)] = None,
+                        refs: Annotated[list[str | dict] | None, Field(description=_A_DR_REFS, json_schema_extra=_X_DR_REFS)] = None,
                         style: Annotated[Literal["report", "memo", "minutes", "plain"], Field(description=_A_DR_STYLE)] = "report",
                         target_chars: Annotated[int, Field(description=_A_DR_TARGET)] = offload.DRAFT_TARGET_DEFAULT,
                         ctx: Context | None = None) -> dict:
@@ -2020,14 +2190,15 @@ def _register_offload(m: FastMCP, on: dict | None = None) -> dict:
     on = offload.ON if on is None else on
     got = {k: bool(on.get(k)) for k in OFFLOAD_TOOLS}
     if got["delegate"]:
-        m.add_tool(delegate_start, name="delegate_start", title="조사 위임 — 서버에 맡기기", description=_DG_START_DESC)
-        m.add_tool(delegate_status, name="delegate_status", title="조사 위임 — 진행", description=_DG_STATUS_DESC)
-        m.add_tool(delegate_result, name="delegate_result", title="조사 위임 — 답 받기", description=_DG_RESULT_DESC)
-        m.add_tool(delegate_cancel, name="delegate_cancel", title="조사 위임 — 접기", description=_DG_CANCEL_DESC)
+        m.add_tool(delegate_start, name="delegate_start", title="조사 위임 — 서버에 맡기기", description=_DG_START_DESC, annotations=_OPEN_JOB)
+        m.add_tool(delegate_status, name="delegate_status", title="조사 위임 — 진행", description=_DG_STATUS_DESC, annotations=_READ)
+        m.add_tool(delegate_result, name="delegate_result", title="조사 위임 — 답 받기", description=_DG_RESULT_DESC, annotations=_READ)
+        m.add_tool(delegate_cancel, name="delegate_cancel", title="조사 위임 — 접기", description=_DG_CANCEL_DESC, annotations=_FOLD)
+    # 작성 · 변환은 LLM 을 부르고 그 사람의 읽기 도구로 근거를 읽을 뿐 원장 · 잡을 쓰지 않는다(사용량 셈만) — 바깥을 부르는 읽기다
     if got["draft"]:
-        m.add_tool(draft_section, name="draft_section", title="긴 글 서버 작성 — 절 초안", description=_DR_DESC)
+        m.add_tool(draft_section, name="draft_section", title="긴 글 서버 작성 — 절 초안", description=_DR_DESC, annotations=_READ_WORLD)
     if got["transform"]:
-        m.add_tool(llm_transform, name="llm_transform", title="단순 변환 — 번역 · 요약 · 표", description=_TF_DESC)
+        m.add_tool(llm_transform, name="llm_transform", title="단순 변환 — 번역 · 요약 · 표", description=_TF_DESC, annotations=_READ_WORLD)
     return got
 
 

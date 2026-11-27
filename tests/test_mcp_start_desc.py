@@ -34,10 +34,33 @@ def _pin_context():
     d._evid_cache.clear()
 
 
+def contract_text(tool) -> str:
+    """클라이언트가 받는 글 — 도구 설명과 인자 설명(칸 안의 칸 · 목록 항목의 칸까지, '이름(설명)' 꼴). 시작 도구의 긴 규칙(근거 · 좌석 · 손잡이)은
+    설명이 1,500자 안이 되며 인자 설명으로 옮겼다(HWAXPortal docs/mcp-modernize M2 — 웹 챗이 2,400자 뒤를 잘라 꼬리의 규칙이 사라졌다)."""
+    parts = [tool.description or ""]
+
+    def walk(props) -> None:
+        for k, v in (props or {}).items():
+            if not isinstance(v, dict):
+                continue
+            if v.get("description"):
+                parts.append(f"{k}({v['description']})")
+            walk(v.get("properties"))
+            for node in [v.get("items"), *(v.get("anyOf") or [])]:
+                if isinstance(node, dict):
+                    walk(node.get("properties"))
+                    for alt in node.get("anyOf") or []:
+                        if isinstance(alt, dict):
+                            walk(alt.get("properties"))
+
+    walk(tool.inputSchema.get("properties"))
+    return "\n".join(parts)
+
+
 def _listed(name: str) -> str:
-    """tools/list 가 내주는 설명 — 독스트링이 아니라 클라이언트가 받는 글이다."""
+    """tools/list 가 내주는 글 — 독스트링이 아니라 클라이언트가 받는 글이다(설명 + 인자 설명, contract_text)."""
     tools = asyncio.run(m.mcp.list_tools())
-    return next(t.description for t in tools if t.name == name)
+    return contract_text(next(t for t in tools if t.name == name))
 
 
 def test_근거_상한이_엔진_상수_값_그대로_적혀_있다():
@@ -74,7 +97,8 @@ def test_설명은_상수를_따라가고_로드_때_예산을_재지_않는다(
         "import asyncio, app, deliberation as d, mcp_server as m\n"
         "assert 'pre' not in d._evid_cache and 'n' not in app._ctx_cache, '로드 때 예산을 쟀다'\n"
         "t = next(t for t in asyncio.run(m.mcp.list_tools()) if t.name == 'deliberate_start')\n"
-        "print(t.description)\n")
+        "print(t.description)\n"
+        "print(t.inputSchema['properties']['evidence']['description'])\n")
     env = {**os.environ, "DELIB_EVID_ITEMS": "77", "DELIB_EVID_ITEM_MAX": "33333",
            "PYTHONDONTWRITEBYTECODE": "1"}
     r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True,
