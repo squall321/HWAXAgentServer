@@ -54,6 +54,8 @@ def _load() -> dict:
         for kind, row in doc.items():
             if kind.startswith("_"):            # _doc 같은 메모 칸
                 continue
+            if kind == "auto_pipeline":           # 포털 자동 파이프라인 줄(게시판 · 토큰 파일 · 형식 묶음) — 포털만 읽는다(HWAXPortal docs/auto-pipeline AP-18)
+                continue
             tid = row.get("template_id") if isinstance(row, dict) else None
             ver = row.get("template_version") if isinstance(row, dict) else None
             if (kind in DEFAULTS and isinstance(tid, str) and _ID_RE.fullmatch(tid)

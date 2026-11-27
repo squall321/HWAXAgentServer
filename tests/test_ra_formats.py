@@ -40,6 +40,16 @@ def test_박스_파일의_줄로_바꾼다(tmp_path, monkeypatch):
     assert h["kinds"]["deliberation"] == {"template_id": "sys.hwax.deliberation", "template_version": 3, "source": "box"}
 
 
+def test_포털_자동_파이프라인_줄은_경고_없이_건너뛴다(tmp_path, monkeypatch, capsys):
+    # 같은 박스 파일에 포털만 읽는 auto_pipeline 줄이 있어도 「모르는 종류」 경고를 내지 않는다(HWAXPortal docs/auto-pipeline AP-18)
+    _write(tmp_path, monkeypatch, {"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": 3},
+                                   "auto_pipeline": {"board": "sys-hwax-auto", "token_file": "infra/secrets/x.token", "formats": {}}})
+    assert ra_formats.draft_args("deliberation") == {"template_id": "sys.hwax.deliberation", "template_version": 3}
+    assert ra_formats.health()["error"] is None
+    assert "auto_pipeline" not in ra_formats.health()["kinds"]
+    assert "모르는 종류" not in capsys.readouterr().out
+
+
 def test_파일을_고치면_재기동_없이_따라간다(tmp_path, monkeypatch):
     f = _write(tmp_path, monkeypatch, {"deliberation": {"template_id": "sys.hwax.deliberation", "template_version": 1}})
     assert ra_formats.template()[1] == 1
