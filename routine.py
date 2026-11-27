@@ -173,6 +173,9 @@ class _GwSession:
         self._groups = [str(g) for g in groups or [] if str(g)]
         self._user = (user or "").strip().lower()
         self.sid: str | None = None
+        # 열렸나는 sid 와 따로 센다 — stateless 게이트웨이는 세션 번호를 내지 않으므로(HWAXPortal docs/mcp-modernize MM-6) sid 가 비어도
+        # 열린 것이다. sid 로 열림을 판정하면 호출마다 initialize 를 다시 해 요청이 셋이 된다.
+        self._opened = False
         self._ids = itertools.count(1)
         self._lock = asyncio.Lock()
         self._c: httpx.AsyncClient | None = None
@@ -218,17 +221,18 @@ class _GwSession:
                 raise RoutineGatewayError(f"게이트웨이 세션을 열지 못했다(HTTP {r.status_code})")
             self.sid = r.headers.get("mcp-session-id") or None
             await self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            self._opened = True
             return
 
     async def call(self, name: str, arguments: dict, *, idempotent: bool = False) -> tuple[bool, list]:
         """(isError, content[]) 를 그대로 — 판정은 부르는 쪽이 한다. 전송 · 프로토콜 · 인증 실패는 RoutineGatewayError 다."""
         async with self._lock:
             for attempt in (0, 1):
-                if self.sid is None:
+                if not self._opened:
                     try:
                         await self._open()
                     except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-                        self.sid = None        # 세션을 여는 중에 끊겼다 — 호출은 아직 안 보냈다
+                        self.sid, self._opened = None, False        # 세션을 여는 중에 끊겼다 — 호출은 아직 안 보냈다
                         if attempt:
                             raise RoutineGatewayError(f"게이트웨이에 닿지 못했다({type(exc).__name__})") from None
                         await asyncio.sleep(1.0)
@@ -237,19 +241,19 @@ class _GwSession:
                     r = await self._post({"jsonrpc": "2.0", "id": next(self._ids), "method": "tools/call",
                                           "params": {"name": name, "arguments": arguments}})
                 except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-                    self.sid = None            # 보내기 전에 끊겼다 — 다시 열어 한 번 더
+                    self.sid, self._opened = None, False            # 보내기 전에 끊겼다 — 다시 열어 한 번 더
                     if attempt:
                         raise RoutineGatewayError(f"게이트웨이에 닿지 못했다({type(exc).__name__})") from None
                     await asyncio.sleep(1.0)
                     continue
                 except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-                    self.sid = None            # 보낸 뒤 끊겼다 — 읽기만 다시 보낸다(쓰기는 원장에 들었을 수 있다)
+                    self.sid, self._opened = None, False            # 보낸 뒤 끊겼다 — 읽기만 다시 보낸다(쓰기는 원장에 들었을 수 있다)
                     if attempt or not idempotent:
                         raise RoutineGatewayError(f"게이트웨이 답이 끊겼다({type(exc).__name__}) — {name}"
                                                   + ("" if idempotent else "(원장에는 남았을 수 있다)")) from None
                     continue
                 if r.status_code == 404 or (r.status_code == 400 and "session" in r.text.lower()):
-                    self.sid = None            # 세션 만료 — 게이트웨이가 재기동했다
+                    self.sid, self._opened = None, False            # 세션 만료 — 게이트웨이가 재기동했다
                     if attempt:
                         raise RoutineGatewayError("게이트웨이 세션을 다시 열지 못했다")
                     continue
@@ -315,7 +319,7 @@ class _GwSession:
         except Exception:  # noqa: BLE001 — 닫기 실패로 실행을 실패시키지 않는다(게이트웨이 세션은 유휴 만료가 없다 — 그래서 닫는다)
             pass
         finally:
-            self.sid = None
+            self.sid, self._opened = None, False
             if self._c is not None:
                 try:
                     await self._c.aclose()

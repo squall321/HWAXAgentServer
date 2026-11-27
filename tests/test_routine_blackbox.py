@@ -827,14 +827,18 @@ class FakeGateway:
         self.violations: list[str] = []
         self.inits = 0
         self.expire_once = None                 # 도구 이름 — 그 tools/call 이 처음 오면 세션을 지운다(게이트웨이 재기동 흉내)
+        # stateless 게이트웨이(GATEWAY_STATELESS — HWAXPortal docs/mcp-modernize MM-6): initialize 가 세션 번호를 내지 않고, 세션 머리
+        # 없는 호출 · 옛 세션 머리 둘 다 받는다(mcp 1.28 stateless 전송 — 세션 검증을 건너뛴다). DELETE 는 405.
+        self.stateless = False
 
     @staticmethod
-    def _sse(rid, payload: dict, sid: str) -> httpx.Response:
+    def _sse(rid, payload: dict, sid: str | None) -> httpx.Response:
         env = {"jsonrpc": "2.0", "id": rid, **payload}
         body = f"event: message\r\ndata: {json.dumps(env, ensure_ascii=False, separators=(',', ':'))}\r\n\r\n"
-        return httpx.Response(200, content=body.encode("utf-8"),
-                              headers={"content-type": "text/event-stream", "cache-control": "no-cache, no-transform",
-                                       "mcp-session-id": sid})
+        h = {"content-type": "text/event-stream", "cache-control": "no-cache, no-transform"}
+        if sid:
+            h["mcp-session-id"] = sid
+        return httpx.Response(200, content=body.encode("utf-8"), headers=h)
 
     @staticmethod
     def _err(status: int, message: str) -> httpx.Response:
@@ -850,6 +854,8 @@ class FakeGateway:
             self.violations.append(f"사람 PAT 가 아닌 자격으로 왔다 — {rec['auth']!r}")
             return httpx.Response(401, json={"error": "invalid_token"})
         if request.method == "DELETE":
+            if self.stateless:
+                return httpx.Response(405)
             if rec["sid"] in self.sessions:
                 self.sessions[rec["sid"]] = "closed"
             return httpx.Response(200)
@@ -864,19 +870,25 @@ class FakeGateway:
         msg = json.loads(request.content or b"{}")
         rec["rpc"] = msg.get("method")
         if rec["rpc"] == "initialize":
+            self.inits += 1
+            if self.stateless:
+                return self._sse(msg.get("id"), {"result": {"protocolVersion": "2024-11-05",
+                                                            "capabilities": {"tools": {"listChanged": False}},
+                                                            "serverInfo": {"name": "hwax-mcp-gateway", "version": "test"}}}, None)
             sid = uuid.uuid4().hex
             self.sessions[sid] = "open"
-            self.inits += 1
             return self._sse(msg.get("id"), {"result": {"protocolVersion": "2024-11-05",
                                                         "capabilities": {"tools": {"listChanged": False}},
                                                         "serverInfo": {"name": "hwax-mcp-gateway", "version": "test"}}}, sid)
         sid = rec["sid"]
-        if not sid:
+        if self.stateless:
+            sid = None                            # 세션 검증을 하지 않는다 — 머리가 있어도 없어도 받는다
+        elif not sid:
             return self._err(400, "Bad Request: Missing session ID")
-        if self.sessions.get(sid) != "open":
+        if not self.stateless and self.sessions.get(sid) != "open":
             return self._err(404, "Not Found: Invalid or expired session ID")
         if rec["rpc"] == "notifications/initialized":
-            return httpx.Response(202, headers={"mcp-session-id": sid})
+            return httpx.Response(202, headers={"mcp-session-id": sid} if sid else {})
         if rec["rpc"] == "tools/list":
             return self._sse(msg.get("id"), {"result": {"tools": []}}, sid)
         if rec["rpc"] != "tools/call":
@@ -1754,6 +1766,21 @@ def test_게이트웨이_세션이_사라지면_한_번_다시_열고_같은_호
     assert gw.inits >= 2, "세션이 사라졌는데 다시 열지 않았다"
     assert portal.call_names == [("anchor", "core-hub:object_resolve"), ("ft", "failuretrace:pd_defect_search")], portal.call_names
     assert _ids(portal.ledger) == ["anchor.c1", "ft.c1"]
+    assert _rt(frames)[-1]["state"] == "done" and frames[-1][0] == "done"
+
+
+def test_stateless_게이트웨이는_세션_번호가_없어도_한_번만_열고_호출마다_다시_열지_않는다(rig):
+    """HWAXPortal docs/mcp-modernize MM-6 — 게이트웨이가 stateless 면 initialize 가 세션 번호를 내지 않는다. 열림을 세션 번호로 판정하면
+    호출마다 initialize · initialized 를 다시 보내 요청이 셋이 된다. 열림은 따로 세고, 닫기(DELETE)는 보내지 않는다."""
+    portal, gw, brain, rec = _two_step_rig(rig)
+    gw.stateless = True
+    frames = _play(_req(NEW))
+    _clean(portal, gw, rec)
+    calls = [r for r in gw.requests if r["method"] == "POST" and r["rpc"] == "tools/call"]
+    assert len(calls) >= 3, [r["tool"] for r in calls]
+    assert gw.inits == 1, f"stateless 인데 호출마다 다시 열었다 — initialize {gw.inits}번 · 호출 {len(calls)}번"
+    assert all(r["sid"] is None for r in gw.requests), "받은 적 없는 세션 머리를 실었다"
+    assert not [r for r in gw.requests if r["method"] == "DELETE"], "세션 번호가 없으면 닫을 세션도 없다"
     assert _rt(frames)[-1]["state"] == "done" and frames[-1][0] == "done"
 
 
