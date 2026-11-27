@@ -447,12 +447,14 @@ def test_한_항목_kind_는_참조의_source_key_를_단다(gw):
 
 
 def test_설명은_kind_목록을_모듈에서_읽는다():
+    from test_mcp_start_desc import _listed
     tools = {t.name: t for t in asyncio.run(m.mcp.list_tools())}
     assert "deliberate_resolve_evidence" in tools
+    start = _listed("deliberate_start")          # 근거 규칙은 evidence 인자 설명에 있다(HWAXPortal docs/mcp-modernize M2)
     for k in r.KINDS:
-        assert k in tools["deliberate_start"].description and k in tools["deliberate_resolve_evidence"].description
+        assert k in start and k in tools["deliberate_resolve_evidence"].description
     for k in r.NOT_OPENED:
-        assert k in tools["deliberate_start"].description
+        assert k in start
 
 
 # ── 2차 검토(4 · 7 · 9) ──────────────────────────────────────────────────────────────────────────────────────────

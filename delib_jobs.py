@@ -2452,7 +2452,7 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
 
     where(잡 → 참거짓)를 주면 볼 수 있는 잡 가운데 그것이 참인 잡만 싣는다 — 주제로 거르는 목록(delib_subject.matches)이 쓴다. 거름은 목록 색인의
     칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned) · 훑는 창(window — 최근 몇 개를 보나) · 원장 파일 수(total — 원장 폴더를 다 읽지
-    못했으면 None)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
+    못했으면 None) · 볼 수 있는 잡이 limit 보다 더 있었나(more)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
@@ -2480,6 +2480,8 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
     if info is not None:
         info.update(scanned=scanned, window=window, total=total)
     rows = sorted(seen.values(), key=lambda j: j.get("started_at") or j.get("queued_at") or 0, reverse=True)
+    if info is not None:
+        info["more"] = len(rows) > limit        # 볼 수 있는 잡이 limit 보다 더 있다(목록이 잘렸다고 말하게 — HWAXPortal docs/mcp-modernize C8)
     return [{**summary(j), "mine": bool(me and _owner(j) == me), "owner": _owner(j)} for j in rows[:limit]]
 
 

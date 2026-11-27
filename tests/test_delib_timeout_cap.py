@@ -159,9 +159,10 @@ def test_안_건_심의의_이어하기는_서버_기본값으로_돈다(monkeyp
 
 # ── 찾을 수 있다 ─────────────────────────────────────────────────────────────
 def test_안내가_호출_1회_기준임과_받는_범위를_엔진_값으로_말한다(monkeypatch):
+    from test_mcp_start_desc import _listed
     listed = {t.name: t.description for t in asyncio.run(m.mcp.list_tools())}
     menu = asyncio.run(m.deliberate_jobs())
-    for text in (listed["deliberate_start"], menu["options"]["advanced"]):
+    for text in (_listed("deliberate_start"), menu["options"]["advanced"]):     # 시작 도구는 손잡이 칸 설명(advanced.timeout_s)에 있다
         at = text.index("timeout_s(")
         seg = text[at:at + 420]
         for want in ("LLM 호출 1회", "심의 전체 시간이 아니다", "DELIB_TIMEOUT_S", "DELIB_TIMEOUT_MAX_S",
