@@ -42,6 +42,7 @@ import httpx
 import call_trace
 import usage_tokens
 import external_llm
+import purposes as _purposes
 from deliberation import _env_float, _env_int, _parse_json, _sse
 from evidence import unsourced_numbers
 
@@ -979,6 +980,34 @@ def _proxy(ctx: _Ctx, sid: str, bk: str, orig: str, base):
                           args_schema=getattr(base, "args_schema", None) or {"type": "object", "properties": {}})
 
 
+# ── 목적 예산 그림자(HWAXPortal docs/mcp-modernize M3) ──────────────────────────────────────────────────────────────────
+# 단계에 도구를 적지 않으면 그 백엔드의 읽기 전부가 묶인다(dev StepForge 157개 · 약 6만 토큰 — docs/mcp-modernize/audit/consumers.md 2.3). 단계 제목 · 할 일
+# 글로 목적을 골라 목적 예산이었으면 몇 개 · 몇 토큰을 묶었을지 단계마다 셈해 로그 한 줄 · /health purpose.routine 에 적는다(app._purpose_bind_count —
+# 목적 단계도 그 단계의 울타리 안의 것만 센다). 묶음은 그대로다. 손잡이 ROUTINE_PURPOSE — off · shadow(기본).
+ROUTINE_PURPOSE = _purposes.mode(os.environ.get("ROUTINE_PURPOSE"), ("off", "shadow"), "shadow")
+_PURPOSE = _purposes.Tally()
+
+
+def purpose_health() -> dict:
+    return _PURPOSE.health(ROUTINE_PURPOSE)
+
+
+def _purpose_shadow(step: dict, tools: list) -> dict | None:
+    """루틴 한 단계의 목적 예산 그림자 — 기록(꺼졌거나 실패면 None). 실패는 삼킨다(단계를 막지 않는다)."""
+    if ROUTINE_PURPOSE == "off" or not tools:
+        return None
+    try:
+        text = f"{step.get('title') or ''} {step.get('goal') or ''}".strip()
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "step": str(step.get("id")), **_app()._purpose_bind_count(tools, text)}
+        _PURPOSE.add(rec)
+        print(f"[routine] purpose shadow: 단계 {rec['step']} — {_purposes.line(rec)}")
+        return rec
+    except Exception as exc:  # noqa: BLE001 — 그림자가 루틴을 막지 않는다
+        _PURPOSE.fail(exc)
+        print(f"[routine] purpose shadow 실패(묶음은 그대로): {exc!r}"[:300])
+        return None
+
+
 def _bind(ctx: _Ctx, step: dict) -> tuple[list, list]:
     """(묶을 도구, 못 찾은 허용 도구) — 허용 목록 {백엔드: [원래 이름]} 의 각 도구를 그 사람의 노출 도구에서 찾아 _proxy 로. 안내대 도구
     (search_tools · invoke_tool …)는 묶지 않는다 — 허용 목록에 없다(R3-D3)."""
@@ -1486,6 +1515,7 @@ async def _platform_step(ctx: _Ctx, step: dict) -> dict:
         await _preload(ctx, step)            # 앞 프로세스가 running 으로 남긴 단계(이어서) — 이미 부른 것을 싣는다
         ctx.reason(f"(앞 프로세스가 이 단계에서 이미 부른 {len(ctx.calls.get(sid) or [])}건을 원장에서 읽어 실었다)\n")
     tools, missing = _bind(ctx, step)
+    _purpose_shadow(step, tools)             # 목적 예산이었으면 몇 개 · 몇 토큰이었나 — 셈해 적기만 한다(ROUTINE_PURPOSE)
     if missing:
         ctx.reason(f"(허용 도구 가운데 내 도구 목록에 없는 {len(missing)}개는 묶지 않았다: {', '.join(missing[:12])})\n")
     if not tools:

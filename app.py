@@ -116,6 +116,7 @@ import embeds as _embeds   # 챗 뷰어 카드 — 도구 결과의 같은 출�
 import offload as _offload   # 토큰 절감 2판 — 위임 · 절 초안 · 변환 · 결과에 묻기(스위치 넷, 기본 꺼짐 — HWAXPortal docs/token-saving offload-v2)
 import publish_token as _publish_token   # RA 게시 확인 토큰을 턴 밖으로 나가는 글에서 가린다(확인 카드 — 사용자 결정 10-31 '내보내는 곳만 가린다')
 import onto_links as _onto   # 코어 어휘표 ontology 칸 — 챗 고정 몫 · 규칙 ⑧ · 입구 표지(HWAXPortal docs/ontology-first)
+import purposes as _purposes   # 게이트웨이 목적 묶음 표(/tools-map purposes) — 챗 목적 예산 · 좌석 · 위임 · 루틴 그림자(HWAXPortal docs/mcp-modernize M3)
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
@@ -3210,7 +3211,25 @@ def _semantic_order(query: str, tools: list) -> list:
         vn = math.sqrt(sum(x * x for x in v)) or 1.0
         scored.append((sum(a * b for a, b in zip(q, v)) / (qn * vn), n))
     scored.sort(reverse=True)
-    return [n for _, n in scored]
+    order = [n for _, n in scored]
+    _SEM_LAST["v"] = (query, ent["sig"], ent["space"], order)    # 목적 예산 그림자가 같은 턴의 순위를 다시 묻지 않고 쓴다(_sem_reuse)
+    return order
+
+
+# 마지막으로 낸 의미 순위 — (질의, 도구 묶음 서명, 공간, 순위). 목적 예산 그림자(_purpose_shadow)만 읽는다 — 지금 묶음을 고른 같은 질의 · 같은 도구 묶음이면
+# 그 순위를 그대로 쓰고, 아니면(다른 턴이 그새 덮었다 · 지금 묶음이 순위를 내지 않았다) 어휘 순위로 셈한다. 그림자가 임베딩을 새로 부르지 않게 한다 —
+# 지금 길의 호출 수는 그대로다(HWAXPortal docs/mcp-modernize M3). 튜플 하나를 통째로 갈아 끼워 스레드 사이에 짝이 어긋나지 않는다.
+_SEM_LAST: dict = {"v": None}
+
+
+def _sem_reuse(query: str, tools: list) -> list | None:
+    """같은 질의 · 같은 도구 묶음으로 방금 낸 의미 순위 — 없으면 None."""
+    import hashlib
+    v = _SEM_LAST.get("v")
+    if not v or v[0] != query or v[2] != _EMBED_SPACE["space"]:
+        return None
+    sig = hashlib.sha256("\n".join(sorted(getattr(t, "name", "") for t in tools)).encode()).hexdigest()[:16]
+    return v[3] if v[1] == sig else None
 
 
 def _rrf(*orders, k: int = 60) -> dict:
@@ -3354,9 +3373,10 @@ def _fit_schema(tools: list, budget: int, keep: tuple = ()) -> list:
     return kept
 
 
-def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, prefer) -> list[tuple]:
+def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, prefer, sem_order: list | None = None) -> list[tuple]:
     """[(도구, 어휘 관련도)] — 콕 집은 것 → 핀 → 지목한 전문가의 분야 도구 → 어휘 + 시맨틱 융합 순위 → 어휘 관련도 → 상시 핵심 → 이름.
-    캡 경로와 무캡 경로가 같은 순서를 쓴다(종전엔 무캡 경로가 이 정렬 없이 게이트웨이 순서 그대로 뒤에서부터 잘랐다 — F1)."""
+    캡 경로와 무캡 경로가 같은 순서를 쓴다(종전엔 무캡 경로가 이 정렬 없이 게이트웨이 순서 그대로 뒤에서부터 잘랐다 — F1).
+    sem_order 를 주면 의미 순위를 묻지 않고 그것을 쓴다(빈 목록이면 어휘 순위만 — 그림자 · 위임 · 루틴 셈이 임베딩을 부르지 않게)."""
     pin = set(pinned or []) | set(first or [])
     top = set(first or [])
     pref = {n: i for i, n in enumerate(prefer or []) if n not in pin}
@@ -3372,7 +3392,8 @@ def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, p
     # (감사 실측: query_voc/search_voc 가 탈락해 모델이 product_code 를 지어내고 다른 제품
     # 통계를 답으로 내놓음 — 빈 결과보다 나쁜 '확신에 찬 오답').
     lex_order = [n for _, n in sorted(((-rel(t), getattr(t, "name", "")) for t in tools if rel(t) > 0))]
-    sem_order = _semantic_order(query, tools)
+    if sem_order is None:
+        sem_order = _semantic_order(query, tools)
     fused = _rrf(lex_order, sem_order) if sem_order else {}
     scored = [(t, rel(t)) for t in tools]
     return sorted(scored, key=lambda x: (
@@ -3389,7 +3410,7 @@ def _relevance_order(tools: list, query: str, pinned, first, core_list: tuple, p
 
 def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
                   first: list[str] | None = None, core_names: tuple | None = None,
-                  prefer: list[str] | None = None) -> list:
+                  prefer: list[str] | None = None, purpose_q: tuple = (), _plain: bool = False) -> list:
     """질의 관련도 기반 도구 선택 — 도구가 수백 개로 늘어도 '알파벳 순 절단'이 아니라
     '이 질문에 필요한 것부터' 남긴다. 우선순위: ① 콕 집은 도구(first) ② 사용자 지정(핀)
     ③ **지목한 전문가의 분야 도구(prefer)** ④ 질의 어휘 관련도 ⑤ 상시 핵심 ⑥ 나머지.
@@ -3402,7 +3423,12 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     (StepForge 81·ReportArchive 70), 핀끼리는 관련도로만 갈려 사용자가 콕 집은 도구나 HE팀
     운영자의 입구 도구(get_guide·list_projects 등)가 캡 밖으로 밀려났다.
 
-    core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다."""
+    core_names 는 상시 핵심 예약을 바꾼다(기본 _TOOL_PRIORITY). HE팀 운영자는 _GUIDE_TOOLS 만 쓴다.
+
+    목적 예산(HWAXPortal docs/mcp-modernize M3) — 손잡이 CHAT_TOOL_PURPOSE 가 off 가 아니면 _select_tools_purposed 가 가른다(shadow 는 이 아래 길로 묶고
+    목적 예산 셈을 곁에 적는다 · on 은 _select_purpose 로 묶는다). purpose_q 는 목적을 고를 글들, _plain 은 그 함수가 이 아래 길을 부를 때만 쓴다."""
+    if CHAT_TOOL_PURPOSE != "off" and not _plain:
+        return _select_tools_purposed(tools, query, pinned, first, core_names, prefer, purpose_q)
     # 고정 몫은 어휘표 ontology 에서(없으면 _ONTO_CORE — 기본 표에서는 글자 그대로다, HWAXPortal docs/ontology-first OF-5). 한 번만 푼다.
     onto = _onto_core() if core_names is None else ()
     core_list = (_TOOL_PRIORITY + onto) if core_names is None else core_names
@@ -3458,6 +3484,187 @@ def _select_tools(tools: list, query: str = "", pinned: list[str] | None = None,
     n_rel = sum(1 for t, sc in ordered[:TOOL_MAX] if sc > 0)
     print(f"[agent] tool select: {len(tools)}개 → {len(kept)}개 (질의관련 {n_rel}, 핀 {len(pin)})")
     return kept
+
+
+# ── 목적 예산(HWAXPortal docs/mcp-modernize M3) ─────────────────────────────────────
+# 게이트웨이 목적 묶음 표(/tools-map purposes)로 턴의 목적 1 ~ 3개를 고르고(게이트웨이 search_tools 목적 층과 같은 규칙 — purposes.match), 그 목적의
+# 입구 · 단계를 콕 집은 것 바로 뒤에 묶는다. 무캡 길(TOOL_MAX=0 — cae00)의 예산은 창의 45% 가 아니라 절대 예산(_purpose_budget)이다 — 창이 1M 인
+# Claude 턴은 45% 가 약 42만 토큰이라 도구 약 1,000개를 한 호출에 싣는다(2,000개 규모 — docs/mcp-modernize/audit/consumers.md 4절).
+# 손잡이 CHAT_TOOL_PURPOSE — off(종전 그대로 · 목적 셈이 없다) · shadow(기본 — 종전 그대로 묶고, 목적 예산이었으면 무엇을 묶었을지 같은 턴에 셈해 로그
+# 한 줄 · /health purpose.chat 에 적는다) · on(목적 예산으로 묶는다). 기본값을 바꾸는 순위 변화라 cae00 그림자 수를 보고 켠다(PLAN §3).
+CHAT_TOOL_PURPOSE = _purposes.mode(os.environ.get("CHAT_TOOL_PURPOSE"), ("off", "shadow", "on"), "shadow")
+# 목적 예산(추정 토큰). 비거나 0 이면 CHAT_TOOL_SCHEMA_BUDGET, 그것도 비면 _PURPOSE_BUDGET_DEFAULT. 창의 45%(종전 무캡 예산)보다 크게는 잡지 않는다 —
+# 작은 창에서 목적 예산이 종전보다 많이 싣는 일은 없다. 그림자 동안 이 값만 바꿔 A/B 를 잴 수 있다(지금 길의 CHAT_TOOL_SCHEMA_BUDGET 은 그대로).
+CHAT_PURPOSE_BUDGET = _env_int("CHAT_PURPOSE_BUDGET", 0)
+_PURPOSE_BUDGET_DEFAULT = 40000
+# 이번 챗 턴의 목적을 고를 글들(이번 발화 → 앞 사람 발화 — 챗 길이 _agent_for 앞에서 건다). _agent_for 의 호출 꼴을 바꾸지 않으려고 문맥 변수로 넘긴다 —
+# _select_tools 는 asyncio.to_thread 로 돌고 to_thread 는 문맥을 물려준다. 비었으면(챗 밖 · 시험) 선별 질의 하나로 고른다.
+_turn_purpose_q: contextvars.ContextVar = contextvars.ContextVar("hwax_turn_purpose_q", default=())
+# 그림자 셈 — 기동 뒤 합(턴 · 목적이 맞은 턴 · 맞은 목적의 입구가 지금 묶음 · 목적 묶음에서 빠진 턴 · 토큰 합)과 마지막 한 턴. 이름 · 질의는 싣지 않는다
+# (무인증 /health — 목적 키와 수만).
+_PURPOSE_CHAT: dict = {"turns": 0, "matched": 0, "entry_missing_now": 0, "entry_missing_purpose": 0,
+                       "tokens_now": 0, "tokens_purpose": 0, "errors": 0, "error": None, "last": None}
+
+
+def _purpose_budget() -> int:
+    """목적 예산(추정 토큰) — CHAT_PURPOSE_BUDGET > CHAT_TOOL_SCHEMA_BUDGET > 40,000, 창의 45% 를 넘지 않는다."""
+    b = (CHAT_PURPOSE_BUDGET if CHAT_PURPOSE_BUDGET > 0
+         else CHAT_TOOL_SCHEMA_BUDGET if CHAT_TOOL_SCHEMA_BUDGET > 0 else _PURPOSE_BUDGET_DEFAULT)
+    return min(b, max(4000, int(_model_context_tokens() * 0.45)))
+
+
+def _chat_purpose_hits(tools, purpose_q) -> tuple[list, int]:
+    """(이 턴의 목적, 몇 번째 글에서 맞았나 — 0 은 이번 발화) — 그 사람의 도구(tools)에 단계가 하나라도 있는 목적만 본다(게이트웨이 시야 규칙)."""
+    table = _purpose_table()
+    if not table:
+        return [], -1
+    avail = {getattr(t, "name", "") for t in tools} if tools is not None else None
+    return _purposes.match_first(purpose_q, table, avail)
+
+
+def _select_purpose(tools: list, query: str, pinned, first, core_names, prefer, hits: list, *,
+                    sem_order: list | None = None, live: bool = True) -> tuple[list, dict]:
+    """목적 예산 묶음 — (묶을 도구, {budget, order}). 종전 길(_select_tools)과 같은 차례에 두 가지만 다르다.
+    ① 고른 목적의 입구 · 단계가 콕 집은 것(first) 바로 뒤에 선다(핀 · 전문가 · 관련도보다 앞 — 앱 핀은 도구 수십 개로 펼쳐져 목적 단계를 예산 밖으로
+       민다). 입구는 예산과 상관없이 남긴다(안내대 · 고정 몫처럼 keep).
+    ② 무캡 길의 예산이 절대값(_purpose_budget)이다. 캡 길(TOOL_MAX>0 — 박스가 캡을 골랐다)은 TOOL_MAX · TOOL_SCHEMA_BUDGET 그대로다 — 입구만 핀처럼
+       상시 핵심 예약에 밀려나지 않고, 나머지 단계는 관련도 순위보다 앞에 서되 예약에는 밀린다(종전 길만큼 캡을 지킨다 — 단계까지 지키면 dev 캡 40 에서
+       55개 · 예산 12,000 에서 1만 7천 토큰까지 불었다, 11-27 dev 측정).
+    live 가 거짓이면(그림자) 로그 · 절단 기록(_TOOL_CUT)을 건드리지 않는다. sem_order 는 _relevance_order 로 넘긴다(빈 목록 = 어휘 순위만)."""
+    onto = _onto_core() if core_names is None else ()
+    core_list = (_TOOL_PRIORITY + onto) if core_names is None else core_names
+    by = {getattr(t, "name", ""): t for t in tools}
+    top = set(first or [])
+    lead = [n for n in _purposes.lead(hits) if n in by and n not in top]
+    lead_set = set(lead)
+    ents = tuple(n for n in _purposes.entries(hits) if n in by)
+
+    def _lead_order(ordered: list) -> list:
+        return ([t for t in ordered if getattr(t, "name", "") in top] + [by[n] for n in lead]
+                + [t for t in ordered if getattr(t, "name", "") not in top and getattr(t, "name", "") not in lead_set])
+
+    def _ranked() -> list:
+        return [t for t, _ in _relevance_order(tools, query, pinned, first, core_list, prefer, sem_order=sem_order)]
+    if TOOL_MAX <= 0 or len(tools) <= TOOL_MAX:
+        budget, order = _purpose_budget(), "none"
+        if sum(_tool_schema_cost(t) for t in tools) > budget:
+            tools, order = _lead_order(_ranked()), ("lex" if sem_order == [] else "full")
+        elif prefer:
+            _r = {n: i for i, n in enumerate(prefer)}
+            tools = sorted(tools, key=lambda t: _r.get(getattr(t, "name", ""), len(_r)))
+        keep = _GUIDE_FRONT + onto
+        _ki = {n: i for i, n in enumerate(keep)}
+        front = sorted((t for t in tools if getattr(t, "name", "") in _ki), key=lambda t: _ki[getattr(t, "name", "")])
+        tools = front + [t for t in tools if getattr(t, "name", "") not in keep]
+        kept = (_fit_schema(tools, budget, keep=keep + ents) if live
+                else _purposes.fit(tools, budget, _tool_schema_cost, keep + ents)[0])
+        return kept, {"budget": budget, "order": order}
+    pin = set(pinned or []) | top | set(ents)
+    kept = _lead_order(_ranked())[:TOOL_MAX]
+    if TOOL_SCHEMA_BUDGET > 0:
+        kept = (_fit_schema(kept, TOOL_SCHEMA_BUDGET, keep=ents) if live
+                else _purposes.fit(kept, TOOL_SCHEMA_BUDGET, _tool_schema_cost, ents)[0])
+    kept_names = {getattr(t, "name", "") for t in kept}
+    missing = [by[n] for n in list(ents) + [c for c in core_list if c not in ents] if n in by and n not in kept_names]
+    if missing:
+        keep_head = [t for t in kept if getattr(t, "name", "") in pin]
+        rest = [t for t in kept if getattr(t, "name", "") not in pin]
+        kept = keep_head + missing + rest[:max(0, TOOL_MAX - len(keep_head) - len(missing))]
+    if live:
+        print(f"[agent] tool select(목적): {len(by)}개 → {len(kept)}개 (목적 {', '.join(h['key'] for h in hits) or '없음'}, 핀 {len(pin)})")
+    return kept, {"budget": TOOL_SCHEMA_BUDGET if TOOL_SCHEMA_BUDGET > 0 else None, "order": "lex" if sem_order == [] else "full"}
+
+
+def _purpose_shadow(tools: list, now: list, hits: list, src: int, query: str, pinned, first, core_names, prefer) -> dict | None:
+    """그림자 — 지금 묶음(now)과 목적 예산이었으면 묶었을 것을 같은 턴에 셈해 로그 한 줄 · /health purpose.chat 에 적는다. 묶음은 바꾸지 않는다.
+    의미 순위는 지금 묶음이 같은 질의 · 같은 도구로 방금 낸 것만 다시 쓴다(_sem_reuse) — 없으면 어휘 순위로 셈한다(order 'lex'). 실패는 삼킨다."""
+    try:
+        sem = _sem_reuse(query, tools)
+        pur, info = _select_purpose(tools, query, pinned, first, core_names, prefer, hits,
+                                    sem_order=sem if sem is not None else [], live=False)
+        cmp = _purposes.compare([getattr(t, "name", "") for t in now], [getattr(t, "name", "") for t in pur], hits)
+        tok_now, tok_pur = sum(_tool_schema_cost(t) for t in now), sum(_tool_schema_cost(t) for t in pur)
+        rec = {"at": _now_iso(), "pool": len(tools), "purposes": _purposes.brief(hits),
+               "src": "message" if src == 0 else ("history" if src > 0 else None), **cmp,
+               "tokens_now": tok_now, "tokens_purpose": tok_pur, "budget_purpose": info["budget"], "order": info["order"],
+               "path": "cap" if (TOOL_MAX > 0 and len(tools) > TOOL_MAX) else "nocap"}
+        S = _PURPOSE_CHAT
+        S["turns"] += 1
+        S["tokens_now"] += tok_now
+        S["tokens_purpose"] += tok_pur
+        if hits:
+            S["matched"] += 1
+            S["entry_missing_now"] += int(cmp["entries_now"] < cmp["entries"])
+            S["entry_missing_purpose"] += int(cmp["entries_purpose"] < cmp["entries"])
+        S["last"] = rec
+        ptxt = " · ".join(f"{h['key']}({h['cover']:.2f})" for h in hits) or "없음"
+        print(f"[agent] purpose shadow: 목적 {ptxt} — 지금 {cmp['now']}개 {tok_now:,}토큰(입구 {cmp['entries_now']}/{cmp['entries']} · 단계 "
+              f"{cmp['steps_now']}/{cmp['steps']}) → 목적 예산 {cmp['purpose']}개 {tok_pur:,}토큰(입구 {cmp['entries_purpose']}/{cmp['entries']} · 단계 "
+              f"{cmp['steps_purpose']}/{cmp['steps']}, 예산 {info['budget']}, 순위 {info['order']}) · 겹침 {cmp['overlap']} · 더함 {cmp['added']} · 뺌 {cmp['removed']}")
+        return rec
+    except Exception as exc:  # noqa: BLE001 — 그림자가 챗을 막지 않는다
+        _PURPOSE_CHAT["errors"] += 1
+        _PURPOSE_CHAT["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        print(f"[agent] purpose shadow 실패(묶음은 그대로): {exc!r}"[:300])
+        return None
+
+
+def _select_tools_purposed(tools: list, query: str, pinned, first, core_names, prefer, purpose_q: tuple = ()) -> list:
+    """챗 도구 묶기의 목적 갈래 — 손잡이 CHAT_TOOL_PURPOSE(HWAXPortal docs/mcp-modernize M3). shadow(기본)는 종전 길(_select_tools(_plain=True))로 묶고 목적 예산
+    셈을 곁에 적으며(_purpose_shadow), on 은 목적 예산(_select_purpose)으로 묶는다. off 는 여기 오지 않는다(_select_tools 가 종전 길로 바로 간다). purpose_q 는
+    목적을 고를 글들(이번 발화 → 앞 사람 발화 차례 — purposes.match_first) — 비면 이 턴의 문맥 변수(_turn_purpose_q), 그것도 비면 query 하나다."""
+    try:
+        hits, src = _chat_purpose_hits(tools, tuple(purpose_q or ()) or _turn_purpose_q.get() or (query,))
+    except Exception as exc:  # noqa: BLE001 — 목적을 못 골라도 묶음은 종전대로
+        print(f"[agent] 목적을 고르지 못했다: {exc!r}"[:300])
+        hits, src = [], -1
+    if CHAT_TOOL_PURPOSE == "on":
+        return _select_purpose(tools, query, pinned, first, core_names, prefer, hits)[0]
+    kept = _select_tools(tools, query, pinned, first, core_names, prefer, _plain=True)
+    _purpose_shadow(tools, kept, hits, src, query, pinned, first, core_names, prefer)
+    return kept
+
+
+def _purpose_bind_count(tools: list, text: str) -> dict:
+    """위임 · 루틴 그림자의 셈(HWAXPortal docs/mcp-modernize M3) — 지금 묶음(tools 전부 — 둘 다 예산 없이 묶는다)과 목적 예산 묶음(맞은 목적의 입구 ·
+    단계 → 어휘 관련도 차례로 _purpose_budget 까지, 입구는 예산과 상관없이)의 수 · 토큰 · 입구. 목적은 tools 안에 단계가 있는 것만 본다. 망을 두드리지
+    않는다(의미 순위 없이 어휘 순위만)."""
+    table = _purpose_table()
+    by = {getattr(t, "name", ""): t for t in tools}
+    hits = _purposes.match(text, table, set(by)) if table else []
+    lead = [n for n in _purposes.lead(hits) if n in by]
+    ls = set(lead)
+    rest = [t for t, _ in _relevance_order(tools, text, None, None, (), None, sem_order=[]) if getattr(t, "name", "") not in ls]
+    budget = _purpose_budget()
+    pick, tok = _purposes.fit([by[n] for n in lead] + rest, budget, _tool_schema_cost, _purposes.entries(hits))
+    cmp = _purposes.compare(list(by), [getattr(t, "name", "") for t in pick], hits)
+    return {"purposes": _purposes.brief(hits), **cmp, "tokens_now": sum(_tool_schema_cost(t) for t in tools),
+            "tokens_purpose": tok, "budget_purpose": budget}
+
+
+def _purpose_health() -> dict:
+    """/health purpose — 목적 표(받았나 · 수 · 지문)와 쓰는 쪽 넷(챗 · 좌석 · 위임 · 루틴)의 손잡이 · 그림자 셈. 목적 키와 수만 싣는다."""
+    out: dict = {}
+    try:
+        out["table"] = _purposes.table_health(_purpose_table())
+        S, n = _PURPOSE_CHAT, _PURPOSE_CHAT["turns"]
+        out["chat"] = {"mode": CHAT_TOOL_PURPOSE, "path": "cap" if TOOL_MAX > 0 else "nocap", "budget": _purpose_budget(),
+                       "budget_knob": ("CHAT_PURPOSE_BUDGET" if CHAT_PURPOSE_BUDGET > 0 else
+                                       "CHAT_TOOL_SCHEMA_BUDGET" if CHAT_TOOL_SCHEMA_BUDGET > 0 else "default"),
+                       "turns": n, "matched": S["matched"], "entry_missing_now": S["entry_missing_now"],
+                       "entry_missing_purpose": S["entry_missing_purpose"],
+                       "avg_tokens_now": round(S["tokens_now"] / n) if n else None,
+                       "avg_tokens_purpose": round(S["tokens_purpose"] / n) if n else None,
+                       "errors": S["errors"], "error": S["error"], "last": S["last"]}
+    except Exception as exc:  # noqa: BLE001 — /health 는 늘 답한다
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    for site, fn in (("seat", lambda: _delib_engine.seat_purpose_health()), ("offload", lambda: _offload.purpose_health()),
+                     ("routine", lambda: __import__("routine").purpose_health())):
+        try:
+            out[site] = fn()
+        except Exception as exc:  # noqa: BLE001
+            out[site] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    return out
 
 
 # ── 도구 검색/카탈로그 — 사용자가 직접 도구를 확인·선택하게 하는 진입점 ─────────────
@@ -3532,8 +3739,10 @@ _GW_HTTP = os.environ.get("GATEWAY_HTTP_BASE", "http://127.0.0.1:9110")
 # 좌석 자유 조회의 원래 이름 판정(HWAXPortal docs/ontology-first F0)이 본다. orig 칸이 없는 옛 게이트웨이면 None — 지금처럼 노출 이름으로 판정한다.
 # panel_read — 게이트웨이가 표지 · 읽기 목록으로 **확인한** 읽기(이름 낱말 갈래 없이 — _panel_read). 좌석 자유 조회가 선언 백엔드의 읽기를 들일 때
 # 본다(HWAXPortal docs/siren-delib HA-36). 옛 게이트웨이는 그 칸이 없어 None — 선언 백엔드 도구를 들이지 않는다(닫힌 쪽).
+# purposes — 목적 묶음 표(게이트웨이 tool_purposes.json + 박스 덧씌우기를 이 박스의 노출 이름으로 푼 것 — purposes.parse). 옛 게이트웨이 · 목적을 끈
+# 박스(GATEWAY_PURPOSES=0)는 그 칸이 없어 None 이다 — 목적 예산 · 그림자가 아무것도 고르지 않는다(HWAXPortal docs/mcp-modernize M3).
 _TOOLS_MAP_CACHE: dict = {"at": 0.0, "map": {}, "areas": {}, "area_meta": {}, "routine_read": None, "orig": None,
-                          "declared": frozenset(), "family": frozenset(), "panel_read": None}
+                          "declared": frozenset(), "family": frozenset(), "panel_read": None, "purposes": None}
 _GROUP_LABEL = {
     "ai-data-hub": "AI 데이터 허브", "mx-white-paper": "MX 백서", "reportarchive": "리포트 아카이브",
     "signalforge": "SignalForge VOC", "smart-twin-cluster": "시뮬레이션 클러스터",
@@ -3614,11 +3823,26 @@ def _tools_map() -> dict:
                                      "orig": ({k: v for k, v in _og.items() if isinstance(k, str) and isinstance(v, str)}
                                               if isinstance(_og, dict) else None),
                                      "declared": frozenset(a["app"] for a in _rows if a.get("declared") is True),
-                                     "family": frozenset(a["app"] for a in _rows if a.get("role") in ("canonical", "sibling"))})
+                                     "family": frozenset(a["app"] for a in _rows if a.get("role") in ("canonical", "sibling")),
+                                     "purposes": _purposes_parse_safe(data.get("purposes"))})
     except Exception as exc:  # noqa: BLE001 — 매핑 실패 시 그룹 없이 동작(회귀 0)
         print(f"[tools] map fetch failed — {_GW_RETRY_S:.0f}초 뒤 다시 묻는다: {exc!r}")
         _TOOLS_MAP_CACHE["retry_at"] = time.monotonic() + _GW_RETRY_S
     return _TOOLS_MAP_CACHE["map"]
+
+
+def _purposes_parse_safe(raw) -> dict | None:
+    """/tools-map purposes → 목적 표(purposes.parse). 못 읽으면 None — 목적 표 하나 때문에 도구 지도(앱 · 영역 · 읽기 판정)를 잃지 않게 따로 삼킨다."""
+    try:
+        return _purposes.parse(raw)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tools] 목적 표를 읽지 못했다 — 목적 없이 간다: {exc!r}"[:300])
+        return None
+
+
+def _purpose_table() -> dict | None:
+    """받아 둔 목적 표 — 게이트웨이를 두드리지 않는다(도구 로드의 _tag_tool_app 이 이미 지도를 새로 받는다). 시험이 캐시를 통째로 바꿔 끼워도 .get 으로 읽는다."""
+    return _TOOLS_MAP_CACHE.get("purposes")
 
 
 def _free_judge_names() -> dict:
@@ -5106,6 +5330,10 @@ async def _agent_for(app: FastAPI, groups: list[str], pinned: list[str] | None =
     # 캡이 걸린 환경에서는 바인딩 도구가 질의에 따라 달라진다 — 질의 토큰을 캐시 키에 넣어
     # 같은 주제는 재사용하고 다른 주제는 새로 구성한다(무제한 환경은 종전대로 그룹 단위 캐시).
     q_key = tuple(sorted(_tok_query(query))[:8]) if TOOL_MAX > 0 else ()
+    # 목적 예산을 켠 캡 길은 고른 목적도 키에 든다 — 질의 낱말 앞 여덟이 같아도 목적이 다르면 묶음이 다르다(HWAXPortal docs/mcp-modernize M3). 무캡 길은
+    # 잘라 만든 에이전트를 턴마다 원본에서 다시 고른다(아래 HA-01) — 키를 늘리지 않는다. 그 사람 시야를 모르는 자리라 박스 표 전체로 본다(가르기만 하면 된다).
+    if CHAT_TOOL_PURPOSE == "on" and TOOL_MAX > 0:
+        q_key = (q_key, tuple(h["key"] for h in _chat_purpose_hits(None, _turn_purpose_q.get() or (query,))[0]))
     # 소스 토글은 바인딩 구성을 바꾸므로 캐시 키에 들어가야 한다 — 안 넣으면 앞 대화의
     # 캐시된 에이전트가 재사용돼 토글이 무시된다(조용히 켜진 채로 남는다).
     # ⚠ 호출자 신원은 반드시 키에 있어야 한다. 도구는 생성 시점의 헤더를 물고 있어서,
@@ -7499,6 +7727,10 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
             if isinstance(h, dict)
         )
         _sel_q = f"{_recent} {req.message}".strip() if _recent else req.message
+        # 목적을 고를 글(HWAXPortal docs/mcp-modernize M3) — 이번 발화를 먼저, 못 맞히면 앞 사람 발화 둘(최근부터). 이어 붙이지 않고 하나씩 본다 — 덮음(맞은
+        # 트리거 글자 / 질의 길이)이 앞 대화 길이만큼 묽어진다(purposes.match_first).
+        _turn_purpose_q.set((req.message, *[str(h.get("content", ""))[:300] for h in reversed(req.history or [])
+                                            if isinstance(h, dict) and h.get("role") == "user"][:2]))
         # 전문가를 앉혔으면 **그 사람이 쓸 줄 아는 도구**가 먼저 붙어야 한다. 종전에는 운영자
         # 페르소나만 도구가 바뀌고(op_apps·key_tools) 도메인 전문가는 질문 어휘로만 골라서,
         # 물성 전문가를 골라도 물성 DB 가 캡 밖으로 밀리는 일이 있었다 — 전문가를 고른 효과가
@@ -10691,6 +10923,9 @@ def health() -> dict:
         # 마지막 챗 도구 절단 — 스키마 예산(창의 45%)을 넘어 뺀 수 · 앱별 수 · 상한. 없으면 null(아직 안 잘렸다 — 기동 뒤 첫 챗 턴 전이거나
         # 다 들었다). update-all 헬스게이트가 '챗 도구 절단 N개' 로 읽는다(HWAXPortal docs/chat-depth-context F1 · F3).
         "tool_cut": dict(_TOOL_CUT) or None,
+        # 목적 묶음(HWAXPortal docs/mcp-modernize M3) — 게이트웨이 목적 표를 받았나 · 챗 목적 예산(mode off · shadow · on, 예산, 그림자 합 · 마지막 턴) ·
+        # 좌석 · 위임 · 루틴 그림자. 켤지는 chat.entry_missing_now(지금 묶음이 맞은 목적의 입구를 놓친 턴)와 avg_tokens 두 값으로 본다.
+        "purpose": _purpose_health(),
         # 허브 응답 접기 — 기동 뒤 글이 줄어든 접기의 횟수 · 원문 자 수 합 · 접은 뒤 자 수 합(HWAXPortal docs/request-1030 HA-34). 챗 · 심의의
         # 도구 결과를 함께 센다(같은 래퍼다). count 가 0 이면 아직 한 번도 접지 않았다. 큰 응답이 접혔는지는 합이 아니라 로그 줄의 원문 자 수로 가른다.
         "hub_fold": _hub_fold_health(),

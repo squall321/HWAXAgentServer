@@ -1098,6 +1098,20 @@ the chat window (about 88,000 tokens on a 262,144 window). `CHAT_TOOL_SCHEMA_BUD
 value instead; empty or 0 keeps the 45%. The default is unchanged on purpose (portal decision D-3) — compare 30,000 and
 40,000 on the box with the same 16 questions first. A smaller bundle means more `search_tools` → `invoke_tool` round trips.
 
+**Purpose budget (portal docs/mcp-modernize M3).** The gateway's `/tools-map` carries `purposes` — its purpose table
+(`tool_purposes.json` + box overlay) resolved to this box's exposed names (`purposes.py` reads it; steps missing on this box
+have no name). The chat picks 1 – 3 purposes per turn with the gateway's `search_tools` purpose-layer rule (every
+space-separated piece of a trigger inside the space-stripped query; score = longest matched trigger; cover ≥ 0.2) — this
+message first, then the last two user messages one by one — and binds their entries and steps right after the explicit
+picks (`first`). Without a tool cap the budget is absolute instead of 45% of the window: `CHAT_PURPOSE_BUDGET` >
+`CHAT_TOOL_SCHEMA_BUDGET` > 40,000, never above 45% of the window. The capped path keeps `TOOL_MAX` / `TOOL_SCHEMA_BUDGET`;
+only entries are protected from the core reservation. `CHAT_TOOL_PURPOSE` — `off` (old path, no purpose work) · `shadow`
+(default — binds the old way, computes the purpose bundle in the same turn without new embedding calls or `tool_cut`
+changes, logs `[agent] purpose shadow: …`, fills `/health purpose.chat`) · `on`. Seats (`DELIB_SEAT_PURPOSE`), delegation
+(`OFFLOAD_PURPOSE`) and routine steps (`ROUTINE_PURPOSE`) have shadow-only knobs (`off` · `shadow`, default `shadow`): they
+never change bound tools, the seat fence (`_FREE_ALLOW`) or results, and risk review is not counted (D-18). Shadow costs
+about 40 ms per chat turn at 2,400 tools.
+
 ### Seat-choice baseline (portal docs/request-1029 design-e5 — E5-0 · E5-1 · E5-2 · E5-4)
 
 Measures who gets picked — deliberation first seats, thinking candidates and screening, the pinned expert's preferred
