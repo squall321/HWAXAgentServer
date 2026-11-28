@@ -2559,6 +2559,93 @@ def insight_items(since: float = 0.0, limit: int = 200) -> dict:
             "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}
 
 
+# ── 잡 주인의 포털 대화 — 끝난 MCP 심의의 대화 거리(HWAXPortal docs/request-1125 WD-03) ─────────────────────────────────────────────────
+# MCP 로 연 심의가 포털 대화 목록 · 검색에 남지 않았다(save_conversation 은 74잡 동안 0회 · 읽기 전용 PAT 는 거절). 과제 인사이트처럼 포털이 공유 비밀
+# 창구(app GET /delib/conversations)로 읽어 간다 — 엔진이 밀지 않는다(PG-9 와 같다: 어느 쪽이 내려가 있어도 다음 읽기에 따라잡는다). 내는 잡은 끝났고
+# (done · error · cancelled · interrupted — 결정문이나 발언이 하나는 있다) 주인이 있고(@) 리스크 앱이 띄운 잡(started_by=app — 그 앱의 웹 패널이 이미
+# 대화로 남긴다)이 아닌 심의다. 행은 화두 → 좌석 발언 → 결정문, meta 는 job_id · 뿌리 job_id(이어하기 사슬의 맨 앞 — 포털은 이것으로 한 대화에 묶고
+# job_id 로 멱등하게 붙인다) · 근거 목록(본문 없이) · 주제 · 보고서. 계약 이름은 포털이 견준다.
+CONV_CONTRACT = "delib-conversations/1"
+CONV_LIMIT_MAX = 50
+CONV_ROOT_HOPS = 20
+_CONV_DONE = ("done", "error", "cancelled", "interrupted")
+
+
+def _conv_head_ok(j: dict, since: float) -> bool:
+    return (not is_task(j) and j.get("status") in _CONV_DONE and float(j.get("finished_at") or 0) >= since
+            and "@" in _norm(j.get("user")) and j.get("started_by") != "app")
+
+
+def conv_root(j: dict) -> str:
+    """이어하기 사슬의 맨 앞 잡 id — continues(이어하기) · resumed_from(끊긴 잡의 요약 이어하기)을 CONV_ROOT_HOPS 번까지 따라간다(돌면 멈춘다)."""
+    cur, seen = j, {j.get("id")}
+    for _ in range(CONV_ROOT_HOPS):
+        prev = cur.get("continues") or cur.get("resumed_from")
+        if not prev or prev in seen:
+            break
+        seen.add(prev)
+        nxt = get(str(prev))
+        if not nxt:
+            return str(prev)
+        cur = nxt
+    return str(cur.get("id"))
+
+
+def _conv_item(j: dict) -> dict | None:
+    """원장 전부 → 대화 거리 하나(발언 · 결정문이 하나도 없으면 None)."""
+    turns = [t for t in (j.get("turns") or []) if isinstance(t, dict)]
+    decision = j.get("decision") or j.get("result_text") or ""
+    if not turns and not decision:
+        return None
+    rows = [{"role": "user", "kind": "question", "content": str(j.get("question") or "")}]
+    for t in turns:
+        say = str(t.get("say_full") or t.get("say") or "")
+        if say:
+            rows.append({"role": "assistant", "kind": "seat", "persona": str(t.get("persona") or t.get("key") or ""),
+                         "round": t.get("round") or t.get("rnd"), "content": say})
+    if decision:
+        rows.append({"role": "assistant", "kind": "decision", "content": str(decision)})
+    ev = [e for e in ((j.get("opts") or {}).get("evidence") or []) if isinstance(e, dict)]
+    evidence = [{k: e.get(k) for k in ("source", "tool", "key") if e.get(k) is not None} | {"chars": len(str(e.get("result") or ""))}
+                for e in ev][:100]
+    meta = {"job_id": j["id"], "root_job_id": conv_root(j), "job": j.get("job"), "chair_template": j.get("chair_template"),
+            "status": j.get("status"), "evidence": evidence, "evidence_refs": list(j.get("evidence_refs") or [])[:100],
+            "subject": j.get("subject"), "report_id": j.get("report_id"), "report_url": j.get("report_url") or None,
+            "continues": j.get("continues") or j.get("resumed_from") or None}
+    return {"job_id": j["id"], "root_job_id": meta["root_job_id"], "kind": "deliberation", "source": "mcp",
+            "user": str(j.get("user") or ""), "owner_aff": str(j.get("owner_aff") or ""), "question": str(j.get("question") or ""),
+            "started_at": float(j.get("started_at") or 0), "finished_at": float(j.get("finished_at") or 0), "rows": rows, "meta": meta}
+
+
+def conversation_items(since: float = 0.0, limit: int = 20) -> dict:
+    """끝난 MCP 심의의 대화 거리 — finished_at 오름차순, since 이상(경계는 다음 부름에 다시 나올 수 있다 — 받는 쪽이 job_id 로 하나로 만든다).
+    고르는 셈은 insight_items 와 같다(mtime → 목록 색인 → 고른 잡만 통째로). 답 {contract, items, next_since, complete}."""
+    lim = max(1, min(int(limit), CONV_LIMIT_MAX))
+    found: dict = {jid: j for jid, j in list(_JOBS.items()) if _conv_head_ok(j, since)}
+    try:
+        files = list(JOB_DIR.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        if f.stem in found:
+            continue
+        try:
+            if f.stat().st_mtime < since - _INSIGHT_MTIME_SLACK_S:
+                continue
+        except OSError:
+            continue
+        head = _list_load(f)
+        if head and _conv_head_ok(head, since):          # 색인에는 started_by 가 없다 — 통째로 읽은 뒤 다시 본다
+            full = _load(f.stem)
+            if full and _conv_head_ok(full, since):
+                found[f.stem] = full
+    items = [it for it in (_conv_item(j) for j in sorted(found.values(), key=lambda j: float(j.get("finished_at") or 0)))
+             if it is not None]
+    page = items[:lim]
+    return {"contract": CONV_CONTRACT, "items": page,
+            "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}
+
+
 # ── 이용 통계 — 잡의 머리(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────
 # 포털이 공유 비밀 창구(app /usage-rollup)로 날마다 읽어 간다. 셈은 usage_rollup.py 가 하고, 여기서는 원장에서 머리(목록 색인의 칸)만 모은다.
 _USAGE_MTIME_SLACK_S = 86400.0   # 잡은 생긴 뒤에만 고쳐진다 — 원장 파일 mtime 이 창의 첫날보다 하루 넘게 앞서면 그 창에 든 잡이 아니다

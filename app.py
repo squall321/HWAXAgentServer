@@ -10697,6 +10697,21 @@ def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
     return delib_jobs.insight_items(since, limit)
 
 
+# GET /delib/conversations — 끝난 MCP 심의를 잡 주인의 포털 대화로(delib_jobs.conversation_items — HWAXPortal docs/request-1125 WD-03). **공유 비밀만**
+# (/insights/cards 와 같은 값) — 모든 사람의 화두 · 발언 · 결정문을 내므로 사람 신원 머리(x-hwax-user)를 실은 호출은 받지 않는다(403 — 이용 통계 창구와 같다).
+@app.get("/delib/conversations")
+def delib_conversations(request: Request, since: float = 0.0, limit: int = 20):
+    import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "대화 거리 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다", 403)
+    if not (since >= 0.0) or limit < 1:
+        return JSONResponse({"error": "since 는 0 이상의 epoch 초, limit 은 1 이상이다"}, status_code=422)
+    return delib_jobs.conversation_items(since, limit)
+
+
 # ── 이용 통계 창구(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────────────────
 # GET /usage-rollup?since&until · POST /usage-rollup {since, until, exclude} — MCP 심의 잡 원장을 KST 날마다 센 수(usage_rollup.py). 포털 서비스가 날마다
 # 읽어 관리자 '이용 통계' 에 접어 둔다. **공유 비밀만**(/seat-questions 와 같은 값) — 모든 사람의 잡 수(이메일 · 소속)를 내므로 사람 신원 머리
