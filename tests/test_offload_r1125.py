@@ -139,3 +139,38 @@ def test_OF2_설명에_일_크기별_권장과_incomplete_를_적는다():
         assert "20~30" in d
     assert "incomplete" in m._DG_START_DESC and "unfilled" in m._DG_RESULT_DESC and "stop{reason" in m._DG_RESULT_DESC
     assert "다시 찾는다" in offload._DELEGATE_SYS and "[못 채운 것]" in offload._DELEGATE_SYS
+
+
+# ── 2절 A-1 앞선 결과 줄여 싣기 ────────────────────────────────────────────────────────────────────────────────
+def test_A1_앞선_결과는_LLM_입력에서만_줄이고_방금_받은_결과는_그대로(kit):
+    long_a, long_b = "가" * 4000, "나" * 4000
+    _kit_tools(kit, {"rep_a": _tool("rep_a", long_a), "rep_b": _tool("rep_b", long_b)})
+    kit.mp.setattr(offload, "PRIOR_RESULT_CHARS", 1000)
+    kit.llm.script = [_ai("", _call("rep_a", q="1")), _ai("", _call("rep_b", q="2")), _ai("끝.\n[못 채운 것] 없음")]
+
+    async def scenario():
+        out = await m.delegate_start(task="두 보고서를 읽어라", ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    last = [x for x in kit.llm.seen[-1] if getattr(x, "type", "") == "tool"]
+    assert len(last) == 2
+    assert last[0].content.startswith("[근거 e1] " + "가" * 900) and long_a not in last[0].content and "앞선 결과" in last[0].content
+    assert len(last[0].content) < 1200
+    assert long_b in last[1].content, "방금 받은 결과는 줄이지 않는다"
+    second = [x for x in kit.llm.seen[1] if getattr(x, "type", "") == "tool"]
+    assert long_a in second[0].content, "그 결과를 받은 바로 다음 차례에는 전문이 보인다"
+    assert [e["chars"] for e in res["evidence"]] == [4000, 4000], "근거 표 · 숫자 대조는 원문 그대로"
+
+
+def test_A1_0_이면_종전처럼_줄이지_않는다(kit):
+    _kit_tools(kit, {"rep_a": _tool("rep_a", "가" * 4000)})
+    kit.mp.setattr(offload, "PRIOR_RESULT_CHARS", 0)
+    kit.llm.script = [_ai("", _call("rep_a", q="1")), _ai("", _call("voc_search", q="2")), _ai("끝.")]
+
+    async def scenario():
+        out = await m.delegate_start(task="읽어라", ctx=_ctx())
+        await _done(out["job_id"])
+    _run(scenario)
+    last = [x for x in kit.llm.seen[-1] if getattr(x, "type", "") == "tool"]
+    assert "가" * 4000 in last[0].content

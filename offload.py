@@ -103,6 +103,11 @@ if DELEGATE_MAX_RUNNING < 1:
     log.warning("env DELEGATE_MAX_RUNNING=%d 는 1 미만 — 기본값 2 로 읽는다", DELEGATE_MAX_RUNNING)
     DELEGATE_MAX_RUNNING = 2
 DELEGATE_PER_USER = 1
+# 앞선 결과 줄여 싣기(HWAXPortal docs/request-1125 2절 A-1) — 실행기는 ReAct 라 LLM 을 부를 때마다 앞의 도구 결과를 **전부** 다시 싣는다(확인 11-28:
+# create_react_agent 가 대화 전체를 넘기고, 결과 한 건 상한은 창을 호출 수로 나눈 값이라 1M 창이면 건당 수만 자다). 위임 23건의 서버 입력이 건당
+# 0.98M 토큰이던 까닭이다. 마지막 차례(가장 최근 AI 호출에 대한 결과)는 그대로 두고, 그 앞의 결과는 LLM 입력에서만 이 글자로 줄인다 — 원장의
+# 메시지 · 근거 원문(숫자 대조) · 정리 턴은 그대로다. 0 이면 종전(줄이지 않는다).
+PRIOR_RESULT_CHARS = _env_int("DELEGATE_PRIOR_RESULT_CHARS", 6000)
 TASK_MAX = 8000             # 맡길 일 한 줄의 글자 상한 — 넘으면 거절한다(근거 본문은 일에 싣지 말고 도구로 읽게 한다)
 APPS_MAX = 10
 ANSWER_MAX = 10_000         # 위임 답 · 결과 회수가 MCP 결과 상한(mcp_pages.PAGE_CHARS 25,000자) 안에 들게
@@ -423,6 +428,25 @@ def _few_hits(text: str) -> bool:
     return False
 
 
+def _trim_prior(state) -> dict:
+    """LLM 입력에서만 앞선 도구 결과를 줄인다(A-1) — 마지막 AI 메시지 뒤의 결과(방금 받은 것)는 그대로, 그 앞의 ToolMessage 는
+    PRIOR_RESULT_CHARS 자와 표지. 상태(원장에 남는 메시지)는 바꾸지 않는다."""
+    msgs = list((state or {}).get("messages") or [])
+    cap = int(PRIOR_RESULT_CHARS or 0)
+    if cap <= 0:
+        return {"llm_input_messages": msgs}
+    last_ai = max((i for i, m in enumerate(msgs) if getattr(m, "type", "") == "ai"), default=-1)
+    out = []
+    for i, m in enumerate(msgs):
+        if getattr(m, "type", "") == "tool" and i < last_ai:
+            t = _text(getattr(m, "content", ""))
+            if len(t) > cap:
+                m = m.model_copy(update={"content": t[:cap] + f"\n…[앞선 결과 — {len(t):,}자 가운데 앞 {cap:,}자만 다시 싣는다. 그 근거 id 로 "
+                                                             "인용하면 된다 — 같은 호출을 다시 하지 마라]"})
+        out.append(m)
+    return {"llm_input_messages": out}
+
+
 def _proxy(base, run: _Run, cap: int):
     """그 사람의 노출 도구와 겉(이름 · 설명 · 인자 스키마)이 같고 속은 그 도구를 부르며 근거를 적는 새 도구(routine._proxy 와 같은 꼴). 호출 예산을
     다 쓰면 부르지 않고 '정리하라' 를 돌려준다. LLM 에는 cap 자까지 보이고, 숫자 대조에는 받은 글 전부를 쓴다."""
@@ -485,8 +509,8 @@ _WRAP_SYS = (
 
 
 def _rec_limit(steps: int) -> int:
-    """그래프 걸음 상한 — 호출 수 × 2 + 5."""
-    return steps * 2 + 5
+    """그래프 걸음 상한 — 호출 N 번이면 LLM 차례 N+1 번(앞마다 앞선 결과 줄이기 마디 하나 — A-1) + 도구 차례 N 번 = 3N+2, 여유 넷."""
+    return steps * 3 + 6
 
 
 async def _react(llm, tools: list, sysmsg: str, human: str, run: _Run) -> None:
@@ -495,7 +519,7 @@ async def _react(llm, tools: list, sysmsg: str, human: str, run: _Run) -> None:
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
     from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
     run.msgs = [SystemMessage(content=sysmsg), HumanMessage(content=human)]
-    agent = create_react_agent(llm, tools)
+    agent = create_react_agent(llm, tools, pre_model_hook=_trim_prior)
     async for st in agent.astream({"messages": run.msgs}, config={"recursion_limit": _rec_limit(run.max_steps)}, stream_mode="values"):
         got = list((st or {}).get("messages") or [])
         if len(got) <= len(run.msgs):
