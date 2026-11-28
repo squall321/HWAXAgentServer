@@ -10197,6 +10197,10 @@ def _safe_cut(text: str, limit: int) -> int:
     return limit
 
 
+_SIM_PART_COLS = ("pid", "title", "elem_class", "n_elems", "area_ext", "volume", "material")
+_SIM_SHORT_MAX = 2000           # SIM 카드의 접촉 · 붙임 절 글자
+
+
 def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> dict:
     """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
     그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다).
@@ -10243,6 +10247,30 @@ def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> di
         if src.get("title") or src.get("doi") or src.get("url"):
             out["sources"].append({k: str(src.get(k) or "")[:300] for k in ("title", "doi", "url", "kind", "authors")}
                                   | {"year": src.get("year") if isinstance(src.get("year"), int) else None})
+    comps = content.get("components")
+    if not secs and out["table"] is None and isinstance(comps, list) and comps and all(isinstance(c, dict) for c in comps):
+        # 모의해석(SIM) 카드의 부품 표(HWAXPortal docs/request-1125 HA-19) — components 가 dict 목록이면 표로, 접촉 · 붙임은 짧은 절로, 남은 칸은 원문(JSON)
+        def _mat(c):
+            m = c.get("material")
+            return m.get("name") if isinstance(m, dict) else m
+        out["table"] = {"caption": "부품", "headers": list(_SIM_PART_COLS),
+                        "rows": [[_cell(c.get(k) if k != "material" else _mat(c)) for k in _SIM_PART_COLS] for c in comps[:RECORD_ROWS_MAX]],
+                        "total_rows": len(comps), "notes": ""}
+        if len(comps) > RECORD_ROWS_MAX:
+            out["truncated"] = True
+        for key, title in (("contact_edges", "접촉"), ("attachments", "붙임")):
+            v = content.get(key)
+            if v:
+                t = json.dumps(v, ensure_ascii=False, default=str)
+                out["sections"].append({"id": "", "title": title, "level": 1,
+                                        "text": "```json\n" + t[:_SIM_SHORT_MAX] + ("\n…" if len(t) > _SIM_SHORT_MAX else "") + "\n```"})
+        content = {k: v for k, v in content.items() if k not in ("components", "contact_edges", "attachments")}
+        rest = {k: v for k, v in content.items() if k != "sources"}
+        if rest:
+            text = json.dumps(rest, ensure_ascii=False, indent=1, default=str)
+            out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1, "text": "```json\n" + text[:RECORD_TEXT_MAX] + "\n```"})
+        out.update(total_sections=len(out["sections"]) or 1,
+                   total_chars=sum(len(x["text"]) for x in out["sections"]) + len(comps))
     if not secs and out["table"] is None:  # 끝을 넘긴 section_offset 이 원문(JSON) 보기로 바뀌지 않게
         rest = {k: v for k, v in content.items() if k != "sources"}
         if rest:
