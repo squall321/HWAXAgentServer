@@ -2027,8 +2027,11 @@ _A_DG_APPS = f"조회를 이 앱들(게이트웨이 백엔드 키 — list_tool_
 _A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다."
 _A_DG_MIN = f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다."
 _A_DG_JOB = "위임 잡 id(delegate_start 응답의 job_id)."
-_A_DG_WAIT = (f"초 — 주면 상태 · 단계가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초). 깬 까닭은 wait.woke — "
-              "ended · changed · timeout · closing · paused. 기본 0(기다리지 않는다).")
+# 위임 상태의 기본 기다림(OF-5) — 심의 진행 조회의 기본 상한과 같은 240초(게이트웨이 호출 한도 600초보다 넉넉히 안쪽)
+DELEGATE_WAIT_DEFAULT_S = STATUS_WAIT_DEFAULT_S
+_A_DG_WAIT = (f"초 — 상태 · 단계가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초). 깬 까닭은 wait.woke — "
+              f"ended · changed · timeout · closing · paused. 기본 {DELEGATE_WAIT_DEFAULT_S:g}(이 서버의 상한이 더 작으면 상한) — 0 이면 "
+              "기다리지 않는다.")
 _A_DG_VIEW = ("full(기본 — 답 · 근거 표 evidence[{id, tool, args, chars, ok}] · 숫자 대조 · 모델 · 호출 수 · 토큰) | summary(근거 표 대신 "
               "evidence_n · evidence_tools). 답을 읽는 데는 summary 로 충분하다.")
 _DG_START_DESC = (
@@ -2038,11 +2041,13 @@ _DG_START_DESC = (
     "심의는 묶이지 않는다. 즉시 job_id 를 돌려주고 뒤에서 돈다 — delegate_status(job_id, wait_s) 를 **한 번** 부르고(고리로 거듭 묻지 마라) "
     "끝나면 delegate_result(job_id, view=\"summary\"). 동시에 서버 전체 " + f"{offload.DELEGATE_MAX_RUNNING}건 · 사람마다 "
     f"{offload.DELEGATE_PER_USER}건 돈다 — 넘치면 줄을 선다(status=queued · queue 에 순번, 자리가 나면 스스로 시작한다 — 다시 시작하지 마라). "
+    "줄이 길면(queue.position 이 2 이상이거나 기다린 뒤에도 queued) 기다리지 말고 delegate_cancel 로 접은 뒤 직접 읽는다. "
     "답의 숫자는 서버 코드가 근거 원문과 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다 — 어긋난 수는 쓰기 전에 확인한다). 서버가 재기동하면 "
     "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다.")
 _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · running · done · error · cancelled · interrupted) · 단계(tools · gather · answer) · "
-                   "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. **wait_s 로 한 번** 부르면 바뀌거나 끝날 때까지 서버가 기다린다 — 고리로 거듭 묻지 마라. "
-                   "done 이면 delegate_result.")
+                   "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. 기본으로 바뀌거나 끝날 때까지 서버가 기다린다(wait_s 기본 "
+                   f"{DELEGATE_WAIT_DEFAULT_S:g}초) — **한 번** 부르고 고리로 거듭 묻지 마라. done 이면 delegate_result. 줄이 길면(queue 순번 2 "
+                   "이상 · 기다린 뒤에도 queued) delegate_cancel 로 접고 직접 읽는다.")
 _DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched}, model, steps, tokens{input, output}}. answer 의 [eN] 은 "
                    "evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수)다. 끝나지 않았으면 상태와 "
                    "안내만 준다. 내가 맡긴 위임만 보인다.")
@@ -2117,17 +2122,23 @@ async def delegate_start(task: Annotated[str, Field(description=_A_DG_TASK)],
     clamped = [x for x in (c1 and f"max_steps {c1}", c2 and f"max_minutes {c2}") if x]
     if clamped:
         out["clamped"] = clamped
-    out["note"] = ((f"줄을 섰다 — 내 순번 {q['position']}번째({q['why']}). 자리가 나면 스스로 시작한다 — 다시 시작하지 마라. " if q else "맡겼다 — ")
-                   + "delegate_status(job_id, wait_s) 를 한 번 부르고, 끝나면 delegate_result(job_id, view=\"summary\").")
+    out["note"] = ((f"줄을 섰다 — 내 순번 {q['position']}번째({q['why']}). 자리가 나면 스스로 시작한다 — 다시 시작하지 마라. "
+                    + ("줄이 길다 — 기다리지 않으려면 delegate_cancel 로 접고 직접 읽는다. " if q.get("position", 0) >= 2 else "") if q else "맡겼다 — ")
+                   + f"delegate_status(job_id) 를 한 번 부르고(기본으로 최대 {DELEGATE_WAIT_DEFAULT_S:g}초 서버가 기다린다), 끝나면 "
+                   "delegate_result(job_id, view=\"summary\").")
     return out
 
 
 async def delegate_status(job_id: Annotated[str, Field(description=_A_DG_JOB)],
-                          wait_s: Annotated[float, Field(description=_A_DG_WAIT)] = 0,
+                          wait_s: Annotated[float, Field(description=_A_DG_WAIT)] = DELEGATE_WAIT_DEFAULT_S,
                           ctx: Context | None = None) -> dict:
-    """위임 진행 — wait_s 를 주면 심의 진행 조회와 같은 기다림(_status_wait — 상태 · 단계가 바뀌거나 끝날 때까지)."""
+    """위임 진행 — 심의 진행 조회와 같은 기다림(_status_wait — 상태 · 단계가 바뀌거나 끝날 때까지). 기본값은 기다린다(HWAXPortal docs/request-1125
+    OF-5 — 기본 0 이라 첫 호출부터 기다리지 않아 위임 32회에 상태 호출이 46번이었다). 기본값을 그대로 받았는데 이 서버의 상한
+    (DELIB_STATUS_WAIT_MAX_S)이 더 작으면 상한까지만 말없이 기다린다 — 부르는 쪽이 고른 값이 아니라 죈 사실을 적지 않는다."""
     job, _user = _delegate_job(job_id, ctx)
     waited = None
+    if wait_s == DELEGATE_WAIT_DEFAULT_S:
+        wait_s = min(wait_s, STATUS_WAIT_MAX_S)
     if wait_s:
         job, waited = await _status_wait(job["id"], job, wait_s)
     out = offload.status_view(job)
