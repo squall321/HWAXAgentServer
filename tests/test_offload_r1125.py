@@ -44,3 +44,10 @@ def test_OF5_기본값은_서버_상한까지만_말없이_죄고_준_값은_그
     assert asked == [90.0, 30], "기본값은 상한 90 으로, 준 30 은 그대로, 0 은 기다리지 않는다"
     assert a["wait"]["wait_s"] == 90.0 and "wait" not in c
     assert "기본으로 최대 240초" in out["note"]
+
+
+# ── OF-4 초안 권고는 긴 절에만 ─────────────────────────────────────────────────────────────────────────────────
+def test_OF4_초안_설명은_긴_절에만_쓰라고_첫머리에_적는다():
+    head = m._DR_DESC[:160]
+    assert "긴 절" in head and "직접 쓴다" in head and f"{m.offload.DRAFT_TARGET_DEFAULT:,}자" in head
+    assert "통째로 다시 쓰지 말고" in m._DR_DESC

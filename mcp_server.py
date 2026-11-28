@@ -2064,7 +2064,12 @@ _X_DR_REFS = {"items": {"anyOf": [
         "args": {"type": "object", "description": "그 도구의 인자."}}}]}}
 _A_DR_STYLE = "꼴 — " + " · ".join(f"{k}({v})" for k, v in offload.STYLES.items()) + "."
 _A_DR_TARGET = f"길이(자) — 기본 {offload.DRAFT_TARGET_DEFAULT:,} · 200~{offload.DRAFT_TARGET_MAX:,} 로 죈다."
+# OF-4(HWAXPortal docs/request-1125) — 짧은 글에도 권해 Claude 가 초안을 다시 읽고 고치느라 쓰기 과제의 Claude 비용이 −0.5% 였다(11-24 비교).
+# 긴 절에만 쓰라고 첫 줄에 적는다 — 기준 길이는 초안 기본 길이(DRAFT_TARGET_DEFAULT)다.
+_DR_LONG_MIN = offload.DRAFT_TARGET_DEFAULT
 _DR_DESC = (
+    f"**긴 절(약 {_DR_LONG_MIN:,}자 넘게 쓸 글)에만 쓴다** — 그보다 짧은 글 · 문장을 고칠 글 · 이미 쓴 글을 다듬는 일은 직접 쓴다(초안을 다시 "
+    "읽고 고치면 토큰이 오히려 는다). 받은 초안은 통째로 다시 쓰지 말고 고칠 곳만 고친다. "
     "긴 글 서버 작성 — 개요 + 근거 손잡이로 서버의 GLM 이 보고서 절 초안을 쓴다 → {draft, numbers{checked, mismatched}, sources, model, "
     "tokens{input, output}(서버 LLM 토큰 — 모르면 null)}. 근거 원문은 "
     "서버가 읽어 GLM 에 싣고 이 대화로 오지 않는다. 숫자는 서버 코드가 근거와 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다). 동기 호출이다 — "
