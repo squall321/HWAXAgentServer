@@ -2438,10 +2438,13 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
 # 목록을 만들 때 훑는 원장 파일 수의 상한. 남의 잡은 세지 않고 지나가므로(아래) 제 잡이 드문 사람은 파일을
 # 더 깊이 훑는다 — 원장이 아주 큰 박스에서 목록 한 번이 파일 전부를 읽지 않게 막아 둔다.
 LIST_SCAN_MAX = 300
+# 날짜 · 글로 거르는 목록(deliberate_list since · until · query — HWAXPortal docs/request-1125 WD-08)은 최근 창보다 깊이 훑는다 — 보름 전 심의는 최근
+# 300개 창 밖이라 못 찾았다. 목록 색인만 읽으므로(원장 전부가 아니다) 이 수까지는 가볍다. since 를 주면 그보다 오래 고쳐지지 않은 파일에서 멈춘다.
+LIST_SCAN_DEEP_MAX = 5000
 
 
 def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer_admin: bool = False,
-              where=None, info: dict | None = None) -> list[dict]:
+              where=None, info: dict | None = None, deep: bool = False, mtime_floor: float | None = None) -> list[dict]:
     """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게는 **볼 수 있는 잡만**(can_read — 제 잡 · 같은
     소속의 잡, 관리자는 전부) 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)은 종전대로 전부 본다.
 
@@ -2452,14 +2455,15 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
 
     where(잡 → 참거짓)를 주면 볼 수 있는 잡 가운데 그것이 참인 잡만 싣는다 — 주제로 거르는 목록(delib_subject.matches)이 쓴다. 거름은 목록 색인의
     칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned) · 훑는 창(window — 최근 몇 개를 보나) · 원장 파일 수(total — 원장 폴더를 다 읽지
-    못했으면 None) · 볼 수 있는 잡이 limit 보다 더 있었나(more)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
+    못했으면 None) · 볼 수 있는 잡이 limit 보다 더 있었나(more)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다. deep 이면 창이 LIST_SCAN_DEEP_MAX 이고
+    (날짜 · 글로 거르는 목록 — WD-08), mtime_floor(epoch 초)를 주면 그보다 앞서 고쳐진 파일에서 멈춘다(잡은 생긴 뒤에만 고쳐진다)."""
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
         # 심의가 아닌 잡(TASK_KINDS — 위임)은 심의 목록에 싣지 않는다 — 그 종류의 도구로 본다
         return not is_task(j) and can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
     seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
-    window = max(limit * 3, LIST_SCAN_MAX)
+    window = max(limit * 3, LIST_SCAN_DEEP_MAX if deep else LIST_SCAN_MAX)
     scanned = total = 0
     try:
         kept = 0
@@ -2468,6 +2472,13 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
         for f in files[:window]:
             if kept >= limit * 3:
                 break
+            if mtime_floor is not None:
+                try:
+                    if f.stat().st_mtime < mtime_floor:
+                        scanned = total     # 그 앞은 모두 더 오래됐다 — 다 본 셈이다(창이 끊은 것이 아니다)
+                        break
+                except OSError:
+                    continue
             scanned += 1
             j = _list_load(f)        # 목록 색인 — 원장 파일(수 MB)을 통째로 읽지 않는다
             if not j or not ok(j):

@@ -19,6 +19,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 from typing import Annotated, Literal
 from urllib.parse import unquote
 
@@ -660,6 +661,9 @@ _A_VIEW = ("full(기본 — 결정문 전문에 쉬운 설명 · 좌석 상세 �
            "consistency 는 결정문의 만장일치 · 전원 합의 문장과 표결의 대조다 — 반대 · 조건부 · 미표명 표가 있는데 그런 문장이 있으면 match 가 거짓). "
            "summary 를 먼저 받고 모자랄 때만 full.")
 _A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
+_A_LIST_SINCE = "이 날(YYYY-MM-DD, 서버 시각) 또는 이 시각(ISO 8601) 이후에 시작한 심의만. 주면 최근 창보다 깊이 훑는다."
+_A_LIST_UNTIL = "이 날(YYYY-MM-DD — 그날 끝까지) 또는 이 시각(ISO 8601)까지 시작한 심의만."
+_A_LIST_QUERY = "화두 · 심의 종류 · 의장 틀 · job_id 에 이 글이 든 심의만(대소문자 무시, 최대 200자). 주면 최근 창보다 깊이 훑는다."
 _A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
 _A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
 _A_TR_SEAT = "이 좌석 키가 든 발언만. 비우면 전체다."
@@ -1500,11 +1504,15 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                       "심의와 **같은 소속**의 심의가 실린다(행의 mine 이 내 것인지, owner 가 시작한 사람이다 — 주인이 안 적힌 "
                       "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. "
                       "subject={sp_task, round?} 를 주면 그 과제(· 차수)로 확인된 주제를 단 심의만 싣는다 — '이 과제 · 이 차수로 누가 이미 "
-                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). limit 보다 더 있으면 truncated 가 참이다. " + _PAGE_DESC,
+                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). since · until(날짜) · query(화두 글)로 거르면 최근 창보다 깊이 "
+                      "훑는다 — 보름 전 심의는 날짜로 찾는다. limit 보다 더 있으면 truncated 가 참이다. " + _PAGE_DESC,
           annotations=_READ)
 async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
                           part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                           subject: Annotated[dict | None, Field(description=_A_LIST_SUBJECT, json_schema_extra=_X_LIST_SUBJECT)] = None,
+                          since: Annotated[str, Field(description=_A_LIST_SINCE)] = "",
+                          until: Annotated[str, Field(description=_A_LIST_UNTIL)] = "",
+                          query: Annotated[str, Field(description=_A_LIST_QUERY, max_length=200)] = "",
                           ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
@@ -1513,10 +1521,12 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     subject — 주제 거름(_subject_list). 신원 없는 호출은 받지 않는다 — 원장을 다 보는 길로 주제를 거르면 남의 과제 심의가 다 보인다."""
     user, aff, admin = _caller_view(ctx)
     lim = max(1, min(100, int(limit or 20)))
+    filt = _list_filter(since, until, query)
     if subject is not None:
-        return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin)
+        return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin, filt=filt)
     info: dict = {}
-    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin, info=info)
+    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin, info=info,
+                                **_list_filter_kw(filt))
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
     caps = delib_jobs.limits()       # 판정 때와 같은 값(박스 덮개가 env 위에 덮인다 — HWAXPortal docs/delib-ops R4)
     out = {"jobs": rows, "running": delib_jobs.running_count(),
@@ -1527,23 +1537,84 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     if info.get("more"):
         # 볼 수 있는 잡이 limit 보다 더 있다 — 조용히 끊지 않는다(HWAXPortal docs/mcp-modernize contract C8). 칸은 그때만 싣는다(종전 답 그대로).
         out["truncated"] = True
-        out["truncated_note"] = f"최신 {lim}건만 실었다 — 더 보려면 limit 을 올린다(최대 100). 그보다 옛 심의는 최근 원장 창 밖이다."
+        out["truncated_note"] = (f"최신 {lim}건만 실었다 — 더 보려면 limit 을 올린다(최대 100)" + (
+            " 또는 since · until 을 좁힌다." if filt else ". 그보다 옛 심의는 최근 원장 창 밖이다 — 날짜(since · until)나 글(query)로 거르면 깊이 훑는다."))
+    again: dict = {"limit": lim}
+    if filt:
+        out["filter"] = filt["echo"]
+        out["window"] = _list_window(info)
+        again.update(filt["echo"])
     # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
-    return mcp_pages.paged(out, part=part, again={"limit": lim},
-                           ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
+    return mcp_pages.paged(out, part=part, again=again,
+                           ids=("running", "queued", "running_max", "running_max_per_user", "queue_max", *(("filter", "window") if filt else ())))
 
 
-def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: bool) -> dict:
+def _list_when(raw: str, *, end: bool) -> float | None:
+    """since · until 글 → epoch 초. 날짜(YYYY-MM-DD)는 서버 시각의 그날 0시(until 이면 다음 날 0시 — 그날 끝까지), ISO 8601 은 그 시각. 비면 None."""
+    t = str(raw or "").strip()
+    if not t:
+        return None
+    import datetime as _dt  # noqa: PLC0415
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+            d = _dt.datetime.strptime(t, "%Y-%m-%d")
+            return (d + _dt.timedelta(days=1)).timestamp() if end else d.timestamp()
+        return _dt.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        raise ValueError(f"{'until' if end else 'since'} 는 YYYY-MM-DD 날짜나 ISO 8601 시각이다 — 받은 값 {t[:40]!r}") from None
+
+
+def _list_filter(since: str, until: str, query: str) -> dict | None:
+    """deliberate_list 의 날짜 · 글 거름(WD-08) — {lo, hi, q, echo}(아무것도 없으면 None). 시작 시각(없으면 줄 선 시각)으로 가른다."""
+    lo, hi = _list_when(since, end=False), _list_when(until, end=True)
+    q = " ".join(str(query or "").split())[:200]
+    if lo is None and hi is None and not q:
+        return None
+    if lo is not None and hi is not None and lo >= hi:
+        raise ValueError("since 가 until 보다 늦다 — 날짜를 바로잡는다")
+    echo = {k: v for k, v in (("since", str(since or "").strip()), ("until", str(until or "").strip()), ("query", q)) if v}
+    return {"lo": lo, "hi": hi, "q": q.lower(), "echo": echo}
+
+
+def _list_filter_kw(filt: dict | None) -> dict:
+    """list_jobs 에 넘길 거름 — where · 깊이 훑기 · mtime 바닥(since 가 있으면 그 전 하루 — 원장 파일은 시작 뒤에 고쳐진다)."""
+    if not filt:
+        return {}
+
+    def where(j: dict) -> bool:
+        at = float(j.get("started_at") or j.get("queued_at") or 0)
+        if filt["lo"] is not None and at < filt["lo"]:
+            return False
+        if filt["hi"] is not None and at >= filt["hi"]:
+            return False
+        if filt["q"]:
+            hay = " ".join(str(j.get(k) or "") for k in ("question", "job", "chair_template", "id", "label")).lower()
+            return filt["q"] in hay
+        return True
+    return {"where": where, "deep": True, "mtime_floor": (filt["lo"] - 86400.0) if filt["lo"] is not None else None}
+
+
+def _list_window(info: dict) -> dict:
+    window, total = info.get("window", delib_jobs.LIST_SCAN_DEEP_MAX), info.get("total")
+    return {"max": window, "complete": isinstance(total, int) and info.get("scanned", 0) >= total,
+            "note": f"원장 {window}개 창까지 훑었다 — complete 가 거짓이면 그보다 오래된 원장은 보지 않았다(since 를 좁히면 다 본다)."}
+
+
+def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: bool, filt: dict | None = None) -> dict:
     """deliberate_list(subject) — 확인된 주제의 과제 key 글자 그대로 · 차수 정확 일치(delib_subject.matches)인 잡 가운데 그 사람이 볼 수 있는 것만
+    (날짜 · 글 거름 filt 을 주면 그것도 — WD-08)
     (can_read — 주인 · 같은 소속 · 관리자). 훑는 창은 목록과 같다(최근 원장 LIST_SCAN_MAX 개 — window 에 적는다). 차수별 수(rounds)는 실은 행만
     센다 — 볼 수 없는 잡은 수에도 들지 않는다(넓은 쪽이 좁은 쪽이 있다는 것을 말하지 않는다 — PLAN §6.3)."""
+    dfilt = filt
     filt = delib_subject.parse_filter(subject)
     if not (user or "").strip():
         raise ValueError("신원 없는 호출은 주제로 거르지 못한다 — 사람 PAT 로 게이트웨이를 거쳐 부른다(주제로 거른 목록은 그 사람이 볼 수 있는 "
                          "심의만 싣는다)")
     info: dict = {}
+    kw = _list_filter_kw(dfilt)
+    dwhere = kw.pop("where", None)
     rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin,
-                                where=lambda j: delib_subject.matches(j, filt), info=info)
+                                where=lambda j: delib_subject.matches(j, filt) and (dwhere is None or dwhere(j)), info=info, **kw)
     rounds: dict = {}
     for r in rows:
         k = (r.get("subject") or {}).get("round") or delib_subject.ROUND_UNKNOWN
@@ -1555,7 +1626,10 @@ def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: b
                       "note": f"최근 원장 {window}개 창 안에서만 찾았다(complete 가 거짓이면 그보다 오래된 원장은 보지 않았다 — 그 심의는 이 목록에 "
                               "없다). 확인된 주제(sp_state=confirmed)만 맞대고, 차수를 모르는 심의는 'unknown' 칸에만 있다(어느 차수에도 섞지 "
                               "않는다). 웹 심의는 포털 대화에 남는다(주인만 본다)."}}
-    return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject}, ids=("subject", "count", "rounds"))
+    if dfilt:
+        out["filter"] = dfilt["echo"]
+    return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject, **(dfilt["echo"] if dfilt else {})},
+                           ids=("subject", "count", "rounds", *(("filter",) if dfilt else ())))
 
 
 @mcp.tool(title="심의 취소",
