@@ -407,7 +407,7 @@ def test_형제_포털의_정본에서_허브를_읽고_시험_사본은_넣지_
     want = {vocab["canonical"]["app"]: vocab["canonical"]["label"],
             **{k: v["label"] for k, v in vocab["apps"].items() if v.get("role") == "sibling"}}
     assert a._hub_apps() == want
-    assert set(want) == {"rootdesigndatahub", "failuretrace", "caegroupdatahub"} and "stepforge-prod" not in want and \
+    assert {"rootdesigndatahub", "failuretrace", "caegroupdatahub"} <= set(want) and "stepforge-prod" not in want and \
         "dynaforge-prod" not in want, "role staging(시험 사본)은 허브가 아니다"
 
 

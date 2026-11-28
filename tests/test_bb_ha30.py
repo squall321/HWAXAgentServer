@@ -657,7 +657,12 @@ def test_허브_표는_정본_어휘표의_정본과_형제다_시험_사본은_
         pytest.skip("형제 포털 리포의 어휘표가 없다")
     monkeypatch.setattr(a, "CORE_VOCAB_PATH", _REAL)
     hubs = a._hub_apps()
-    assert hubs == HUB_LABEL, "라벨은 어휘표의 것이다"
+    vocab = json.loads(_REAL.read_text(encoding="utf-8"))
+    # 포털이 형제 허브를 더해도(HPO-1 · 11-28 — 실장솔루션 · NC개발팀) 어휘표가 정본이다 — 기본 셋을 박아 두지 않는다
+    want = {vocab["canonical"]["app"]: vocab["canonical"]["label"],
+            **{k: v["label"] for k, v in vocab["apps"].items() if v.get("role") == "sibling"}}
+    assert hubs == want, "라벨은 어휘표의 것이다"
+    assert {k: hubs[k] for k in HUB_LABEL} == HUB_LABEL, "기본 셋은 어휘표에도 같은 라벨로 있다"
     assert "stepforge-prod" not in hubs and "dynaforge-prod" not in hubs, "role staging(시험 사본)은 허브가 아니다(Q6)"
 
 
