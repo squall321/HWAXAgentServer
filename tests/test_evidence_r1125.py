@@ -60,3 +60,18 @@ def test_OF3_반올림_의심은_가까운_값이_있을_때다():
 def test_OF3_원문이_없으면_종전처럼_모두_어긋남이고_빈_칸은_싣지_않는다():
     assert offload.numbers("값 123.4", "") == {"checked": 1, "mismatched": ["123.4"]}
     assert offload.numbers("값 123.4", "값 123.4") == {"checked": 1, "mismatched": []}
+
+
+# ── WD-12 id 꼴은 수치 대조에서 뺀다 ──────────────────────────────────────────────────────────────────────────────
+def test_WD12_id_만_다른_답은_어긋남이_0_이다():
+    ans = ("심의 delib-20261124-153012-a1b2c3 과 위임 delegate-20261125-090000-ff00aa 를 봤다. 커밋 9c0c845e · 결함 HA-1234 · 과제 PLM-7781 · "
+           "보고서 #5521 · 확인 cf-0123456789ab · 잡 3f2a9c81-1111-2222-3333-444455556666")
+    assert ev.sig_numbers(ans) == [], ev.sig_numbers(ans)
+    assert ev.unsourced_numbers(ans, "전혀 다른 원문", limit=0) == []
+
+
+def test_WD12_id_곁의_진짜_수는_그대로_본다():
+    ans = "잡 delib-20261124-153012-a1b2c3 의 결과 응력 312.5 MPa · 불량 1,234건 · 비율 77.7%"
+    assert [r for r, _n in ev.sig_numbers(ans)] == ["312.5", "1,234", "77.7"]
+    assert ev.unsourced_numbers(ans, "응력 312.5 · 1234", limit=0) == ["77.7"]
+    assert ev._sig_tokens("HA-35 의 비율 12.5%") == [("12.5", "12.5", True)], "가린 뒤에도 % 붙음은 제자리"

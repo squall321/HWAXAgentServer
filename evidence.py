@@ -17,9 +17,26 @@ import re
 _NUM_TOK_RE = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\d.])")
 
 
+# id 꼴은 수치가 아니다(HWAXPortal docs/request-1125 WD-12) — 잡 id(<종류>-YYYYMMDD-HHMMSS-<4~8자>) · UUID · 확인 번호(cf-) · 숫자와 a~f 가 섞인
+# 7자 넘는 16진(커밋 · 해시) · 영문 머리를 붙인 번호(HA-35 · PLM-7781 · OB_89) · #번호. 종전엔 잡 id 의 날짜 조각 · 결함 번호 조각이 '확인 안 된
+# 수치' 로 떠 표시가 늘었다. 답 쪽에서만 같은 길이의 빈칸으로 가린다(자리가 그대로라 % 붙음 판정이 흔들리지 않는다). 유령 ID 막이(_int_tokens)와는
+# 따로다 — 그쪽은 도구 인자의 id 를 본다.
+_ID_SPAN_RE = re.compile(
+    r"(?<![0-9A-Za-z])[A-Za-z][A-Za-z0-9_]*-\d{8}-\d{6}-[0-9A-Za-z]{4,8}(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Fa-f])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Fa-f])"
+    r"|\bcf-[0-9a-f]{12}\b"
+    r"|(?<![0-9A-Za-z])(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}(?![0-9A-Za-z])"
+    r"|(?<![0-9A-Za-z])[A-Za-z]{1,12}[-_]\d+(?![\d.])"
+    r"|(?<![\w#])#\d+(?![\d.])")
+
+
+def _mask_ids(text: str) -> str:
+    return _ID_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
 def _sig_tokens(text: str) -> list:
-    """sig_numbers 의 꼴에 % 붙음을 더한 것 — [(쓴 그대로, 쉼표 뗀 글, 뒤에 % 가 붙었나)]."""
-    text = text or ""
+    """sig_numbers 의 꼴에 % 붙음을 더한 것 — [(쓴 그대로, 쉼표 뗀 글, 뒤에 % 가 붙었나)]. id 꼴은 가린 뒤에 훑는다(WD-12)."""
+    text = _mask_ids(text or "")
     out = []
     for m in _NUM_TOK_RE.finditer(text):
         raw = m.group(0)

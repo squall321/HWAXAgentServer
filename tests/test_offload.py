@@ -525,7 +525,8 @@ def test_절_초안은_ref_와_울타리_안_도구로_근거를_읽고_숫자�
                                       style="memo", ctx=_ctx()))
     assert out["model"] == "glm-5.3" and out["draft"].startswith("## 결과")
     assert out["tokens"] == {"input": 10, "output": 5}, "이 일이 쓴 서버 LLM 토큰(위임 delegate_result 와 같은 셈)"
-    assert out["numbers"] == {"checked": 4, "mismatched": ["88.8"], "kinds": {"88.8": "원문에 없음"}}, "PLM-7781 의 7781 은 울타리 안 도구 결과에 있다"
+    assert out["numbers"] == {"checked": 3, "mismatched": ["88.8"], "kinds": {"88.8": "원문에 없음"}}, \
+        "PLM-7781 은 id 꼴이라 대조하지 않는다(HWAXPortal docs/request-1125 WD-12)"
     src = out["sources"]
     assert [s["ok"] for s in src] == [True, True, False] and "읽기 울타리 밖" in src[2]["error"]
     assert src[0] == {"n": 1, "kind": "ref", "ref": "r-1", "chars": len("앞쪽 수율 97.5% 확인 · 뒤쪽 불량 1,234건"), "ok": True}
