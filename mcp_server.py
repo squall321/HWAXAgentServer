@@ -1444,6 +1444,8 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
 
 
 _VIEWS = ("full", "summary", "decision_json")
+_A_RESULT_FIELDS = ("맨 위 칸 이름 목록(최대 30) — 주면 그 칸만 싣는다(job_id · status 는 늘, decision_json 은 그대로). 예 ['decision', 'votes']. "
+                    "있던 칸 이름은 fields_all, 없는 이름은 fields_unknown. 비우면 종전 그대로.")
 
 
 def _result_full(job: dict) -> dict:
@@ -1480,6 +1482,7 @@ def _result_summary(job_id: str, job: dict, full: dict) -> dict:
 async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
                             part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                             view: Annotated[Literal["full", "summary", "decision_json"], Field(description=_A_VIEW)] = "full",
+                            fields: Annotated[list[str] | None, Field(description=_A_RESULT_FIELDS, max_length=30)] = None,
                             ctx: Context | None = None) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
     루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다) |
@@ -1493,10 +1496,27 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
     if view == "decision_json":
         return mcp_pages.paged(delib_decision.build(job), part=part, ids=_JOB_IDS, again={"job_id": job_id, "view": "decision_json"})
     out = _result_full(job)
+    want = [str(f).strip() for f in (fields or []) if str(f).strip()]
     if view == "summary":
-        return mcp_pages.paged(_result_summary(job_id, job, out), part=part, ids=_JOB_IDS, tail=("decision",),
-                               again={"job_id": job_id, "view": "summary"})
-    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
+        summ = _pick_fields(_result_summary(job_id, job, out), want)
+        return mcp_pages.paged(summ, part=part, ids=_JOB_IDS, tail=("decision",),
+                               again={"job_id": job_id, "view": "summary", **({"fields": want} if want else {})})
+    out = _pick_fields(out, want)
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True,
+                           again={"job_id": job_id, **({"fields": want} if want else {})})
+
+
+def _pick_fields(out: dict, want: list) -> dict:
+    """deliberate_result(fields) — 고른 맨 위 칸만(job_id · status 는 늘) + fields_all(있던 칸 이름) · fields_unknown(없는 이름). 비면 그대로
+    (HWAXPortal docs/request-1125 2절 B-1 — 결과 글자 상위 도구의 칸 고르기)."""
+    if not want:
+        return out
+    keep = {k: v for k, v in out.items() if k in _JOB_IDS or k in want}
+    keep["fields_all"] = sorted(out)
+    miss = [f for f in want if f not in out]
+    if miss:
+        keep["fields_unknown"] = miss[:30]
+    return keep
 
 
 @mcp.tool(title="심의 목록",
