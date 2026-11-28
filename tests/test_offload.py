@@ -311,7 +311,8 @@ def test_위임은_그_사람_시야의_읽기_도구로_풀고_답_근거_숫�
     assert CALLS == [("voc_search", {"q": "S26"})], "쓰기 도구는 불리지 않았다"
     assert full["answer"].startswith("S26 VOC 불량은 1,234건") and full["model"] == "qwen-test" and full["steps"] == 1
     assert full["evidence"] == [{"id": "e1", "tool": "voc_search", "args": '{"q": "S26"}', "chars": len(VOC_OUT), "ok": True}]
-    assert full["numbers"] == {"checked": 3, "mismatched": ["9876.5"]}, "근거에 없는 수만 짚는다(고쳐 쓰지 않는다)"
+    assert full["numbers"] == {"checked": 3, "mismatched": ["9876.5"], "kinds": {"9876.5": "원문에 없음"}}, \
+        "근거에 없는 수만 짚는다(고쳐 쓰지 않는다) — 어긋남마다 종류(HWAXPortal docs/request-1125 OF-3)"
     assert full["tokens"] == {"input": 30, "output": 15}
     assert summ["evidence_n"] == 1 and summ["evidence_tools"] == ["voc_search"] and "evidence" not in summ
     assert kit.seen["who"] == [(["연구소"], ME)]
@@ -524,7 +525,7 @@ def test_절_초안은_ref_와_울타리_안_도구로_근거를_읽고_숫자�
                                       style="memo", ctx=_ctx()))
     assert out["model"] == "glm-5.3" and out["draft"].startswith("## 결과")
     assert out["tokens"] == {"input": 10, "output": 5}, "이 일이 쓴 서버 LLM 토큰(위임 delegate_result 와 같은 셈)"
-    assert out["numbers"] == {"checked": 4, "mismatched": ["88.8"]}, "PLM-7781 의 7781 은 울타리 안 도구 결과에 있다"
+    assert out["numbers"] == {"checked": 4, "mismatched": ["88.8"], "kinds": {"88.8": "원문에 없음"}}, "PLM-7781 의 7781 은 울타리 안 도구 결과에 있다"
     src = out["sources"]
     assert [s["ok"] for s in src] == [True, True, False] and "읽기 울타리 밖" in src[2]["error"]
     assert src[0] == {"n": 1, "kind": "ref", "ref": "r-1", "chars": len("앞쪽 수율 97.5% 확인 · 뒤쪽 불량 1,234건"), "ok": True}
@@ -554,7 +555,7 @@ def test_남의_ref_는_읽지_못하고_근거가_창을_넘으면_거절한다
 def test_변환은_글_하나만_받아_챗_LLM_으로_바꾸고_숫자를_대조한다(kit, _pin_context):
     kit.llm.script = [_ai("Defects: 1,234 · ratio 12.5% · new 4321.0", model="qwen-x")]
     out = asyncio.run(m.llm_transform(instruction="영어로", text=VOC_OUT, ctx=_ctx()))
-    assert out == {"text": "Defects: 1,234 · ratio 12.5% · new 4321.0", "numbers": {"checked": 3, "mismatched": ["4321.0"]}, "model": "qwen-x",
+    assert out == {"text": "Defects: 1,234 · ratio 12.5% · new 4321.0", "numbers": {"checked": 3, "mismatched": ["4321.0"], "kinds": {"4321.0": "원문에 없음"}}, "model": "qwen-x",
                    "tokens": {"input": 10, "output": 5}}
     for kw in ({}, {"text": "a", "ref": "r-1"}):
         with pytest.raises(ValueError, match="하나만"):
@@ -614,7 +615,7 @@ def test_한_쪽이면_한_번_묻고_원문에_없는_인용은_버리고_자�
     s1, s2 = TEXT.index("불량 원인은"), TEXT.index("수율은 97.5%")
     assert out["quotes"] == [{"page": 1, "start": s1, "end": s1 + len("불량 원인은 커넥터 접촉 저항 증가다."), "text": "불량 원인은 커넥터 접촉 저항 증가다."},
                              {"page": 1, "start": s2, "end": s2 + len("수율은 97.5% 였다."), "text": "수율은 97.5% 였다."}]
-    assert out["numbers"] == {"checked": 2, "mismatched": ["99.9"]} and out["model"] == "qwen-ask"
+    assert out["numbers"] == {"checked": 2, "mismatched": ["99.9"], "kinds": {"99.9": "원문에 없음"}} and out["model"] == "qwen-ask"
     assert out["tokens"] == {"input": 10, "output": 5}
     assert len(ask.llm.seen) == 1 and TEXT in ask.llm.seen[0][1].content
 

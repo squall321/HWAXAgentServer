@@ -17,14 +17,11 @@ import re
 _NUM_TOK_RE = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\d.])")
 
 
-def sig_numbers(text: str) -> list:
-    """대조할 가치가 있는 수치만. 오탐을 줄이려고 범위를 좁게 잡는다.
-
-    작은 정수(0~99)는 개수·순번·백분율로 정상 생성되는 값이라 제외한다 — 여기까지 잡으면
-    경고가 남발돼 표시 자체를 아무도 안 보게 된다. 소수점이 있거나 100 이상인 값만 본다.
-    """
+def _sig_tokens(text: str) -> list:
+    """sig_numbers 의 꼴에 % 붙음을 더한 것 — [(쓴 그대로, 쉼표 뗀 글, 뒤에 % 가 붙었나)]."""
+    text = text or ""
     out = []
-    for m in _NUM_TOK_RE.finditer(text or ""):
+    for m in _NUM_TOK_RE.finditer(text):
         raw = m.group(0)
         norm = raw.replace(",", "")
         try:
@@ -33,8 +30,17 @@ def sig_numbers(text: str) -> list:
             continue
         if "." not in norm and val < 100:
             continue
-        out.append((raw, norm))
+        out.append((raw, norm, bool(_PCT_AFTER.match(text, m.end()))))
     return out
+
+
+def sig_numbers(text: str) -> list:
+    """대조할 가치가 있는 수치만. 오탐을 줄이려고 범위를 좁게 잡는다.
+
+    작은 정수(0~99)는 개수·순번·백분율로 정상 생성되는 값이라 제외한다 — 여기까지 잡으면
+    경고가 남발돼 표시 자체를 아무도 안 보게 된다. 소수점이 있거나 100 이상인 값만 본다.
+    """
+    return [(raw, norm) for raw, norm, _pct in _sig_tokens(text)]
 
 
 def unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
@@ -44,23 +50,147 @@ def unsourced_numbers(answer: str, sources: str, limit: int = 6) -> list:
     부분 일치라 '232' 가 '1232' 에 걸려 통과하는 느슨함이 있는데, 이 방향의 오차는
     '근거 있다고 잘못 보는' 쪽이라 경고 남발보다 낫다(과다 경고는 기능을 죽인다).
 
+    글자로 없으면 **같은 값의 다른 꼴**인지 본다(HWAXPortal docs/request-1125 OF-3 — 11-24 비교에서 어긋남 표시 21건을 하나씩 보니 모두
+    오탐이었다: Pa → GPa · MPa 환산 20 · 반올림) — 천 단위 쉼표 · 숫자 묶음 사이 공백을 뗀 원문, SI 접두 ×10^(3k)(2,350,000,000 Pa ↔ 2.35 GPa),
+    답의 소수 자리로 반올림(5717.116 ↔ 5,717.12), 비 ↔ %(0.125 ↔ 12.5%, % 가 한쪽에 붙었을 때만). 판정은 equivalent() 하나다 — 위임의 숫자
+    대조(offload.numbers)도 같은 것을 쓴다.
+
     limit 은 돌려줄 건수 상한이고 **0 이하면 전부**다. 상한에서 끊으면 나머지가 있다는 것도 함께
     사라진다 — 7건이든 70건이든 6건으로 보였다. 총 건수를 알려야 하는 호출부(심의 결정문)는 전부
     받아서 보일 만큼만 보이고 건수를 적는다.
     """
     if not sources:
         return []
-    src_norm = sources.replace(",", "")
+    src_norm = _src_flat(sources)
+    pool = None
     seen, bad = set(), []
-    for raw, norm in sig_numbers(answer):
+    for raw, norm, pct in _sig_tokens(answer):
         if norm in seen:
             continue
         seen.add(norm)
-        if norm not in src_norm:
+        if norm in src_norm:
+            continue
+        if pool is None:
+            pool = SourcePool(sources)
+        if pool.equivalent(norm, pct) is None:
             bad.append(raw)
         if 0 < limit <= len(bad):
             break
     return bad
+
+
+# ── 같은 값의 다른 꼴(OF-3) ─────────────────────────────────────────────────────────────────────────────────────
+# 원문 쪽만 넓힌다 — 숫자 묶음 사이 공백(2 350 000 · 얇은 공백)을 떼 '글자로 있다' 를 넓힐 뿐 답의 수를 잇지 않는다(답 쪽에서 이으면 '모델 3 100개'
+# 가 3100 이 된다). 넓히는 쪽이라 어긋남을 새로 만들지 않는다.
+_SRC_GROUP_SP = re.compile(r"(?<=\d)[ \u00a0\u2009\u202f](?=\d{3}(?!\d))")
+_SRC_NUM_RE = re.compile(r"(?<![\w.])(?:\d{1,3}(?:[,\u00a0\u2009\u202f ]\d{3})+|\d+)(?:\.\d+)?(?![\d.])")
+_PCT_AFTER = re.compile(r"\s?(?:%|％|퍼센트)")
+_SI_EXPS = (3, -3, 6, -6, 9, -9, 12, -12)
+SRC_VALUES_MAX = 200_000        # 원문에서 담는 수의 상한 — 넘으면 앞의 것만(넓히는 판정이라 덜 담으면 어긋남 쪽으로 남는다)
+
+
+def _src_flat(sources: str) -> str:
+    return _SRC_GROUP_SP.sub("", sources).replace(",", "")
+
+
+def _decimals(norm: str) -> int:
+    return len(norm.split(".", 1)[1]) if "." in norm else 0
+
+
+class SourcePool:
+    """원문의 수(값 · % 붙음)를 정렬해 둔 것 — 답의 수 하나가 같은 값의 다른 꼴로 있는지 이분 탐색으로 본다."""
+
+    def __init__(self, sources: str):
+        import bisect  # noqa: PLC0415
+        self._bisect = bisect
+        vals, pcts = [], []
+        for m in _SRC_NUM_RE.finditer(sources or ""):
+            try:
+                v = float(re.sub(r"[,\u00a0\u2009\u202f ]", "", m.group(0)))
+            except ValueError:
+                continue
+            vals.append(v)
+            if _PCT_AFTER.match(sources, m.end()):
+                pcts.append(v)
+            if len(vals) >= SRC_VALUES_MAX:
+                break
+        self.values = sorted(set(vals))
+        self.pcts = sorted(set(pcts))
+
+    def _near(self, arr: list, target: float, tol: float):
+        i = self._bisect.bisect_left(arr, target - tol)
+        if i < len(arr) and arr[i] <= target + tol:
+            return arr[i]
+        return None
+
+    def equivalent(self, norm: str, pct: bool = False) -> str | None:
+        """답의 수(norm — 쉼표 뗀 글)가 원문의 어느 수와 같은 값인지 — 맞으면 그 꼴을 한 줄로('반올림 5717.116' · 'SI ×10^9 2350000000' ·
+        '비 ↔ % 0.125'), 아니면 None. 반올림 폭은 답이 쓴 소수 자리의 반이다(정수면 0.5)."""
+        try:
+            a = float(norm)
+        except ValueError:
+            return None
+        d = _decimals(norm)
+        half = 0.5 * 10 ** (-d)
+        tol = half * (1 + 1e-9) + 1e-12 * abs(a)
+        b = self._near(self.values, a, tol)
+        if b is not None:
+            return f"반올림 {_fmt(b)}"
+        for k in _SI_EXPS:
+            f = 10.0 ** k
+            b = self._near(self.values, a * f, tol * f)
+            if b is not None:
+                return f"SI 접두 10^{abs(k)} 배 {_fmt(b)}"
+        if pct:
+            b = self._near(self.values, a / 100.0, tol / 100.0)
+            if b is not None:
+                return f"비 ↔ % {_fmt(b)}"
+        b = self._near(self.pcts, a * 100.0, tol * 100.0)
+        if b is not None:
+            return f"비 ↔ % {_fmt(b)}%"
+        return None
+
+    def suspect(self, norm: str) -> str:
+        """같은 값이 아닌 수의 종류 — '환산 의심'(10 의 다른 거듭제곱 배로 맞는다) · '반올림 의심'(0.5% 안에 원문 수가 있다) · '원문에 없음'."""
+        try:
+            a = float(norm)
+        except ValueError:
+            return "원문에 없음"
+        d = _decimals(norm)
+        tol = 0.5 * 10 ** (-d) * (1 + 1e-9) + 1e-12 * abs(a)
+        for k in (1, -1, 2, -2, 4, -4, 5, -5, 7, -7, 8, -8):
+            f = 10.0 ** k
+            if self._near(self.values, a * f, tol * f) is not None:
+                return "환산 의심"
+        if a and self._near(self.values, a, abs(a) * 0.005) is not None:
+            return "반올림 의심"
+        return "원문에 없음"
+
+
+def _fmt(v: float) -> str:
+    return f"{v:.12g}"
+
+
+def derived_from(norm: str, bases: list) -> dict | None:
+    """답의 수가 답에 함께 쓴 근거 수 둘로 계산한 값인지 — 합 · 차 · 비 · 증가율(%) · 곱. 맞으면 {op, from: [두 수]}, 아니면 None. 근거 수는
+    원문 전체가 아니라 **답이 인용해 근거가 확인된 수**만 쓴다(원문 전체의 쌍이면 지어낸 수도 어느 쌍의 차로 맞는다)."""
+    try:
+        a = float(norm)
+    except ValueError:
+        return None
+    d = _decimals(norm)
+    tol = 0.5 * 10 ** (-d) * (1 + 1e-9) + 1e-12 * abs(a)
+    for i, (rx, x) in enumerate(bases):
+        for j, (ry, y) in enumerate(bases):
+            if i == j:
+                continue
+            cands = (("합", x + y), ("차", x - y), ("곱", x * y))
+            if y:
+                cands += (("비", x / y), ("증가율 %", (x - y) / y * 100.0), ("비율 %", x / y * 100.0))
+            for op, v in cands:
+                if abs(v - a) <= tol:
+                    return {"op": op, "from": [rx, ry]}
+    return None
 
 
 # ── 긴 문서를 예산에 맞추기 ──────────────────────────────────────────────────

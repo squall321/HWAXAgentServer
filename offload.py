@@ -34,7 +34,7 @@ import httpx
 import external_llm
 import purposes as _purposes
 import usage_tokens
-from evidence import sig_numbers, unsourced_numbers
+from evidence import SourcePool, _sig_tokens, _src_flat, derived_from
 
 log = logging.getLogger("agent.offload")
 
@@ -226,13 +226,52 @@ def _cut(text: str, cap: int) -> tuple[str, str]:
 
 def numbers(answer: str, sources: str) -> dict:
     """답의 수를 근거 원문과 대조한다 — {checked: 대조한 수의 개수, mismatched: [원문에 없는 수]}(+ 넘치면 mismatched_total). 판정은 챗 · 결정문과
-    같다(evidence — 소수점이 있거나 100 이상인 수만, 부분 문자열). 어긋나도 고쳐 쓰지 않는다."""
-    checked = len({norm for _raw, norm in sig_numbers(answer)})
-    bad = unsourced_numbers(answer, sources, limit=0) if sources else [raw for raw, _n in sig_numbers(answer)]
-    bad = list(dict.fromkeys(bad))
-    out = {"checked": checked, "mismatched": bad[:NUMS_SHOW]}
+    같다(evidence — 소수점이 있거나 100 이상인 수만, 부분 문자열 + 같은 값의 다른 꼴: 쉼표 · 공백 · SI 접두 · 반올림 · 비 ↔ %). 어긋나도 고쳐 쓰지
+    않는다. 위임 결과에는 셋을 더 싣는다(HWAXPortal docs/request-1125 OF-3) — kinds{수: 원문에 없음 · 환산 의심 · 반올림 의심}(어긋남마다) ·
+    derived[{value, op, from}](답이 인용한 근거 수 둘로 계산한 값 — 어긋남에서 빼고 따로) · equivalent[{value, source}](같은 값의 다른 꼴로 맞은 수).
+    비는 칸은 싣지 않는다."""
+    toks = _sig_tokens(answer)
+    out: dict = {"checked": len({norm for _raw, norm, _p in toks})}
+    if not sources:
+        bad = list(dict.fromkeys(raw for raw, _n, _p in toks))
+        out["mismatched"] = bad[:NUMS_SHOW]
+        if len(bad) > NUMS_SHOW:
+            out["mismatched_total"] = len(bad)
+        return out
+    flat, pool = _src_flat(sources), None
+    seen: set = set()
+    bases, pending, equiv = [], [], []
+    for raw, norm, pct in toks:
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if norm in flat:
+            bases.append((raw, float(norm)))
+            continue
+        pool = pool or SourcePool(sources)
+        how = pool.equivalent(norm, pct)
+        if how is not None:
+            equiv.append({"value": raw, "source": how})
+            bases.append((raw, float(norm)))
+        else:
+            pending.append((raw, norm))
+    bad, kinds, derived = [], {}, []
+    for raw, norm in pending:
+        dv = derived_from(norm, bases)
+        if dv is not None:
+            derived.append({"value": raw, **dv})
+            continue
+        bad.append(raw)
+        kinds[raw] = (pool or SourcePool(sources)).suspect(norm)
+    out["mismatched"] = bad[:NUMS_SHOW]
     if len(bad) > NUMS_SHOW:
         out["mismatched_total"] = len(bad)
+    if bad:
+        out["kinds"] = {r: kinds[r] for r in bad[:NUMS_SHOW]}
+    if derived:
+        out["derived"] = derived[:NUMS_SHOW]
+    if equiv:
+        out["equivalent"] = equiv[:NUMS_SHOW]
     return out
 
 
@@ -392,6 +431,8 @@ _DELEGATE_SYS = (
     "[규칙]\n"
     "- 묶인 도구만 쓴다 — 읽기 도구뿐이다. 쓰기 · 잡 제출 · 지우기는 할 수 없고, 하겠다고 말하지도 않는다.\n"
     "- 값(수치 · 이름 · 키)은 도구 결과에 나온 것만 쓴다. 지어내지 않고 식별자(id)를 추측해 넣지 않는다 — 목록 · 검색 도구로 먼저 확인한다.\n"
+    "- 근거의 수를 옮길 때는 쓴 그대로(단위 · 자리)가 가장 좋다. 단위를 바꾸거나 계산한 수(합 · 차 · 비 · 증가율)는 '(계산: 근거 수 → 값)' 처럼 계산임을 "
+    "밝히고 근거 수도 함께 적는다 — 서버 코드가 근거 원문과 대조한다.\n"
     "- 결과마다 [근거 eN] 머리가 붙는다 — 답의 사실마다 근거를 [eN] 으로 단다.\n"
     "- 모르면 모른다고 한다. 일에 충분하면 더 부르지 않는다.\n"
     "- 예산 — 도구 호출 {steps}번 · {minutes}분.\n"

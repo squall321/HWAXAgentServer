@@ -40,14 +40,13 @@ def _load() -> dict:
         assert m, f"app.py 에서 블록을 찾지 못했다: {pat[:40]}"
         exec(m.group(0), ns)  # noqa: S102 — 자기 레포 소스만 대상
     # 수치 대조는 챗·심의 공용 모듈로 옮겼다(evidence.py) — 거기서 읽어 옛 이름으로 붙인다.
+    # 모듈째 실행한다 — 같은 값의 다른 꼴 판정(SourcePool 등 — HWAXPortal docs/request-1125 OF-3)이 도우미 여럿을 쓴다. evidence 는 re 만 읽는다.
     ev = APP.parent / "evidence.py"
-    ev_src = ev.read_text(encoding="utf-8")
-    for pat in (r"_NUM_TOK_RE = re\.compile\(r\"[^\n]*\"\)",
-                r"def sig_numbers.*?\n    return out",
-                r"def unsourced_numbers.*?\n    return bad"):
-        m = re.search(pat, ev_src, re.S)
-        assert m, f"evidence.py 에서 블록을 찾지 못했다: {pat[:40]}"
-        exec(m.group(0), ns)  # noqa: S102
+    ev_ns: dict = {"__name__": "evidence_under_test"}
+    exec(compile(ev.read_text(encoding="utf-8"), str(ev), "exec"), ev_ns)  # noqa: S102 — 자기 레포 소스만 대상
+    for name in ("_NUM_TOK_RE", "sig_numbers", "unsourced_numbers"):
+        assert name in ev_ns, f"evidence.py 에 {name} 이 없다"
+        ns[name] = ev_ns[name]
     ns["_sig_numbers"] = ns["sig_numbers"]
     ns["_unsourced_numbers"] = ns["unsourced_numbers"]
     return ns
