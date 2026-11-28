@@ -10852,6 +10852,30 @@ async def deliberate_verify_http(request: Request):
         return _dl_error("bad_request", str(exc), 422)
 
 
+# POST /deliberate/continue {previous_job_id, …} — deliberate_continue 와 같은 함수(HWAXPortal docs/request-1125 WD-05). 포털의 웹 '이어하기' 가 MCP 로 연
+# 심의(대화에 job_id 가 있다 — WD-03)를 새 웹 심의로 열지 않고 같은 잡 계보의 다음 잡으로 잇게 한다(_CONT_CARRY 손잡이 · 앞 회차 기준일 · 보고서 이어붙이기가
+# 엔진 쪽에서 그대로 이어진다). 칸은 deliberate_continue 의 인자 그대로다. 신원 머리가 있어야 한다 — 이은 잡은 그 사람 이름으로 돈다(묶음 시작과 같은 신뢰).
+_CONT_FIELDS = ("previous_job_id", "human_note", "question", "job", "rounds", "non_negotiables", "keep_seats", "append_report", "modifiers",
+                "advanced", "evidence", "subject")
+
+
+@app.post("/deliberate/continue")
+async def deliberate_continue_http(request: Request):
+    body, who, denied = await _dl_open(request, _CONT_FIELDS)
+    if denied:
+        return denied
+    if not (who[0] or "").strip():
+        return _dl_error("identity_required", "이어하기는 사람 이름으로 돈다 — 신원 머리(x-hwax-user)를 싣는다", 403)
+    if not isinstance(body.get("previous_job_id"), str) or not body["previous_job_id"].strip():
+        return _dl_error("bad_request", "previous_job_id 는 비지 않은 글이다", 422)
+    from types import SimpleNamespace  # noqa: PLC0415
+    shim = SimpleNamespace(request_context=SimpleNamespace(request=request))      # MCP 의 Context 와 같은 자리에서 머리를 읽는다
+    try:
+        return await _delib_mcp_module.deliberate_continue(**{k: body[k] for k in _CONT_FIELDS if k in body}, ctx=shim)
+    except (ValueError, TypeError) as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
 # POST /deliberate/evidence/resolve {evidence, user_email, user_pat, groups?} — deliberate_resolve_evidence 와 같은 답(DL-01 — 크기 · 지문만, 잡 없음).
 # 사람의 참조를 푸는 창구라 /deliberate/subject/confirm 과 같은 규칙이다 — 루프백 신뢰에 **그 사람의 PAT** 를 요구하고 그 PAT 로 푼다(공유 비밀 + 신원
 # 머리만으로 이름 붙은 사람의 참조를 풀지 않는다 — 반대 검토 M5). 모르는 칸은 422.
