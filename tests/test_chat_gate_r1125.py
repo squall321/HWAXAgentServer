@@ -119,3 +119,45 @@ def test_WD13_심의_잡은_진행_조회_호출을_함께_싣는다():
     jc = a._confirm_job_card(c, "cf-1-1", json.dumps({"job_id": "delib-20261128-101010-abc123", "status": "running", "stage": "seats"}))
     assert jc["kind"] == "deliberation" and jc["status_call"] == {"tool": "deliberate_status", "args": {"job_id": "delib-20261128-101010-abc123"}}
     assert a._confirm_job_card(c, "x", json.dumps({"job_id": "J", "status": "done"})) is None, "끝난 잡 결과는 카드가 아니다"
+
+
+# ── WD-02 심의 · 리스크 잡 맥락 묶기 · 지어낸 실행 주장 ───────────────────────────────────────────────────────────────
+FAKE_ID = "diagnosis-20261110-101010-abcdef"
+
+
+def test_WD02_맥락이_있으면_심의_리스크_도구를_먼저_묶는다():
+    names = ["deliberate_start", "hwaxdeliberation_deliberate_status", "risk_next_step", "voc_search", "deliberate_cancel"]
+    got = a._job_ctx_tools(f"{FAKE_ID} 이어서 해줘", [], names)
+    assert got == ["deliberate_start", "hwaxdeliberation_deliberate_status", "risk_next_step"]
+    assert a._job_ctx_tools("어제 회의 정리해줘", [{"role": "assistant", "content": "신뢰 판정 결과 …"}], names), "최근 이력의 심의 낱말도 맥락"
+    assert a._job_ctx_tools("S26 불량 수 알려줘", [{"role": "user", "content": "안녕"}], names) == []
+
+
+def test_WD02_출처_없는_잡_id_와_부르지_않은_실행_주장을_짚는다():
+    known = a._job_known_ids("", [{"role": "user", "content": "trust-20261101-090000-0a0b0c 를 봐 줘"},
+                                  {"role": "assistant", "content": f"지어낸 {FAKE_ID}"}], [])
+    assert known == {"trust-20261101-090000-0a0b0c"}, "근거 블록 없는 앞 답의 id 는 출처가 아니다"
+    f = a._job_claim_findings(f"심의를 이어 돌렸습니다({FAKE_ID}).", set(), known)
+    assert len(f) == 2 and FAKE_ID in f[0] and "부르지 않았는데" in f[1]
+    assert a._job_claim_findings("심의를 이어 돌렸습니다.", {"deliberate_continue"}, set()) == [], "부른 턴의 주장은 짚지 않는다"
+    assert a._job_claim_findings("trust-20261101-090000-0a0b0c 의 결론은 …", set(), known) == []
+    assert a._job_claim_findings("심의를 열겠습니다.", set(), set()) == [], "예고는 이 검사가 아니다"
+
+
+def test_WD02_지어낸_주장은_한_번_다시_쓰고_고쳐지면_표지가_없다(gate, monkeypatch):
+    tools: dict = {}
+    ag = _GateAgent(tools, steps=[], say=f"신뢰 판정 심의를 시작했습니다. 잡 {FAKE_ID} 입니다.")
+    ag.again_say = "도구를 부르지 못해 심의는 아직 열지 않았습니다. 열까요?"
+    evs, _seen = _turn(monkeypatch, ag, tools, "이 결과의 신뢰 판정을 해줘")
+    res = _result(evs)
+    assert ag.ainvoked == 1 and res == ag.again_say and a._JOB_CLAIM_FLAG not in res
+    assert any("도구 호출 없이 쓴 내용을 짚었습니다" in d.get("step", "") for e, d in evs if e == "status")
+
+
+def test_WD02_다시_써도_같으면_답_위에_표지를_단다(gate, monkeypatch):
+    tools: dict = {}
+    ag = _GateAgent(tools, steps=[], say=f"심의를 이어 돌렸습니다 — {FAKE_ID}.")
+    ag.again_say = f"심의를 이어 돌렸습니다 — {FAKE_ID}."
+    evs, _seen = _turn(monkeypatch, ag, tools, "그 심의 이어서 해줘")
+    res = _result(evs)
+    assert res.startswith(a._JOB_CLAIM_FLAG) and FAKE_ID in res.split("\n")[0]

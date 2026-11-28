@@ -6786,6 +6786,66 @@ _ANNOUNCE_RE = re.compile(
     re.IGNORECASE)  # "Let me check…" 처럼 문장 첫 글자가 대문자인 경우가 대부분이다
 
 
+# ── 심의 · 리스크 잡 맥락과 지어낸 실행 주장(HWAXPortal docs/request-1125 WD-02) ────────────────────────────────────────────
+# 11-10 시험 — 도구 · id 를 짚어 준 9단계 가운데 2단계에서 챗이 도구를 부르지 않고 부른 것처럼 썼고, 한 번은 없는 잡 id 와 표결 변화표까지 지어냈다.
+# 그 턴에 심의 · 리스크 도구가 묶이지 않으면 그렇게 된다. (가) 맥락(잡 id · 도구 이름 · 심의 낱말)이 있으면 그 도구를 이 턴에 먼저 묶고, (나) 답 뒤에
+# 이번 턴 활동 · 이력에 없는 잡 id 와 그 도구를 부르지 않은 실행 주장을 짚어 한 번 다시 쓰게 한 뒤, 그래도 남으면 답 위에 표지를 단다.
+_JOB_ID_RE = re.compile(r"(?<![0-9A-Za-z])[a-z][a-z0-9_]{1,30}-\d{8}-\d{6}-[0-9a-f]{6}(?![0-9A-Za-z])")
+_JOB_CTX_RE = re.compile(r"deliberate_[a-z_]+|risk_[a-z_]+|심의|결정문|리스크\s*심사|신뢰\s*판정|원인\s*규명|좌석\s*발언|표결", re.I)
+# 맥락이 서면 먼저 묶는 도구(원래 이름 — 노출 이름은 그대로이거나 <앱>_<이름>). 심의는 열기 · 잇기 · 진행 · 결과 · 목록 · 발언, 리스크는 다음 걸음 ·
+# 잡 · 쟁점 · 보고서. 목록이 커지면 스키마 몫이 커져 묶음 예산에서 다른 도구를 밀어낸다 — 고정 열 개만.
+_JOB_CTX_TOOLS = ("deliberate_start", "deliberate_continue", "deliberate_status", "deliberate_result", "deliberate_list",
+                  "deliberate_transcript", "risk_next_step", "risk_start_job", "risk_job_action", "risk_get_report")
+_JOB_TOOL_PFX = ("deliberate_", "risk_")
+# 실행 주장 — 심의 · 심사 · 판정 · 잡을 열었다 · 시작했다 · 이어 돌렸다 · 재조회했다(과거 · 완료꼴만 — '열겠습니다' 같은 예고는 다른 관문이 본다)
+_ACT_CLAIM_RE = re.compile(
+    r"(?:심의|리스크\s*심사|심사|신뢰\s*판정|원인\s*규명|잡)[^\n.。!?]{0,30}?(?:을|를|은|는|이|가)?\s*"
+    r"(?:열었|열어\s*두었|시작했|이어\s*(?:돌렸|갔|진행했|열었)|재조회했|다시\s*조회했|다시\s*돌렸|제출했|걸었)"
+    r"|(?:열었|시작했|이어\s*돌렸|재조회했)[^\n.。!?]{0,12}?(?:심의|심사|판정)", re.I)
+
+
+def _job_ctx_tools(message: str, history, names) -> list:
+    """이번 말 · 최근 이력에 심의 · 리스크 잡 맥락이 있으면 먼저 묶을 노출 이름(names 가운데 _JOB_CTX_TOOLS 꼴만) — 없으면 []."""
+    recent = " ".join(str(h.get("content", ""))[:2000] for h in list(history or [])[-6:] if isinstance(h, dict))
+    blob = f"{message or ''}\n{recent}"
+    if not (_JOB_ID_RE.search(blob) or _JOB_CTX_RE.search(blob)):
+        return []
+    out = []
+    for want in _JOB_CTX_TOOLS:
+        hit = sorted(n for n in (names or ()) if n == want or n.endswith("_" + want))
+        out.extend(hit[:1])
+    return out
+
+
+def _job_known_ids(message: str, history, outputs) -> set:
+    """출처가 있는 잡 id — 이번 말 · 이번 턴 도구 결과 · 이력의 사람 말 · 도구가 돈 답(근거 블록이 붙은 것). 모델이 앞 턴에 지어낸 id 는 넣지 않는다
+    (유령 ID 막이와 같은 규칙 — 근거 없는 앞 답의 값이 다음 턴의 출처가 되지 않게)."""
+    parts = [message or "", *[str(o) for o in (outputs or [])]]
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        c = str(h.get("content") or "")
+        if h.get("role") == "assistant" and _EVIDENCE_MARK not in c and not h.get("kind"):
+            continue            # 포털이 종류를 단 항목(심의 결과 · 업로드 알림 — kind)은 서버가 쓴 글이라 출처다
+        parts.append(c)
+    return set(_JOB_ID_RE.findall("\n".join(parts)))
+
+
+def _job_claim_findings(text: str, called, known_ids: set) -> list:
+    """답 뒤 검사(WD-02) — ① 출처 없는 잡 id ② 심의 · 리스크 도구를 이번 턴에 부르지 않은 실행 주장. 짚은 것 글 목록(없으면 [])."""
+    out = []
+    bad = sorted(set(_JOB_ID_RE.findall(text or "")) - set(known_ids or ()))
+    if bad:
+        out.append("이번 턴 도구 결과 · 이력에 없는 잡 id " + ", ".join(bad[:5]))
+    m = _ACT_CLAIM_RE.search(text or "")
+    if m and not any(any(p in str(n).lower() for p in _JOB_TOOL_PFX) or _confirm_class(n)[0] == "job" for n in (called or ())):
+        out.append(f"심의 · 리스크 도구를 부르지 않았는데 '{' '.join(m.group(0).split())[:40]}' 라고 썼다")
+    return out
+
+
+_JOB_CLAIM_FLAG = "> ⚠ **도구 호출 없이 쓴 내용** — "
+
+
 def _announced_without_calling(text: str) -> bool:
     """도구를 쓰겠다고 '말만' 하고 실제로는 한 번도 호출하지 않은 턴인지.
 
@@ -7834,6 +7894,11 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
         first = list(dict.fromkeys([*pinned, *_operator_entry(persona),
                                     *[t for _k, _m in helpers for t in _operator_entry(_m)]]))
+        # 심의 · 리스크 잡 맥락(WD-02) — 잡 id · 도구 이름 · 심의 낱말이 이번 말이나 최근 이력에 있으면 그 도구를 이 턴에 먼저 묶는다
+        _jt = _job_ctx_tools(req.message, req.history, await asyncio.to_thread(_tools_map) or {})
+        if _jt:
+            first = list(dict.fromkeys([*first, *_jt]))
+            yield _sse("status", {"step": f"심의 · 리스크 잡 맥락 — 그 도구 {len(_jt)}개를 이 턴에 묶었습니다", "tool": None, "tools_used": _jt})
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
@@ -8567,6 +8632,49 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                      "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")
             text += _warn
             yield _sse("token", {"delta": _warn})
+    # ── 지어낸 잡 id · 실행 주장(WD-02) — 짚으면 그 도구를 묶은 에이전트로 한 번 다시 쓰게 하고, 그래도 남으면 답 위에 표지. 확인 카드가 선 턴은
+    # 건너뛴다(카드로 끝난다).
+    _called = {n for n, _d in turn_calls} | set(_turn_tool_calls.get() or ())
+    _jf = [] if _cctx.pending else _job_claim_findings(text, _called, _job_known_ids(req.message, req.history, turn_out))
+    if _jf:
+        print(f"[agent] 지어낸 실행 주장 — {' · '.join(_jf)[:200]} — 도구를 묶어 1회 다시 쓴다")
+        yield _sse("status", {"step": "도구 호출 없이 쓴 내용을 짚었습니다 — 심의 · 리스크 도구를 묶어 한 번 다시 씁니다", "tool": None})
+        _rt_out: list = []
+        try:
+            _jt2 = _job_ctx_tools("심의", [], await asyncio.to_thread(_tools_map) or {})
+            _ag2 = await _agent_for(app, req.groups, locals().get("pinned"), locals().get("_sel_q") or req.message, req.search_sources,
+                                    req.user_email, req.user_pat, list(dict.fromkeys([*(locals().get("first") or []), *_jt2])),
+                                    _GUIDE_TOOLS if (locals().get("operator") or locals().get("op_apps")) else None, locals().get("prefer"))
+            _forced = _turn_msgs(sys_prompt, (locals().get("turn_notes") or "") + "\n\n[중요] 앞 답이 이번 턴에 부르지 않은 도구의 결과를 "
+                                 "말했다(" + " · ".join(_jf) + "). 심의 · 리스크 잡을 열었다 · 이었다 · 다시 조회했다고 쓰려면 그 도구를 **지금 실제로 "
+                                 "호출**하라. 부를 수 없으면 '부르지 못했다' 고 쓴다. 도구 결과 · 이력에 없는 잡 id 를 쓰지 마라.",
+                                 _history_messages(req.history, has_docs=bool(req.documents)),
+                                 locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
+            _status_wait_retry()
+            _r4 = await _ag2.ainvoke({"messages": _forced}, config=_cfg)
+            _new = ""
+            for m in (_r4 or {}).get("messages") or []:
+                if getattr(m, "type", "") == "tool":
+                    _tc = getattr(m, "content", "")
+                    _rt_out.append("".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _tc) if isinstance(_tc, list) else str(_tc))
+            for m in reversed((_r4 or {}).get("messages") or []):
+                if getattr(m, "type", "") == "ai":
+                    _c4 = getattr(m, "content", None)
+                    _new = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c4) if isinstance(_c4, list) else str(_c4 or "")
+                    if _new.strip():
+                        break
+            if _new.strip():
+                _sep = "\n\n---\n**도구로 다시 확인한 답**\n\n"
+                yield _sse("token", {"delta": _sep + _new.strip()})
+                text = _new.strip()
+        except Exception as exc:  # noqa: BLE001 — 다시 쓰기가 실패해도 표지는 단다
+            print(f"[agent] 지어낸 실행 주장 다시 쓰기 실패: {exc!r}")
+        _called = _called | set(_turn_tool_calls.get() or ())
+        _jf = _job_claim_findings(text, _called, _job_known_ids(req.message, req.history, [*turn_out, *_rt_out]))
+        if _jf:
+            _flag = _JOB_CLAIM_FLAG + " · ".join(_jf) + " — 이 부분은 실제 조회 · 실행 결과가 아니다.\n\n"
+            text = _flag + text
+            yield _sse("status", {"step": "도구 호출 없이 쓴 내용 — 답 위에 표지를 달았습니다", "tool": None, "flag": _jf})
     # ── 확정 종결 — "조회하겠습니다"만 남기고 끝나거나 빈 응답으로 끝나는 애매한 턴을 없앤다.
     # 사용자 요구(2026-08-05): 스트림이 애매하게 꺼지지 말 것 — 도구가 있는지 없는지 판별될
     # 때까지 진행해서, 있으면 코드가 직접 1회 호출해 결과로 답하고, 없으면 '없다'고 명시하고
