@@ -4387,7 +4387,9 @@ _PROCEDURE_START = ("procedure_run_start",)
 # 5d22517e)는 RA 운영자와 대화할 때만 걸려, 운영자를 고르지 않은 웹 챗 · 다른 운영자 대화에서는 RA 초안이 확인 없이 만들어졌다(11-10 시험).
 # 운영자 정의 없이도 늘 카드(confirm — 주문 말로도 통과하지 않는다)다. 이 서버가 결정적으로 저장하는 길(/보고서 · 심의 save_report)은 챗 턴 밖이라
 # 관문이 서지 않는다(_turn_confirm 이 없다).
-_CONFIRM_ALWAYS_TOOLS = ("create_report_draft", "update_report_draft", "add_report_tags", "publish_report", "create_report_from_format")
+_CONFIRM_ALWAYS_TOOLS = ("create_report_draft", "update_report_draft", "add_report_tags", "publish_report", "create_report_from_format",
+                         # 끝난 심의의 결정문을 RA 로 저장(WD-09 — 이 서버의 심의 MCP 도구)
+                         "deliberate_save_report")
 # '이번 말이 시켰다' 판정 — 주문 동사 · 질문 · 부정. 질문 · 부정은 주문을 지운다(어긋나면 카드 쪽으로 간다 — 엄한 쪽이 틀려도 카드가 하나 더 뜰 뿐이다).
 _ORDER_RE = re.compile(
     r"(?:실행|재실행|제출|시작|변환|등록|생성|저장|업로드|추가|수정|변경|삭제|취소|적용|반입|게시)\s*(?:을|를)?\s*"

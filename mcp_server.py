@@ -1632,6 +1632,30 @@ def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: b
                            ids=("subject", "count", "rounds", *(("filter",) if dfilt else ())))
 
 
+_A_SAVE_JOB = "보고서로 남길 끝난 심의의 job_id(deliberate_list 로 찾는다)."
+
+
+@mcp.tool(title="심의 결정문 — 보고서로 저장",
+          description="끝난 심의(status done · 결정문 있음)의 결정문 전문 · 마지막 라운드 발언 · 회의록을 엔진의 보고서 꼴 그대로 Report "
+                      "Archive 에 부른 사람 이름으로 저장한다 — 챗이 결정문 블록을 다시 쓰지 않는다. 시작 때 save_report 를 끄고 돈 심의를 나중에 "
+                      "남길 때 쓴다. 같은 사람이 같은 잡을 다시 부르면 새로 만들지 않고 앞서 받은 번호를 돌려준다(already=true — 주인이면 시작 때 "
+                      "저장한 보고서도 같다). 볼 수 있는 심의만(주인 · 같은 소속) · 신원 있는 호출만 · 도는 잡 · 결정문 없는 잡 · 리스크 심사 계열 · "
+                      "위임은 거절한다. 답 {job_id, report_id, report_url, already, note}. 쓰기다 — 부르기 전에 사람에게 확인한다(웹 챗은 확인 카드).",
+          annotations=_ann(read=False, world=True))
+async def deliberate_save_report(job_id: Annotated[str, Field(description=_A_SAVE_JOB)], ctx: Context | None = None) -> dict:
+    """끝난 잡을 RA 보고서로 — delib_report_save.save(그 사람 이름 · 한 번만, HWAXPortal docs/request-1125 WD-09)."""
+    import delib_report_save  # noqa: PLC0415
+    user, groups = _caller(ctx)
+    if not user.strip():
+        raise ValueError("신원 없는 호출은 보고서를 쓰지 않는다 — 사람 PAT 로 게이트웨이를 거쳐 부른다(보고서는 부른 사람 이름으로 남는다)")
+    _u, aff, admin = _caller_view(ctx)
+    jid = str(job_id or "").strip()
+    job = delib_jobs.get(jid)
+    if not job or not delib_jobs.can_read(job, user, aff, admin):
+        raise ValueError(f"그런 심의 잡이 없다: {jid[:80]} — deliberate_list 로 확인하라")
+    return await delib_report_save.save(_need_app(), jid, user=user, groups=groups)
+
+
 @mcp.tool(title="심의 취소",
           description="진행 중이거나 대기 중(queued)인 HWAX 심의를 접는다. 동시 실행 상한에 걸렸을 때 "
                       "자리를 비운다 — 대기 중인 것은 시작하지 않고 줄에서 빠진다. 접을 수 있는 것은 내가 "
