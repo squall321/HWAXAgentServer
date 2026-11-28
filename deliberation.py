@@ -6065,7 +6065,9 @@ async def _defect_briefing(tools: dict, llm, question: str, history=None):
             issues = [x for x in _parse_json_multi(await _call(
                 tools, "get_top_issues", {"product_code": p, "period_days": 7, "top_n": 5})) if isinstance(x, dict)]
             if len(issues) == 1:   # 래핑 응답({issues:[…]}) 형태도 받는다
-                _w = issues[0].get("issues") or issues[0].get("top_issues") or issues[0].get("data")
+                # SignalForge 계약 2단계(81aef78, 11-28)는 목록을 {total, truncated, results} 로 싼다 — results 도 받는다
+                _w = (issues[0].get("issues") or issues[0].get("top_issues") or issues[0].get("results")
+                      or issues[0].get("data"))
                 if isinstance(_w, list):
                     issues = _w
             names = [str((_first_dict(i)).get("category") or (_first_dict(i)).get("issue") or i)[:40]
