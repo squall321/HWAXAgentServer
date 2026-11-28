@@ -174,3 +174,91 @@ def test_A1_0_이면_종전처럼_줄이지_않는다(kit):
     _run(scenario)
     last = [x for x in kit.llm.seen[-1] if getattr(x, "type", "") == "tool"]
     assert "가" * 4000 in last[0].content
+
+
+# ── OF-1 첨부 본문 읽기 · 울타리 밖 도구 ──────────────────────────────────────────────────────────────────────────
+import base64  # noqa: E402
+import json  # noqa: E402
+
+_HTML = ("<html><head><style>.x{color:red}</style><script>var a=1;</script></head><body><h1>낙하 시험 보고</h1>"
+         "<p>시료 S26 은 1.5 m 낙하에서 화면 깨짐.</p><table><tr><td>원인</td><td>모서리 응력 312.5 MPa</td></tr></table>"
+         "<p>대책 — 모서리 보강 리브 추가.</p></body></html>")
+
+
+def _dl_json(text: str, mime="text/html", name="report.html") -> str:
+    return json.dumps({"file_id": "f1", "filename": name, "mime_type": mime, "size": len(text.encode()), "encoding": "base64",
+                       "data_base64": base64.b64encode(text.encode()).decode()})
+
+
+def test_OF1_첨부_글은_HTML_을_걷고_바이너리는_읽지_않는다():
+    text, why = offload.attachment_text(_dl_json(_HTML))
+    assert why == "" and "낙하 시험 보고" in text and "모서리 응력 312.5 MPa" in text and "color:red" not in text and "var a" not in text
+    assert offload.attachment_text(_dl_json("PNG", mime="image/png", name="a.png"))[1].startswith("글이 아닌 첨부다")
+    assert "받지 못했다" in offload.attachment_text(json.dumps({"error": "권한 없음"}))[1]
+    assert "JSON 이 아니다" in offload.attachment_text("잘린 글 {")[1]
+
+
+def test_OF1_첨부는_쪽과_찾기로_읽는다():
+    body = "\n".join(f"줄 {i} 내용" for i in range(1, 51)) + "\n원인은 모서리 응력\n끝"
+    page = offload._attach_page(body, "f1", 0, 30, "")
+    assert page.startswith(f"[첨부 f1 — 전체 {len(body):,}자 · 0~30 · 다음 offset=30]")
+    hit = offload._attach_page(body, "f1", 0, 6000, "모서리")
+    assert "든 줄 1곳" in hit and "원인은 모서리 응력" in hit and "줄 50 내용" in hit and "줄 10 내용" not in hit
+    assert "든 줄이 없다" in offload._attach_page(body, "f1", 0, 6000, "없는낱말")
+
+
+def test_OF1_첨부_받기가_울타리_안이면_그대로_묶지_않고_첨부_읽기를_묶는다(kit):
+    _kit_tools(kit, {"download_file": _tool("download_file", "이건 부르면 안 된다"),
+                     "get_report": _tool("get_report", '{"blocks": [{"type": "file", "file_id": "f1"}]}')})
+    got = []
+
+    async def _dt(_app, groups, user, name):
+        got.append((name, user))
+        return _tool("download_file", _dl_json(_HTML))
+    kit.mp.setattr(offload, "_download_tool", _dt)
+    kit.llm.script = [_ai("", _call("get_report", q="R-1")), _ai("", _call("read_attachment", file_id="f1", query="원인")),
+                      _ai("", _call("read_attachment", file_id="f1", offset=0, limit=500)),
+                      _ai("원인은 모서리 응력 312.5 MPa [e2].\n[못 채운 것] 없음")]
+
+    async def scenario():
+        out = await m.delegate_start(task="보고서 R-1 첨부의 원인", ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    assert "read_attachment" in kit.llm.bound[0] and "download_file" not in kit.llm.bound[0]
+    assert [e["tool"] for e in res["evidence"]] == ["get_report", "read_attachment", "read_attachment"]
+    assert got == [("download_file", "me@example.com")], "첨부마다 한 번만 받는다(그 사람의 신원으로)"
+    assert res["numbers"]["mismatched"] == [], "첨부 본문이 숫자 대조의 근거다"
+    assert "blocked_tools" not in res and res["incomplete"] is False
+
+
+def test_OF1_첨부_받기가_울타리_밖이면_막이가_까닭을_주고_blocked_tools_에_싣는다(kit):
+    dl = _tool("download_file", "부르면 안 된다")
+    _kit_tools(kit, {"get_report": _tool("get_report", '{"blocks": [{"file_id": "f1"}]}')})
+    base_pt = offload._person_tools
+
+    async def _pt(_app, groups, user):
+        d = dict(await base_pt(_app, groups, user))
+        d["download_file"] = dl
+        return d
+    kit.mp.setattr(offload, "_person_tools", _pt)
+    kit.llm.script = [_ai("", _call("download_file", file_id="f1")), _ai("", _call("voc_write_note", q="x")),
+                      _ai("첨부는 울타리 밖이라 못 읽음.\n[못 채운 것] 첨부 본문")]
+
+    async def scenario():
+        out = await m.delegate_start(task="보고서 첨부 본문 요약", ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    from test_offload import CALLS
+    assert not any(c[0] in ("download_file", "voc_write_note") for c in CALLS), "울타리 밖은 부르지 않는다"
+    bt = {b["tool"]: b["why"] for b in res["blocked_tools"]}
+    assert set(bt) == {"download_file", "voc_write_note"} and "울타리 밖" in bt["download_file"] and "울타리 밖" in bt["voc_write_note"]
+    stub = [x for x in kit.llm.seen[1] if getattr(x, "type", "") == "tool"]
+    assert "울타리 밖이라 못 읽음" in stub[0].content
+    assert res["unfilled"] == ["첨부 본문"]
+
+
+def test_OF1_설명에_첨부_읽기와_blocked_tools_를_적는다():
+    assert "read_attachment" in m._DG_START_DESC and "blocked_tools" in m._DG_START_DESC and "직접 읽는다" in m._DG_START_DESC
+    assert "blocked_tools" in m._DG_RESULT_DESC and "울타리 밖이라 못 읽음" in offload._DELEGATE_SYS

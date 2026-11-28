@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import time
+from html.parser import HTMLParser
 from urllib.parse import quote, unquote
 
 import httpx
@@ -320,19 +321,23 @@ def header_user(hdr) -> str:
 
 
 # ── 울타리 ────────────────────────────────────────────────────────────────────────────────────────────────────
-async def read_fence(app, groups: list, user: str, apps=None) -> tuple[dict, str]:
+async def read_fence(app, groups: list, user: str, apps=None, *, with_all: bool = False):
     """(묶을 도구 {노출 이름: 도구}, 비었을 때의 까닭) — 그 사람의 도구 ∩ 게이트웨이가 읽기로 확인한 것(routine_read) − 이 서버의 도구 − 게이트웨이
-    로컬 도구, apps 를 주면 그 앱(백엔드 키)의 것만. routine_read 를 모르면 빈 울타리다(모르면 막는다 — 루틴과 같다)."""
-    tools = await _maybe(_person_tools(app, groups, user))
+    로컬 도구, apps 를 주면 그 앱(백엔드 키)의 것만. routine_read 를 모르면 빈 울타리다(모르면 막는다 — 루틴과 같다). with_all 이면 셋째 칸에 그
+    사람의 도구 전부({노출 이름: 도구} — 울타리 밖이라 못 부른 것을 가르는 데 쓴다, OF-1)."""
+    tools = dict(await _maybe(_person_tools(app, groups, user)) or {})
     m, rr = await _maybe(_read_map(app))
+
+    def _out(allowed, why):
+        return (allowed, why, tools) if with_all else (allowed, why)
     if rr is None:
-        return {}, "게이트웨이가 읽기 판정(/tools-map 의 routine_read)을 주지 않았다 — 읽기로 확인된 도구가 없어 아무것도 묶지 않는다(옛 게이트웨이 · 불통)"
+        return _out({}, "게이트웨이가 읽기 판정(/tools-map 의 routine_read)을 주지 않았다 — 읽기로 확인된 도구가 없어 아무것도 묶지 않는다(옛 게이트웨이 · 불통)")
     want = {str(a).strip() for a in (apps or []) if str(a).strip()}
-    allowed = {n: t for n, t in (tools or {}).items()
+    allowed = {n: t for n, t in tools.items()
                if n in rr and m.get(n) and m[n] not in (OWN_BACKEND, GATEWAY_LOCAL) and (not want or m[n] in want)}
     if allowed:
-        return allowed, ""
-    return {}, ("고른 앱(" + ", ".join(sorted(want)) + ")에" if want else "이 사람의 도구에") + " 읽기로 확인된 도구가 하나도 없다"
+        return _out(allowed, "")
+    return _out({}, ("고른 앱(" + ", ".join(sorted(want)) + ")에" if want else "이 사람의 도구에") + " 읽기로 확인된 도구가 하나도 없다")
 
 
 # ── 게이트웨이 내부 ref 창구(B 의 손잡이 — 게이트웨이 작업자가 짓는다) ──────────────────────────────────────────────────
@@ -399,6 +404,7 @@ class _Run:
         self.final = ""
         self.final_msg = None
         self.halted = False         # 호출 예산을 넘는 호출을 돌려보냈다(덜 찾고 멈췄다 — OF-2)
+        self.blocked: dict = {}     # 울타리 밖이라 못 부른 도구 {이름: 까닭}(OF-1)
         self.few_hits = 0           # 적중이 적어 다시 찾으라는 힌트를 단 결과 수
 
 
@@ -532,6 +538,207 @@ async def _react(llm, tools: list, sysmsg: str, human: str, run: _Run) -> None:
         run.msgs = got
 
 
+# ── 첨부 읽기(OF-1) ─────────────────────────────────────────────────────────────────────────────────────────────
+# 보고서 본문이 HTML 첨부에만 있는 과제에서 위임이 '못 읽음' 으로 끝났다(11-24 — 패 8 가운데 2). 첨부 받기(RA download_file)는 base64 바이트를
+# 통째로 돌려줘 LLM 이 읽을 수 없고 결과 상한에 잘린다. 그래서 그 도구가 울타리 안이면 그대로 묶지 않고, 서버가 받아 글로 풀어 쪽(offset · limit) ·
+# 찾기(query → 일치 줄과 앞뒤)로 내주는 실행기 안의 도구 하나를 묶는다. 울타리 밖이면 같은 이름의 막이를 묶어 '울타리 밖이라 못 읽음' 을 돌려주고
+# blocked_tools 에 적는다(부르지 않는다). 받기는 그 사람의 시야 그대로다(같은 게이트웨이 도구 — 상한만 크게, 첨부마다 한 번 받아 둔다).
+ATTACH_TOOL = "read_attachment"
+DOWNLOAD_TOOLS = ("download_file",)       # 원래 이름 — 게이트웨이가 접두를 단 꼴(<앱>_download_file)도 같다
+ATTACH_PAGE_DEFAULT = 6000
+ATTACH_CTX_LINES = 2
+_ATTACH_BIN_MIME = ("image/", "audio/", "video/", "application/pdf", "application/zip", "application/octet-stream",
+                    "application/vnd.openxmlformats", "application/vnd.ms-", "application/msword")
+
+
+def _download_name(tools: dict) -> str:
+    for n in sorted(tools or {}):
+        low = n.lower()
+        if any(low == d or low.endswith("_" + d) for d in DOWNLOAD_TOOLS):
+            return n
+    return ""
+
+
+async def _download_tool(app, groups: list, user: str, name: str):
+    """첨부 받기 도구를 결과 상한 없이(CATALOG_RESULT_MAX) 다시 받는다 — 기본 상한(TOOL_RESULT_MAX)이면 base64 가 잘려 풀 수 없다. 처음 읽을 때 한 번."""
+    import deliberation  # noqa: PLC0415
+    got = await deliberation._tools_by_name(app, list(groups or []), result_max=_app().CATALOG_RESULT_MAX, user=user)
+    return (got or {}).get(name)
+
+
+class _TagText(HTMLParser):
+    """HTML → 글 — script · style 은 버리고 블록 태그는 줄을 바꾼다."""
+    _BLOCK = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "section", "article", "ul", "ol", "pre", "hr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag in ("td", "th"):
+            self.parts.append(" | ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def attachment_text(raw: str) -> tuple[str, str]:
+    """(글, 못 읽은 까닭) — 첨부 받기 결과(RA download_file 의 {filename, mime_type, data_base64} 또는 {error})를 글로. HTML 은 태그를 걷고,
+    글 꼴(text · json · csv · xml · md)은 그대로, 그림 · PDF · 오피스 같은 바이너리는 읽지 않는다(까닭)."""
+    import base64  # noqa: PLC0415
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        return "", "첨부 받기 답이 JSON 이 아니다(결과가 잘렸거나 꼴이 다르다)"
+    if not isinstance(d, dict):
+        return "", "첨부 받기 답의 꼴이 다르다"
+    if d.get("error"):
+        return "", f"첨부를 받지 못했다: {str(d['error'])[:200]}"
+    b64 = d.get("data_base64")
+    if not isinstance(b64, str):
+        return "", "첨부 받기 답에 data_base64 가 없다"
+    mime = str(d.get("mime_type") or "").lower()
+    name = str(d.get("filename") or "")
+    if any(mime.startswith(x) for x in _ATTACH_BIN_MIME) and not name.lower().endswith((".html", ".htm", ".txt", ".csv", ".json", ".md", ".xml")):
+        return "", f"글이 아닌 첨부다({mime or '모름'} · {name[:80]}) — 이 도구로는 읽지 못한다"
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (ValueError, TypeError):
+        return "", "base64 를 풀지 못했다"
+    for enc in ("utf-8", "cp949"):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return "", f"글자 꼴을 알 수 없는 첨부다({mime or '모름'})"
+    if "html" in mime or name.lower().endswith((".html", ".htm")) or re.match(r"\s*<(?:!doctype|html|body|div|table|p)\b", text, re.I):
+        p = _TagText()
+        p.feed(text)
+        p.close()
+        text = "".join(p.parts)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    return text, ""
+
+
+def _attach_page(text: str, file_id: str, offset: int, limit: int, query: str) -> str:
+    """쪽 하나(offset · limit) 또는 찾기(query — 낱말이 든 줄과 앞뒤 ATTACH_CTX_LINES 줄) — 머리에 전체 글자 · 다음 offset 을 적는다."""
+    n = len(text)
+    if query:
+        lines = text.split("\n")
+        q = query.strip().lower()
+        hits = [i for i, ln in enumerate(lines) if q in ln.lower()]
+        if not hits:
+            return f"[첨부 {file_id} — 전체 {n:,}자 · '{query[:60]}' 이(가) 든 줄이 없다 — 낱말을 바꾸거나 offset 으로 쪽을 읽는다]"
+        keep: list = []
+        for i in hits:
+            lo, hi = max(0, i - ATTACH_CTX_LINES), min(len(lines), i + ATTACH_CTX_LINES + 1)
+            if keep and lo <= keep[-1][1]:
+                keep[-1] = (keep[-1][0], max(keep[-1][1], hi))
+            else:
+                keep.append((lo, hi))
+        body, shown = [], 0
+        for lo, hi in keep:
+            chunk = "\n".join(lines[lo:hi])
+            if shown + len(chunk) > limit:
+                body.append("…[찾은 곳이 더 있다 — query 를 좁히거나 offset 으로 쪽을 읽는다]")
+                break
+            body.append(f"(줄 {lo + 1}~{hi})\n{chunk}")
+            shown += len(chunk)
+        return f"[첨부 {file_id} — 전체 {n:,}자 · '{query[:60]}' 이(가) 든 줄 {len(hits)}곳]\n" + "\n---\n".join(body)
+    offset = min(max(0, offset), n)
+    end = min(n, offset + limit)
+    more = f" · 다음 offset={end}" if end < n else " · 끝"
+    return f"[첨부 {file_id} — 전체 {n:,}자 · {offset:,}~{end:,}{more}]\n" + text[offset:end]
+
+
+def _attachment_reader(app, groups: list, user: str, dl_name: str, run: "_Run", cap: int):
+    """실행기 안의 첨부 읽기 도구 — 호출 예산 · 근거 표 · 숫자 대조는 다른 도구와 같다(_proxy 와 같은 기록). 첨부마다 한 번 받아 둔다."""
+    from langchain_core.tools import StructuredTool  # noqa: PLC0415
+    cache: dict = {}
+    page_max = max(500, min(int(cap), 20_000))
+
+    async def _run(file_id: str = "", offset: int = 0, limit: int = ATTACH_PAGE_DEFAULT, query: str = ""):
+        if run.calls >= run.max_steps:
+            run.halted = True
+            return (f"{_HALT} 호출 예산 {run.max_steps}번을 다 썼다 — 더 부르지 말고 지금까지 받은 결과로 답을 정리하라. 확인하지 못한 항목은 "
+                    "[못 채운 것] 줄에 적는다.")
+        run.calls += 1
+        eid = f"e{run.calls}"
+        fid = str(file_id or "").strip()
+        run.emit({"step": f"도구 호출 {run.calls}/{run.max_steps}: {ATTACH_TOOL}", "tool": ATTACH_TOOL})
+        ok, text = True, ""
+        try:
+            if not fid:
+                raise OffloadError("file_id 가 비었다 — get_report · list_report_files 결과의 file_id 를 준다")
+            if fid not in cache:
+                t = await _maybe(_download_tool(app, groups, user, dl_name))
+                if t is None:
+                    raise OffloadError(f"첨부 받기 도구({dl_name})를 다시 받지 못했다")
+                cache[fid] = attachment_text(_text(await t.ainvoke({"file_id": fid})))
+            body, why = cache[fid]
+            if why:
+                raise OffloadError(why)
+            lim = max(200, min(int(limit or ATTACH_PAGE_DEFAULT), page_max))
+            text = _attach_page(body, fid, int(offset or 0), lim, str(query or ""))
+        except Exception as exc:  # noqa: BLE001 — 실패도 근거 표에 남기고 까닭을 준다
+            ok, text = False, f"{_HALT} {ATTACH_TOOL} 실패: {str(exc)[:300]}"
+        args = {"file_id": fid, **({"query": query} if query else {"offset": int(offset or 0)})}
+        run.evidence.append({"id": eid, "tool": ATTACH_TOOL, "args": _args_show(args), "chars": len(text), "ok": ok})
+        if ok:
+            run.texts.append(text)
+        run.shown.append((eid, ATTACH_TOOL, text))
+        return f"[근거 {eid}] " + ("(도구가 실패했다) " if not ok else "") + text
+
+    desc = ("보고서 첨부(HTML · 글 파일)의 본문을 서버가 받아 글로 풀어 읽는다 — 본문이 첨부에만 있을 때 쓴다. file_id 는 get_report · "
+            "list_report_files 결과의 것. 쪽으로 읽으려면 offset · limit(글자, 기본 6,000) — 머리에 전체 글자와 다음 offset 이 있다. 찾으려면 "
+            "query(낱말 — 그 낱말이 든 줄과 앞뒤 두 줄). 그림 · PDF · 오피스 파일은 읽지 못한다.")
+    schema = {"type": "object", "required": ["file_id"], "properties": {
+        "file_id": {"type": "string", "description": "첨부 file_id"},
+        "offset": {"type": "integer", "description": "읽기 시작 글자(기본 0)"},
+        "limit": {"type": "integer", "description": f"읽을 글자(기본 {ATTACH_PAGE_DEFAULT:,} · 최대 {page_max:,})"},
+        "query": {"type": "string", "description": "찾을 낱말 — 주면 쪽 대신 그 낱말이 든 줄과 앞뒤"}}}
+    return StructuredTool(name=ATTACH_TOOL, description=desc, coroutine=_run, args_schema=schema)
+
+
+def _fence_stub(name: str, run: "_Run", why: str):
+    """울타리 밖 도구 자리의 막이 — 부르지 않고 '울타리 밖이라 못 읽음' 을 돌려주며 blocked 에 적는다(호출 수는 세지 않는다)."""
+    from langchain_core.tools import StructuredTool  # noqa: PLC0415
+
+    async def _run(**_kw):
+        run.blocked.setdefault(name, why)
+        return (f"{_HALT} {name} 는 {why} — 부르지 않았다. 이 내용은 답에 '울타리 밖이라 못 읽음' 으로 적고 [못 채운 것] 줄에 넣는다. 다시 "
+                "부르지 마라.")
+    return StructuredTool(name=name, description=f"(이 위임에서는 부를 수 없다 — {why})", coroutine=_run,
+                          args_schema={"type": "object", "properties": {"file_id": {"type": "string"}}})
+
+
+def _blocked_calls(run: "_Run", bound: set, everyone: dict) -> list:
+    """울타리 밖이라 못 부른 도구 — 막이가 받은 것 + LLM 이 묶이지 않은 이름으로 부른 것(그 사람의 도구에 있으면 울타리 밖, 없으면 없는 이름)."""
+    out = dict(run.blocked)
+    for m in run.msgs:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            n = str((tc or {}).get("name") or "")
+            if n and n not in bound and n not in out:
+                out[n] = ("울타리 밖 — 게이트웨이가 읽기로 확인하지 않은 도구 · 쓰기 · 이 서버의 도구는 위임에 묶이지 않는다" if n in (everyone or {})
+                          else "이 사람의 도구에 없는 이름이다")
+    return [{"tool": n, "why": w} for n, w in sorted(out.items())][:NUMS_SHOW]
+
+
 _UNFILLED_RE = re.compile(r"^\s*\[못\s*채운\s*것\]\s*(.*?)\s*$", re.M)
 
 
@@ -561,9 +768,9 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
         usage_tokens.tag(kind=USAGE_KIND)   # 이 잡 태스크의 LLM 토큰 종류(루틴 · 띵킹과 같은 자리 — 사람은 잡 원장이 이미 달았다)
         yield _sse("delib", {"kind": "stage", "stage": "tools"})
         try:
-            allowed, why = await read_fence(app, groups, user_email, apps)
+            allowed, why, everyone = await read_fence(app, groups, user_email, apps, with_all=True)
         except Exception as exc:  # noqa: BLE001 — 게이트웨이 불통 · 자격 거절은 까닭을 붙여 끝낸다
-            allowed, why = {}, f"게이트웨이 도구를 불러오지 못했다({type(exc).__name__}: {str(exc)[:200]})"
+            allowed, why, everyone = {}, f"게이트웨이 도구를 불러오지 못했다({type(exc).__name__}: {str(exc)[:200]})", {}
         if not allowed:
             yield _sse("error", {"message": f"위임을 시작하지 못했다 — {why}"})
             return
@@ -576,7 +783,14 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
         queue: asyncio.Queue = asyncio.Queue()
         run = _Run(steps, queue.put_nowait)
         cap = routine._result_cap(steps)
-        tools = [_proxy(t, run, cap) for t in allowed.values()]
+        dl_in = _download_name(allowed)
+        dl_out = "" if dl_in else _download_name(everyone)
+        tools = [_proxy(t, run, cap) for n, t in allowed.items() if n != dl_in]     # 첨부 받기는 base64 라 그대로 묶지 않는다(OF-1)
+        if dl_in and ATTACH_TOOL not in allowed:
+            tools.append(_attachment_reader(app, groups, user_email, dl_in, run, cap))
+            yield _sse("status", {"step": f"첨부 읽기({ATTACH_TOOL} — 쪽 · 찾기)를 묶었다({dl_in} 로 받아 글로 풀어 읽는다)"})
+        elif dl_out:
+            tools.append(_fence_stub(dl_out, run, "울타리 밖 — 게이트웨이가 이 박스에서 읽기로 확인하지 않은 도구다(첨부 본문을 못 읽는다)"))
         yield _sse("delib", {"kind": "stage", "stage": "gather"})
         loop = asyncio.get_running_loop()
         deadline = loop.time() + minutes * _MINUTE_S
@@ -642,6 +856,9 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
             result["unfilled"] = ["(실행기가 못 채운 항목을 적지 않았다 — 맡긴 일 가운데 답에 없는 것을 직접 확인한다)"]
         if run.few_hits:
             result["few_hits"] = run.few_hits
+        blocked = _blocked_calls(run, {t.name for t in tools}, everyone)
+        if blocked:
+            result["blocked_tools"] = blocked
         yield _sse("result", {"content": shown, "task": result})
     finally:
         for f in (getter, react):

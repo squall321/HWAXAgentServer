@@ -2049,7 +2049,9 @@ _DG_START_DESC = (
     "답의 숫자는 서버 코드가 근거 원문과 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다 — 어긋난 수는 쓰기 전에 확인한다). 서버가 재기동하면 "
     "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다. "
     + _DG_SIZE_HINT + " 결과의 incomplete=true(시간 · 호출 수로 멈춤 — stop.reason)면 unfilled 의 항목은 채워지지 않은 것이다 — 빈 사례로 표를 "
-    "채우지 말고 그 항목만 다시 맡기거나 직접 읽는다.")
+    "채우지 말고 그 항목만 다시 맡기거나 직접 읽는다. 보고서 본문이 첨부(HTML 등)에만 있으면 서버가 첨부 읽기(" + offload.ATTACH_TOOL + " — 쪽 · "
+    "찾기)로 읽는다. 결과의 blocked_tools 는 울타리 밖이라 못 부른 도구다 — 거기에 첨부 받기(download_file)가 있으면 그 박스에서는 첨부를 "
+    "못 읽으니 본문이 첨부에만 있는 일은 위임하지 말고 직접 읽는다.")
 _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · running · done · error · cancelled · interrupted) · 단계(tools · gather · answer) · "
                    "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. 기본으로 바뀌거나 끝날 때까지 서버가 기다린다(wait_s 기본 "
                    f"{DELEGATE_WAIT_DEFAULT_S:g}초) — **한 번** 부르고 고리로 거듭 묻지 마라. done 이면 delegate_result. 줄이 길면(queue 순번 2 "
@@ -2059,7 +2061,8 @@ _DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked,
                    "쉼표 · 공백 · SI 접두 환산 · 반올림 · 비 ↔ % 는 같은 값으로 본다 — 그렇게 맞은 수는 equivalent)이고 kinds 가 어긋남마다 종류(원문에 없음 · "
                    "환산 의심 · 반올림 의심)다. derived 는 답이 인용한 근거 수로 계산한 수(어긋남이 아니다). stop{reason(answered · time · steps · "
                    "recursion · error), calls, steps_budget, minutes_budget, elapsed_s} 와 incomplete · unfilled — incomplete 면 unfilled 의 항목을 "
-                   "채우지 못했다(빈 사례로 메우지 마라). 끝나지 않았으면 상태와 "
+                   "채우지 못했다(빈 사례로 메우지 마라). blocked_tools[{tool, why}] 는 울타리 밖이라 못 부른 도구 — 그 내용은 직접 읽는다. "
+                   "끝나지 않았으면 상태와 "
                    "안내만 준다. 내가 맡긴 위임만 보인다.")
 _DG_CANCEL_DESC = ("도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만(남의 위임 · 없는 위임은 '그런 위임이 없다'). 줄 선 것은 시작하지 않고 빠지고, 도는 것은 "
                    "접기를 청해 status=cancelling 이면 잠시 뒤 delegate_status 로 확인한다. 접은 위임은 이어 돌리지 않는다 — 같은 일은 delegate_start 로 다시 "
