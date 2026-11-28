@@ -198,12 +198,22 @@ def test_seat_timeout_default_is_1800_like_deliberation():
     (DELIB_TIMEOUT_S 기본 1800)와 같다 — 같은 GLM 에서 같은 크기의 일을 하는 좌석이다."""
     import re
 
-    src = open(t.__file__, encoding="utf-8").read()
-    m = re.search(r'^SEAT_TIMEOUT_S = float\(os\.environ\.get\("THINK_SEAT_TIMEOUT_S", "(\d+)"\)\)$', src, re.M)
     app_src = open(t.__file__.replace("thinking.py", "app.py"), encoding="utf-8").read()
     d = re.search(r'd_to = _env_float\("DELIB_TIMEOUT_S", (\d+)\.0\)', app_src)
-    assert m and int(m.group(1)) == 1800, m and m.group(0)
-    assert d and int(d.group(1)) == int(m.group(1)), "심의 좌석 호출 한도와 같다"
+    assert t._SEAT_TIMEOUT_DEFAULT == 1800.0
+    assert d and int(d.group(1)) == int(t._SEAT_TIMEOUT_DEFAULT), "심의 좌석 호출 한도와 같다"
+    assert t._seat_timeout({}) == 1800.0
+
+
+def test_seat_timeout_follows_delib_when_empty():
+    """THINK_SEAT_TIMEOUT_S 가 비면 DELIB_TIMEOUT_S 를 따른다(HWAXPortal docs/request-1125 HA-35 — cae00 10-31 DELIB 36000 만 올려 둘이 어긋났다).
+    적으면 그 값이 이긴다(종전 그대로). 따라 온 심의 값 0 은 심의처럼 한도 없음 · 못 읽는 값은 기본값."""
+    assert t._seat_timeout({"DELIB_TIMEOUT_S": "36000"}) == 36000.0
+    assert t._seat_timeout({"THINK_SEAT_TIMEOUT_S": "", "DELIB_TIMEOUT_S": "36000"}) == 36000.0
+    assert t._seat_timeout({"THINK_SEAT_TIMEOUT_S": "900", "DELIB_TIMEOUT_S": "36000"}) == 900.0
+    assert t._seat_timeout({"DELIB_TIMEOUT_S": "0"}) is None
+    assert t._seat_timeout({"THINK_SEAT_TIMEOUT_S": "abc"}) == 1800.0
+    assert t._seat_timeout({"DELIB_TIMEOUT_S": " "}) == 1800.0
 
 
 # ── 종합 문구 — 기권과 장애를 섞지 않는다 ─────────────────────────────────────
