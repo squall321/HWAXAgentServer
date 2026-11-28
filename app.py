@@ -1387,6 +1387,9 @@ class ChatRequest(BaseModel):
     # 사용자 지정 우선 도구 — AI 의 도구 선택을 100% 신뢰할 수 없어, 사용자가 도구 카탈로그에서
     # 직접 고른 도구를 우선 사용하게 강제한다(바인딩 보장 + 시스템 프롬프트 지시).
     pinned_tools: list[str] = []
+    # 확인 카드에서 바꾼 칸(HWAXPortal docs/request-1125 WD-06) — {id: 카드 번호, set: {save_report · job · rounds}}. 승인 말과 함께 올 때만, 그 카드의
+    # 심의 시작 · 이어하기 호출에만 얹는다(_confirm_apply_edit — 받는 칸 · 값만). 없으면 종전 그대로다.
+    confirm_edit: dict | None = None
     # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
     # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
     pinned_agent: str | None = None
@@ -4750,11 +4753,14 @@ def _confirm_ctx(req) -> _ConfirmCtx:
         return ctx
     _confirm_count("approved")
     ctx.card_id = cid
+    edits = _confirm_apply_edit(cid, card["calls"], getattr(req, "confirm_edit", None))    # 카드에서 바꾼 칸(WD-06) — 승인 열쇠보다 먼저
+    if edits:
+        print(f"[confirm] 카드 {cid} 고침 — " + " · ".join(edits)[:300], flush=True)
     ctx.approved = {(c["name"].strip().lower(), c["base"], c["canon"]): c for c in card["calls"]}
     # 카드 턴은 사람 자격(PAT)으로 돌았는데 승인 턴에 그 자격이 없으면(포털 발급 실패 — 빈 글) 보내지 않는다 — 그대로 보내면 승인된 잡 · 쓰기가
     # 서비스 계정 연결로 말없이 나간다(C-11 · 반대 검토 2차, 포털 루틴 길의 routine_no_pat 과 같다). 카드 턴도 자격 없이 돌았으면(서비스 계정 박스) 같다.
     ctx.no_pat = bool(card.get("pat")) and not (req.user_pat or "").strip()
-    ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다"
+    ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다" + (" · 카드에서 바꿈: " + " · ".join(edits) if edits else "")
     return ctx
 
 
@@ -5046,6 +5052,95 @@ async def _confirm_workload(app_, req, calls: list) -> None:
                 c["workload"] = miss
 
 
+# 심의 확인 카드의 요약(WD-06) — 자연어로 연 심의가 종류를 잘못 골라도 카드에서 알아채고 바꾸게, 종류 · 라운드 · 좌석 · RA 저장 · 근거 수 · 글자 · 앱을
+# 카드 맨 위에 고정해 보인다. 바꿀 수 있는 칸은 셋이다 — save_report(참 · 거짓) · job(엔진의 심의 종류) · rounds(0 = 기본 · 2~8).
+_CONFIRM_DELIB = ("deliberate_start", "deliberate_continue")
+_CONFIRM_EDIT_KEYS = ("save_report", "job", "rounds")
+_CONFIRM_SEATS_SHOW = 20
+
+
+def _confirm_is_delib(c: dict) -> bool:
+    return str(c.get("base") or "") in _CONFIRM_DELIB
+
+
+def _confirm_delib_summary(c: dict) -> dict | None:
+    """심의 시작 · 이어하기 호출의 카드 요약 — 인자에서만 센다(엔진을 부르지 않는다). 빠진 칸은 엔진 기본값이라 그렇게 적는다."""
+    if not _confirm_is_delib(c):
+        return None
+    args = _arg_dict(c.get("args")) or {}
+    personas = [p for p in (args.get("personas") or []) if isinstance(p, dict)]
+    seats = [str(p.get("name") or p.get("key") or p.get("agent_type") or p.get("id") or "?")[:40] for p in personas]
+    ev = [e for e in (args.get("evidence") or []) if isinstance(e, (dict, str))]
+    ev_chars = sum(len(e if isinstance(e, str) else json.dumps(e, ensure_ascii=False, default=str)) for e in ev)
+    rounds = args.get("rounds")
+    save = args.get("save_report")
+    out = {"call": c["base"], "job": str(args.get("job") or "default"),
+           "rounds": int(rounds) if isinstance(rounds, int) and not isinstance(rounds, bool) and rounds > 0 else 0,
+           "seats": seats[:_CONFIRM_SEATS_SHOW], "seats_n": len(seats),
+           "save_report": True if save is None else bool(save),
+           "evidence_n": len(ev), "evidence_chars": ev_chars,
+           "apps": [str(x) for x in (args.get("apps") or []) if str(x).strip()][:10],
+           "editable": list(_CONFIRM_EDIT_KEYS)}
+    if args.get("modifiers"):
+        out["modifiers"] = [str(x) for x in args["modifiers"]][:5]
+    if c["base"] == "deliberate_continue" and args.get("previous_job_id"):
+        out["previous_job_id"] = str(args["previous_job_id"])[:80]
+    return out
+
+
+def _confirm_delib_line(sm: dict) -> str:
+    """카드 글의 심의 요약 한 줄 — 단추 없는 화면에서도 종류 · 라운드 · 저장을 읽는다."""
+    seats = (f"좌석 {sm['seats_n']}(" + ", ".join(sm["seats"][:8]) + (" …" if sm["seats_n"] > 8 else "") + ")") if sm["seats_n"] else "좌석 서버가 고름"
+    parts = [f"종류 **{sm['job']}**", f"라운드 {sm['rounds'] or '기본(3)'}", seats, f"RA 저장 {'켬' if sm['save_report'] else '끔'}",
+             f"근거 {sm['evidence_n']}건 · {sm['evidence_chars']:,}자"]
+    if sm.get("apps"):
+        parts.append("앱 " + ", ".join(sm["apps"]))
+    if sm.get("modifiers"):
+        parts.append("층 " + ", ".join(sm["modifiers"]))
+    if sm.get("previous_job_id"):
+        parts.append(f"이을 잡 {sm['previous_job_id']}")
+    return "   심의 — " + " · ".join(parts)
+
+
+def _confirm_apply_edit(cid: str, calls: list, edit) -> list:
+    """승인과 함께 온 카드 고침(req.confirm_edit)을 그 카드의 심의 호출에 얹는다 → 바꾼 사실 글 목록. 번호가 다르거나 칸 · 값이 틀리면 그 칸은
+    버리고 그렇다고 적는다(보내는 인자는 사람이 본 카드 + 고친 칸뿐이다). 고친 호출은 정규 인자 · 카드 글을 다시 센다(승인 열쇠가 보내는 인자로 잰다)."""
+    if not isinstance(edit, dict) or str(edit.get("id") or "").strip() != cid:
+        return []
+    want = edit.get("set")
+    if not isinstance(want, dict) or not want:
+        return []
+    import delib_jobs  # noqa: PLC0415 — 심의 종류 이름표
+    ok: dict = {}
+    notes: list = []
+    for k, v in want.items():
+        if k == "save_report" and isinstance(v, bool):
+            ok[k] = v
+        elif k == "job" and isinstance(v, str) and v.strip() in delib_jobs.JOBS:
+            ok[k] = v.strip()
+        elif k == "rounds" and isinstance(v, int) and not isinstance(v, bool) and (v == 0 or 2 <= v <= 8):
+            ok[k] = v
+        else:
+            notes.append(f"{str(k)[:30]} 는 카드에서 바꿀 수 없는 칸이거나 값이 틀려 버렸다")
+    delib = [c for c in calls if _confirm_is_delib(c)]
+    if ok and not delib:
+        return ["이 카드에는 심의 호출이 없어 고친 칸을 버렸다"]
+    for c in delib:
+        args = _arg_dict(c.get("args"))
+        if args is None:
+            continue
+        keys = [k for k in ok if not (k == "job" and c["base"] != "deliberate_start")]   # 이어하기는 종류를 앞 잡에서 잇는다
+        if not keys:
+            continue
+        before = {k: args.get(k) for k in keys}
+        args = {**args, **{k: ok[k] for k in keys}}
+        c["args"] = json.dumps(args, ensure_ascii=False) if isinstance(c.get("args"), str) else args
+        c["canon"] = _confirm_canon(c["args"])
+        c["args_text"] = _confirm_args_text(_publish_token.mask(c["canon"]))
+        notes += [f"{c['base']} 의 {k}: {before[k]!r} → {ok[k]!r}" for k in keys]
+    return notes
+
+
 def _confirm_card_text(cid: str, calls: list, sent=()) -> str:
     """본문 끝의 결정적 카드 글 — 다른 기기 · 서버 사본 · 단추 없는 화면에서도 글로 확인할 수 있고, 그 안의 번호가 다음 턴 이력으로 돌아와 승인을
     잇는다. 끝이 확인 번호라 끊긴 턴 표지(_INTERRUPTED_RE)에 걸리지 않는다. sent 는 이 턴에 보낸 잡 · 쓰기 [(이름, 결과 머리)] — 한 단계에 시킨
@@ -5063,6 +5158,8 @@ def _confirm_card_text(cid: str, calls: list, sent=()) -> str:
         if c.get("again"):
             s += " (이 턴에 같은 호출을 이미 보냈다 — 다시 보내면 하나 더 선다)"
         lines.append(s)
+        if c.get("summary"):
+            lines.append(_confirm_delib_line(c["summary"]))
     for n, (name, head) in enumerate(sent):
         if n == 0:
             lines.append("이 턴에 보낸 호출(위 카드와 따로 이미 나갔다):")
@@ -5095,6 +5192,9 @@ async def _confirm_card(app_, req, ctx):
         else:
             c["args_shown"] = _publish_token.mask(c["canon"])
             c["args_text"] = _confirm_args_text(c["args_shown"])
+        sm = _confirm_delib_summary(c)
+        if sm is not None:
+            c["summary"] = sm
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
@@ -5108,6 +5208,7 @@ async def _confirm_card(app_, req, ctx):
                            "calls": [{"tool": c["name"], **({"app": c["app"]} if c.get("app") else {}), "kind": c["kind"],
                                       "args_text": c["args_text"], **_confirm_sse_args(c["args_shown"]),
                                       **({"workload": c["workload"]} if c.get("workload") else {}),
+                                      **({"summary": c["summary"]} if c.get("summary") else {}),
                                       "again": bool(c.get("again"))} for c in calls],
                            "approve_text": f"실행 — 확인 번호 {cid}", "decline_text": f"취소 — 확인 번호 {cid} 는 실행하지 않음"})
 
