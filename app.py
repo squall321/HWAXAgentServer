@@ -1387,6 +1387,9 @@ class ChatRequest(BaseModel):
     # 사용자 지정 우선 도구 — AI 의 도구 선택을 100% 신뢰할 수 없어, 사용자가 도구 카탈로그에서
     # 직접 고른 도구를 우선 사용하게 강제한다(바인딩 보장 + 시스템 프롬프트 지시).
     pinned_tools: list[str] = []
+    # 확인 카드에서 바꾼 칸(HWAXPortal docs/request-1125 WD-06) — {id: 카드 번호, set: {save_report · job · rounds}}. 승인 말과 함께 올 때만, 그 카드의
+    # 심의 시작 · 이어하기 호출에만 얹는다(_confirm_apply_edit — 받는 칸 · 값만). 없으면 종전 그대로다.
+    confirm_edit: dict | None = None
     # 사용자 지정 전문가(agent_type) — 이 전문가의 역할/시스템프롬프트를 페르소나로 주입해
     # '전문가와 대화' 모드가 된다(챗 시작 전 선택 패널에서 지정).
     pinned_agent: str | None = None
@@ -4380,6 +4383,13 @@ _CONFIRM_JOB_TOOLS = (
     "procedure_run_start")
 # 절차 실행 시작 — 사람의 확인 카드가 서지 않는 곳(챗 턴 밖)에서는 보내지 않는다(capped 의 G2c). 이름 규칙은 위와 같다(_named).
 _PROCEDURE_START = ("procedure_run_start",)
+# 늘 카드인 바닥 목록 — Report Archive 보고서 쓰기(HWAXPortal docs/request-1125 WD-07). 운영자 정의(he-team.json 의 RA 운영자 confirm — 포털
+# 5d22517e)는 RA 운영자와 대화할 때만 걸려, 운영자를 고르지 않은 웹 챗 · 다른 운영자 대화에서는 RA 초안이 확인 없이 만들어졌다(11-10 시험).
+# 운영자 정의 없이도 늘 카드(confirm — 주문 말로도 통과하지 않는다)다. 이 서버가 결정적으로 저장하는 길(/보고서 · 심의 save_report)은 챗 턴 밖이라
+# 관문이 서지 않는다(_turn_confirm 이 없다).
+_CONFIRM_ALWAYS_TOOLS = ("create_report_draft", "update_report_draft", "add_report_tags", "publish_report", "create_report_from_format",
+                         # 끝난 심의의 결정문을 RA 로 저장(WD-09 — 이 서버의 심의 MCP 도구)
+                         "deliberate_save_report")
 # '이번 말이 시켰다' 판정 — 주문 동사 · 질문 · 부정. 질문 · 부정은 주문을 지운다(어긋나면 카드 쪽으로 간다 — 엄한 쪽이 틀려도 카드가 하나 더 뜰 뿐이다).
 _ORDER_RE = re.compile(
     r"(?:실행|재실행|제출|시작|변환|등록|생성|저장|업로드|추가|수정|변경|삭제|취소|적용|반입|게시)\s*(?:을|를)?\s*"
@@ -4555,7 +4565,7 @@ def _confirm_class(name, args=None) -> tuple:
     if _rest_write(n, args):
         return "confirm", _AGENT_REST_BRIDGE[0]
     lists = _confirm_lists()
-    for kind, names in (("confirm", lists["confirm"]), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
+    for kind, names in (("confirm", (*lists["confirm"], *_CONFIRM_ALWAYS_TOOLS)), ("job", _CONFIRM_JOB_TOOLS), ("write", lists["writes"])):
         hit = [t for t in names if n == t or n.endswith("_" + t)]
         if hit:
             return kind, max(hit, key=len)
@@ -4745,11 +4755,14 @@ def _confirm_ctx(req) -> _ConfirmCtx:
         return ctx
     _confirm_count("approved")
     ctx.card_id = cid
+    edits = _confirm_apply_edit(cid, card["calls"], getattr(req, "confirm_edit", None))    # 카드에서 바꾼 칸(WD-06) — 승인 열쇠보다 먼저
+    if edits:
+        print(f"[confirm] 카드 {cid} 고침 — " + " · ".join(edits)[:300], flush=True)
     ctx.approved = {(c["name"].strip().lower(), c["base"], c["canon"]): c for c in card["calls"]}
     # 카드 턴은 사람 자격(PAT)으로 돌았는데 승인 턴에 그 자격이 없으면(포털 발급 실패 — 빈 글) 보내지 않는다 — 그대로 보내면 승인된 잡 · 쓰기가
     # 서비스 계정 연결로 말없이 나간다(C-11 · 반대 검토 2차, 포털 루틴 길의 routine_no_pat 과 같다). 카드 턴도 자격 없이 돌았으면(서비스 계정 박스) 같다.
     ctx.no_pat = bool(card.get("pat")) and not (req.user_pat or "").strip()
-    ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다"
+    ctx.status = f"확인 카드 {cid} 승인 — 승인된 호출 {len(card['calls'])}건을 보냅니다" + (" · 카드에서 바꿈: " + " · ".join(edits) if edits else "")
     return ctx
 
 
@@ -5041,6 +5054,95 @@ async def _confirm_workload(app_, req, calls: list) -> None:
                 c["workload"] = miss
 
 
+# 심의 확인 카드의 요약(WD-06) — 자연어로 연 심의가 종류를 잘못 골라도 카드에서 알아채고 바꾸게, 종류 · 라운드 · 좌석 · RA 저장 · 근거 수 · 글자 · 앱을
+# 카드 맨 위에 고정해 보인다. 바꿀 수 있는 칸은 셋이다 — save_report(참 · 거짓) · job(엔진의 심의 종류) · rounds(0 = 기본 · 2~8).
+_CONFIRM_DELIB = ("deliberate_start", "deliberate_continue")
+_CONFIRM_EDIT_KEYS = ("save_report", "job", "rounds")
+_CONFIRM_SEATS_SHOW = 20
+
+
+def _confirm_is_delib(c: dict) -> bool:
+    return str(c.get("base") or "") in _CONFIRM_DELIB
+
+
+def _confirm_delib_summary(c: dict) -> dict | None:
+    """심의 시작 · 이어하기 호출의 카드 요약 — 인자에서만 센다(엔진을 부르지 않는다). 빠진 칸은 엔진 기본값이라 그렇게 적는다."""
+    if not _confirm_is_delib(c):
+        return None
+    args = _arg_dict(c.get("args")) or {}
+    personas = [p for p in (args.get("personas") or []) if isinstance(p, dict)]
+    seats = [str(p.get("name") or p.get("key") or p.get("agent_type") or p.get("id") or "?")[:40] for p in personas]
+    ev = [e for e in (args.get("evidence") or []) if isinstance(e, (dict, str))]
+    ev_chars = sum(len(e if isinstance(e, str) else json.dumps(e, ensure_ascii=False, default=str)) for e in ev)
+    rounds = args.get("rounds")
+    save = args.get("save_report")
+    out = {"call": c["base"], "job": str(args.get("job") or "default"),
+           "rounds": int(rounds) if isinstance(rounds, int) and not isinstance(rounds, bool) and rounds > 0 else 0,
+           "seats": seats[:_CONFIRM_SEATS_SHOW], "seats_n": len(seats),
+           "save_report": True if save is None else bool(save),
+           "evidence_n": len(ev), "evidence_chars": ev_chars,
+           "apps": [str(x) for x in (args.get("apps") or []) if str(x).strip()][:10],
+           "editable": list(_CONFIRM_EDIT_KEYS)}
+    if args.get("modifiers"):
+        out["modifiers"] = [str(x) for x in args["modifiers"]][:5]
+    if c["base"] == "deliberate_continue" and args.get("previous_job_id"):
+        out["previous_job_id"] = str(args["previous_job_id"])[:80]
+    return out
+
+
+def _confirm_delib_line(sm: dict) -> str:
+    """카드 글의 심의 요약 한 줄 — 단추 없는 화면에서도 종류 · 라운드 · 저장을 읽는다."""
+    seats = (f"좌석 {sm['seats_n']}(" + ", ".join(sm["seats"][:8]) + (" …" if sm["seats_n"] > 8 else "") + ")") if sm["seats_n"] else "좌석 서버가 고름"
+    parts = [f"종류 **{sm['job']}**", f"라운드 {sm['rounds'] or '기본(3)'}", seats, f"RA 저장 {'켬' if sm['save_report'] else '끔'}",
+             f"근거 {sm['evidence_n']}건 · {sm['evidence_chars']:,}자"]
+    if sm.get("apps"):
+        parts.append("앱 " + ", ".join(sm["apps"]))
+    if sm.get("modifiers"):
+        parts.append("층 " + ", ".join(sm["modifiers"]))
+    if sm.get("previous_job_id"):
+        parts.append(f"이을 잡 {sm['previous_job_id']}")
+    return "   심의 — " + " · ".join(parts)
+
+
+def _confirm_apply_edit(cid: str, calls: list, edit) -> list:
+    """승인과 함께 온 카드 고침(req.confirm_edit)을 그 카드의 심의 호출에 얹는다 → 바꾼 사실 글 목록. 번호가 다르거나 칸 · 값이 틀리면 그 칸은
+    버리고 그렇다고 적는다(보내는 인자는 사람이 본 카드 + 고친 칸뿐이다). 고친 호출은 정규 인자 · 카드 글을 다시 센다(승인 열쇠가 보내는 인자로 잰다)."""
+    if not isinstance(edit, dict) or str(edit.get("id") or "").strip() != cid:
+        return []
+    want = edit.get("set")
+    if not isinstance(want, dict) or not want:
+        return []
+    import delib_jobs  # noqa: PLC0415 — 심의 종류 이름표
+    ok: dict = {}
+    notes: list = []
+    for k, v in want.items():
+        if k == "save_report" and isinstance(v, bool):
+            ok[k] = v
+        elif k == "job" and isinstance(v, str) and v.strip() in delib_jobs.JOBS:
+            ok[k] = v.strip()
+        elif k == "rounds" and isinstance(v, int) and not isinstance(v, bool) and (v == 0 or 2 <= v <= 8):
+            ok[k] = v
+        else:
+            notes.append(f"{str(k)[:30]} 는 카드에서 바꿀 수 없는 칸이거나 값이 틀려 버렸다")
+    delib = [c for c in calls if _confirm_is_delib(c)]
+    if ok and not delib:
+        return ["이 카드에는 심의 호출이 없어 고친 칸을 버렸다"]
+    for c in delib:
+        args = _arg_dict(c.get("args"))
+        if args is None:
+            continue
+        keys = [k for k in ok if not (k == "job" and c["base"] != "deliberate_start")]   # 이어하기는 종류를 앞 잡에서 잇는다
+        if not keys:
+            continue
+        before = {k: args.get(k) for k in keys}
+        args = {**args, **{k: ok[k] for k in keys}}
+        c["args"] = json.dumps(args, ensure_ascii=False) if isinstance(c.get("args"), str) else args
+        c["canon"] = _confirm_canon(c["args"])
+        c["args_text"] = _confirm_args_text(_publish_token.mask(c["canon"]))
+        notes += [f"{c['base']} 의 {k}: {before[k]!r} → {ok[k]!r}" for k in keys]
+    return notes
+
+
 def _confirm_card_text(cid: str, calls: list, sent=()) -> str:
     """본문 끝의 결정적 카드 글 — 다른 기기 · 서버 사본 · 단추 없는 화면에서도 글로 확인할 수 있고, 그 안의 번호가 다음 턴 이력으로 돌아와 승인을
     잇는다. 끝이 확인 번호라 끊긴 턴 표지(_INTERRUPTED_RE)에 걸리지 않는다. sent 는 이 턴에 보낸 잡 · 쓰기 [(이름, 결과 머리)] — 한 단계에 시킨
@@ -5058,6 +5160,8 @@ def _confirm_card_text(cid: str, calls: list, sent=()) -> str:
         if c.get("again"):
             s += " (이 턴에 같은 호출을 이미 보냈다 — 다시 보내면 하나 더 선다)"
         lines.append(s)
+        if c.get("summary"):
+            lines.append(_confirm_delib_line(c["summary"]))
     for n, (name, head) in enumerate(sent):
         if n == 0:
             lines.append("이 턴에 보낸 호출(위 카드와 따로 이미 나갔다):")
@@ -5090,6 +5194,9 @@ async def _confirm_card(app_, req, ctx):
         else:
             c["args_shown"] = _publish_token.mask(c["canon"])
             c["args_text"] = _confirm_args_text(c["args_shown"])
+        sm = _confirm_delib_summary(c)
+        if sm is not None:
+            c["summary"] = sm
     need = _confirm_workload_local([c for c in calls if c["kind"] == "job" and not c.get("workload")])
     if need:
         yield _sse("status", {"step": "확인 카드 — 예상 작업량을 묻는 중", "tool": None})
@@ -5103,6 +5210,7 @@ async def _confirm_card(app_, req, ctx):
                            "calls": [{"tool": c["name"], **({"app": c["app"]} if c.get("app") else {}), "kind": c["kind"],
                                       "args_text": c["args_text"], **_confirm_sse_args(c["args_shown"]),
                                       **({"workload": c["workload"]} if c.get("workload") else {}),
+                                      **({"summary": c["summary"]} if c.get("summary") else {}),
                                       "again": bool(c.get("again"))} for c in calls],
                            "approve_text": f"실행 — 확인 번호 {cid}", "decline_text": f"취소 — 확인 번호 {cid} 는 실행하지 않음"})
 
@@ -5203,6 +5311,14 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
         yield _sse("status", {"step": f"도구 완료: {name}", "tool": name, **({"via": "invoke_tool"} if via else {}), "ok": ok,
                               "ts": int(time.time() * 1000), "ms": round((time.monotonic() - t0) * 1000), "call": call_id,
                               **({"result_preview": prev} if prev else {}), **({"result_full": hand} if len(hand) > len(prev) else {})})
+        jc = _confirm_job_card(c, call_id, txt) if ok else None
+        if jc is not None:
+            # 진행 카드(WD-13) — 잡을 건 결과면 화면이 상태 · 단계 · 링크 카드를 세운다(끝나면 결과 링크로 바꾸는 것은 화면이 상태를 다시 물어서).
+            # LLM 에는 결과를 6,000자로 잘라 다시 주지 않고 잡 id · 상태와 짧은 머리만 준다 — 사람은 카드로 본다.
+            yield _sse("job_card", jc)
+            lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → 잡 {', '.join(jc['job_ids'])} · 상태 "
+                         f"{jc.get('state') or '?'} — 화면에 진행 카드를 띄웠다(상태 · 링크). 결과 머리: {_cut_mark(txt, _JOB_CARD_NOTE_MAX)}")
+            continue
         lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → {_cut_mark(txt, 6000)}")
     print(f"[confirm] 승인 {cid} — {ctx.sent}건 보냄", flush=True)
     # 상태 기다림(HA-28)이 켜져 있으면 결과를 물은 사람에게는 상태 조회를 한 번 부르라고 시킨다 — '볼 수 있다' 처럼 허용만 하면 모델이 queued 로 답하고
@@ -5217,6 +5333,32 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
                     + "\n이 호출을 다시 하지 마라(같은 잡이 하나 더 선다). " + follow + moved_note)
     else:
         ctx.note = f"[확인 카드 {cid} 승인 — 그러나 승인된 호출을 보내지 않았다]" + moved_note
+
+
+_JOB_CARD_NOTE_MAX = 1500      # 진행 카드를 띄운 잡 결과를 LLM 에 다시 주는 머리 글자(WD-13 — 카드 없는 결과는 종전 6,000자)
+_JOB_CARD_LINK_KEYS = ("url", "link", "view_url", "result_url", "web_url", "html_url", "page_url")
+
+
+def _confirm_job_card(c: dict, call_id: str, txt: str) -> dict | None:
+    """승인 실행이 건 잡의 진행 카드(WD-13) — 결과가 '도는 중' 잡 하나(status_wait.born_ids)일 때만. {call, tool, app, kind(deliberation · job),
+    job_ids, phase, state, progress, detail, link?, status_call?}. 링크는 결과 맨 위 · 잡 사전의 주소 칸(http(s) · / 로 시작)만, 심의면 진행 조회
+    호출(deliberate_status)을 함께 싣는다 — 화면이 그것으로 상태를 다시 묻고 끝나면 결과 링크로 바꾼다."""
+    ids = _status_wait_mod.born_ids(txt)
+    st = _status_wait_mod.job_state(txt) if ids else None
+    if not ids or st is None:
+        return None
+    card = {"call": call_id, "tool": c["name"], **({"app": c["app"]} if c.get("app") else {}),
+            "kind": "deliberation" if _confirm_is_delib(c) else "job", "job_ids": sorted(ids)[:5],
+            "phase": st.get("phase"), "state": st.get("word"), "progress": st.get("progress"), "detail": st.get("detail") or ""}
+    obj = _arg_dict(txt) or {}
+    for d in (obj, *(v for v in obj.values() if isinstance(v, dict))):
+        hit = next((str(d[k]) for k in _JOB_CARD_LINK_KEYS if isinstance(d.get(k), str) and re.match(r"(?:https?://|/)\S+$", d[k].strip())), "")
+        if hit:
+            card["link"] = hit[:500]
+            break
+    if card["kind"] == "deliberation":
+        card["status_call"] = {"tool": "deliberate_status", "args": {"job_id": card["job_ids"][0]}}
+    return card
 
 
 def _confirm_strip(text: str, card) -> str:
@@ -6646,6 +6788,66 @@ _ANNOUNCE_RE = re.compile(
     re.IGNORECASE)  # "Let me check…" 처럼 문장 첫 글자가 대문자인 경우가 대부분이다
 
 
+# ── 심의 · 리스크 잡 맥락과 지어낸 실행 주장(HWAXPortal docs/request-1125 WD-02) ────────────────────────────────────────────
+# 11-10 시험 — 도구 · id 를 짚어 준 9단계 가운데 2단계에서 챗이 도구를 부르지 않고 부른 것처럼 썼고, 한 번은 없는 잡 id 와 표결 변화표까지 지어냈다.
+# 그 턴에 심의 · 리스크 도구가 묶이지 않으면 그렇게 된다. (가) 맥락(잡 id · 도구 이름 · 심의 낱말)이 있으면 그 도구를 이 턴에 먼저 묶고, (나) 답 뒤에
+# 이번 턴 활동 · 이력에 없는 잡 id 와 그 도구를 부르지 않은 실행 주장을 짚어 한 번 다시 쓰게 한 뒤, 그래도 남으면 답 위에 표지를 단다.
+_JOB_ID_RE = re.compile(r"(?<![0-9A-Za-z])[a-z][a-z0-9_]{1,30}-\d{8}-\d{6}-[0-9a-f]{6}(?![0-9A-Za-z])")
+_JOB_CTX_RE = re.compile(r"deliberate_[a-z_]+|risk_[a-z_]+|심의|결정문|리스크\s*심사|신뢰\s*판정|원인\s*규명|좌석\s*발언|표결", re.I)
+# 맥락이 서면 먼저 묶는 도구(원래 이름 — 노출 이름은 그대로이거나 <앱>_<이름>). 심의는 열기 · 잇기 · 진행 · 결과 · 목록 · 발언, 리스크는 다음 걸음 ·
+# 잡 · 쟁점 · 보고서. 목록이 커지면 스키마 몫이 커져 묶음 예산에서 다른 도구를 밀어낸다 — 고정 열 개만.
+_JOB_CTX_TOOLS = ("deliberate_start", "deliberate_continue", "deliberate_status", "deliberate_result", "deliberate_list",
+                  "deliberate_transcript", "risk_next_step", "risk_start_job", "risk_job_action", "risk_get_report")
+_JOB_TOOL_PFX = ("deliberate_", "risk_")
+# 실행 주장 — 심의 · 심사 · 판정 · 잡을 열었다 · 시작했다 · 이어 돌렸다 · 재조회했다(과거 · 완료꼴만 — '열겠습니다' 같은 예고는 다른 관문이 본다)
+_ACT_CLAIM_RE = re.compile(
+    r"(?:심의|리스크\s*심사|심사|신뢰\s*판정|원인\s*규명|잡)[^\n.。!?]{0,30}?(?:을|를|은|는|이|가)?\s*"
+    r"(?:열었|열어\s*두었|시작했|이어\s*(?:돌렸|갔|진행했|열었)|재조회했|다시\s*조회했|다시\s*돌렸|제출했|걸었)"
+    r"|(?:열었|시작했|이어\s*돌렸|재조회했)[^\n.。!?]{0,12}?(?:심의|심사|판정)", re.I)
+
+
+def _job_ctx_tools(message: str, history, names) -> list:
+    """이번 말 · 최근 이력에 심의 · 리스크 잡 맥락이 있으면 먼저 묶을 노출 이름(names 가운데 _JOB_CTX_TOOLS 꼴만) — 없으면 []."""
+    recent = " ".join(str(h.get("content", ""))[:2000] for h in list(history or [])[-6:] if isinstance(h, dict))
+    blob = f"{message or ''}\n{recent}"
+    if not (_JOB_ID_RE.search(blob) or _JOB_CTX_RE.search(blob)):
+        return []
+    out = []
+    for want in _JOB_CTX_TOOLS:
+        hit = sorted(n for n in (names or ()) if n == want or n.endswith("_" + want))
+        out.extend(hit[:1])
+    return out
+
+
+def _job_known_ids(message: str, history, outputs) -> set:
+    """출처가 있는 잡 id — 이번 말 · 이번 턴 도구 결과 · 이력의 사람 말 · 도구가 돈 답(근거 블록이 붙은 것). 모델이 앞 턴에 지어낸 id 는 넣지 않는다
+    (유령 ID 막이와 같은 규칙 — 근거 없는 앞 답의 값이 다음 턴의 출처가 되지 않게)."""
+    parts = [message or "", *[str(o) for o in (outputs or [])]]
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        c = str(h.get("content") or "")
+        if h.get("role") == "assistant" and _EVIDENCE_MARK not in c and not h.get("kind"):
+            continue            # 포털이 종류를 단 항목(심의 결과 · 업로드 알림 — kind)은 서버가 쓴 글이라 출처다
+        parts.append(c)
+    return set(_JOB_ID_RE.findall("\n".join(parts)))
+
+
+def _job_claim_findings(text: str, called, known_ids: set) -> list:
+    """답 뒤 검사(WD-02) — ① 출처 없는 잡 id ② 심의 · 리스크 도구를 이번 턴에 부르지 않은 실행 주장. 짚은 것 글 목록(없으면 [])."""
+    out = []
+    bad = sorted(set(_JOB_ID_RE.findall(text or "")) - set(known_ids or ()))
+    if bad:
+        out.append("이번 턴 도구 결과 · 이력에 없는 잡 id " + ", ".join(bad[:5]))
+    m = _ACT_CLAIM_RE.search(text or "")
+    if m and not any(any(p in str(n).lower() for p in _JOB_TOOL_PFX) or _confirm_class(n)[0] == "job" for n in (called or ())):
+        out.append(f"심의 · 리스크 도구를 부르지 않았는데 '{' '.join(m.group(0).split())[:40]}' 라고 썼다")
+    return out
+
+
+_JOB_CLAIM_FLAG = "> ⚠ **도구 호출 없이 쓴 내용** — "
+
+
 def _announced_without_calling(text: str) -> bool:
     """도구를 쓰겠다고 '말만' 하고 실제로는 한 번도 호출하지 않은 턴인지.
 
@@ -7694,6 +7896,11 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
         # 캡을 넘고, 핀끼리는 관련도로만 갈려 이 둘이 밀려난다.
         first = list(dict.fromkeys([*pinned, *_operator_entry(persona),
                                     *[t for _k, _m in helpers for t in _operator_entry(_m)]]))
+        # 심의 · 리스크 잡 맥락(WD-02) — 잡 id · 도구 이름 · 심의 낱말이 이번 말이나 최근 이력에 있으면 그 도구를 이 턴에 먼저 묶는다
+        _jt = _job_ctx_tools(req.message, req.history, await asyncio.to_thread(_tools_map) or {})
+        if _jt:
+            first = list(dict.fromkeys([*first, *_jt]))
+            yield _sse("status", {"step": f"심의 · 리스크 잡 맥락 — 그 도구 {len(_jt)}개를 이 턴에 묶었습니다", "tool": None, "tools_used": _jt})
         # 앱 지정 → 그 앱의 도구로 펼침. 개별 지정과 합집합이며, 개별 지정이 앞에 온다
         # (사용자가 콕 집은 것이 앱 전체보다 우선). 12개 캡은 개별 지정에만 적용된다 —
         # 앱은 애초에 20~30개를 의도한 선택이라 같은 캡을 씌우면 조용히 잘린다.
@@ -8427,6 +8634,49 @@ async def _agent_stream_turn(app: FastAPI, req: ChatRequest, box: dict | None = 
                      "수치·날짜는 실제 데이터가 아닐 수 있으니 그대로 사용하지 마세요.")
             text += _warn
             yield _sse("token", {"delta": _warn})
+    # ── 지어낸 잡 id · 실행 주장(WD-02) — 짚으면 그 도구를 묶은 에이전트로 한 번 다시 쓰게 하고, 그래도 남으면 답 위에 표지. 확인 카드가 선 턴은
+    # 건너뛴다(카드로 끝난다).
+    _called = {n for n, _d in turn_calls} | set(_turn_tool_calls.get() or ())
+    _jf = [] if _cctx.pending else _job_claim_findings(text, _called, _job_known_ids(req.message, req.history, turn_out))
+    if _jf:
+        print(f"[agent] 지어낸 실행 주장 — {' · '.join(_jf)[:200]} — 도구를 묶어 1회 다시 쓴다")
+        yield _sse("status", {"step": "도구 호출 없이 쓴 내용을 짚었습니다 — 심의 · 리스크 도구를 묶어 한 번 다시 씁니다", "tool": None})
+        _rt_out: list = []
+        try:
+            _jt2 = _job_ctx_tools("심의", [], await asyncio.to_thread(_tools_map) or {})
+            _ag2 = await _agent_for(app, req.groups, locals().get("pinned"), locals().get("_sel_q") or req.message, req.search_sources,
+                                    req.user_email, req.user_pat, list(dict.fromkeys([*(locals().get("first") or []), *_jt2])),
+                                    _GUIDE_TOOLS if (locals().get("operator") or locals().get("op_apps")) else None, locals().get("prefer"))
+            _forced = _turn_msgs(sys_prompt, (locals().get("turn_notes") or "") + "\n\n[중요] 앞 답이 이번 턴에 부르지 않은 도구의 결과를 "
+                                 "말했다(" + " · ".join(_jf) + "). 심의 · 리스크 잡을 열었다 · 이었다 · 다시 조회했다고 쓰려면 그 도구를 **지금 실제로 "
+                                 "호출**하라. 부를 수 없으면 '부르지 못했다' 고 쓴다. 도구 결과 · 이력에 없는 잡 id 를 쓰지 마라.",
+                                 _history_messages(req.history, has_docs=bool(req.documents)),
+                                 locals().get("_recap"), locals().get("_user_msg") or ("user", req.message))
+            _status_wait_retry()
+            _r4 = await _ag2.ainvoke({"messages": _forced}, config=_cfg)
+            _new = ""
+            for m in (_r4 or {}).get("messages") or []:
+                if getattr(m, "type", "") == "tool":
+                    _tc = getattr(m, "content", "")
+                    _rt_out.append("".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _tc) if isinstance(_tc, list) else str(_tc))
+            for m in reversed((_r4 or {}).get("messages") or []):
+                if getattr(m, "type", "") == "ai":
+                    _c4 = getattr(m, "content", None)
+                    _new = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in _c4) if isinstance(_c4, list) else str(_c4 or "")
+                    if _new.strip():
+                        break
+            if _new.strip():
+                _sep = "\n\n---\n**도구로 다시 확인한 답**\n\n"
+                yield _sse("token", {"delta": _sep + _new.strip()})
+                text = _new.strip()
+        except Exception as exc:  # noqa: BLE001 — 다시 쓰기가 실패해도 표지는 단다
+            print(f"[agent] 지어낸 실행 주장 다시 쓰기 실패: {exc!r}")
+        _called = _called | set(_turn_tool_calls.get() or ())
+        _jf = _job_claim_findings(text, _called, _job_known_ids(req.message, req.history, [*turn_out, *_rt_out]))
+        if _jf:
+            _flag = _JOB_CLAIM_FLAG + " · ".join(_jf) + " — 이 부분은 실제 조회 · 실행 결과가 아니다.\n\n"
+            text = _flag + text
+            yield _sse("status", {"step": "도구 호출 없이 쓴 내용 — 답 위에 표지를 달았습니다", "tool": None, "flag": _jf})
     # ── 확정 종결 — "조회하겠습니다"만 남기고 끝나거나 빈 응답으로 끝나는 애매한 턴을 없앤다.
     # 사용자 요구(2026-08-05): 스트림이 애매하게 꺼지지 말 것 — 도구가 있는지 없는지 판별될
     # 때까지 진행해서, 있으면 코드가 직접 1회 호출해 결과로 답하고, 없으면 '없다'고 명시하고
@@ -9947,6 +10197,10 @@ def _safe_cut(text: str, limit: int) -> int:
     return limit
 
 
+_SIM_PART_COLS = ("pid", "title", "elem_class", "n_elems", "area_ext", "volume", "material")
+_SIM_SHORT_MAX = 2000           # SIM 카드의 접촉 · 붙임 절 글자
+
+
 def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> dict:
     """get_record 원문 → 읽기 화면. 본문 모양이 셋이다 — DOC(sections·sources)·DATA(headers·rows)·
     그 밖(SIM 의 tool_call 등). 모르는 모양은 버리지 않고 JSON 원문으로 보인다(없다고 하면 거짓이다).
@@ -9993,6 +10247,30 @@ def _record_view(rec: dict, section_offset: int = 0, char_offset: int = 0) -> di
         if src.get("title") or src.get("doi") or src.get("url"):
             out["sources"].append({k: str(src.get(k) or "")[:300] for k in ("title", "doi", "url", "kind", "authors")}
                                   | {"year": src.get("year") if isinstance(src.get("year"), int) else None})
+    comps = content.get("components")
+    if not secs and out["table"] is None and isinstance(comps, list) and comps and all(isinstance(c, dict) for c in comps):
+        # 모의해석(SIM) 카드의 부품 표(HWAXPortal docs/request-1125 HA-19) — components 가 dict 목록이면 표로, 접촉 · 붙임은 짧은 절로, 남은 칸은 원문(JSON)
+        def _mat(c):
+            m = c.get("material")
+            return m.get("name") if isinstance(m, dict) else m
+        out["table"] = {"caption": "부품", "headers": list(_SIM_PART_COLS),
+                        "rows": [[_cell(c.get(k) if k != "material" else _mat(c)) for k in _SIM_PART_COLS] for c in comps[:RECORD_ROWS_MAX]],
+                        "total_rows": len(comps), "notes": ""}
+        if len(comps) > RECORD_ROWS_MAX:
+            out["truncated"] = True
+        for key, title in (("contact_edges", "접촉"), ("attachments", "붙임")):
+            v = content.get(key)
+            if v:
+                t = json.dumps(v, ensure_ascii=False, default=str)
+                out["sections"].append({"id": "", "title": title, "level": 1,
+                                        "text": "```json\n" + t[:_SIM_SHORT_MAX] + ("\n…" if len(t) > _SIM_SHORT_MAX else "") + "\n```"})
+        content = {k: v for k, v in content.items() if k not in ("components", "contact_edges", "attachments")}
+        rest = {k: v for k, v in content.items() if k != "sources"}
+        if rest:
+            text = json.dumps(rest, ensure_ascii=False, indent=1, default=str)
+            out["sections"].append({"id": "", "title": "원문(JSON)", "level": 1, "text": "```json\n" + text[:RECORD_TEXT_MAX] + "\n```"})
+        out.update(total_sections=len(out["sections"]) or 1,
+                   total_chars=sum(len(x["text"]) for x in out["sections"]) + len(comps))
     if not secs and out["table"] is None:  # 끝을 넘긴 section_offset 이 원문(JSON) 보기로 바뀌지 않게
         rest = {k: v for k, v in content.items() if k != "sources"}
         if rest:
@@ -10447,6 +10725,21 @@ def insight_cards(request: Request, since: float = 0.0, limit: int = 200):
     return delib_jobs.insight_items(since, limit)
 
 
+# GET /delib/conversations — 끝난 MCP 심의를 잡 주인의 포털 대화로(delib_jobs.conversation_items — HWAXPortal docs/request-1125 WD-03). **공유 비밀만**
+# (/insights/cards 와 같은 값) — 모든 사람의 화두 · 발언 · 결정문을 내므로 사람 신원 머리(x-hwax-user)를 실은 호출은 받지 않는다(403 — 이용 통계 창구와 같다).
+@app.get("/delib/conversations")
+def delib_conversations(request: Request, since: float = 0.0, limit: int = 20):
+    import delib_jobs  # noqa: PLC0415 — /health 와 같다(심의 MCP 가 비활성이어도 답한다)
+    denied = _seat_auth(request)
+    if denied:
+        return denied
+    if (request.headers.get("x-hwax-user") or "").strip():
+        return _dl_error("service_only", "대화 거리 창구는 포털 서비스만 부른다 — 사람 신원(x-hwax-user)을 실은 호출은 받지 않는다", 403)
+    if not (since >= 0.0) or limit < 1:
+        return JSONResponse({"error": "since 는 0 이상의 epoch 초, limit 은 1 이상이다"}, status_code=422)
+    return delib_jobs.conversation_items(since, limit)
+
+
 # ── 이용 통계 창구(HWAXPortal docs/ops-dashboard M2 · OD-12) ──────────────────────────────────────────────────────────────────────────
 # GET /usage-rollup?since&until · POST /usage-rollup {since, until, exclude} — MCP 심의 잡 원장을 KST 날마다 센 수(usage_rollup.py). 포털 서비스가 날마다
 # 읽어 관리자 '이용 통계' 에 접어 둔다. **공유 비밀만**(/seat-questions 와 같은 값) — 모든 사람의 잡 수(이메일 · 소속)를 내므로 사람 신원 머리
@@ -10584,6 +10877,30 @@ async def deliberate_verify_http(request: Request):
     try:
         return _delib_mcp_module.verify_job(job, scope=body.get("scope") or "num,id,part,net", forbidden=body.get("forbidden"))
     except ValueError as exc:
+        return _dl_error("bad_request", str(exc), 422)
+
+
+# POST /deliberate/continue {previous_job_id, …} — deliberate_continue 와 같은 함수(HWAXPortal docs/request-1125 WD-05). 포털의 웹 '이어하기' 가 MCP 로 연
+# 심의(대화에 job_id 가 있다 — WD-03)를 새 웹 심의로 열지 않고 같은 잡 계보의 다음 잡으로 잇게 한다(_CONT_CARRY 손잡이 · 앞 회차 기준일 · 보고서 이어붙이기가
+# 엔진 쪽에서 그대로 이어진다). 칸은 deliberate_continue 의 인자 그대로다. 신원 머리가 있어야 한다 — 이은 잡은 그 사람 이름으로 돈다(묶음 시작과 같은 신뢰).
+_CONT_FIELDS = ("previous_job_id", "human_note", "question", "job", "rounds", "non_negotiables", "keep_seats", "append_report", "modifiers",
+                "advanced", "evidence", "subject")
+
+
+@app.post("/deliberate/continue")
+async def deliberate_continue_http(request: Request):
+    body, who, denied = await _dl_open(request, _CONT_FIELDS)
+    if denied:
+        return denied
+    if not (who[0] or "").strip():
+        return _dl_error("identity_required", "이어하기는 사람 이름으로 돈다 — 신원 머리(x-hwax-user)를 싣는다", 403)
+    if not isinstance(body.get("previous_job_id"), str) or not body["previous_job_id"].strip():
+        return _dl_error("bad_request", "previous_job_id 는 비지 않은 글이다", 422)
+    from types import SimpleNamespace  # noqa: PLC0415
+    shim = SimpleNamespace(request_context=SimpleNamespace(request=request))      # MCP 의 Context 와 같은 자리에서 머리를 읽는다
+    try:
+        return await _delib_mcp_module.deliberate_continue(**{k: body[k] for k in _CONT_FIELDS if k in body}, ctx=shim)
+    except (ValueError, TypeError) as exc:
         return _dl_error("bad_request", str(exc), 422)
 
 

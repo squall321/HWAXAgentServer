@@ -46,7 +46,13 @@ KINDS: dict[str, tuple] = {
     "risk_bundle": ("heax-hwax_risk", "risk_get_evidence_bundle", lambda rid: {"bundle_id": rid}, "hwax_risk"),
     "reportarchive_file": ("reportarchive", "download_file", lambda rid: {"file_id": rid}, "reportarchive"),
     "stepforge_job": ("heax-step_forge", "job_status", lambda rid: {"job_id": rid, "full": True}, "step_forge"),
+    # 앞 심의의 결정문(HWAXPortal docs/request-1125 WD-01) — 이 서버의 원장에서 푼다(게이트웨이를 부르지 않는다). id 는 <job_id> 또는
+    # <job_id>:decision · :summary(결정문 앞 세 문단) · :full(결정문 + 좌석 발언 전문). 챗이 5만 자 결정문을 도구 인자로 손수 다시 쓰다 출력 한도에서
+    # 27% 만 실렸다 — 참조 한 줄로 넘긴다. 볼 수 있는 잡은 주인 · 관리자(풀이에는 소속이 오지 않는다 — 같은 소속의 잡은 본문으로 넘긴다).
+    "delib_job": ("hwax-deliberation", "deliberate_result", lambda rid: {"job_id": rid.partition(":")[0]}, "hwax_deliberation"),
 }
+LOCAL_KINDS = frozenset(("delib_job",))     # 게이트웨이를 부르지 않고 이 서버가 푸는 kind
+_DJ_VIEWS = ("decision", "summary", "full")
 # 이름은 정했지만 열지 않은 kind → 까닭(사용자 결정 C2 — 그 플랫폼의 판을 기다린다).
 NOT_OPENED: dict[str, str] = {
     "dynaforge_report": "DynaForge 의 DF-01(리포트를 근거로 내는 도구)을 기다린다",
@@ -265,6 +271,34 @@ def _check_sf_job(rid: str, text: str) -> tuple[list | None, dict]:
 _CHECKS = {"risk_bundle": _check_bundle, "reportarchive_file": _check_ra_file, "stepforge_job": _check_sf_job}
 
 
+def _local_delib_job(rid: str, *, user: str, groups) -> tuple[list | None, dict]:
+    """delib_job 참조 → (항목 하나 또는 None, 기록 칸). 원장의 결정문을 view 대로 — 잡이 없거나 볼 수 없으면 같은 까닭(남의 잡이 있는지 말하지
+    않는다), 결정문이 없으면 그 까닭."""
+    import delib_jobs  # noqa: PLC0415
+    jid, _sep, view = rid.partition(":")
+    view = view or "decision"
+    if view not in _DJ_VIEWS:
+        return None, {"why": f"view 는 {' · '.join(_DJ_VIEWS)} 가운데 하나다(id 끝의 :view) — 받은 값 {view[:20]!r}"}
+    job = delib_jobs.get(jid)
+    if not job or delib_jobs.is_task(job) or not delib_jobs.can_read(job, user, "", "portal-admin" in list(groups or [])):
+        return None, {"why": "그런 심의 잡이 없거나 볼 수 없다(주인 · 관리자만 참조로 푼다)"}
+    decision = str(job.get("decision") or job.get("result_text") or "")
+    if not decision.strip():
+        return None, {"why": f"결정문이 없다(status={job.get('status')}) — 끝난 심의만 참조로 넘긴다"}
+    if view == "summary":
+        text = "\n\n".join([p for p in decision.split("\n\n") if p.strip()][:3])
+    elif view == "full":
+        turns = [t for t in (job.get("turns") or []) if isinstance(t, dict)]
+        text = decision + ("\n\n[좌석 발언]\n" + "\n".join(
+            f"[{t.get('round') or t.get('rnd') or '?'}R · {t.get('persona') or t.get('key') or '?'}] {t.get('say_full') or t.get('say') or ''}"
+            for t in turns) if turns else "")
+    else:
+        text = decision
+    item = {"source": f"앞 심의 결정문 · {jid}", "tool": "deliberate_result", "args": json.dumps({"job_id": jid, "view": view}, ensure_ascii=False),
+            "result": text}
+    return [item], {"items": 1, "chars": len(text), "fingerprint": fingerprint([item]), "_version": job.get("finished_at"), "_scope": jid}
+
+
 async def _resolve_one(app, ref: dict, *, groups, user: str, user_pat: str) -> tuple[list | None, dict]:
     """참조 하나 → (펼칠 항목 또는 None, 기록). 한 항목을 내는 kind 는 참조 항목의 source · key 를 그 항목에 단다(지문은 단 뒤에 잰다)."""
     kind, rid = ref["kind"], ref["id"]
@@ -273,21 +307,24 @@ async def _resolve_one(app, ref: dict, *, groups, user: str, user_pat: str) -> t
     side = {k: ref[k] for k in REF_SIDE if k in ref}
     if side:
         rec["side"] = side          # 이어하기가 같은 꼴로 다시 풀게(carried) — 한 항목 kind 는 이것이 지문에 든다(2차 검토 4)
-    try:
-        is_err, text = await asyncio.wait_for(
-            call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}", args=args_of(rid)),
-            RESOLVE_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        rec.update(why=f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)", unreachable=True)
-        return None, rec
-    except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
-        log.warning("근거 참조 %s 풀이 실패: %r", label(kind, rid), exc)
-        rec.update(why=f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)", unreachable=True)
-        return None, rec
+    if kind in LOCAL_KINDS:
+        is_err, text = False, ""
+    else:
+        try:
+            is_err, text = await asyncio.wait_for(
+                call_alias(app, groups=groups, user=user, user_pat=user_pat, alias=f"{app_key.replace('-', '')}_{tool}", args=args_of(rid)),
+                RESOLVE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            rec.update(why=f"{RESOLVE_TIMEOUT_S:g}초 안에 답하지 않았다(불통)", unreachable=True)
+            return None, rec
+        except Exception as exc:  # noqa: BLE001 — 하나를 못 풀어도 나머지는 푼다
+            log.warning("근거 참조 %s 풀이 실패: %r", label(kind, rid), exc)
+            rec.update(why=f"게이트웨이를 부르지 못했다({type(exc).__name__} — 불통)", unreachable=True)
+            return None, rec
     if is_err:
         rec["why"] = _why_error(text)
         return None, rec
-    ev, got = _CHECKS[kind](rid, text)
+    ev, got = (_local_delib_job(rid, user=user, groups=groups) if kind == "delib_job" else _CHECKS[kind](rid, text))
     version, scope = got.pop("_version", None), got.pop("_scope", None)
     rec.update(got)
     if ev is None:

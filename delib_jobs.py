@@ -2438,10 +2438,13 @@ def transcript(job_id: str, *, rnd: int | None = None, seat: str = "",
 # 목록을 만들 때 훑는 원장 파일 수의 상한. 남의 잡은 세지 않고 지나가므로(아래) 제 잡이 드문 사람은 파일을
 # 더 깊이 훑는다 — 원장이 아주 큰 박스에서 목록 한 번이 파일 전부를 읽지 않게 막아 둔다.
 LIST_SCAN_MAX = 300
+# 날짜 · 글로 거르는 목록(deliberate_list since · until · query — HWAXPortal docs/request-1125 WD-08)은 최근 창보다 깊이 훑는다 — 보름 전 심의는 최근
+# 300개 창 밖이라 못 찾았다. 목록 색인만 읽으므로(원장 전부가 아니다) 이 수까지는 가볍다. since 를 주면 그보다 오래 고쳐지지 않은 파일에서 멈춘다.
+LIST_SCAN_DEEP_MAX = 5000
 
 
 def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer_admin: bool = False,
-              where=None, info: dict | None = None) -> list[dict]:
+              where=None, info: dict | None = None, deep: bool = False, mtime_floor: float | None = None) -> list[dict]:
     """메모리 원장 + 파일 원장을 합쳐 최신순으로. viewer(신원 있는 호출자)에게는 **볼 수 있는 잡만**(can_read — 제 잡 · 같은
     소속의 잡, 관리자는 전부) 싣는다. 신원 없는 호출(서비스 계정 — 운영이 쓰는 길)은 종전대로 전부 본다.
 
@@ -2452,14 +2455,15 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
 
     where(잡 → 참거짓)를 주면 볼 수 있는 잡 가운데 그것이 참인 잡만 싣는다 — 주제로 거르는 목록(delib_subject.matches)이 쓴다. 거름은 목록 색인의
     칸으로 본다. info(사전)를 주면 훑은 원장 파일 수(scanned) · 훑는 창(window — 최근 몇 개를 보나) · 원장 파일 수(total — 원장 폴더를 다 읽지
-    못했으면 None) · 볼 수 있는 잡이 limit 보다 더 있었나(more)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다."""
+    못했으면 None) · 볼 수 있는 잡이 limit 보다 더 있었나(more)를 적는다 — 창 밖의 옛 잡은 이 목록에 없다. deep 이면 창이 LIST_SCAN_DEEP_MAX 이고
+    (날짜 · 글로 거르는 목록 — WD-08), mtime_floor(epoch 초)를 주면 그보다 앞서 고쳐진 파일에서 멈춘다(잡은 생긴 뒤에만 고쳐진다)."""
     me = _norm(viewer)
 
     def ok(j: dict) -> bool:
         # 심의가 아닌 잡(TASK_KINDS — 위임)은 심의 목록에 싣지 않는다 — 그 종류의 도구로 본다
         return not is_task(j) and can_read(j, viewer, viewer_aff, viewer_admin) and (where is None or bool(where(j)))
     seen = {jid: j for jid, j in _JOBS.items() if ok(j)}
-    window = max(limit * 3, LIST_SCAN_MAX)
+    window = max(limit * 3, LIST_SCAN_DEEP_MAX if deep else LIST_SCAN_MAX)
     scanned = total = 0
     try:
         kept = 0
@@ -2468,6 +2472,13 @@ def list_jobs(limit: int = 20, *, viewer: str = "", viewer_aff: str = "", viewer
         for f in files[:window]:
             if kept >= limit * 3:
                 break
+            if mtime_floor is not None:
+                try:
+                    if f.stat().st_mtime < mtime_floor:
+                        scanned = total     # 그 앞은 모두 더 오래됐다 — 다 본 셈이다(창이 끊은 것이 아니다)
+                        break
+                except OSError:
+                    continue
             scanned += 1
             j = _list_load(f)        # 목록 색인 — 원장 파일(수 MB)을 통째로 읽지 않는다
             if not j or not ok(j):
@@ -2545,6 +2556,93 @@ def insight_items(since: float = 0.0, limit: int = 200) -> dict:
              if it is not None]
     page = items[:lim]
     return {"contract": INSIGHT_CONTRACT, "items": page,
+            "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}
+
+
+# ── 잡 주인의 포털 대화 — 끝난 MCP 심의의 대화 거리(HWAXPortal docs/request-1125 WD-03) ─────────────────────────────────────────────────
+# MCP 로 연 심의가 포털 대화 목록 · 검색에 남지 않았다(save_conversation 은 74잡 동안 0회 · 읽기 전용 PAT 는 거절). 과제 인사이트처럼 포털이 공유 비밀
+# 창구(app GET /delib/conversations)로 읽어 간다 — 엔진이 밀지 않는다(PG-9 와 같다: 어느 쪽이 내려가 있어도 다음 읽기에 따라잡는다). 내는 잡은 끝났고
+# (done · error · cancelled · interrupted — 결정문이나 발언이 하나는 있다) 주인이 있고(@) 리스크 앱이 띄운 잡(started_by=app — 그 앱의 웹 패널이 이미
+# 대화로 남긴다)이 아닌 심의다. 행은 화두 → 좌석 발언 → 결정문, meta 는 job_id · 뿌리 job_id(이어하기 사슬의 맨 앞 — 포털은 이것으로 한 대화에 묶고
+# job_id 로 멱등하게 붙인다) · 근거 목록(본문 없이) · 주제 · 보고서. 계약 이름은 포털이 견준다.
+CONV_CONTRACT = "delib-conversations/1"
+CONV_LIMIT_MAX = 50
+CONV_ROOT_HOPS = 20
+_CONV_DONE = ("done", "error", "cancelled", "interrupted")
+
+
+def _conv_head_ok(j: dict, since: float) -> bool:
+    return (not is_task(j) and j.get("status") in _CONV_DONE and float(j.get("finished_at") or 0) >= since
+            and "@" in _norm(j.get("user")) and j.get("started_by") != "app")
+
+
+def conv_root(j: dict) -> str:
+    """이어하기 사슬의 맨 앞 잡 id — continues(이어하기) · resumed_from(끊긴 잡의 요약 이어하기)을 CONV_ROOT_HOPS 번까지 따라간다(돌면 멈춘다)."""
+    cur, seen = j, {j.get("id")}
+    for _ in range(CONV_ROOT_HOPS):
+        prev = cur.get("continues") or cur.get("resumed_from")
+        if not prev or prev in seen:
+            break
+        seen.add(prev)
+        nxt = get(str(prev))
+        if not nxt:
+            return str(prev)
+        cur = nxt
+    return str(cur.get("id"))
+
+
+def _conv_item(j: dict) -> dict | None:
+    """원장 전부 → 대화 거리 하나(발언 · 결정문이 하나도 없으면 None)."""
+    turns = [t for t in (j.get("turns") or []) if isinstance(t, dict)]
+    decision = j.get("decision") or j.get("result_text") or ""
+    if not turns and not decision:
+        return None
+    rows = [{"role": "user", "kind": "question", "content": str(j.get("question") or "")}]
+    for t in turns:
+        say = str(t.get("say_full") or t.get("say") or "")
+        if say:
+            rows.append({"role": "assistant", "kind": "seat", "persona": str(t.get("persona") or t.get("key") or ""),
+                         "round": t.get("round") or t.get("rnd"), "content": say})
+    if decision:
+        rows.append({"role": "assistant", "kind": "decision", "content": str(decision)})
+    ev = [e for e in ((j.get("opts") or {}).get("evidence") or []) if isinstance(e, dict)]
+    evidence = [{k: e.get(k) for k in ("source", "tool", "key") if e.get(k) is not None} | {"chars": len(str(e.get("result") or ""))}
+                for e in ev][:100]
+    meta = {"job_id": j["id"], "root_job_id": conv_root(j), "job": j.get("job"), "chair_template": j.get("chair_template"),
+            "status": j.get("status"), "evidence": evidence, "evidence_refs": list(j.get("evidence_refs") or [])[:100],
+            "subject": j.get("subject"), "report_id": j.get("report_id"), "report_url": j.get("report_url") or None,
+            "continues": j.get("continues") or j.get("resumed_from") or None}
+    return {"job_id": j["id"], "root_job_id": meta["root_job_id"], "kind": "deliberation", "source": "mcp",
+            "user": str(j.get("user") or ""), "owner_aff": str(j.get("owner_aff") or ""), "question": str(j.get("question") or ""),
+            "started_at": float(j.get("started_at") or 0), "finished_at": float(j.get("finished_at") or 0), "rows": rows, "meta": meta}
+
+
+def conversation_items(since: float = 0.0, limit: int = 20) -> dict:
+    """끝난 MCP 심의의 대화 거리 — finished_at 오름차순, since 이상(경계는 다음 부름에 다시 나올 수 있다 — 받는 쪽이 job_id 로 하나로 만든다).
+    고르는 셈은 insight_items 와 같다(mtime → 목록 색인 → 고른 잡만 통째로). 답 {contract, items, next_since, complete}."""
+    lim = max(1, min(int(limit), CONV_LIMIT_MAX))
+    found: dict = {jid: j for jid, j in list(_JOBS.items()) if _conv_head_ok(j, since)}
+    try:
+        files = list(JOB_DIR.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        if f.stem in found:
+            continue
+        try:
+            if f.stat().st_mtime < since - _INSIGHT_MTIME_SLACK_S:
+                continue
+        except OSError:
+            continue
+        head = _list_load(f)
+        if head and _conv_head_ok(head, since):          # 색인에는 started_by 가 없다 — 통째로 읽은 뒤 다시 본다
+            full = _load(f.stem)
+            if full and _conv_head_ok(full, since):
+                found[f.stem] = full
+    items = [it for it in (_conv_item(j) for j in sorted(found.values(), key=lambda j: float(j.get("finished_at") or 0)))
+             if it is not None]
+    page = items[:lim]
+    return {"contract": CONV_CONTRACT, "items": page,
             "next_since": max((it["finished_at"] for it in page), default=float(since)), "complete": len(items) <= lim}
 
 

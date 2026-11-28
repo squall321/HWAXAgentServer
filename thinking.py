@@ -74,7 +74,28 @@ def _knowledge_budget() -> int:
 # 호출이 큐에서 180초를 넘겨 전 좌석이 '초과' 로 빠졌다.
 # 600 → 1800 (2026-10-18, 사용자 결정 — 지연보다 내용). 좌석마다 세션 맥락(앞 대화 · 조회 근거)을 싣게 되어 프롬프트가 커졌고, GLM 은
 # 호출마다 평균 1.3만 토큰을 생각한다(요청서 v1.1 P6 — 평균 114초, 꼬리 16분). 심의 좌석 한도(DELIB_TIMEOUT_S)와 같다.
-SEAT_TIMEOUT_S = float(os.environ.get("THINK_SEAT_TIMEOUT_S", "1800"))
+# 비우면 DELIB_TIMEOUT_S 를 따른다(HWAXPortal docs/request-1125 HA-35) — 종전엔 비면 1800 으로 돌아, 박스가 심의 한도만 올리면(cae00 10-31
+# DELIB 36000) 둘이 말없이 어긋났다(env 킷 주석은 같은 값이라고 적었다). 둘 다 비면 1800. 따라 온 심의 값이 0 이하면 심의처럼 한도 없음(None).
+_SEAT_TIMEOUT_DEFAULT = 1800.0
+
+
+def _seat_timeout(env=os.environ) -> float | None:
+    """띵킹 좌석 1콜 한도(초) — THINK_SEAT_TIMEOUT_S > DELIB_TIMEOUT_S > 1800. 못 읽는 값은 기본값(까닭을 찍는다)."""
+    own = str(env.get("THINK_SEAT_TIMEOUT_S") or "").strip()
+    name, raw = ("THINK_SEAT_TIMEOUT_S", own) if own else ("DELIB_TIMEOUT_S", str(env.get("DELIB_TIMEOUT_S") or "").strip())
+    if not raw:
+        return _SEAT_TIMEOUT_DEFAULT
+    try:
+        val = float(raw)
+    except ValueError:
+        print(f"[thinking] ⚠ {name}={raw[:40]!r} 숫자가 아니다 — 띵킹 좌석 한도는 기본값 {_SEAT_TIMEOUT_DEFAULT:.0f}초")
+        return _SEAT_TIMEOUT_DEFAULT
+    if name == "DELIB_TIMEOUT_S" and val <= 0:
+        return None         # 심의의 0 은 '무제한'이다 — 따라 온 값을 즉시 시간 초과로 읽지 않는다
+    return val
+
+
+SEAT_TIMEOUT_S = _seat_timeout()
 # 세션 맥락 — 앞 대화([c:N] 사람 · [a:N] 챗)와 그때 도구가 조회한 근거([e:N])를 좌석 본심 프롬프트에 싣는다(사용자 결정 10-18 —
 # "thinking 을 켜면 전문가 자문 모드이고 각자 맥락을 다 가지고 와야 한다", HWAXPortal docs/chat-depth-context). 0 이면 종전(질문만).
 WITH_HISTORY = os.environ.get("THINK_WITH_HISTORY", "1").strip() != "0"

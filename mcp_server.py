@@ -19,6 +19,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 from typing import Annotated, Literal
 from urllib.parse import unquote
 
@@ -281,7 +282,9 @@ _EVID_DESC = (
     "서버가 시작 전에 **부른 사람의 신원으로** 게이트웨이를 불러 풀고 그 자리에 차례대로 펼친다 — kind "
     f"{' · '.join(delib_refs.KINDS)}(risk_bundle 은 리스크 앱 risk_get_evidence_bundle(bundle_id=id) 의 evidence 를 펼치고 지문을 다시 재어 "
     "묶음의 fingerprint 와 다르면 싣지 않는다 · reportarchive_file 은 Report Archive download_file(file_id=id) 의 글 파일(UTF-8 — 그림 · "
-    "바이너리는 싣지 않는다) 한 항목 · stepforge_job 은 StepForge job_status(job_id=id, full=true) 의 끝난(done) 잡 결과 한 항목). 권한 · 없음 · "
+    "바이너리는 싣지 않는다) 한 항목 · stepforge_job 은 StepForge job_status(job_id=id, full=true) 의 끝난(done) 잡 결과 한 항목 · delib_job 은 "
+    "이 서버 원장의 앞 심의 결정문 한 항목 — id 는 <job_id>(결정문 전문) · <job_id>:summary · <job_id>:full(+ 좌석 발언), 주인 · 관리자만). **앞 심의 "
+    "결정문 · 긴 근거 본문을 인자로 다시 쓰지 말고 참조를 넘겨라**(손으로 옮기면 출력 한도에서 잘린다). 권한 · 없음 · "
     "불통 · 글이 아님 · 끝나지 않음으로 못 푼 참조는 빼고 evidence_omitted 에 'ref:<kind>:<id> — 까닭' 으로, 풀이 기록(항목 수 · 자수 · 지문 · "
     "시각 · 인용 cite{source_platform, source_kind, source_id, source_version, scope})은 잡의 evidence_refs 에 남는다. 꼴이 틀린 참조와 아직 "
     f"열지 않은 kind({' · '.join(f'{k} — {v}' for k, v in delib_refs.NOT_OPENED.items())})는 시작 전에 거절한다. 크기 · 지문만 미리 보려면 "
@@ -660,6 +663,9 @@ _A_VIEW = ("full(기본 — 결정문 전문에 쉬운 설명 · 좌석 상세 �
            "consistency 는 결정문의 만장일치 · 전원 합의 문장과 표결의 대조다 — 반대 · 조건부 · 미표명 표가 있는데 그런 문장이 있으면 match 가 거짓). "
            "summary 를 먼저 받고 모자랄 때만 full.")
 _A_LIST_LIMIT = "실을 잡 수 — 최신순, 1~100 으로 죈다(기본 20)."
+_A_LIST_SINCE = "이 날(YYYY-MM-DD, 서버 시각) 또는 이 시각(ISO 8601) 이후에 시작한 심의만. 주면 최근 창보다 깊이 훑는다."
+_A_LIST_UNTIL = "이 날(YYYY-MM-DD — 그날 끝까지) 또는 이 시각(ISO 8601)까지 시작한 심의만."
+_A_LIST_QUERY = "화두 · 심의 종류 · 의장 틀 · job_id 에 이 글이 든 심의만(대소문자 무시, 최대 200자). 주면 최근 창보다 깊이 훑는다."
 _A_CANCEL_JOB_ID = "접을 심의의 job_id — 내가 시작한 심의만 접힌다. 줄 선 심의는 줄에서 빠진다."
 _A_TR_ROUND = "이 라운드의 발언만(1부터). 0 이면 전체다."
 _A_TR_SEAT = "이 좌석 키가 든 발언만. 비우면 전체다."
@@ -1440,6 +1446,8 @@ async def deliberate_status(job_id: Annotated[str, Field(description=_A_JOB_ID)]
 
 
 _VIEWS = ("full", "summary", "decision_json")
+_A_RESULT_FIELDS = ("맨 위 칸 이름 목록(최대 30) — 주면 그 칸만 싣는다(job_id · status 는 늘, decision_json 은 그대로). 예 ['decision', 'votes']. "
+                    "있던 칸 이름은 fields_all, 없는 이름은 fields_unknown. 비우면 종전 그대로.")
 
 
 def _result_full(job: dict) -> dict:
@@ -1476,6 +1484,7 @@ def _result_summary(job_id: str, job: dict, full: dict) -> dict:
 async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)],
                             part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                             view: Annotated[Literal["full", "summary", "decision_json"], Field(description=_A_VIEW)] = "full",
+                            fields: Annotated[list[str] | None, Field(description=_A_RESULT_FIELDS, max_length=30)] = None,
                             ctx: Context | None = None) -> dict:
     """결정 문서 전문·쉬운 설명·좌석 구성·저장된 보고서 id. part — 쪽으로 나뉘었을 때 받을 쪽(1부터). view — full(기본 · 종전 응답 그대로 —
     루틴의 심의 단계가 결정문을 쪽마다 다 읽는다, routine._delib_step) | summary(_result_summary — page.next 가 view 를 싣는다) |
@@ -1489,10 +1498,27 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
     if view == "decision_json":
         return mcp_pages.paged(delib_decision.build(job), part=part, ids=_JOB_IDS, again={"job_id": job_id, "view": "decision_json"})
     out = _result_full(job)
+    want = [str(f).strip() for f in (fields or []) if str(f).strip()]
     if view == "summary":
-        return mcp_pages.paged(_result_summary(job_id, job, out), part=part, ids=_JOB_IDS, tail=("decision",),
-                               again={"job_id": job_id, "view": "summary"})
-    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True, again={"job_id": job_id})
+        summ = _pick_fields(_result_summary(job_id, job, out), want)
+        return mcp_pages.paged(summ, part=part, ids=_JOB_IDS, tail=("decision",),
+                               again={"job_id": job_id, "view": "summary", **({"fields": want} if want else {})})
+    out = _pick_fields(out, want)
+    return mcp_pages.paged(out, part=part, ids=_JOB_IDS, tail=_JOB_TAIL, tail_page=True,
+                           again={"job_id": job_id, **({"fields": want} if want else {})})
+
+
+def _pick_fields(out: dict, want: list) -> dict:
+    """deliberate_result(fields) — 고른 맨 위 칸만(job_id · status 는 늘) + fields_all(있던 칸 이름) · fields_unknown(없는 이름). 비면 그대로
+    (HWAXPortal docs/request-1125 2절 B-1 — 결과 글자 상위 도구의 칸 고르기)."""
+    if not want:
+        return out
+    keep = {k: v for k, v in out.items() if k in _JOB_IDS or k in want}
+    keep["fields_all"] = sorted(out)
+    miss = [f for f in want if f not in out]
+    if miss:
+        keep["fields_unknown"] = miss[:30]
+    return keep
 
 
 @mcp.tool(title="심의 목록",
@@ -1500,11 +1526,15 @@ async def deliberate_result(job_id: Annotated[str, Field(description=_A_JOB_ID)]
                       "심의와 **같은 소속**의 심의가 실린다(행의 mine 이 내 것인지, owner 가 시작한 사람이다 — 주인이 안 적힌 "
                       "옛 잡은 관리자에게만 보인다). running·queued 는 전체 수다. "
                       "subject={sp_task, round?} 를 주면 그 과제(· 차수)로 확인된 주제를 단 심의만 싣는다 — '이 과제 · 이 차수로 누가 이미 "
-                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). limit 보다 더 있으면 truncated 가 참이다. " + _PAGE_DESC,
+                      "심의했나'(신원이 있는 호출만 · 최근 원장 창 안에서). since · until(날짜) · query(화두 글)로 거르면 최근 창보다 깊이 "
+                      "훑는다 — 보름 전 심의는 날짜로 찾는다. limit 보다 더 있으면 truncated 가 참이다. " + _PAGE_DESC,
           annotations=_READ)
 async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)] = 20,
                           part: Annotated[int, Field(description=_A_PART, json_schema_extra=_X_PART)] = 1,
                           subject: Annotated[dict | None, Field(description=_A_LIST_SUBJECT, json_schema_extra=_X_LIST_SUBJECT)] = None,
+                          since: Annotated[str, Field(description=_A_LIST_SINCE)] = "",
+                          until: Annotated[str, Field(description=_A_LIST_UNTIL)] = "",
+                          query: Annotated[str, Field(description=_A_LIST_QUERY, max_length=200)] = "",
                           ctx: Context | None = None) -> dict:
     """최근 심의를 최신순으로. job_id 를 잊었을 때 여기서 찾는다.
 
@@ -1513,10 +1543,12 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     subject — 주제 거름(_subject_list). 신원 없는 호출은 받지 않는다 — 원장을 다 보는 길로 주제를 거르면 남의 과제 심의가 다 보인다."""
     user, aff, admin = _caller_view(ctx)
     lim = max(1, min(100, int(limit or 20)))
+    filt = _list_filter(since, until, query)
     if subject is not None:
-        return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin)
+        return _subject_list(subject, lim, part, user=user, aff=aff, admin=admin, filt=filt)
     info: dict = {}
-    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin, info=info)
+    rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin, info=info,
+                                **_list_filter_kw(filt))
     # 수는 **전체**다. 행을 세면 제 것만 세게 돼, 상한이 얼마나 찼는지를 틀리게 읽는다.
     caps = delib_jobs.limits()       # 판정 때와 같은 값(박스 덮개가 env 위에 덮인다 — HWAXPortal docs/delib-ops R4)
     out = {"jobs": rows, "running": delib_jobs.running_count(),
@@ -1527,23 +1559,84 @@ async def deliberate_list(limit: Annotated[int, Field(description=_A_LIST_LIMIT)
     if info.get("more"):
         # 볼 수 있는 잡이 limit 보다 더 있다 — 조용히 끊지 않는다(HWAXPortal docs/mcp-modernize contract C8). 칸은 그때만 싣는다(종전 답 그대로).
         out["truncated"] = True
-        out["truncated_note"] = f"최신 {lim}건만 실었다 — 더 보려면 limit 을 올린다(최대 100). 그보다 옛 심의는 최근 원장 창 밖이다."
+        out["truncated_note"] = (f"최신 {lim}건만 실었다 — 더 보려면 limit 을 올린다(최대 100)" + (
+            " 또는 since · until 을 좁힌다." if filt else ". 그보다 옛 심의는 최근 원장 창 밖이다 — 날짜(since · until)나 글(query)로 거르면 깊이 훑는다."))
+    again: dict = {"limit": lim}
+    if filt:
+        out["filter"] = filt["echo"]
+        out["window"] = _list_window(info)
+        again.update(filt["echo"])
     # 행마다 화두를 통째로 싣는다 — 리스크 심사 화두는 변경 요지를 담아 수천 자라, 20행이면 상한을 넘는다.
-    return mcp_pages.paged(out, part=part, again={"limit": lim},
-                           ids=("running", "queued", "running_max", "running_max_per_user", "queue_max"))
+    return mcp_pages.paged(out, part=part, again=again,
+                           ids=("running", "queued", "running_max", "running_max_per_user", "queue_max", *(("filter", "window") if filt else ())))
 
 
-def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: bool) -> dict:
+def _list_when(raw: str, *, end: bool) -> float | None:
+    """since · until 글 → epoch 초. 날짜(YYYY-MM-DD)는 서버 시각의 그날 0시(until 이면 다음 날 0시 — 그날 끝까지), ISO 8601 은 그 시각. 비면 None."""
+    t = str(raw or "").strip()
+    if not t:
+        return None
+    import datetime as _dt  # noqa: PLC0415
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+            d = _dt.datetime.strptime(t, "%Y-%m-%d")
+            return (d + _dt.timedelta(days=1)).timestamp() if end else d.timestamp()
+        return _dt.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        raise ValueError(f"{'until' if end else 'since'} 는 YYYY-MM-DD 날짜나 ISO 8601 시각이다 — 받은 값 {t[:40]!r}") from None
+
+
+def _list_filter(since: str, until: str, query: str) -> dict | None:
+    """deliberate_list 의 날짜 · 글 거름(WD-08) — {lo, hi, q, echo}(아무것도 없으면 None). 시작 시각(없으면 줄 선 시각)으로 가른다."""
+    lo, hi = _list_when(since, end=False), _list_when(until, end=True)
+    q = " ".join(str(query or "").split())[:200]
+    if lo is None and hi is None and not q:
+        return None
+    if lo is not None and hi is not None and lo >= hi:
+        raise ValueError("since 가 until 보다 늦다 — 날짜를 바로잡는다")
+    echo = {k: v for k, v in (("since", str(since or "").strip()), ("until", str(until or "").strip()), ("query", q)) if v}
+    return {"lo": lo, "hi": hi, "q": q.lower(), "echo": echo}
+
+
+def _list_filter_kw(filt: dict | None) -> dict:
+    """list_jobs 에 넘길 거름 — where · 깊이 훑기 · mtime 바닥(since 가 있으면 그 전 하루 — 원장 파일은 시작 뒤에 고쳐진다)."""
+    if not filt:
+        return {}
+
+    def where(j: dict) -> bool:
+        at = float(j.get("started_at") or j.get("queued_at") or 0)
+        if filt["lo"] is not None and at < filt["lo"]:
+            return False
+        if filt["hi"] is not None and at >= filt["hi"]:
+            return False
+        if filt["q"]:
+            hay = " ".join(str(j.get(k) or "") for k in ("question", "job", "chair_template", "id", "label")).lower()
+            return filt["q"] in hay
+        return True
+    return {"where": where, "deep": True, "mtime_floor": (filt["lo"] - 86400.0) if filt["lo"] is not None else None}
+
+
+def _list_window(info: dict) -> dict:
+    window, total = info.get("window", delib_jobs.LIST_SCAN_DEEP_MAX), info.get("total")
+    return {"max": window, "complete": isinstance(total, int) and info.get("scanned", 0) >= total,
+            "note": f"원장 {window}개 창까지 훑었다 — complete 가 거짓이면 그보다 오래된 원장은 보지 않았다(since 를 좁히면 다 본다)."}
+
+
+def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: bool, filt: dict | None = None) -> dict:
     """deliberate_list(subject) — 확인된 주제의 과제 key 글자 그대로 · 차수 정확 일치(delib_subject.matches)인 잡 가운데 그 사람이 볼 수 있는 것만
+    (날짜 · 글 거름 filt 을 주면 그것도 — WD-08)
     (can_read — 주인 · 같은 소속 · 관리자). 훑는 창은 목록과 같다(최근 원장 LIST_SCAN_MAX 개 — window 에 적는다). 차수별 수(rounds)는 실은 행만
     센다 — 볼 수 없는 잡은 수에도 들지 않는다(넓은 쪽이 좁은 쪽이 있다는 것을 말하지 않는다 — PLAN §6.3)."""
+    dfilt = filt
     filt = delib_subject.parse_filter(subject)
     if not (user or "").strip():
         raise ValueError("신원 없는 호출은 주제로 거르지 못한다 — 사람 PAT 로 게이트웨이를 거쳐 부른다(주제로 거른 목록은 그 사람이 볼 수 있는 "
                          "심의만 싣는다)")
     info: dict = {}
+    kw = _list_filter_kw(dfilt)
+    dwhere = kw.pop("where", None)
     rows = delib_jobs.list_jobs(lim, viewer=user, viewer_aff=aff, viewer_admin=admin,
-                                where=lambda j: delib_subject.matches(j, filt), info=info)
+                                where=lambda j: delib_subject.matches(j, filt) and (dwhere is None or dwhere(j)), info=info, **kw)
     rounds: dict = {}
     for r in rows:
         k = (r.get("subject") or {}).get("round") or delib_subject.ROUND_UNKNOWN
@@ -1555,7 +1648,34 @@ def _subject_list(subject, lim: int, part: int, *, user: str, aff: str, admin: b
                       "note": f"최근 원장 {window}개 창 안에서만 찾았다(complete 가 거짓이면 그보다 오래된 원장은 보지 않았다 — 그 심의는 이 목록에 "
                               "없다). 확인된 주제(sp_state=confirmed)만 맞대고, 차수를 모르는 심의는 'unknown' 칸에만 있다(어느 차수에도 섞지 "
                               "않는다). 웹 심의는 포털 대화에 남는다(주인만 본다)."}}
-    return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject}, ids=("subject", "count", "rounds"))
+    if dfilt:
+        out["filter"] = dfilt["echo"]
+    return mcp_pages.paged(out, part=part, again={"limit": lim, "subject": subject, **(dfilt["echo"] if dfilt else {})},
+                           ids=("subject", "count", "rounds", *(("filter",) if dfilt else ())))
+
+
+_A_SAVE_JOB = "보고서로 남길 끝난 심의의 job_id(deliberate_list 로 찾는다)."
+
+
+@mcp.tool(title="심의 결정문 — 보고서로 저장",
+          description="끝난 심의(status done · 결정문 있음)의 결정문 전문 · 마지막 라운드 발언 · 회의록을 엔진의 보고서 꼴 그대로 Report "
+                      "Archive 에 부른 사람 이름으로 저장한다 — 챗이 결정문 블록을 다시 쓰지 않는다. 시작 때 save_report 를 끄고 돈 심의를 나중에 "
+                      "남길 때 쓴다. 같은 사람이 같은 잡을 다시 부르면 새로 만들지 않고 앞서 받은 번호를 돌려준다(already=true — 주인이면 시작 때 "
+                      "저장한 보고서도 같다). 볼 수 있는 심의만(주인 · 같은 소속) · 신원 있는 호출만 · 도는 잡 · 결정문 없는 잡 · 리스크 심사 계열 · "
+                      "위임은 거절한다. 답 {job_id, report_id, report_url, already, note}. 쓰기다 — 부르기 전에 사람에게 확인한다(웹 챗은 확인 카드).",
+          annotations=_ann(read=False, world=True))
+async def deliberate_save_report(job_id: Annotated[str, Field(description=_A_SAVE_JOB)], ctx: Context | None = None) -> dict:
+    """끝난 잡을 RA 보고서로 — delib_report_save.save(그 사람 이름 · 한 번만, HWAXPortal docs/request-1125 WD-09)."""
+    import delib_report_save  # noqa: PLC0415
+    user, groups = _caller(ctx)
+    if not user.strip():
+        raise ValueError("신원 없는 호출은 보고서를 쓰지 않는다 — 사람 PAT 로 게이트웨이를 거쳐 부른다(보고서는 부른 사람 이름으로 남는다)")
+    _u, aff, admin = _caller_view(ctx)
+    jid = str(job_id or "").strip()
+    job = delib_jobs.get(jid)
+    if not job or not delib_jobs.can_read(job, user, aff, admin):
+        raise ValueError(f"그런 심의 잡이 없다: {jid[:80]} — deliberate_list 로 확인하라")
+    return await delib_report_save.save(_need_app(), jid, user=user, groups=groups)
 
 
 @mcp.tool(title="심의 취소",
@@ -2024,11 +2144,18 @@ _OFF_IDENT = ("신원 없는 호출이다 — 게이트웨이가 신원 머리(x
 _A_DG_TASK = (f"맡길 일 한 줄(최대 {offload.TASK_MAX:,}자) — 무엇을 알아내 답할지. 근거 본문을 싣지 말고 찾을 대상(과제 · 모델 · 부품 · 기간 "
               "등)을 적는다 — 서버가 그 사람의 읽기 도구로 찾는다.")
 _A_DG_APPS = f"조회를 이 앱들(게이트웨이 백엔드 키 — list_tool_apps 의 app)로 좁힌다(최대 {offload.APPS_MAX}개). 비우면 내 읽기 도구 전부."
-_A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다."
-_A_DG_MIN = f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다."
+# 일 크기별 권장(OF-2) — 11-24 비교에서 여러 건으로 표를 채우는 일이 기본(12번 · 10분)에서 검색 한 번 뒤 멈췄다
+_DG_SIZE_HINT = ("일 크기별 권장 — 값 하나 · 한 건 확인은 기본, 여러 건을 모아 표(부품 × 증상 · 원인 · 대책 등)를 채우는 일은 max_steps 20~30 · "
+                 "max_minutes 20 이상.")
+_A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다. " + _DG_SIZE_HINT
+_A_DG_MIN = (f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다"
+             "(결과의 incomplete=true).")
 _A_DG_JOB = "위임 잡 id(delegate_start 응답의 job_id)."
-_A_DG_WAIT = (f"초 — 주면 상태 · 단계가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초). 깬 까닭은 wait.woke — "
-              "ended · changed · timeout · closing · paused. 기본 0(기다리지 않는다).")
+# 위임 상태의 기본 기다림(OF-5) — 심의 진행 조회의 기본 상한과 같은 240초(게이트웨이 호출 한도 600초보다 넉넉히 안쪽)
+DELEGATE_WAIT_DEFAULT_S = STATUS_WAIT_DEFAULT_S
+_A_DG_WAIT = (f"초 — 상태 · 단계가 바뀌거나 끝날 때까지 서버가 기다렸다 답한다(최대 {STATUS_WAIT_MAX_S:g}초). 깬 까닭은 wait.woke — "
+              f"ended · changed · timeout · closing · paused. 기본 {DELEGATE_WAIT_DEFAULT_S:g}(이 서버의 상한이 더 작으면 상한) — 0 이면 "
+              "기다리지 않는다.")
 _A_DG_VIEW = ("full(기본 — 답 · 근거 표 evidence[{id, tool, args, chars, ok}] · 숫자 대조 · 모델 · 호출 수 · 토큰) | summary(근거 표 대신 "
               "evidence_n · evidence_tools). 답을 읽는 데는 summary 로 충분하다.")
 _DG_START_DESC = (
@@ -2038,13 +2165,24 @@ _DG_START_DESC = (
     "심의는 묶이지 않는다. 즉시 job_id 를 돌려주고 뒤에서 돈다 — delegate_status(job_id, wait_s) 를 **한 번** 부르고(고리로 거듭 묻지 마라) "
     "끝나면 delegate_result(job_id, view=\"summary\"). 동시에 서버 전체 " + f"{offload.DELEGATE_MAX_RUNNING}건 · 사람마다 "
     f"{offload.DELEGATE_PER_USER}건 돈다 — 넘치면 줄을 선다(status=queued · queue 에 순번, 자리가 나면 스스로 시작한다 — 다시 시작하지 마라). "
+    "줄이 길면(queue.position 이 2 이상이거나 기다린 뒤에도 queued) 기다리지 말고 delegate_cancel 로 접은 뒤 직접 읽는다. "
     "답의 숫자는 서버 코드가 근거 원문과 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다 — 어긋난 수는 쓰기 전에 확인한다). 서버가 재기동하면 "
-    "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다.")
+    "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다. "
+    + _DG_SIZE_HINT + " 결과의 incomplete=true(시간 · 호출 수로 멈춤 — stop.reason)면 unfilled 의 항목은 채워지지 않은 것이다 — 빈 사례로 표를 "
+    "채우지 말고 그 항목만 다시 맡기거나 직접 읽는다. 보고서 본문이 첨부(HTML 등)에만 있으면 서버가 첨부 읽기(" + offload.ATTACH_TOOL + " — 쪽 · "
+    "찾기)로 읽는다. 결과의 blocked_tools 는 울타리 밖이라 못 부른 도구다 — 거기에 첨부 받기(download_file)가 있으면 그 박스에서는 첨부를 "
+    "못 읽으니 본문이 첨부에만 있는 일은 위임하지 말고 직접 읽는다.")
 _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · running · done · error · cancelled · interrupted) · 단계(tools · gather · answer) · "
-                   "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. **wait_s 로 한 번** 부르면 바뀌거나 끝날 때까지 서버가 기다린다 — 고리로 거듭 묻지 마라. "
-                   "done 이면 delegate_result.")
-_DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched}, model, steps, tokens{input, output}}. answer 의 [eN] 은 "
-                   "evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수)다. 끝나지 않았으면 상태와 "
+                   "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. 기본으로 바뀌거나 끝날 때까지 서버가 기다린다(wait_s 기본 "
+                   f"{DELEGATE_WAIT_DEFAULT_S:g}초) — **한 번** 부르고 고리로 거듭 묻지 마라. done 이면 delegate_result. 줄이 길면(queue 순번 2 "
+                   "이상 · 기다린 뒤에도 queued) delegate_cancel 로 접고 직접 읽는다.")
+_DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched, kinds, derived, equivalent}, model, steps, tokens{input, "
+                   "output}}. answer 의 [eN] 은 evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수, "
+                   "쉼표 · 공백 · SI 접두 환산 · 반올림 · 비 ↔ % 는 같은 값으로 본다 — 그렇게 맞은 수는 equivalent)이고 kinds 가 어긋남마다 종류(원문에 없음 · "
+                   "환산 의심 · 반올림 의심)다. derived 는 답이 인용한 근거 수로 계산한 수(어긋남이 아니다). stop{reason(answered · time · steps · "
+                   "recursion · error), calls, steps_budget, minutes_budget, elapsed_s} 와 incomplete · unfilled — incomplete 면 unfilled 의 항목을 "
+                   "채우지 못했다(빈 사례로 메우지 마라). blocked_tools[{tool, why}] 는 울타리 밖이라 못 부른 도구 — 그 내용은 직접 읽는다. "
+                   "끝나지 않았으면 상태와 "
                    "안내만 준다. 내가 맡긴 위임만 보인다.")
 _DG_CANCEL_DESC = ("도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만(남의 위임 · 없는 위임은 '그런 위임이 없다'). 줄 선 것은 시작하지 않고 빠지고, 도는 것은 "
                    "접기를 청해 status=cancelling 이면 잠시 뒤 delegate_status 로 확인한다. 접은 위임은 이어 돌리지 않는다 — 같은 일은 delegate_start 로 다시 "
@@ -2059,7 +2197,12 @@ _X_DR_REFS = {"items": {"anyOf": [
         "args": {"type": "object", "description": "그 도구의 인자."}}}]}}
 _A_DR_STYLE = "꼴 — " + " · ".join(f"{k}({v})" for k, v in offload.STYLES.items()) + "."
 _A_DR_TARGET = f"길이(자) — 기본 {offload.DRAFT_TARGET_DEFAULT:,} · 200~{offload.DRAFT_TARGET_MAX:,} 로 죈다."
+# OF-4(HWAXPortal docs/request-1125) — 짧은 글에도 권해 Claude 가 초안을 다시 읽고 고치느라 쓰기 과제의 Claude 비용이 −0.5% 였다(11-24 비교).
+# 긴 절에만 쓰라고 첫 줄에 적는다 — 기준 길이는 초안 기본 길이(DRAFT_TARGET_DEFAULT)다.
+_DR_LONG_MIN = offload.DRAFT_TARGET_DEFAULT
 _DR_DESC = (
+    f"**긴 절(약 {_DR_LONG_MIN:,}자 넘게 쓸 글)에만 쓴다** — 그보다 짧은 글 · 문장을 고칠 글 · 이미 쓴 글을 다듬는 일은 직접 쓴다(초안을 다시 "
+    "읽고 고치면 토큰이 오히려 는다). 받은 초안은 통째로 다시 쓰지 말고 고칠 곳만 고친다. "
     "긴 글 서버 작성 — 개요 + 근거 손잡이로 서버의 GLM 이 보고서 절 초안을 쓴다 → {draft, numbers{checked, mismatched}, sources, model, "
     "tokens{input, output}(서버 LLM 토큰 — 모르면 null)}. 근거 원문은 "
     "서버가 읽어 GLM 에 싣고 이 대화로 오지 않는다. 숫자는 서버 코드가 근거와 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다). 동기 호출이다 — "
@@ -2117,17 +2260,23 @@ async def delegate_start(task: Annotated[str, Field(description=_A_DG_TASK)],
     clamped = [x for x in (c1 and f"max_steps {c1}", c2 and f"max_minutes {c2}") if x]
     if clamped:
         out["clamped"] = clamped
-    out["note"] = ((f"줄을 섰다 — 내 순번 {q['position']}번째({q['why']}). 자리가 나면 스스로 시작한다 — 다시 시작하지 마라. " if q else "맡겼다 — ")
-                   + "delegate_status(job_id, wait_s) 를 한 번 부르고, 끝나면 delegate_result(job_id, view=\"summary\").")
+    out["note"] = ((f"줄을 섰다 — 내 순번 {q['position']}번째({q['why']}). 자리가 나면 스스로 시작한다 — 다시 시작하지 마라. "
+                    + ("줄이 길다 — 기다리지 않으려면 delegate_cancel 로 접고 직접 읽는다. " if q.get("position", 0) >= 2 else "") if q else "맡겼다 — ")
+                   + f"delegate_status(job_id) 를 한 번 부르고(기본으로 최대 {DELEGATE_WAIT_DEFAULT_S:g}초 서버가 기다린다), 끝나면 "
+                   "delegate_result(job_id, view=\"summary\").")
     return out
 
 
 async def delegate_status(job_id: Annotated[str, Field(description=_A_DG_JOB)],
-                          wait_s: Annotated[float, Field(description=_A_DG_WAIT)] = 0,
+                          wait_s: Annotated[float, Field(description=_A_DG_WAIT)] = DELEGATE_WAIT_DEFAULT_S,
                           ctx: Context | None = None) -> dict:
-    """위임 진행 — wait_s 를 주면 심의 진행 조회와 같은 기다림(_status_wait — 상태 · 단계가 바뀌거나 끝날 때까지)."""
+    """위임 진행 — 심의 진행 조회와 같은 기다림(_status_wait — 상태 · 단계가 바뀌거나 끝날 때까지). 기본값은 기다린다(HWAXPortal docs/request-1125
+    OF-5 — 기본 0 이라 첫 호출부터 기다리지 않아 위임 32회에 상태 호출이 46번이었다). 기본값을 그대로 받았는데 이 서버의 상한
+    (DELIB_STATUS_WAIT_MAX_S)이 더 작으면 상한까지만 말없이 기다린다 — 부르는 쪽이 고른 값이 아니라 죈 사실을 적지 않는다."""
     job, _user = _delegate_job(job_id, ctx)
     waited = None
+    if wait_s == DELEGATE_WAIT_DEFAULT_S:
+        wait_s = min(wait_s, STATUS_WAIT_MAX_S)
     if wait_s:
         job, waited = await _status_wait(job["id"], job, wait_s)
     out = offload.status_view(job)

@@ -25,7 +25,7 @@ DESTRUCTIVE = {"deliberate_cancel", "deliberate_batch_stop", "delegate_cancel"}
 NOT_IDEMPOTENT = {"deliberate_start", "deliberate_continue", "deliberate_batch_start", "delegate_start", "review_task_next",
                   "review_task_submit"}
 OPEN_WORLD = {"deliberate_start", "deliberate_continue", "deliberate_batch_start", "delegate_start", "deliberate_resolve_evidence",
-              "draft_section", "llm_transform"}
+              "draft_section", "llm_transform", "deliberate_save_report"}
 DESC_MIN, DESC_MAX = 150, 1500          # contract C1 — 웹 챗 바인딩 상한 TOOL_DESC_MAX 2,400 · 게이트웨이 4,000 보다 넉넉히 아래
 ARG_DESC_MAX = 2400                     # 웹 챗이 인자 설명도 같은 상한으로 자른다(app._slim_tool)
 
@@ -41,7 +41,7 @@ def _all_tools() -> list:
 
 def test_모든_도구에_네_표지가_참거짓으로_있다():
     tools = _all_tools()
-    assert len(tools) == 22, [t.name for t in tools]
+    assert len(tools) == 23, [t.name for t in tools]
     for t in tools:
         a = t.annotations
         assert a is not None, t.name

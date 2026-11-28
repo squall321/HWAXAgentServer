@@ -34,6 +34,42 @@ _TRANSCRIBE_CONC = 4      # 판독을 한꺼번에 몇 장 — 그림 여덟 장
 _RETRY_S = 60.0
 PROBE_TIMEOUT_S = float(os.environ.get("VISION_PROBE_TIMEOUT_S", "120"))  # 탐침 한 번 — 기동 직후 첫 그림 요청 · 바쁜 서버는 15초를 넘긴다
 #   (dev 실측 10-18 — 막 뜬 vLLM 의 첫 다중모달 요청이 15초를 넘겨 '모름' 이 됐고 그 턴은 그림 없이 갔다). 판정은 서버마다 한 번이라 첫 그림 턴만 기다린다
+# 생각 끄기를 끝점마다(HWAXPortal docs/request-1125 IR-51) — 판독 · 탐침은 모든 호출에 chat_template_kwargs.enable_thinking=false 를 실었다. 챗 모델(Qwen)에는
+# 맞지만 심의 모델(GLM)에서는 이 값이 영어 생각 글을 답 칸 앞에 꼬리표 없이 새게 한다(11-10 네 꼴 비교) — </think> 자르기로는 못 거른다. 그래서 판독을
+# 심의 모델로 나누기 전에 끝점마다 고르게 한다. VISION_THINKING_OFF — all(기본 · 지금대로 모든 끝점에 보낸다) | none(보내지 않는다) | 쉼표 목록(그
+# 글이 주소나 모델 이름에 든 끝점에만 보낸다). 보내지 않는 끝점의 답은 생각 칸(reasoning_content)을 버리고 글만 쓴다 — 서버가 생각을 답에 붙여 보내면
+# 마지막 </think> 뒤만 남긴다.
+THINKING_OFF = (os.environ.get("VISION_THINKING_OFF") or "all").strip()
+
+
+def thinking_off(base_url: str, model: str, setting: str | None = None) -> bool:
+    """이 끝점(주소 · 모델)에 생각 끄기 값을 싣나 — VISION_THINKING_OFF 로 고른다(기본 all — 지금대로)."""
+    s = (THINKING_OFF if setting is None else setting).strip().lower()
+    if s in ("", "all", "1", "on", "true"):
+        return True
+    if s in ("none", "0", "off", "false"):
+        return False
+    hay = f"{base_url or ''} {model or ''}".lower()
+    return any(p in hay for p in (x.strip() for x in s.split(",")) if p)
+
+
+def _llm_endpoint(llm) -> tuple[str, str]:
+    """(주소, 모델) — ChatOpenAI 와 그 감싸개(bound · runnable)에서 읽는다. 모르면 빈 글."""
+    for o in (llm, getattr(llm, "bound", None), getattr(llm, "runnable", None)):
+        if o is None:
+            continue
+        base = getattr(o, "openai_api_base", None) or getattr(o, "base_url", None) or ""
+        model = getattr(o, "model_name", None) or getattr(o, "model", None) or ""
+        if base or model:
+            return str(base), str(model)
+    return "", ""
+
+
+def _drop_think(text: str) -> str:
+    """생각이 답에 붙어 왔으면 마지막 </think> 뒤만 — 생각 끄기를 보내지 않은 끝점의 답에만 쓴다."""
+    return text.rsplit("</think>", 1)[-1].strip() if "</think>" in text else text
+
+
 _MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 # 이름 끝은 영숫자 · _ 가 아니면 된다 — \b 는 한글을 낱말 글자로 봐서 조사가 붙은 주소('…png에')를 놓쳤다(report_figures._NAME 과 같은 고침).
 # 앞쪽 이름은 탐욕으로 읽는다 — 게으르면 'shot.jpg.png' 를 'shot.jpg' 에서 끊어 없는 파일을 가리킨다(반대 검토). '.pngx' 같은 꼴은 뒤의
@@ -186,7 +222,7 @@ def _probe(base_url: str, api_key: str, model: str) -> tuple[bool | None, str]:
     """(판정, 까닭). 200 이면 받는다. 400 · 422 중 그림 · 다중모달을 말하는 거절만 '못 받는다' — 다른 400(모델 이름 · 상한 등)과
     닿지 않음 · 5xx · 401 은 모른다(굳히지 않는다). 까닭은 로그와 /health 에 남긴다 — 삼키면 '그림을 못 읽는다' 가 왜인지 아무도 모른다."""
     body = json.dumps({"model": model, "max_tokens": 1, "temperature": 0,
-                       "chat_template_kwargs": {"enable_thinking": False},
+                       **({"chat_template_kwargs": {"enable_thinking": False}} if thinking_off(base_url, model) else {}),
                        "messages": [{"role": "user", "content": [
                            {"type": "text", "text": "색 하나만"},
                            {"type": "image_url", "image_url": {"url": data_url(red_png(), "image/png")}}]}]}).encode()
@@ -282,15 +318,18 @@ async def transcribe(llm, raw: bytes, mime: str, artifact_dir: str, hint: str = 
     msgs = [SystemMessage(content=_TRANSCRIBE_SYS),
             HumanMessage(content=[{"type": "text", "text": _TRANSCRIBE_ASK + (f"\n맥락: {hint}" if hint else "")},
                                   {"type": "image_url", "image_url": {"url": data_url(raw, mime)}}])]
+    off = thinking_off(*_llm_endpoint(llm))
     try:
-        # 판독에 깊은 생각은 필요 없다 — 생각을 끄고 한 번(그림 하나에 1~2분씩 걸리지 않게).
-        r = await llm.ainvoke(msgs, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+        # 판독에 깊은 생각은 필요 없다 — 생각을 끄고 한 번(그림 하나에 1~2분씩 걸리지 않게). 끄기를 싣지 않는 끝점(IR-51)은 그냥 부른다.
+        r = await (llm.ainvoke(msgs, extra_body={"chat_template_kwargs": {"enable_thinking": False}}) if off else llm.ainvoke(msgs))
     except Exception as exc:  # noqa: BLE001 — 판독 실패가 챗 · 띵킹 · 심의를 죽이지 않는다
         print(f"[vision] 판독 실패({type(exc).__name__}: {str(exc)[:120]})")
         return ""
     text = r.content if isinstance(r.content, str) else " ".join(
-        p.get("text", "") for p in (r.content or []) if isinstance(p, dict))
+        p.get("text", "") for p in (r.content or []) if isinstance(p, dict) and p.get("type", "text") == "text")
     text = str(text or "").strip()
+    if not off:
+        text = _drop_think(text)         # 생각 칸(reasoning_content)은 additional_kwargs 에 있어 글에 들지 않는다 — 붙어 온 생각만 걷는다
     if text:
         tmp = f"{path}.{os.getpid()}.tmp"       # 쓰다 만 판독문을 다른 호출이 읽지 않게 — 다 쓴 뒤 바꿔 끼운다
         with open(tmp, "w", encoding="utf-8") as f:
