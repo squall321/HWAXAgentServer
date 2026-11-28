@@ -2024,8 +2024,12 @@ _OFF_IDENT = ("신원 없는 호출이다 — 게이트웨이가 신원 머리(x
 _A_DG_TASK = (f"맡길 일 한 줄(최대 {offload.TASK_MAX:,}자) — 무엇을 알아내 답할지. 근거 본문을 싣지 말고 찾을 대상(과제 · 모델 · 부품 · 기간 "
               "등)을 적는다 — 서버가 그 사람의 읽기 도구로 찾는다.")
 _A_DG_APPS = f"조회를 이 앱들(게이트웨이 백엔드 키 — list_tool_apps 의 app)로 좁힌다(최대 {offload.APPS_MAX}개). 비우면 내 읽기 도구 전부."
-_A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다."
-_A_DG_MIN = f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다."
+# 일 크기별 권장(OF-2) — 11-24 비교에서 여러 건으로 표를 채우는 일이 기본(12번 · 10분)에서 검색 한 번 뒤 멈췄다
+_DG_SIZE_HINT = ("일 크기별 권장 — 값 하나 · 한 건 확인은 기본, 여러 건을 모아 표(부품 × 증상 · 원인 · 대책 등)를 채우는 일은 max_steps 20~30 · "
+                 "max_minutes 20 이상.")
+_A_DG_STEPS = f"도구 호출 상한 — 기본 {offload.STEPS_DEFAULT} · 1~{offload.STEPS_MAX} 로 죈다. " + _DG_SIZE_HINT
+_A_DG_MIN = (f"시간 상한(분) — 기본 {offload.MINUTES_DEFAULT} · 1~{offload.MINUTES_MAX} 로 죈다. 넘으면 그때까지 받은 결과로 답을 정리한다"
+             "(결과의 incomplete=true).")
 _A_DG_JOB = "위임 잡 id(delegate_start 응답의 job_id)."
 # 위임 상태의 기본 기다림(OF-5) — 심의 진행 조회의 기본 상한과 같은 240초(게이트웨이 호출 한도 600초보다 넉넉히 안쪽)
 DELEGATE_WAIT_DEFAULT_S = STATUS_WAIT_DEFAULT_S
@@ -2043,7 +2047,9 @@ _DG_START_DESC = (
     f"{offload.DELEGATE_PER_USER}건 돈다 — 넘치면 줄을 선다(status=queued · queue 에 순번, 자리가 나면 스스로 시작한다 — 다시 시작하지 마라). "
     "줄이 길면(queue.position 이 2 이상이거나 기다린 뒤에도 queued) 기다리지 말고 delegate_cancel 로 접은 뒤 직접 읽는다. "
     "답의 숫자는 서버 코드가 근거 원문과 대조해 numbers.mismatched 에 적는다(고쳐 쓰지 않는다 — 어긋난 수는 쓰기 전에 확인한다). 서버가 재기동하면 "
-    "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다.")
+    "도는 위임은 interrupted 로 끝난다(이어 돌리지 않는다 — 같은 일을 다시 맡긴다) · 줄 선 위임은 같은 차례로 다시 선다. "
+    + _DG_SIZE_HINT + " 결과의 incomplete=true(시간 · 호출 수로 멈춤 — stop.reason)면 unfilled 의 항목은 채워지지 않은 것이다 — 빈 사례로 표를 "
+    "채우지 말고 그 항목만 다시 맡기거나 직접 읽는다.")
 _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · running · done · error · cancelled · interrupted) · 단계(tools · gather · answer) · "
                    "최근 도구 호출 줄 · 경과 · 줄 순번 · 오류. 기본으로 바뀌거나 끝날 때까지 서버가 기다린다(wait_s 기본 "
                    f"{DELEGATE_WAIT_DEFAULT_S:g}초) — **한 번** 부르고 고리로 거듭 묻지 마라. done 이면 delegate_result. 줄이 길면(queue 순번 2 "
@@ -2051,7 +2057,9 @@ _DG_STATUS_DESC = ("위임이 어디까지 갔는지 — 상태(queued · runnin
 _DG_RESULT_DESC = ("끝난 위임의 답 — {answer, evidence, numbers{checked, mismatched, kinds, derived, equivalent}, model, steps, tokens{input, "
                    "output}}. answer 의 [eN] 은 evidence 의 id 다. numbers.mismatched 는 근거 원문에 없는 수(코드 대조 — 소수점이 있거나 100 이상인 수, "
                    "쉼표 · 공백 · SI 접두 환산 · 반올림 · 비 ↔ % 는 같은 값으로 본다 — 그렇게 맞은 수는 equivalent)이고 kinds 가 어긋남마다 종류(원문에 없음 · "
-                   "환산 의심 · 반올림 의심)다. derived 는 답이 인용한 근거 수로 계산한 수(어긋남이 아니다). 끝나지 않았으면 상태와 "
+                   "환산 의심 · 반올림 의심)다. derived 는 답이 인용한 근거 수로 계산한 수(어긋남이 아니다). stop{reason(answered · time · steps · "
+                   "recursion · error), calls, steps_budget, minutes_budget, elapsed_s} 와 incomplete · unfilled — incomplete 면 unfilled 의 항목을 "
+                   "채우지 못했다(빈 사례로 메우지 마라). 끝나지 않았으면 상태와 "
                    "안내만 준다. 내가 맡긴 위임만 보인다.")
 _DG_CANCEL_DESC = ("도는 · 줄 선 위임을 접는다 — 내가 맡긴 것만(남의 위임 · 없는 위임은 '그런 위임이 없다'). 줄 선 것은 시작하지 않고 빠지고, 도는 것은 "
                    "접기를 청해 status=cancelling 이면 잠시 뒤 delegate_status 로 확인한다. 접은 위임은 이어 돌리지 않는다 — 같은 일은 delegate_start 로 다시 "

@@ -51,3 +51,91 @@ def test_OF4_초안_설명은_긴_절에만_쓰라고_첫머리에_적는다():
     head = m._DR_DESC[:160]
     assert "긴 절" in head and "직접 쓴다" in head and f"{m.offload.DRAFT_TARGET_DEFAULT:,}자" in head
     assert "통째로 다시 쓰지 말고" in m._DR_DESC
+
+
+# ── OF-2 멈춘 까닭 · 덜 찾음 ─────────────────────────────────────────────────────────────────────────────────────
+from test_offload import MAP, RR, TOOLS, _tool  # noqa: E402
+
+import offload  # noqa: E402
+
+
+def _kit_tools(kit, extra: dict):
+    tools = {**TOOLS, **extra}
+
+    async def _pt(_app, groups, user):
+        return dict(tools)
+
+    async def _rm(_app):
+        return {**MAP, **{n: "signalforge" for n in extra}}, frozenset(RR | set(extra))
+    kit.mp.setattr(offload, "_person_tools", _pt)
+    kit.mp.setattr(offload, "_read_map", _rm)
+
+
+def test_OF2_답에_멈춘_까닭_예산_incomplete_못_채운_것이_구조로_실린다(kit):
+    kit.llm.script = [_ai("", _call("voc_search", q="1")), _ai("불량 1,234건 [e1].\n[못 채운 것] 없음")]
+
+    async def scenario():
+        out = await m.delegate_start(task="S26 불량 수", ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    assert res["incomplete"] is False and "unfilled" not in res
+    st = res["stop"]
+    assert st["reason"] == "answered" and st["calls"] == 1 and st["steps_budget"] == offload.STEPS_DEFAULT
+    assert st["minutes_budget"] == offload.MINUTES_DEFAULT and st["elapsed_s"] >= 0
+
+
+def test_OF2_호출_예산으로_멈추면_incomplete_와_못_채운_항목(kit):
+    kit.llm.script = [_ai("", _call("voc_search", q="1")), _ai("", _call("voc_search", q="2")),
+                      _ai("불량 1,234건 [e1].\n[못 채운 것] 원인 분류; 대책 이력")]
+
+    async def scenario():
+        out = await m.delegate_start(task="부품 × 증상 표를 채워라", max_steps=1, ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], view="summary", ctx=_ctx())
+    res = _run(scenario)
+    assert res["stop"]["reason"] == "steps" and res["stop"]["calls"] == 1 and res["incomplete"] is True
+    assert res["unfilled"] == ["원인 분류", "대책 이력"]
+
+
+def test_OF2_시간으로_멈추고_못_채운_것을_적지_않았으면_그렇다고_적는다(kit):
+    gate = asyncio.Event()
+
+    async def _stall(_msgs):
+        await gate.wait()
+        return _ai("오지 않는다")
+    kit.mp.setattr(offload, "_MINUTE_S", 0.3)
+    kit.llm.script = [_ai("", _call("voc_search", q="S26")), _stall, _ai("정리 — 불량 1,234건 [e1].")]
+
+    async def scenario():
+        out = await m.delegate_start(task="S26 불량", max_minutes=1, ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    assert res["stop"]["reason"] == "time" and res["incomplete"] is True
+    assert len(res["unfilled"]) == 1 and "적지 않았다" in res["unfilled"][0]
+    wrap = kit.llm.seen[-1]
+    assert "[못 채운 것]" in wrap[0].content, "정리 턴도 못 채운 것을 적게 한다"
+
+
+def test_OF2_적중이_적으면_다시_찾으라는_힌트를_LLM_에만_단다(kit):
+    _kit_tools(kit, {"voc_find": _tool("voc_find", '{"total": 0, "results": []}')})
+    kit.llm.script = [_ai("", _call("voc_find", q="S26 화면 깨짐")), _ai("없다.\n[못 채운 것] 화면 깨짐 건수")]
+
+    async def scenario():
+        out = await m.delegate_start(task="S26 화면 깨짐 건수", ctx=_ctx())
+        await _done(out["job_id"])
+        return await m.delegate_result(out["job_id"], ctx=_ctx())
+    res = _run(scenario)
+    seen_tool = [x for x in kit.llm.seen[-1] if getattr(x, "type", "") == "tool"]
+    assert seen_tool and "[실행기 힌트] 적중이 0~1건" in str(seen_tool[0].content)
+    assert res["few_hits"] == 1 and res["evidence"][0]["chars"] == len('{"total": 0, "results": []}'), "근거 표의 글자 수는 힌트 앞 원문"
+    assert offload._few_hits("[]") and offload._few_hits('{"count": 1}') and not offload._few_hits('{"count": 5}')
+    assert not offload._few_hits("결과 없음") and not offload._few_hits('{"results": [1, 2]}')
+
+
+def test_OF2_설명에_일_크기별_권장과_incomplete_를_적는다():
+    for d in (m._DG_START_DESC, m._A_DG_STEPS):
+        assert "20~30" in d
+    assert "incomplete" in m._DG_START_DESC and "unfilled" in m._DG_RESULT_DESC and "stop{reason" in m._DG_RESULT_DESC
+    assert "다시 찾는다" in offload._DELEGATE_SYS and "[못 채운 것]" in offload._DELEGATE_SYS

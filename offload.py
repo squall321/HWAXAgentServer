@@ -393,6 +393,34 @@ class _Run:
         self.msgs: list = []
         self.final = ""
         self.final_msg = None
+        self.halted = False         # 호출 예산을 넘는 호출을 돌려보냈다(덜 찾고 멈췄다 — OF-2)
+        self.few_hits = 0           # 적중이 적어 다시 찾으라는 힌트를 단 결과 수
+
+
+_HIT_KEYS = ("total", "count", "n", "total_count", "hits_total", "matched")
+_LIST_KEYS = ("results", "items", "hits", "rows", "records", "data", "matches", "reports", "list")
+
+
+def _few_hits(text: str) -> bool:
+    """검색 · 목록 결과의 적중이 0~1건인가 — JSON 이 목록이거나 총수 칸 · 목록 칸이 있을 때만 본다(글 결과는 모른다 — 거짓)."""
+    t = (text or "").strip()
+    if not t or t[0] not in "[{":
+        return False
+    try:
+        v = json.loads(t)
+    except ValueError:
+        return False
+    if isinstance(v, list):
+        return len(v) <= 1
+    if not isinstance(v, dict):
+        return False
+    for k in _HIT_KEYS:
+        if isinstance(v.get(k), int) and not isinstance(v.get(k), bool):
+            return v[k] <= 1
+    for k in _LIST_KEYS:
+        if isinstance(v.get(k), list):
+            return len(v[k]) <= 1
+    return False
 
 
 def _proxy(base, run: _Run, cap: int):
@@ -403,7 +431,9 @@ def _proxy(base, run: _Run, cap: int):
 
     async def _run(**kwargs):
         if run.calls >= run.max_steps:
-            return f"{_HALT} 호출 예산 {run.max_steps}번을 다 썼다 — 더 부르지 말고 지금까지 받은 결과로 답을 정리하라."
+            run.halted = True
+            return (f"{_HALT} 호출 예산 {run.max_steps}번을 다 썼다 — 더 부르지 말고 지금까지 받은 결과로 답을 정리하라. 확인하지 못한 항목은 "
+                    "[못 채운 것] 줄에 적는다.")
         run.calls += 1
         eid = f"e{run.calls}"
         run.emit({"step": f"도구 호출 {run.calls}/{run.max_steps}: {base.name}", "tool": base.name})
@@ -420,7 +450,12 @@ def _proxy(base, run: _Run, cap: int):
             run.texts.append(text)
         shown, _c = _cut(text, cap)
         run.shown.append((eid, base.name, shown))
-        return f"[근거 {eid}] " + ("(도구가 실패했다) " if not ok else "") + shown
+        hint = ""
+        if ok and _few_hits(text):
+            run.few_hits += 1
+            hint = ("\n[실행기 힌트] 적중이 0~1건이다 — 낱말을 바꾸거나 넓혀(동의어 · 영문 · 상위 범주 · 기간) 한 번 더 찾아라. 한 번 찾고 '없다' 로 "
+                    "끝내지 않는다.")
+        return f"[근거 {eid}] " + ("(도구가 실패했다) " if not ok else "") + shown + hint
 
     return StructuredTool(name=base.name, description=getattr(base, "description", "") or "", coroutine=_run,
                           args_schema=getattr(base, "args_schema", None) or {"type": "object", "properties": {}})
@@ -435,24 +470,33 @@ _DELEGATE_SYS = (
     "밝히고 근거 수도 함께 적는다 — 서버 코드가 근거 원문과 대조한다.\n"
     "- 결과마다 [근거 eN] 머리가 붙는다 — 답의 사실마다 근거를 [eN] 으로 단다.\n"
     "- 모르면 모른다고 한다. 일에 충분하면 더 부르지 않는다.\n"
+    "- 검색 · 목록의 적중이 적으면(0~1건) 낱말을 바꾸거나 넓혀 다시 찾는다 — 한 번 찾고 '없다' 로 끝내지 않는다.\n"
+    "- 필요한 도구가 묶여 있지 않으면(읽기 울타리 밖) 그 내용은 '울타리 밖이라 못 읽음' 이라고 적는다 — 읽은 척하지 않는다.\n"
     "- 예산 — 도구 호출 {steps}번 · {minutes}분.\n"
-    "- 답은 한국어로 짧고 정확하게 — 알아낸 것 · 근거 · 빈 곳(확인하지 못한 것)."
+    "- 답은 한국어로 짧고 정확하게 — 알아낸 것 · 근거 · 빈 곳(확인하지 못한 것).\n"
+    "- 답의 마지막 줄은 '[못 채운 것] 항목; 항목' 이다 — 맡은 일 가운데 확인하지 못한 항목을 적고, 다 채웠으면 '[못 채운 것] 없음'."
 )
 _WRAP_SYS = (
     "너는 HWAX 서버의 조사 위임 실행기다. 도구를 더 부르지 않는다. 아래 [받은 결과] 만으로 [맡은 일] 에 답한다.\n"
     "- 값은 결과에 있는 그대로 쓰고 사실마다 근거를 [eN] 으로 단다. 결과에 없는 것은 '확인하지 못했다' 로 적는다.\n"
-    "- 답은 한국어로 짧고 정확하게."
+    "- 답은 한국어로 짧고 정확하게.\n"
+    "- 답의 마지막 줄은 '[못 채운 것] 항목; 항목' 이다 — 조회가 멈춰 확인하지 못한 항목을 적는다(다 채웠으면 '[못 채운 것] 없음')."
 )
+
+
+def _rec_limit(steps: int) -> int:
+    """그래프 걸음 상한 — 호출 수 × 2 + 5."""
+    return steps * 2 + 5
 
 
 async def _react(llm, tools: list, sysmsg: str, human: str, run: _Run) -> None:
     """작은 ReAct — create_react_agent 를 astream(values) 로 돌려 도중에 끊겨도 받은 메시지는 run 에 남는다(routine._gather 와 같은 까닭).
-    도구 호출이 없는 마지막 AI 글이 답이다. 왕복 상한은 호출 수 × 2 + 5."""
+    도구 호출이 없는 마지막 AI 글이 답이다. 왕복 상한은 _rec_limit."""
     from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
     from langgraph.prebuilt import create_react_agent  # noqa: PLC0415
     run.msgs = [SystemMessage(content=sysmsg), HumanMessage(content=human)]
     agent = create_react_agent(llm, tools)
-    async for st in agent.astream({"messages": run.msgs}, config={"recursion_limit": run.max_steps * 2 + 5}, stream_mode="values"):
+    async for st in agent.astream({"messages": run.msgs}, config={"recursion_limit": _rec_limit(run.max_steps)}, stream_mode="values"):
         got = list((st or {}).get("messages") or [])
         if len(got) <= len(run.msgs):
             continue
@@ -462,6 +506,20 @@ async def _react(llm, tools: list, sysmsg: str, human: str, run: _Run) -> None:
                 if t and not getattr(m, "tool_calls", None):
                     run.final, run.final_msg = t, m
         run.msgs = got
+
+
+_UNFILLED_RE = re.compile(r"^\s*\[못\s*채운\s*것\]\s*(.*?)\s*$", re.M)
+
+
+def _unfilled(answer: str) -> list:
+    """답 끝의 '[못 채운 것] a; b' 줄 → [a, b] — '없음' · 빈 줄이면 []. 여러 줄이면 마지막 것."""
+    got = _UNFILLED_RE.findall(answer or "")
+    if not got:
+        return []
+    body = got[-1].strip()
+    if not body or body.strip(" .") in ("없음", "없다", "none", "None"):
+        return []
+    return [x.strip() for x in re.split(r"\s*[;；]\s*", body) if x.strip() and x.strip(" .") not in ("없음", "없다")][:NUMS_SHOW]
 
 
 async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str):
@@ -474,6 +532,7 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
     apps = [str(a) for a in (opts.get("apps") or []) if str(a).strip()][:APPS_MAX]
     toks: list = []
     react = getter = None
+    t_start = time.monotonic()
     try:
         usage_tokens.tag(kind=USAGE_KIND)   # 이 잡 태스크의 LLM 토큰 종류(루틴 · 띵킹과 같은 자리 — 사람은 잡 원장이 이미 달았다)
         yield _sse("delib", {"kind": "stage", "stage": "tools"})
@@ -498,7 +557,7 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
         loop = asyncio.get_running_loop()
         deadline = loop.time() + minutes * _MINUTE_S
         react = asyncio.ensure_future(_react(llm, tools, _DELEGATE_SYS.format(steps=steps, minutes=minutes), task, run))
-        note = ""
+        note, reason = "", "answered"
         while True:
             getter = asyncio.ensure_future(queue.get())
             done, _p = await asyncio.wait({react, getter}, timeout=max(0.0, deadline - loop.time()),
@@ -513,17 +572,20 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
                 exc = react.exception()
                 if exc is not None:
                     from langgraph.errors import GraphRecursionError  # noqa: PLC0415
-                    note = (f"호출 왕복 상한({steps * 2 + 5})에 닿아 멈췄다" if isinstance(exc, GraphRecursionError)
+                    rec = isinstance(exc, GraphRecursionError)
+                    reason = "recursion" if rec else "error"
+                    note = (f"호출 왕복 상한({_rec_limit(steps)})에 닿아 멈췄다" if rec
                             else f"조회 도중 멈췄다({type(exc).__name__}: {str(exc)[:160]})")
                 break
             react.cancel()
             await asyncio.gather(react, return_exceptions=True)
-            note = f"시간 예산({minutes}분)에 닿아 조회를 멈췄다"
+            note, reason = f"시간 예산({minutes}분)에 닿아 조회를 멈췄다", "time"
             break
         while not queue.empty():
             yield _sse("status", queue.get_nowait())
-        if run.calls >= steps and not run.final:
+        if run.calls >= steps and (run.halted or not run.final):
             note = note or f"호출 예산({steps}번)을 다 썼다"
+            reason = reason if reason != "answered" else "steps"
         if note:
             yield _sse("warning", {"message": note + " — 그때까지 받은 결과로 답을 정리한다"})
         yield _sse("delib", {"kind": "stage", "stage": "answer"})
@@ -539,11 +601,23 @@ async def run_delegate(app, task: str, groups: list, opts: dict, user_email: str
             yield _sse("error", {"message": "LLM 이 빈 답을 냈다" + (f" — {note}" if note else "")})
             return
         shown, cut = _cut(answer, ANSWER_MAX)
+        unfilled = _unfilled(answer)
+        incomplete = reason != "answered"
         result = {"answer": shown, "evidence": run.evidence,
                   "numbers": numbers(answer, "\n".join(run.texts) + "\n" + task),
                   "model": _model_of(msg, llm), "steps": run.calls, "tokens": _usage(run.msgs),
+                  # 멈춘 까닭과 쓴 예산(OF-2) — 시간 · 호출 수 · 왕복 상한 · 오류로 멈췄으면 incomplete 와 못 채운 항목
+                  "stop": {"reason": reason, "calls": run.calls, "steps_budget": steps, "minutes_budget": minutes,
+                           "elapsed_s": round(time.monotonic() - t_start, 1)},
+                  "incomplete": incomplete,
                   "notes": [x for x in (note, f"답을 {cut}에서 잘랐다" if cut else "", _c1 and f"max_steps {_c1}",
                                         _c2 and f"max_minutes {_c2}") if x]}
+        if unfilled:
+            result["unfilled"] = unfilled
+        elif incomplete:
+            result["unfilled"] = ["(실행기가 못 채운 항목을 적지 않았다 — 맡긴 일 가운데 답에 없는 것을 직접 확인한다)"]
+        if run.few_hits:
+            result["few_hits"] = run.few_hits
         yield _sse("result", {"content": shown, "task": result})
     finally:
         for f in (getter, react):
@@ -599,6 +673,9 @@ def result_view(job: dict, view: str) -> dict:
         return out
     out = {"job_id": job["id"], "status": st, "view": view, "answer": r.get("answer"), "numbers": r.get("numbers"),
            "model": r.get("model"), "steps": r.get("steps"), "tokens": r.get("tokens")}
+    for k in ("stop", "incomplete", "unfilled", "few_hits", "blocked_tools"):     # OF-2 · OF-1 — 옛 잡(칸 없음)은 싣지 않는다
+        if k in r:
+            out[k] = r[k]
     ev = r.get("evidence") or []
     if view == "full":
         out["evidence"] = ev
