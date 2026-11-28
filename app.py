@@ -5309,6 +5309,14 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
         yield _sse("status", {"step": f"도구 완료: {name}", "tool": name, **({"via": "invoke_tool"} if via else {}), "ok": ok,
                               "ts": int(time.time() * 1000), "ms": round((time.monotonic() - t0) * 1000), "call": call_id,
                               **({"result_preview": prev} if prev else {}), **({"result_full": hand} if len(hand) > len(prev) else {})})
+        jc = _confirm_job_card(c, call_id, txt) if ok else None
+        if jc is not None:
+            # 진행 카드(WD-13) — 잡을 건 결과면 화면이 상태 · 단계 · 링크 카드를 세운다(끝나면 결과 링크로 바꾸는 것은 화면이 상태를 다시 물어서).
+            # LLM 에는 결과를 6,000자로 잘라 다시 주지 않고 잡 id · 상태와 짧은 머리만 준다 — 사람은 카드로 본다.
+            yield _sse("job_card", jc)
+            lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → 잡 {', '.join(jc['job_ids'])} · 상태 "
+                         f"{jc.get('state') or '?'} — 화면에 진행 카드를 띄웠다(상태 · 링크). 결과 머리: {_cut_mark(txt, _JOB_CARD_NOTE_MAX)}")
+            continue
         lines.append(f"- {name}({c.get('args_text') or _confirm_args_text(c['args'])}) → {_cut_mark(txt, 6000)}")
     print(f"[confirm] 승인 {cid} — {ctx.sent}건 보냄", flush=True)
     # 상태 기다림(HA-28)이 켜져 있으면 결과를 물은 사람에게는 상태 조회를 한 번 부르라고 시킨다 — '볼 수 있다' 처럼 허용만 하면 모델이 queued 로 답하고
@@ -5323,6 +5331,32 @@ async def _confirm_send(app_, req, ctx, turn_calls: list, turn_out: list):
                     + "\n이 호출을 다시 하지 마라(같은 잡이 하나 더 선다). " + follow + moved_note)
     else:
         ctx.note = f"[확인 카드 {cid} 승인 — 그러나 승인된 호출을 보내지 않았다]" + moved_note
+
+
+_JOB_CARD_NOTE_MAX = 1500      # 진행 카드를 띄운 잡 결과를 LLM 에 다시 주는 머리 글자(WD-13 — 카드 없는 결과는 종전 6,000자)
+_JOB_CARD_LINK_KEYS = ("url", "link", "view_url", "result_url", "web_url", "html_url", "page_url")
+
+
+def _confirm_job_card(c: dict, call_id: str, txt: str) -> dict | None:
+    """승인 실행이 건 잡의 진행 카드(WD-13) — 결과가 '도는 중' 잡 하나(status_wait.born_ids)일 때만. {call, tool, app, kind(deliberation · job),
+    job_ids, phase, state, progress, detail, link?, status_call?}. 링크는 결과 맨 위 · 잡 사전의 주소 칸(http(s) · / 로 시작)만, 심의면 진행 조회
+    호출(deliberate_status)을 함께 싣는다 — 화면이 그것으로 상태를 다시 묻고 끝나면 결과 링크로 바꾼다."""
+    ids = _status_wait_mod.born_ids(txt)
+    st = _status_wait_mod.job_state(txt) if ids else None
+    if not ids or st is None:
+        return None
+    card = {"call": call_id, "tool": c["name"], **({"app": c["app"]} if c.get("app") else {}),
+            "kind": "deliberation" if _confirm_is_delib(c) else "job", "job_ids": sorted(ids)[:5],
+            "phase": st.get("phase"), "state": st.get("word"), "progress": st.get("progress"), "detail": st.get("detail") or ""}
+    obj = _arg_dict(txt) or {}
+    for d in (obj, *(v for v in obj.values() if isinstance(v, dict))):
+        hit = next((str(d[k]) for k in _JOB_CARD_LINK_KEYS if isinstance(d.get(k), str) and re.match(r"(?:https?://|/)\S+$", d[k].strip())), "")
+        if hit:
+            card["link"] = hit[:500]
+            break
+    if card["kind"] == "deliberation":
+        card["status_call"] = {"tool": "deliberate_status", "args": {"job_id": card["job_ids"][0]}}
+    return card
 
 
 def _confirm_strip(text: str, card) -> str:

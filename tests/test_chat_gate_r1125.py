@@ -80,3 +80,42 @@ def test_WD06_다른_카드의_고침_틀린_값은_버린다(gate):
     assert len(notes) == 2 and calls[0]["args"]["job"] == "default" and calls[0]["args"]["rounds"] == 3
     other = [{"name": "run_job", "base": "run_job", "args": {"kind": "graph"}, "canon": "{}"}]
     assert a._confirm_apply_edit("cf-0", other, {"id": "cf-0", "set": {"save_report": True}}) == ["이 카드에는 심의 호출이 없어 고친 칸을 버렸다"]
+
+
+# ── WD-13 확인 뒤 진행 카드 ──────────────────────────────────────────────────────────────────────────────────────
+import json  # noqa: E402
+
+from test_confirm_gate import P1_GRAPH  # noqa: E402
+
+
+def test_WD13_승인한_잡이_돌기_시작하면_진행_카드를_내고_LLM_에는_짧은_머리만(gate, monkeypatch):
+    reached: list = []
+    started = json.dumps({"job_id": "J-77", "status": "queued", "url": "/apps/step_forge/jobs/J-77", "log": "가" * 9000}, ensure_ascii=False)
+    tools = {"run_job": _gw("run_job", reached, reply=lambda n, args: started)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    ag = _GateAgent(tools, steps=[], say="잡을 걸었습니다.")
+    evs, _seen = _turn(monkeypatch, ag, tools, card["approve_text"], hist)
+    cards = [d for e, d in evs if e == "job_card"]
+    assert len(cards) == 1
+    jc = cards[0]
+    assert jc["job_ids"] == ["J-77"] and jc["state"] == "queued" and jc["phase"] == "run" and jc["kind"] == "job"
+    assert jc["link"] == "/apps/step_forge/jobs/J-77" and jc["call"] == f"{card['id']}-1" and "status_call" not in jc
+    human = ag.inputs[0]["messages"][-1][1]
+    assert "진행 카드를 띄웠다" in human and "가" * 3000 not in human, "카드를 띄운 잡은 결과를 6,000자로 다시 주지 않는다"
+
+
+def test_WD13_잡이_아닌_결과는_카드가_없고_종전처럼_6000자(gate, monkeypatch):
+    reached: list = []
+    tools = {"run_job": _gw("run_job", reached, reply=lambda n, args: "그냥 글 결과 " + "나" * 3000)}
+    _evs, card, hist = _card_turn(monkeypatch, tools, [("run_job", P1_GRAPH)])
+    ag = _GateAgent(tools, steps=[], say="끝.")
+    evs, _seen = _turn(monkeypatch, ag, tools, card["approve_text"], hist)
+    assert not [d for e, d in evs if e == "job_card"]
+    assert "나" * 3000 in ag.inputs[0]["messages"][-1][1]
+
+
+def test_WD13_심의_잡은_진행_조회_호출을_함께_싣는다():
+    c = {"name": "deliberate_start", "base": "deliberate_start", "app": "심의"}
+    jc = a._confirm_job_card(c, "cf-1-1", json.dumps({"job_id": "delib-20261128-101010-abc123", "status": "running", "stage": "seats"}))
+    assert jc["kind"] == "deliberation" and jc["status_call"] == {"tool": "deliberate_status", "args": {"job_id": "delib-20261128-101010-abc123"}}
+    assert a._confirm_job_card(c, "x", json.dumps({"job_id": "J", "status": "done"})) is None, "끝난 잡 결과는 카드가 아니다"
